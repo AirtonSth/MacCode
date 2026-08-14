@@ -1702,16 +1702,15 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     private func handleLine(_ line: String, session: Session) {
-        let bridgeUserInputRequest = Self.bridgeUserInputRequest(in: line)
-        let isSDKError = line.data(using: .utf8)
-            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["type"] as? String == "sdk_error"
-        if isSDKError { session.sawError = true }
-        if let runtimeEvent = ProviderRuntimeEvent.fromJSONLine(line, provider: .claude, source: "claude.agent-sdk") {
+        let interpretation = Self.interpretSDKLine(line, parser: session.parser)
+        let bridgeUserInputRequest = interpretation.userInputRequest
+        if interpretation.isSDKError { session.sawError = true }
+        if let runtimeEvent = interpretation.runtimeEvent {
             let event = AssistantEvent.providerRuntime(runtimeEvent)
             record(event, session: session)
             emit(.event(event), session: session)
         }
-        let parsed = session.parser.parseLine(line)
+        let parsed = interpretation.parsedEvents
         for event in parsed {
             // The SDK emits AskUserQuestion as an assistant tool block before
             // canUseTool has registered its callback. The bridge then emits the
@@ -2007,11 +2006,46 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         ))), session: session)
     }
 
+    /// One JSON decode of a Claude SDK stdout line. handleLine used to
+    /// JSONSerialization separately for sdk_error, user_input_request,
+    /// ProviderRuntimeEvent.fromJSONLine, and ClaudeParser.parseLine.
+    static func jsonObject(from line: String) -> [String: Any]? {
+#if DEBUG
+        sdkLineJSONDecodeCountForTesting += 1
+#endif
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+#if DEBUG
+    static var sdkLineJSONDecodeCountForTesting = 0
+#endif
+
+    struct SDKLineInterpretation {
+        let isSDKError: Bool
+        let userInputRequest: (id: String, requestedSchema: [String: Any]?)?
+        let runtimeEvent: ProviderRuntimeEvent?
+        let parsedEvents: [AssistantEvent]
+    }
+
+    /// Decode once, then derive sdk_error / user-input / runtime / parser events.
+    static func interpretSDKLine(_ line: String, parser: ClaudeParser) -> SDKLineInterpretation {
+        let object = jsonObject(from: line)
+        return SDKLineInterpretation(
+            isSDKError: object?["type"] as? String == "sdk_error",
+            userInputRequest: bridgeUserInputRequest(in: object),
+            runtimeEvent: object.flatMap {
+                ProviderRuntimeEvent.fromJSONObject($0, provider: .claude, source: "claude.agent-sdk")
+            },
+            parsedEvents: object.map { parser.parseObject($0) } ?? []
+        )
+    }
+
     private static func bridgeUserInputRequest(
-        in line: String
+        in object: [String: Any]?
     ) -> (id: String, requestedSchema: [String: Any]?)? {
-        guard let data = line.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let obj = object,
               (obj["type"] as? String) == "user_input_request" else {
             return nil
         }

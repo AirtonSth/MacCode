@@ -69,6 +69,30 @@ final class FeedPanelViewModelClockTests: XCTestCase {
 
     // MARK: - T058: filter + clear reset
 
+    func test_shouldIngest_dropsStreamKindsAndKeepsDomainAndLifecycle() {
+        // WHY: Feed empty-state copy is domain events. Token-rate stream
+        // kinds already skip EventLog persist; ingesting them here is a
+        // 30 Hz main hop + FormatStyle + 200-cap eviction for empty titles.
+        XCTAssertFalse(FeedPanelViewModel.shouldIngest(kind: "agent.item.delta"))
+        XCTAssertFalse(FeedPanelViewModel.shouldIngest(kind: "agent.item.progress"))
+        XCTAssertFalse(FeedPanelViewModel.shouldIngest(kind: "surface.output"))
+        XCTAssertFalse(FeedPanelViewModel.shouldIngest(kind: "surface.output.summary"))
+        XCTAssertTrue(FeedPanelViewModel.shouldIngest(kind: "agent.item.started"))
+        XCTAssertTrue(FeedPanelViewModel.shouldIngest(kind: "agent.run.started"))
+        XCTAssertTrue(FeedPanelViewModel.shouldIngest(kind: "workspace.selected"))
+        XCTAssertTrue(FeedPanelViewModel.shouldIngest(kind: "notification.created"))
+    }
+
+    func test_receive_streamKindsDoNotEnterItems() {
+        let vm = FeedPanelViewModel()
+        vm.receive(seq: 1, kind: "agent.item.delta", title: "tok", ts: 0)
+        vm.receive(seq: 2, kind: "surface.output", title: "", ts: 1)
+        vm.receive(seq: 3, kind: "workspace.created", title: "ws", ts: 2)
+        XCTAssertEqual(vm.items.map(\.id), [3],
+                       "stream chunks must not occupy Feed rows or the 200-cap")
+        XCTAssertEqual(vm.items.first?.kind, "workspace.created")
+    }
+
     func test_filter_matchesKindAndTitle() {
         let vm = FeedPanelViewModel()
         vm.receive(seq: 1, kind: "agent.run", title: "started", ts: 0)
@@ -149,5 +173,20 @@ final class FeedPanelViewModelClockTests: XCTestCase {
         let ts = try XCTUnwrap(obj["ts"] as? Double)
         XCTAssertEqual(ts, fixedTs.timeIntervalSince1970, accuracy: 0.001,
                        "json ts field must match the item timestamp so clients can reconstruct absolute time")
+    }
+
+    /// WHY: the 1s relative tick used to FormatStyle every visible row's
+    /// hover string even though ts is immutable. The ingest-time label must
+    /// match the previous FormatStyle so hover copy does not change.
+    func test_absoluteTimestampLabel_matchesFormatStyleAndIsStable() {
+        let ts = Date(timeIntervalSince1970: 1_700_000_000)
+        let item = FeedPanelViewModel.Item(id: 1, kind: "k", title: "t", ts: ts)
+        XCTAssertEqual(
+            item.absoluteTimestampLabel,
+            ts.formatted(date: .abbreviated, time: .standard),
+            "hover label must stay the same string the 1s body used to format"
+        )
+        let again = FeedPanelViewModel.Item(id: 2, kind: "k", title: "t", ts: ts)
+        XCTAssertEqual(item.absoluteTimestampLabel, again.absoluteTimestampLabel)
     }
 }

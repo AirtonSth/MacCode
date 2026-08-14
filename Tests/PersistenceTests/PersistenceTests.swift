@@ -204,6 +204,86 @@ final class PersistenceTests: XCTestCase {
                        "completed sessions with a resume cursor must be classified as recoverable, not silently lost")
     }
 
+    func test_updateDiagnostics_skipsNoOpUpsertWhileStreamingSameKind() throws {
+        // WHY: persistStreamBatch calls updateDiagnostics on every 16-event /
+        // 250ms flush. Token deltas on one item keep lastEventKind as
+        // `itemDelta(id)` but used to rewrite the whole provider_session_runtime
+        // row (runtime_payload_json included) just to bump updatedAt.
+        let tmp = NSTemporaryDirectory() + "RC2DiagnosticsNoOp-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "stream", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let repo = ProviderSessionRuntimeRepository(db: db)
+        let frozen = Date(timeIntervalSince1970: 1_700_000_000)
+        let payload = String(repeating: "x", count: 8_192)
+        try repo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .running,
+            lastEventKind: "itemDelta(item-1)",
+            runtimePayloadJSON: payload,
+            updatedAt: frozen
+        ))
+
+        var upserts = 0
+        db.beforeStatementStepForTesting = { sql in
+            if sql.contains("INSERT INTO provider_session_runtime") {
+                upserts += 1
+            }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+
+        try repo.updateDiagnostics(
+            threadId: thread.id,
+            lastEventKind: "itemDelta(item-1)",
+            lastErrorMessage: nil,
+            at: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+
+        XCTAssertEqual(upserts, 0, "same lastEventKind must not WAL-write the session row")
+        XCTAssertEqual(
+            repo.diagnosticsLoadCountForTesting, 0,
+            "upsert already remembered diagnostics; same-kind flush must not SELECT runtime_payload_json"
+        )
+        let afterNoop = try XCTUnwrap(try repo.get(threadId: thread.id))
+        XCTAssertEqual(afterNoop.lastEventKind, "itemDelta(item-1)")
+        XCTAssertEqual(afterNoop.updatedAt.timeIntervalSince1970, frozen.timeIntervalSince1970,
+                       "updatedAt must stay put so skip is observable; reaper only lists completed sessions")
+        XCTAssertEqual(afterNoop.runtimePayloadJSON, payload)
+
+        try repo.updateDiagnostics(
+            threadId: thread.id,
+            lastEventKind: "itemDelta(item-2)",
+            lastErrorMessage: nil,
+            at: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        XCTAssertEqual(upserts, 1, "a new lastEventKind must still persist")
+        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 1, "kind change still reads the row once")
+        try repo.updateDiagnostics(
+            threadId: thread.id,
+            lastEventKind: "itemDelta(item-2)",
+            lastErrorMessage: nil,
+            at: Date(timeIntervalSince1970: 1_850_000_000)
+        )
+        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 1, "repeat same kind after write must not SELECT again")
+        let afterChange = try XCTUnwrap(try repo.get(threadId: thread.id))
+        XCTAssertEqual(afterChange.lastEventKind, "itemDelta(item-2)")
+        XCTAssertEqual(afterChange.updatedAt.timeIntervalSince1970, 1_800_000_000)
+
+        try repo.updateDiagnostics(
+            threadId: thread.id,
+            lastEventKind: "itemDelta(item-2)",
+            lastErrorMessage: "boom",
+            at: Date(timeIntervalSince1970: 1_900_000_000)
+        )
+        XCTAssertEqual(upserts, 2, "a new lastErrorMessage must still persist")
+        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 2, "error change still reads the row")
+        let afterError = try XCTUnwrap(try repo.get(threadId: thread.id))
+        XCTAssertEqual(afterError.lastErrorMessage, "boom")
+        XCTAssertEqual(afterError.lastEventKind, "itemDelta(item-2)")
+    }
+
     func test_interruptedProviderSessionWithCursorIsRecoverableButCancelledSessionIsStopped() throws {
         let tmp = NSTemporaryDirectory() + "RC2InterruptedRecovery-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }
@@ -405,6 +485,316 @@ final class PersistenceTests: XCTestCase {
             .error(message: "first update", recoverable: false),
             .turnStarted(turnId: "second")
         ], "reopening or following up must replay every persisted run event, not only the latest response")
+    }
+
+    func test_persistStreamBatch_formatsCreatedAtOnceForTheFlush() throws {
+        // WHY: persistStreamBatch used to iso.string(from: Date()) on every
+        // stream + provider INSERT. ISO8601 is second-precision, so a 16-event
+        // / 250ms flush already stored the same created_at; the extra formats
+        // were lock+calendar under the SQLite writer.
+        let tmp = NSTemporaryDirectory() + "RC2BatchCreatedAt-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "flush", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m")
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+
+        var items: [AgentRunRepository.StreamWriteIntent] = []
+        for seq in 1...16 {
+            items.append(AgentRunRepository.StreamWriteIntent(
+                seq: seq,
+                kind: "itemDelta(i1)",
+                payloadJSON: #"{"itemDelta":{"itemId":"i1"}}"#,
+                providerEvent: ProviderRuntimeEvent(
+                    id: "evt-\(seq)",
+                    provider: .codex,
+                    source: "test",
+                    method: "event",
+                    payloadJSON: #"{"i":\#(seq)}"#,
+                    receivedAtMs: Int64(seq)
+                )
+            ))
+        }
+
+        XCTAssertEqual(runs.streamBatchISO8601FormatCountForTesting, 0)
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: items,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.streamBatchISO8601FormatCountForTesting, 1,
+            "one 16-event flush must format created_at once, not once per stream/provider row"
+        )
+
+        let created = try db.prepare(
+            "SELECT DISTINCT created_at FROM agent_stream_events WHERE run_id = ?;"
+        )
+        try created.bind(1, run.id.value.uuidString)
+        var stamps: [String] = []
+        while try created.step() {
+            stamps.append(created.columnText(0) ?? "")
+        }
+        XCTAssertEqual(stamps.count, 1, "all flushed stream rows must share the batch created_at")
+        XCTAssertFalse(stamps[0].isEmpty)
+
+        let providerStamps = try db.prepare(
+            "SELECT DISTINCT created_at FROM agent_provider_event_logs WHERE thread_id = ?;"
+        )
+        try providerStamps.bind(1, thread.id.value.uuidString)
+        var provider: [String] = []
+        while try providerStamps.step() {
+            provider.append(providerStamps.columnText(0) ?? "")
+        }
+        XCTAssertEqual(provider, stamps, "paired provider rows must reuse the same batch timestamp")
+    }
+
+    func test_persistStreamBatch_skipsReversibleStoreWhenUnderLimit() throws {
+        // WHY: persistStreamBatch and boundPayloadForPersistence constructed
+        // ReversibleContentStore on every token-sized row even though
+        // softTruncate returns identity under the 16 MiB ceiling. Store-before-loss
+        // only runs when the payload exceeds the limit.
+        let tmp = NSTemporaryDirectory() + "RC2ReversibleStoreSkip-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "store-skip", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m")
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+
+        let items = (1...16).map { seq in
+            AgentRunRepository.StreamWriteIntent(
+                seq: seq,
+                kind: "itemDelta(i1)",
+                payloadJSON: #"{"itemDelta":{"itemId":"i1","seq":\#(seq)}}"#,
+                providerEvent: ProviderRuntimeEvent(
+                    id: "evt-\(seq)",
+                    provider: .codex,
+                    source: "test",
+                    method: "event",
+                    payloadJSON: #"{"i":\#(seq)}"#,
+                    receivedAtMs: Int64(seq)
+                )
+            )
+        }
+        XCTAssertEqual(runs.reversibleStoreInitCountForTesting, 0)
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: items,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.reversibleStoreInitCountForTesting, 0,
+            "16 under-limit stream+provider rows must not construct ReversibleContentStore"
+        )
+        XCTAssertEqual(try runs.maxStreamEventSeq(runId: run.id), 16)
+
+        let oversized = String(repeating: "a", count: 64)
+        _ = try runs.boundPayloadForPersistence(oversized, byteLimit: 8)
+        XCTAssertEqual(
+            runs.reversibleStoreInitCountForTesting, 1,
+            "a payload over the caller limit must still construct the store"
+        )
+    }
+
+    func test_persistStreamBatch_skipsIdentitySelectOnFirstWriteOfNewSeqs() throws {
+        // WHY: persistStreamBatch used to SELECT event_kind+payload_json for
+        // every (run_id, seq) before INSERT (~16 probes / 250ms flush) even
+        // when the coordinator had just allocated those sequences. First write
+        // of a seq above the durable high-water mark can INSERT; retry and a
+        // fresh repository instance must still probe so matching bytes stay
+        // idempotent and a different identity still fails loud.
+        let tmp = NSTemporaryDirectory() + "RC2StreamIdentitySelect-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "stream-select", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m")
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+
+        func intent(seq: Int, kind: String = "itemDelta(i1)") -> AgentRunRepository.StreamWriteIntent {
+            AgentRunRepository.StreamWriteIntent(
+                seq: seq,
+                kind: kind,
+                payloadJSON: #"{"itemDelta":{"itemId":"i1","seq":\#(seq)}}"#,
+                providerEvent: nil
+            )
+        }
+
+        let firstFlush = (1...16).map { intent(seq: $0) }
+        XCTAssertEqual(runs.streamEventIdentitySelectCountForTesting, 0)
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: firstFlush,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.streamEventIdentitySelectCountForTesting, 0,
+            "first write of seqs 1...16 must INSERT without an identity SELECT"
+        )
+        XCTAssertEqual(try runs.maxStreamEventSeq(runId: run.id), 16)
+
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: firstFlush,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.streamEventIdentitySelectCountForTesting, 16,
+            "retry of the same prefix must SELECT each identity instead of inserting a second row"
+        )
+        XCTAssertEqual(try runs.maxStreamEventSeq(runId: run.id), 16)
+
+        let secondFlush = (17...32).map { intent(seq: $0) }
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: secondFlush,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.streamEventIdentitySelectCountForTesting, 16,
+            "seqs above the committed high-water mark must not SELECT again"
+        )
+        XCTAssertEqual(try runs.maxStreamEventSeq(runId: run.id), 32)
+
+        let fresh = AgentRunRepository(db: db)
+        try fresh.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: [intent(seq: 32)],
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            fresh.streamEventIdentitySelectCountForTesting, 1,
+            "a new repository instance must seed from durable MAX and probe a retry"
+        )
+        XCTAssertEqual(try fresh.maxStreamEventSeq(runId: run.id), 32)
+
+        XCTAssertThrowsError(
+            try fresh.persistStreamBatch(
+                runId: run.id,
+                threadId: thread.id,
+                items: [intent(seq: 32, kind: "turnStarted(t1)")],
+                shouldPruneStreamEvents: false
+            )
+        ) { error in
+            let text = String(describing: error)
+            XCTAssertTrue(
+                text.contains("Conflicting stream event identity"),
+                "retry with a different kind must still fail loud: \(text)"
+            )
+        }
+    }
+
+    func test_persistStreamBatch_skipsProviderIdentitySelectOnFirstWrite() throws {
+        // WHY: persistStreamBatch used to SELECT the full provider-log row
+        // (payload_json included) before every INSERT even when the
+        // coordinator had just minted a new event_id. Claude SDK lines emit
+        // a providerRuntime pair at token rate. First write of an unseen id
+        // can INSERT; retry and a new repository instance must still probe.
+        let tmp = NSTemporaryDirectory() + "RC2ProviderIdentitySelect-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "provider-select", provider: .claude, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .claude, model: "m")
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+
+        func intent(seq: Int, eventId: String, method: String = "content_block_delta") -> AgentRunRepository.StreamWriteIntent {
+            AgentRunRepository.StreamWriteIntent(
+                seq: seq,
+                kind: "providerRuntime(\(eventId))",
+                payloadJSON: #"{"providerRuntime":{"id":"\#(eventId)"}}"#,
+                providerEvent: ProviderRuntimeEvent(
+                    id: eventId,
+                    provider: .claude,
+                    source: "claude.agent-sdk",
+                    method: method,
+                    payloadJSON: #"{"type":"\#(method)","id":"\#(eventId)"}"#,
+                    receivedAtMs: Int64(seq)
+                )
+            )
+        }
+
+        let firstIds = (1...16).map { "evt-\($0)" }
+        let firstFlush = zip(1...16, firstIds).map { intent(seq: $0, eventId: $1) }
+        XCTAssertEqual(runs.providerEventIdentitySelectCountForTesting, 0)
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: firstFlush,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.providerEventIdentitySelectCountForTesting, 0,
+            "first write of 16 new provider event_ids must INSERT without an identity SELECT"
+        )
+        XCTAssertEqual(try runs.countProviderEventLogs(threadId: thread.id), 16)
+
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: firstFlush,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.providerEventIdentitySelectCountForTesting, 16,
+            "retry of the same provider ids must SELECT each identity instead of inserting a second row"
+        )
+        XCTAssertEqual(try runs.countProviderEventLogs(threadId: thread.id), 16)
+
+        let secondIds = (17...32).map { "evt-\($0)" }
+        let secondFlush = zip(17...32, secondIds).map { intent(seq: $0, eventId: $1) }
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: secondFlush,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.providerEventIdentitySelectCountForTesting, 16,
+            "new provider event_ids above the seeded set must not SELECT again"
+        )
+        XCTAssertEqual(try runs.countProviderEventLogs(threadId: thread.id), 32)
+
+        let fresh = AgentRunRepository(db: db)
+        try fresh.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: [intent(seq: 32, eventId: "evt-32")],
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            fresh.providerEventIdentitySelectCountForTesting, 1,
+            "a new repository instance must seed durable event_ids and probe a retry"
+        )
+        XCTAssertEqual(try fresh.countProviderEventLogs(threadId: thread.id), 32)
+
+        XCTAssertThrowsError(
+            try fresh.persistStreamBatch(
+                runId: run.id,
+                threadId: thread.id,
+                items: [intent(seq: 32, eventId: "evt-32", method: "message_stop")],
+                shouldPruneStreamEvents: false
+            )
+        ) { error in
+            let text = String(describing: error)
+            XCTAssertTrue(
+                text.contains("Conflicting provider event identity"),
+                "retry with a different method must still fail loud: \(text)"
+            )
+        }
+        XCTAssertEqual(try fresh.countProviderEventLogs(threadId: thread.id), 32)
     }
 
     func test_streamEventReplayLimitKeepsNewestEventsInChronologicalOrder() throws {

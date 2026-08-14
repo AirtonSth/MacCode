@@ -326,4 +326,68 @@ final class FilesViewModelRoutingTests: XCTestCase {
         XCTAssertEqual(router.contents["a.txt"], "ab",
             "the host content should receive the follow-up patch after the first patch finishes")
     }
+
+    func test_filesSurfaceFilter_dropsStreamKindsAndKeepsEditKinds() {
+        // WHY: each open Files tab used to hop every EventBus event (incl.
+        // ~30 Hz agent.item.delta) to main, then drop it in receive(). The
+        // admission filter must keep edit/state and reject the stream firehose.
+        let filter = EventStreamFilter.filesSurface
+        func event(_ kind: String) -> EventBus.Event {
+            EventBus.Event(seq: 1, kind: kind, payload: .null, ts: 0)
+        }
+
+        XCTAssertTrue(filter.allows(event("files.state.updated")))
+        XCTAssertTrue(filter.allows(event("files.edit.opened")))
+        XCTAssertTrue(filter.allows(event("files.edit.patch_applied")))
+        XCTAssertTrue(filter.allows(event("files.edit.saved")))
+        XCTAssertTrue(filter.allows(event("files.edit.discarded")))
+        XCTAssertTrue(filter.allows(event("files.edit.conflict")))
+        XCTAssertTrue(filter.allows(event("files.edit.closed")))
+        XCTAssertFalse(filter.allows(event("agent.item.delta")),
+            "token-rate deltas must not admit a Files tab handler")
+        XCTAssertFalse(filter.allows(event("agent.item.progress")))
+        XCTAssertFalse(filter.allows(event("surface.output")))
+        XCTAssertFalse(filter.allows(event("workspace.selected")))
+    }
+
+    func test_streamEventsDoNotHopFilesSurfaceToMain() {
+        // WHY: proof that the subscribe filter actually gates receive(), not
+        // just the pure admission table. Three stream publishes + one files
+        // state event must increment the receive counter once.
+        let router = FakeFilesRouter()
+        let model = makeModel(router: router)
+        defer { model.close() }
+
+        EventBus.shared.publish(kind: "agent.item.delta", payload: .object([
+            "item_id": .string("i1"),
+            "body_append": .string("x")
+        ]))
+        EventBus.shared.publish(kind: "agent.item.progress", payload: .object([
+            "item_id": .string("i1"),
+            "progress": .number(0.5)
+        ]))
+        EventBus.shared.publish(kind: "surface.output", payload: .object([
+            "surface_id": .string("term")
+        ]))
+        drainMainQueue()
+        XCTAssertEqual(model.eventReceiveCountForTests, 0,
+            "stream kinds must be dropped on the EventBus delivery thread")
+
+        EventBus.shared.publish(kind: "files.state.updated", payload: .object([
+            "surface_id": .string(model.surfaceID.value.uuidString),
+            "state": .object([
+                "current_directory": .string("src"),
+                "reader_mode": .string("source")
+            ])
+        ]))
+        drainMainQueue()
+        XCTAssertEqual(model.eventReceiveCountForTests, 1,
+            "files.state.updated must still reach receive so dirty/dir state stays live")
+        XCTAssertEqual(model.currentDirectory, "src",
+            "admitted files.state.updated must still apply")
+    }
+
+    private func drainMainQueue() {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    }
 }

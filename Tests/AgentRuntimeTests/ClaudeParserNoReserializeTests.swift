@@ -63,6 +63,35 @@ final class ClaudeParserNoReserializeTests: XCTestCase {
 
     // MARK: - Core parity: stream_event wrapper == direct line
 
+    func test_parseObject_matchesParseLineForTextDelta() {
+        // WHY: the SDK bridge now feeds ClaudeParser the already-decoded dict.
+        // parseObject must keep the same itemDelta as parseLine or tokens vanish.
+        let line = #"{"type":"content_block_delta","index":0,"session_id":"sid","delta":{"type":"text_delta","text":"Hello world"}}"#
+        func warmUp(_ p: ClaudeParser) {
+            _ = p.parseObject([
+                "type": "system", "subtype": "init", "session_id": "sid",
+            ], now: 1)
+            _ = p.parseObject([
+                "type": "message_start", "message": ["id": "m1"],
+            ], now: 1)
+            _ = p.parseObject([
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": ["type": "text", "id": "item0"],
+            ], now: 1)
+        }
+        let viaLine = ClaudeParser()
+        warmUp(viaLine)
+        let viaObject = ClaudeParser()
+        warmUp(viaObject)
+        let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        XCTAssertEqual(
+            summarize(viaLine.parseLine(line)),
+            summarize(viaObject.parseObject(try XCTUnwrap(object), now: 1_700_000_000_000)),
+            "parseObject on the decoded dict must match parseLine"
+        )
+    }
+
     func test_streamEvent_textDelta_matchesDirectLine() {
         // WHY: a stream_event wrapper around content_block_delta must produce
         // the identical itemDelta event as feeding the inner line directly.

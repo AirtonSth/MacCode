@@ -90,6 +90,29 @@ final class EventLogRepositoryTests: XCTestCase {
 
     /// WHY: append and retention are one atomic write. If pruning fails, callers
     /// must not receive an error after the new event has already been committed.
+    /// WHY: every append used to run two retention DELETEs (events + orphan
+    /// receipt links) even when COUNT(*) was far below the cap. A DELETE
+    /// abort must not fail those under-cap writes.
+    func test_append_underCapSkipsRetentionDeletes() throws {
+        let db = try makeDB()
+        let repo = EventLogRepository(db: db)
+        try db.execute("""
+            CREATE TRIGGER reject_event_retention_delete
+            BEFORE DELETE ON events
+            BEGIN
+                SELECT RAISE(ABORT, 'injected retention failure');
+            END;
+        """)
+
+        XCTAssertNoThrow(try repo.append(seq: 1, kind: "test", payloadJSON: "{}"))
+        XCTAssertNoThrow(try repo.append(seq: 2, kind: "test", payloadJSON: "{}"))
+
+        let countSt = try db.prepare("SELECT COUNT(*) FROM events;")
+        XCTAssertTrue(try countSt.step())
+        XCTAssertEqual(Int(countSt.columnInt64(0)), 2,
+            "under-cap appends must not touch retention DELETEs")
+    }
+
     func test_T009c_pruneFailureRollsBackAppendAndPreservesHardCap() throws {
         let db = try makeDB()
         let repo = EventLogRepository(db: db)
@@ -232,5 +255,30 @@ final class EventLogRepositoryTests: XCTestCase {
 
         XCTAssertEqual(rows.map(\.seq), [1, 2, 3],
                        "cursor pagination must return the first matching page in reducer order")
+    }
+
+    func test_append_skipsEventCountSelectWhileUnderCap() throws {
+        // WHY: every EventLog.append used to SELECT COUNT(*) FROM events even
+        // when the table was far under the 5000-row cap (lifecycle persist
+        // after stream kinds were already live-only). The connection caches
+        // occupancy after the first count so later under-cap appends skip it.
+        let db = try makeDB()
+        let repo = EventLogRepository(db: db)
+        XCTAssertEqual(db.eventRowCountSelectCountForTesting, 0)
+        try repo.append(seq: 1, kind: "agent.run.started", payloadJSON: "{}")
+        XCTAssertEqual(
+            db.eventRowCountSelectCountForTesting, 1,
+            "first append must COUNT once to seed the connection cache"
+        )
+        for seq in 2...10 {
+            try repo.append(seq: Int64(seq), kind: "agent.run.started", payloadJSON: "{}")
+        }
+        XCTAssertEqual(
+            db.eventRowCountSelectCountForTesting, 1,
+            "nine more under-cap appends must not COUNT again"
+        )
+        let countSt = try db.prepare("SELECT COUNT(*) FROM events;")
+        XCTAssertTrue(try countSt.step())
+        XCTAssertEqual(countSt.columnInt64(0), 10)
     }
 }

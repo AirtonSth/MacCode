@@ -26,8 +26,16 @@ public final class CodexParser {
         guard !trimmed.isEmpty else { return [] }
         guard let data = trimmed.data(using: .utf8) else { return [] }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+        return parseObject(obj)
+    }
+
+    /// Dispatch on an already-decoded `codex exec --json` object so CodexRunner
+    /// can share one JSONSerialization with providerRuntime.
+    public func parseObject(
+        _ obj: [String: Any],
+        now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> [AssistantEvent] {
         guard let type = obj["type"] as? String else { return [] }
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
 
         switch type {
         case "thread.started":

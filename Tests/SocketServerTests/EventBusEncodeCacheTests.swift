@@ -128,4 +128,95 @@ final class EventBusEncodeCacheTests: XCTestCase {
             "encodedData must return stable bytes for the published event -- instability would cause different subscribers to receive different wire payloads")
         XCTAssertFalse(bytes1.isEmpty, "encoded bytes must not be empty for a retained event")
     }
+
+    // MARK: - Publish retains without JSONEncoder
+
+    /// Token-rate `agent.item.delta` used to `JSONEncoder.encode` under the
+    /// EventBus lock solely to measure the recent ring. The walk must match
+    /// that encoder byte-for-byte so eviction / recentEvents stay identical.
+    func test_retainedJSONByteCount_matchesEncoderForStreamAndLifecycleShapes() throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let cases: [EventBus.Event] = [
+            EventBus.Event(seq: 1, kind: "agent.item.delta", payload: .object([
+                "thread_id": .string("t1"),
+                "item_id": .string("i1"),
+                "body_append": .string("hello"),
+            ]), ts: 1_720_000_000.25),
+            EventBus.Event(seq: 2, kind: "agent.item.delta", payload: .object([
+                "body_append": .string("line\nquote\"slash\\path/tab\tend"),
+            ]), ts: 1_720_000_001),
+            EventBus.Event(seq: 3, kind: "agent.item.progress", payload: .object([
+                "item_id": .string("i1"),
+                "progress": .number(0.5),
+            ]), ts: 0),
+            EventBus.Event(seq: 4, kind: "workspace.created", payload: .null, ts: -1),
+            EventBus.Event(seq: 5, kind: "surface.created", payload: .array([
+                .bool(true), .bool(false), .number(0), .string(""),
+            ]), ts: 42),
+            EventBus.Event(seq: 6, kind: "emoji", payload: .string("café 🐱"), ts: 99.125),
+            EventBus.Event(seq: Int64.max, kind: "big.seq", payload: .object([:]), ts: 1),
+            // Live publish clock is Date().timeIntervalSince1970 (fractional).
+            EventBus.Event(seq: 7, kind: "agent.item.delta", payload: .object([
+                "progress": .number(1.0 / 3.0),
+            ]), ts: 1_786_682_163.2664108),
+            EventBus.Event(seq: 8, kind: "num", payload: .number(Double.pi), ts: -0.0),
+            // Unsorted insertion order must still match encoder+sortedKeys length.
+            EventBus.Event(seq: 9, kind: "agent.item.delta", payload: .object([
+                "thread_id": .string("t"),
+                "summary": .string("s"),
+                "output_append": .string("o"),
+                "item_id": .string("i"),
+                "body_append": .string("b"),
+            ]), ts: 2),
+        ]
+        for ev in cases {
+            let encoded = try encoder.encode(ev)
+            XCTAssertEqual(
+                EventBus.retainedJSONByteCount(ev),
+                encoded.count,
+                "walk must equal JSONEncoder+sortedKeys for \(ev.kind) seq=\(ev.seq) body=\(String(data: encoded, encoding: .utf8) ?? "?")"
+            )
+        }
+    }
+
+    /// Publish must not JSON-encode just to admit an event into the ring.
+    func test_publish_doesNotJSONEncodeForRingAccounting() {
+        let bus = EventBus()
+        bus.publish(
+            kind: "agent.item.delta",
+            payload: .object([
+                "thread_id": .string("t1"),
+                "item_id": .string("i1"),
+                "body_append": .string("tok"),
+            ])
+        )
+        XCTAssertEqual(
+            bus.encodeCountForTesting,
+            0,
+            "retainRecent must walk JSON size; encoding here is the 30 Hz EventBus-lock tax"
+        )
+        XCTAssertEqual(bus.recentCountForTests, 1)
+        XCTAssertGreaterThan(bus.recentBytesForTests, 0)
+    }
+
+    /// Publish `ts` is never an Int64. The walk must still equal the encoder
+    /// for a live clock sample so ring eviction stays identical.
+    func test_jsonNumberByteCount_liveTimestampAndFractions_matchEncoder() throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let now = Date().timeIntervalSince1970
+        let values: [Double] = [
+            now, -0.0, 0.5, 99.125, Double.pi, 1.0 / 3.0, 1e20, 1e-10, -1.25,
+        ]
+        for value in values {
+            let ev = EventBus.Event(seq: 1, kind: "n", payload: .number(value), ts: value)
+            let encoded = try encoder.encode(ev)
+            XCTAssertEqual(
+                EventBus.retainedJSONByteCount(ev),
+                encoded.count,
+                "walk != encoder for \(value) json=\(String(data: encoded, encoding: .utf8) ?? "?")"
+            )
+        }
+    }
 }

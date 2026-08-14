@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import AgentRuntime
 import CoreModel
 import Persistence
@@ -93,6 +94,263 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         XCTAssertNil(
             viewModel.tokenSaverLocalUsageUpdate,
             "WHY: an account percentage refresh changes no locally observed provider-token total"
+        )
+    }
+
+    /// WHY: usage-changed fires during agent runs. Rewriting equal
+    /// tokenSaverEnabled / snapshot @Published values rebuilt the always-on
+    /// sidebar and pushed a widget digest with a new timestamp.
+    func test_unchangedUsageReload_doesNotPublishSidebar() async throws {
+        let (_, viewModel, appSupport) = try makeViewModel()
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        await viewModel.reloadTokenSaverAndWait()
+
+        var publishes = 0
+        let sub = viewModel.objectWillChange.sink { publishes += 1 }
+        NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+        let settled = await waitUntil(timeout: 1.0) { publishes > 0 }
+        _ = sub
+
+        XCTAssertFalse(settled)
+        XCTAssertEqual(
+            publishes,
+            0,
+            "equal flags/snapshot must not invalidate the sidebar on a usage notification"
+        )
+    }
+
+    /// WHY: a 7-day heal used to construct a fresh SettingsStore + UsageStore
+    /// per day (empty cache → 7 SQLite reads + 7 usage.json decodes) on the
+    /// MainActor. Shared snapshot must load once per window call.
+    func test_economyWindow_loadsSharedSettingsAndUsageOnce() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2TokenSaverEconomyWindow-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        context.tokenSaverDailyEconomySharedSnapshotLoadsForTesting = 0
+
+        context.recomputeTokenSaverDailyEconomyWindow(dayCount: 7)
+
+        XCTAssertEqual(
+            context.tokenSaverDailyEconomySharedSnapshotLoadsForTesting,
+            1,
+            "7-day heal must share one settings+usage.json snapshot, not load per day"
+        )
+    }
+
+    /// WHY: AppContext already recomputes today before posting usage-changed.
+    /// Reloading the sidebar snapshot must not stall MainActor on another
+    /// 7-day settings+usage walk — historical days are unchanged by this event.
+    func test_usageChangedNotification_doesNotRehealSevenDayWindow() async throws {
+        let (context, viewModel, appSupport) = try makeViewModel()
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let healsAfterInit = viewModel.tokenSaverEconomyWindowHealCountForTesting
+        XCTAssertGreaterThanOrEqual(healsAfterInit, 1, "boot must heal the week once")
+
+        _ = try TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).record(
+            provider: .claude,
+            actualProviderTokens: 10,
+            estimatedRawTokens: 10,
+            eligibleRuns: 1
+        )
+        NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+
+        let refreshed = await waitUntil {
+            viewModel.tokenSaverUsageSnapshot.providers
+                .contains(where: { $0.provider == .claude && $0.actualProviderTokens >= 10 })
+        }
+        XCTAssertTrue(refreshed)
+        XCTAssertEqual(
+            viewModel.tokenSaverEconomyWindowHealCountForTesting,
+            healsAfterInit,
+            "usage notification must not re-run the 7-day economy heal"
+        )
+    }
+
+    /// WHY: itemDelta fires at stream rate. A new SettingsStore per chunk
+    /// was a MainActor SQLite load even when Token Saver / Graphify is off.
+    func test_graphifyUsageGate_loadsSettingsOnceUntilRevisionChanges() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyUsageGate-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        context.graphifyUsageSettingsLoadCountForTesting = 0
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "i1",
+            bodyAppend: "echo",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "i1",
+            bodyAppend: " hi",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(
+            context.graphifyUsageSettingsLoadCountForTesting,
+            1,
+            "unchanged settings revision must not SQLite-load on every itemDelta"
+        )
+
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "i1",
+            bodyAppend: "!",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(
+            context.graphifyUsageSettingsLoadCountForTesting,
+            2,
+            "a settings save must bump revision so the next delta re-reads admission"
+        )
+    }
+
+    /// WHY: when Graphify is admitted, itemDelta used to threadRepo.get on
+    /// every chunk (~30 Hz). Provider is stable per thread; first chunk
+    /// fills the cache, later chunks must not hit SQLite.
+    func test_graphifyProviderLabel_cachedAcrossItemDeltas() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyProviderCache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        context.graphifyProviderLookupCountForTesting = 0
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "tool-1",
+            bodyAppend: "graphify",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "tool-1",
+            bodyAppend: " query",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "tool-2",
+            bodyAppend: "graphify path",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+
+        XCTAssertEqual(
+            context.graphifyProviderLookupCountForTesting,
+            1,
+            "thread provider must be SQLite-loaded once per thread, not per itemDelta"
+        )
+        XCTAssertEqual(context.graphifyProviderLabel(for: threadId), "unknown")
+    }
+
+    /// WHY: after a Graphify invocation is recorded, later itemDelta chunks
+    /// used to JSON-parse the growing tool body and re-detect on MainActor.
+    func test_graphifyDetect_skipsAfterInvocationRecorded() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyDetectSkip-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        context.graphifyDetectCountForTesting = 0
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "bash-1",
+            bodyAppend: #"{"command":"graphify query where is X"}"#,
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(context.graphifyDetectCountForTesting, 1)
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "bash-1",
+            bodyAppend: " && echo more",
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "bash-1",
+            bodyAppend: " && echo again",
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(
+            context.graphifyDetectCountForTesting,
+            1,
+            "after the pending Graphify row is recorded, later deltas must not re-parse/detect"
+        )
+    }
+
+    /// WHY: after detect records the pending row, later itemDelta chunks
+    /// still copied the growing command body (~30 Hz) and then copied it
+    /// again in processGraphifyBuffer only to return. Answer tokens come
+    /// from result-phase output, so command-body growth is wasted.
+    func test_graphifyBuffer_stopsGrowingBodyAfterInvocationRecorded() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyBodyCap-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+        let itemId = "bash-body"
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: #"{"command":"graphify query where is X"}"#,
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        let afterMatch = context.graphifyBufferBodyUTF8CountForTesting(runId: runId, itemId: itemId)
+        XCTAssertGreaterThan(afterMatch, 0, "first matching chunk must populate the command body")
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: String(repeating: "x", count: 2048),
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: String(repeating: "y", count: 2048),
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(
+            context.graphifyBufferBodyUTF8CountForTesting(runId: runId, itemId: itemId),
+            afterMatch,
+            "later command-text deltas must not grow the body after the pending row exists"
         )
     }
 

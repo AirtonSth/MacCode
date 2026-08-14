@@ -312,6 +312,8 @@ public final class SidebarViewModel: ObservableObject {
     @Published public var workspaces: [Workspace] = [] {
         didSet {
             busyStateCache.removeAll(keepingCapacity: true)
+            busyTooltipCache.removeAll(keepingCapacity: true)
+            busySurfaceTitlesCache.removeAll(keepingCapacity: true)
             filteredWorkspacesCache = nil
         }
     }
@@ -321,6 +323,14 @@ public final class SidebarViewModel: ObservableObject {
     /// every render. Invalidated whenever `workspaces` is reassigned via
     /// `reload`, which is driven by the same mutations that change busy.
     private var busyStateCache: [WorkspaceID: Bool] = [:]
+    /// Final tooltip keyed by workspace + running thread titles. Agent titles
+    /// win without a SurfaceRegistry walk; surface titles are cached separately.
+    private var busyTooltipCache: [WorkspaceID: (titles: [String], tooltip: String?)] = [:]
+    private var busySurfaceTitlesCache: [WorkspaceID: [String]] = [:]
+    /// Test seam: SurfaceRegistry walks performed for tooltips.
+    var busySurfaceWalkCountForTesting = 0
+    /// Test seam: inject running titles without a live coordinator run.
+    var busyTooltipRunningTitlesOverrideForTesting: [WorkspaceID: [String]]?
     // PERF: filteredWorkspaces is recomputed on every SwiftUI body evaluation
     // and on the drag-scroll timer (16 Hz). Cache the last filtered result and
     // invalidate only when workspaces or filterText changes so repeated renders
@@ -404,6 +414,12 @@ public final class SidebarViewModel: ObservableObject {
     /// Legacy test seam retained for source compatibility. Busy tooltips are
     /// now derived from live in-memory surfaces and must not read SQLite.
     var threadListCallCount: Int = 0
+    /// PERF-MAC_SIDEBAR-002 (test seam): JSONDecoder of the private account
+    /// session. `reload()` still peeks the settings blob so save+reload stays
+    /// synchronous, but an unchanged blob must not decode or publish.
+    var privateAccountLoadCount: Int = 0
+    private var lastPrivateAccountJSON: String?
+    private var didPeekPrivateAccountJSON = false
     private var privateAccountObserver: NSObjectProtocol?
     private var tokenSaverUsageObserver: NSObjectProtocol?
     private var tokenSaverDistributedUsageObserver: NSObjectProtocol?
@@ -412,6 +428,12 @@ public final class SidebarViewModel: ObservableObject {
     /// task so a burst of per-provider `.rc2TokenSaverUsageChanged` events
     /// coalesces into a single off-main read instead of N main-thread reads.
     private var tokenSaverHeavyReloadTask: Task<Void, Never>?
+    /// Test seam: 7-day economy heals requested from this VM (boot / AndWait).
+    var tokenSaverEconomyWindowHealCountForTesting = 0
+    /// Distill tree size for the disabled-footer "Delete model" row. Measured
+    /// once per URL; SwiftUI body must not re-stat the model directory on every
+    /// sidebar @Published invalidation (active-thread badge, usage, filter).
+    var tokenSaverInstalledModelSizeCache = TokenSaverInstalledModelSizeCache()
     private var tokenSaverLocalUsageBaseline: [AgentProvider: Int]?
     private var sidecarStatusObserver: NSObjectProtocol?
     private var tokenSaverToggleObserver: NSObjectProtocol?
@@ -518,7 +540,9 @@ public final class SidebarViewModel: ObservableObject {
         workspacePrompter = AppKitWorkspacePrompter(viewModel: self)
         reload()
         reloadInsomnia()
-        reloadTokenSaver()
+        // Heal last-7-days formula rows once at boot. Usage notifications
+        // only need today, which AppContext already recomputes before notify.
+        reloadTokenSaver(healEconomyWindow: true)
         sidecarStatus = context.tokenSaverDistillServiceController.status
     }
 
@@ -557,10 +581,10 @@ public final class SidebarViewModel: ObservableObject {
         // row deselected so the destination is unambiguous.
         let shellDestinationSelected = isScheduledTasksSelected || isActiveThreadsSelected
         if shellDestinationSelected {
-            selectedWorkspaceID = nil
-            selectedWorkspaceIDs.removeAll()
+            if selectedWorkspaceID != nil { selectedWorkspaceID = nil }
+            if !selectedWorkspaceIDs.isEmpty { selectedWorkspaceIDs.removeAll() }
             selectionAnchorID = nil
-        } else {
+        } else if selectedWorkspaceID != ctx.state.window.selectedWorkspaceID {
             selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
         }
         updateCompletedWorkspaces(from: ordered)
@@ -568,13 +592,19 @@ public final class SidebarViewModel: ObservableObject {
             workspaces = ordered
         }
         if !shellDestinationSelected {
-            selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
+            let nextIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
+            if nextIDs != selectedWorkspaceIDs {
+                selectedWorkspaceIDs = nextIDs
+            }
         }
         // Live Active Threads badge: host projection count, same source as Pet.
         let nextActiveCount = ctx.coordinator.activeThreadIdsSnapshot().count
         if nextActiveCount != activeThreadCount {
             activeThreadCount = nextActiveCount
         }
+        // Peek the account blob so save+reload stays synchronous (Insomnia /
+        // Token Saver tests). Unchanged JSON must not decode or assign
+        // `@Published` — that rebuilt the sidebar on every refreshFromState.
         reloadPrivateAccount()
     }
 
@@ -583,12 +613,15 @@ public final class SidebarViewModel: ObservableObject {
     /// already batch-computes (agent run / terminal job), so no extra DB work.
     private func updateCompletedWorkspaces(from list: [Workspace]) {
         let nowBusy = Set(list.filter { $0.metadata["busy"] == "true" }.map(\.id))
-        completedWorkspaces = Self.completedWorkspacesAfterReload(
+        let next = Self.completedWorkspacesAfterReload(
             previousBusy: previousBusyWorkspaces,
             nowBusy: nowBusy,
             current: completedWorkspaces,
             existing: Set(list.map(\.id)),
             selected: selectedWorkspaceID)
+        if next != completedWorkspaces {
+            completedWorkspaces = next
+        }
         previousBusyWorkspaces = nowBusy
     }
 
@@ -623,7 +656,16 @@ public final class SidebarViewModel: ObservableObject {
 
     private func reloadPrivateAccount() {
         guard let ctx = context else { return }
-        privateAccountUser = PrivateAccountSessionStore(repo: ctx.settingsRepo).load()?.user
+        let store = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let json = store.loadRawJSON()
+        if didPeekPrivateAccountJSON, json == lastPrivateAccountJSON { return }
+        didPeekPrivateAccountJSON = true
+        lastPrivateAccountJSON = json
+        privateAccountLoadCount += 1
+        let next = store.session(fromJSON: json)?.user
+        if next != privateAccountUser {
+            privateAccountUser = next
+        }
     }
 
     private func reloadInsomnia() {
@@ -643,25 +685,37 @@ public final class SidebarViewModel: ObservableObject {
     /// aggregate (`tokenSaverSavingsRepo.summary()`) -- runs OFF the main
     /// thread and is coalesced: a fresh notification cancels the prior task,
     /// so a per-provider burst collapses to a single background read.
-    private func reloadTokenSaver(trackLocalUsageChange: Bool = false) {
+    private func reloadTokenSaver(
+        trackLocalUsageChange: Bool = false,
+        healEconomyWindow: Bool = false
+    ) {
         let settings = settingsStore.load()
-        tokenSaverEnabled = settings.tokenSaverEnabled
-        graphifyRuntimeActive = settings.isGraphifyRuntimeActive
+        applyTokenSaverSettingsFlags(settings)
         guard let context else {
             tokenSaverHeavyReloadTask?.cancel()
             tokenSaverHeavyReloadTask = nil
-            tokenSaverUsageSnapshot = .empty()
-            tokenSaverSavingsSummary = .empty
-            tokenSaverDailyEconomyToday = nil
-            tokenSaverDailyEconomyWeekTotal = 0
-            tokenSaverProviderCacheAmortToday = [:]
+            applyTokenSaverHeavyResult(
+                snapshot: .empty(),
+                summary: .empty,
+                economyToday: nil,
+                economyWeekTotal: 0,
+                providerCacheAmortToday: [:],
+                trackLocalUsageChange: false,
+                publishDigest: false
+            )
             tokenSaverLocalUsageBaseline = nil
-            tokenSaverLocalUsageUpdate = nil
+            if tokenSaverLocalUsageUpdate != nil {
+                tokenSaverLocalUsageUpdate = nil
+            }
             return
         }
-        // Recompute the retained week so pre-v6 permanent-amort rows do not
-        // keep painting a ~999M Week headline after the formula heal.
-        context.recomputeTokenSaverDailyEconomyWindow(dayCount: 7)
+        // Week heal is for formula-version rows (boot / explicit wait). A
+        // usage notification already recomputed today on the write path;
+        // redoing 7 days here stalled MainActor on 7× settings + usage.json.
+        if healEconomyWindow {
+            tokenSaverEconomyWindowHealCountForTesting += 1
+            context.recomputeTokenSaverDailyEconomyWindow(dayCount: 7)
+        }
         let appSupport = context.appSupportDirectory
         let savingsRepo = context.tokenSaverSavingsRepo
         let economyRepo = context.tokenSaverDailyEconomyRepo
@@ -675,16 +729,15 @@ public final class SidebarViewModel: ObservableObject {
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 guard let self, !Task.isCancelled else { return }
-                self.tokenSaverUsageSnapshot = result.snapshot
-                self.tokenSaverSavingsSummary = result.summary
-                self.tokenSaverDailyEconomyToday = result.economyToday
-                self.tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
-                self.tokenSaverProviderCacheAmortToday = result.providerCacheAmortToday
-                self.updateTokenSaverLocalUsage(
-                    from: result.snapshot,
-                    emitPositiveChange: trackLocalUsageChange
+                self.applyTokenSaverHeavyResult(
+                    snapshot: result.snapshot,
+                    summary: result.summary,
+                    economyToday: result.economyToday,
+                    economyWeekTotal: result.economyWeekTotal,
+                    providerCacheAmortToday: result.providerCacheAmortToday,
+                    trackLocalUsageChange: trackLocalUsageChange,
+                    publishDigest: true
                 )
-                self.publishTokenSaverWidgetDigest()
             }
         }
     }
@@ -885,16 +938,19 @@ public final class SidebarViewModel: ObservableObject {
     /// notification cannot cancel it) before assigning the published values.
     func reloadTokenSaverAndWait() async {
         let settings = settingsStore.load()
-        tokenSaverEnabled = settings.tokenSaverEnabled
-        graphifyRuntimeActive = settings.isGraphifyRuntimeActive
+        applyTokenSaverSettingsFlags(settings)
         guard let context else {
             tokenSaverHeavyReloadTask?.cancel()
             tokenSaverHeavyReloadTask = nil
-            tokenSaverUsageSnapshot = .empty()
-            tokenSaverSavingsSummary = .empty
-            tokenSaverDailyEconomyToday = nil
-            tokenSaverDailyEconomyWeekTotal = 0
-            tokenSaverProviderCacheAmortToday = [:]
+            applyTokenSaverHeavyResult(
+                snapshot: .empty(),
+                summary: .empty,
+                economyToday: nil,
+                economyWeekTotal: 0,
+                providerCacheAmortToday: [:],
+                trackLocalUsageChange: false,
+                publishDigest: false
+            )
             return
         }
         // Heal last 7 days with current formula (day-scoped amort) so Week
@@ -905,13 +961,65 @@ public final class SidebarViewModel: ObservableObject {
             savingsRepo: context.tokenSaverSavingsRepo,
             economyRepo: context.tokenSaverDailyEconomyRepo
         )
-        tokenSaverUsageSnapshot = result.snapshot
-        tokenSaverSavingsSummary = result.summary
-        tokenSaverDailyEconomyToday = result.economyToday
-        tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
-        tokenSaverProviderCacheAmortToday = result.providerCacheAmortToday
-        updateTokenSaverLocalUsage(from: result.snapshot, emitPositiveChange: false)
-        publishTokenSaverWidgetDigest()
+        applyTokenSaverHeavyResult(
+            snapshot: result.snapshot,
+            summary: result.summary,
+            economyToday: result.economyToday,
+            economyWeekTotal: result.economyWeekTotal,
+            providerCacheAmortToday: result.providerCacheAmortToday,
+            trackLocalUsageChange: false,
+            publishDigest: true
+        )
+    }
+
+    private func applyTokenSaverSettingsFlags(_ settings: AppSettings) {
+        if tokenSaverEnabled != settings.tokenSaverEnabled {
+            tokenSaverEnabled = settings.tokenSaverEnabled
+        }
+        if graphifyRuntimeActive != settings.isGraphifyRuntimeActive {
+            graphifyRuntimeActive = settings.isGraphifyRuntimeActive
+        }
+    }
+
+    /// Assign Token Saver published fields only when the value changed.
+    /// Usage notifications used to rewrite equal snapshots and force a full
+    /// sidebar body (and a widget EventBus publish with a new timestamp).
+    @discardableResult
+    private func applyTokenSaverHeavyResult(
+        snapshot: TokenSaverUsageSnapshot,
+        summary: TokenSaverSavingsSummary,
+        economyToday: TokenSaverDailyEconomyRecord?,
+        economyWeekTotal: Int,
+        providerCacheAmortToday: [String: Int],
+        trackLocalUsageChange: Bool,
+        publishDigest: Bool
+    ) -> Bool {
+        var changed = false
+        if tokenSaverUsageSnapshot != snapshot {
+            tokenSaverUsageSnapshot = snapshot
+            changed = true
+        }
+        if tokenSaverSavingsSummary != summary {
+            tokenSaverSavingsSummary = summary
+            changed = true
+        }
+        if tokenSaverDailyEconomyToday != economyToday {
+            tokenSaverDailyEconomyToday = economyToday
+            changed = true
+        }
+        if tokenSaverDailyEconomyWeekTotal != economyWeekTotal {
+            tokenSaverDailyEconomyWeekTotal = economyWeekTotal
+            changed = true
+        }
+        if tokenSaverProviderCacheAmortToday != providerCacheAmortToday {
+            tokenSaverProviderCacheAmortToday = providerCacheAmortToday
+            changed = true
+        }
+        updateTokenSaverLocalUsage(from: snapshot, emitPositiveChange: trackLocalUsageChange)
+        if changed, publishDigest {
+            publishTokenSaverWidgetDigest()
+        }
+        return changed
     }
 
     /// Runs the heavy Token Saver reads off the main actor. `repo` is
@@ -1083,6 +1191,7 @@ public final class SidebarViewModel: ObservableObject {
             guard confirmed else { return }
             tokenSaverEnabled = false
             graphifyRuntimeActive = false
+            invalidateInstalledTokenSaverModelBytes()
             settingsStore.update {
                 $0.tokenSaverEnabled = false
             }
@@ -1251,11 +1360,36 @@ public final class SidebarViewModel: ObservableObject {
     public func markTokenSaverModelInstalledForTesting() {
         tokenSaverModelDownloadState = .ready
         showsTokenSaverModelDownload = false
+        invalidateInstalledTokenSaverModelBytes()
         tokenSaverEnabled = true
         settingsStore.update {
             $0.tokenSaverEnabled = true
         }
         refreshTokenSaverDistillService(modelValidation: .installed)
+    }
+
+    /// Distill size for the disabled footer. First call walks the tree; later
+    /// sidebar bodies reuse the cache until disable / download / delete.
+    func installedTokenSaverModelBytes() -> Int64 {
+        guard !tokenSaverEnabled, let ctx = context else { return 0 }
+        let url = SidebarRootView.tokenSaverDistillDirectory(appSupportDirectory: ctx.appSupportDirectory)
+        if let cached = SidebarRootView.cachedInstalledModelBytes(
+            at: url,
+            cache: tokenSaverInstalledModelSizeCache
+        ) {
+            return cached
+        }
+        let bytes = SidebarRootView.modelDirSize(at: url)
+        tokenSaverInstalledModelSizeCache = TokenSaverInstalledModelSizeCache(url: url, bytes: bytes)
+        return bytes
+    }
+
+    func invalidateInstalledTokenSaverModelBytes() {
+        tokenSaverInstalledModelSizeCache = TokenSaverInstalledModelSizeCache()
+    }
+
+    func recordInstalledTokenSaverModelBytes(_ bytes: Int64, at url: URL) {
+        tokenSaverInstalledModelSizeCache = TokenSaverInstalledModelSizeCache(url: url, bytes: bytes)
     }
 
     private func validateTokenSaverModel(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
@@ -1314,6 +1448,7 @@ public final class SidebarViewModel: ObservableObject {
                 }
                 self.tokenSaverModelDownloadState = .ready
                 self.showsTokenSaverModelDownload = false
+                self.invalidateInstalledTokenSaverModelBytes()
                 self.tokenSaverEnabled = true
                 self.settingsStore.update {
                     $0.tokenSaverEnabled = true
@@ -1945,10 +2080,47 @@ public final class SidebarViewModel: ObservableObject {
         return nil
     }
 
+    /// Thread titles take priority over surfaces. A walk is wasted whenever
+    /// an agent is already running in the workspace (the common busy case).
+    nonisolated public static func needsBusySurfaceWalk(runningThreadTitles: [String]) -> Bool {
+        runningThreadTitles.isEmpty
+    }
+
     /// Returns a tooltip string describing the active busy source for `ws`,
     /// or nil when the workspace is idle.
     public func busyTooltip(for ws: Workspace) -> String? {
-        let surfaceTitles: [String] = ws.layout.paneIDs().flatMap { pid -> [String] in
+        let runningThreadTitles = busyTooltipRunningTitlesOverrideForTesting?[ws.id]
+            ?? context?.activeAgentThreadTitles(in: ws.id)
+            ?? []
+        if let cached = busyTooltipCache[ws.id], cached.titles == runningThreadTitles {
+            return cached.tooltip
+        }
+        if !Self.needsBusySurfaceWalk(runningThreadTitles: runningThreadTitles) {
+            let tooltip = Self.busyTooltip(
+                runningThreadTitles: runningThreadTitles,
+                busySurfaceTitles: []
+            )
+            busyTooltipCache[ws.id] = (runningThreadTitles, tooltip)
+            return tooltip
+        }
+        let surfaceTitles: [String]
+        if let cachedSurfaces = busySurfaceTitlesCache[ws.id] {
+            surfaceTitles = cachedSurfaces
+        } else {
+            busySurfaceWalkCountForTesting += 1
+            surfaceTitles = collectBusySurfaceTitles(ws)
+            busySurfaceTitlesCache[ws.id] = surfaceTitles
+        }
+        let tooltip = Self.busyTooltip(
+            runningThreadTitles: runningThreadTitles,
+            busySurfaceTitles: surfaceTitles
+        )
+        busyTooltipCache[ws.id] = (runningThreadTitles, tooltip)
+        return tooltip
+    }
+
+    private func collectBusySurfaceTitles(_ ws: Workspace) -> [String] {
+        ws.layout.paneIDs().flatMap { pid -> [String] in
             guard let pane = ws.layout.find(paneID: pid) else { return [] }
             return pane.surfaces.compactMap { desc -> String? in
                 guard SurfaceRegistry.shared.surface(desc.id)?.isBusy == true else { return nil }
@@ -1960,11 +2132,6 @@ public final class SidebarViewModel: ObservableObject {
                 }
             }
         }
-        let runningThreadTitles = context?.activeAgentThreadTitles(in: ws.id) ?? []
-        return Self.busyTooltip(
-            runningThreadTitles: runningThreadTitles,
-            busySurfaceTitles: surfaceTitles
-        )
     }
 
     public func reorderWorkspace(_ dragged: WorkspaceID, before target: WorkspaceID) {
@@ -2334,6 +2501,23 @@ public enum TokenSaverSavingsDisplay {
             savedTokens: savedTokens,
             runs: summary.runs(forProvidersOtherThan: managedProviderIDs)
         )
+    }
+}
+
+/// Cached Distill tree size for the disabled Token Saver footer.
+///
+/// WHY: `tokenSaverControl` lives in the always-on sidebar. While Token Saver
+/// is off, a body walk of Distill (multi-GB, many files) plus a fresh
+/// `TokenSaverModelInstaller` (JSONEncoder/Decoder) ran on every sidebar
+/// `@Published` invalidation. Cache by directory URL; invalidate on disable,
+/// download, and delete.
+public struct TokenSaverInstalledModelSizeCache: Equatable {
+    public var url: URL?
+    public var bytes: Int64?
+
+    public init(url: URL? = nil, bytes: Int64? = nil) {
+        self.url = url
+        self.bytes = bytes
     }
 }
 
@@ -2842,14 +3026,11 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverControl: some View {
-        // :186 -- compute model dir size once for this render pass.
-        // Only evaluated when !tokenSaverEnabled so the hot (enabled) path
-        // pays zero cost.
-        let modelDirURL: URL? = {
-            guard !vm.tokenSaverEnabled, let ctx = vm.context else { return nil }
-            return TokenSaverModelInstaller(appSupportDirectory: ctx.appSupportDirectory).distillDirectory
-        }()
-        let modelDirBytes: Int64 = modelDirURL.map { Self.modelDirSize(at: $0) } ?? 0
+        // :186 -- delete-model row only when disabled + Distill files exist.
+        // Size is cached on the VM: constructing TokenSaverModelInstaller and
+        // walking the tree from body re-allocated codecs and re-statted every
+        // sidebar invalidation while Token Saver was off.
+        let modelDirBytes = vm.installedTokenSaverModelBytes()
         let showDeleteModel = !vm.tokenSaverEnabled && modelDirBytes > 0
 
         return VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -3019,6 +3200,7 @@ public struct SidebarRootView: View {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         try? FileManager.default.removeItem(at: installer.distillDirectory)
+        vm.recordInstalledTokenSaverModelBytes(0, at: installer.distillDirectory)
     }
 
     private var tokenSaverPillText: String {
@@ -4156,26 +4338,41 @@ public struct SidebarRootView: View {
         return 0
     }
 
-    /// :186 -- Sums the byte sizes of all regular files under `url` (non-recursive
-    /// into sub-directories is fine; the model dir is flat).  Uses a recursive
-    /// enumerator so nested revision sub-directories are included.
+    /// Distill directory next to app support. Same path as
+    /// `TokenSaverModelInstaller.distillDirectory` without allocating installer codecs.
+    nonisolated public static func tokenSaverDistillDirectory(appSupportDirectory: URL) -> URL {
+        appSupportDirectory.appendingPathComponent("Distill", isDirectory: true)
+    }
+
+    /// Hit when `cache` already measured `url`. Miss (nil) means walk once.
+    nonisolated public static func cachedInstalledModelBytes(
+        at url: URL,
+        cache: TokenSaverInstalledModelSizeCache
+    ) -> Int64? {
+        guard cache.url == url else { return nil }
+        return cache.bytes
+    }
+
+    /// :186 -- Sums the byte sizes of all regular files under `url`. Uses a
+    /// recursive enumerator so nested revision sub-directories are included.
     ///
     /// WHY pure/nonisolated: lets tests exercise the calculation with a temp-dir
     /// fixture without any AppContext or UI setup.  Returns 0 when the directory
     /// does not exist (model not installed).
     nonisolated public static func modelDirSize(at url: URL) -> Int64 {
         let fm = FileManager.default
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .isRegularFileKey]
         guard let enumerator = fm.enumerator(
             at: url,
-            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            includingPropertiesForKeys: Array(keys),
             options: [.skipsHiddenFiles]
         ) else { return 0 }
         var total: Int64 = 0
         for case let fileURL as URL in enumerator {
-            guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
-            if let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize {
-                total += Int64(size)
-            }
+            guard let values = try? fileURL.resourceValues(forKeys: keys),
+                  values.isRegularFile == true,
+                  let size = values.fileSize else { continue }
+            total += Int64(size)
         }
         return total
     }

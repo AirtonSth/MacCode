@@ -203,6 +203,20 @@ final class SettingsStoreCacheTests: XCTestCase {
 
     // MARK: cache returns defaults when repo has no stored value
 
+    func test_saveBumpsProcessWideRevision() {
+        // WHY: agent itemDelta used to construct a new SettingsStore (empty
+        // cache → SQLite) per chunk. Hot readers key their gate on this
+        // revision so a write from any instance invalidates them.
+        let before = SettingsStore.revision
+        let repo = CountingSettingsRepository()
+        SettingsStore(repo: repo).save(AppSettings(tokenSaverEnabled: true))
+        XCTAssertEqual(
+            SettingsStore.revision,
+            before + 1,
+            "successful save must bump SettingsStore.revision for cross-instance readers"
+        )
+    }
+
     func test_cacheReturnsDefaults_whenRepoEmpty() {
         let repo = CountingSettingsRepository()
         let store = SettingsStore(repo: repo)

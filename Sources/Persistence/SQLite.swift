@@ -67,7 +67,31 @@ public final class SQLiteDB {
     private var liveAgentThreadBySurface: [SurfaceID: AgentThreadID] = [:]
     private var ownedMaintenance: SQLiteDBOwnedMaintenance?
     private(set) var maintenanceInstallCountForTesting = 0
+#if DEBUG
+    /// `SELECT COUNT(*) FROM events` probes from `EventRetentionPolicy.prune`.
+    private(set) var eventRowCountSelectCountForTesting = 0
+#endif
     var onDeinitForTesting: (() -> Void)?
+    /// Connection-local events-table occupancy. EventLog + command receipts
+    /// share this so under-cap appends skip COUNT(*).
+    private var cachedEventRowCount: Int64?
+
+    func cachedEventRowCountIfKnown() -> Int64? { cachedEventRowCount }
+
+    func rememberEventRowCount(_ count: Int64) {
+        cachedEventRowCount = count
+    }
+
+    func noteEventRowsInserted(_ n: Int64) {
+        guard n > 0, let current = cachedEventRowCount else { return }
+        cachedEventRowCount = current + n
+    }
+
+#if DEBUG
+    func noteEventRowCountSelectForTesting() {
+        eventRowCountSelectCountForTesting += 1
+    }
+#endif
     // Marks `queue` so cachedStatement() can detect when it is running inside a
     // `performSync` block (and may therefore safely reuse a shared cached stmt).
     private static let queueKey = DispatchSpecificKey<UInt8>()

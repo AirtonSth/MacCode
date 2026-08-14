@@ -3282,38 +3282,64 @@ public final class AgentRunRepository: @unchecked Sendable {
     // a short lock so concurrent thread reads avoid per-call codec construction.
     private let streamEventCodecLock = NSLock()
     private let streamEventDecoder = JSONDecoder()
+    /// Highest durable `seq` observed for a run on this repository instance.
+    /// Token-rate flushes used to SELECT `(run_id, seq)` before every INSERT
+    /// even when the coordinator had just allocated a never-written sequence.
+    /// Seed from `MAX(seq)` on cache miss so a new instance / relaunch still
+    /// probes retries of already-written identities.
+    private let committedStreamSeqLock = NSLock()
+    private var lastCommittedStreamSeqByRun: [String: Int] = [:]
+    private static let committedStreamSeqCacheLimit = 128
+    /// Durable `event_id`s already written for a thread on this instance.
+    /// Token-rate flushes used to SELECT the full provider row (payload
+    /// included) before every INSERT even when the coordinator had just
+    /// minted a new UUID. Seed the set from `event_id` on first touch so a
+    /// new instance still probes retries.
+    private let committedProviderEventLock = NSLock()
+    private var knownProviderEventIdsByThread: [String: Set<String>] = [:]
+    private static let committedProviderEventCacheLimit = 128
     public init(db: SQLiteDB) { self.db = db }
+#if DEBUG
+    /// `iso.string(from:)` calls from `persistStreamBatch` (one per flush).
+    private(set) var streamBatchISO8601FormatCountForTesting = 0
+    /// Identity `SELECT` probes from `persistStreamEventIdempotently`.
+    private(set) var streamEventIdentitySelectCountForTesting = 0
+    /// Identity `SELECT` probes from `persistProviderEventIdempotently`.
+    private(set) var providerEventIdentitySelectCountForTesting = 0
+    /// ReversibleContentStore constructions from bound/persist helpers.
+    private(set) var reversibleStoreInitCountForTesting = 0
+#endif
 
     /// Store-before-loss soft bound used by coordinator + repository (S3).
     public func boundPayloadForPersistence(
         _ payloadJSON: String,
         byteLimit: Int = maximumPersistedEventRowBytes
     ) throws -> String {
-        try Self.softTruncateUTF8Payload(
-            payloadJSON,
-            byteLimit: byteLimit,
-            reversibleStore: ReversibleContentStore(db: db)
-        )
+        try boundPayloadIfNeeded(payloadJSON, byteLimit: byteLimit)
     }
 
     private func boundedStreamRow(kind: String, payloadJSON: String) throws -> (kind: String, payloadJSON: String) {
         let kindBytes = kind.utf8.count
         let payloadBudget = max(1, Self.maximumPersistedEventRowBytes - kindBytes)
-        let store = ReversibleContentStore(db: db)
-        let boundedPayload = try Self.softTruncateUTF8Payload(
-            payloadJSON,
-            byteLimit: payloadBudget,
-            reversibleStore: store
-        )
-        return (kind, boundedPayload)
+        return (kind, try boundPayloadIfNeeded(payloadJSON, byteLimit: payloadBudget))
     }
 
     private func boundedProviderPayload(_ payloadJSON: String) throws -> String {
-        let store = ReversibleContentStore(db: db)
+        try boundPayloadIfNeeded(payloadJSON, byteLimit: Self.maximumPersistedEventRowBytes)
+    }
+
+    /// Store-before-loss is unused when the payload already fits. Token-rate
+    /// persist used to construct ReversibleContentStore on every row anyway.
+    private func boundPayloadIfNeeded(_ payloadJSON: String, byteLimit: Int) throws -> String {
+        let limit = max(1, byteLimit)
+        if payloadJSON.utf8.count <= limit { return payloadJSON }
+#if DEBUG
+        reversibleStoreInitCountForTesting += 1
+#endif
         return try Self.softTruncateUTF8Payload(
             payloadJSON,
-            byteLimit: Self.maximumPersistedEventRowBytes,
-            reversibleStore: store
+            byteLimit: limit,
+            reversibleStore: ReversibleContentStore(db: db)
         )
     }
 
@@ -3594,6 +3620,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(4, bounded.payloadJSON)
         try st.bind(5, iso.string(from: Date()))
         _ = try st.step()
+        rememberCommittedStreamSeq(runId: runId, seq: seq)
         // Single-path writers (tests + rare direct callers) must also reclaim so
         // a large admit never relies on the batch prune cadence alone.
         if let run = try get(id: runId) {
@@ -3615,11 +3642,43 @@ public final class AgentRunRepository: @unchecked Sendable {
     /// Used to seed in-memory allocation after process relaunch or ownership repair
     /// so a retry cannot reuse seq 1 for a different event kind.
     public func maxStreamEventSeq(runId: AgentRunID) throws -> Int {
+        try maxStreamEventSeq(db: db, runId: runId)
+    }
+
+    private func maxStreamEventSeq(db: SQLiteDB, runId: AgentRunID) throws -> Int {
         let st = try db.prepare(
             "SELECT COALESCE(MAX(seq), 0) FROM agent_stream_events WHERE run_id = ?;"
         )
         try st.bind(1, runId.value.uuidString)
         return (try st.step()) ? Int(st.columnInt64(0)) : 0
+    }
+
+    private func rememberedCommittedStreamSeq(runId: AgentRunID) -> Int? {
+        committedStreamSeqLock.lock()
+        defer { committedStreamSeqLock.unlock() }
+        return lastCommittedStreamSeqByRun[runId.value.uuidString]
+    }
+
+    private func rememberCommittedStreamSeq(runId: AgentRunID, seq: Int) {
+        let key = runId.value.uuidString
+        committedStreamSeqLock.lock()
+        defer { committedStreamSeqLock.unlock() }
+        if lastCommittedStreamSeqByRun.count >= Self.committedStreamSeqCacheLimit,
+           lastCommittedStreamSeqByRun[key] == nil {
+            lastCommittedStreamSeqByRun.removeAll(keepingCapacity: true)
+        }
+        lastCommittedStreamSeqByRun[key] = max(lastCommittedStreamSeqByRun[key] ?? 0, seq)
+    }
+
+    /// Known high-water seq for `runId`. Cache miss reads durable `MAX(seq)`
+    /// once so INSERT-first never duplicates a row written by another instance.
+    private func knownCommittedStreamSeq(db: SQLiteDB, runId: AgentRunID) throws -> Int {
+        if let cached = rememberedCommittedStreamSeq(runId: runId) {
+            return cached
+        }
+        let maxSeq = try maxStreamEventSeq(db: db, runId: runId)
+        rememberCommittedStreamSeq(runId: runId, seq: maxSeq)
+        return maxSeq
     }
 
     /// One ordered mirror write. A provider runtime event shares the transaction
@@ -3636,6 +3695,23 @@ public final class AgentRunRepository: @unchecked Sendable {
             self.payloadJSON = payloadJSON
             self.providerEvent = providerEvent
         }
+    }
+
+    /// Whether `persistStreamBatch` should run per-thread window retention.
+    /// Token-rate flushes pass `shouldPruneStreamEvents: false`; a single
+    /// oversize frame still reclaims immediately so older history drops first.
+    nonisolated public static func streamBatchNeedsRetentionReclaim(
+        shouldPruneStreamEvents: Bool,
+        itemPayloadBytes: [Int],
+        providerPayloadBytes: [Int],
+        streamEventBytesPerThread: Int64,
+        providerLogBytesPerThread: Int64
+    ) -> Bool {
+        if shouldPruneStreamEvents { return true }
+        if itemPayloadBytes.contains(where: { Int64($0) > streamEventBytesPerThread }) {
+            return true
+        }
+        return providerPayloadBytes.contains(where: { Int64($0) > providerLogBytesPerThread })
     }
 
     public struct TerminalCommitResult: Sendable {
@@ -3752,19 +3828,39 @@ public final class AgentRunRepository: @unchecked Sendable {
         retentionPolicy policy: AgentEventRetentionPolicy = .production
     ) throws {
         guard !items.isEmpty || shouldPruneStreamEvents else { return }
-        // Always reclaim after any write so a large new frame never fails closed
-        // with an "omitted" banner — older history is dropped first.
-        let shouldReclaim = !items.isEmpty || shouldPruneStreamEvents
+        // Inserts never fail-closed (store-before-loss). The coordinator already
+        // asks for prune every `streamEventPruneInterval` events. Running the
+        // JOIN + ROW_NUMBER + running-SUM DELETE on every 16-event / 250ms flush
+        // rescanned up to 8 MiB of blobs while the thread was still under cap.
+        // Reclaim on the caller's cadence, or immediately when a single frame
+        // already exceeds the per-thread byte budget.
+        let shouldReclaim = Self.streamBatchNeedsRetentionReclaim(
+            shouldPruneStreamEvents: shouldPruneStreamEvents,
+            itemPayloadBytes: items.map(\.payloadJSON.utf8.count),
+            providerPayloadBytes: items.compactMap { $0.providerEvent?.payloadJSON.utf8.count },
+            streamEventBytesPerThread: policy.streamEventBytesPerThread,
+            providerLogBytesPerThread: policy.providerLogBytesPerThread
+        )
         try db.performSync { db in
             try db.transaction {
+                // ISO8601DateFormatter is second-precision. A 16-event / 250ms
+                // flush already stores the same created_at on every row; format
+                // once instead of lock+calendar per INSERT (stream + provider).
+                let createdAt = items.isEmpty ? nil : iso.string(from: Date())
+#if DEBUG
+                if createdAt != nil { streamBatchISO8601FormatCountForTesting += 1 }
+#endif
                 for item in items {
-                    try persistStreamEventIdempotently(db: db, runId: runId, item: item)
+                    try persistStreamEventIdempotently(
+                        db: db, runId: runId, item: item, createdAt: createdAt
+                    )
                     if let providerEvent = item.providerEvent {
                         try persistProviderEventIdempotently(
                             db: db,
                             threadId: threadId,
                             runId: runId,
-                            event: providerEvent
+                            event: providerEvent,
+                            createdAt: createdAt
                         )
                     }
                 }
@@ -3918,6 +4014,14 @@ public final class AgentRunRepository: @unchecked Sendable {
         maxPayloadBytes: Int64
     ) throws -> Bool {
         guard limit > 0, maxPayloadBytes > 0 else { return false }
+        if try providerRetentionIsUnderBudget(
+            db: db,
+            threadId: threadId,
+            limit: limit,
+            maxPayloadBytes: maxPayloadBytes
+        ) {
+            return false
+        }
         let st = try db.prepare("""
             WITH ranked AS (
                 SELECT id,
@@ -3970,9 +4074,45 @@ public final class AgentRunRepository: @unchecked Sendable {
     private func persistStreamEventIdempotently(
         db: SQLiteDB,
         runId: AgentRunID,
-        item: StreamWriteIntent
+        item: StreamWriteIntent,
+        createdAt: String? = nil
     ) throws {
         let bounded = try boundedStreamRow(kind: item.kind, payloadJSON: item.payloadJSON)
+        let lastCommitted = try knownCommittedStreamSeq(db: db, runId: runId)
+        // First write of a freshly allocated seq cannot collide. Retry and
+        // relaunch still SELECT so matching bytes stay idempotent and a
+        // different identity still fails loud.
+        if item.seq <= lastCommitted {
+            try probeExistingStreamEventIdentity(
+                db: db,
+                runId: runId,
+                item: item,
+                bounded: bounded,
+                createdAt: createdAt
+            )
+            return
+        }
+
+        let insert = try db.prepare("INSERT INTO agent_stream_events(run_id, seq, event_kind, payload_json, created_at) VALUES(?, ?, ?, ?, ?);")
+        try insert.bind(1, runId.value.uuidString)
+        try insert.bind(2, Int64(item.seq))
+        try insert.bind(3, bounded.kind)
+        try insert.bind(4, bounded.payloadJSON)
+        try insert.bind(5, createdAt ?? iso.string(from: Date()))
+        _ = try insert.step()
+        rememberCommittedStreamSeq(runId: runId, seq: item.seq)
+    }
+
+    private func probeExistingStreamEventIdentity(
+        db: SQLiteDB,
+        runId: AgentRunID,
+        item: StreamWriteIntent,
+        bounded: (kind: String, payloadJSON: String),
+        createdAt: String?
+    ) throws {
+#if DEBUG
+        streamEventIdentitySelectCountForTesting += 1
+#endif
         let existing = try db.prepare("SELECT event_kind, payload_json FROM agent_stream_events WHERE run_id = ? AND seq = ? LIMIT 1;")
         try existing.bind(1, runId.value.uuidString)
         try existing.bind(2, Int64(item.seq))
@@ -3995,17 +4135,98 @@ public final class AgentRunRepository: @unchecked Sendable {
         try insert.bind(2, Int64(item.seq))
         try insert.bind(3, bounded.kind)
         try insert.bind(4, bounded.payloadJSON)
-        try insert.bind(5, iso.string(from: Date()))
+        try insert.bind(5, createdAt ?? iso.string(from: Date()))
         _ = try insert.step()
+        rememberCommittedStreamSeq(runId: runId, seq: item.seq)
     }
 
     private func persistProviderEventIdempotently(
         db: SQLiteDB,
         threadId: AgentThreadID,
         runId: AgentRunID,
-        event: ProviderRuntimeEvent
+        event: ProviderRuntimeEvent,
+        createdAt: String? = nil
     ) throws {
         let boundedPayload = try boundedProviderPayload(event.payloadJSON)
+        let known = try knownProviderEventIds(db: db, threadId: threadId)
+        // First write of a freshly minted event_id cannot collide. Retry and
+        // relaunch still SELECT so matching bytes stay idempotent and a
+        // different identity still fails loud.
+        if known.contains(event.id) {
+            try probeExistingProviderEventIdentity(
+                db: db,
+                threadId: threadId,
+                runId: runId,
+                event: event,
+                boundedPayload: boundedPayload,
+                createdAt: createdAt
+            )
+            return
+        }
+        try insertProviderEvent(
+            db: db,
+            threadId: threadId,
+            runId: runId,
+            event: event,
+            boundedPayload: boundedPayload,
+            createdAt: createdAt
+        )
+        rememberProviderEventId(threadId: threadId, eventId: event.id)
+    }
+
+    private func knownProviderEventIds(db: SQLiteDB, threadId: AgentThreadID) throws -> Set<String> {
+        let key = threadId.value.uuidString
+        committedProviderEventLock.lock()
+        if let cached = knownProviderEventIdsByThread[key] {
+            let copy = cached
+            committedProviderEventLock.unlock()
+            return copy
+        }
+        committedProviderEventLock.unlock()
+
+        let st = try db.prepare(
+            "SELECT event_id FROM agent_provider_event_logs WHERE thread_id = ?;"
+        )
+        try st.bind(1, key)
+        var ids = Set<String>()
+        while try st.step() {
+            if let id = st.columnText(0) { ids.insert(id) }
+        }
+
+        committedProviderEventLock.lock()
+        defer { committedProviderEventLock.unlock() }
+        if knownProviderEventIdsByThread.count >= Self.committedProviderEventCacheLimit,
+           knownProviderEventIdsByThread[key] == nil {
+            knownProviderEventIdsByThread.removeAll(keepingCapacity: true)
+        }
+        if var existing = knownProviderEventIdsByThread[key] {
+            existing.formUnion(ids)
+            knownProviderEventIdsByThread[key] = existing
+            return existing
+        }
+        knownProviderEventIdsByThread[key] = ids
+        return ids
+    }
+
+    private func rememberProviderEventId(threadId: AgentThreadID, eventId: String) {
+        let key = threadId.value.uuidString
+        committedProviderEventLock.lock()
+        defer { committedProviderEventLock.unlock() }
+        guard knownProviderEventIdsByThread[key] != nil else { return }
+        knownProviderEventIdsByThread[key]?.insert(eventId)
+    }
+
+    private func probeExistingProviderEventIdentity(
+        db: SQLiteDB,
+        threadId: AgentThreadID,
+        runId: AgentRunID,
+        event: ProviderRuntimeEvent,
+        boundedPayload: String,
+        createdAt: String?
+    ) throws {
+#if DEBUG
+        providerEventIdentitySelectCountForTesting += 1
+#endif
         let existing = try db.prepare("""
             SELECT provider, source, method, provider_turn_id, provider_item_id,
                    provider_request_id, payload_json, received_at_ms
@@ -4029,6 +4250,25 @@ public final class AgentRunRepository: @unchecked Sendable {
             return
         }
 
+        try insertProviderEvent(
+            db: db,
+            threadId: threadId,
+            runId: runId,
+            event: event,
+            boundedPayload: boundedPayload,
+            createdAt: createdAt
+        )
+        rememberProviderEventId(threadId: threadId, eventId: event.id)
+    }
+
+    private func insertProviderEvent(
+        db: SQLiteDB,
+        threadId: AgentThreadID,
+        runId: AgentRunID,
+        event: ProviderRuntimeEvent,
+        boundedPayload: String,
+        createdAt: String?
+    ) throws {
         let insert = try db.prepare("""
             INSERT INTO agent_provider_event_logs(
                 thread_id, run_id, event_id, provider, source, method,
@@ -4047,7 +4287,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         try insert.bind(9, event.providerRequestId)
         try insert.bind(10, boundedPayload)
         try insert.bind(11, Int64(event.receivedAtMs))
-        try insert.bind(12, iso.string(from: Date()))
+        try insert.bind(12, createdAt ?? iso.string(from: Date()))
         _ = try insert.step()
     }
 
@@ -4059,6 +4299,14 @@ public final class AgentRunRepository: @unchecked Sendable {
         maxPayloadBytes: Int64
     ) throws -> Bool {
         guard limit > 0, maxPayloadBytes > 0 else { return false }
+        if try streamRetentionIsUnderBudget(
+            db: db,
+            threadId: threadId,
+            limit: limit,
+            maxPayloadBytes: maxPayloadBytes
+        ) {
+            return false
+        }
         let st = try db.prepare("""
             WITH ranked AS (
                 SELECT e.id,
@@ -4086,6 +4334,56 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(3, maxPayloadBytes)
         _ = try st.step()
         return try changedRowCount(db) > 0
+    }
+
+    /// COUNT first; SUM payloads only while still under the row cap so a
+    /// long stream at the 100-row ceiling does not rescan 8 MiB just to
+    /// decide it must window-DELETE.
+    private func streamRetentionIsUnderBudget(
+        db: SQLiteDB,
+        threadId: AgentThreadID,
+        limit: Int,
+        maxPayloadBytes: Int64
+    ) throws -> Bool {
+        let countSt = try db.prepare("""
+            SELECT COUNT(*)
+            FROM agent_stream_events e
+            JOIN agent_runs r ON r.id = e.run_id
+            WHERE r.thread_id = ?;
+        """)
+        try countSt.bind(1, threadId.value.uuidString)
+        let count = try countSt.step() ? countSt.columnInt64(0) : 0
+        guard count <= Int64(limit) else { return false }
+        let bytesSt = try db.prepare("""
+            SELECT COALESCE(SUM(LENGTH(CAST(e.payload_json AS BLOB))), 0)
+            FROM agent_stream_events e
+            JOIN agent_runs r ON r.id = e.run_id
+            WHERE r.thread_id = ?;
+        """)
+        try bytesSt.bind(1, threadId.value.uuidString)
+        let bytes = try bytesSt.step() ? bytesSt.columnInt64(0) : 0
+        return bytes <= maxPayloadBytes
+    }
+
+    private func providerRetentionIsUnderBudget(
+        db: SQLiteDB,
+        threadId: AgentThreadID,
+        limit: Int,
+        maxPayloadBytes: Int64
+    ) throws -> Bool {
+        let countSt = try db.prepare("""
+            SELECT COUNT(*) FROM agent_provider_event_logs WHERE thread_id = ?;
+        """)
+        try countSt.bind(1, threadId.value.uuidString)
+        let count = try countSt.step() ? countSt.columnInt64(0) : 0
+        guard count <= Int64(limit) else { return false }
+        let bytesSt = try db.prepare("""
+            SELECT COALESCE(SUM(LENGTH(CAST(payload_json AS BLOB))), 0)
+            FROM agent_provider_event_logs WHERE thread_id = ?;
+        """)
+        try bytesSt.bind(1, threadId.value.uuidString)
+        let bytes = try bytesSt.step() ? bytesSt.columnInt64(0) : 0
+        return bytes <= maxPayloadBytes
     }
 
     private func changedRowCount(_ db: SQLiteDB) throws -> Int {
@@ -5607,7 +5905,45 @@ public final class AgentTurnCheckpointRepository {
 
 public final class ProviderSessionRuntimeRepository {
     let db: SQLiteDB
+    /// lastEventKind/lastErrorMessage last written or loaded on this instance.
+    /// persistStreamBatch calls updateDiagnostics every flush with the same
+    /// `itemDelta(id)`; skip the SELECT of runtime_payload_json when we already
+    /// know both diagnostic fields match.
+    private let diagnosticsLock = NSLock()
+    private var diagnosticsByThread: [String: (kind: String?, error: String?)] = [:]
+#if DEBUG
+    private var diagnosticsLoadCountStorageForTesting = 0
+    var diagnosticsLoadCountForTesting: Int {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        return diagnosticsLoadCountStorageForTesting
+    }
+#endif
     public init(db: SQLiteDB) { self.db = db }
+
+    private func rememberDiagnostics(threadId: AgentThreadID, kind: String?, error: String?) {
+        let key = threadId.value.uuidString
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        if diagnosticsByThread.count >= 128, diagnosticsByThread[key] == nil {
+            diagnosticsByThread.removeAll(keepingCapacity: true)
+        }
+        diagnosticsByThread[key] = (kind, error)
+    }
+
+    private func cachedDiagnostics(threadId: AgentThreadID) -> (kind: String?, error: String?)? {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        return diagnosticsByThread[threadId.value.uuidString]
+    }
+
+#if DEBUG
+    private func noteDiagnosticsLoadForTesting() {
+        diagnosticsLock.lock()
+        diagnosticsLoadCountStorageForTesting += 1
+        diagnosticsLock.unlock()
+    }
+#endif
 
     public func upsert(_ session: ProviderSessionRuntime) throws {
         let st = try db.prepare("""
@@ -5647,6 +5983,11 @@ public final class ProviderSessionRuntimeRepository {
         try st.bind(15, session.lastEventKind)
         try st.bind(16, session.lastErrorMessage)
         _ = try st.step()
+        rememberDiagnostics(
+            threadId: session.threadId,
+            kind: session.lastEventKind,
+            error: session.lastErrorMessage
+        )
     }
 
     public func get(threadId: AgentThreadID) throws -> ProviderSessionRuntime? {
@@ -5722,9 +6063,34 @@ public final class ProviderSessionRuntimeRepository {
     }
 
     public func updateDiagnostics(threadId: AgentThreadID, lastEventKind: String?, lastErrorMessage: String?, at date: Date = Date()) throws {
+        if let cached = cachedDiagnostics(threadId: threadId) {
+            let nextKind = lastEventKind ?? cached.kind
+            let nextError = lastErrorMessage ?? cached.error
+            if cached.kind == nextKind, cached.error == nextError {
+                return
+            }
+        }
+#if DEBUG
+        noteDiagnosticsLoadForTesting()
+#endif
         guard var session = try get(threadId: threadId) else { return }
-        session.lastEventKind = lastEventKind ?? session.lastEventKind
-        session.lastErrorMessage = lastErrorMessage ?? session.lastErrorMessage
+        rememberDiagnostics(
+            threadId: threadId,
+            kind: session.lastEventKind,
+            error: session.lastErrorMessage
+        )
+        let nextKind = lastEventKind ?? session.lastEventKind
+        let nextError = lastErrorMessage ?? session.lastErrorMessage
+        // Stream flushes (~16 events / 250 ms) call this with the last
+        // buffered kind. Token deltas on one item keep `itemDelta(id)`
+        // unchanged, but the previous path still SELECT+UPSERT-ed the whole
+        // row (including runtime_payload_json) just to bump updatedAt.
+        // After an upsert/get on this instance, skip the SELECT too.
+        guard session.lastEventKind != nextKind || session.lastErrorMessage != nextError else {
+            return
+        }
+        session.lastEventKind = nextKind
+        session.lastErrorMessage = nextError
         session.updatedAt = date
         try upsert(session)
     }
@@ -6091,6 +6457,7 @@ public final class CommandReceiptRepository {
                     // The just-finalized events are newest and therefore remain
                     // available to `persistedEvents` for ambiguous-commit reread.
                     // Only old replay payloads and their now-useless links prune.
+                    db.noteEventRowsInserted(Int64(persisted.count))
                     try EventRetentionPolicy.prune(db: db, cap: eventRetentionCap)
                 }
                 return persisted
@@ -7261,14 +7628,9 @@ public final class TerminalOutputRepository {
             try st.bind(4, data)
             try st.bind(5, Int64(data.count))
             try st.bind(6, iso.string(from: Date()))
+            // A successful INSERT step already admitted one row. SELECT
+            // changes() was a second statement on every PTY persist.
             _ = try st.step()
-
-            let changes = try database.prepare("SELECT changes();")
-            guard try changes.step(), changes.columnInt64(0) == 1 else {
-                throw SQLiteError.execute(
-                    "Terminal history append did not insert exactly one row for surface \(surfaceID) chunk \(chunkIndex)."
-                )
-            }
         }
     }
 
@@ -7467,14 +7829,9 @@ public final class TerminalOutputRepository {
                 try st.bind(4, data)
                 try st.bind(5, Int64(data.count))
                 try st.bind(6, iso.string(from: Date()))
+                // A successful INSERT step already admitted one row. SELECT
+                // changes() was a second statement on every reserved persist.
                 _ = try st.step()
-
-                let changes = try database.prepare("SELECT changes();")
-                guard try changes.step(), changes.columnInt64(0) == 1 else {
-                    throw SQLiteError.execute(
-                        "Terminal history append did not insert exactly one row for surface \(surfaceID) chunk \(chunkIndex)."
-                    )
-                }
                 try Self.deleteSetting(
                     key: Self.dirtyHistoryKey(surfaceID: surfaceID),
                     database: database

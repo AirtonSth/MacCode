@@ -1058,8 +1058,14 @@ final class FilesViewModel: ObservableObject {
         // Subscribe from the current head, not `nil` (which replays the entire retained
         // backlog into this surface on the main thread). This surface loads its own state
         // explicitly via loadInitialState()/filesStateGet (PERF-MAC_FILES-003).
+        // Drop every other kind on the delivery thread (same as PaneTabsView /
+        // Agent App `.agentThreadAndQueue`) so token-rate stream events do not
+        // hop each open Files tab to main just to hit `receive` default.
         let head = EventBus.shared.snapshot().lastSeq
-        eventToken = EventBus.shared.subscribe(since: head) { [weak self] event in
+        eventToken = EventBus.shared.subscribe(
+            since: head,
+            filter: .filesSurface
+        ) { [weak self] event in
             DispatchQueue.main.async { self?.receive(event) }
         }
     }
@@ -1470,8 +1476,14 @@ final class FilesViewModel: ObservableObject {
         filesMinimalEdit(from: old, to: new)
     }
 
+    /// Incremented at the top of `receive` so tests can prove stream kinds
+    /// never hop to main. Production ignores it.
+    var eventReceiveCountForTests = 0
+
     private func receive(_ event: EventBus.Event) {
+        eventReceiveCountForTests += 1
         guard let payload = event.payload.objectValue else { return }
+        // Kinds must stay under EventStreamFilter.filesSurface prefixes.
         switch event.kind {
         case "files.state.updated":
             guard payload["surface_id"]?.stringValue == surfaceID.value.uuidString,

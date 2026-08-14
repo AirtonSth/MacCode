@@ -102,10 +102,16 @@ public final class EventBus: @unchecked Sendable {
         encoder.outputFormatting = [.sortedKeys]
         return encoder
     }()
-    /// One-encode-per-event cache keyed by seq. Entries are evicted when the
-    /// corresponding event is removed from the recent ring, bounding memory to
-    /// at most recentLimit entries.
+    /// Lazy encode cache for `encodedData(for:)`. Publish no longer fills this —
+    /// ring accounting uses `retainedJSONByteCount` so token-rate deltas do not
+    /// allocate `JSONEncoder` `Data` under `lock`.
     private var encodedCache: [Int64: Data] = [:]
+    /// Byte-cost cache keyed by seq. Evicted with the recent ring.
+    private var encodedSizeCache: [Int64: Int] = [:]
+#if DEBUG
+    /// Test seam: increments only when `encodedData(for:)` actually encodes.
+    private(set) var encodeCountForTesting = 0
+#endif
 
     // QA-002: injectable clock so event timestamps (ts field) are deterministic
     // in tests. Default is real wall time. Protected by `lock` so the closure
@@ -282,32 +288,29 @@ public final class EventBus: @unchecked Sendable {
         let retain = shouldRetainRecentEvent  // capture while holding lock, same as publish()
         lock.unlock()
 
-        // --- precompute off the lock (expensive: filter + encode) ---
+        // --- precompute off the lock (filter + byte-cost walk, no JSONEncoder) ---
         // `recent` is the caller-provided immutable parameter (no lock needed).
         // `knownSeqs` and `retain` are immutable snapshots captured under the lock above.
-        // We encode only the events that are new relative to the snapshot; events that
-        // arrive via publish() between the two lock regions are not in `recent` at all
-        // and are handled correctly by the per-event path in publish().
-        var newEncoded: [Int64: Data] = [:]
+        // Events that arrive via publish() between the two lock regions are not in
+        // `recent` at all and are handled correctly by the per-event path in publish().
+        var newSizes: [Int64: Int] = [:]
         let candidates = recent.filter { ev in
             guard !knownSeqs.contains(ev.seq) else { return false }
             guard retain?(ev) ?? true else { return false }
-            let d = (try? encoder.encode(ev)) ?? Data()
-            newEncoded[ev.seq] = d
+            newSizes[ev.seq] = Self.retainedJSONByteCount(ev)
             return true
         }
 
         // --- assign under lock (cheap: dedup check, append, sort, byte-count, trim) ---
         // Re-check against the live self.recent to handle events that publish() may have
-        // added between the two lock regions; encoding is already done via newEncoded.
+        // added between the two lock regions; sizes are already walked via newSizes.
         lock.lock()
         self.lastSeq = max(self.lastSeq, lastSeq)
         let liveKnown = Set(self.recent.map(\.seq))
         for ev in candidates where !liveKnown.contains(ev.seq) {
-            let bytes = newEncoded[ev.seq]?.count ?? 0
+            let bytes = newSizes[ev.seq] ?? 0
             guard recentLimit > 0, recentByteLimit > 0, bytes <= recentByteLimit else { continue }
-            // populate cache before appending so trimRecent's encodedSize hits the cache
-            if let d = newEncoded[ev.seq] { encodedCache[ev.seq] = d }
+            encodedSizeCache[ev.seq] = bytes
             self.recent.append(ev)
             self.recentBytes += bytes
         }
@@ -582,6 +585,7 @@ public final class EventBus: @unchecked Sendable {
             recent.removeAll(keepingCapacity: true)
             recentBytes = 0
             encodedCache.removeAll(keepingCapacity: true)
+            encodedSizeCache.removeAll(keepingCapacity: true)
             recent.append(ev)
             recentBytes = bytes
             return
@@ -600,6 +604,7 @@ public final class EventBus: @unchecked Sendable {
             let removed = recent.removeFirst()
             recentBytes = max(0, recentBytes - encodedSize(removed))
             encodedCache.removeValue(forKey: removed.seq)
+            encodedSizeCache.removeValue(forKey: removed.seq)
         }
     }
 
@@ -628,15 +633,135 @@ public final class EventBus: @unchecked Sendable {
 
     /// Returns the JSON-encoded bytes for `ev`, encoding at most once per event.
     /// Callers inside the lock may call this freely; the cache is also lock-protected.
+    /// Production publish/retain uses `retainedJSONByteCount` instead so the
+    /// token-rate path does not allocate encoder `Data`.
     func encodedData(for ev: Event) -> Data {
         if let cached = encodedCache[ev.seq] { return cached }
+#if DEBUG
+        encodeCountForTesting += 1
+#endif
         let data = (try? encoder.encode(ev)) ?? Data()
         encodedCache[ev.seq] = data
         return data
     }
 
     private func encodedSize(_ ev: Event) -> Int {
-        encodedData(for: ev).count
+        if let cached = encodedSizeCache[ev.seq] { return cached }
+        let size = Self.retainedJSONByteCount(ev)
+        encodedSizeCache[ev.seq] = size
+        return size
+    }
+
+    /// Byte cost of `JSONEncoder` + `.sortedKeys` for a retained event, without
+    /// allocating `Data`. Must stay equal to `encoder.encode(ev).count` so ring
+    /// eviction and `recentEvents` truncation match the previous encode path.
+    nonisolated static func retainedJSONByteCount(_ ev: Event) -> Int {
+        // Auto-synthesized Codable keys, sorted: kind, payload, seq, ts.
+        var count = 2 // {}
+        count += 7 // "kind":
+        count += jsonStringByteCount(ev.kind)
+        count += 1 // ,
+        count += 10 // "payload":
+        count += jsonValueByteCount(ev.payload)
+        count += 1 // ,
+        count += 6 // "seq":
+        count += jsonInt64ByteCount(ev.seq)
+        count += 1 // ,
+        count += 5 // "ts":
+        count += jsonNumberByteCount(ev.ts)
+        return count
+    }
+
+    nonisolated static func jsonValueByteCount(_ value: JSONValue) -> Int {
+        switch value {
+        case .null:
+            return 4
+        case .bool(true):
+            return 4
+        case .bool(false):
+            return 5
+        case .number(let number):
+            return jsonNumberByteCount(number)
+        case .string(let string):
+            return jsonStringByteCount(string)
+        case .array(let items):
+            var count = 2
+            if !items.isEmpty {
+                count += items.count - 1
+                for item in items { count += jsonValueByteCount(item) }
+            }
+            return count
+        case .object(let object):
+            // Key order does not change JSON length (`"a":1,"b":2` ==
+            // `"b":2,"a":1`). Skip `keys.sorted()` so token-rate retain
+            // does not allocate an Array under the EventBus lock.
+            var count = 2
+            if !object.isEmpty {
+                count += object.count - 1
+                for (key, value) in object {
+                    count += jsonStringByteCount(key) + 1
+                    count += jsonValueByteCount(value)
+                }
+            }
+            return count
+        }
+    }
+
+    nonisolated static func jsonStringByteCount(_ string: String) -> Int {
+        var count = 2
+        for scalar in string.unicodeScalars {
+            switch scalar.value {
+            case 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x22, 0x2F, 0x5C:
+                count += 2
+            case 0x00...0x1F:
+                count += 6
+            case 0x20..<0x80:
+                count += 1
+            case 0x80..<0x800:
+                count += 2
+            case 0x800..<0x10000:
+                count += 3
+            default:
+                count += 4
+            }
+        }
+        return count
+    }
+
+    nonisolated static func jsonInt64ByteCount(_ value: Int64) -> Int {
+        if value == 0 { return 1 }
+        if value == Int64.min { return 20 } // -9223372036854775808
+        var n = value
+        var count = 0
+        if n < 0 {
+            count += 1
+            n = -n
+        }
+        while n > 0 {
+            count += 1
+            n /= 10
+        }
+        return count
+    }
+
+    /// Match `JSONEncoder` + `.sortedKeys` number fragments for `ts` and
+    /// `JSONValue.number`. Exact integers stay digit-count only. Fractional
+    /// values use Swift's `Double` description, which matches the encoder
+    /// (unlike `JSONSerialization` of `NSNumber`, which lengthens π / 1/3).
+    /// Publish `ts` is `Date().timeIntervalSince1970` — almost never an
+    /// integer — so the previous `JSONSerialization.data` allocated on every
+    /// token-rate retain under `lock`.
+    nonisolated static func jsonNumberByteCount(_ value: Double) -> Int {
+        if value == 0 {
+            // `Int64(exactly: -0.0)` is 0, but JSONEncoder emits `-0`.
+            return value.sign == .minus ? 2 : 1
+        }
+        if value.isFinite, value.rounded(.towardZero) == value,
+           let exact = Int64(exactly: value) {
+            return jsonInt64ByteCount(exact)
+        }
+        guard value.isFinite else { return 24 }
+        return String(value).utf8.count
     }
 }
 
@@ -661,6 +786,14 @@ public enum EventStreamFilter: Sendable, Equatable {
         "agent.thread.",
         "agent.message.queue",
         "agent.message.queued"
+    ])
+
+    /// Files tab subscription: state + edit lifecycle only.
+    /// Stream kinds (`agent.item.delta` / `surface.output`) must not hop
+    /// each open Files surface to the main queue.
+    public static let filesSurface = EventStreamFilter.kindPrefixes([
+        "files.state.",
+        "files.edit."
     ])
 
     public static func parse(_ raw: String?) -> EventStreamFilter {

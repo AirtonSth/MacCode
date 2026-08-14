@@ -47,8 +47,17 @@ public final class ClaudeParser {
         guard !trimmed.isEmpty else { return [] }
         guard let data = trimmed.data(using: .utf8) else { return [] }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+        return parseObject(obj)
+    }
+
+    /// Dispatch on an already-decoded SDK/CLI JSON object.
+    /// The Claude SDK bridge decodes each line once and reuses this so
+    /// `sdk_error` / user-input / runtime / parser do not JSONSerialization again.
+    public func parseObject(
+        _ obj: [String: Any],
+        now: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> [AssistantEvent] {
         guard let type = obj["type"] as? String else { return [] }
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
 
         // Every line (incl. the cmux shim's hook_started/hook_response
         // lines that arrive BEFORE init) carries session_id — capture it

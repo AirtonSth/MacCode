@@ -419,6 +419,9 @@ public final class AppContext {
     /// store mutation. Production never sets this.
     var beforeTokenSaverUsageWriteForTesting: (@Sendable () throws -> Void)?
     var tokenSaverUsageTombstoneLimitForTesting: Int?
+    /// Test seam: shared settings+usage.json loads for daily-economy heal.
+    /// One window(7) must increment this once, not once per day.
+    var tokenSaverDailyEconomySharedSnapshotLoadsForTesting = 0
     var completedUsageTombstoneCountForTesting: Int { completedUsageByRun.count }
     func hasCompletedUsageTombstoneForTesting(runId: AgentRunID) -> Bool {
         completedUsageByRun[runId] != nil
@@ -664,9 +667,42 @@ public final class AppContext {
         var createdAtMs: Int64
         var recordedInvocation: Bool = false
         var recordedExploration: Bool = false
+
+        /// After the pending row exists, later command-text chunks are unused
+        /// until finalize (detect already ran; answer tokens come from output).
+        var isCommandBodyClosed: Bool {
+            recordedInvocation
+                && (recordedExploration
+                    || !GraphifyUsageDetector.isExplorationTool(summary: summary))
+        }
     }
     private var graphifyItemBuffers: [String: GraphifyItemBuffer] = [:]
     private let graphifyItemBuffersLock = NSLock()
+    /// Graphify usage recording gate. `SettingsStore(db:)` is a new instance
+    /// (empty cache) so itemDelta used to SQLite-load settings at stream rate.
+    private var graphifyUsageAdmissionCache: (
+        admitted: Bool,
+        settingsRevision: UInt64,
+        runtimeAdmitted: Bool
+    )?
+    /// Test seam: SettingsStore loads performed for the Graphify usage gate.
+    var graphifyUsageSettingsLoadCountForTesting = 0
+    /// Thread provider labels for Graphify usage rows. itemDelta used to
+    /// SQLite-get the thread on every chunk when Graphify was admitted.
+    private var graphifyProviderByThread: [AgentThreadID: String] = [:]
+    private static let graphifyProviderByThreadLimit = 128
+    /// Test seam: threadRepo.get calls for Graphify provider labels.
+    var graphifyProviderLookupCountForTesting = 0
+    /// Test seam: GraphifyUsageDetector.detect / commandText runs.
+    var graphifyDetectCountForTesting = 0
+
+    /// Test seam: accumulated command-body bytes for one Graphify item buffer.
+    func graphifyBufferBodyUTF8CountForTesting(runId: AgentRunID, itemId: String) -> Int {
+        let key = "\(runId.value.uuidString)|\(itemId)"
+        graphifyItemBuffersLock.lock()
+        defer { graphifyItemBuffersLock.unlock() }
+        return graphifyItemBuffers[key]?.body.utf8.count ?? 0
+    }
 
     public init(
         channel: ReleaseChannel = .debug,
@@ -4456,28 +4492,50 @@ public final class AppContext {
         }
     }
 
+    private struct TokenSaverDailyEconomySharedSnapshot {
+        let settings: AppSettings
+        let usage: TokenSaverUsageSnapshot
+    }
+
     /// Persist today's credible total so Week = Σ(daily.total_credible).
     public func recomputeTokenSaverDailyEconomyToday(now: Date = Date()) {
-        recomputeTokenSaverDailyEconomy(for: now, now: now)
+        let snapshot = loadTokenSaverDailyEconomySharedSnapshot()
+        recomputeTokenSaverDailyEconomy(for: now, now: now, snapshot: snapshot)
     }
 
     /// Recompute the last `dayCount` calendar days (inclusive of today) so Week
     /// totals heal after formula changes (e.g. v5 permanent-amort → v6 day-scoped).
     /// Older formula rows would otherwise keep painting ~999M until each day ages out.
     public func recomputeTokenSaverDailyEconomyWindow(dayCount: Int = 7, now: Date = Date()) {
+        let snapshot = loadTokenSaverDailyEconomySharedSnapshot()
         let cal = Calendar.current
         let todayStart = cal.startOfDay(for: now)
         let count = max(1, min(dayCount, 14))
         for offset in 0..<count {
             guard let day = cal.date(byAdding: .day, value: -offset, to: todayStart) else { continue }
-            recomputeTokenSaverDailyEconomy(for: day, now: now)
+            recomputeTokenSaverDailyEconomy(for: day, now: now, snapshot: snapshot)
         }
     }
 
+    /// Settings + usage.json are identical for every day in a window. A new
+    /// `SettingsStore` has an empty cache, so the previous per-day path did
+    /// 7 SQLite loads + 7 usage.json decode passes on the MainActor.
+    private func loadTokenSaverDailyEconomySharedSnapshot() -> TokenSaverDailyEconomySharedSnapshot {
+        tokenSaverDailyEconomySharedSnapshotLoadsForTesting += 1
+        return TokenSaverDailyEconomySharedSnapshot(
+            settings: SettingsStore(db: db).load(),
+            usage: TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
+        )
+    }
+
     /// Persist one calendar day's credible total (day-scoped amort + caps).
-    private func recomputeTokenSaverDailyEconomy(for day: Date, now: Date) {
-        let settings = SettingsStore(db: db).load()
-        let usage = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
+    private func recomputeTokenSaverDailyEconomy(
+        for day: Date,
+        now: Date,
+        snapshot: TokenSaverDailyEconomySharedSnapshot
+    ) {
+        let settings = snapshot.settings
+        let usage = snapshot.usage
         let cal = Calendar.current
         let dayStart = cal.startOfDay(for: day)
         let windowUsage = usage.daily
@@ -4568,6 +4626,41 @@ public final class AppContext {
         }
     }
 
+    /// Token Saver ∧ Graphify must both be on. Cached until settings revision
+    /// or runtime admission changes so itemDelta (~30 Hz) does not SQLite-load
+    /// a fresh SettingsStore on every chunk.
+    func isGraphifyUsageRecordingAdmitted() -> Bool {
+        let revision = SettingsStore.revision
+        if let cached = graphifyUsageAdmissionCache,
+           cached.settingsRevision == revision,
+           cached.runtimeAdmitted == tokenSaverRuntimeAdmitted {
+            return cached.admitted
+        }
+        graphifyUsageSettingsLoadCountForTesting += 1
+        let settings = SettingsStore(db: db).load()
+        let admitted = isTokenSaverRuntimeActive(settings: settings)
+            && settings.isGraphifyRuntimeActive
+        graphifyUsageAdmissionCache = (
+            admitted: admitted,
+            settingsRevision: revision,
+            runtimeAdmitted: tokenSaverRuntimeAdmitted
+        )
+        return admitted
+    }
+
+    /// Provider label for Graphify usage rows. Thread identity is stable for a
+    /// run; itemDelta must not SQLite-get the thread on every stream chunk.
+    func graphifyProviderLabel(for threadId: AgentThreadID) -> String {
+        if let cached = graphifyProviderByThread[threadId] { return cached }
+        graphifyProviderLookupCountForTesting += 1
+        let label = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
+        if graphifyProviderByThread.count >= Self.graphifyProviderByThreadLimit {
+            graphifyProviderByThread.removeAll(keepingCapacity: true)
+        }
+        graphifyProviderByThread[threadId] = label
+        return label
+    }
+
     /// Record Graphify CLI uses (and exploration samples) from assistant tool events.
     /// Fail-open: never blocks the event funnel. Writes on backgroundWriterQueue.
     /// Counts only succeed after a non-failed tool result (`ok=1`).
@@ -4582,11 +4675,8 @@ public final class AppContext {
         default:
             return
         }
-        let settings = SettingsStore(db: db).load()
-        guard isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return }
+        guard isGraphifyUsageRecordingAdmitted() else { return }
 
-        let provider = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
         let runKey = runId.value.uuidString
         let createdAtMs = item.startedAtMs > 0
             ? item.startedAtMs
@@ -4597,7 +4687,7 @@ public final class AppContext {
         graphifyItemBuffersLock.lock()
         var buf = graphifyItemBuffers[bufferKey] ?? GraphifyItemBuffer(
             summary: item.summary,
-            provider: provider,
+            provider: graphifyProviderLabel(for: threadId),
             createdAtMs: createdAtMs
         )
         if let s = item.summary, !s.isEmpty { buf.summary = s }
@@ -4629,16 +4719,42 @@ public final class AppContext {
         runId: AgentRunID,
         finalize: Bool = false
     ) {
-        let settings = SettingsStore(db: db).load()
-        guard isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return }
+        guard isGraphifyUsageRecordingAdmitted() else { return }
         guard bodyAppend != nil || outputAppend != nil || summary != nil else { return }
 
-        let provider = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
         let runKey = runId.value.uuidString
         let bufferKey = "\(runKey)|\(itemId)"
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
 
+        graphifyItemBuffersLock.lock()
+        if var existing = graphifyItemBuffers[bufferKey] {
+            if let s = summary, !s.isEmpty { existing.summary = s }
+            let resultPhase = (summary == "result") || (existing.summary == "result")
+            let bodyClosed = existing.isCommandBodyClosed
+            // Mid-stream command text is only needed until detect records a
+            // pending row. After that, += copies a growing multi-KB body on
+            // every itemDelta and processGraphifyBuffer copies it again just
+            // to return. Result-phase output still accumulates for finalize.
+            if !bodyClosed {
+                if let b = bodyAppend { existing.body += b }
+                if let o = outputAppend, !resultPhase { existing.body += o }
+            }
+            if let o = outputAppend, resultPhase { existing.output += o }
+            graphifyItemBuffers[bufferKey] = existing
+            graphifyItemBuffersLock.unlock()
+            if bodyClosed, !finalize { return }
+            processGraphifyBuffer(
+                bufferKey: bufferKey,
+                itemId: itemId,
+                runKey: runKey,
+                finalizeOutput: finalize
+            )
+            return
+        }
+        graphifyItemBuffersLock.unlock()
+
+        // First chunk for this item: need a provider label once per thread.
+        let provider = graphifyProviderLabel(for: threadId)
         graphifyItemBuffersLock.lock()
         var buf = graphifyItemBuffers[bufferKey] ?? GraphifyItemBuffer(
             summary: summary,
@@ -4717,6 +4833,17 @@ public final class AppContext {
         let alreadyExploration = buf.recordedExploration
         graphifyItemBuffersLock.unlock()
 
+        // After a pending row is recorded, mid-stream deltas only grow the
+        // body. Re-running commandText (JSON parse) + detect on a multi-KB
+        // tool payload at itemDelta rate is wasted until finalize.
+        if alreadyInvocation, !finalizeOutput {
+            if alreadyExploration
+                || !GraphifyUsageDetector.isExplorationTool(summary: summary) {
+                return
+            }
+        }
+
+        graphifyDetectCountForTesting += 1
         let combinedBody = GraphifyUsageDetector.commandText(fromBody: body)
         let haystackBody = [body, combinedBody].joined(separator: "\n")
         let invocations = GraphifyUsageDetector.detect(summary: summary, body: haystackBody)
@@ -4857,9 +4984,7 @@ public final class AppContext {
         // Counter is local to the closure; only ever mutated on `queue` (serial).
         var appendCount = 0
         EventBus.shared.persister = { ev in
-            // surface.output is high-frequency binary; never persisted (same
-            // predicate as AppDelegate.shouldPersistEvent).
-            guard ev.kind != "surface.output" else { return }
+            guard AppDelegate.shouldPersistEvent(ev) else { return }
             let json = EventBus.encodePayloadForPersistence(ev.payload)
             queue.async {
                 _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)

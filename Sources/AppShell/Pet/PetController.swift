@@ -232,7 +232,8 @@ public final class PetController {
                 if rows.count < 500 { break }
             }
             // All persisted candidates through this launch cursor were projected.
-            // Any sequence gaps are non-persisted `surface.output` noise by contract.
+            // Sequence gaps are non-persisted stream noise (`surface.output`,
+            // `agent.item.delta`, `agent.item.progress`) by contract.
             try persistProjectionWatermark(capturedCursor)
             return nil
         } catch {

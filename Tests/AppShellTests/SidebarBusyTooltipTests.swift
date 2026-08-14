@@ -94,4 +94,24 @@ final class SidebarBusyTooltipTests: XCTestCase {
         )
         XCTAssertEqual(result, "Agent run in thread \"Refactor auth\"")
     }
+
+    /// WHY: during an agent run the sidebar body used to walk every pane and
+    /// SurfaceRegistry just to discard the result — thread titles already win.
+    func test_needsBusySurfaceWalk_falseWhenAgentTitlesPresent() {
+        XCTAssertFalse(
+            SidebarViewModel.needsBusySurfaceWalk(runningThreadTitles: ["Fix CI"]),
+            "agent titles must skip the SurfaceRegistry walk"
+        )
+        XCTAssertFalse(
+            SidebarViewModel.needsBusySurfaceWalk(runningThreadTitles: [""]),
+            "blank agent title still wins over surfaces and must skip the walk"
+        )
+    }
+
+    func test_needsBusySurfaceWalk_trueWhenNoAgentTitles() {
+        XCTAssertTrue(
+            SidebarViewModel.needsBusySurfaceWalk(runningThreadTitles: []),
+            "terminal-only busy still needs a surface walk"
+        )
+    }
 }

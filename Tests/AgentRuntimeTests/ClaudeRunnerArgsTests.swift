@@ -486,4 +486,37 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertTrue(event.payloadJSON.contains("session expired"),
                       "fatal Claude stderr must be stored as raw provider runtime evidence for later debugging")
     }
+
+    func test_interpretStreamJSONLine_decodesJSONOnce() {
+        // WHY: emitLine used to JSONSerialization via fromJSONLine and again
+        // in ClaudeParser.parseLine on every stream-json token.
+        let parser = ClaudeParser()
+        _ = parser.parseObject([
+            "type": "system", "subtype": "init", "session_id": "sid",
+        ], now: 1)
+        _ = parser.parseObject([
+            "type": "message_start", "message": ["id": "m1"],
+        ], now: 1)
+        _ = parser.parseObject([
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": ["type": "text", "id": "item0"],
+        ], now: 1)
+        ClaudeRunner.streamJSONDecodeCountForTesting = 0
+        let line = #"{"type":"content_block_delta","index":0,"session_id":"sid","delta":{"type":"text_delta","text":"Hi"}}"#
+        let interpreted = ClaudeRunner.interpretStreamJSONLine(line, parser: parser, receivedAtMs: 1)
+        XCTAssertEqual(
+            ClaudeRunner.streamJSONDecodeCountForTesting, 1,
+            "runtime + parser must share one JSONSerialization"
+        )
+        XCTAssertEqual(interpreted.runtimeEvent?.method, "content_block_delta")
+        XCTAssertEqual(interpreted.runtimeEvent?.source, "claude.stream-json")
+        XCTAssertTrue(
+            interpreted.parsedEvents.contains { event in
+                if case .itemDelta(_, let body, _, _) = event { return body == "Hi" }
+                return false
+            },
+            "decode-once must still surface the text delta: \(interpreted.parsedEvents)"
+        )
+    }
 }

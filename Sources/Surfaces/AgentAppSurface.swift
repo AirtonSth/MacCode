@@ -74,11 +74,30 @@ public final class AgentComposerState: ObservableObject {
 /// Stream/transcript paint state on its OWN ObservableObject so token/tool storms
 /// re-render the conversation column without republishing chrome, rail, or composer
 /// fields on the parent `AgentAppViewModel`.
+/// Coalesced scroll/collapse pulse (~30 Hz). Kept off `AgentTranscriptState`
+/// so tick publishes do not rebuild the conversation column — content already
+/// published when `messages` / `timeline` were assigned.
+@MainActor
+public final class AgentTranscriptPaintTick: ObservableObject {
+    @Published public var timelineUpdateTick: Int = 0
+}
+
 @MainActor
 public final class AgentTranscriptState: ObservableObject {
-    @Published public var messages: [AgentMessage] = []
-    @Published public var timeline = AssistantTimelineState()
-    @Published public var timelineUpdateTick: Int = 0
+    @Published public var messages: [AgentMessage] = [] {
+        didSet { contentGeneration &+= 1 }
+    }
+    @Published public var timeline = AssistantTimelineState() {
+        didSet { contentGeneration &+= 1 }
+    }
+    public let paintTick = AgentTranscriptPaintTick()
+    public var timelineUpdateTick: Int {
+        get { paintTick.timelineUpdateTick }
+        set { paintTick.timelineUpdateTick = newValue }
+    }
+    /// Bumped only when `messages` / `timeline` are assigned. Paint ticks
+    /// live on `paintTick` so they do not republish this object.
+    public private(set) var contentGeneration: UInt64 = 0
 }
 
 /// F1: scopes @ObservedObject observation to the composer subtree. A change to the
@@ -98,6 +117,22 @@ private struct TranscriptReactiveScope<Content: View>: View {
     @ObservedObject var transcriptState: AgentTranscriptState
     @ViewBuilder var content: () -> Content
     var body: some View { content() }
+}
+
+/// Observes only the coalesced paint tick so scroll/collapse can run at ~30 Hz
+/// without `TranscriptReactiveScope` rebuilding the transcript.
+private struct TranscriptPaintTickScope: View {
+    @ObservedObject var paintTick: AgentTranscriptPaintTick
+    let onTick: () -> Void
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onChange(of: paintTick.timelineUpdateTick) { _ in
+                onTick()
+            }
+    }
 }
 
 /// Thread mutations performed by the macOS UI itself (create/rename/pin/color/
@@ -10036,6 +10071,53 @@ public struct AgentAppView: View {
         text
     }
 
+    /// Visible-text check without allocating a trimmed copy.
+    /// `collapseAllCompletedWorkOnFinalIfNeeded` runs on every
+    /// `timelineUpdateTick` (~30 Hz) and used to `trimmingCharacters`
+    /// every finished answer, including already-collapsed turns.
+    nonisolated static func finalAssistantHasVisibleText(_ text: String?) -> Bool {
+        guard let text else { return false }
+        for scalar in text.unicodeScalars {
+            if !CharacterSet.whitespacesAndNewlines.contains(scalar) { return true }
+        }
+        return false
+    }
+
+    /// Rebuilds the finished-turn set from the live timeline (so pruned
+    /// turns drop out) without rescanning already-known finals.
+    /// Stream flushes (~30 Hz) usually add tokens to a still-live turn:
+    /// reuse `previouslyKnown` so we do not allocate a new Set of every
+    /// finished turn id on each flush.
+    nonisolated static func completedWorkTurnIds(
+        turns: [AssistantTurnSnapshot],
+        previouslyKnown: Set<String>
+    ) -> (ids: Set<String>, hasNewlyFinished: Bool) {
+        var hasNewlyFinished = false
+        var knownStillPresent = 0
+        for turn in turns {
+            if previouslyKnown.contains(turn.turnId) {
+                knownStillPresent += 1
+                continue
+            }
+            if turn.finished || finalAssistantHasVisibleText(turn.finalAssistantMessage) {
+                hasNewlyFinished = true
+            }
+        }
+        if !hasNewlyFinished && knownStillPresent == previouslyKnown.count {
+            return (previouslyKnown, false)
+        }
+        var ids = Set<String>()
+        ids.reserveCapacity(turns.count)
+        for turn in turns {
+            if previouslyKnown.contains(turn.turnId)
+                || turn.finished
+                || finalAssistantHasVisibleText(turn.finalAssistantMessage) {
+                ids.insert(turn.turnId)
+            }
+        }
+        return (ids, hasNewlyFinished)
+    }
+
     /// Cap live-render text to the first `limit` graphemes (head window).
     ///
     /// PERF: `text.count` is an O(n) grapheme walk paid on every live-render copy
@@ -10827,6 +10909,7 @@ public struct AgentAppView: View {
     }
 
     private final class HiddenPersistedAssistantMessageCache {
+        var generation: UInt64?
         var key: String?
         var ids: Set<AgentMessageID> = []
     }
@@ -10842,14 +10925,20 @@ public struct AgentAppView: View {
     }
 
     private var hiddenPersistedAssistantMessageIDs: Set<AgentMessageID> {
-        // R4-C: key on content fingerprint (message ids/utf8 lengths + assistant
-        // body/final lengths), not timelineUpdateTick. Pure paint ticks (~30 Hz)
-        // with unchanged content must hit; streaming body growth must recompute.
+        // R4-C: key on content fingerprint, not timelineUpdateTick. Paint
+        // ticks republish transcriptState (~30 Hz) even when messages/timeline
+        // are unchanged; contentGeneration skips the O(thread) hash+hide
+        // recompute on those passes. Streaming assigns still bump generation.
+        let generation = vm.transcriptState.contentGeneration
+        if hiddenPersistedAssistantMessageCache.generation == generation {
+            return hiddenPersistedAssistantMessageCache.ids
+        }
         let key = Self.hiddenPersistedAssistantContentKey(
             messages: vm.messages,
             timelineTurns: vm.timeline.turns
         )
         if hiddenPersistedAssistantMessageCache.key == key {
+            hiddenPersistedAssistantMessageCache.generation = generation
             return hiddenPersistedAssistantMessageCache.ids
         }
         let ids = Self.hiddenPersistedAssistantMessageIDs(
@@ -10857,6 +10946,7 @@ public struct AgentAppView: View {
             timelineTurns: vm.timeline.turns,
             persistedAssistantTexts: persistedAssistantTexts
         )
+        hiddenPersistedAssistantMessageCache.generation = generation
         hiddenPersistedAssistantMessageCache.key = key
         hiddenPersistedAssistantMessageCache.ids = ids
         return ids
@@ -11729,20 +11819,23 @@ public struct AgentAppView: View {
                 }
             }
             .onAppear { rejoinTimelineBottom(proxy) }
+            .overlay(alignment: .topLeading) {
+                // Tick lives on a sibling ObservableObject. Observing it here
+                // (not on TranscriptReactiveScope) keeps scroll/collapse at
+                // ~30 Hz without rebuilding the transcript for unchanged content.
+                TranscriptPaintTickScope(paintTick: vm.transcriptState.paintTick) {
+                    collapseAllCompletedWorkOnFinalIfNeeded()
+                    // One coalesced schedule. A second async pass raced TimelineScrollFollower
+                    // post-layout snaps and multipass-jumped the viewport during streams.
+                    // Follower handleContentGrowth re-snaps after Lazy materialize.
+                    scheduleTimelineScrollToBottom(proxy, force: false)
+                }
+            }
             .onChange(of: vm.focusTick) { _ in
                 // focusTick bumps on outgoing user send — collapse before the
                 // new turn paints so pending follow-ups do not keep prior expands.
                 collapseTranscriptForNewTurn()
                 rejoinTimelineBottom(proxy)
-            }
-            // Prefer coalesced paint tick over raw message/turn counts so every
-            // token delta does not schedule redundant scroll work.
-            .onChange(of: vm.timelineUpdateTick) { _ in
-                collapseAllCompletedWorkOnFinalIfNeeded()
-                // One coalesced schedule. A second async pass raced TimelineScrollFollower
-                // post-layout snaps and multipass-jumped the viewport during streams.
-                // Follower handleContentGrowth re-snaps after Lazy materialize.
-                scheduleTimelineScrollToBottom(proxy, force: false)
             }
             .onChange(of: workDisclosureLayoutEpoch) { _ in
                 // Height change while following live output: re-assert bottom.
@@ -13051,17 +13144,12 @@ public struct AgentAppView: View {
 
     /// When a turn first gains a final answer / finishes, collapse every Work so far.
     private func collapseAllCompletedWorkOnFinalIfNeeded() {
-        let finishedIds = Set(
-            vm.timeline.turns
-                .filter { turn in
-                    turn.finished
-                        || !(turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-                }
-                .map(\.turnId)
+        let update = Self.completedWorkTurnIds(
+            turns: vm.timeline.turns,
+            previouslyKnown: knownFinishedWorkTurnIds
         )
-        let newlyFinished = finishedIds.subtracting(knownFinishedWorkTurnIds)
-        knownFinishedWorkTurnIds = finishedIds
-        guard !newlyFinished.isEmpty else { return }
+        knownFinishedWorkTurnIds = update.ids
+        guard update.hasNewlyFinished else { return }
         collapseAllWorkDisclosures()
     }
 

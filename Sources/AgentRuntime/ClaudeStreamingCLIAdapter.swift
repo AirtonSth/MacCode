@@ -740,11 +740,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                 isSameUser: sameUser
             )
         }
-        // F12: decode the line once and reuse the dict for both the assistant-uuid
-        // probe and the runtime-event build instead of re-running JSONSerialization
-        // for each. (The parser keeps its own decode: it has a no-reserialize fast
-        // path keyed on the raw line that must not change.)
-        let rawObject = Self.jsonObject(from: line)
+        // F12: decode the line once and reuse the dict for uuid, runtime,
+        // background tracking, and ClaudeParser.parseObject. parseLine used
+        // to JSONSerialization the same bytes again at token rate.
+        let interpretation = Self.interpretStreamJSONLine(line, parser: session.parser)
+        let rawObject = interpretation.object
         if let assistantUuid = Self.assistantUuid(from: rawObject) {
             lock.lock()
             session.lastAssistantUuid = assistantUuid
@@ -774,11 +774,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                 refreshDeferralWatchdog(session: session)
             }
         }
-        if let rawObject,
-           let runtimeEvent = ProviderRuntimeEvent.fromJSONObject(rawObject, provider: .claude, source: "claude.stream-json") {
+        if let runtimeEvent = interpretation.runtimeEvent {
             emit(.event(.providerRuntime(runtimeEvent)), session: session)
         }
-        let rawParsed = session.parser.parseLine(line)
+        let rawParsed = interpretation.parsedEvents
         // New-turn reset MUST run before shell-detach observation: the first
         // assistant line of a turn often carries both turnStarted and a Bash
         // tool_use. Resetting after tracking would wipe the detach signal.
@@ -1945,12 +1944,39 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         ].joined(separator: "\u{1F}")
     }
 
-    private static func jsonObject(from line: String) -> [String: Any]? {
+#if DEBUG
+    static var streamJSONDecodeCountForTesting = 0
+#endif
+
+    static func jsonObject(from line: String) -> [String: Any]? {
+#if DEBUG
+        streamJSONDecodeCountForTesting += 1
+#endif
         guard let data = line.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
         return object
+    }
+
+    /// Decode once, then runtime + parser events. handleLine uses this so
+    /// uuid / lifecycle / fromJSONObject / parseObject share one JSONSerialization.
+    static func interpretStreamJSONLine(
+        _ line: String,
+        parser: ClaudeParser
+    ) -> (
+        object: [String: Any]?,
+        runtimeEvent: ProviderRuntimeEvent?,
+        parsedEvents: [AssistantEvent]
+    ) {
+        let object = jsonObject(from: line)
+        return (
+            object,
+            object.flatMap {
+                ProviderRuntimeEvent.fromJSONObject($0, provider: .claude, source: "claude.stream-json")
+            },
+            object.map { parser.parseObject($0) } ?? []
+        )
     }
 
     private static func assistantUuid(from object: [String: Any]?) -> String? {
