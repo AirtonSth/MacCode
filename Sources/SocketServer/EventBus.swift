@@ -711,7 +711,7 @@ public final class EventBus: @unchecked Sendable {
         var count = 2
         for scalar in string.unicodeScalars {
             switch scalar.value {
-            case 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x22, 0x5C:
+            case 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x22, 0x2F, 0x5C:
                 count += 2
             case 0x00...0x1F:
                 count += 6

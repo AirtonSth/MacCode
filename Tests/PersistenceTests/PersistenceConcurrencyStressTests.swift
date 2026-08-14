@@ -72,4 +72,53 @@ final class PersistenceConcurrencyStressTests: XCTestCase {
         XCTAssertEqual(all.count, 50 + iterations / 2,
             "the 50 seeds plus every even-index write must all be present after the read/write storm")
     }
+
+    func test_providerDiagnosticsCache_isSafeAcrossConcurrentThreads() throws {
+        // WHY: provider callbacks from simultaneous agent runs reach one
+        // ProviderSessionRuntimeRepository on arbitrary executors. The
+        // diagnostic cache must not race while different threads read/write it.
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("RC2DiagnosticsStress-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let db = try SQLiteDB(path: dir.appendingPathComponent("diagnostics.sqlite").path)
+        try Schema.migrate(db)
+        let threadRepo = AgentThreadRepository(db: db)
+        let repo = ProviderSessionRuntimeRepository(db: db)
+        let threads = (0..<16).map { index in
+            AgentThread(title: "diagnostics-\(index)", provider: .codex, model: "m")
+        }
+        for thread in threads {
+            try threadRepo.upsert(thread)
+            try repo.upsert(ProviderSessionRuntime(
+                threadId: thread.id,
+                provider: .codex,
+                status: .running,
+                lastEventKind: "itemDelta(0)"
+            ))
+        }
+
+        let lock = NSLock()
+        var failures = 0
+        DispatchQueue.concurrentPerform(iterations: 512) { index in
+            let thread = threads[index % threads.count]
+            do {
+                try repo.updateDiagnostics(
+                    threadId: thread.id,
+                    lastEventKind: "itemDelta(\(index % 4))",
+                    lastErrorMessage: nil
+                )
+            } catch {
+                lock.lock()
+                failures += 1
+                lock.unlock()
+            }
+        }
+
+        XCTAssertEqual(failures, 0,
+            "concurrent provider diagnostics must not race or fail")
+        for thread in threads {
+            XCTAssertNotNil(try repo.get(threadId: thread.id))
+        }
+    }
 }

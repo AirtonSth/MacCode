@@ -5909,19 +5909,41 @@ public final class ProviderSessionRuntimeRepository {
     /// persistStreamBatch calls updateDiagnostics every flush with the same
     /// `itemDelta(id)`; skip the SELECT of runtime_payload_json when we already
     /// know both diagnostic fields match.
+    private let diagnosticsLock = NSLock()
     private var diagnosticsByThread: [String: (kind: String?, error: String?)] = [:]
 #if DEBUG
-    private(set) var diagnosticsLoadCountForTesting = 0
+    private var diagnosticsLoadCountStorageForTesting = 0
+    var diagnosticsLoadCountForTesting: Int {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        return diagnosticsLoadCountStorageForTesting
+    }
 #endif
     public init(db: SQLiteDB) { self.db = db }
 
     private func rememberDiagnostics(threadId: AgentThreadID, kind: String?, error: String?) {
         let key = threadId.value.uuidString
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
         if diagnosticsByThread.count >= 128, diagnosticsByThread[key] == nil {
             diagnosticsByThread.removeAll(keepingCapacity: true)
         }
         diagnosticsByThread[key] = (kind, error)
     }
+
+    private func cachedDiagnostics(threadId: AgentThreadID) -> (kind: String?, error: String?)? {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        return diagnosticsByThread[threadId.value.uuidString]
+    }
+
+#if DEBUG
+    private func noteDiagnosticsLoadForTesting() {
+        diagnosticsLock.lock()
+        diagnosticsLoadCountStorageForTesting += 1
+        diagnosticsLock.unlock()
+    }
+#endif
 
     public func upsert(_ session: ProviderSessionRuntime) throws {
         let st = try db.prepare("""
@@ -6041,8 +6063,7 @@ public final class ProviderSessionRuntimeRepository {
     }
 
     public func updateDiagnostics(threadId: AgentThreadID, lastEventKind: String?, lastErrorMessage: String?, at date: Date = Date()) throws {
-        let key = threadId.value.uuidString
-        if let cached = diagnosticsByThread[key] {
+        if let cached = cachedDiagnostics(threadId: threadId) {
             let nextKind = lastEventKind ?? cached.kind
             let nextError = lastErrorMessage ?? cached.error
             if cached.kind == nextKind, cached.error == nextError {
@@ -6050,7 +6071,7 @@ public final class ProviderSessionRuntimeRepository {
             }
         }
 #if DEBUG
-        diagnosticsLoadCountForTesting += 1
+        noteDiagnosticsLoadForTesting()
 #endif
         guard var session = try get(threadId: threadId) else { return }
         rememberDiagnostics(

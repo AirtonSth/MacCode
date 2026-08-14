@@ -144,7 +144,7 @@ final class EventBusEncodeCacheTests: XCTestCase {
                 "body_append": .string("hello"),
             ]), ts: 1_720_000_000.25),
             EventBus.Event(seq: 2, kind: "agent.item.delta", payload: .object([
-                "body_append": .string("line\nquote\"slash\\tab\tend"),
+                "body_append": .string("line\nquote\"slash\\path/tab\tend"),
             ]), ts: 1_720_000_001),
             EventBus.Event(seq: 3, kind: "agent.item.progress", payload: .object([
                 "item_id": .string("i1"),
