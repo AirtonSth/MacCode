@@ -513,8 +513,10 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             XCTAssertFalse(WrappedCommandCatalog.exactOutputCommandSet.contains(name), name)
         }
         // Still never wrap provider binaries or exact-output.
-        for name in ["claude", "codex", "grok", "rg", "sed", "jq", "node"] {
+        for name in ["claude", "codex", "grok", "rg", "sed", "jq", "node", "env"] {
             XCTAssertFalse(WrappedCommandCatalog.commands.contains(name), "\(name) must not be in wrap catalog")
         }
+        XCTAssertTrue(WrappedCommandCatalog.isShebangInterpreter("node"))
+        XCTAssertTrue(WrappedCommandCatalog.isShebangInterpreter("env"))
     }
 }

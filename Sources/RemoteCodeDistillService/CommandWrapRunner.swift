@@ -27,6 +27,20 @@ enum CommandWrapRunner {
     /// generous headroom for review-sized output.
     private static let captureCapBytes = 8 * 1024 * 1024
 
+    /// Fail-open for unexpected PATH wrappers (`node`, `env`, leftover names).
+    /// Inherit every stream so a long-running child (Codex app-server via
+    /// `#!/usr/bin/env node`) is not buffered or distilled.
+    static func runPassthroughInheritingStreams(command: String, args: [String]) -> Int32 {
+        let env = ProcessInfo.processInfo.environment
+        guard let realExe = resolveRealExecutable(command: command, environment: env) else {
+            FileHandle.standardError.write(
+                Data("\(CommandWrapPolicy.commandBasename(command)): command not found\n".utf8)
+            )
+            return 127
+        }
+        return runInheritingAllStreams(executable: realExe, args: args)
+    }
+
     /// Runs the wrapped command and writes its (possibly compressed) output to our real stdout
     /// before any deferred ledger side effect is returned to the caller.
     /// Always returns the REAL command's exit code so the agent's shell sees the true status.

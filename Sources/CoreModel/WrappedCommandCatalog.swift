@@ -36,6 +36,21 @@ public enum WrappedCommandCatalog {
 
     public static let exactOutputCommandSet: Set<String> = Set(exactOutputCommands)
 
+    // MARK: Shebang interpreters (never wrap)
+
+    /// Interpreters resolved by `#!/usr/bin/env <name>` (and the `env` lookup
+    /// itself). PATH-wrapping these replaces the interpreter with Distill, so a
+    /// node script such as Homebrew `codex` never starts.
+    public static let shebangInterpreterCommands: [String] = [
+        "node", "nodejs", "env", "sh", "bash", "zsh", "dash", "fish"
+    ]
+
+    public static let shebangInterpreterCommandSet: Set<String> = Set(shebangInterpreterCommands)
+
+    public static func isShebangInterpreter(_ command: String) -> Bool {
+        shebangInterpreterCommandSet.contains((command as NSString).lastPathComponent)
+    }
+
     // MARK: Compressible wrap targets
 
     /// Ordered for deterministic install/uninstall; `commandSet` is the membership view.

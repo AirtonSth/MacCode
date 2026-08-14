@@ -234,14 +234,27 @@ struct RemoteCodeDistillServiceMain {
             return
         }
 
+        let programArguments = Array(rawArgs.dropFirst())
+        // Unknown symlink basenames (node/env leftovers) must exec the real
+        // binary. parse() treats `/opt/homebrew/bin/codex` as a flag name.
+        guard DistillServiceLaunch.shouldStartHTTPService(
+            programName: programName,
+            arguments: programArguments
+        ) else {
+            let code = CommandWrapRunner.runPassthroughInheritingStreams(
+                command: programName,
+                args: programArguments
+            )
+            Darwin.exit(code)
+        }
+
         do {
-            let arguments = Array(CommandLine.arguments.dropFirst())
-            if arguments.contains("--help") {
+            if programArguments.contains("--help") {
                 print(helpText)
                 return
             }
 
-            let configuration = try DistillServiceConfiguration.parse(arguments: arguments)
+            let configuration = try DistillServiceConfiguration.parse(arguments: programArguments)
             let runtimeResolution = try await runtime(for: configuration)
             let baseRuntime = runtimeResolution.runtime
             if let fallbackReason = runtimeResolution.fallbackReason {

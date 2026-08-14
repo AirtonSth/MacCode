@@ -221,6 +221,27 @@ public enum DistillServiceError: Error, Sendable, Equatable, CustomStringConvert
     }
 }
 
+/// Dispatch gate for the sidecar Mach-O. HTTP mode is only valid when this
+/// binary is invoked as itself with flag-style arguments.
+///
+/// A leftover PATH wrapper (`~/.remote-code/bin/node`) is the same inode as
+/// `RemoteCodeDistillService`. Codex is a `#!/usr/bin/env node` script, so
+/// launching `codex app-server` becomes `node /opt/homebrew/bin/codex
+/// app-server`. Falling through to `parse` then reports
+/// `missing required option /opt/homebrew/bin/codex` and the app-server dies.
+public enum DistillServiceLaunch {
+    public static let httpServiceProgramName = "RemoteCodeDistillService"
+
+    public static func shouldStartHTTPService(programName: String, arguments: [String]) -> Bool {
+        let name = (programName as NSString).lastPathComponent
+        guard name == httpServiceProgramName else { return false }
+        if let first = arguments.first, !first.hasPrefix("--") {
+            return false
+        }
+        return true
+    }
+}
+
 public struct DistillServiceConfiguration: Sendable, Equatable {
     public let host: String
     public let port: UInt16

@@ -12,7 +12,7 @@ final class CommandWrapPolicyTests: XCTestCase {
         }
         // Exact-output tools must NOT be PATH-wrapped (agent needs full stdout).
         // `node` stays unwrapped (agent runtime / bridge); use bun/python for script compress.
-        for c in ["rg", "grep", "sed", "cat", "head", "tail", "awk", "jq", "echo", "node", "rm"] {
+        for c in ["rg", "grep", "sed", "cat", "head", "tail", "awk", "jq", "echo", "node", "env", "rm"] {
             XCTAssertFalse(CommandWrapPolicy.isWrapped(c), "\(c) must NOT be wrapped")
         }
     }
@@ -235,6 +235,21 @@ final class CommandWrapPolicyTests: XCTestCase {
         XCTAssertTrue(
             Set(WrappedCommandCatalog.commands).isDisjoint(with: Set(WrappedCommandCatalog.exactOutputCommands)),
             "commands and exactOutputCommands must never overlap"
+        )
+    }
+
+    func test_wrappedCommandCatalog_neverWrapsShebangInterpreters() {
+        // WHY: wrapping `node`/`env` intercepts `#!/usr/bin/env node` and
+        // turns Homebrew Codex into Distill (`missing required option /opt/homebrew/bin/codex`).
+        XCTAssertTrue(WrappedCommandCatalog.isShebangInterpreter("node"))
+        XCTAssertTrue(WrappedCommandCatalog.isShebangInterpreter("/opt/homebrew/bin/env"))
+        XCTAssertTrue(
+            Set(WrappedCommandCatalog.commands).isDisjoint(with: WrappedCommandCatalog.shebangInterpreterCommandSet),
+            "shebang interpreters must never be wrap targets"
+        )
+        XCTAssertTrue(
+            Set(WrappedCommandCatalog.exactOutputCommands)
+                .isDisjoint(with: WrappedCommandCatalog.shebangInterpreterCommandSet)
         )
     }
 }

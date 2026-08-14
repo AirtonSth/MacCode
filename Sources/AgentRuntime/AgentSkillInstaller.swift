@@ -1069,9 +1069,17 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             basenames: WrappedCommandCatalog.exactOutputCommands,
             binaryURL: binary
         )
+        // Drop leftover Distill symlinks that are not catalog wrappers or
+        // always-on controllers. A stray `node` wrapper makes
+        // `#!/usr/bin/env node` (Homebrew Codex) start the sidecar instead.
+        _ = try pruneUnmanagedManagedBinSymlinks(
+            keeping: reservedManagedBinBasenames(includingCommandWrappers: true),
+            serviceBinaryURL: binary
+        )
         let searchDirectories = systemCommandSearchDirectories()
         var installed: [String] = []
         for command in WrappedCommandCatalog.commands {
+            guard !WrappedCommandCatalog.isShebangInterpreter(command) else { continue }
             guard commandExistsOnSystem(command, searchDirectories: searchDirectories) else { continue }
             let link = cliBinDirectory.appendingPathComponent(command)
             if let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) {
@@ -1102,10 +1110,20 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         serviceBinaryURL: URL? = nil
     ) throws -> [String] {
         let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager)
-        return try removeManagedWrapperSymlinks(
+        let removedCatalog = try removeManagedWrapperSymlinks(
             basenames: WrappedCommandCatalog.symlinkBasenamesToRemove,
             binaryURL: binary
         )
+        let removedExtras = try pruneUnmanagedManagedBinSymlinks(
+            keeping: reservedManagedBinBasenames(includingCommandWrappers: false),
+            serviceBinaryURL: binary
+        )
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for name in removedCatalog + removedExtras where seen.insert(name).inserted {
+            ordered.append(name)
+        }
+        return ordered
     }
 
     /// Install nested provider PATH proxies for `claude` / `codex` / `grok`.
@@ -1290,6 +1308,54 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             removed.append(command)
         }
         return removed
+    }
+
+    /// Basenames that may keep a Distill symlink in the managed bin.
+    func reservedManagedBinBasenames(includingCommandWrappers: Bool) -> Set<String> {
+        var names = Set(ProviderProxyCatalog.providers)
+        names.insert(Self.agentAppMiddlewareCommand)
+        names.insert("distill")
+        names.insert("rc-retrieve-mcp")
+        if includingCommandWrappers {
+            for command in WrappedCommandCatalog.commands where !WrappedCommandCatalog.isShebangInterpreter(command) {
+                names.insert(command)
+            }
+        }
+        return names
+    }
+
+    /// Remove Distill-owned symlinks that are not in `reserved`.
+    /// Never deletes a regular file or a symlink that points elsewhere.
+    /// Ownership is the target name (`RemoteCodeDistillService`), not a single
+    /// build path — leftovers from a relocated app still shadow `node`.
+    @discardableResult
+    public func pruneUnmanagedManagedBinSymlinks(
+        keeping reserved: Set<String>,
+        serviceBinaryURL: URL? = nil
+    ) throws -> [String] {
+        _ = serviceBinaryURL
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: cliBinDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        var removed: [String] = []
+        for url in entries {
+            let name = url.lastPathComponent
+            if reserved.contains(name) { continue }
+            guard isRemoteCodeDistillServiceSymlink(url) else { continue }
+            try fileManager.removeItem(at: url)
+            removed.append(name)
+        }
+        return removed
+    }
+
+    private func isRemoteCodeDistillServiceSymlink(_ link: URL) -> Bool {
+        guard let dest = resolvedSymlinkTarget(at: link) else { return false }
+        return dest.lastPathComponent == "RemoteCodeDistillService"
+            || dest.path.contains("RemoteCodeDistillService")
     }
 
     /// Agent command search path (the same dirs the agent's shell sees) minus the managed bin
