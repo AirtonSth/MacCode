@@ -242,6 +242,10 @@ final class PersistenceTests: XCTestCase {
         )
 
         XCTAssertEqual(upserts, 0, "same lastEventKind must not WAL-write the session row")
+        XCTAssertEqual(
+            repo.diagnosticsLoadCountForTesting, 0,
+            "upsert already remembered diagnostics; same-kind flush must not SELECT runtime_payload_json"
+        )
         let afterNoop = try XCTUnwrap(try repo.get(threadId: thread.id))
         XCTAssertEqual(afterNoop.lastEventKind, "itemDelta(item-1)")
         XCTAssertEqual(afterNoop.updatedAt.timeIntervalSince1970, frozen.timeIntervalSince1970,
@@ -255,6 +259,14 @@ final class PersistenceTests: XCTestCase {
             at: Date(timeIntervalSince1970: 1_800_000_000)
         )
         XCTAssertEqual(upserts, 1, "a new lastEventKind must still persist")
+        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 1, "kind change still reads the row once")
+        try repo.updateDiagnostics(
+            threadId: thread.id,
+            lastEventKind: "itemDelta(item-2)",
+            lastErrorMessage: nil,
+            at: Date(timeIntervalSince1970: 1_850_000_000)
+        )
+        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 1, "repeat same kind after write must not SELECT again")
         let afterChange = try XCTUnwrap(try repo.get(threadId: thread.id))
         XCTAssertEqual(afterChange.lastEventKind, "itemDelta(item-2)")
         XCTAssertEqual(afterChange.updatedAt.timeIntervalSince1970, 1_800_000_000)
@@ -266,6 +278,7 @@ final class PersistenceTests: XCTestCase {
             at: Date(timeIntervalSince1970: 1_900_000_000)
         )
         XCTAssertEqual(upserts, 2, "a new lastErrorMessage must still persist")
+        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 2, "error change still reads the row")
         let afterError = try XCTUnwrap(try repo.get(threadId: thread.id))
         XCTAssertEqual(afterError.lastErrorMessage, "boom")
         XCTAssertEqual(afterError.lastEventKind, "itemDelta(item-2)")

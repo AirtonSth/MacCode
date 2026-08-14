@@ -5716,7 +5716,23 @@ public final class AgentTurnCheckpointRepository {
 
 public final class ProviderSessionRuntimeRepository {
     let db: SQLiteDB
+    /// lastEventKind/lastErrorMessage last written or loaded on this instance.
+    /// persistStreamBatch calls updateDiagnostics every flush with the same
+    /// `itemDelta(id)`; skip the SELECT of runtime_payload_json when we already
+    /// know both diagnostic fields match.
+    private var diagnosticsByThread: [String: (kind: String?, error: String?)] = [:]
+#if DEBUG
+    private(set) var diagnosticsLoadCountForTesting = 0
+#endif
     public init(db: SQLiteDB) { self.db = db }
+
+    private func rememberDiagnostics(threadId: AgentThreadID, kind: String?, error: String?) {
+        let key = threadId.value.uuidString
+        if diagnosticsByThread.count >= 128, diagnosticsByThread[key] == nil {
+            diagnosticsByThread.removeAll(keepingCapacity: true)
+        }
+        diagnosticsByThread[key] = (kind, error)
+    }
 
     public func upsert(_ session: ProviderSessionRuntime) throws {
         let st = try db.prepare("""
@@ -5756,6 +5772,11 @@ public final class ProviderSessionRuntimeRepository {
         try st.bind(15, session.lastEventKind)
         try st.bind(16, session.lastErrorMessage)
         _ = try st.step()
+        rememberDiagnostics(
+            threadId: session.threadId,
+            kind: session.lastEventKind,
+            error: session.lastErrorMessage
+        )
     }
 
     public func get(threadId: AgentThreadID) throws -> ProviderSessionRuntime? {
@@ -5831,16 +5852,30 @@ public final class ProviderSessionRuntimeRepository {
     }
 
     public func updateDiagnostics(threadId: AgentThreadID, lastEventKind: String?, lastErrorMessage: String?, at date: Date = Date()) throws {
+        let key = threadId.value.uuidString
+        if let cached = diagnosticsByThread[key] {
+            let nextKind = lastEventKind ?? cached.kind
+            let nextError = lastErrorMessage ?? cached.error
+            if cached.kind == nextKind, cached.error == nextError {
+                return
+            }
+        }
+#if DEBUG
+        diagnosticsLoadCountForTesting += 1
+#endif
         guard var session = try get(threadId: threadId) else { return }
+        rememberDiagnostics(
+            threadId: threadId,
+            kind: session.lastEventKind,
+            error: session.lastErrorMessage
+        )
         let nextKind = lastEventKind ?? session.lastEventKind
         let nextError = lastErrorMessage ?? session.lastErrorMessage
         // Stream flushes (~16 events / 250 ms) call this with the last
         // buffered kind. Token deltas on one item keep `itemDelta(id)`
-        // unchanged, but the previous path still upserted the whole row
-        // (including runtime_payload_json) just to bump updatedAt.
-        // Reaper only lists completed sessions; running lastEventKind
-        // identity is what recovery reads. Skip the WAL write when both
-        // diagnostic fields are already stored.
+        // unchanged, but the previous path still SELECT+UPSERT-ed the whole
+        // row (including runtime_payload_json) just to bump updatedAt.
+        // After an upsert/get on this instance, skip the SELECT too.
         guard session.lastEventKind != nextKind || session.lastErrorMessage != nextError else {
             return
         }
