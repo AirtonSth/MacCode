@@ -167,6 +167,55 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
     }
 
+    /// WHY: itemDelta fires at stream rate. A new SettingsStore per chunk
+    /// was a MainActor SQLite load even when Token Saver / Graphify is off.
+    func test_graphifyUsageGate_loadsSettingsOnceUntilRevisionChanges() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyUsageGate-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        context.graphifyUsageSettingsLoadCountForTesting = 0
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "i1",
+            bodyAppend: "echo",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "i1",
+            bodyAppend: " hi",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(
+            context.graphifyUsageSettingsLoadCountForTesting,
+            1,
+            "unchanged settings revision must not SQLite-load on every itemDelta"
+        )
+
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "i1",
+            bodyAppend: "!",
+            outputAppend: nil,
+            summary: nil,
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(
+            context.graphifyUsageSettingsLoadCountForTesting,
+            2,
+            "a settings save must bump revision so the next delta re-reads admission"
+        )
+    }
+
     private func makeViewModel() throws -> (AppContext, SidebarViewModel, URL) {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverLocalSignal-\(UUID().uuidString)", isDirectory: true)

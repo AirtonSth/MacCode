@@ -258,9 +258,29 @@ public final class SettingsStore {
         do {
             try repo.set(key, json)
             cache.invalidate()
+            // Independent SettingsStore instances do not share caches. A
+            // process-wide revision lets hot readers (agent item deltas)
+            // skip a new store + SQLite load until any instance writes.
+            Self.bumpRevision()
         } catch {
             onWriteError?(error)
         }
+    }
+
+    private static let revisionLock = NSLock()
+    private static var revisionValue: UInt64 = 0
+
+    /// Monotonic write generation. Starts at 0; increments on every successful save.
+    public static var revision: UInt64 {
+        revisionLock.lock()
+        defer { revisionLock.unlock() }
+        return revisionValue
+    }
+
+    private static func bumpRevision() {
+        revisionLock.lock()
+        revisionValue &+= 1
+        revisionLock.unlock()
     }
 
     /// Read-modify-write a single field without clobbering the others.

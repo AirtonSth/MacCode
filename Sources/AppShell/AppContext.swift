@@ -670,6 +670,15 @@ public final class AppContext {
     }
     private var graphifyItemBuffers: [String: GraphifyItemBuffer] = [:]
     private let graphifyItemBuffersLock = NSLock()
+    /// Graphify usage recording gate. `SettingsStore(db:)` is a new instance
+    /// (empty cache) so itemDelta used to SQLite-load settings at stream rate.
+    private var graphifyUsageAdmissionCache: (
+        admitted: Bool,
+        settingsRevision: UInt64,
+        runtimeAdmitted: Bool
+    )?
+    /// Test seam: SettingsStore loads performed for the Graphify usage gate.
+    var graphifyUsageSettingsLoadCountForTesting = 0
 
     public init(
         channel: ReleaseChannel = .debug,
@@ -4593,6 +4602,28 @@ public final class AppContext {
         }
     }
 
+    /// Token Saver ∧ Graphify must both be on. Cached until settings revision
+    /// or runtime admission changes so itemDelta (~30 Hz) does not SQLite-load
+    /// a fresh SettingsStore on every chunk.
+    func isGraphifyUsageRecordingAdmitted() -> Bool {
+        let revision = SettingsStore.revision
+        if let cached = graphifyUsageAdmissionCache,
+           cached.settingsRevision == revision,
+           cached.runtimeAdmitted == tokenSaverRuntimeAdmitted {
+            return cached.admitted
+        }
+        graphifyUsageSettingsLoadCountForTesting += 1
+        let settings = SettingsStore(db: db).load()
+        let admitted = isTokenSaverRuntimeActive(settings: settings)
+            && settings.isGraphifyRuntimeActive
+        graphifyUsageAdmissionCache = (
+            admitted: admitted,
+            settingsRevision: revision,
+            runtimeAdmitted: tokenSaverRuntimeAdmitted
+        )
+        return admitted
+    }
+
     /// Record Graphify CLI uses (and exploration samples) from assistant tool events.
     /// Fail-open: never blocks the event funnel. Writes on backgroundWriterQueue.
     /// Counts only succeed after a non-failed tool result (`ok=1`).
@@ -4607,9 +4638,7 @@ public final class AppContext {
         default:
             return
         }
-        let settings = SettingsStore(db: db).load()
-        guard isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return }
+        guard isGraphifyUsageRecordingAdmitted() else { return }
 
         let provider = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
         let runKey = runId.value.uuidString
@@ -4654,9 +4683,7 @@ public final class AppContext {
         runId: AgentRunID,
         finalize: Bool = false
     ) {
-        let settings = SettingsStore(db: db).load()
-        guard isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return }
+        guard isGraphifyUsageRecordingAdmitted() else { return }
         guard bodyAppend != nil || outputAppend != nil || summary != nil else { return }
 
         let provider = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
