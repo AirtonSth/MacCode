@@ -3306,6 +3306,8 @@ public final class AgentRunRepository: @unchecked Sendable {
     private(set) var streamEventIdentitySelectCountForTesting = 0
     /// Identity `SELECT` probes from `persistProviderEventIdempotently`.
     private(set) var providerEventIdentitySelectCountForTesting = 0
+    /// ReversibleContentStore constructions from bound/persist helpers.
+    private(set) var reversibleStoreInitCountForTesting = 0
 #endif
 
     /// Store-before-loss soft bound used by coordinator + repository (S3).
@@ -3313,31 +3315,31 @@ public final class AgentRunRepository: @unchecked Sendable {
         _ payloadJSON: String,
         byteLimit: Int = maximumPersistedEventRowBytes
     ) throws -> String {
-        try Self.softTruncateUTF8Payload(
-            payloadJSON,
-            byteLimit: byteLimit,
-            reversibleStore: ReversibleContentStore(db: db)
-        )
+        try boundPayloadIfNeeded(payloadJSON, byteLimit: byteLimit)
     }
 
     private func boundedStreamRow(kind: String, payloadJSON: String) throws -> (kind: String, payloadJSON: String) {
         let kindBytes = kind.utf8.count
         let payloadBudget = max(1, Self.maximumPersistedEventRowBytes - kindBytes)
-        let store = ReversibleContentStore(db: db)
-        let boundedPayload = try Self.softTruncateUTF8Payload(
-            payloadJSON,
-            byteLimit: payloadBudget,
-            reversibleStore: store
-        )
-        return (kind, boundedPayload)
+        return (kind, try boundPayloadIfNeeded(payloadJSON, byteLimit: payloadBudget))
     }
 
     private func boundedProviderPayload(_ payloadJSON: String) throws -> String {
-        let store = ReversibleContentStore(db: db)
+        try boundPayloadIfNeeded(payloadJSON, byteLimit: Self.maximumPersistedEventRowBytes)
+    }
+
+    /// Store-before-loss is unused when the payload already fits. Token-rate
+    /// persist used to construct ReversibleContentStore on every row anyway.
+    private func boundPayloadIfNeeded(_ payloadJSON: String, byteLimit: Int) throws -> String {
+        let limit = max(1, byteLimit)
+        if payloadJSON.utf8.count <= limit { return payloadJSON }
+#if DEBUG
+        reversibleStoreInitCountForTesting += 1
+#endif
         return try Self.softTruncateUTF8Payload(
             payloadJSON,
-            byteLimit: Self.maximumPersistedEventRowBytes,
-            reversibleStore: store
+            byteLimit: limit,
+            reversibleStore: ReversibleContentStore(db: db)
         )
     }
 

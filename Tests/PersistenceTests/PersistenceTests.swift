@@ -552,6 +552,56 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(provider, stamps, "paired provider rows must reuse the same batch timestamp")
     }
 
+    func test_persistStreamBatch_skipsReversibleStoreWhenUnderLimit() throws {
+        // WHY: persistStreamBatch and boundPayloadForPersistence constructed
+        // ReversibleContentStore on every token-sized row even though
+        // softTruncate returns identity under the 16 MiB ceiling. Store-before-loss
+        // only runs when the payload exceeds the limit.
+        let tmp = NSTemporaryDirectory() + "RC2ReversibleStoreSkip-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "store-skip", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m")
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+
+        let items = (1...16).map { seq in
+            AgentRunRepository.StreamWriteIntent(
+                seq: seq,
+                kind: "itemDelta(i1)",
+                payloadJSON: #"{"itemDelta":{"itemId":"i1","seq":\#(seq)}}"#,
+                providerEvent: ProviderRuntimeEvent(
+                    id: "evt-\(seq)",
+                    provider: .codex,
+                    source: "test",
+                    method: "event",
+                    payloadJSON: #"{"i":\#(seq)}"#,
+                    receivedAtMs: Int64(seq)
+                )
+            )
+        }
+        XCTAssertEqual(runs.reversibleStoreInitCountForTesting, 0)
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: items,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.reversibleStoreInitCountForTesting, 0,
+            "16 under-limit stream+provider rows must not construct ReversibleContentStore"
+        )
+        XCTAssertEqual(try runs.maxStreamEventSeq(runId: run.id), 16)
+
+        let oversized = String(repeating: "a", count: 64)
+        _ = try runs.boundPayloadForPersistence(oversized, byteLimit: 8)
+        XCTAssertEqual(
+            runs.reversibleStoreInitCountForTesting, 1,
+            "a payload over the caller limit must still construct the store"
+        )
+    }
+
     func test_persistStreamBatch_skipsIdentitySelectOnFirstWriteOfNewSeqs() throws {
         // WHY: persistStreamBatch used to SELECT event_kind+payload_json for
         // every (run_id, seq) before INSERT (~16 probes / 250ms flush) even
