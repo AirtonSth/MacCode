@@ -1420,7 +1420,9 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         case .itemCompleted(let iid, let state):
             mutateItem(iid) { item in
                 item.state = state
-                item.finishedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                if item.finishedAtMs == nil {
+                    item.finishedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                }
             }
             if let item = item(withId: iid) {
                 recordActivity(for: item, state: state)

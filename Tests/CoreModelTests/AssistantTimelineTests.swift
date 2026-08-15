@@ -77,6 +77,27 @@ final class AssistantTimelineTests: XCTestCase {
         XCTAssertEqual(s.turns[0].finalAssistantMessage, "Hello")
     }
 
+    func test_itemCompletedPreservesPersistedFinishedAt_becauseReplayMustNotStretchWorked() {
+        // WHY: replaying itemCompleted used Date() and turned an hour-old
+        // session into "Worked for 84m". Keep the timestamp the item already has.
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "t1"))
+        s.apply(.itemStarted(item: AssistantItem(
+            id: "tool1",
+            turnId: "t1",
+            type: .tool,
+            state: .completed,
+            startedAtMs: 1_000,
+            finishedAtMs: 2_000
+        )))
+        s.apply(.itemCompleted(itemId: "tool1", finalState: .completed))
+        XCTAssertEqual(
+            s.turns[0].items[0].finishedAtMs,
+            2_000,
+            "replay must not replace a persisted finish time with now"
+        )
+    }
+
     func test_timelineDuplicateItemStartDoesNotEraseStreamedAssistantText() {
         var s = AssistantTimelineState()
         s.apply(.turnStarted(turnId: "turn1"))

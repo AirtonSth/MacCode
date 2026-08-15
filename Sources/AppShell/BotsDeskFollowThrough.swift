@@ -114,36 +114,105 @@ enum BotsDeskFollowThrough {
         hideWorkLog: Bool = false,
         hideWorkingPlaceholder: Bool = false
     ) -> [BotDeskTimelineItem] {
-        let finals = Set(
-            turns.compactMap { turn -> String? in
-                let text = turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
-                return (text?.isEmpty == false) ? text : nil
-            }
-        )
         let visibleMessages = messages.filter { message in
             guard message.role == .assistant else { return true }
             if hideWorkingPlaceholder, message.text == workingPlaceholder { return false }
-            let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if finals.contains(trimmed) { return false }
+            if AgentChatLiveTurnChrome.messageDuplicatesTurn(message.text, turns: turns) {
+                return false
+            }
             return true
         }
         let logs = hideWorkLog ? [] : workLog
-        let items = visibleMessages.map(BotDeskTimelineItem.message)
-            + logs.map(BotDeskTimelineItem.workLog)
-            + turns.filter { turn in
-                let composition = AgentChatLiveTurnChrome.compose(turn)
-                return !composition.reasoning.isEmpty
-                    || !composition.work.isEmpty
-                    || AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn)
-                    || turn.items.contains {
-                        $0.type == .assistantMessage
-                            && !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    }
-            }.map(BotDeskTimelineItem.liveTurn)
-        return items.sorted { lhs, rhs in
-            if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
-            return lhs.stableOrder < rhs.stableOrder
+        let visibleTurns = turns.filter { turn in
+            let composition = AgentChatLiveTurnChrome.compose(turn)
+            return !composition.reasoning.isEmpty
+                || !composition.work.isEmpty
+                || AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn)
+                || turn.items.contains {
+                    $0.type == .assistantMessage
+                        && !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
         }
+        var previousTurns: [AssistantTurnSnapshot] = []
+        previousTurns.reserveCapacity(visibleTurns.count)
+        let liveItems: [BotDeskTimelineItem] = visibleTurns
+            .sorted { AgentChatLiveTurnChrome.turnSortDate($0) < AgentChatLiveTurnChrome.turnSortDate($1) }
+            .map { turn in
+                let hide = AgentChatLiveTurnChrome.shouldHideAssistantOutput(
+                    turn,
+                    previousTurns: previousTurns
+                )
+                previousTurns.append(turn)
+                return .liveTurn(turn, hideAssistantOutput: hide)
+            }
+        return composeConversationOrder(
+            messages: visibleMessages,
+            workLog: logs,
+            liveTurns: liveItems
+        )
+    }
+
+    /// User bubble, then that turn's work, then the answer — never a pile of
+    /// user bubbles followed by every Worked row at the bottom.
+    static func composeConversationOrder(
+        messages: [BotDeskMessage],
+        workLog: [BotDeskWorkLogRow],
+        liveTurns: [BotDeskTimelineItem]
+    ) -> [BotDeskTimelineItem] {
+        let users = messages.filter { $0.role == .user }.sorted { $0.createdAt < $1.createdAt }
+        let assistants = messages.filter { $0.role != .user }.sorted { $0.createdAt < $1.createdAt }
+        let logs = workLog.sorted { $0.createdAt < $1.createdAt }
+        let turns = liveTurns.sorted { $0.createdAt < $1.createdAt }
+        if users.isEmpty {
+            return (assistants.map(BotDeskTimelineItem.message)
+                + logs.map(BotDeskTimelineItem.workLog)
+                + turns)
+                .sorted { lhs, rhs in
+                    if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                    return lhs.stableOrder < rhs.stableOrder
+                }
+        }
+        var result: [BotDeskTimelineItem] = []
+        var turnIndex = 0
+        var assistantIndex = 0
+        var logIndex = 0
+        func appendDue(before limit: Date) {
+            while true {
+                var next: BotDeskTimelineItem?
+                if turnIndex < turns.count, turns[turnIndex].createdAt < limit {
+                    next = turns[turnIndex]
+                }
+                if assistantIndex < assistants.count, assistants[assistantIndex].createdAt < limit {
+                    let item = BotDeskTimelineItem.message(assistants[assistantIndex])
+                    if next == nil || item.createdAt < next!.createdAt
+                        || (item.createdAt == next!.createdAt && item.stableOrder < next!.stableOrder) {
+                        next = item
+                    }
+                }
+                if logIndex < logs.count, logs[logIndex].createdAt < limit {
+                    let item = BotDeskTimelineItem.workLog(logs[logIndex])
+                    if next == nil || item.createdAt < next!.createdAt
+                        || (item.createdAt == next!.createdAt && item.stableOrder < next!.stableOrder) {
+                        next = item
+                    }
+                }
+                guard let item = next else { return }
+                result.append(item)
+                switch item {
+                case .liveTurn: turnIndex += 1
+                case .message: assistantIndex += 1
+                case .workLog: logIndex += 1
+                }
+            }
+        }
+        for (index, user) in users.enumerated() {
+            appendDue(before: user.createdAt)
+            result.append(.message(user))
+            let nextUserDate = index + 1 < users.count ? users[index + 1].createdAt : Date.distantFuture
+            appendDue(before: nextUserDate)
+        }
+        appendDue(before: Date.distantFuture)
+        return result
     }
 
     static func isTerminal(_ status: AgentRunStatus) -> Bool {

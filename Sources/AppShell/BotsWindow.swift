@@ -118,13 +118,13 @@ public struct BotDeskWorkLogRow: Identifiable, Equatable, Sendable {
 public enum BotDeskTimelineItem: Identifiable, Equatable, Sendable {
     case message(BotDeskMessage)
     case workLog(BotDeskWorkLogRow)
-    case liveTurn(AssistantTurnSnapshot)
+    case liveTurn(AssistantTurnSnapshot, hideAssistantOutput: Bool)
 
     public var id: String {
         switch self {
         case .message(let message): return "msg-\(message.id.uuidString)"
         case .workLog(let row): return "log-\(row.id.uuidString)"
-        case .liveTurn(let turn): return "turn-\(turn.turnId)"
+        case .liveTurn(let turn, _): return "turn-\(turn.turnId)"
         }
     }
 
@@ -132,7 +132,7 @@ public enum BotDeskTimelineItem: Identifiable, Equatable, Sendable {
         switch self {
         case .message(let message): return message.createdAt
         case .workLog(let row): return row.createdAt
-        case .liveTurn(let turn): return AgentChatLiveTurnChrome.turnSortDate(turn)
+        case .liveTurn(let turn, _): return AgentChatLiveTurnChrome.turnSortDate(turn)
         }
     }
 
@@ -233,6 +233,8 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var deskWorkLog: [BotDeskWorkLogRow] = []
     @Published public private(set) var deskLiveTimeline = AssistantTimelineState()
     @Published public private(set) var deskStreamEventCount = 0
+    @Published public private(set) var deskSendInFlight = false
+    @Published public private(set) var deskSendInFlightStartedAt: Date?
     @Published public private(set) var conversations: [BotConversation] = []
     @Published public private(set) var selectedConversation: BotConversation?
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
@@ -674,6 +676,10 @@ public final class BotsViewModel: ObservableObject {
         deskWorkLog.contains { $0.statusLabel == "Working" }
     }
 
+    public var deskShowsLoading: Bool {
+        deskSendInFlight && !deskRunIsLive
+    }
+
     public var deskSendEnabled: Bool {
         AgentChatTranscriptChrome.admitsSend(text: composerText, attachmentCount: attachments.count)
     }
@@ -751,6 +757,8 @@ public final class BotsViewModel: ObservableObject {
             appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: bot.id)
             if let router = resolvedRouter(),
                let revision = try currentRevision(for: bot) {
+                deskSendInFlight = true
+                deskSendInFlightStartedAt = Date()
                 Task { [weak self] in
                     guard let self else { return }
                     let started = await self.startSupervisedRun(
@@ -761,6 +769,7 @@ public final class BotsViewModel: ObservableObject {
                         attachments: attached,
                         router: router
                     )
+                    self.deskSendInFlight = false
                     if let runId = started {
                         self.lastSendStartedProviderRun = true
                         self.lastLinkedRunIDByBot[bot.id] = runId
@@ -772,6 +781,7 @@ public final class BotsViewModel: ObservableObject {
                             runId: runId
                         )
                     } else {
+                        self.deskSendInFlightStartedAt = nil
                         self.recordNeedsAttention(bot: bot, conversation: conversation, userText: message)
                     }
                 }
@@ -1054,6 +1064,12 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func reloadSelectedBot(id: BotID) {
+        deskLiveTurnWatch?.cancel()
+        deskLiveTurnWatch = nil
+        deskSendInFlight = false
+        deskLiveTimeline = liveTimelineByBot[id] ?? AssistantTimelineState()
+        deskStreamEventCount = liveStreamCountByBot[id] ?? 0
+        deskMessages = messagesByBot[id] ?? []
         do {
             conversations = try botStore.listConversations(botID: id)
             selectedConversation = conversations.first
@@ -1165,6 +1181,11 @@ public final class BotsViewModel: ObservableObject {
         return (try? botStore.listConversations(botID: botID).first)
     }
 
+    private func threadBelongsToAnotherBot(_ threadID: AgentThreadID, botID: BotID) -> Bool {
+        guard let owner = try? botStore.conversationLinked(to: threadID) else { return false }
+        return owner.botID != botID
+    }
+
     private func restoreDeskMessages(botID: BotID) {
         let cached = messagesByBot[botID] ?? []
         let conversation = conversationForBot(botID)
@@ -1223,14 +1244,24 @@ public final class BotsViewModel: ObservableObject {
 
     private func applyDeskLiveReplay(botID: BotID, threadID: AgentThreadID, force: Bool = false) {
         let count = context.coordinator.countStreamEvents(threadId: threadID)
-        if !force, liveStreamCountByBot[botID] == count { return }
+        if !force, liveStreamCountByBot[botID] == count {
+            if selectedBotID == botID {
+                deskLiveTimeline = liveTimelineByBot[botID] ?? deskLiveTimeline
+                deskStreamEventCount = liveStreamCountByBot[botID] ?? count
+            }
+            return
+        }
         let events = context.coordinator.latestStreamEvents(threadId: threadID)
         let state = AgentChatLiveTurnChrome.timelineByReplaying(events)
-        let current = selectedBotID == botID
-            ? deskLiveTimeline
-            : (liveTimelineByBot[botID] ?? AssistantTimelineState())
+        // Only compare against THIS bot's timeline. Using deskLiveTimeline here
+        // kept the previous bot's richer Worked rows after a roster switch.
+        let current = liveTimelineByBot[botID] ?? AssistantTimelineState()
         if AgentChatLiveTurnChrome.isRicher(current, than: state) {
             liveStreamCountByBot[botID] = max(count, liveStreamCountByBot[botID] ?? 0)
+            if selectedBotID == botID {
+                deskLiveTimeline = current
+                deskStreamEventCount = liveStreamCountByBot[botID] ?? count
+            }
             return
         }
         liveTimelineByBot[botID] = state
@@ -1321,10 +1352,17 @@ public final class BotsViewModel: ObservableObject {
 
     @discardableResult
     private func persistUserMessage(bot: BotDefinition, text: String) throws -> BotConversation {
-        var conversation = selectedConversation ?? conversations.first ?? BotConversation(
-            botID: bot.id,
-            title: Self.titleFromFirstMessage(text)
-        )
+        var conversation: BotConversation
+        if let selected = selectedConversation, selected.botID == bot.id {
+            conversation = selected
+        } else if let existing = (try? botStore.listConversations(botID: bot.id))?.first {
+            conversation = existing
+        } else {
+            conversation = BotConversation(
+                botID: bot.id,
+                title: Self.titleFromFirstMessage(text)
+            )
+        }
         if conversation.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             conversation.title = Self.titleFromFirstMessage(text)
         }
@@ -1384,7 +1422,8 @@ public final class BotsViewModel: ObservableObject {
         do {
             let thread: AgentThread
             if let linked = conversation.linkedAgentThreadID,
-               let existing = try context.threadRepo.get(id: linked) {
+               let existing = try context.threadRepo.get(id: linked),
+               !threadBelongsToAnotherBot(linked, botID: bot.id) {
                 thread = existing
             } else {
                 thread = try router.createAgentThread(
@@ -1405,6 +1444,9 @@ public final class BotsViewModel: ObservableObject {
                 linked.updatedAt = Date()
                 try botStore.upsertConversation(linked)
                 selectedConversation = linked
+            }
+            if selectedBotID == bot.id, screen == .desk {
+                startDeskLiveTurnWatch(botID: bot.id, threadID: thread.id)
             }
             let memory = (try? botStore.listMemory(botID: bot.id)) ?? []
             let skills = (try? botStore.listSkillBindings(botID: bot.id)) ?? []
@@ -1518,7 +1560,9 @@ public final class BotsViewModel: ObservableObject {
             errorMessage = String(describing: error)
         }
         isStopping = false
+        deskSendInFlight = false
         if BotsDeskFollowThrough.isTerminal(status) {
+            deskSendInFlightStartedAt = nil
             drainQueuedFollowUp()
         }
     }
@@ -3006,14 +3050,17 @@ public struct BotsRootView: View {
                             deskBubble(message, columnWidth: geo.size.width)
                         case .workLog(let row):
                             deskWorkLogRow(row)
-                        case .liveTurn(let turn):
+                        case .liveTurn(let turn, let hideAssistantOutput):
                             AgentChatLiveTurnView(
                                 turn: turn,
-                                live: vm.deskRunIsLive && !turn.finished
+                                live: vm.deskRunIsLive && !turn.finished,
+                                hideAssistantOutput: hideAssistantOutput
                             )
                         }
                     }
-                    if vm.deskRunIsLive, let started = vm.deskWorkingStartedAt() {
+                    if vm.deskShowsLoading {
+                        AgentChatLoadingStatusStrip()
+                    } else if vm.deskRunIsLive, let started = vm.deskWorkingStartedAt() {
                         AgentChatWorkingStatusStrip(
                             startedAt: started,
                             isStopping: vm.isStopping,

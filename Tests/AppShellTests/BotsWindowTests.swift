@@ -57,6 +57,8 @@ final class BotsWindowTests: XCTestCase {
             exp.fulfill()
         }
         vm.send()
+        XCTAssertTrue(vm.deskShowsLoading,
+                      "Agent App shows Loading… the instant the user sends, before sendAgentMessage returns")
         XCTAssertTrue(vm.attachments.isEmpty, "send must consume staged files")
         XCTAssertEqual(vm.deskMessages.first?.text, "📎 brief.pdf")
         await fulfillment(of: [exp], timeout: 3)
@@ -989,6 +991,269 @@ final class BotsWindowTests: XCTestCase {
         vm.openDesk(piper)
         XCTAssertEqual(vm.deskWorkLog.first?.runID, run.id)
         XCTAssertEqual(vm.deskWorkLog.first?.statusLabel, "Done")
+    }
+
+    func test_deskTimelineHidesPersistedAssistantThatDuplicatesTheTurn_becauseRepliesMustNotDouble() {
+        // WHY: Desk hydrates messageRepo AND replays stream events. The same
+        // greeting must not appear as a bubble and again as the turn final.
+        let user = BotDeskMessage(
+            role: .user,
+            text: "Qual seu nome?",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let assistant = BotDeskMessage(
+            role: .assistant,
+            text: "Meu nome é Batatilson da Silva — Gerente de Marketing.",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_030)
+        )
+        let turn = AssistantTurnSnapshot(
+            turnId: "t-name",
+            items: [
+                AssistantItem(
+                    id: "r1",
+                    turnId: "t-name",
+                    type: .reasoning,
+                    state: .completed,
+                    body: "Introducing myself",
+                    startedAtMs: 1_700_000_010_000,
+                    finishedAtMs: 1_700_000_020_000
+                ),
+            ],
+            finalAssistantMessage: "Meu nome é Batatilson da Silva — Gerente de Marketing.",
+            finished: true
+        )
+        let items = BotsDeskFollowThrough.timeline(
+            messages: [user, assistant],
+            workLog: [],
+            turns: [turn],
+            hideWorkLog: true
+        )
+        let assistantRows = items.filter { item in
+            if case .message(let message) = item, message.role == .assistant { return true }
+            return false
+        }
+        XCTAssertTrue(assistantRows.isEmpty, "the persisted bubble must yield to the turn-owned answer")
+        XCTAssertEqual(items.filter { if case .liveTurn = $0 { return true }; return false }.count, 1)
+    }
+
+    func test_deskTimelineHidesRepeatedTurnFinal_becauseTwoWorkedRowsMustNotRepeatTheAnswer() {
+        // WHY: two finished turns with the same final would stack the greeting.
+        // Keep each Worked disclosure; paint the answer once.
+        let first = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(
+                    id: "tool1",
+                    turnId: "t1",
+                    type: .tool,
+                    state: .completed,
+                    summary: "Bash",
+                    startedAtMs: 1,
+                    finishedAtMs: 2
+                ),
+            ],
+            finalAssistantMessage: "Oi! Como posso ajudar?",
+            finished: true
+        )
+        let second = AssistantTurnSnapshot(
+            turnId: "t2",
+            items: [
+                AssistantItem(
+                    id: "tool2",
+                    turnId: "t2",
+                    type: .tool,
+                    state: .completed,
+                    summary: "Bash",
+                    startedAtMs: 3,
+                    finishedAtMs: 4
+                ),
+            ],
+            finalAssistantMessage: "Oi! Como posso ajudar?",
+            finished: true
+        )
+        let items = BotsDeskFollowThrough.timeline(
+            messages: [],
+            workLog: [],
+            turns: [first, second],
+            hideWorkLog: true
+        )
+        let hidden = items.compactMap { item -> Bool? in
+            if case .liveTurn(_, let hide) = item { return hide }
+            return nil
+        }
+        XCTAssertEqual(hidden, [false, true])
+    }
+
+    func test_openingAnotherBotDoesNotKeepPreviousLiveTurns_becauseEachDeskOwnsItsThread() throws {
+        // WHY: applyDeskLiveReplay used the previous bot's deskLiveTimeline as
+        // "current". isRicher then kept Batatilson's Worked rows on New Agent.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+
+        let piperThread = AgentThread(title: "Piper", provider: .claude, model: "opus")
+        let quinnThread = AgentThread(title: "Quinn", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(piperThread)
+        try context.threadRepo.upsert(quinnThread)
+        let piperRun = AgentRun(
+            threadId: piperThread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_010),
+            finishedAt: Date(timeIntervalSince1970: 1_700_000_040)
+        )
+        let quinnRun = AgentRun(
+            threadId: quinnThread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_110),
+            finishedAt: Date(timeIntervalSince1970: 1_700_000_120)
+        )
+        try context.runRepo.upsert(piperRun)
+        try context.runRepo.upsert(quinnRun)
+        try persistStreamEvents(
+            context: context,
+            run: piperRun,
+            events: [
+                .turnStarted(turnId: "piper-turn"),
+                .itemStarted(item: AssistantItem(
+                    id: "piper-tool",
+                    turnId: "piper-turn",
+                    type: .tool,
+                    state: .completed,
+                    summary: "Bash",
+                    startedAtMs: 1_700_000_010_000,
+                    finishedAtMs: 1_700_000_020_000
+                )),
+                .turnCompleted(turnId: "piper-turn", finalMessage: "Piper only answer"),
+            ]
+        )
+        try persistStreamEvents(
+            context: context,
+            run: quinnRun,
+            events: [
+                .turnStarted(turnId: "quinn-turn"),
+                .itemStarted(item: AssistantItem(
+                    id: "quinn-r",
+                    turnId: "quinn-turn",
+                    type: .reasoning,
+                    state: .completed,
+                    body: "Quinn thought",
+                    startedAtMs: 1_700_000_110_000,
+                    finishedAtMs: 1_700_000_111_000
+                )),
+                .turnCompleted(turnId: "quinn-turn", finalMessage: "Quinn only answer"),
+            ]
+        )
+        try context.messageRepo.append(AgentMessage(
+            threadId: piperThread.id,
+            role: .user,
+            content: "Piper ask",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        try context.messageRepo.append(AgentMessage(
+            threadId: quinnThread.id,
+            role: .user,
+            content: "P1a desk send check",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_100)
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Piper ask", linkedAgentThreadID: piperThread.id)
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: quinn.id, title: "P1a desk send check", linkedAgentThreadID: quinnThread.id)
+        )
+
+        vm.openDesk(piper)
+        XCTAssertTrue(
+            vm.deskLiveTimeline.turns.contains { $0.finalAssistantMessage == "Piper only answer" },
+            "Piper's Desk must replay Piper's thread"
+        )
+
+        vm.openDesk(quinn)
+        XCTAssertFalse(
+            vm.deskLiveTimeline.turns.contains { $0.finalAssistantMessage == "Piper only answer" },
+            "Quinn must not inherit Piper's richer live timeline"
+        )
+        XCTAssertTrue(
+            vm.deskLiveTimeline.turns.contains { $0.finalAssistantMessage == "Quinn only answer" }
+        )
+        XCTAssertFalse(
+            vm.deskMessages.contains { $0.text.contains("Piper") },
+            "Quinn's persisted bubbles must stay on Quinn's thread"
+        )
+        XCTAssertTrue(vm.deskMessages.contains { $0.text == "P1a desk send check" })
+    }
+
+    func test_deskTimelineKeepsEachTurnBesideItsUser_becauseChatIsNotTwoColumns() {
+        // WHY: replay used Date() as turnStarted, so every Worked row sorted
+        // to now and all user bubbles stacked on the right.
+        let userName = BotDeskMessage(
+            role: .user,
+            text: "Qual seu nome?",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let userJob = BotDeskMessage(
+            role: .user,
+            text: "Qual sua função?",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+        let nameTurn = AssistantTurnSnapshot(
+            turnId: "t-name",
+            items: [
+                AssistantItem(
+                    id: "r-name",
+                    turnId: "t-name",
+                    type: .reasoning,
+                    state: .completed,
+                    body: "intro",
+                    startedAtMs: 1_700_000_001_000,
+                    finishedAtMs: 1_700_000_002_000
+                ),
+            ],
+            finalAssistantMessage: "Meu nome é Batatilson.",
+            finished: true,
+            startedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        let jobTurn = AssistantTurnSnapshot(
+            turnId: "t-job",
+            items: [
+                AssistantItem(
+                    id: "r-job",
+                    turnId: "t-job",
+                    type: .reasoning,
+                    state: .completed,
+                    body: "role",
+                    startedAtMs: 1_700_000_101_000,
+                    finishedAtMs: 1_700_000_102_000
+                ),
+            ],
+            finalAssistantMessage: "Gerente de Marketing.",
+            finished: true,
+            startedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        let items = BotsDeskFollowThrough.timeline(
+            messages: [userName, userJob],
+            workLog: [],
+            turns: [nameTurn, jobTurn],
+            hideWorkLog: true
+        )
+        XCTAssertEqual(items.count, 4)
+        guard case .message(let first) = items[0], first.text == "Qual seu nome?" else {
+            return XCTFail("first row must be the name question")
+        }
+        guard case .liveTurn(let firstTurn, _) = items[1], firstTurn.turnId == "t-name" else {
+            return XCTFail("name turn must follow its user bubble, not sink to the bottom")
+        }
+        guard case .message(let second) = items[2], second.text == "Qual sua função?" else {
+            return XCTFail("job question must come after the name turn")
+        }
+        guard case .liveTurn(let secondTurn, _) = items[3], secondTurn.turnId == "t-job" else {
+            return XCTFail("job turn must follow its user bubble")
+        }
     }
 
     func test_visibleDeskMessagesPrefersPersistedAssistantOverWorkingCache() {

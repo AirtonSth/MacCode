@@ -132,6 +132,88 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         )
     }
 
+    func test_messageDuplicatesTurnHidesPersistedAnswer_becauseDeskMustNotPaintTheReplyTwice() {
+        // WHY: messageRepo stores the assistant row and the live turn stores
+        // the same final. Painting both is the duplicate the user reported.
+        let turn = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(
+                    id: "a1",
+                    turnId: "t1",
+                    type: .assistantMessage,
+                    state: .completed,
+                    body: "Oi! Como posso ajudar?",
+                    startedAtMs: 1,
+                    finishedAtMs: 2
+                ),
+            ],
+            finalAssistantMessage: "Oi! Como posso ajudar?",
+            finished: true
+        )
+        XCTAssertTrue(
+            AgentChatLiveTurnChrome.messageDuplicatesTurn("Oi! Como posso ajudar?", turns: [turn])
+        )
+        XCTAssertFalse(
+            AgentChatLiveTurnChrome.messageDuplicatesTurn("Qual sua função?", turns: [turn])
+        )
+    }
+
+    func test_turnSortDatePrefersItemTimestamps_becauseReplayTurnStartedIsNow() {
+        // WHY: turnStarted replay stamps startedAtMs with Date(), which stacked
+        // every historical Worked row under the latest user bubble.
+        let turn = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [
+                AssistantItem(
+                    id: "r1",
+                    turnId: "t1",
+                    type: .reasoning,
+                    state: .completed,
+                    body: "x",
+                    startedAtMs: 1_700_000_001_000,
+                    finishedAtMs: 1_700_000_002_000
+                ),
+            ],
+            finished: true,
+            startedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        XCTAssertEqual(
+            AgentChatLiveTurnChrome.turnSortDate(turn),
+            Date(timeIntervalSince1970: 1_700_000_001),
+            "item start must win over the replay wall-clock on turn.startedAtMs"
+        )
+    }
+
+    func test_laterTurnHidesRepeatedFinal_becauseTwoTurnsMustNotStackTheSameReply() {
+        // WHY: a reused Claude session can emit two finished turns with the
+        // same greeting. The second Worked row can stay; the second answer cannot.
+        let first = AssistantTurnSnapshot(
+            turnId: "t1",
+            items: [],
+            finalAssistantMessage: "Oi! Como posso ajudar?",
+            finished: true
+        )
+        let second = AssistantTurnSnapshot(
+            turnId: "t2",
+            items: [
+                AssistantItem(
+                    id: "tool1",
+                    turnId: "t2",
+                    type: .tool,
+                    state: .completed,
+                    summary: "Bash",
+                    startedAtMs: 1,
+                    finishedAtMs: 2
+                ),
+            ],
+            finalAssistantMessage: "Oi! Como posso ajudar?",
+            finished: true
+        )
+        XCTAssertTrue(AgentChatLiveTurnChrome.shouldHideAssistantOutput(second, previousTurns: [first]))
+        XCTAssertFalse(AgentChatLiveTurnChrome.shouldHideAssistantOutput(first, previousTurns: []))
+    }
+
     func test_isRicherKeepsLiveThoughtAheadOfLaggingPersist_becauseFlushMustNotEraseThinking() {
         // WHY: Desk applies coordinator events immediately. A later SQLite
         // replay that has not flushed the reasoning delta must not wipe the row.

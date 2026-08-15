@@ -103,6 +103,47 @@ public enum AgentChatLiveTurnChrome {
         compose(turn).work
     }
 
+    public static func assistantBodies(in turn: AssistantTurnSnapshot) -> [String] {
+        var texts: [String] = []
+        for item in turn.items where item.type == .assistantMessage {
+            let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !body.isEmpty { texts.append(body) }
+        }
+        if let final = turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !final.isEmpty {
+            texts.append(final)
+        }
+        return texts
+    }
+
+    public static func assistantTextsMatch(_ lhs: String, _ rhs: String) -> Bool {
+        let a = lhs.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = rhs.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        return a == b || a.contains(b) || b.contains(a)
+    }
+
+    /// Persisted assistant bubbles must not sit next to the same turn-owned answer.
+    public static func messageDuplicatesTurn(_ text: String, turns: [AssistantTurnSnapshot]) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return turns.contains { turn in
+            assistantBodies(in: turn).contains { assistantTextsMatch(trimmed, $0) }
+        }
+    }
+
+    /// Later turns that only repeat an earlier final must not paint that answer again.
+    public static func shouldHideAssistantOutput(
+        _ turn: AssistantTurnSnapshot,
+        previousTurns: [AssistantTurnSnapshot]
+    ) -> Bool {
+        let bodies = assistantBodies(in: turn)
+        guard !bodies.isEmpty else { return false }
+        return bodies.contains { body in
+            previousTurns.contains { assistantBodies(in: $0).contains { assistantTextsMatch(body, $0) } }
+        }
+    }
+
     public static func paintsLiveTurnChrome(_ timeline: AssistantTimelineState) -> Bool {
         timeline.turns.contains {
             let composition = compose($0)
@@ -135,10 +176,13 @@ public enum AgentChatLiveTurnChrome {
     }
 
     public static func turnSortDate(_ turn: AssistantTurnSnapshot) -> Date {
-        if let ms = turn.startedAtMs {
+        // Replay applies turnStarted with Date(), which dumps every historical
+        // Worked block at "now". Item timestamps survive persist and keep
+        // user → work → answer in conversation order.
+        if let ms = turn.items.map(\.startedAtMs).min(), ms > 0 {
             return Date(timeIntervalSince1970: TimeInterval(ms) / 1000)
         }
-        if let ms = turn.items.map(\.startedAtMs).min() {
+        if let ms = turn.startedAtMs {
             return Date(timeIntervalSince1970: TimeInterval(ms) / 1000)
         }
         return Date.distantPast
@@ -632,6 +676,7 @@ public struct AgentChatLiveItemRow: View {
 public struct AgentChatLiveTurnView: View {
     public let turn: AssistantTurnSnapshot
     public let live: Bool
+    public let hideAssistantOutput: Bool
 
     @State private var userExpanded: Set<String> = []
     @State private var userCollapsedLive: Set<String> = []
@@ -639,9 +684,10 @@ public struct AgentChatLiveTurnView: View {
     @State private var expandedTools: Set<String> = []
     @State private var expandedToolGroups: Set<String> = []
 
-    public init(turn: AssistantTurnSnapshot, live: Bool) {
+    public init(turn: AssistantTurnSnapshot, live: Bool, hideAssistantOutput: Bool = false) {
         self.turn = turn
         self.live = live
+        self.hideAssistantOutput = hideAssistantOutput
     }
 
     public var body: some View {
@@ -678,16 +724,18 @@ public struct AgentChatLiveTurnView: View {
                     expandedToolGroups: $expandedToolGroups
                 )
             }
-            ForEach(composition.outside) { item in
-                AgentChatLiveItemRow(
-                    item: item,
-                    expandedReasoning: $expandedReasoning,
-                    expandedTools: $expandedTools
-                )
-            }
-            if AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn),
-               let final = turn.finalAssistantMessage {
-                AgentChatAssistantReply(text: final)
+            if !hideAssistantOutput {
+                ForEach(composition.outside) { item in
+                    AgentChatLiveItemRow(
+                        item: item,
+                        expandedReasoning: $expandedReasoning,
+                        expandedTools: $expandedTools
+                    )
+                }
+                if AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn),
+                   let final = turn.finalAssistantMessage {
+                    AgentChatAssistantReply(text: final)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -722,6 +770,30 @@ public struct AgentChatLiveTurnView: View {
 }
 
 // MARK: - Working status
+
+/// Window between the user bubble and a real run — same as Agent App Loading….
+public struct AgentChatLoadingStatusStrip: View {
+    public init() {}
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Loading")
+                Text("Loading…")
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityIdentifier("agent.loading.status")
+            }
+            Rectangle()
+                .fill(DS.Palette.line)
+                .frame(height: DS.Border.hairline)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("bots.desk.loading")
+    }
+}
 
 public struct AgentChatWorkingStatusStrip: View {
     public let startedAt: Date

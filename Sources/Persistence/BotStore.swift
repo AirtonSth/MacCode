@@ -384,6 +384,17 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func conversationLinked(to threadID: AgentThreadID) throws -> BotConversation? {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                Self.conversationSelect + " WHERE linked_agent_thread_id = ? LIMIT 1;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, threadID.value.uuidString.lowercased())
+            return try statement.step() ? try decodeConversation(statement) : nil
+        }
+    }
+
     public func listConversations(botID: BotID) throws -> [BotConversation] {
         try db.performSync { database in
             let statement = try database.prepare(
