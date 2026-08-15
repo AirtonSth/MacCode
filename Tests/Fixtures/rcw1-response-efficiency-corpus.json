@@ -23,12 +23,29 @@
         "records": [
           {
             "kind": "O",
-            "value": "A disposable local workspace improves software testing because isolation separates experiments from valuable work, repeatability reproduces the same scenario, safety limits risky-operation damage, cleanup removes temporary state, and together these properties increase confidence."
+            "value": "A disposable local workspace improves software testing because isolation separates experiments from valuable work, repeatability reproduces the same scenario, safety limits damage from risky operations, and cleanup removes temporary state; together these properties increase confidence in the result, and because the workspace is temporary by design, they enable experiments to be repeated and discarded without contaminating unrelated projects."
           }
         ]
       }
     ],
-    "human_baseline": "A disposable local workspace improves software testing because isolation separates experiments from valuable work, repeatability reproduces the same scenario, safety limits risky-operation damage, cleanup removes temporary state, and together these properties increase confidence."
+    "human_baseline": "A disposable local workspace improves software testing because isolation separates experiments from valuable work, repeatability reproduces the same scenario, safety limits damage from risky operations, and cleanup removes temporary state; together these properties increase confidence in the result, and because the workspace is temporary by design, they enable experiments to be repeated and discarded without contaminating unrelated projects.",
+    "semantic_contract": {
+      "source_prompt_sha256": "2a31b16c2e1fa1a342a92f1ee2d86e713b16338daff9c4d8e9a29cfb25b0056a",
+      "language": "en",
+      "shape": "one_concise_human_readable_sentence",
+      "scope": "test_only_human_reviewed_exact_spans",
+      "production_admission": false,
+      "requirements": [
+        {"id": "R1", "kind": "subject_relation_object", "evidence_span": "isolation separates experiments from valuable work"},
+        {"id": "R2", "kind": "subject_relation_object", "evidence_span": "repeatability reproduces the same scenario"},
+        {"id": "R3", "kind": "subject_relation_object", "evidence_span": "safety limits damage from risky operations"},
+        {"id": "R4", "kind": "subject_relation_object", "evidence_span": "cleanup removes temporary state"},
+        {"id": "R5", "kind": "aggregate_outcome", "evidence_span": "together these properties increase confidence in the result"},
+        {"id": "R6", "kind": "design_property", "evidence_span": "the workspace is temporary by design"},
+        {"id": "R7", "kind": "enabled_action", "evidence_span": "they enable experiments to be repeated and discarded"},
+        {"id": "R8", "kind": "negative_boundary", "evidence_span": "without contaminating unrelated projects"}
+      ]
+    }
   },
   {
     "id": "multi-record-all-kinds",

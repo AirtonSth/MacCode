@@ -133,9 +133,106 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             XCTAssertEqual(projection.rawWire, wire)
             XCTAssertEqual(projection.deterministicHuman, item.humanBaseline)
         }
-        let nominal = try XCTUnwrap(cases.first { $0.id == "reported-disposable-workspace-answer" })
+        let nominal = try XCTUnwrap(cases.first { $0.id == nominalResponseCaseID })
+        let contract = try XCTUnwrap(nominal.semanticContract)
+        let sourcePrompt = try XCTUnwrap(loadCorpus().first {
+            $0.id == "reported-disposable-workspace"
+        })
         XCTAssertTrue(nominal.humanBaseline.hasPrefix("A disposable local workspace improves software testing"))
         XCTAssertFalse(nominal.humanBaseline.contains("Explain in one short"))
+        XCTAssertEqual(sha256Hex(Data(sourcePrompt.human.utf8)), frozenNominalSourcePromptSHA256)
+        XCTAssertEqual(contract.sourcePromptSHA256, frozenNominalSourcePromptSHA256)
+        XCTAssertEqual(sha256Hex(contract.canonicalData), frozenResponseSemanticContractSHA256)
+        XCTAssertEqual(contract.requirements.map(\.id), ResponseSemanticRequirementID.allCases)
+        XCTAssertTrue(cases.filter { $0.id != nominalResponseCaseID }
+            .allSatisfy { $0.semanticContract == nil })
+    }
+
+    func test_responseNominalSemanticContractPrecedesEconomicCounting() throws {
+        let nominal = try XCTUnwrap(loadResponseCorpus().first {
+            $0.id == nominalResponseCaseID
+        })
+        let contract = try XCTUnwrap(nominal.semanticContract)
+        let optimisticText = "One concise human-readable English sentence: disposable temporary workspace; "
+            + "isolation, repeatability, safety, cleanup, confidence; repeat, discard, unrelated projects."
+        let optimistic = responseNominalCase(
+            basedOn: nominal, humanBaseline: optimisticText, semanticContract: contract
+        )
+        var mutations = contract.requirements.map { requirement in
+            (
+                "missing-\(requirement.id.rawValue)",
+                responseNominalCase(
+                    basedOn: nominal,
+                    humanBaseline: nominal.humanBaseline.replacingOccurrences(
+                        of: requirement.evidenceSpan, with: ""
+                    ),
+                    semanticContract: contract
+                ),
+                requirement.id.rawValue
+            )
+        }
+        mutations += [
+            ("keyword-inventory", optimistic, "R1"),
+            (
+                "sentence-shape",
+                responseNominalCase(
+                    basedOn: nominal,
+                    humanBaseline: nominal.humanBaseline + " This is a second sentence.",
+                    semanticContract: contract
+                ),
+                "sentence shape"
+            ),
+            (
+                "source-sha",
+                responseNominalCase(
+                    basedOn: nominal,
+                    humanBaseline: nominal.humanBaseline,
+                    semanticContract: .init(
+                        sourcePromptSHA256: String(repeating: "0", count: 64),
+                        language: contract.language, shape: contract.shape,
+                        scope: contract.scope, productionAdmission: contract.productionAdmission,
+                        requirements: contract.requirements
+                    )
+                ),
+                "source SHA-256"
+            ),
+        ]
+        for (name, item, expected) in mutations {
+            let measurement = try responseMeasurement(item)
+            var economicCountCalls = 0
+            let counter = BenchmarkTokenCounter(
+                diagnostic: exactTokenDiagnostic,
+                sourceSHA256: String(repeating: "c", count: 64)
+            ) { _ in economicCountCalls += 1; return 1 }
+            XCTAssertThrowsError(try ResponseBenchmarkHarness.evaluateRowsForUnitTest(
+                corpus: [item], measurements: [measurement], counter: counter
+            ), name) { error in
+                XCTAssertTrue(error.localizedDescription.contains("semantic contract"), "\(name): \(error)")
+                XCTAssertTrue(error.localizedDescription.contains(expected), "\(name): \(error)")
+            }
+            XCTAssertEqual(economicCountCalls, 0, "\(name) must fail before economic counting")
+        }
+    }
+
+    func test_responseReportRejectsNominalSourcePromptDriftBeforeEconomicCounting() throws {
+        let data = try responseCorpusData()
+        XCTAssertEqual(sha256Hex(data), frozenResponseCorpusSHA256)
+        let corpus = try loadResponseCorpus()
+        let measurements = try responseMeasurements(corpus)
+        let original = try nominalSourcePromptFromRequestCorpus()
+        var economicCountCalls = 0
+        let counter = BenchmarkTokenCounter(
+            diagnostic: exactTokenDiagnostic,
+            sourceSHA256: String(repeating: "c", count: 64)
+        ) { _ in economicCountCalls += 1; return 1 }
+
+        XCTAssertThrowsError(try responseReport(
+            corpusData: data, measurements: measurements, counter: counter,
+            nominalSourcePrompt: original + " committed drift"
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("nominal source prompt SHA-256"))
+        }
+        XCTAssertEqual(economicCountCalls, 0, "source drift must fail before economic counting")
     }
 
     func test_responseBenchmarkRejectsFrozenCorpusAndCounterEvidenceTable() throws {
@@ -167,7 +264,8 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             sourceSHA256: String(repeating: "d", count: 64), count: { _ in drift += 1; return drift })
         let mismatched = ResponseEfficiencyCase(
             id: one.id, category: one.category, language: one.language,
-            frames: one.frames, humanBaseline: one.humanBaseline + " changed")
+            frames: one.frames, humanBaseline: one.humanBaseline + " changed",
+            semanticContract: nil)
         let mismatchedMeasurement = ResponseBenchmarkMeasurement(id: one.id,
             human: mismatched.humanBaseline, wire: oneMeasurement.wire, caveman: oneMeasurement.caveman)
         func evaluate(_ cases: [ResponseEfficiencyCase], _ rows: [ResponseBenchmarkMeasurement],
@@ -289,16 +387,26 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         let measurements = try responseMeasurements(corpus)
         let counter = responseCounter(cases: corpus, measurements: measurements)
         let report = try responseReport(corpusData: data, measurements: measurements, counter: counter)
-        XCTAssertEqual(report.schemaVersion, 4)
+        XCTAssertEqual(report.schemaVersion, 5)
         XCTAssertEqual(report.codec, "rcw1-v1")
         XCTAssertEqual(report.corpusSHA256, frozenResponseCorpusSHA256)
+        XCTAssertEqual(report.semanticContractSHA256, frozenResponseSemanticContractSHA256)
+        XCTAssertEqual(report.semanticContractSourcePromptSHA256, frozenNominalSourcePromptSHA256)
         XCTAssertEqual(report.runnerSourceSHA256, try responseRunnerSourceSHA256())
         XCTAssertEqual(report.counterSourceSHA256, counter.sourceSHA256)
         XCTAssertFalse(report.methodology.providerReportedTokens)
         XCTAssertFalse(report.methodology.providerBound)
         XCTAssertTrue(report.methodology.abiCountedOncePerRow)
+        XCTAssertFalse(report.methodology.semanticContractIsProductionAdmission)
+        XCTAssertFalse(report.methodology.semanticContractUsesGenericNLP)
         XCTAssertEqual(report.rows.count, 10)
         XCTAssertTrue(report.rows.allSatisfy { $0.cavemanSHA256.count == 64 })
+        let nominal = try XCTUnwrap(report.rows.first { $0.id == nominalResponseCaseID })
+        XCTAssertEqual(nominal.semanticReceiptStatus, .passed)
+        XCTAssertEqual(nominal.semanticReceiptIds, ResponseSemanticRequirementID.allCases)
+        XCTAssertTrue(report.rows.filter { $0.id != nominalResponseCaseID }.allSatisfy {
+            $0.semanticReceiptStatus == .notApplicable && $0.semanticReceiptIds.isEmpty
+        })
         let csvLines = report.csv.split(whereSeparator: \.isNewline).map(String.init)
         XCTAssertEqual(csvLines.count, 12, "header + 10 all-row records + one totals record")
         XCTAssertEqual(csvLines.filter { $0.hasPrefix("row,") }.count, 10)
@@ -306,12 +414,30 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             String($0.split(separator: ",")[1])
         }, report.rows.map(\.id))
         XCTAssertTrue(csvLines.last?.hasPrefix("totals,") == true)
+        XCTAssertTrue(csvLines.first?.contains(
+            "semantic_contract_sha256,semantic_contract_source_prompt_sha256,decision,"
+                + "semantic_receipt_status,semantic_receipt_ids"
+        ) == true)
+        XCTAssertEqual(csvLines.filter { $0.contains(frozenResponseSemanticContractSHA256) }.count, 11)
+        XCTAssertEqual(csvLines.filter { $0.contains(frozenNominalSourcePromptSHA256) }.count, 11)
+        XCTAssertTrue(csvLines.contains { $0.contains(",passed,R1|R2|R3|R4|R5|R6|R7|R8,") })
         XCTAssertEqual(csvLines.first?.split(separator: ",").count,
                        csvLines.last?.split(separator: ",", omittingEmptySubsequences: false).count)
         let json = try XCTUnwrap(JSONSerialization.jsonObject(
             with: responseJSONData(report)) as? [String: Any])
-        XCTAssertEqual(json["schema_version"] as? Int, 4)
-        XCTAssertEqual((json["rows"] as? [[String: Any]])?.count, 10)
+        XCTAssertEqual(json["schema_version"] as? Int, 5)
+        XCTAssertEqual(json["semantic_contract_sha256"] as? String,
+                       frozenResponseSemanticContractSHA256)
+        XCTAssertEqual(json["semantic_contract_source_prompt_sha256"] as? String,
+                       frozenNominalSourcePromptSHA256)
+        let jsonRows = try XCTUnwrap(json["rows"] as? [[String: Any]])
+        XCTAssertEqual(jsonRows.count, 10)
+        let nominalJSON = try XCTUnwrap(jsonRows.first {
+            $0["id"] as? String == nominalResponseCaseID
+        })
+        XCTAssertEqual(nominalJSON["semantic_receipt_status"] as? String, "passed")
+        XCTAssertEqual(nominalJSON["semantic_receipt_ids"] as? [String],
+                       ResponseSemanticRequirementID.allCases.map(\.rawValue))
         XCTAssertNil(try responseReportOutputBundle(environment: [:]))
         let aliasStem = "remotecode-response-\(UUID().uuidString.lowercased())"
         let fixtureAlias = URL(fileURLWithPath: "/tmp/\(aliasStem)-fixture.json")
@@ -446,6 +572,7 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         let provenance = try buildPinnedCavemanEngine(
             go: cavemanGo, checkout: cavemanCheckout, output: cavemanEngine)
         let database = temporaryDirectory.appendingPathComponent("ccr.db")
+        let nominalSourcePrompt = try nominalSourcePromptFromRequestCorpus()
         let corpusData = try responseCorpusData()
         let corpus = try JSONDecoder().decode([ResponseEfficiencyCase].self, from: corpusData)
         let observed = try corpus.map { item in
@@ -457,7 +584,7 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         let report = try responseReport(
             corpusData: corpusData, measurements: observed, counter: counter,
             head: initial.remoteCodeHead, runnerSourceSHA256: initial.runnerSourceSHA256,
-            provenance: provenance)
+            provenance: provenance, nominalSourcePrompt: nominalSourcePrompt)
         let json = try responseJSONData(report)
         let csv = report.csv
         try validatePinnedCavemanBinary(cavemanEngine)
@@ -1320,10 +1447,13 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         counter: BenchmarkTokenCounter,
         head: String = String(repeating: "f", count: 40),
         runnerSourceSHA256: String? = nil,
-        provenance: CavemanBenchmarkProvenance = benchmarkPinnedCavemanProvenance
+        provenance: CavemanBenchmarkProvenance = benchmarkPinnedCavemanProvenance,
+        nominalSourcePrompt: String? = nil
     ) throws -> ResponseBenchmarkReport {
-        try ResponseBenchmarkHarness.build(
+        let sourcePrompt = try nominalSourcePrompt ?? nominalSourcePromptFromRequestCorpus()
+        return try ResponseBenchmarkHarness.build(
             corpusData: corpusData, measurements: measurements,
+            nominalSourcePrompt: sourcePrompt,
             remoteCodeHead: head, runnerSourceSHA256: runnerSourceSHA256 ?? responseRunnerSourceSHA256(),
             cavemanProvenance: provenance, counter: counter)
     }
@@ -1369,7 +1499,18 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
     private func responseCase(id: String, outcome: String) -> ResponseEfficiencyCase {
         .init(id: id, category: "unit_control", language: "en",
               frames: [.init(sequence: 1, records: [.init(kind: .outcome, value: outcome)])],
-              humanBaseline: outcome)
+              humanBaseline: outcome, semanticContract: nil)
+    }
+    private func responseNominalCase(
+        basedOn item: ResponseEfficiencyCase,
+        humanBaseline: String,
+        semanticContract: ResponseSemanticContract
+    ) -> ResponseEfficiencyCase {
+        .init(
+            id: nominalResponseCaseID, category: item.category, language: item.language,
+            frames: [.init(sequence: 1, records: [.init(kind: .outcome, value: humanBaseline)])],
+            humanBaseline: humanBaseline, semanticContract: semanticContract
+        )
     }
     private func loadResponseCorpus() throws -> [ResponseEfficiencyCase] {
         try JSONDecoder().decode([ResponseEfficiencyCase].self, from: responseCorpusData()) }
@@ -1383,6 +1524,15 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
     }
     private func responseRunnerSourceSHA256() throws -> String {
         sha256Hex(try Data(contentsOf: URL(fileURLWithPath: #filePath))) }
+
+    private func nominalSourcePromptFromRequestCorpus() throws -> String {
+        guard let item = try loadCorpus().first(where: {
+            $0.id == "reported-disposable-workspace"
+        }) else {
+            throw benchmarkError("request corpus is missing the nominal source prompt")
+        }
+        return item.human
+    }
 
     private func loadCorpus() throws -> [EfficiencyCase] {
         let data = try Data(contentsOf: corpusURL())
@@ -1740,7 +1890,12 @@ private struct EfficiencyCase: Decodable {
     }
 }
 
-private let frozenResponseCorpusSHA256 = "35b3722d6a58e593a2770a6d727e5796fbd7e80c9f8aa90f013ed7c691537029"
+private let frozenResponseCorpusSHA256 = "4825e41375dc28d97188ca1218a3071eeef7802b1c7062d47b9c5909f9b7a43d"
+private let nominalResponseCaseID = "reported-disposable-workspace-answer"
+private let frozenNominalSourcePromptSHA256 =
+    "2a31b16c2e1fa1a342a92f1ee2d86e713b16338daff9c4d8e9a29cfb25b0056a"
+private let frozenResponseSemanticContractSHA256 =
+    "c4d60c41dba9e4c6d187b6f129ca2911bcb2b5d2ccb79e8136b798da0075687a"
 private let frozenResponseCorpusIDs = [
     "short-ok", "reported-disposable-workspace-answer", "multi-record-all-kinds",
     "progressive-multiframe", "exact-code-path", "portuguese-natural", "japanese-natural",
@@ -1754,6 +1909,7 @@ private struct ResponseEfficiencyCase: Decodable {
     let id, category, language: String
     let frames: [ResponseLogicalFrame]
     let humanBaseline: String
+    let semanticContract: ResponseSemanticContract?
     func rcWireFrames() throws -> [RCWireFrame] {
         let result = frames.map { frame in
             RCWireFrame(direction: .response, sequence: frame.sequence,
@@ -1768,12 +1924,51 @@ private struct ResponseEfficiencyCase: Decodable {
     }
     func serializedWire() throws -> String { try rcWireFrames().map(RCWireProtocol.serialize).joined() }
     enum CodingKeys: String, CodingKey { case id, category, language, frames
-        case humanBaseline = "human_baseline" }
+        case humanBaseline = "human_baseline"; case semanticContract = "semantic_contract" }
 }
 private struct ResponseLogicalFrame: Decodable {
     let sequence: Int; let records: [ResponseLogicalRecord] }
 private struct ResponseLogicalRecord: Decodable {
     let kind: RCWireRecordKind; let value: String }
+private enum ResponseSemanticRequirementID: String, Codable, CaseIterable, Equatable {
+    case r1 = "R1", r2 = "R2", r3 = "R3", r4 = "R4"
+    case r5 = "R5", r6 = "R6", r7 = "R7", r8 = "R8"
+}
+private struct ResponseSemanticRequirement: Decodable, Equatable {
+    let id: ResponseSemanticRequirementID
+    let kind, evidenceSpan: String
+    enum CodingKeys: String, CodingKey { case id, kind; case evidenceSpan = "evidence_span" }
+}
+private struct ResponseSemanticContract: Decodable, Equatable {
+    let sourcePromptSHA256, language, shape, scope: String
+    let productionAdmission: Bool
+    let requirements: [ResponseSemanticRequirement]
+
+    enum CodingKeys: String, CodingKey {
+        case language, shape, scope, requirements
+        case sourcePromptSHA256 = "source_prompt_sha256"
+        case productionAdmission = "production_admission"
+    }
+
+    var canonicalData: Data {
+        var lines = [
+            "scope=\(scope)",
+            "production_admission=\(productionAdmission)",
+            "source_prompt_sha256=\(sourcePromptSHA256)",
+            "language=\(language)",
+            "shape=\(shape)",
+        ]
+        lines += requirements.map { "\($0.id.rawValue)|\($0.kind)|\($0.evidenceSpan)" }
+        return Data((lines.joined(separator: "\n") + "\n").utf8)
+    }
+}
+private enum ResponseSemanticReceiptStatus: String, Encodable, Equatable {
+    case passed, notApplicable = "not_applicable"
+}
+private struct ResponseSemanticReceipt {
+    let status: ResponseSemanticReceiptStatus
+    let requirementIDs: [ResponseSemanticRequirementID]
+}
 private struct ResponseBenchmarkMeasurement {
     let id, human, wire: String; let caveman: CavemanObservation }
 private enum ResponseQualificationFailure: String, Encodable, CaseIterable, Equatable {
@@ -1787,12 +1982,17 @@ private enum CavemanHandleBehavior: Equatable {
     case passThroughNoHandle, changedWithVerifiedHandle }
 private enum ResponseBenchmarkHarness {
     static func build(corpusData: Data, measurements: [ResponseBenchmarkMeasurement],
+        nominalSourcePrompt: String,
         remoteCodeHead: String, runnerSourceSHA256: String,
         cavemanProvenance: CavemanBenchmarkProvenance,
         counter: BenchmarkTokenCounter) throws -> ResponseBenchmarkReport {
         let corpusSHA256 = sha256Hex(corpusData)
         guard corpusSHA256 == frozenResponseCorpusSHA256 else {
             throw benchmarkError("report requires the frozen response corpus bytes")
+        }
+        let sourcePromptSHA256 = sha256Hex(Data(nominalSourcePrompt.utf8))
+        guard sourcePromptSHA256 == frozenNominalSourcePromptSHA256 else {
+            throw benchmarkError("report requires the frozen nominal source prompt SHA-256")
         }
         let corpus = try JSONDecoder().decode([ResponseEfficiencyCase].self, from: corpusData)
         guard corpus.map(\.id) == frozenResponseCorpusIDs else {
@@ -1814,8 +2014,13 @@ private enum ResponseBenchmarkHarness {
         guard let counterSourceSHA256 = counter.sourceSHA256 else {
             throw benchmarkError("response report requires token counter source SHA-256")
         }
+        guard let semanticContractSHA256 = evaluated.semanticContractSHA256 else {
+            throw benchmarkError("response report requires the frozen nominal semantic contract")
+        }
         return .init(
-            schemaVersion: 4, codec: "rcw1-v1", corpusSHA256: corpusSHA256,
+            schemaVersion: 5, codec: "rcw1-v1", corpusSHA256: corpusSHA256,
+            semanticContractSHA256: semanticContractSHA256,
+            semanticContractSourcePromptSHA256: sourcePromptSHA256,
             remoteCodeHead: remoteCodeHead, runnerSourceSHA256: runnerSourceSHA256,
             counterSourceSHA256: counterSourceSHA256,
             tokenCounter: counter.diagnostic, methodology: .init(),
@@ -1823,7 +2028,8 @@ private enum ResponseBenchmarkHarness {
     }
     static func evaluateRowsForUnitTest(corpus: [ResponseEfficiencyCase],
         measurements: [ResponseBenchmarkMeasurement], counter: BenchmarkTokenCounter
-    ) throws -> (rows: [ResponseBenchmarkRow], totals: ResponseBenchmarkTotals) {
+    ) throws -> (rows: [ResponseBenchmarkRow], totals: ResponseBenchmarkTotals,
+                 semanticContractSHA256: String?) {
         guard counter.diagnostic.measurementKind == "exact-local-tokenizer" else {
             throw benchmarkError("response report requires measurement_kind=exact-local-tokenizer")
         }
@@ -1842,6 +2048,7 @@ private enum ResponseBenchmarkHarness {
         guard Set(measuredIDs) == Set(corpusIDs) else {
             throw benchmarkError("measurements must include all response corpus rows exactly once")
         }
+        let semantic = try validateSemanticContracts(corpus)
         var counts: [String: Int] = [:]
         func stableCount(_ text: String) throws -> Int {
             if let count = counts[text] { return count }
@@ -1855,11 +2062,13 @@ private enum ResponseBenchmarkHarness {
         guard abiTokens > 0 else { throw benchmarkError("response ABI token count must be positive") }
         let byID = Dictionary(uniqueKeysWithValues: measurements.map { ($0.id, $0) })
         let rows = try corpus.map { try evaluate(item: $0, measurement: byID[$0.id]!,
+                                                 semanticReceipt: semantic.receipts[$0.id]!,
                                                  abiTokens: abiTokens, count: stableCount) }
-        return (rows, ResponseBenchmarkTotals(rows: rows))
+        return (rows, ResponseBenchmarkTotals(rows: rows), semantic.contractSHA256)
     }
     private static func evaluate(item: ResponseEfficiencyCase,
-        measurement: ResponseBenchmarkMeasurement, abiTokens: Int,
+        measurement: ResponseBenchmarkMeasurement, semanticReceipt: ResponseSemanticReceipt,
+        abiTokens: Int,
         count: (String) throws -> Int) throws -> ResponseBenchmarkRow {
         let frames = try item.rcWireFrames()
         guard RCWireProtocol.renderEnglish(frames) == item.humanBaseline else {
@@ -1905,7 +2114,9 @@ private enum ResponseBenchmarkHarness {
             humanSHA256: sha256Hex(Data(measurement.human.utf8)),
             candidateFrameSHA256: sha256Hex(Data(measurement.wire.utf8)),
             cavemanSHA256: sha256Hex(Data(measurement.caveman.output.utf8)),
-            decision: decision, humanTokens: human, candidateFrameTokens: frame,
+            decision: decision, semanticReceiptStatus: semanticReceipt.status,
+            semanticReceiptIds: semanticReceipt.requirementIDs,
+            humanTokens: human, candidateFrameTokens: frame,
             candidateVsHumanPPM: ratioPPM(frame, human), abiTokens: abiTokens,
             candidateEffectiveTokens: effective,
             effectiveDeliveredTokens: decision == .rcw1 ? effective : human, cavemanTokens: caveman,
@@ -1914,17 +2125,103 @@ private enum ResponseBenchmarkHarness {
             claimedSavedTokensVsHuman: decision == .rcw1 ? human - effective : 0,
             claimedSavedTokensVsCaveman: decision == .rcw1 ? caveman - effective : 0)
     }
+
+    private static func validateSemanticContracts(
+        _ corpus: [ResponseEfficiencyCase]
+    ) throws -> (receipts: [String: ResponseSemanticReceipt], contractSHA256: String?) {
+        var receipts: [String: ResponseSemanticReceipt] = [:]
+        var contractSHA256: String?
+        for item in corpus {
+            guard item.id == nominalResponseCaseID else {
+                guard item.semanticContract == nil else {
+                    throw benchmarkError("\(item.id) semantic contract is reserved for the nominal row")
+                }
+                receipts[item.id] = .init(status: .notApplicable, requirementIDs: [])
+                continue
+            }
+            guard let contract = item.semanticContract else {
+                throw benchmarkError("\(item.id) semantic contract is required before economic counting")
+            }
+            let receipt = try validate(contract: contract, for: item)
+            receipts[item.id] = receipt
+            contractSHA256 = sha256Hex(contract.canonicalData)
+        }
+        return (receipts, contractSHA256)
+    }
+
+    private static func validate(
+        contract: ResponseSemanticContract,
+        for item: ResponseEfficiencyCase
+    ) throws -> ResponseSemanticReceipt {
+        guard contract.scope == "test_only_human_reviewed_exact_spans",
+              !contract.productionAdmission else {
+            throw benchmarkError("\(item.id) semantic contract must remain test-only, not production admission")
+        }
+        guard contract.sourcePromptSHA256 == frozenNominalSourcePromptSHA256 else {
+            throw benchmarkError("\(item.id) semantic contract source SHA-256 drifted")
+        }
+        guard contract.language == "en", item.language == contract.language,
+              contract.shape == "one_concise_human_readable_sentence" else {
+            throw benchmarkError("\(item.id) semantic contract requires one English human-readable sentence")
+        }
+        let ids = contract.requirements.map(\.id)
+        guard ids == ResponseSemanticRequirementID.allCases else {
+            throw benchmarkError("\(item.id) semantic contract must contain typed IDs R1-R8 in order")
+        }
+        let expectedKinds = [
+            "subject_relation_object", "subject_relation_object",
+            "subject_relation_object", "subject_relation_object",
+            "aggregate_outcome", "design_property", "enabled_action", "negative_boundary",
+        ]
+        guard contract.requirements.map(\.kind) == expectedKinds,
+              Set(contract.requirements.map(\.evidenceSpan)).count == contract.requirements.count else {
+            throw benchmarkError("\(item.id) semantic contract evidence types or spans drifted")
+        }
+        let terminators = item.humanBaseline.filter { ".!?".contains($0) }
+        let words = item.humanBaseline.split(whereSeparator: \.isWhitespace)
+        guard item.humanBaseline.last == ".", terminators.count == 1,
+              !item.humanBaseline.contains(where: \.isNewline), words.count <= 60 else {
+            throw benchmarkError("\(item.id) semantic contract sentence shape failed")
+        }
+        var lowerBound = item.humanBaseline.startIndex
+        for requirement in contract.requirements {
+            let occurrences = item.humanBaseline.components(
+                separatedBy: requirement.evidenceSpan
+            ).count - 1
+            let range = item.humanBaseline.range(
+                of: requirement.evidenceSpan,
+                range: lowerBound..<item.humanBaseline.endIndex
+            )
+            guard occurrences == 1, let range,
+                  range.lowerBound >= lowerBound else {
+                throw benchmarkError(
+                    "\(item.id) semantic contract missing exact evidence span \(requirement.id.rawValue)"
+                )
+            }
+            lowerBound = range.upperBound
+        }
+        let digest = sha256Hex(contract.canonicalData)
+        guard digest == frozenResponseSemanticContractSHA256 else {
+            throw benchmarkError("\(item.id) frozen semantic contract receipt drifted")
+        }
+        return .init(status: .passed, requirementIDs: ids)
+    }
 }
 
 private struct ResponseBenchmarkReport: Encodable {
-    let schemaVersion: Int; let codec, corpusSHA256, remoteCodeHead: String
+    let schemaVersion: Int
+    let codec, corpusSHA256, semanticContractSHA256, semanticContractSourcePromptSHA256: String
+    let remoteCodeHead: String
     let runnerSourceSHA256, counterSourceSHA256: String
     let tokenCounter: TokenCounterDiagnostic; let methodology: ResponseBenchmarkMethodology
     let cavemanProvenance: CavemanBenchmarkProvenance
     let rows: [ResponseBenchmarkRow]; let totals: ResponseBenchmarkTotals
     var csv: String {
         let header = [
-            "record_type", "id", "decision", "human_sha256", "candidate_frame_sha256", "caveman_sha256",
+            "record_type", "id", "semantic_contract_sha256",
+            "semantic_contract_source_prompt_sha256", "decision",
+            "semantic_receipt_status", "semantic_receipt_ids",
+            "human_sha256", "candidate_frame_sha256", "caveman_sha256",
             "human_tokens", "candidate_frame_tokens", "candidate_vs_human_ppm", "abi_tokens",
             "candidate_effective_tokens", "effective_delivered_tokens", "caveman_tokens",
             "claimed_saved_tokens_vs_human", "claimed_saved_tokens_vs_caveman",
@@ -1933,7 +2230,11 @@ private struct ResponseBenchmarkReport: Encodable {
         ]
         let body = rows.map { row in
             [
-                "row", row.id, row.decision.rawValue, row.humanSHA256, row.candidateFrameSHA256,
+                "row", row.id, semanticContractSHA256, semanticContractSourcePromptSHA256,
+                row.decision.rawValue,
+                row.semanticReceiptStatus.rawValue,
+                row.semanticReceiptIds.map(\.rawValue).joined(separator: "|"),
+                row.humanSHA256, row.candidateFrameSHA256,
                 row.cavemanSHA256, String(row.humanTokens), String(row.candidateFrameTokens),
                 String(row.candidateVsHumanPPM), String(row.abiTokens),
                 String(row.candidateEffectiveTokens), String(row.effectiveDeliveredTokens),
@@ -1945,7 +2246,9 @@ private struct ResponseBenchmarkReport: Encodable {
         let failures = totals.failureCounts.sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }.joined(separator: "|")
         let total = [
-            "totals", "", "", "", "", "", String(totals.humanTokens), String(totals.candidateFrameTokens),
+            "totals", "", semanticContractSHA256, semanticContractSourcePromptSHA256,
+            "", "", "", "", "", "",
+            String(totals.humanTokens), String(totals.candidateFrameTokens),
             "", String(totals.abiTokens),
             String(totals.candidateEffectiveTokens), String(totals.effectiveDeliveredTokens),
             String(totals.cavemanTokens), String(totals.claimedSavedTokensVsHuman),
@@ -1959,11 +2262,16 @@ private struct ResponseBenchmarkReport: Encodable {
 
 private struct ResponseBenchmarkMethodology: Encodable {
     let providerReportedTokens = false, providerBound = false, abiCountedOncePerRow = true
+    let semanticContractScope = "test_only_human_reviewed_exact_spans"
+    let semanticContractIsProductionAdmission = false, semanticContractUsesGenericNLP = false
     let qualificationRule = "complete frame <=45% Human; frame + one ABI < Human and pinned Caveman"
 }
 private struct ResponseBenchmarkRow: Encodable {
     let id, humanSHA256, candidateFrameSHA256, cavemanSHA256: String
-    let decision: ResponseBenchmarkDecision; let humanTokens, candidateFrameTokens: Int
+    let decision: ResponseBenchmarkDecision
+    let semanticReceiptStatus: ResponseSemanticReceiptStatus
+    let semanticReceiptIds: [ResponseSemanticRequirementID]
+    let humanTokens, candidateFrameTokens: Int
     let candidateVsHumanPPM, abiTokens, candidateEffectiveTokens: Int
     let effectiveDeliveredTokens, cavemanTokens: Int
     let cavemanRecoveryHandlePresent: Bool
