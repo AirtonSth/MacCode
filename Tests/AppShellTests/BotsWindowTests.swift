@@ -18,6 +18,43 @@ final class BotsWindowTests: XCTestCase {
         directory = nil
     }
 
+    func test_beginCreateOpensDeskImmediately_becauseATeammateShouldNotRequireStudioFirst() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.beginCreate()
+
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(try context.botStore.list().count, 1)
+        XCTAssertEqual(try context.botStore.list().first?.name, "New Agent")
+        XCTAssertTrue(try context.threadRepo.list().isEmpty)
+    }
+
+    func test_beginCreateTwiceAllocatesDistinctHandles_becauseNewAgentIsAPlaceholder() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.beginCreate()
+        vm.beginCreate()
+        let bots = try context.botStore.list()
+        XCTAssertEqual(bots.count, 2)
+        XCTAssertEqual(Set(bots.map(\.handle)).count, 2)
+        XCTAssertTrue(bots.allSatisfy { $0.name == "New Agent" })
+    }
+
+    func test_openDeskMarksUnreadConversationRead_becauseOpeningTheChatClearsFleetAttention() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Standup", unread: true, attentionState: .unreadActivity)
+        )
+        vm.reload()
+        vm.openDesk(bot)
+
+        let conversation = try XCTUnwrap(context.botStore.listConversations(botID: bot.id).first)
+        XCTAssertFalse(conversation.unread)
+        XCTAssertEqual(conversation.attentionState, .none)
+    }
+
     func test_createViaVM_persistsThroughBotStoreList_becauseATeammateIsNotAnAgentThread() throws {
         // WHY: a durable teammate must be creatable without becoming an AgentThread.
         let context = try makeContext()
@@ -95,6 +132,81 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskMessages.first?.text, "Please look at the failing test")
         XCTAssertEqual(vm.deskMessages.last?.text, BotsViewModel.assistantPlaceholder)
         XCTAssertFalse(vm.lastSendStartedProviderRun)
+    }
+
+    func test_followThroughLeavesWorkingWhenRunCompletes_becauseTheDeskMustShowAResult() {
+        // WHY: Grok Bot keeps the user in the same conversation until work
+        // finishes; a started run that never leaves "Working…" is not a teammate.
+        XCTAssertEqual(BotsDeskFollowThrough.conversationState(for: .running), .working)
+        XCTAssertEqual(BotsDeskFollowThrough.conversationState(for: .completed), .unreadActivity)
+        XCTAssertEqual(BotsDeskFollowThrough.conversationState(for: .failed), .needsAttention)
+        XCTAssertNil(BotsDeskFollowThrough.attentionKind(for: .completed))
+        XCTAssertEqual(BotsDeskFollowThrough.attentionKind(for: .failed), .blocked)
+        XCTAssertTrue(BotsDeskFollowThrough.isTerminal(.completed))
+        XCTAssertFalse(BotsDeskFollowThrough.isTerminal(.running))
+    }
+
+    func test_visibleDeskMessagesPrefersPersistedAssistantOverWorkingCache() {
+        // WHY: follow-through must replace the local "Working…" bubble with
+        // the linked thread's assistant reply or the user cannot review the result.
+        let cached = [
+            BotDeskMessage(role: .user, text: "Summarize overnight"),
+            BotDeskMessage(role: .assistant, text: BotsDeskFollowThrough.workingPlaceholder),
+        ]
+        let persisted = [
+            BotDeskMessage(role: .user, text: "Summarize overnight"),
+            BotDeskMessage(role: .assistant, text: "Three failing tests remain."),
+        ]
+        let visible = BotsDeskFollowThrough.visibleDeskMessages(cached: cached, persisted: persisted)
+        XCTAssertEqual(visible.last?.text, "Three failing tests remain.")
+        XCTAssertFalse(visible.contains { $0.text == BotsDeskFollowThrough.workingPlaceholder })
+    }
+
+    func test_composeRunPromptIncludesTrustedMemoryAndEnabledSkills() {
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "Looks around")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "Looks around",
+            soul: "Be brief.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let live = BotMemoryItem(
+            botID: bot.id,
+            currentRevisionID: UUID(),
+            content: "Prefers dark mode",
+            provenance: "user",
+            trusted: true,
+            source: "chat"
+        )
+        var forgotten = live
+        forgotten.content = "Old secret"
+        forgotten.forgottenAt = Date()
+        let enabled = BotSkillBinding(botID: bot.id, skillID: "weekly-account-health", enabled: true)
+        let disabled = BotSkillBinding(botID: bot.id, skillID: "off-skill", enabled: false)
+
+        let prompt = BotsDeskFollowThrough.composeRunPrompt(
+            bot: bot,
+            revision: revision,
+            userText: "Summarize overnight",
+            memory: [live, forgotten],
+            skills: [enabled, disabled]
+        )
+
+        XCTAssertTrue(prompt.contains("Prefers dark mode"))
+        XCTAssertFalse(prompt.contains("Old secret"))
+        XCTAssertTrue(prompt.contains("weekly-account-health"))
+        XCTAssertFalse(prompt.contains("off-skill"))
+        XCTAssertTrue(prompt.contains("Summarize overnight"))
     }
 
     func test_hiddenBotsAreExcludedFromDefaultFleet() throws {

@@ -79,7 +79,6 @@ public final class BotStore: @unchecked Sendable {
         guard !trimmedName.isEmpty else { throw BotPublishError.invalidRevision }
         let routes = normalizedRoutes(compatibleRouteSet)
         guard !routes.isEmpty else { throw BotPublishError.invalidRevision }
-        let resolvedHandle = try resolveHandle(handle, fallback: trimmedName)
         let draft = BotRevisionDraft(
             name: trimmedName,
             title: title.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -104,23 +103,31 @@ public final class BotStore: @unchecked Sendable {
             publishedAt: now,
             supersedes: nil
         )
-        let bot = BotDefinition(
-            id: botID,
-            handle: resolvedHandle,
-            name: draft.name,
-            title: draft.title,
-            description: draft.description,
-            avatarSymbol: avatarSymbol,
-            currentRevisionID: revisionID,
-            directoryEpoch: 1,
-            notificationsEnabled: notificationsEnabled,
-            createdAt: now,
-            updatedAt: now,
-            workspaceID: workspaceID
-        )
+        var created: BotDefinition!
         try db.transaction {
             try assertLiveCapacity(database: db, additional: 1)
-            try assertHandleAvailable(resolvedHandle, database: db)
+            let resolvedHandle: String
+            if let handle {
+                resolvedHandle = try resolveHandle(handle, fallback: trimmedName)
+                try assertHandleAvailable(resolvedHandle, database: db)
+            } else {
+                resolvedHandle = try allocateUniqueHandle(stem: trimmedName, database: db)
+            }
+            let bot = BotDefinition(
+                id: botID,
+                handle: resolvedHandle,
+                name: draft.name,
+                title: draft.title,
+                description: draft.description,
+                avatarSymbol: avatarSymbol,
+                currentRevisionID: revisionID,
+                directoryEpoch: 1,
+                notificationsEnabled: notificationsEnabled,
+                createdAt: now,
+                updatedAt: now,
+                workspaceID: workspaceID
+            )
+            created = bot
             try insertBot(bot, currentRevisionID: nil, database: db)
             try insertRevision(revision, database: db)
             try setCurrentRevision(
@@ -134,9 +141,9 @@ public final class BotStore: @unchecked Sendable {
                 updatedAt: now,
                 database: db
             )
-            try insertLiveHandle(resolvedHandle, botID: botID, at: now, database: db)
+            try insertLiveHandle(bot.handle, botID: botID, at: now, database: db)
         }
-        return bot
+        return created
     }
 
     public func updateProfile(

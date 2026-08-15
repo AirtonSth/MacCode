@@ -105,8 +105,7 @@ public enum BotDetailTab: String, CaseIterable, Identifiable {
 
 @MainActor
 public final class BotsViewModel: ObservableObject {
-    public static let assistantPlaceholder =
-        "Supervised run starts from this conversation; provider turn is the next slice"
+    public static let assistantPlaceholder = BotsDeskFollowThrough.noRouterPlaceholder
 
     @Published public private(set) var bots: [BotDefinition] = []
     @Published public var searchText: String = ""
@@ -202,9 +201,13 @@ public final class BotsViewModel: ObservableObject {
             errorMessage = "Turn on Bot control plane in Settings"
             return
         }
-        studioDraft = BotStudioDraft()
-        applyDefaultModel(for: studioDraft.provider)
-        screen = .studio
+        do {
+            // Match the bar: create opens a teammate immediately; profile is optional.
+            let bot = try create(name: "New Agent", title: "", description: "")
+            openDesk(bot)
+        } catch {
+            errorMessage = String(describing: error)
+        }
     }
 
     public func beginEdit(_ bot: BotDefinition) {
@@ -241,7 +244,29 @@ public final class BotsViewModel: ObservableObject {
         selectedBotID = bot.id
         detailTab = .desk
         screen = .desk
+        markOpenedConversationRead(botID: bot.id)
         reloadSelectedBot(id: bot.id)
+    }
+
+    private func markOpenedConversationRead(botID: BotID) {
+        do {
+            let items = try botStore.listConversations(botID: botID)
+            for var conversation in items where conversation.unread || conversation.attentionState == .unreadActivity {
+                conversation.unread = false
+                if conversation.attentionState == .unreadActivity {
+                    conversation.attentionState = .none
+                }
+                conversation.updatedAt = Date()
+                try botStore.upsertConversation(conversation)
+            }
+            for item in try botStore.listAttention() where item.botID == botID && item.acknowledgedAt == nil && item.kind == .unread {
+                try botStore.acknowledgeAttention(id: item.id)
+            }
+            reloadAttention()
+            reloadFleet()
+        } catch {
+            errorMessage = String(describing: error)
+        }
     }
 
     public func openAttention() {
@@ -442,11 +467,16 @@ public final class BotsViewModel: ObservableObject {
                         userText: message,
                         router: router
                     )
-                    if started {
+                    if let runId = started {
                         self.lastSendStartedProviderRun = true
                         self.appendDeskMessage(
                             BotDeskMessage(role: .assistant, text: "Working…"),
                             botID: bot.id
+                        )
+                        await self.followLinkedRun(
+                            bot: bot,
+                            conversation: conversation,
+                            runId: runId
                         )
                     } else {
                         self.recordNeedsAttention(bot: bot, conversation: conversation, userText: message)
@@ -649,15 +679,13 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func restoreDeskMessages(botID: BotID) {
-        if let cached = messagesByBot[botID], !cached.isEmpty {
-            deskMessages = cached
-            return
-        }
+        let cached = messagesByBot[botID] ?? []
+        var persisted: [BotDeskMessage] = []
         if let conversation = selectedConversation,
            let threadID = conversation.linkedAgentThreadID,
            let stored = try? context.messageRepo.listRecent(threadId: threadID, limit: 80),
            !stored.isEmpty {
-            let mapped = stored.reversed().compactMap { message -> BotDeskMessage? in
+            persisted = stored.reversed().compactMap { message -> BotDeskMessage? in
                 let role: BotDeskMessage.Role
                 switch message.role {
                 case .user: role = .user
@@ -666,14 +694,12 @@ public final class BotsViewModel: ObservableObject {
                 }
                 return BotDeskMessage(role: role, text: message.content, createdAt: message.createdAt)
             }
-            deskMessages = mapped
-            messagesByBot[botID] = mapped
-            return
         }
-        if let conversation = selectedConversation, !conversation.title.isEmpty {
+        let visible = BotsDeskFollowThrough.visibleDeskMessages(cached: cached, persisted: persisted)
+        if visible.isEmpty, let conversation = selectedConversation, !conversation.title.isEmpty {
             deskMessages = [BotDeskMessage(role: .user, text: conversation.title, createdAt: conversation.createdAt)]
         } else {
-            deskMessages = []
+            deskMessages = visible
         }
         messagesByBot[botID] = deskMessages
     }
@@ -737,7 +763,7 @@ public final class BotsViewModel: ObservableObject {
         conversation: BotConversation,
         userText: String,
         router: AppCommandRouter
-    ) async -> Bool {
+    ) async -> AgentRunID? {
         let workspaceID = bot.workspaceID
             ?? context.state.window.selectedWorkspaceID
             ?? context.state.window.workspaces.first
@@ -767,8 +793,16 @@ public final class BotsViewModel: ObservableObject {
                 try botStore.upsertConversation(linked)
                 selectedConversation = linked
             }
-            let prompt = Self.composeRunPrompt(bot: bot, revision: revision, userText: userText)
-            _ = try await router.sendAgentMessage(
+            let memory = (try? botStore.listMemory(botID: bot.id)) ?? []
+            let skills = (try? botStore.listSkillBindings(botID: bot.id)) ?? []
+            let prompt = BotsDeskFollowThrough.composeRunPrompt(
+                bot: bot,
+                revision: revision,
+                userText: userText,
+                memory: memory,
+                skills: skills
+            )
+            let result = try await router.sendAgentMessage(
                 thread: thread.id,
                 text: prompt,
                 provider: revision.provider,
@@ -777,10 +811,62 @@ public final class BotsViewModel: ObservableObject {
                 reasoningEffort: revision.reasoningEffort,
                 providerInstanceId: revision.providerInstanceID
             )
-            return true
+            return result.runId
         } catch {
             errorMessage = String(describing: error)
-            return false
+            return nil
+        }
+    }
+
+    private func followLinkedRun(
+        bot: BotDefinition,
+        conversation: BotConversation,
+        runId: AgentRunID
+    ) async {
+        let threadID = conversation.linkedAgentThreadID
+            ?? selectedConversation?.linkedAgentThreadID
+        for _ in 0..<120 {
+            if Task.isCancelled { return }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            let run = try? context.runRepo.get(id: runId)
+            let activeId = threadID.flatMap { context.coordinator.activeRunId(threadId: $0) }
+            let terminal = run.map { BotsDeskFollowThrough.isTerminal($0.status) } ?? false
+            if terminal || (activeId != runId && run != nil) {
+                applyFollowThrough(bot: bot, conversation: conversation, run: run)
+                return
+            }
+        }
+        applyFollowThrough(bot: bot, conversation: conversation, run: try? context.runRepo.get(id: runId))
+    }
+
+    private func applyFollowThrough(
+        bot: BotDefinition,
+        conversation: BotConversation,
+        run: AgentRun?
+    ) {
+        restoreDeskMessages(botID: bot.id)
+        let status = run?.status ?? .interrupted
+        var next = selectedConversation ?? conversation
+        next.attentionState = BotsDeskFollowThrough.conversationState(for: status)
+        next.updatedAt = Date()
+        do {
+            try botStore.upsertConversation(next)
+            selectedConversation = next
+            if let kind = BotsDeskFollowThrough.attentionKind(for: status) {
+                try botStore.upsertAttention(
+                    BotAttentionItem(
+                        botID: bot.id,
+                        conversationID: next.id,
+                        kind: kind,
+                        title: status == .cancelled ? "Run cancelled" : "Run needs you",
+                        detail: run?.errorMessage ?? "The supervised turn ended without a clean completion."
+                    )
+                )
+            }
+            reloadAttention()
+            reloadFleet()
+        } catch {
+            errorMessage = String(describing: error)
         }
     }
 
@@ -798,24 +884,8 @@ public final class BotsViewModel: ObservableObject {
         return String(collapsed.prefix(72))
     }
 
-    private static func composeRunPrompt(bot: BotDefinition, revision: BotRevision, userText: String) -> String {
-        var lines: [String] = []
-        let job = [bot.name, revision.title].filter { !$0.isEmpty }.joined(separator: " — ")
-        if !job.isEmpty {
-            lines.append("You are \(job).")
-        }
-        let description = revision.description.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !description.isEmpty {
-            lines.append(description)
-        }
-        let soul = revision.soul.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !soul.isEmpty {
-            lines.append("Standing instructions:")
-            lines.append(soul)
-        }
-        lines.append("User request:")
-        lines.append(userText)
-        return lines.joined(separator: "\n\n")
+    static func composeRunPrompt(bot: BotDefinition, revision: BotRevision, userText: String) -> String {
+        BotsDeskFollowThrough.composeRunPrompt(bot: bot, revision: revision, userText: userText)
     }
 }
 

@@ -312,4 +312,11 @@ final class BotStoreTests: XCTestCase {
         XCTAssertTrue(try store.listRoutines(botID: bot.id).isEmpty)
         XCTAssertEqual(try store.listAttention().map(\.title), ["Need you"])
     }
+
+    func test_createWithoutHandleUniquesDerivedHandle_becauseRepeatedNewAgentMustNotCollide() throws {
+        let first = try store.create(name: "New Agent", title: "", description: "", provider: .claude)
+        let second = try store.create(name: "New Agent", title: "", description: "", provider: .claude)
+        XCTAssertEqual(first.handle, "new-agent")
+        XCTAssertEqual(second.handle, "new-agent-2")
+    }
 }
