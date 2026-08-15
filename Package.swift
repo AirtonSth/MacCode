@@ -148,7 +148,8 @@ let package = Package(
                 .copy("Resources/Pet")
             ],
             linkerSettings: [
-                .linkedFramework("IOKit")
+                .linkedFramework("IOKit"),
+                .linkedFramework("Virtualization")
             ]
         ),
         .executableTarget(

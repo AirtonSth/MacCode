@@ -835,6 +835,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(source.contains("Isolated / Dedicated VM"))
         XCTAssertFalse(source.contains("Isolated network"))
         XCTAssertFalse(source.contains("Take over"))
+        XCTAssertTrue(source.contains("bots.desktop.vm.start"))
+        XCTAssertTrue(source.contains("bots.desktop.vm.stop"))
         XCTAssertFalse(
             source.contains("Running • macOS VM"),
             "Fleet Home must not paint the concept's fake dedicated VM"
@@ -2047,6 +2049,37 @@ final class BotsWindowTests: XCTestCase {
 
         vm.beginEdit(saved)
         XCTAssertEqual(vm.studioDraft.desktopKind, .dedicatedLocalVM)
+    }
+
+    func test_startDesktopVMPersistsIdentityAndStaysStopped_becauseThereIsNoGuestImage() throws {
+        // WHY: Start/stop must be real work against a persisted identity.
+        // Without a guest image the VM stays stopped and honesty must say so.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        vm.studioDraft.desktopKind = .dedicatedLocalVM
+        _ = try vm.saveStudio()
+
+        XCTAssertNil(vm.desktopVM)
+        vm.startDesktopVM()
+
+        let identity = try XCTUnwrap(vm.desktopVM)
+        XCTAssertEqual(identity.botID, bot.id)
+        XCTAssertEqual(identity.state, .stopped)
+        XCTAssertTrue(
+            identity.lastError == BotDesktopVMIdentity.noGuestImageCode
+                || identity.lastError == BotDesktopVMIdentity.virtualizationUnsupportedCode
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: identity.bundlePath))
+        XCTAssertTrue(vm.desktopHonestyLabel.localizedCaseInsensitiveContains("stopped"))
+        XCTAssertTrue(vm.desktopHonestyLabel.localizedCaseInsensitiveContains("not isolated"))
+        XCTAssertEqual(vm.desktopStatusPill, "Local VM · stopped")
+
+        let firstID = identity.id
+        vm.stopDesktopVM()
+        XCTAssertEqual(vm.desktopVM?.id, firstID)
+        XCTAssertEqual(vm.desktopVM?.state, .stopped)
     }
 
     func test_newStudioBotPersistsDedicatedLocalVM_becauseCreateMustKeepTheSelectedKind() throws {

@@ -150,6 +150,20 @@ final class BotTypesTests: XCTestCase {
         XCTAssertFalse(planeOff.isBotChannelsActive)
     }
 
+    func test_desktopVMHonesty_neverClaimsARunningGuestWithoutAnImage() {
+        let identity = BotDesktopVMIdentity(
+            botID: BotID(),
+            bundlePath: "/tmp/bot-desktop",
+            state: .stopped,
+            lastError: BotDesktopVMIdentity.noGuestImageCode,
+            virtualizationSupported: true
+        )
+        XCTAssertTrue(identity.honestyLabel.localizedCaseInsensitiveContains("no guest image"))
+        XCTAssertTrue(identity.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
+        XCTAssertFalse(identity.honestyLabel.localizedCaseInsensitiveContains("active now"))
+        XCTAssertEqual(identity.statusPill, "Local VM · stopped")
+    }
+
     func test_routineCopy_doesNotClaimAppClosedExecution() {
         XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("Test runs are real work"))
         XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("App-closed schedules stay off"))

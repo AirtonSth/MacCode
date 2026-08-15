@@ -349,6 +349,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var isDesktopVMActive = false
     @Published public private(set) var lastSendStartedProviderRun = false
     @Published public var pendingDeleteID: BotID?
+    @Published public private(set) var desktopVM: BotDesktopVMIdentity?
     public var onLeaveBots: (() -> Void)?
 
     public var displayedDesktopKind: BotDesktopKind {
@@ -359,13 +360,24 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public var desktopHonestyLabel: String {
-        displayedDesktopKind.honestyLabel
+        if displayedDesktopKind == .dedicatedLocalVM, let desktopVM {
+            return desktopVM.honestyLabel
+        }
+        return displayedDesktopKind.honestyLabel
+    }
+
+    public var desktopStatusPill: String {
+        if displayedDesktopKind == .dedicatedLocalVM, let desktopVM {
+            return desktopVM.statusPill
+        }
+        return displayedDesktopKind.statusPill
     }
 
     private let context: AppContext
     private let router: AppCommandRouter?
     private let botStore: BotStore
     private let settingsStore: SettingsStore
+    private let desktopVMRuntime: BotDesktopVMRuntime
     private var messagesByBot: [BotID: [BotDeskMessage]] = [:]
     private var attentionStateByBot: [BotID: BotAttentionState] = [:]
     private var lastPreviewByBot: [BotID: String] = [:]
@@ -387,6 +399,8 @@ public final class BotsViewModel: ObservableObject {
         self.router = router
         self.botStore = context.botStore
         self.settingsStore = SettingsStore(db: context.db)
+        let desktopRoot = context.appSupportDirectory.appendingPathComponent("bot-desktops", isDirectory: true)
+        self.desktopVMRuntime = BotDesktopVMRuntime(store: BotDesktopVMStore(root: desktopRoot))
         restoreQueuedFollowUpsIfNeeded()
         restoreComposerDraftsIfNeeded()
         restoreInspectorDraftsIfNeeded()
@@ -747,6 +761,28 @@ public final class BotsViewModel: ObservableObject {
         )
         beginEdit(created)
         return created
+    }
+
+    public func startDesktopVM() {
+        guard let botID = selectedBotID ?? studioDraft.botID else { return }
+        do {
+            desktopVM = try desktopVMRuntime.start(botID: botID)
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public func stopDesktopVM() {
+        guard let botID = selectedBotID ?? studioDraft.botID else { return }
+        do {
+            desktopVM = try desktopVMRuntime.stop(botID: botID)
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    private func reloadDesktopVM(botID: BotID) {
+        desktopVM = try? desktopVMRuntime.identity(botID: botID)
     }
 
     @discardableResult
@@ -1255,6 +1291,7 @@ public final class BotsViewModel: ObservableObject {
                 selectedRevision = nil
             }
             skillBindings = try botStore.listSkillBindings(botID: id)
+            reloadDesktopVM(botID: id)
             reloadMemory(botID: id)
             reloadRoutines(botID: id)
             reloadContextReceipt(botID: id)
@@ -2738,7 +2775,7 @@ public struct BotsRootView: View {
                     .font(DS.Font.bodyStrong)
                     .foregroundColor(DS.Palette.text)
                 Spacer(minLength: 0)
-                DSPill(kind.statusPill, tone: .neutral)
+                DSPill(vm.desktopStatusPill, tone: .neutral)
             }
             ZStack {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -2757,7 +2794,7 @@ public struct BotsRootView: View {
                     Text(kind.displayTitle)
                         .font(DS.Font.bodyStrong)
                         .foregroundColor(.white)
-                    Text(kind.honestyLabel)
+                    Text(vm.desktopHonestyLabel)
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.warning)
                         .multilineTextAlignment(.center)
@@ -2767,6 +2804,9 @@ public struct BotsRootView: View {
                 .padding(DS.Space.lg)
             }
             .frame(maxWidth: .infinity, minHeight: 188)
+            if kind == .dedicatedLocalVM {
+                desktopVMControls
+            }
             if let model = vm.selectedRevision?.model, !model.isEmpty {
                 Text(model)
                     .font(DS.Font.caption)
@@ -2776,7 +2816,7 @@ public struct BotsRootView: View {
         .dsPanel(padding: DS.Space.lg)
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("bots.home.desktop")
-        .accessibilityLabel("Desktop for \(bot.name). \(kind.honestyLabel)")
+        .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
     }
 
     private var fleetHeader: some View {
@@ -3162,6 +3202,9 @@ public struct BotsRootView: View {
                 .foregroundColor(DS.Palette.warning)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("bots.studio.desktop.honesty")
+            if vm.displayedDesktopKind == .dedicatedLocalVM {
+                desktopVMControls
+            }
         }
         .dsPanel(padding: DS.Space.lg)
         .accessibilityIdentifier("bots.studio.desktop")
@@ -3379,7 +3422,7 @@ public struct BotsRootView: View {
                     .font(DS.Font.bodyStrong)
                     .foregroundColor(DS.Palette.text)
                 Spacer(minLength: 0)
-                DSPill(kind.statusPill, tone: .neutral)
+                DSPill(vm.desktopStatusPill, tone: .neutral)
             }
             ZStack {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -3397,7 +3440,7 @@ public struct BotsRootView: View {
                     Text(kind.displayTitle)
                         .font(DS.Font.bodyStrong)
                         .foregroundColor(.white)
-                    Text(kind.honestyLabel)
+                    Text(vm.desktopHonestyLabel)
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.warning)
                         .multilineTextAlignment(.center)
@@ -3407,11 +3450,35 @@ public struct BotsRootView: View {
                 .padding(DS.Space.lg)
             }
             .frame(maxWidth: .infinity, minHeight: 160)
+            if kind == .dedicatedLocalVM {
+                desktopVMControls
+            }
         }
         .padding(DS.Space.lg)
         .dsBar(edge: .bottom)
         .accessibilityIdentifier("bots.desk.desktop")
-        .accessibilityLabel("Desktop for \(bot.name). \(kind.honestyLabel)")
+        .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
+    }
+
+    private var desktopVMControls: some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            if let identity = vm.desktopVM {
+                Text("Identity \(identity.shortID) · gen \(identity.generation)")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityIdentifier("bots.desktop.vm.identity")
+            }
+            HStack(spacing: DS.Space.sm) {
+                Button("Start") { vm.startDesktopVM() }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(vm.selectedBotID == nil && vm.studioDraft.botID == nil)
+                    .accessibilityIdentifier("bots.desktop.vm.start")
+                Button("Stop") { vm.stopDesktopVM() }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(vm.selectedBotID == nil && vm.studioDraft.botID == nil)
+                    .accessibilityIdentifier("bots.desktop.vm.stop")
+            }
+        }
     }
 
     private func desktopPreviewColors(_ kind: BotDesktopKind) -> [Color] {

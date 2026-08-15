@@ -7,9 +7,11 @@ Product intent this loop: ship remaining P1a-honest work **including Dedicated l
 
 ## Open
 
-- [ ] dedicated-local-vm-runtime Leftover after the select/persist slice: a real dedicated guest (Virtualization.framework or equivalent), not a fake screenshot of a VM. Start/stop, persist the VM identity with the Bot, honest running/stopped copy. No isolated-network / takeover / app-closed claims until those actually work. — seen: 2026-08-15
+- [ ] dedicated-local-vm-boot Leftover after identity/start-stop: boot a real guest from a restore image (IPSW / Disk.img). No isolated-network / takeover / app-closed claims until those actually work. — seen: 2026-08-15
 
 ## Done
+
+- [x] dedicated-local-vm-runtime Persist a per-Bot VM identity on disk and probe Virtualization.framework. Start/Stop stay honest: stopped, no guest image (or unsupported). No running/isolation/takeover claims. Guest boot remains leftover. — seen: 2026-08-15 — done: this fire
 
 - [x] hide-remote-mac Managed remote Mac is no longer advertised — Studio Profile/Desktop offer only Logical execution space and Dedicated local VM; Settings has no remote-Mac toggle; leftover drafts fall back to logical. Persist enum remains decode-only. — seen: 2026-08-15 — done: this fire
 
