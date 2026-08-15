@@ -1075,7 +1075,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             self?.presentWorkspaceContent()
         }
         vm.reload()
-        vm.openFleet()
+        // Keep Desk / Studio / Attention. openFleet() here kicked users
+        // home every time they left Bots and came back.
         let host = NSHostingView(rootView: BotsRootView(vm: vm, embedsRosterRail: false))
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true

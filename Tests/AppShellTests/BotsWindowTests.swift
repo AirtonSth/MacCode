@@ -12,6 +12,8 @@ final class BotsWindowTests: XCTestCase {
         directory = NSTemporaryDirectory() + "rc-bots-window-\(UUID().uuidString)"
         UserDefaults.standard.removeObject(forKey: "bots.inspectorTab")
         UserDefaults.standard.removeObject(forKey: "bots.selectedBotID")
+        UserDefaults.standard.removeObject(forKey: "bots.screen")
+        UserDefaults.standard.removeObject(forKey: "bots.studioTab")
     }
 
     override func tearDown() {
@@ -492,6 +494,80 @@ final class BotsWindowTests: XCTestCase {
         vm.inspectorTab = .routines
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.inspectorTab, .routines)
+    }
+
+    func test_reloadKeepsDesk_becauseRemountMustNotNavigateHome() throws {
+        // WHY: installBotsContent remounts with reload() only. reload must
+        // refresh the open Desk, not convert a paint into Fleet navigation.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.send("Summarize overnight")
+        vm.reload()
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, bot.id)
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+    }
+
+    func test_deskScreenSurvivesRelaunch_becauseLeavingBotsMustNotDropTheChat() throws {
+        // WHY: installBotsContent remounts after Agentic/workspace. Forcing
+        // Fleet Home there (or on a new VM) throws away the open Desk turn.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.send("Summarize overnight")
+        XCTAssertEqual(vm.screen, .desk)
+
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.selectedBotID, bot.id)
+        XCTAssertEqual(reopened.screen, .desk)
+        XCTAssertEqual(reopened.deskMessages.first?.text, "Summarize overnight")
+    }
+
+    func test_studioScreenAndTabSurviveRelaunch_becauseSelectedTabsAreUserWorkflowState() throws {
+        // WHY: Studio Memory/Skills are selected tabs. A remount that lands
+        // on Fleet + Profile makes the user re-find the Brain they were editing.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        vm.studioTab = .memory
+        XCTAssertEqual(vm.screen, .studio)
+
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.selectedBotID, bot.id)
+        XCTAssertEqual(reopened.screen, .studio)
+        XCTAssertEqual(reopened.studioTab, .memory)
+        XCTAssertEqual(reopened.studioDraft.name, "Piper")
+    }
+
+    func test_fleetScreenSurvivesRelaunch_becauseHomeIsAlsoAnExplicitChoice() throws {
+        // WHY: restoring Desk after the user pressed Back would fight them.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.openHome(bot)
+        XCTAssertEqual(vm.screen, .fleet)
+
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.selectedBotID, bot.id)
+        XCTAssertEqual(reopened.screen, .fleet)
+    }
+
+    func test_deletedBotDoesNotRestoreItsDesk_becauseTheTeammateIsGone() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        vm.delete(id: piper.id)
+
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.selectedBotID, quinn.id)
+        XCTAssertEqual(reopened.screen, .fleet)
     }
 
     func test_memoryCorrectAndForgetStayOnDesk_becauseTheInspectorOwnsBrainEdits() throws {
@@ -1461,7 +1537,10 @@ final class BotsWindowTests: XCTestCase {
 
         XCTAssertTrue(main.contains("presentBotsInMainContent"))
         XCTAssertTrue(main.contains("installBotsContent"))
-        XCTAssertTrue(main.contains("vm.openFleet()"))
+        XCTAssertFalse(
+            main.contains("vm.openFleet()"),
+            "remounting Bots must keep Desk/Studio, not force Fleet Home"
+        )
         XCTAssertTrue(main.contains("embedsRosterRail: false"))
         XCTAssertTrue(main.contains("case bots"))
         XCTAssertTrue(main.contains("visibleWorkspaceLabel.stringValue = \"Bots\""))

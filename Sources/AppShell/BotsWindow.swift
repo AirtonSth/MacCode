@@ -219,11 +219,15 @@ public final class BotsViewModel: ObservableObject {
     @Published public var searchText: String = ""
     @Published public var showHidden: Bool = false { didSet { reloadFleet() } }
     @Published public var selectedBotID: BotID?
-    @Published public var screen: BotsScreen = .fleet
+    @Published public var screen: BotsScreen = .fleet {
+        didSet { persistScreen() }
+    }
     @Published public var inspectorTab: BotDeskInspectorTab = .memory {
         didSet { persistInspectorTab() }
     }
-    @Published public var studioTab: BotStudioTab = .profile
+    @Published public var studioTab: BotStudioTab = .profile {
+        didSet { persistStudioTab() }
+    }
     @Published public var studioDraft = BotStudioDraft()
     @Published public var composerText: String = ""
     @Published public var attachments: [AgentAttachment] = []
@@ -279,7 +283,9 @@ public final class BotsViewModel: ObservableObject {
         self.botStore = context.botStore
         self.settingsStore = SettingsStore(db: context.db)
         restoreInspectorTabIfNeeded()
+        restoreStudioTabIfNeeded()
         reload()
+        restoreScreenIfNeeded()
         context.coordinator.addObserver(self)
     }
 
@@ -651,6 +657,7 @@ public final class BotsViewModel: ObservableObject {
             if hidden, selectedBotID == id {
                 selectedBotID = nil
                 screen = .fleet
+                persistSelection()
             }
             reloadFleet()
         } catch {
@@ -664,6 +671,7 @@ public final class BotsViewModel: ObservableObject {
             if selectedBotID == id {
                 selectedBotID = nil
                 screen = .fleet
+                persistSelection()
             }
             reloadFleet()
             reloadAttention()
@@ -1114,6 +1122,8 @@ public final class BotsViewModel: ObservableObject {
 
     private static let selectedBotDefaultsKey = "bots.selectedBotID"
     private static let inspectorTabDefaultsKey = "bots.inspectorTab"
+    private static let screenDefaultsKey = "bots.screen"
+    private static let studioTabDefaultsKey = "bots.studioTab"
 
     private func persistSelection() {
         UserDefaults.standard.set(selectedBotID?.value.uuidString.lowercased(), forKey: Self.selectedBotDefaultsKey)
@@ -1123,10 +1133,45 @@ public final class BotsViewModel: ObservableObject {
         UserDefaults.standard.set(inspectorTab.rawValue, forKey: Self.inspectorTabDefaultsKey)
     }
 
+    private func persistScreen() {
+        UserDefaults.standard.set(screen.rawValue, forKey: Self.screenDefaultsKey)
+    }
+
+    private func persistStudioTab() {
+        UserDefaults.standard.set(studioTab.rawValue, forKey: Self.studioTabDefaultsKey)
+    }
+
     private func restoreInspectorTabIfNeeded() {
         guard let raw = UserDefaults.standard.string(forKey: Self.inspectorTabDefaultsKey),
               let tab = BotDeskInspectorTab(rawValue: raw) else { return }
         inspectorTab = tab
+    }
+
+    private func restoreStudioTabIfNeeded() {
+        guard let raw = UserDefaults.standard.string(forKey: Self.studioTabDefaultsKey),
+              let tab = BotStudioTab(rawValue: raw) else { return }
+        studioTab = tab
+    }
+
+    private func restoreScreenIfNeeded() {
+        guard let raw = UserDefaults.standard.string(forKey: Self.screenDefaultsKey),
+              let saved = BotsScreen(rawValue: raw) else { return }
+        let persistedSelection = UserDefaults.standard.string(forKey: Self.selectedBotDefaultsKey)
+        let selectionMatches = selectedBotID?.value.uuidString.lowercased() == persistedSelection
+        switch saved {
+        case .fleet:
+            return
+        case .desk:
+            guard selectionMatches, let bot = selectedBot else { return }
+            openDesk(bot)
+        case .studio:
+            guard selectionMatches, let bot = selectedBot else { return }
+            let tab = studioTab
+            beginEdit(bot)
+            studioTab = tab
+        case .attention:
+            openAttention()
+        }
     }
 
     private func restoreSelectedBotIfNeeded() {
