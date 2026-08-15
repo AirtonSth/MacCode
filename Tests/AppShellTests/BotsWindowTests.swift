@@ -9,6 +9,8 @@ final class BotsWindowTests: XCTestCase {
 
     override func setUpWithError() throws {
         directory = NSTemporaryDirectory() + "rc-bots-window-\(UUID().uuidString)"
+        UserDefaults.standard.removeObject(forKey: "bots.inspectorTab")
+        UserDefaults.standard.removeObject(forKey: "bots.selectedBotID")
     }
 
     override func tearDown() {
@@ -76,7 +78,85 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.screen, .fleet)
         vm.openDesk(bot)
         XCTAssertEqual(vm.screen, .desk)
-        XCTAssertEqual(vm.detailTab, .desk)
+        XCTAssertEqual(vm.inspectorTab, .memory)
+    }
+
+    func test_deskInspectorKeepsChatVisible_becauseMemoryMustNotReplaceTheConversation() throws {
+        // WHY: Grok keeps Memory beside the chat. Swapping the timeline out
+        // for a Memory tab teaches the user the teammate conversation is gone.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.send("Summarize overnight")
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+        XCTAssertEqual(vm.inspectorTab, .memory)
+
+        vm.inspectorTab = .routines
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+        XCTAssertEqual(vm.inspectorTab, .routines)
+
+        vm.memoryDraft = "Prefers dark mode"
+        vm.addMemory()
+        XCTAssertEqual(vm.memoryItems.map(\.content), ["Prefers dark mode"])
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+        XCTAssertTrue(vm.memoryDraft.isEmpty)
+    }
+
+    func test_routineTestRunSendsTheInstruction_becauseTestRunsAreRealWork() throws {
+        // WHY: Test run is a live supervised turn, not a fake schedule fire.
+        // Enabling Active still must not imply the app runs while closed.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.saveRoutine()
+        let routine = try XCTUnwrap(vm.routines.first)
+        XCTAssertFalse(routine.activation.isEnabled)
+        XCTAssertNil(routine.activation.lastTestRunRequestedAt)
+
+        vm.requestRoutineTestRun(id: routine.definition.id)
+
+        XCTAssertEqual(vm.screen, .desk, "a test run is desk work, not a hidden schedule")
+        XCTAssertEqual(vm.deskMessages.first?.text, "Scan overnight failures")
+        XCTAssertEqual(vm.deskMessages.last?.text, BotsViewModel.assistantPlaceholder)
+        let updated = try XCTUnwrap(vm.routines.first)
+        XCTAssertNotNil(updated.activation.lastTestRunRequestedAt)
+        XCTAssertFalse(updated.activation.isEnabled, "Test run must not silently enable a schedule")
+        XCTAssertFalse(vm.isAutonomyActive)
+        XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("App-closed schedules stay off"))
+    }
+
+    func test_inspectorTabSurvivesRelaunch_becauseSelectedTabsAreUserWorkflowState() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.inspectorTab = .routines
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.inspectorTab, .routines)
+    }
+
+    func test_memoryCorrectAndForgetStayOnDesk_becauseTheInspectorOwnsBrainEdits() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.send("Keep chatting")
+        vm.memoryDraft = "Prefers dark mode"
+        vm.addMemory()
+        let item = try XCTUnwrap(vm.memoryItems.first)
+        vm.correctMemory(id: item.id, content: "Prefers light mode")
+        XCTAssertEqual(vm.memoryItems.map(\.content), ["Prefers light mode"])
+        vm.forgetMemory(id: try XCTUnwrap(vm.memoryItems.first).id)
+        XCTAssertTrue(vm.memoryItems.isEmpty)
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.deskMessages.first?.text, "Keep chatting")
     }
 
     func test_studioFromHomeOpensStudio_becauseBrainEditsStayOffTheOverview() throws {
@@ -775,6 +855,24 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.permission\")"))
         XCTAssertTrue(bots.contains("bots.desk.role.user"))
         XCTAssertTrue(bots.contains("bots.desk.role.assistant"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.inspector\")"))
+        XCTAssertTrue(bots.contains("bots.desk.inspector.tab.memory"))
+        XCTAssertTrue(bots.contains("bots.desk.inspector.tab.routines"))
+        XCTAssertTrue(bots.contains("bots.desk.inspector.memory"))
+        XCTAssertTrue(bots.contains("bots.desk.inspector.routines"))
+        XCTAssertTrue(bots.contains("bots.memory.field"))
+        XCTAssertTrue(bots.contains("bots.memory.add"))
+        XCTAssertTrue(bots.contains("bots.memory.list"))
+        XCTAssertTrue(bots.contains("bots.memory.correct"))
+        XCTAssertTrue(bots.contains("bots.memory.forget"))
+        XCTAssertTrue(bots.contains("bots.routines.name"))
+        XCTAssertTrue(bots.contains("bots.routines.instruction"))
+        XCTAssertTrue(bots.contains("bots.routines.when"))
+        XCTAssertTrue(bots.contains("bots.routines.active"))
+        XCTAssertTrue(bots.contains("bots.routines.test"))
+        XCTAssertTrue(bots.contains("bots.routines.honesty"))
+        XCTAssertFalse(bots.contains("BotDetailTab"))
+        XCTAssertFalse(bots.contains("detailTab = .desk"))
         XCTAssertTrue(bots.contains("BOT ROSTER"))
         XCTAssertFalse(bots.contains("Take over"))
         XCTAssertFalse(bots.contains("Dedicated macOS VM"))

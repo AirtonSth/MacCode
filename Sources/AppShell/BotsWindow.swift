@@ -138,8 +138,7 @@ public enum BotsScreen: String, Equatable {
     case attention
 }
 
-public enum BotDetailTab: String, CaseIterable, Identifiable {
-    case desk
+public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
     case memory
     case routines
 
@@ -147,9 +146,15 @@ public enum BotDetailTab: String, CaseIterable, Identifiable {
 
     public var title: String {
         switch self {
-        case .desk: return "Desk"
         case .memory: return "Memory"
         case .routines: return "Routines"
+        }
+    }
+
+    public var accessibilityIdentifier: String {
+        switch self {
+        case .memory: return "bots.desk.inspector.tab.memory"
+        case .routines: return "bots.desk.inspector.tab.routines"
         }
     }
 }
@@ -195,7 +200,9 @@ public final class BotsViewModel: ObservableObject {
     @Published public var showHidden: Bool = false { didSet { reloadFleet() } }
     @Published public var selectedBotID: BotID?
     @Published public var screen: BotsScreen = .fleet
-    @Published public var detailTab: BotDetailTab = .desk
+    @Published public var inspectorTab: BotDeskInspectorTab = .memory {
+        didSet { persistInspectorTab() }
+    }
     @Published public var studioTab: BotStudioTab = .profile
     @Published public var studioDraft = BotStudioDraft()
     @Published public var composerText: String = ""
@@ -240,6 +247,7 @@ public final class BotsViewModel: ObservableObject {
         self.router = router
         self.botStore = context.botStore
         self.settingsStore = SettingsStore(db: context.db)
+        restoreInspectorTabIfNeeded()
         reload()
     }
 
@@ -394,7 +402,6 @@ public final class BotsViewModel: ObservableObject {
 
     public func openDesk(_ bot: BotDefinition) {
         selectedBotID = bot.id
-        detailTab = .desk
         screen = .desk
         persistSelection()
         markOpenedConversationRead(botID: bot.id)
@@ -782,9 +789,21 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func requestRoutineTestRun(id: BotRoutineID) {
+        guard let routine = routines.first(where: { $0.definition.id == id }) else { return }
+        let instruction = routine.definition.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !instruction.isEmpty else {
+            errorMessage = "Routine instruction is required."
+            return
+        }
         do {
             try botStore.requestRoutineTestRun(id: id)
             if let botID = selectedBotID { reloadRoutines(botID: botID) }
+            if let bot = selectedBot, screen != .desk {
+                openDesk(bot)
+            }
+            // Test run is a live supervised turn. Enabling a schedule still
+            // does not execute while RemoteCode is closed.
+            send(instruction)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -928,9 +947,20 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private static let selectedBotDefaultsKey = "bots.selectedBotID"
+    private static let inspectorTabDefaultsKey = "bots.inspectorTab"
 
     private func persistSelection() {
         UserDefaults.standard.set(selectedBotID?.value.uuidString.lowercased(), forKey: Self.selectedBotDefaultsKey)
+    }
+
+    private func persistInspectorTab() {
+        UserDefaults.standard.set(inspectorTab.rawValue, forKey: Self.inspectorTabDefaultsKey)
+    }
+
+    private func restoreInspectorTabIfNeeded() {
+        guard let raw = UserDefaults.standard.string(forKey: Self.inspectorTabDefaultsKey),
+              let tab = BotDeskInspectorTab(rawValue: raw) else { return }
+        inspectorTab = tab
     }
 
     private func restoreSelectedBotIfNeeded() {
@@ -2198,18 +2228,7 @@ public struct BotsRootView: View {
             if let bot = vm.selectedBot {
                 VStack(spacing: 0) {
                     deskHeader(bot)
-                    deskTabs
-                    Group {
-                        switch vm.detailTab {
-                        case .desk:
-                            deskChat(bot)
-                        case .memory:
-                            memoryTab
-                        case .routines:
-                            routinesTab
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    deskChat(bot)
                 }
                 .accessibilityIdentifier("bots.desk")
             } else {
@@ -2269,34 +2288,6 @@ public struct BotsRootView: View {
         .dsBar(edge: .bottom)
     }
 
-    private var deskTabs: some View {
-        HStack(spacing: DS.Space.md) {
-            ForEach(BotDetailTab.allCases) { tab in
-                if tab == .memory && !vm.isMemoryActive {
-                    EmptyView()
-                } else {
-                    let selected = vm.detailTab == tab
-                    Button {
-                        vm.detailTab = tab
-                    } label: {
-                        Text(tab.title)
-                            .font(DS.Font.body.weight(selected ? .semibold : .regular))
-                            .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
-                            .padding(.horizontal, DS.Space.lg)
-                            .padding(.vertical, DS.Space.sm)
-                            .background(selected ? DS.Palette.accent : DS.Palette.surfaceRaised)
-                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(selected ? .isSelected : [])
-                }
-            }
-            Spacer()
-        }
-        .padding(.horizontal, DS.Space.xxl)
-        .padding(.vertical, DS.Space.lg)
-    }
-
     private func deskChat(_ bot: BotDefinition) -> some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
@@ -2308,9 +2299,139 @@ public struct BotsRootView: View {
                 .fill(DS.Palette.line)
                 .frame(width: 1)
                 .accessibilityHidden(true)
-            deskDesktop(bot)
+            deskInspector(bot)
                 .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
         }
+    }
+
+    private func deskInspector(_ bot: BotDefinition) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: DS.Space.sm) {
+                ForEach(BotDeskInspectorTab.allCases) { tab in
+                    if tab == .memory && !vm.isMemoryActive {
+                        EmptyView()
+                    } else {
+                        let selected = resolvedInspectorTab == tab
+                        Button {
+                            vm.inspectorTab = tab
+                        } label: {
+                            Text(tab.title)
+                                .font(DS.Font.caption.weight(selected ? .semibold : .regular))
+                                .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
+                                .padding(.horizontal, DS.Space.md)
+                                .padding(.vertical, DS.Space.sm)
+                                .background(selected ? DS.Palette.accent : DS.Palette.surfaceRaised)
+                                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(selected ? .isSelected : [])
+                        .accessibilityIdentifier(tab.accessibilityIdentifier)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.top, DS.Space.lg)
+            .padding(.bottom, DS.Space.md)
+
+            Group {
+                switch resolvedInspectorTab {
+                case .memory:
+                    inspectorMemory
+                case .routines:
+                    inspectorRoutines
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            deskDesktopHonesty(bot)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(DS.Palette.surface)
+        .accessibilityIdentifier("bots.desk.inspector")
+    }
+
+    private var resolvedInspectorTab: BotDeskInspectorTab {
+        if vm.inspectorTab == .memory && !vm.isMemoryActive {
+            return .routines
+        }
+        return vm.inspectorTab
+    }
+
+    private var inspectorMemory: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            if vm.isMemoryActive {
+                HStack(spacing: DS.Space.sm) {
+                    studioField(placeholder: "Remember a fact", text: $vm.memoryDraft)
+                        .accessibilityIdentifier("bots.memory.field")
+                    Button("Add") { vm.addMemory() }
+                        .buttonStyle(DSPrimaryButtonStyle())
+                        .disabled(vm.memoryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityIdentifier("bots.memory.add")
+                }
+            } else {
+                Text("Memory mutations are off. Turn on Bot memory in Settings.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+            if vm.memoryItems.isEmpty {
+                Text("No remembered facts yet.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: DS.Space.sm) {
+                        ForEach(vm.memoryItems, id: \.id) { item in
+                            memoryRow(item, compact: true)
+                        }
+                    }
+                }
+                .accessibilityIdentifier("bots.memory.list")
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.bottom, DS.Space.md)
+        .accessibilityIdentifier("bots.desk.inspector.memory")
+    }
+
+    private var inspectorRoutines: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                Text(BotRoutineCopy.testRunHonestyCaption)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("bots.routines.honesty")
+                labeledField("Name") {
+                    studioField(placeholder: "Morning scan", text: $vm.routineName)
+                        .accessibilityIdentifier("bots.routines.name")
+                }
+                labeledField("Instruction") {
+                    studioMultiline(text: $vm.routinePrompt, minHeight: 56, maxHeight: 96)
+                        .accessibilityIdentifier("bots.routines.instruction")
+                }
+                labeledField("When") {
+                    studioField(placeholder: "Weekdays 9:00", text: $vm.routineScheduleNote)
+                        .accessibilityIdentifier("bots.routines.when")
+                }
+                Button("Save routine") { vm.saveRoutine() }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("bots.routines.save")
+                if vm.routines.isEmpty {
+                    Text("No routines yet.")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                } else {
+                    ForEach(vm.routines, id: \.definition.id) { routine in
+                        routineRow(routine)
+                    }
+                }
+            }
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.bottom, DS.Space.md)
+        }
+        .accessibilityIdentifier("bots.desk.inspector.routines")
     }
 
     private func deskTimeline(_ bot: BotDefinition) -> some View {
@@ -2409,37 +2530,27 @@ public struct BotsRootView: View {
         }
     }
 
-    private func deskDesktop(_ bot: BotDefinition) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
+    private func deskDesktopHonesty(_ bot: BotDefinition) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
             HStack(spacing: DS.Space.sm) {
-                DSSectionHeaderG("Desktop")
+                Text("Desktop")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
                 Spacer(minLength: 0)
                 DSPill("Logical space", tone: .neutral)
             }
-            VStack(spacing: DS.Space.md) {
-                Image(systemName: "desktopcomputer")
-                    .font(.system(size: 28, weight: .regular))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityHidden(true)
-                Text("Logical execution space")
-                    .font(DS.Font.bodyStrong)
-                    .foregroundColor(DS.Palette.text)
-                    .multilineTextAlignment(.center)
-                Text(vm.desktopHonestyLabel)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.warning)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("bots.desk.desktop.honesty")
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(DS.Space.lg)
-            .background(DS.Palette.surfaceRaised)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            Text("Logical execution space")
+                .font(DS.Font.caption.weight(.medium))
+                .foregroundColor(DS.Palette.text)
+            Text(vm.desktopHonestyLabel)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.warning)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("bots.desk.desktop.honesty")
         }
         .padding(DS.Space.lg)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(DS.Palette.surface)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
         .accessibilityIdentifier("bots.desk.desktop")
         .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
     }
@@ -2549,30 +2660,33 @@ public struct BotsRootView: View {
         .accessibilityIdentifier("bots.studio.skills")
     }
 
-    private func memoryRow(_ item: BotMemoryItem) -> some View {
+    private func memoryRow(_ item: BotMemoryItem, compact: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             Text(item.content)
                 .font(DS.Font.body)
                 .foregroundColor(DS.Palette.text)
                 .textSelection(.enabled)
-            HStack(spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
                 Text(item.provenance)
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
+                Spacer(minLength: 0)
                 if vm.isMemoryActive {
                     Button("Correct") {
                         let next = promptCorrection(current: item.content)
                         if let next { vm.correctMemory(id: item.id, content: next) }
                     }
                     .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("bots.memory.correct")
                     Button("Forget", role: .destructive) {
                         vm.forgetMemory(id: item.id)
                     }
                     .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("bots.memory.forget")
                 }
             }
         }
-        .dsPanel(padding: DS.Space.lg)
+        .dsPanel(padding: compact ? DS.Space.md : DS.Space.lg)
     }
 
     private func promptCorrection(current: String) -> String? {
@@ -2597,14 +2711,24 @@ public struct BotsRootView: View {
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.warning)
                 .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("bots.routines.honesty")
             if !vm.isAutonomyActive {
                 Text("Enabling a schedule does not run while RemoteCode is closed.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
             }
-            labeledField("Name") { studioField(placeholder: "Morning scan", text: $vm.routineName) }
-            labeledField("Instruction") { studioMultiline(text: $vm.routinePrompt, minHeight: 72, maxHeight: 140) }
-            labeledField("When") { studioField(placeholder: "Weekdays 9:00", text: $vm.routineScheduleNote) }
+            labeledField("Name") {
+                studioField(placeholder: "Morning scan", text: $vm.routineName)
+                    .accessibilityIdentifier("bots.routines.name")
+            }
+            labeledField("Instruction") {
+                studioMultiline(text: $vm.routinePrompt, minHeight: 72, maxHeight: 140)
+                    .accessibilityIdentifier("bots.routines.instruction")
+            }
+            labeledField("When") {
+                studioField(placeholder: "Weekdays 9:00", text: $vm.routineScheduleNote)
+                    .accessibilityIdentifier("bots.routines.when")
+            }
             Button("Save routine") { vm.saveRoutine() }
                 .buttonStyle(DSSecondaryButtonStyle())
                 .accessibilityIdentifier("bots.routines.save")
@@ -2630,12 +2754,13 @@ public struct BotsRootView: View {
                     .font(DS.Font.bodyStrong)
                     .foregroundColor(DS.Palette.text)
                 Spacer()
-                Toggle(routine.activation.isEnabled ? "On" : "Paused", isOn: Binding(
+                Toggle("Active", isOn: Binding(
                     get: { routine.activation.isEnabled },
                     set: { vm.setRoutineEnabled(id: routine.definition.id, enabled: $0) }
                 ))
                 .toggleStyle(.switch)
                 .controlSize(.small)
+                .accessibilityIdentifier("bots.routines.active")
             }
             Text(routine.definition.prompt)
                 .font(DS.Font.caption)
@@ -2647,6 +2772,7 @@ public struct BotsRootView: View {
             }
             Button("Test run") { vm.requestRoutineTestRun(id: routine.definition.id) }
                 .buttonStyle(DSSecondaryButtonStyle())
+                .accessibilityIdentifier("bots.routines.test")
             if let at = routine.activation.lastTestRunRequestedAt {
                 Text("Test run requested \(at.formatted(date: .abbreviated, time: .shortened))")
                     .font(DS.Font.caption2)
