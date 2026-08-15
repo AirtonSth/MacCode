@@ -7,6 +7,16 @@ import SwiftUI
 
 // MARK: - Drafts & rows
 
+public struct BotQueuedFollowUp: Equatable {
+    public var text: String
+    public var attachments: [AgentAttachment]
+
+    public init(text: String, attachments: [AgentAttachment] = []) {
+        self.text = text
+        self.attachments = attachments
+    }
+}
+
 public struct BotStudioDraft: Equatable {
     public var botID: BotID?
     public var name: String
@@ -210,6 +220,9 @@ public final class BotsViewModel: ObservableObject {
     @Published public var studioTab: BotStudioTab = .profile
     @Published public var studioDraft = BotStudioDraft()
     @Published public var composerText: String = ""
+    @Published public var attachments: [AgentAttachment] = []
+    @Published public var isStopping = false
+    @Published public private(set) var queuedFollowUps: [BotQueuedFollowUp] = []
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
     @Published public private(set) var deskWorkLog: [BotDeskWorkLogRow] = []
     @Published public private(set) var conversations: [BotConversation] = []
@@ -626,15 +639,65 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    public var deskRunIsLive: Bool {
+        deskWorkLog.contains { $0.statusLabel == "Working" }
+    }
+
+    public var deskSendEnabled: Bool {
+        AgentChatTranscriptChrome.admitsSend(text: composerText, attachmentCount: attachments.count)
+    }
+
+    public func deskWorkingLabel(now: Date = Date()) -> String? {
+        AgentChatTranscriptChrome.deskWorkingLabel(
+            runIsLive: deskRunIsLive,
+            startedAt: deskWorkLog.first(where: { $0.statusLabel == "Working" })?.createdAt,
+            now: now
+        )
+    }
+
+    public func addAttachments(_ paths: [String]) {
+        do {
+            let staged = try AgentAttachmentResolver.resolve(paths: paths)
+            var known = Set(attachments.map(\.path))
+            for attachment in staged where known.insert(attachment.path).inserted {
+                attachments.append(attachment)
+            }
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public func removeAttachment(_ attachment: AgentAttachment) {
+        attachments.removeAll { $0 == attachment }
+    }
+
+    public func stopDeskRun() {
+        guard let threadID = selectedConversation?.linkedAgentThreadID else { return }
+        isStopping = true
+        do {
+            try resolvedRouter()?.stopAgentRun(thread: threadID)
+        } catch {
+            errorMessage = String(describing: error)
+            isStopping = false
+        }
+    }
+
     public func send(_ text: String? = nil) {
+        let attached = attachments
         let message = (text ?? composerText).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !message.isEmpty else { return }
+        guard AgentChatTranscriptChrome.admitsSend(text: message, attachmentCount: attached.count) else { return }
         guard let bot = selectedBot else { return }
         composerText = ""
+        attachments = []
         lastSendStartedProviderRun = false
+        if deskRunIsLive, text == nil {
+            queuedFollowUps.append(BotQueuedFollowUp(text: message, attachments: attached))
+            return
+        }
         do {
-            let conversation = try persistUserMessage(bot: bot, text: message)
-            appendDeskMessage(BotDeskMessage(role: .user, text: message), botID: bot.id)
+            let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attached)
+            let conversation = try persistUserMessage(bot: bot, text: display)
+            appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: bot.id)
             if let router = resolvedRouter(),
                let revision = try currentRevision(for: bot) {
                 Task { [weak self] in
@@ -644,6 +707,7 @@ public final class BotsViewModel: ObservableObject {
                         revision: revision,
                         conversation: conversation,
                         userText: message,
+                        attachments: attached,
                         router: router
                     )
                     if let runId = started {
@@ -1178,6 +1242,7 @@ public final class BotsViewModel: ObservableObject {
         revision: BotRevision,
         conversation: BotConversation,
         userText: String,
+        attachments: [AgentAttachment] = [],
         router: AppCommandRouter
     ) async -> AgentRunID? {
         let workspaceID = bot.workspaceID
@@ -1225,7 +1290,8 @@ public final class BotsViewModel: ObservableObject {
                 model: model,
                 permissionMode: .supervised,
                 reasoningEffort: revision.reasoningEffort,
-                providerInstanceId: revision.providerInstanceID
+                providerInstanceId: revision.providerInstanceID,
+                attachments: attachments
             )
             return result.runId
         } catch {
@@ -1253,6 +1319,14 @@ public final class BotsViewModel: ObservableObject {
             }
         }
         applyFollowThrough(bot: bot, conversation: conversation, run: try? context.runRepo.get(id: runId))
+    }
+
+    private func drainQueuedFollowUp() {
+        guard !queuedFollowUps.isEmpty else { return }
+        let next = queuedFollowUps.removeFirst()
+        composerText = next.text
+        attachments = next.attachments
+        send()
     }
 
     private func applyFollowThrough(
@@ -1303,6 +1377,10 @@ public final class BotsViewModel: ObservableObject {
             reloadFleet()
         } catch {
             errorMessage = String(describing: error)
+        }
+        isStopping = false
+        if BotsDeskFollowThrough.isTerminal(status) {
+            drainQueuedFollowUp()
         }
     }
 
@@ -2814,16 +2892,26 @@ public struct BotsRootView: View {
     }
 
     private func composerBar(_ bot: BotDefinition) -> some View {
-        AgentChatComposerBar(
-            text: $vm.composerText,
-            placeholder: AgentChatTranscriptChrome.composerPlaceholder(
-                providerDisplayName: vm.providerLabel(for: bot) ?? bot.name
-            ),
-            sendEnabled: !vm.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-            onSend: { vm.send() },
-            composerIdentifier: "bots.desk.composer",
-            sendIdentifier: "bots.desk.send"
-        )
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            AgentChatComposerBar(
+                text: $vm.composerText,
+                attachments: vm.attachments,
+                placeholder: AgentChatTranscriptChrome.composerPlaceholder(
+                    providerDisplayName: vm.providerLabel(for: bot) ?? bot.name
+                ),
+                sendEnabled: vm.deskSendEnabled,
+                runActive: vm.deskRunIsLive,
+                isStopping: vm.isStopping,
+                workingLabel: vm.deskWorkingLabel(now: context.date),
+                attachEnabled: true,
+                onSend: { vm.send() },
+                onStop: { vm.stopDeskRun() },
+                onAttach: { vm.addAttachments($0) },
+                onRemoveAttachment: { vm.removeAttachment($0) },
+                composerIdentifier: "bots.desk.composer",
+                sendIdentifier: "bots.desk.send"
+            )
+        }
     }
 
     // MARK: Memory

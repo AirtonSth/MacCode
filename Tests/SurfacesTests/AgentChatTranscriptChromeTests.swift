@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 @testable import Surfaces
 
 final class AgentChatTranscriptChromeTests: XCTestCase {
@@ -66,6 +67,40 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         XCTAssertEqual(
             AgentChatTranscriptChrome.composerPlaceholder(providerDisplayName: "Claude"),
             "Ask Claude for changes…"
+        )
+    }
+
+    func test_admitsSend_matchesAgentAppEmptyRule_becauseAttachmentsCountAsATurn() {
+        // WHY: Agent App send is enabled with files and empty text. Desk must
+        // use the same admission so attach-only turns are not silently dropped.
+        XCTAssertFalse(AgentChatTranscriptChrome.admitsSend(text: "  ", attachmentCount: 0))
+        XCTAssertTrue(AgentChatTranscriptChrome.admitsSend(text: "go", attachmentCount: 0))
+        XCTAssertTrue(AgentChatTranscriptChrome.admitsSend(text: "", attachmentCount: 1))
+    }
+
+    func test_displayUserLine_prefixesAttachmentsLikeAgentApp() {
+        // WHY: the transcript must show what was attached, the same way Agent
+        // App suffixes 📎 names onto the user line.
+        let file = AgentAttachment(path: "/tmp/brief.pdf", displayName: "brief.pdf", kind: .file)
+        XCTAssertEqual(
+            AgentChatTranscriptChrome.displayUserLine(text: "Review this", attachments: [file]),
+            "Review this\n\n📎 brief.pdf"
+        )
+        XCTAssertEqual(
+            AgentChatTranscriptChrome.displayUserLine(text: "  ", attachments: [file]),
+            "📎 brief.pdf"
+        )
+    }
+
+    func test_deskWorkingLabel_usesAgentAppThinkingPhase() {
+        // WHY: a live bot turn must show the same working phrase Agent App
+        // uses, not only a work-log pill.
+        let start = Date(timeIntervalSince1970: 0)
+        let now = Date(timeIntervalSince1970: 12)
+        XCTAssertNil(AgentChatTranscriptChrome.deskWorkingLabel(runIsLive: false, startedAt: start, now: now))
+        XCTAssertEqual(
+            AgentChatTranscriptChrome.deskWorkingLabel(runIsLive: true, startedAt: start, now: now),
+            AgentWorkingStripPresentation.label(phase: .thinking, elapsedSeconds: 12)
         )
     }
 }

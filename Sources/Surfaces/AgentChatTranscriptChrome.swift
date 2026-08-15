@@ -1,6 +1,8 @@
 import AppKit
+import CoreModel
 import DesignSystemKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Shared Agent App transcript chrome. Bots Desk uses these views so chat
 /// layout, bubble hug, markdown, copy, and composer match Agent App.
@@ -20,6 +22,36 @@ public enum AgentChatTranscriptChrome {
 
     public static func composerPlaceholder(providerDisplayName: String) -> String {
         "Ask \(providerDisplayName) for changes…"
+    }
+
+    public static func displayUserLine(text: String, attachments: [AgentAttachment]) -> String {
+        let names = attachments.map(\.displayName).filter { !$0.isEmpty }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if names.isEmpty { return trimmed }
+        let suffix = "📎 " + names.joined(separator: ", ")
+        if trimmed.isEmpty { return suffix }
+        return trimmed + "\n\n" + suffix
+    }
+
+    public static func admitsSend(text: String, attachmentCount: Int) -> Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || attachmentCount > 0
+    }
+
+    public static func deskWorkingLabel(runIsLive: Bool, startedAt: Date?, now: Date = Date()) -> String? {
+        let phase = AgentWorkingStripPresentation.phase(
+            runIsLive: runIsLive,
+            isAwaitingBackground: false,
+            backgroundShellCount: 0,
+            activeSubagentCount: 0,
+            hasStreamingTools: false
+        )
+        let elapsed = startedAt.map { max(0, Int(now.timeIntervalSince($0))) }
+        return AgentWorkingStripPresentation.label(phase: phase, elapsedSeconds: elapsed)
+    }
+
+    public static func isImagePath(_ path: String) -> Bool {
+        let ext = (path as NSString).pathExtension.lowercased()
+        return ["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"].contains(ext)
     }
 
     public static func relativeTimestamp(_ date: Date, now: Date = Date()) -> String {
@@ -168,30 +200,71 @@ public struct AgentChatAssistantReply: View {
 
 public struct AgentChatComposerBar: View {
     @Binding public var text: String
+    public let attachments: [AgentAttachment]
     public let placeholder: String
     public let sendEnabled: Bool
+    public let runActive: Bool
+    public let isStopping: Bool
+    public let workingLabel: String?
+    public let attachEnabled: Bool
     public let onSend: () -> Void
+    public let onStop: () -> Void
+    public let onAttach: ([String]) -> Void
+    public let onRemoveAttachment: (AgentAttachment) -> Void
     public var composerIdentifier: String = "bots.desk.composer"
     public var sendIdentifier: String = "bots.desk.send"
 
     public init(
         text: Binding<String>,
+        attachments: [AgentAttachment] = [],
         placeholder: String,
         sendEnabled: Bool,
+        runActive: Bool = false,
+        isStopping: Bool = false,
+        workingLabel: String? = nil,
+        attachEnabled: Bool = true,
         onSend: @escaping () -> Void,
+        onStop: @escaping () -> Void = {},
+        onAttach: @escaping ([String]) -> Void = { _ in },
+        onRemoveAttachment: @escaping (AgentAttachment) -> Void = { _ in },
         composerIdentifier: String = "bots.desk.composer",
         sendIdentifier: String = "bots.desk.send"
     ) {
         self._text = text
+        self.attachments = attachments
         self.placeholder = placeholder
         self.sendEnabled = sendEnabled
+        self.runActive = runActive
+        self.isStopping = isStopping
+        self.workingLabel = workingLabel
+        self.attachEnabled = attachEnabled
         self.onSend = onSend
+        self.onStop = onStop
+        self.onAttach = onAttach
+        self.onRemoveAttachment = onRemoveAttachment
         self.composerIdentifier = composerIdentifier
         self.sendIdentifier = sendIdentifier
     }
 
     public var body: some View {
         VStack(spacing: 0) {
+            if let workingLabel {
+                HStack {
+                    DSPill(workingLabel, tone: .accent)
+                        .help(workingLabel)
+                        .accessibilityIdentifier("agent.workingPhase")
+                        .accessibilityLabel(workingLabel)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.top, DS.Space.sm)
+                .accessibilityIdentifier("bots.desk.workingPhase")
+            }
+            if !attachments.isEmpty {
+                attachmentChips
+                    .padding(.horizontal, DS.Space.lg)
+                    .padding(.top, DS.Space.md)
+            }
             TextField(placeholder, text: $text, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...8)
@@ -203,32 +276,28 @@ public struct AgentChatComposerBar: View {
                 .accessibilityLabel(placeholder)
                 .accessibilityIdentifier(composerIdentifier)
                 .onSubmit(onSend)
-            HStack {
-                Spacer(minLength: 0)
-                Button(action: onSend) {
-                    ZStack {
-                        Circle()
-                            .fill(sendEnabled ? DS.Palette.accent : DS.Palette.surfaceRaised)
-                            .frame(
-                                width: AgentChatTranscriptChrome.sendCircleSize,
-                                height: AgentChatTranscriptChrome.sendCircleSize
-                            )
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundColor(sendEnabled ? DS.Palette.onAccent : DS.Palette.textTertiary)
-                    }
-                    .frame(
-                        width: AgentChatTranscriptChrome.sendHitTarget,
-                        height: AgentChatTranscriptChrome.sendHitTarget
-                    )
-                    .contentShape(Rectangle())
+            HStack(spacing: DS.Space.sm) {
+                Button(action: pickAttachments) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 13, weight: .medium))
+                        .frame(width: 26, height: 26)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(!sendEnabled)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .accessibilityLabel("Send")
-                .accessibilityIdentifier(sendIdentifier)
-                .help("Send prompt")
+                .disabled(!attachEnabled)
+                .foregroundColor(DS.Palette.textSecondary)
+                .help("Attach files")
+                .accessibilityLabel("Attach files")
+                .accessibilityIdentifier("agent.attach")
+                Spacer(minLength: 0)
+                if runActive {
+                    stopButton
+                    Rectangle()
+                        .fill(DS.Palette.line)
+                        .frame(width: DS.Border.hairline, height: 18)
+                        .padding(.horizontal, DS.Space.xxs)
+                }
+                sendButton
             }
             .padding(.horizontal, DS.Space.md)
             .padding(.vertical, DS.Space.sm)
@@ -241,5 +310,126 @@ public struct AgentChatComposerBar: View {
         )
         .padding(DS.Space.lg)
         .background(DS.Palette.bg)
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            loadDroppedFiles(from: providers)
+        }
+    }
+
+    private var sendButton: some View {
+        Button(action: onSend) {
+            ZStack {
+                Circle()
+                    .fill(sendEnabled ? DS.Palette.accent : DS.Palette.surfaceRaised)
+                    .frame(
+                        width: AgentChatTranscriptChrome.sendCircleSize,
+                        height: AgentChatTranscriptChrome.sendCircleSize
+                    )
+                Image(systemName: runActive ? "text.line.first.and.arrowtriangle.forward" : "arrow.up")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(sendEnabled ? DS.Palette.onAccent : DS.Palette.textTertiary)
+            }
+            .frame(
+                width: AgentChatTranscriptChrome.sendHitTarget,
+                height: AgentChatTranscriptChrome.sendHitTarget
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!sendEnabled)
+        .keyboardShortcut(.return, modifiers: [.command])
+        .accessibilityLabel(runActive ? "Queue message" : "Send")
+        .accessibilityIdentifier(sendIdentifier)
+        .help(runActive ? "Queue message for this thread" : "Send prompt")
+    }
+
+    private var stopButton: some View {
+        Button(action: onStop) {
+            ZStack {
+                Circle()
+                    .fill(isStopping ? DS.Palette.surfaceRaised : DS.Palette.danger)
+                    .frame(
+                        width: AgentChatTranscriptChrome.sendCircleSize,
+                        height: AgentChatTranscriptChrome.sendCircleSize
+                    )
+                if isStopping {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(DS.Palette.textSecondary)
+                } else {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(DS.Palette.bg)
+                }
+            }
+            .frame(
+                width: AgentChatTranscriptChrome.sendHitTarget,
+                height: AgentChatTranscriptChrome.sendHitTarget
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isStopping ? "Force stop running agent" : "Stop running agent")
+        .accessibilityIdentifier("agent.composer.stop")
+        .help(isStopping
+              ? "Still stopping — click again to force-stop the provider"
+              : "Stop running agent")
+    }
+
+    private var attachmentChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: DS.Space.sm) {
+                ForEach(attachments, id: \.self) { attachment in
+                    HStack(spacing: DS.Space.xs) {
+                        if AgentChatTranscriptChrome.isImagePath(attachment.path),
+                           let img = NSImage(contentsOfFile: attachment.path) {
+                            Image(nsImage: img)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 18, height: 18)
+                                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                        } else {
+                            Image(systemName: AgentChatTranscriptChrome.isImagePath(attachment.path) ? "photo" : "doc")
+                                .font(.system(size: 9))
+                        }
+                        Text(attachment.displayName)
+                            .font(DS.Font.caption2).lineLimit(1)
+                        Button { onRemoveAttachment(attachment) } label: {
+                            Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove \(attachment.displayName)")
+                    }
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .padding(.horizontal, DS.Space.sm).padding(.vertical, 3)
+                    .background(DS.Palette.surfaceRaised)
+                    .clipShape(Capsule())
+                    .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    .accessibilityIdentifier("bots.desk.attachment.\(attachment.displayName)")
+                }
+            }
+        }
+        .accessibilityIdentifier("bots.desk.attachments")
+    }
+
+    private func pickAttachments() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK {
+            onAttach(panel.urls.map(\.path))
+        }
+    }
+
+    private func loadDroppedFiles(from providers: [NSItemProvider]) -> Bool {
+        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !fileProviders.isEmpty else { return false }
+        for provider in fileProviders {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, url.isFileURL else { return }
+                DispatchQueue.main.async { onAttach([url.path]) }
+            }
+        }
+        return true
     }
 }

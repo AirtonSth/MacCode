@@ -21,6 +21,55 @@ final class BotsWindowTests: XCTestCase {
         directory = nil
     }
 
+    func test_deskSendAdmitsAndClearsAttachments_becauseAnexosMustReachTheTurn() throws {
+        // WHY: Desk must stage, preview, remove, and send files through the
+        // real bot send path — not a decorative chip list.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        let file = (directory as NSString).appendingPathComponent("brief.pdf")
+        FileManager.default.createFile(atPath: file, contents: Data("hi".utf8))
+        vm.addAttachments([file])
+        XCTAssertEqual(vm.attachments.map(\.displayName), ["brief.pdf"])
+        vm.removeAttachment(vm.attachments[0])
+        XCTAssertTrue(vm.attachments.isEmpty)
+        vm.addAttachments([file])
+        vm.composerText = ""
+        XCTAssertTrue(vm.deskSendEnabled)
+        vm.send()
+        XCTAssertTrue(vm.attachments.isEmpty, "send must consume staged files")
+        XCTAssertEqual(vm.deskMessages.first?.text, "📎 brief.pdf")
+        XCTAssertTrue(vm.deskSendEnabled == false)
+    }
+
+    func test_deskWorkingLabelFollowsALiveWorkLog_becauseDeskMustShowWorking() throws {
+        // WHY: a supervised run in Working must surface the Agent App thinking
+        // label on Desk, not only the work-log status pill.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        let started = Date(timeIntervalSince1970: 1_700_000_000)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: started
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.deskRunIsLive)
+        XCTAssertEqual(
+            vm.deskWorkingLabel(now: started.addingTimeInterval(9)),
+            AgentWorkingStripPresentation.label(phase: .thinking, elapsedSeconds: 9)
+        )
+    }
+
     func test_currentGoalAndActivityDriveHomeFromRealConversations() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -943,6 +992,12 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("AgentChatUserBubble"))
         XCTAssertTrue(bots.contains("AgentChatAssistantReply"))
         XCTAssertTrue(bots.contains("AgentChatComposerBar"))
+        XCTAssertTrue(bots.contains("onAttach"))
+        XCTAssertTrue(bots.contains("stopDeskRun"))
+        XCTAssertTrue(bots.contains("attachments: attached") || bots.contains("attachments: attached,"))
+        XCTAssertTrue(chatChrome.contains("agent.attach"))
+        XCTAssertTrue(chatChrome.contains("agent.workingPhase"))
+        XCTAssertTrue(chatChrome.contains("agent.composer.stop"))
         XCTAssertTrue(bots.contains("bots.desk.composer"))
         XCTAssertTrue(chatChrome.contains("accessibilityIdentifier(composerIdentifier)"))
         XCTAssertTrue(chatChrome.contains("\"bots.desk.composer\""))
