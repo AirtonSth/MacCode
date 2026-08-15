@@ -15,6 +15,7 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.screen")
         UserDefaults.standard.removeObject(forKey: "bots.studioTab")
         UserDefaults.standard.removeObject(forKey: "bots.queuedFollowUps")
+        UserDefaults.standard.removeObject(forKey: "bots.composerDrafts")
     }
 
     override func tearDown() {
@@ -1251,6 +1252,71 @@ final class BotsWindowTests: XCTestCase {
         reopened.openDesk(quinn)
         XCTAssertTrue(reopened.queuedFollowUps.isEmpty)
         XCTAssertFalse(reopened.deskMessages.contains { $0.text == "orphan this" })
+    }
+
+    func test_composerDraftStaysOnOwningBot_becauseDeskMustNotLeakUnsentWords() throws {
+        // WHY: composerText was process-wide. Typing on Piper then opening
+        // Quinn sent Piper's unsent line to the wrong teammate.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "only Piper should see this"
+        vm.openDesk(quinn)
+        XCTAssertEqual(vm.composerText, "", "Quinn's Desk must not inherit Piper's unsent draft")
+        XCTAssertTrue(vm.attachments.isEmpty)
+        vm.composerText = "only Quinn should see this"
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.composerText, "only Piper should see this")
+        vm.openDesk(quinn)
+        XCTAssertEqual(vm.composerText, "only Quinn should see this")
+    }
+
+    func test_composerDraftSurvivesRelaunch_becauseTypedWordsMustNotVanish() throws {
+        // WHY: an unsent Desk line is user work. Closing RemoteCode used
+        // to drop the in-memory composer, same class of loss as follow-ups.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.composerText = "keep after relaunch"
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.selectedBotID, bot.id)
+        XCTAssertEqual(reopened.screen, .desk)
+        XCTAssertEqual(reopened.composerText, "keep after relaunch")
+        XCTAssertFalse(
+            reopened.deskMessages.contains { $0.text == "keep after relaunch" },
+            "relaunch must restore the draft, not send it"
+        )
+    }
+
+    func test_sendClearsComposerDraft_becauseSentWordsAreNotADraft() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.composerText = "send then forget"
+        XCTAssertTrue(vm.send())
+        XCTAssertEqual(vm.composerText, "")
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(bot)
+        XCTAssertEqual(reopened.composerText, "", "a sent line must not come back as a draft")
+        XCTAssertTrue(reopened.deskMessages.contains { $0.text == "send then forget" })
+    }
+
+    func test_deletedBotDropsItsComposerDraft_becauseTheTeammateIsGone() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "orphan this draft"
+        vm.delete(id: piper.id)
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(quinn)
+        XCTAssertEqual(reopened.composerText, "")
+        XCTAssertFalse(reopened.deskMessages.contains { $0.text == "orphan this draft" })
     }
 
     func test_deskTimelineHidesPersistedAssistantThatDuplicatesTheTurn_becauseRepliesMustNotDouble() {

@@ -20,6 +20,24 @@ public struct BotQueuedFollowUp: Equatable, Identifiable, Codable {
     }
 }
 
+public struct BotComposerDraft: Equatable, Codable {
+    public var text: String
+    public var attachments: [AgentAttachment]
+
+    public init(text: String = "", attachments: [AgentAttachment] = []) {
+        self.text = text
+        self.attachments = attachments
+    }
+
+    public var isEmpty: Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty
+    }
+
+    public var liveAttachments: [AgentAttachment] {
+        attachments.filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+}
+
 public struct BotStudioDraft: Equatable {
     public var botID: BotID?
     public var name: String
@@ -231,8 +249,12 @@ public final class BotsViewModel: ObservableObject {
         didSet { persistStudioTab() }
     }
     @Published public var studioDraft = BotStudioDraft()
-    @Published public var composerText: String = ""
-    @Published public var attachments: [AgentAttachment] = []
+    @Published public var composerText: String = "" {
+        didSet { persistComposerIfHydrated() }
+    }
+    @Published public var attachments: [AgentAttachment] = [] {
+        didSet { persistComposerIfHydrated() }
+    }
     @Published public var isStopping = false
     @Published public private(set) var queuedFollowUps: [BotQueuedFollowUp] = []
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
@@ -278,6 +300,9 @@ public final class BotsViewModel: ObservableObject {
     private var liveTimelineByBot: [BotID: AssistantTimelineState] = [:]
     private var liveStreamCountByBot: [BotID: Int] = [:]
     private var queuedFollowUpsByBot: [BotID: [BotQueuedFollowUp]] = [:]
+    private var composerDraftsByBot: [BotID: BotComposerDraft] = [:]
+    private var composerHydrated = false
+    private var isApplyingComposerDraft = false
     private var deskLiveTurnWatch: Task<Void, Never>?
 
     public init(context: AppContext, router: AppCommandRouter? = nil) {
@@ -286,10 +311,14 @@ public final class BotsViewModel: ObservableObject {
         self.botStore = context.botStore
         self.settingsStore = SettingsStore(db: context.db)
         restoreQueuedFollowUpsIfNeeded()
+        restoreComposerDraftsIfNeeded()
         restoreInspectorTabIfNeeded()
         restoreStudioTabIfNeeded()
         reload()
         restoreScreenIfNeeded()
+        if !composerHydrated {
+            applyComposerDraft(for: selectedBotID)
+        }
         context.coordinator.addObserver(self)
     }
 
@@ -458,7 +487,7 @@ public final class BotsViewModel: ObservableObject {
         if studioDraft.model.isEmpty {
             applyDefaultModel(for: studioDraft.provider)
         }
-        selectedBotID = bot.id
+        adoptSelectedBot(bot.id)
         studioTab = .profile
         screen = .studio
         persistSelection()
@@ -477,7 +506,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func openHome(_ bot: BotDefinition) {
-        selectedBotID = bot.id
+        adoptSelectedBot(bot.id)
         screen = .fleet
         persistSelection()
         reloadAttention()
@@ -485,7 +514,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func openDesk(_ bot: BotDefinition) {
-        selectedBotID = bot.id
+        adoptSelectedBot(bot.id)
         screen = .desk
         persistSelection()
         markOpenedConversationRead(botID: bot.id)
@@ -575,7 +604,7 @@ public final class BotsViewModel: ObservableObject {
             workspaceID: context.state.window.selectedWorkspaceID,
             notificationsEnabled: notificationsEnabled
         )
-        selectedBotID = bot.id
+        adoptSelectedBot(bot.id)
         reloadFleet()
         return bot
     }
@@ -614,7 +643,7 @@ public final class BotsViewModel: ObservableObject {
                 notificationsEnabled: studioDraft.notificationsEnabled
             )
             studioDraft.expectedRevisionID = published.id
-            selectedBotID = botID
+            adoptSelectedBot(botID)
             reloadFleet()
             reloadSelectedBot(id: botID)
             screen = .studio
@@ -643,7 +672,7 @@ public final class BotsViewModel: ObservableObject {
             throw BotPublishError.controlPlaneDisabled
         }
         let copy = try botStore.duplicate(id: id)
-        selectedBotID = copy.id
+        adoptSelectedBot(copy.id)
         reloadFleet()
         return copy
     }
@@ -661,7 +690,7 @@ public final class BotsViewModel: ObservableObject {
         do {
             try botStore.setHidden(id: id, hidden: hidden)
             if hidden, selectedBotID == id {
-                selectedBotID = nil
+                adoptSelectedBot(nil)
                 screen = .fleet
                 persistSelection()
             }
@@ -675,12 +704,14 @@ public final class BotsViewModel: ObservableObject {
         do {
             try botStore.delete(id: id)
             if selectedBotID == id {
-                selectedBotID = nil
+                adoptSelectedBot(nil)
                 screen = .fleet
                 persistSelection()
             }
             queuedFollowUpsByBot[id] = nil
+            composerDraftsByBot[id] = nil
             persistQueuedFollowUps()
+            persistComposerDrafts()
             syncQueuedFollowUps()
             reloadFleet()
             reloadAttention()
@@ -1062,6 +1093,7 @@ public final class BotsViewModel: ObservableObject {
             lastUpdatedByBot = updated
             rebuildAttentionStates()
             pruneQueuedFollowUpsToFleet()
+            pruneComposerDraftsToFleet()
         } catch {
             errorMessage = String(describing: error)
         }
@@ -1152,6 +1184,7 @@ public final class BotsViewModel: ObservableObject {
     private static let screenDefaultsKey = "bots.screen"
     private static let studioTabDefaultsKey = "bots.studioTab"
     private static let queuedFollowUpsDefaultsKey = "bots.queuedFollowUps"
+    private static let composerDraftsDefaultsKey = "bots.composerDrafts"
 
     private func persistSelection() {
         UserDefaults.standard.set(selectedBotID?.value.uuidString.lowercased(), forKey: Self.selectedBotDefaultsKey)
@@ -1209,6 +1242,80 @@ public final class BotsViewModel: ObservableObject {
         syncQueuedFollowUps()
     }
 
+    private func persistComposerIfHydrated() {
+        guard composerHydrated, !isApplyingComposerDraft else { return }
+        captureComposerDraft()
+    }
+
+    private func adoptSelectedBot(_ id: BotID?) {
+        if selectedBotID == id {
+            if composerHydrated {
+                captureComposerDraft()
+            } else {
+                applyComposerDraft(for: id)
+            }
+            return
+        }
+        if composerHydrated {
+            captureComposerDraft()
+        }
+        selectedBotID = id
+        applyComposerDraft(for: id)
+    }
+
+    private func captureComposerDraft(for botID: BotID? = nil) {
+        guard let botID = botID ?? selectedBotID else { return }
+        let draft = BotComposerDraft(text: composerText, attachments: attachments)
+        if draft.isEmpty {
+            composerDraftsByBot[botID] = nil
+        } else {
+            composerDraftsByBot[botID] = draft
+        }
+        persistComposerDrafts()
+    }
+
+    private func applyComposerDraft(for botID: BotID?) {
+        let draft = botID.flatMap { composerDraftsByBot[$0] }
+        isApplyingComposerDraft = true
+        composerText = draft?.text ?? ""
+        attachments = draft?.liveAttachments ?? []
+        isApplyingComposerDraft = false
+        composerHydrated = true
+    }
+
+    private func persistComposerDrafts() {
+        let payload = Dictionary(uniqueKeysWithValues: composerDraftsByBot.compactMap { id, draft -> (String, BotComposerDraft)? in
+            draft.isEmpty ? nil : (id.value.uuidString.lowercased(), draft)
+        })
+        if payload.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.composerDraftsDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.composerDraftsDefaultsKey)
+        }
+    }
+
+    private func restoreComposerDraftsIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.composerDraftsDefaultsKey),
+              let payload = try? JSONDecoder().decode([String: BotComposerDraft].self, from: data)
+        else { return }
+        var restored: [BotID: BotComposerDraft] = [:]
+        for (raw, draft) in payload {
+            guard let uuid = UUID(uuidString: raw), !draft.isEmpty else { continue }
+            restored[BotID(uuid)] = draft
+        }
+        composerDraftsByBot = restored
+    }
+
+    private func pruneComposerDraftsToFleet() {
+        let live = Set(bots.map(\.id))
+        let next = composerDraftsByBot.filter { live.contains($0.key) }
+        guard next.count != composerDraftsByBot.count else { return }
+        composerDraftsByBot = next
+        persistComposerDrafts()
+    }
+
     private func restoreInspectorTabIfNeeded() {
         guard let raw = UserDefaults.standard.string(forKey: Self.inspectorTabDefaultsKey),
               let tab = BotDeskInspectorTab(rawValue: raw) else { return }
@@ -1244,15 +1351,18 @@ public final class BotsViewModel: ObservableObject {
 
     private func restoreSelectedBotIfNeeded() {
         if let selectedBotID, fleet.contains(where: { $0.id == selectedBotID }) {
+            if !composerHydrated {
+                applyComposerDraft(for: selectedBotID)
+            }
             return
         }
         if let raw = UserDefaults.standard.string(forKey: Self.selectedBotDefaultsKey),
            let uuid = UUID(uuidString: raw),
            fleet.contains(where: { $0.id == BotID(uuid) }) {
-            selectedBotID = BotID(uuid)
+            adoptSelectedBot(BotID(uuid))
             return
         }
-        selectedBotID = fleet.first?.id
+        adoptSelectedBot(fleet.first?.id)
     }
 
     public var liveMemoryCount: Int {
