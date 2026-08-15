@@ -465,6 +465,79 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.fleet.map(\.id), [bot.id])
     }
 
+    func test_saveStudioPublishesOneRevision_becauseBrainEditsAreVersioned() throws {
+        // WHY: Studio Save is a publish, not a silent profile mutate. A second
+        // updateProfile revision would make the digest history unreadable.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(
+            name: "Piper",
+            title: "Scout",
+            description: "Looks around",
+            soul: "Be brief.",
+            provider: .claude
+        )
+        let first = try XCTUnwrap(bot.currentRevisionID)
+        vm.beginEdit(bot)
+        XCTAssertEqual(vm.screen, .studio)
+        XCTAssertEqual(vm.studioTab, .profile)
+        vm.studioDraft.title = "Research lead"
+        vm.studioDraft.soul = "Stand up for the brief."
+        vm.studioDraft.provider = .grok
+        vm.applyDefaultModel(for: .grok)
+        vm.studioDraft.notificationsEnabled = false
+
+        let saved = try vm.saveStudio()
+
+        XCTAssertEqual(vm.screen, .studio, "Save stays in Studio so Brain tabs remain reachable")
+        XCTAssertNotEqual(saved.currentRevisionID, first)
+        XCTAssertEqual(vm.studioDraft.expectedRevisionID, saved.currentRevisionID)
+        let revision = try XCTUnwrap(vm.selectedRevision)
+        XCTAssertEqual(revision.revisionNumber, 2)
+        XCTAssertEqual(revision.title, "Research lead")
+        XCTAssertEqual(revision.soul, "Stand up for the brief.")
+        XCTAssertEqual(revision.provider, .grok)
+        XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
+        XCTAssertEqual(saved.notificationsEnabled, false)
+        XCTAssertEqual(vm.studioRouteLabel, "Grok")
+        XCTAssertEqual(vm.studioDesktopSummary, "Logical execution space")
+        XCTAssertEqual(vm.studioApprovalLabel, "Supervised")
+    }
+
+    func test_studioSkillsPersistAsCatalogBindings_becauseStudioOwnsTheBrain() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        vm.studioTab = .skills
+        vm.skillDraft = "weekly-account-health"
+        vm.addSkill()
+
+        XCTAssertEqual(vm.skillBindings.map(\.skillID), ["weekly-account-health"])
+        XCTAssertEqual(vm.enabledSkillCount, 1)
+        vm.setSkillEnabled(skillID: "weekly-account-health", enabled: false)
+        XCTAssertEqual(vm.enabledSkillCount, 0)
+        XCTAssertEqual(
+            try context.botStore.listSkillBindings(botID: bot.id).first?.enabled,
+            false
+        )
+    }
+
+    func test_studioRejectsUnshippedDesktop_becauseP1aMustNotClaimAVM() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        XCTAssertFalse(vm.isDesktopVMActive)
+        vm.studioDraft.desktopKind = .dedicatedLocalVM
+        let saved = try vm.saveStudio()
+        let revision = try XCTUnwrap(
+            saved.currentRevisionID.flatMap { try context.botStore.getRevision(id: $0) }
+        )
+        XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
+        XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+    }
+
     func test_botsOpensInMainContent_andSidebarSitsUnderScheduleTasks() throws {
         let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
         let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
@@ -492,6 +565,20 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.home.skills"))
         XCTAssertTrue(bots.contains("bots.home.routines"))
         XCTAssertTrue(bots.contains("bots.home.approvals"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.studio\")"))
+        XCTAssertTrue(bots.contains("bots.studio.tab.profile"))
+        XCTAssertTrue(bots.contains("bots.studio.tab.memory"))
+        XCTAssertTrue(bots.contains("bots.studio.tab.skills"))
+        XCTAssertTrue(bots.contains("bots.studio.tab.routines"))
+        XCTAssertTrue(bots.contains("bots.studio.tab.desktop"))
+        XCTAssertTrue(bots.contains("bots.studio.identity"))
+        XCTAssertTrue(bots.contains("bots.studio.routing"))
+        XCTAssertTrue(bots.contains("bots.studio.soul"))
+        XCTAssertTrue(bots.contains("bots.studio.summary"))
+        XCTAssertTrue(bots.contains("bots.studio.desktop.honesty"))
+        XCTAssertTrue(bots.contains("Role & Identity"))
+        XCTAssertTrue(bots.contains("Provider routing"))
+        XCTAssertTrue(bots.contains("Configuration summary"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.composer\")"))
         XCTAssertFalse(main.contains("SurfaceType.bot"))
         XCTAssertFalse(bots.contains("SurfaceType.bot"))

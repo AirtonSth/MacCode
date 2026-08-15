@@ -224,6 +224,8 @@ public final class BotStore: @unchecked Sendable {
         botID: BotID,
         expectedCurrentRevisionID: BotRevisionID?,
         draft: BotRevisionDraft,
+        avatarSymbol: String? = nil,
+        notificationsEnabled: Bool? = nil,
         now: Date = Date()
     ) throws -> BotRevision {
         try db.transaction {
@@ -234,8 +236,8 @@ public final class BotStore: @unchecked Sendable {
                 bot: bot,
                 expectedCurrentRevisionID: expectedCurrentRevisionID,
                 draft: draft,
-                avatarSymbol: bot.avatarSymbol,
-                notificationsEnabled: bot.notificationsEnabled,
+                avatarSymbol: avatarSymbol ?? bot.avatarSymbol,
+                notificationsEnabled: notificationsEnabled ?? bot.notificationsEnabled,
                 now: now,
                 database: db
             )

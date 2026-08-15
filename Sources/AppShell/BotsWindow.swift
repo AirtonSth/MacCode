@@ -101,6 +101,36 @@ public enum BotDetailTab: String, CaseIterable, Identifiable {
     }
 }
 
+public enum BotStudioTab: String, CaseIterable, Identifiable {
+    case profile
+    case memory
+    case skills
+    case routines
+    case desktop
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .profile: return "Profile"
+        case .memory: return "Memory"
+        case .skills: return "Skills"
+        case .routines: return "Routines"
+        case .desktop: return "Desktop"
+        }
+    }
+
+    public var accessibilityIdentifier: String {
+        switch self {
+        case .profile: return "bots.studio.tab.profile"
+        case .memory: return "bots.studio.tab.memory"
+        case .skills: return "bots.studio.tab.skills"
+        case .routines: return "bots.studio.tab.routines"
+        case .desktop: return "bots.studio.tab.desktop"
+        }
+    }
+}
+
 // MARK: - View model
 
 @MainActor
@@ -113,6 +143,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public var selectedBotID: BotID?
     @Published public var screen: BotsScreen = .fleet
     @Published public var detailTab: BotDetailTab = .desk
+    @Published public var studioTab: BotStudioTab = .profile
     @Published public var studioDraft = BotStudioDraft()
     @Published public var composerText: String = ""
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
@@ -124,6 +155,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var selectedRevision: BotRevision?
     @Published public private(set) var routines: [BotRoutine] = []
     @Published public var memoryDraft: String = ""
+    @Published public var skillDraft: String = ""
     @Published public var routineName: String = ""
     @Published public var routinePrompt: String = ""
     @Published public var routineScheduleNote: String = ""
@@ -254,7 +286,10 @@ public final class BotsViewModel: ObservableObject {
             applyDefaultModel(for: studioDraft.provider)
         }
         selectedBotID = bot.id
+        studioTab = .profile
         screen = .studio
+        persistSelection()
+        reloadSelectedBot(id: bot.id)
     }
 
     public func openFleet() {
@@ -397,25 +432,19 @@ public final class BotsViewModel: ObservableObject {
                 permissionMode: .supervised,
                 desktopKind: desktop
             )
-            _ = try botStore.publish(
+            let published = try botStore.publish(
                 botID: botID,
                 expectedCurrentRevisionID: studioDraft.expectedRevisionID ?? bot.currentRevisionID,
-                draft: draft
-            )
-            let updated = try botStore.updateProfile(
-                id: botID,
-                name: name,
-                title: studioDraft.title,
-                description: studioDraft.description,
+                draft: draft,
                 avatarSymbol: studioDraft.avatarSymbol,
                 notificationsEnabled: studioDraft.notificationsEnabled
             )
-            selectedBotID = updated.id
+            studioDraft.expectedRevisionID = published.id
+            selectedBotID = botID
             reloadFleet()
-            reloadSelectedBot(id: updated.id)
-            screen = .desk
-            detailTab = .desk
-            return updated
+            reloadSelectedBot(id: botID)
+            screen = .studio
+            return try botStore.get(id: botID) ?? bot
         }
         let created = try create(
             name: name,
@@ -429,9 +458,7 @@ public final class BotsViewModel: ObservableObject {
             avatarSymbol: studioDraft.avatarSymbol,
             notificationsEnabled: studioDraft.notificationsEnabled
         )
-        screen = .desk
-        detailTab = .desk
-        reloadSelectedBot(id: created.id)
+        beginEdit(created)
         return created
     }
 
@@ -524,6 +551,75 @@ public final class BotsViewModel: ObservableObject {
         } catch {
             errorMessage = String(describing: error)
         }
+    }
+
+    public func addSkill() {
+        let skillID = skillDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !skillID.isEmpty, let bot = selectedBot else { return }
+        do {
+            try botStore.setSkillBinding(
+                BotSkillBinding(botID: bot.id, skillID: skillID, enabled: true)
+            )
+            skillDraft = ""
+            skillBindings = try botStore.listSkillBindings(botID: bot.id)
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public func setSkillEnabled(skillID: String, enabled: Bool) {
+        guard let bot = selectedBot else { return }
+        do {
+            try botStore.setSkillBinding(
+                BotSkillBinding(botID: bot.id, skillID: skillID, enabled: enabled)
+            )
+            skillBindings = try botStore.listSkillBindings(botID: bot.id)
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public var studioWorkspaceLabel: String {
+        let id = selectedBot?.workspaceID ?? context.state.window.selectedWorkspaceID
+        if let id, let name = context.state.workspaces[id]?.name, !name.isEmpty {
+            return name
+        }
+        return "None"
+    }
+
+    public var studioRouteLabel: String {
+        switch studioDraft.provider {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        case .grok: return "Grok"
+        }
+    }
+
+    public var studioDesktopSummary: String {
+        switch resolvedDesktopKind(studioDraft.desktopKind) {
+        case .logicalExecutionSpace:
+            return "Logical execution space"
+        case .dedicatedLocalVM:
+            return "Dedicated local VM"
+        case .managedRemoteMac:
+            return "Managed remote Mac"
+        }
+    }
+
+    public var studioApprovalLabel: String { "Supervised" }
+
+    public var studioHasUnpublishedChanges: Bool {
+        guard let revision = selectedRevision else { return studioDraft.isNew }
+        let bot = selectedBot
+        return studioDraft.name != revision.name
+            || studioDraft.title != revision.title
+            || studioDraft.description != revision.description
+            || studioDraft.soul != revision.soul
+            || studioDraft.provider != revision.provider
+            || studioDraft.model != revision.model
+            || studioDraft.desktopKind != revision.desktopKind
+            || studioDraft.notificationsEnabled != (bot?.notificationsEnabled ?? true)
+            || studioDraft.avatarSymbol != (bot?.avatarSymbol ?? "person.crop.circle")
     }
 
     public func addMemory() {
@@ -1658,44 +1754,126 @@ public struct BotsRootView: View {
 
     private var studioScreen: some View {
         VStack(spacing: 0) {
-            HStack(spacing: DS.Space.lg) {
+            studioHeader
+            studioTabs
+            Group {
+                switch vm.studioTab {
+                case .profile:
+                    studioProfile
+                case .memory:
+                    memoryTab
+                case .skills:
+                    skillsTab
+                case .routines:
+                    routinesTab
+                case .desktop:
+                    ScrollView {
+                        studioDesktop
+                            .padding(DS.Space.xxl)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .accessibilityIdentifier("bots.studio")
+    }
+
+    private var studioHeader: some View {
+        HStack(alignment: .top, spacing: DS.Space.lg) {
+            if !showsRosterRail {
                 backButton { vm.openFleet() }
-                Text(vm.studioDraft.isNew ? "New Bot" : "Bot Studio")
+            }
+            Image(systemName: vm.studioDraft.avatarSymbol)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundColor(DS.Palette.accent)
+                .frame(width: 40, height: 40)
+                .background(DS.Palette.accent.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: DS.Space.sm) {
+                    Text("Bot Studio")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                    if vm.studioHasUnpublishedChanges {
+                        DSPill("Draft", tone: .warning)
+                    }
+                }
+                Text(vm.studioDraft.name.isEmpty ? "New Bot" : vm.studioDraft.name)
                     .font(DS.Font.title2.weight(.semibold))
                     .foregroundColor(DS.Palette.text)
-                Spacer()
-                Button("Cancel") { vm.openFleet() }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                Button(vm.studioDraft.isNew ? "Create Bot" : "Save Bot") {
-                    do { _ = try vm.saveStudio() } catch { vm.errorMessage = String(describing: error) }
-                }
-                .buttonStyle(DSPrimaryButtonStyle())
-                .disabled(!vm.isControlPlaneActive)
-                .accessibilityIdentifier("bots.studio.save")
+                    .accessibilityIdentifier("bots.studio.name")
+                Text(vm.studioDraft.title.isEmpty ? "No job yet" : vm.studioDraft.title)
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityIdentifier("bots.studio.role")
             }
-            .padding(.horizontal, DS.Space.xxl)
-            .padding(.vertical, DS.Space.xl)
-            .dsBar(edge: .bottom)
+            Spacer(minLength: DS.Space.lg)
+            Button("Save Bot") {
+                do { _ = try vm.saveStudio() } catch { vm.errorMessage = String(describing: error) }
+            }
+            .buttonStyle(DSPrimaryButtonStyle())
+            .disabled(!vm.isControlPlaneActive)
+            .accessibilityIdentifier("bots.studio.save")
+        }
+        .padding(.horizontal, DS.Space.xxl)
+        .padding(.vertical, DS.Space.xl)
+        .dsBar(edge: .bottom)
+    }
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: DS.Space.xxl) {
+    private var studioTabs: some View {
+        HStack(spacing: DS.Space.md) {
+            ForEach(BotStudioTab.allCases) { tab in
+                if tab == .memory && !vm.isMemoryActive {
+                    EmptyView()
+                } else {
+                    let selected = vm.studioTab == tab
+                    Button {
+                        vm.studioTab = tab
+                    } label: {
+                        Text(tab.title)
+                            .font(DS.Font.body.weight(selected ? .semibold : .regular))
+                            .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
+                            .padding(.horizontal, DS.Space.lg)
+                            .padding(.vertical, DS.Space.sm)
+                            .background(selected ? DS.Palette.accent : DS.Palette.surfaceRaised)
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(selected ? .isSelected : [])
+                    .accessibilityIdentifier(tab.accessibilityIdentifier)
+                }
+            }
+            Spacer()
+        }
+        .padding(.horizontal, DS.Space.xxl)
+        .padding(.vertical, DS.Space.lg)
+    }
+
+    private var studioProfile: some View {
+        ScrollView {
+            HStack(alignment: .top, spacing: DS.Space.xl) {
+                VStack(alignment: .leading, spacing: DS.Space.xl) {
                     studioIdentity
                     studioProvider
                     studioSoul
-                    studioDesktop
                     studioNotifications
                 }
-                .padding(DS.Space.xxl)
-                .frame(maxWidth: 860, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: DS.Space.xl) {
+                    studioSummary
+                    studioDesktop
+                }
+                .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(DS.Space.xxl)
         }
     }
 
     private var studioIdentity: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
-            DSSectionHeaderG("Identity")
-            labeledField("Name") {
+            DSSectionHeaderG("Role & Identity")
+            studioFormRow("Name") {
                 studioField(placeholder: "e.g. Piper", text: $vm.studioDraft.name)
                     .onChange(of: vm.studioDraft.name) { name in
                         if vm.studioDraft.isNew, vm.studioDraft.handle.isEmpty || handleMatchesDerivedName {
@@ -1703,21 +1881,23 @@ public struct BotsRootView: View {
                         }
                     }
             }
-            labeledField("Job / title") {
+            studioFormRow("Role") {
                 studioField(placeholder: "What this teammate does", text: $vm.studioDraft.title)
             }
-            labeledField("Description") {
+            studioFormRow("Description") {
                 studioMultiline(text: $vm.studioDraft.description, minHeight: 72)
+                    .accessibilityIdentifier("bots.studio.description")
             }
-            labeledField("Handle") {
+            studioFormRow("Handle") {
                 studioField(placeholder: "piper", text: $vm.studioDraft.handle)
                     .disabled(!vm.studioDraft.isNew)
             }
-            labeledField("Avatar") {
+            studioFormRow("Avatar") {
                 studioField(placeholder: "person.crop.circle", text: $vm.studioDraft.avatarSymbol)
             }
         }
         .dsPanel(padding: DS.Space.lg)
+        .accessibilityIdentifier("bots.studio.identity")
     }
 
     private var handleMatchesDerivedName: Bool {
@@ -1726,22 +1906,28 @@ public struct BotsRootView: View {
 
     private var studioProvider: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
-            DSSectionHeaderG("Provider")
-            Picker("Provider", selection: $vm.studioDraft.provider) {
-                Text("Claude").tag(AgentProvider.claude)
-                Text("Codex").tag(AgentProvider.codex)
-                Text("Grok").tag(AgentProvider.grok)
+            DSSectionHeaderG("Provider routing")
+            studioFormRow("Default route") {
+                Picker("Provider", selection: $vm.studioDraft.provider) {
+                    Text("Claude").tag(AgentProvider.claude)
+                    Text("Codex").tag(AgentProvider.codex)
+                    Text("Grok").tag(AgentProvider.grok)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: vm.studioDraft.provider) { provider in
+                    vm.applyDefaultModel(for: provider)
+                }
+                .accessibilityIdentifier("bots.studio.provider")
             }
-            .pickerStyle(.segmented)
-            .onChange(of: vm.studioDraft.provider) { provider in
-                vm.applyDefaultModel(for: provider)
-            }
-            .accessibilityIdentifier("bots.studio.provider")
-            labeledField("Model") {
+            studioFormRow("Model") {
                 studioField(placeholder: "Model id", text: $vm.studioDraft.model)
             }
+            Text("One published route. Fallback order is not shipped in P1a.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
         }
         .dsPanel(padding: DS.Space.lg)
+        .accessibilityIdentifier("bots.studio.routing")
     }
 
     private var studioSoul: some View {
@@ -1753,6 +1939,7 @@ public struct BotsRootView: View {
                 .foregroundColor(DS.Palette.textTertiary)
         }
         .dsPanel(padding: DS.Space.lg)
+        .accessibilityIdentifier("bots.studio.soul")
     }
 
     private var studioDesktop: some View {
@@ -1761,33 +1948,39 @@ public struct BotsRootView: View {
             desktopOption(
                 kind: .logicalExecutionSpace,
                 title: "Logical execution space",
-                enabled: true
+                enabled: true,
+                identifier: "bots.studio.desktop.logical"
             )
             desktopOption(
                 kind: .dedicatedLocalVM,
                 title: "Dedicated local VM Desktop",
                 enabled: vm.isDesktopVMActive,
-                notShipped: !vm.isDesktopVMActive
+                notShipped: !vm.isDesktopVMActive,
+                identifier: "bots.studio.desktop.vm"
             )
             desktopOption(
                 kind: .managedRemoteMac,
                 title: "Managed remote Mac Desktop",
                 enabled: vm.isDesktopRemoteActive,
-                notShipped: !vm.isDesktopRemoteActive
+                notShipped: !vm.isDesktopRemoteActive,
+                identifier: "bots.studio.desktop.remote"
             )
             Text(vm.desktopHonestyLabel)
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.warning)
                 .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("bots.studio.desktop.honesty")
         }
         .dsPanel(padding: DS.Space.lg)
+        .accessibilityIdentifier("bots.studio.desktop")
     }
 
     private func desktopOption(
         kind: BotDesktopKind,
         title: String,
         enabled: Bool,
-        notShipped: Bool = false
+        notShipped: Bool = false,
+        identifier: String
     ) -> some View {
         Button {
             guard enabled else { return }
@@ -1819,6 +2012,7 @@ public struct BotsRootView: View {
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
+        .accessibilityIdentifier(identifier)
     }
 
     private var studioNotifications: some View {
@@ -1829,6 +2023,52 @@ public struct BotsRootView: View {
                 .foregroundColor(DS.Palette.text)
         }
         .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var studioSummary: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG("Configuration summary")
+            studioSummaryRow("Workspace", vm.studioWorkspaceLabel)
+            studioSummaryRow("Role", vm.studioDraft.title.isEmpty ? "No job yet" : vm.studioDraft.title)
+            studioSummaryRow("Default route", vm.studioRouteLabel)
+            studioSummaryRow("Model", vm.studioDraft.model.isEmpty ? "Default" : vm.studioDraft.model)
+            studioSummaryRow("Approval mode", vm.studioApprovalLabel)
+            studioSummaryRow("Desktop", vm.studioDesktopSummary)
+            studioSummaryRow("Memory", "\(vm.liveMemoryCount) facts")
+            studioSummaryRow("Skills", "\(vm.enabledSkillCount) enabled")
+            studioSummaryRow("Routines", "\(vm.enabledRoutineCount) · no app-closed runs")
+            studioSummaryRow("Notifications", vm.studioDraft.notificationsEnabled ? "On" : "Off")
+            Text(vm.desktopHonestyLabel)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.warning)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .dsPanel(padding: DS.Space.lg)
+        .accessibilityIdentifier("bots.studio.summary")
+    }
+
+    private func studioSummaryRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: DS.Space.md) {
+            Text(label)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            Spacer(minLength: DS.Space.sm)
+            Text(value)
+                .font(DS.Font.caption.weight(.medium))
+                .foregroundColor(DS.Palette.text)
+                .multilineTextAlignment(.trailing)
+        }
+    }
+
+    private func studioFormRow<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.lg) {
+            Text(label)
+                .font(DS.Font.caption.weight(.medium))
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(width: 112, alignment: .leading)
+                .padding(.top, 10)
+            content()
+        }
     }
 
     // MARK: Desk
@@ -2019,6 +2259,52 @@ public struct BotsRootView: View {
             Spacer(minLength: 0)
         }
         .padding(DS.Space.xxl)
+        .accessibilityIdentifier("bots.studio.memory")
+    }
+
+    private var skillsTab: some View {
+        VStack(alignment: .leading, spacing: DS.Space.lg) {
+            DSSectionHeaderG("Skills")
+            Text("Catalog ids only. A skill id is not a filesystem path.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            HStack(alignment: .center, spacing: DS.Space.md) {
+                studioField(placeholder: "weekly-account-health", text: $vm.skillDraft)
+                Button("Add") { vm.addSkill() }
+                    .buttonStyle(DSPrimaryButtonStyle())
+                    .disabled(vm.skillDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.selectedBot == nil)
+                    .accessibilityIdentifier("bots.studio.skills.add")
+            }
+            if vm.skillBindings.isEmpty {
+                Text("No skills bound yet.")
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textTertiary)
+            } else {
+                ForEach(vm.skillBindings, id: \.skillID) { binding in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(binding.skillID)
+                                .font(DS.Font.bodyStrong)
+                                .foregroundColor(DS.Palette.text)
+                            Text(binding.enabled ? "Enabled" : "Off")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.textTertiary)
+                        }
+                        Spacer()
+                        Toggle(binding.enabled ? "On" : "Off", isOn: Binding(
+                            get: { binding.enabled },
+                            set: { vm.setSkillEnabled(skillID: binding.skillID, enabled: $0) }
+                        ))
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    }
+                    .dsPanel(padding: DS.Space.lg)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(DS.Space.xxl)
+        .accessibilityIdentifier("bots.studio.skills")
     }
 
     private func memoryRow(_ item: BotMemoryItem) -> some View {

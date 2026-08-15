@@ -114,6 +114,18 @@ final class BotStoreTests: XCTestCase {
         let original = try XCTUnwrap(store.getRevision(id: current))
         XCTAssertEqual(original.title, "Scout")
         XCTAssertEqual(original.soul, "")
+
+        let chrome = try store.publish(
+            botID: bot.id,
+            expectedCurrentRevisionID: published.id,
+            draft: draft,
+            avatarSymbol: "brain.head.profile",
+            notificationsEnabled: false,
+            now: Date(timeIntervalSince1970: 30)
+        )
+        XCTAssertEqual(chrome.revisionNumber, 3)
+        XCTAssertEqual(try store.get(id: bot.id)?.avatarSymbol, "brain.head.profile")
+        XCTAssertEqual(try store.get(id: bot.id)?.notificationsEnabled, false)
     }
 
     func test_updateProfile_writesNewRevisionInsteadOfMutatingOldRow() throws {
