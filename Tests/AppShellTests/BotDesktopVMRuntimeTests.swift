@@ -109,4 +109,19 @@ final class BotDesktopVMRuntimeTests: XCTestCase {
         XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("running"))
         XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
     }
+
+    func test_systemProbeSourceInstallsEFIBootLoader_becauseNilBootLoaderCannotStartAGuest() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/BotDesktopVMRuntime.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("VZEFIBootLoader"), "Disk.img start must set an EFI boot loader")
+        XCTAssertTrue(source.contains("config.bootLoader = bootLoader"))
+        XCTAssertFalse(source.contains("Isolated network"))
+        XCTAssertFalse(source.contains("Take over"))
+    }
 }

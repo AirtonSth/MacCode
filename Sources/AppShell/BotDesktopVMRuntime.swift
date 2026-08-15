@@ -45,6 +45,13 @@ public final class SystemBotDesktopVirtualizationProbe: BotDesktopVirtualization
             config.cpuCount = max(1, min(2, ProcessInfo.processInfo.processorCount))
             config.memorySize = 512 * 1024 * 1024
             config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: attachment)]
+            config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+            config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
+            // EFI firmware is a real guest start path. A macOS IPSW restore
+            // image is leftover; do not attach a network device (no isolation claim).
+            let bootLoader = VZEFIBootLoader()
+            bootLoader.variableStore = try efiVariableStore(nextTo: diskImage)
+            config.bootLoader = bootLoader
             try config.validate()
             let vm = VZVirtualMachine(configuration: config)
             let box = StartBox()
@@ -72,6 +79,14 @@ public final class SystemBotDesktopVirtualizationProbe: BotDesktopVirtualization
         #else
         return BotDesktopVMBootAttempt(didStart: false, failure: "Virtualization is not available.")
         #endif
+    }
+
+    private func efiVariableStore(nextTo diskImage: URL) throws -> VZEFIVariableStore {
+        let url = diskImage.deletingLastPathComponent().appendingPathComponent("efi-nvram.bin")
+        if FileManager.default.fileExists(atPath: url.path) {
+            return VZEFIVariableStore(url: url)
+        }
+        return try VZEFIVariableStore(creatingVariableStoreAt: url)
     }
 
     public func halt() {
