@@ -7,9 +7,9 @@ Product intent this loop: ship remaining P1a-honest work **including Dedicated l
 
 ## Open
 
-- [ ] dedicated-local-vm-guest Leftover after honest starting state: install/start a real OS from a valid restore image / IPSW. VZ state 4 (starting) is no longer reported as boot-failed. No isolated-network / takeover / app-closed claims until those actually work. — seen: 2026-08-15
-
 ## Done
+
+- [x] dedicated-local-vm-guest Restore.ipsw Start loads VZMacOSRestoreImage and runs VZMacOSInstaller; dummy IPSW fails as invalid-restore-image (not a virtual-disk / EFI boot). Honesty: “Stopped. Restore image is not a valid macOS IPSW: … not isolated.” No isolated-network / takeover. A host-supplied valid IPSW that finishes install remains a later leftover. — seen: 2026-08-15 — done: this fire
 
 - [x] dedicated-local-vm-starting Do not report boot-failed while Virtualization.framework is still starting. Persist starting + honesty “Starting. … not isolated.” IPSW leftover. — seen: 2026-08-15 — done: this fire
 

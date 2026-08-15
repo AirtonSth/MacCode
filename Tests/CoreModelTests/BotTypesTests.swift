@@ -186,6 +186,30 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(starting.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
         XCTAssertFalse(starting.honestyLabel.localizedCaseInsensitiveContains("boot failed"))
         XCTAssertEqual(starting.statusPill, "Local VM · starting")
+
+        let installing = BotDesktopVMIdentity(
+            botID: BotID(),
+            bundlePath: "/tmp/bot-desktop",
+            state: .installing,
+            virtualizationSupported: true
+        )
+        XCTAssertTrue(installing.honestyLabel.localizedCaseInsensitiveContains("installing"))
+        XCTAssertTrue(installing.honestyLabel.localizedCaseInsensitiveContains("restore image"))
+        XCTAssertTrue(installing.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
+        XCTAssertFalse(installing.honestyLabel.localizedCaseInsensitiveContains("active now"))
+        XCTAssertEqual(installing.statusPill, "Local VM · installing")
+
+        let invalidRestore = BotDesktopVMIdentity(
+            botID: BotID(),
+            bundlePath: "/tmp/bot-desktop",
+            state: .failed,
+            lastError: BotDesktopVMIdentity.invalidRestoreImageCode,
+            lastErrorDetail: "The file is not a valid restore image.",
+            virtualizationSupported: true
+        )
+        XCTAssertTrue(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("not a valid macOS IPSW"))
+        XCTAssertTrue(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
+        XCTAssertFalse(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("virtual disk"))
     }
 
     func test_routineCopy_doesNotClaimAppClosedExecution() {

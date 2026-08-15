@@ -4,6 +4,7 @@ public enum BotDesktopVMRunState: String, Codable, Sendable, Equatable {
     case stopped
     case failed
     case starting
+    case installing
     case running
 }
 
@@ -12,6 +13,8 @@ public struct BotDesktopVMIdentity: Codable, Sendable, Equatable {
     public static let virtualizationUnsupportedCode = "virtualization-unsupported"
     public static let bootNotShippedCode = "boot-not-shipped"
     public static let bootFailedCode = "boot-failed"
+    public static let invalidRestoreImageCode = "invalid-restore-image"
+    public static let installFailedCode = "install-failed"
 
     public var id: UUID
     public var botID: BotID
@@ -57,12 +60,22 @@ public struct BotDesktopVMIdentity: Codable, Sendable, Equatable {
             return "Local VM · failed"
         case .starting:
             return "Local VM · starting"
+        case .installing:
+            return "Local VM · installing"
         case .running:
             return "Local VM · running"
         }
     }
 
+    private var trimmedDetail: String? {
+        (lastErrorDetail?.trimmingCharacters(in: CharacterSet(charactersIn: ". \n\t")))
+            .flatMap { $0.isEmpty ? nil : $0 }
+    }
+
     public var honestyLabel: String {
+        if state == .installing {
+            return "Installing from restore image. Virtualization.framework is restoring a guest OS. Same Mac host; not isolated."
+        }
         if state == .starting {
             return "Starting. Virtualization.framework is still bringing the guest up. Same Mac host; not isolated."
         }
@@ -75,9 +88,16 @@ public struct BotDesktopVMIdentity: Codable, Sendable, Equatable {
         if lastError == Self.noGuestImageCode {
             return "Stopped. No guest image. Work still uses this Mac account; not isolated."
         }
+        if lastError == Self.invalidRestoreImageCode {
+            let detail = trimmedDetail ?? "file is not a valid macOS IPSW"
+            return "Stopped. Restore image is not a valid macOS IPSW: \(detail). Work still uses this Mac account; not isolated."
+        }
+        if lastError == Self.installFailedCode {
+            let detail = trimmedDetail ?? "Virtualization.framework rejected the restore image"
+            return "Stopped. Install failed: \(detail). Work still uses this Mac account; not isolated."
+        }
         if lastError == Self.bootFailedCode {
-            let detail = (lastErrorDetail?.trimmingCharacters(in: CharacterSet(charactersIn: ". \n\t"))).flatMap { $0.isEmpty ? nil : $0 }
-                ?? "Virtualization.framework rejected the guest image"
+            let detail = trimmedDetail ?? "Virtualization.framework rejected the guest image"
             return "Stopped. Boot failed: \(detail). Work still uses this Mac account; not isolated."
         }
         if lastError == Self.bootNotShippedCode {
