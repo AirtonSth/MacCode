@@ -352,7 +352,16 @@ public final class BotsViewModel: ObservableObject {
     @Published public var pendingDeleteID: BotID?
     public var onLeaveBots: (() -> Void)?
 
-    public let desktopHonestyLabel = BotDesktopKind.logicalExecutionSpaceHonestyLabel
+    public var displayedDesktopKind: BotDesktopKind {
+        if screen == .studio {
+            return resolvedDesktopKind(studioDraft.desktopKind)
+        }
+        return resolvedDesktopKind(selectedRevision?.desktopKind ?? .logicalExecutionSpace)
+    }
+
+    public var desktopHonestyLabel: String {
+        displayedDesktopKind.honestyLabel
+    }
 
     private let context: AppContext
     private let router: AppCommandRouter?
@@ -655,7 +664,8 @@ public final class BotsViewModel: ObservableObject {
         providerInstanceID: String? = nil,
         model: String = "",
         avatarSymbol: String = "person.crop.circle",
-        notificationsEnabled: Bool = true
+        notificationsEnabled: Bool = true,
+        desktopKind: BotDesktopKind = .logicalExecutionSpace
     ) throws -> BotDefinition {
         guard isControlPlaneActive else {
             errorMessage = "Turn on Bot control plane in Settings"
@@ -674,6 +684,7 @@ public final class BotsViewModel: ObservableObject {
             provider: provider,
             providerInstanceID: providerInstanceID ?? provider.rawValue,
             model: resolvedModel,
+            desktopKind: resolvedDesktopKind(desktopKind),
             workspaceID: context.state.window.selectedWorkspaceID,
             notificationsEnabled: notificationsEnabled
         )
@@ -732,7 +743,8 @@ public final class BotsViewModel: ObservableObject {
             providerInstanceID: studioDraft.providerInstanceID.isEmpty ? nil : studioDraft.providerInstanceID,
             model: studioDraft.model,
             avatarSymbol: studioDraft.avatarSymbol,
-            notificationsEnabled: studioDraft.notificationsEnabled
+            notificationsEnabled: studioDraft.notificationsEnabled,
+            desktopKind: desktop
         )
         beginEdit(created)
         return created
@@ -975,14 +987,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public var studioDesktopSummary: String {
-        switch resolvedDesktopKind(studioDraft.desktopKind) {
-        case .logicalExecutionSpace:
-            return "Logical execution space"
-        case .dedicatedLocalVM:
-            return "Dedicated local VM"
-        case .managedRemoteMac:
-            return "Managed remote Mac"
-        }
+        resolvedDesktopKind(studioDraft.desktopKind).displayTitle
     }
 
     public var studioApprovalLabel: String { "Supervised" }
@@ -2728,32 +2733,33 @@ public struct BotsRootView: View {
     }
 
     private func fleetHomeDesktop(_ bot: BotDefinition) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
+        let kind = vm.displayedDesktopKind
+        return VStack(alignment: .leading, spacing: DS.Space.md) {
             HStack(spacing: DS.Space.sm) {
                 Label(BotsChrome.Label.desktop, systemImage: "desktopcomputer")
                     .font(DS.Font.bodyStrong)
                     .foregroundColor(DS.Palette.text)
                 Spacer(minLength: 0)
-                DSPill("Logical space", tone: .neutral)
+                DSPill(kind.statusPill, tone: .neutral)
             }
             ZStack {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(
                         LinearGradient(
-                            colors: [Color(hex: 0x2A1848), Color(hex: 0x7B5CFF).opacity(0.55), Color(hex: 0x171D24)],
+                            colors: desktopPreviewColors(kind),
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
                     )
                 VStack(spacing: DS.Space.md) {
-                    Image(systemName: "desktopcomputer")
+                    Image(systemName: desktopPreviewSymbol(kind))
                         .font(.system(size: 28, weight: .regular))
                         .foregroundColor(.white.opacity(0.9))
                         .accessibilityHidden(true)
-                    Text("Logical execution space")
+                    Text(kind.displayTitle)
                         .font(DS.Font.bodyStrong)
                         .foregroundColor(.white)
-                    Text(vm.desktopHonestyLabel)
+                    Text(kind.honestyLabel)
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.warning)
                         .multilineTextAlignment(.center)
@@ -2772,7 +2778,7 @@ public struct BotsRootView: View {
         .dsPanel(padding: DS.Space.lg)
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("bots.home.desktop")
-        .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
+        .accessibilityLabel("Desktop for \(bot.name). \(kind.honestyLabel)")
     }
 
     private var fleetHeader: some View {
@@ -3149,15 +3155,15 @@ public struct BotsRootView: View {
             desktopOption(
                 kind: .dedicatedLocalVM,
                 title: "Dedicated local VM Desktop",
-                enabled: vm.isDesktopVMActive,
-                notShipped: !vm.isDesktopVMActive,
+                enabled: true,
+                status: "Guest not running",
                 identifier: "bots.studio.desktop.vm"
             )
             desktopOption(
                 kind: .managedRemoteMac,
                 title: "Managed remote Mac Desktop",
                 enabled: vm.isDesktopRemoteActive,
-                notShipped: !vm.isDesktopRemoteActive,
+                status: vm.isDesktopRemoteActive ? nil : "Not shipped",
                 identifier: "bots.studio.desktop.remote"
             )
             Text(vm.desktopHonestyLabel)
@@ -3174,7 +3180,7 @@ public struct BotsRootView: View {
         kind: BotDesktopKind,
         title: String,
         enabled: Bool,
-        notShipped: Bool = false,
+        status: String? = nil,
         identifier: String
     ) -> some View {
         Button {
@@ -3190,8 +3196,8 @@ public struct BotsRootView: View {
                         Text(title)
                             .font(DS.Font.bodyStrong)
                             .foregroundColor(enabled ? DS.Palette.text : DS.Palette.textTertiary)
-                        if notShipped {
-                            DSPill("Not shipped", tone: .neutral)
+                        if let status, !status.isEmpty {
+                            DSPill(status, tone: .neutral)
                         }
                     }
                     Text(kind.honestyLabel)
@@ -3375,31 +3381,32 @@ public struct BotsRootView: View {
     }
 
     private func deskDesktopPane(_ bot: BotDefinition) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
+        let kind = vm.displayedDesktopKind
+        return VStack(alignment: .leading, spacing: DS.Space.md) {
             HStack {
                 Label("\(bot.name) Desktop", systemImage: "desktopcomputer")
                     .font(DS.Font.bodyStrong)
                     .foregroundColor(DS.Palette.text)
                 Spacer(minLength: 0)
-                DSPill("Logical space", tone: .neutral)
+                DSPill(kind.statusPill, tone: .neutral)
             }
             ZStack {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(
                         LinearGradient(
-                            colors: [Color(hex: 0x2A1848), Color(hex: 0x7B5CFF).opacity(0.45), Color(hex: 0x171D24)],
+                            colors: desktopPreviewColors(kind),
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
                     )
                 VStack(spacing: DS.Space.sm) {
-                    Image(systemName: "macwindow")
+                    Image(systemName: desktopPreviewSymbol(kind))
                         .font(.system(size: 26, weight: .regular))
                         .foregroundColor(.white.opacity(0.92))
-                    Text("Logical execution space")
+                    Text(kind.displayTitle)
                         .font(DS.Font.bodyStrong)
                         .foregroundColor(.white)
-                    Text(vm.desktopHonestyLabel)
+                    Text(kind.honestyLabel)
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.warning)
                         .multilineTextAlignment(.center)
@@ -3413,7 +3420,25 @@ public struct BotsRootView: View {
         .padding(DS.Space.lg)
         .dsBar(edge: .bottom)
         .accessibilityIdentifier("bots.desk.desktop")
-        .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
+        .accessibilityLabel("Desktop for \(bot.name). \(kind.honestyLabel)")
+    }
+
+    private func desktopPreviewColors(_ kind: BotDesktopKind) -> [Color] {
+        switch kind {
+        case .dedicatedLocalVM:
+            return [Color(hex: 0x102028), Color(hex: 0x2563EB).opacity(0.42), Color(hex: 0x171D24)]
+        case .logicalExecutionSpace, .managedRemoteMac:
+            return [Color(hex: 0x2A1848), Color(hex: 0x7B5CFF).opacity(0.55), Color(hex: 0x171D24)]
+        }
+    }
+
+    private func desktopPreviewSymbol(_ kind: BotDesktopKind) -> String {
+        switch kind {
+        case .dedicatedLocalVM:
+            return "internaldrive"
+        case .logicalExecutionSpace, .managedRemoteMac:
+            return "desktopcomputer"
+        }
     }
 
     private func deskInspector(_ bot: BotDefinition) -> some View {

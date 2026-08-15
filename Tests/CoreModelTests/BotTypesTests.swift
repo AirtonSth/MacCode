@@ -74,17 +74,32 @@ final class BotTypesTests: XCTestCase {
         XCTAssertFalse(
             BotDesktopKind.logicalExecutionSpace.honestyLabel.localizedCaseInsensitiveContains("virtual machine")
         )
+        XCTAssertEqual(
+            BotDesktopKind.dedicatedLocalVM.honestyLabel,
+            BotDesktopKind.dedicatedLocalVMHonestyLabel
+        )
+        XCTAssertTrue(
+            BotDesktopKind.dedicatedLocalVM.honestyLabel.localizedCaseInsensitiveContains("not running")
+        )
+        XCTAssertTrue(
+            BotDesktopKind.dedicatedLocalVM.honestyLabel.localizedCaseInsensitiveContains("not isolated")
+        )
+        XCTAssertFalse(
+            BotDesktopKind.dedicatedLocalVM.honestyLabel.localizedCaseInsensitiveContains("active now")
+        )
+        XCTAssertEqual(BotDesktopKind.dedicatedLocalVM.displayTitle, "Dedicated local VM")
+        XCTAssertEqual(BotDesktopKind.dedicatedLocalVM.statusPill, "Local VM · not running")
         XCTAssertFalse(
             BotDesktopKind.logicalExecutionSpace.isSelectable(
                 flags: BotControlPlaneFlags(botsControlPlaneEnabled: false)
             ),
             "even the shared-account desktop is unavailable when the control plane is off"
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             BotDesktopKind.dedicatedLocalVM.isSelectable(
                 flags: BotControlPlaneFlags(botsControlPlaneEnabled: true, botsDesktopVMEnabled: false)
             ),
-            "VM desktop must stay unselectable while its flag is off"
+            "select/persist the VM kind without requiring a guest runtime flag"
         )
         XCTAssertFalse(
             BotDesktopKind.dedicatedLocalVM.isSelectable(

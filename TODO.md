@@ -7,13 +7,13 @@ Product intent this loop: ship remaining P1a-honest work **including Dedicated l
 
 ## Open
 
-- [ ] dedicated-local-vm Dedicated local VM Desktop is not a real selectable option — evidence: New Agent (@new-agent-2) Studio Desktop and Profile rail show **Dedicated local VM Desktop · Not shipped** (disabled); Settings toggle caption is still “Not shipped”; `BotsViewModel.desktopHonestyLabel` is hardcoded to `logicalExecutionSpaceHonestyLabel`; `resolvedDesktopKind` falls back unless `botsDesktopVMEnabled`. Fleet/Desk still paint only the purple “Logical execution space” card. Product intent: ship the smallest honest working slice (create / select / persist kind, honesty that matches what actually runs). No Take over / Isolated network / app-closed / “Active now in macOS VM” lies. Leave leftover hypervisor work open if the full guest cannot land in one fire. — seen: 2026-08-15
-
 - [ ] hide-remote-mac Managed remote Mac Desktop is still advertised — evidence: Studio Profile rail + Studio Desktop tab show **Managed remote Mac Desktop · Not shipped**; Settings has a “Managed remote Mac Desktop” toggle; `BotDesktopKind.managedRemoteMac` honesty/copy and UI enums expose it. Product intent: remove it from Studio/options/copy/enums exposed in UI. Do not advertise it. — seen: 2026-08-15
 
 - [ ] dedicated-local-vm-runtime Leftover after the select/persist slice: a real dedicated guest (Virtualization.framework or equivalent), not a fake screenshot of a VM. Start/stop, persist the VM identity with the Bot, honest running/stopped copy. No isolated-network / takeover / app-closed claims until those actually work. — seen: 2026-08-15
 
 ## Done
+
+- [x] dedicated-local-vm Dedicated local VM Desktop is a selectable, persistable kind — New Agent (@new-agent-2) Studio Desktop/Profile can select it; revision keeps `dedicatedLocalVM`; Fleet/Desk show “Dedicated local VM” + “Guest is not running yet. Work still uses this Mac account; not isolated.” No Take over / Isolated network / “Active now in macOS VM”. Guest runtime remains open as dedicated-local-vm-runtime. — seen: 2026-08-15 — done: 4eea0030
 
 - [x] inspector-drafts Inspector memory/skill/routine field drafts are process-wide and leak across bots — evidence: typed `only-new-agent-2-memory-draft-1805` on New Agent (@new-agent-2) Studio Memory; Batatilson Desk Memory showed the same unsent text; Batatilson Studio Skills still held leftover `weekly-account-health`. Code: `BotsViewModel.memoryDraft` / `skillDraft` / `routineName` / `routinePrompt` / `routineScheduleNote` are single fields, not keyed by BotID (unlike composer drafts). — seen: 2026-08-15 — done: 903c77d7
 

@@ -1790,7 +1790,7 @@ public struct SettingsView: View {
                 .disabled(!vm.appSettings.botsControlPlaneEnabled)
                 .accessibilityIdentifier("settings.bots.desktopVM.toggle")
             }
-            Text("Not shipped. \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)")
+            Text("Select Dedicated local VM in Studio to persist the kind. A guest OS is not running yet; this toggle does not start one.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
             settingRow("Managed remote Mac Desktop") {

@@ -826,10 +826,17 @@ final class BotsWindowTests: XCTestCase {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("desktopHonestyLabel"))
         XCTAssertTrue(source.contains("Not shipped"))
+        XCTAssertTrue(source.contains("Guest not running"))
         XCTAssertFalse(source.contains("Isolated / Dedicated VM"))
+        XCTAssertFalse(source.contains("Isolated network"))
+        XCTAssertFalse(source.contains("Take over"))
         XCTAssertFalse(
             source.contains("Running • macOS VM"),
             "Fleet Home must not paint the concept's fake dedicated VM"
+        )
+        XCTAssertFalse(
+            source.contains("Active now in macOS VM"),
+            "select/persist must not claim a running guest"
         )
         XCTAssertFalse(
             source.contains("Dedicated Desktop"),
@@ -2007,19 +2014,51 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
-    func test_studioRejectsUnshippedDesktop_becauseP1aMustNotClaimAVM() throws {
+    func test_studioPersistsDedicatedLocalVM_becauseKindIsSelectableBeforeGuestRuns() throws {
+        // WHY: Dedicated local VM must be a real Studio option. Persist the
+        // kind now; honesty must say no guest is running instead of falling
+        // back to logical space or claiming an isolated macOS VM.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.beginEdit(bot)
         XCTAssertFalse(vm.isDesktopVMActive)
         vm.studioDraft.desktopKind = .dedicatedLocalVM
+        XCTAssertEqual(vm.displayedDesktopKind, .dedicatedLocalVM)
+        XCTAssertEqual(vm.studioDesktopSummary, "Dedicated local VM")
+        XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.dedicatedLocalVMHonestyLabel)
+
         let saved = try vm.saveStudio()
         let revision = try XCTUnwrap(
             saved.currentRevisionID.flatMap { try context.botStore.getRevision(id: $0) }
         )
-        XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
-        XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+        XCTAssertEqual(revision.desktopKind, .dedicatedLocalVM)
+        XCTAssertEqual(vm.displayedDesktopKind, .dedicatedLocalVM)
+        XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.dedicatedLocalVMHonestyLabel)
+
+        vm.openDesk(saved)
+        XCTAssertEqual(vm.displayedDesktopKind, .dedicatedLocalVM)
+        XCTAssertTrue(vm.desktopHonestyLabel.localizedCaseInsensitiveContains("not running"))
+
+        vm.beginEdit(saved)
+        XCTAssertEqual(vm.studioDraft.desktopKind, .dedicatedLocalVM)
+    }
+
+    func test_newStudioBotPersistsDedicatedLocalVM_becauseCreateMustKeepTheSelectedKind() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.studioDraft.name = "Nova"
+        vm.studioDraft.title = "Scout"
+        vm.studioDraft.provider = .claude
+        vm.applyDefaultModel(for: .claude)
+        vm.studioDraft.desktopKind = .dedicatedLocalVM
+
+        let created = try vm.saveStudio()
+        let revision = try XCTUnwrap(
+            created.currentRevisionID.flatMap { try context.botStore.getRevision(id: $0) }
+        )
+        XCTAssertEqual(revision.desktopKind, .dedicatedLocalVM)
+        XCTAssertEqual(vm.studioDraft.desktopKind, .dedicatedLocalVM)
     }
 
     func test_botsOpensInMainContent_andSidebarSitsUnderScheduleTasks() throws {

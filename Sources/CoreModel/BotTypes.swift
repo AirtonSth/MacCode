@@ -73,23 +73,47 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
     public static let logicalExecutionSpaceHonestyLabel =
         "Same macOS account; not isolated. Not a dedicated Desktop."
 
+    /// Kind is selectable. A guest OS is not running; leftover hypervisor work stays open.
+    public static let dedicatedLocalVMHonestyLabel =
+        "Guest is not running yet. Work still uses this Mac account; not isolated."
+
     public var honestyLabel: String {
         switch self {
         case .logicalExecutionSpace:
             return Self.logicalExecutionSpaceHonestyLabel
         case .dedicatedLocalVM:
-            return "Dedicated local VM Desktop. Off until the VM flag is on."
+            return Self.dedicatedLocalVMHonestyLabel
         case .managedRemoteMac:
             return "Managed remote Mac Desktop. Off until the remote flag is on."
         }
     }
 
-    public func isSelectable(flags: BotControlPlaneFlags) -> Bool {
+    public var displayTitle: String {
         switch self {
         case .logicalExecutionSpace:
-            return flags.isBotControlPlaneActive
+            return "Logical execution space"
         case .dedicatedLocalVM:
-            return flags.isBotDesktopVMActive
+            return "Dedicated local VM"
+        case .managedRemoteMac:
+            return "Managed remote Mac"
+        }
+    }
+
+    public var statusPill: String {
+        switch self {
+        case .logicalExecutionSpace:
+            return "Logical space"
+        case .dedicatedLocalVM:
+            return "Local VM · not running"
+        case .managedRemoteMac:
+            return "Remote Mac · not shipped"
+        }
+    }
+
+    public func isSelectable(flags: BotControlPlaneFlags) -> Bool {
+        switch self {
+        case .logicalExecutionSpace, .dedicatedLocalVM:
+            return flags.isBotControlPlaneActive
         case .managedRemoteMac:
             return flags.isBotDesktopRemoteActive
         }
