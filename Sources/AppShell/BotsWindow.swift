@@ -1362,22 +1362,27 @@ public struct BotsModeSwitcher: View {
     }
 
     public var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 2) {
             segment(
                 title: BotsChrome.Label.agentic,
                 selected: !isBotsSelected,
-                usesBotsAccent: false,
                 identifier: "bots.chrome.agentic",
                 action: onSelectAgentic
             )
             segment(
                 title: BotsChrome.Label.bots,
                 selected: isBotsSelected,
-                usesBotsAccent: true,
                 identifier: "bots.chrome.bots",
                 action: onSelectBots
             )
         }
+        .padding(2)
+        .background(DS.Palette.bg)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("bots.chrome.mode")
         .accessibilityLabel("Sidebar mode")
@@ -1387,23 +1392,16 @@ public struct BotsModeSwitcher: View {
     private func segment(
         title: String,
         selected: Bool,
-        usesBotsAccent: Bool,
         identifier: String,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
             Text(title)
-                .font(DS.Font.body.weight(selected ? .semibold : .medium))
-                .foregroundColor(selected && usesBotsAccent ? BotsChrome.onPrimary : (
-                    selected ? DS.Palette.text : DS.Palette.textSecondary
-                ))
-                .frame(maxWidth: .infinity, minHeight: BotsChrome.hitTarget)
-                .background(
-                    selected
-                        ? (usesBotsAccent ? BotsChrome.primary : DS.Palette.surfaceRaised)
-                        : Color.clear
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .font(DS.Font.caption.weight(selected ? .semibold : .regular))
+                .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
+                .frame(maxWidth: .infinity, minHeight: 36)
+                .background(selected ? DS.Palette.surfaceRaised : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control - 1, style: .continuous))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1422,53 +1420,34 @@ public struct BotsRosterList: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityHidden(true)
-                TextField(BotsChrome.Label.search, text: $vm.searchText)
-                    .textFieldStyle(.plain)
-                    .foregroundColor(DS.Palette.text)
-                    .accessibilityLabel(BotsChrome.Label.search)
-            }
-            .padding(.horizontal, DS.Space.lg)
-            .frame(minHeight: 40)
-            .background(DS.Palette.surfaceRaised)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.top, DS.Space.lg)
-
             Button(action: vm.beginCreate) {
-                HStack(spacing: DS.Space.sm) {
-                    Image(systemName: "plus")
-                    Text(BotsChrome.Label.newBot)
-                }
-                .frame(maxWidth: .infinity)
+                actionRow(symbol: "plus", title: BotsChrome.Label.newBot)
             }
-            .buttonStyle(BotsPrimaryButtonStyle())
+            .buttonStyle(.plain)
             .disabled(!vm.isControlPlaneActive)
+            .help("Create a named teammate")
             .accessibilityIdentifier("bots.new")
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.top, DS.Space.md)
+            .padding(.horizontal, DS.Space.md)
+            .padding(.bottom, DS.Space.lg)
 
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(BotsChrome.Label.botRoster)
-                        .font(DS.Font.caption2.weight(.semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .tracking(1.1)
-                    Text(BotsChrome.Label.myBots)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.textSecondary)
-                }
+            HStack(spacing: DS.Space.sm) {
+                Text(BotsChrome.Label.myBots)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
                 Spacer(minLength: 0)
                 Button(action: vm.openAttention) {
                     Image(systemName: vm.openAttentionCount == 0 ? "bell" : "bell.badge")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(vm.openAttentionCount == 0 ? DS.Palette.textTertiary : DS.Palette.warning)
-                        .frame(width: BotsChrome.hitTarget, height: BotsChrome.hitTarget)
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundColor(vm.openAttentionCount == 0 ? DS.Palette.textSecondary : DS.Palette.warning)
+                        .frame(width: 28, height: 32)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .help(
+                    vm.openAttentionCount == 0
+                        ? "Attention"
+                        : "Attention \(vm.openAttentionCount)"
+                )
                 .accessibilityLabel(
                     vm.openAttentionCount == 0
                         ? "Attention"
@@ -1477,77 +1456,128 @@ public struct BotsRosterList: View {
                 .accessibilityIdentifier("bots.roster.attention")
             }
             .padding(.horizontal, DS.Space.lg)
-            .padding(.top, DS.Space.xl)
+            .padding(.bottom, DS.Space.sm)
+
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityHidden(true)
+                TextField(BotsChrome.Label.search, text: $vm.searchText)
+                    .textFieldStyle(.plain)
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                    .accessibilityLabel(BotsChrome.Label.search)
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .frame(height: 30)
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                    .fill(DS.Palette.surfaceRaised.opacity(0.6))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .strokeBorder(DS.Palette.lineStrong.opacity(0.5), lineWidth: DS.Border.hairline)
+                    )
+            )
+            .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.sm)
 
             ScrollView {
-                LazyVStack(spacing: DS.Space.sm) {
-                    ForEach(vm.fleet, id: \.id) { bot in
-                        rosterRow(bot)
+                LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    if vm.fleet.isEmpty {
+                        Text(vm.searchText.isEmpty ? "No bots yet" : "No matches")
+                            .font(DS.Font.body)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .padding(.horizontal, DS.Space.md)
+                            .padding(.vertical, DS.Space.sm)
+                    } else {
+                        ForEach(vm.fleet, id: \.id) { bot in
+                            rosterRow(bot)
+                        }
                     }
                 }
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.bottom, DS.Space.lg)
+                .padding(.horizontal, DS.Space.sm)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityIdentifier("bots.roster")
     }
 
+    private func actionRow(symbol: String, title: String) -> some View {
+        HStack(spacing: DS.Space.md) {
+            Image(systemName: symbol)
+                .font(.system(size: 16, weight: .regular))
+                .frame(width: 20, height: 20)
+                .foregroundColor(DS.Palette.text)
+            Text(title)
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.text)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .frame(height: 42)
+        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .fill(Color.white.opacity(0.001))
+        )
+    }
+
     private func rosterRow(_ bot: BotDefinition) -> some View {
         let selected = vm.selectedBotID == bot.id && vm.screen != .attention
         let state = vm.attentionState(for: bot)
+        let preview = vm.rosterPreview(for: bot)
         return Button {
             vm.openHome(bot)
         } label: {
-            HStack(alignment: .center, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
                 ZStack(alignment: .bottomTrailing) {
-                    BotsAvatarView(name: bot.name, handle: bot.handle, size: 36)
+                    BotsAvatarView(name: bot.name, handle: bot.handle, size: 22)
                     Circle()
                         .fill(state == .working ? DS.Palette.warning : DS.Palette.success)
-                        .frame(width: 8, height: 8)
-                        .overlay(Circle().stroke(DS.Palette.surface, lineWidth: 1.5))
+                        .frame(width: 7, height: 7)
+                        .overlay(Circle().stroke(DS.Palette.surface, lineWidth: 1))
                 }
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: DS.Space.sm) {
-                        Text(bot.name)
-                            .font(DS.Font.bodyStrong)
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(1)
-                        Spacer(minLength: 0)
-                        if let provider = vm.providerLabel(for: bot) {
-                            Text(provider)
-                                .font(DS.Font.caption2.weight(.semibold))
-                                .foregroundColor(DS.Palette.textSecondary)
-                        }
-                    }
-                    HStack(spacing: DS.Space.sm) {
-                        Text(BotsChrome.statusTitle(for: state))
-                            .font(DS.Font.caption2)
-                            .foregroundColor(DS.Palette.textTertiary)
-                        if let stamp = vm.rosterTimestamp(for: bot) {
-                            Text(stamp, style: .relative)
-                                .font(DS.Font.caption2)
-                                .foregroundColor(DS.Palette.textTertiary)
-                        }
-                    }
-                    Text(vm.rosterPreview(for: bot))
+                .frame(width: 20, height: 20)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(bot.name)
+                        .font(selected ? DS.Font.bodyStrong : DS.Font.body)
+                        .foregroundColor(DS.Palette.text)
+                        .lineLimit(1)
+                    Text(preview)
                         .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textSecondary)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                if let provider = vm.providerLabel(for: bot) {
+                    Text(provider)
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
                         .lineLimit(1)
                 }
             }
-            .padding(DS.Space.md)
-            .frame(minHeight: 56)
-            .background(selected ? BotsChrome.primarySoft : DS.Palette.surfaceRaised)
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(selected ? BotsChrome.primary.opacity(0.55) : DS.Palette.line, lineWidth: 1)
+            .padding(.horizontal, DS.Space.sm)
+            .frame(height: 38)
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                    .fill(selected ? DS.Palette.selection.opacity(0.75) : Color.white.opacity(0.001))
             )
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(alignment: .leading) {
+                if selected {
+                    DS.Palette.accent
+                        .frame(width: 3)
+                        .clipShape(RoundedRectangle(cornerRadius: 1.5, style: .continuous))
+                        .padding(.vertical, 5)
+                }
+            }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help("\(bot.name) · \(BotsChrome.statusTitle(for: state))")
+        .accessibilityLabel(bot.name)
+        .accessibilityValue("\(BotsChrome.statusTitle(for: state)). \(preview)")
         .accessibilityIdentifier("bots.roster.row.\(bot.handle)")
     }
 }

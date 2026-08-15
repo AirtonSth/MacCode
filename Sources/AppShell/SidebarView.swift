@@ -2642,6 +2642,7 @@ public struct SidebarRootView: View {
             )
             .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.md)
+            .accessibilityIdentifier("sidebar.bots")
 
             if vm.isBotsSelected, let botsVM {
                 BotsRosterList(vm: botsVM)
@@ -2685,18 +2686,6 @@ public struct SidebarRootView: View {
                 .help("Create and manage scheduled Agent tasks")
                 .accessibilityIdentifier("sidebar.scheduleTasks")
                 .accessibilityAddTraits(vm.isScheduledTasksSelected ? .isSelected : [])
-
-                Button(action: onOpenBots) {
-                    sidebarActionRow(
-                        symbol: "person.2",
-                        title: "Bots",
-                        isSelected: vm.isBotsSelected
-                    )
-                }
-                .buttonStyle(.plain)
-                .help("Create and message durable named teammates")
-                .accessibilityIdentifier("sidebar.bots")
-                .accessibilityAddTraits(vm.isBotsSelected ? .isSelected : [])
 
                 Button(action: reportBug) {
                     sidebarActionRow(symbol: "ladybug", title: "Report Bug")

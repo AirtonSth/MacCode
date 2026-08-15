@@ -867,6 +867,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(sidebar.contains("isBotsSelected"))
         XCTAssertTrue(sidebar.contains("setBotsSelected"))
         XCTAssertTrue(sidebar.contains("accessibilityIdentifier(\"sidebar.bots\")"))
+        XCTAssertFalse(sidebar.contains("title: \"Bots\""))
         XCTAssertTrue(sidebar.contains("BotsModeSwitcher"))
         XCTAssertTrue(sidebar.contains("BotsRosterList"))
         XCTAssertTrue(bots.contains("bots.chrome.agentic"))
@@ -967,10 +968,12 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(bots.contains("SurfaceType.bot"))
 
         let scheduleTasks = try XCTUnwrap(sidebar.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
-        let botsRow = try XCTUnwrap(sidebar.range(of: "accessibilityIdentifier(\"sidebar.bots\")"))
         let reportBug = try XCTUnwrap(sidebar.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
-        XCTAssertLessThan(scheduleTasks.lowerBound, botsRow.lowerBound)
-        XCTAssertLessThan(botsRow.lowerBound, reportBug.lowerBound)
+        XCTAssertLessThan(scheduleTasks.lowerBound, reportBug.lowerBound)
+        XCTAssertTrue(
+            sidebar.contains("BotsModeSwitcher"),
+            "Bots is entered from the Agentic/Bots switcher, not a dest row"
+        )
     }
 
     private func makeContext() throws -> AppContext {
