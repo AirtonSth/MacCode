@@ -49,6 +49,11 @@ public struct RCWireFrame: Codable, Sendable, Equatable {
     }
 }
 
+public struct RCWireResponseProjection: Sendable, Equatable {
+    public let rawWire: String
+    public let deterministicHuman: String
+}
+
 public enum RCWirePrefixDisposition: Sendable, Equatable {
     case undecided
     case wire
@@ -363,6 +368,20 @@ public enum RCWireProtocol {
         }
         guard !frames.isEmpty else { throw RCWireProtocolError.empty }
         return frames
+    }
+
+    /// Projects only a complete provider response whose RCW1 A sentinel begins
+    /// at byte zero. The exact raw input is preserved for exact lexical counts;
+    /// this path intentionally does not trim or recover a transport envelope.
+    public static func strictResponseProjection(raw: String) -> RCWireResponseProjection? {
+        guard raw.hasPrefix("\(version)\t\(RCWireDirection.response.rawValue)\t"),
+              let frames = try? parse(raw),
+              frames.allSatisfy({ $0.direction == .response }) else {
+            return nil
+        }
+        let human = renderEnglish(frames)
+        guard !human.isEmpty else { return nil }
+        return RCWireResponseProjection(rawWire: raw, deterministicHuman: human)
     }
 
     public static func renderEnglish(_ frames: [RCWireFrame]) -> String {

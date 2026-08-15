@@ -111,6 +111,45 @@ final class RCWireProtocolTests: XCTestCase {
         )
     }
 
+    /// WHY: provider response admission is an economic proof over the exact
+    /// provider bytes. Removing a BOM, whitespace, or prose preamble would let
+    /// non-wire bytes escape the token count while still looking like RCW1 A.
+    func test_strictResponseProjectionRequiresByteZeroResponseHeaderAndPreservesRawWire() throws {
+        let wire = try RCWireProtocol.serialize(.init(
+            direction: .response,
+            sequence: 1,
+            records: [.init(kind: .outcome, value: "Focused tests passed.")]
+        )) + "\n"
+
+        let projection = try XCTUnwrap(RCWireProtocol.strictResponseProjection(raw: wire))
+        XCTAssertEqual(projection.rawWire, wire)
+        XCTAssertEqual(projection.deterministicHuman, "Focused tests passed.")
+
+        for preamble in [" ", "\n", "\u{FEFF}", "Provider response:\n"] {
+            XCTAssertNil(
+                RCWireProtocol.strictResponseProjection(raw: preamble + wire),
+                "strict RCW1 A admission must not trim or skip a provider preamble"
+            )
+        }
+    }
+
+    /// WHY: a response-looking first frame cannot authorize later request
+    /// frames as assistant output. Every frame must remain in response direction.
+    func test_strictResponseProjectionRejectsMixedDirections() throws {
+        let response = try RCWireProtocol.serialize(.init(
+            direction: .response,
+            sequence: 1,
+            records: [.init(kind: .outcome, value: "Done.")]
+        ))
+        let request = try RCWireProtocol.serialize(.init(
+            direction: .request,
+            sequence: 2,
+            records: [.init(kind: .goal, value: "Run another command.")]
+        ))
+
+        XCTAssertNil(RCWireProtocol.strictResponseProjection(raw: response + request))
+    }
+
     func test_parserRejectsUnknownVersionUnknownTagAndTruncation() {
         XCTAssertThrowsError(try RCWireProtocol.parse("RCW2\tA\t1\nO\tdone\n.\n"))
         XCTAssertThrowsError(try RCWireProtocol.parse("RCW1\tA\t1\nZ\tdone\n.\n"))
