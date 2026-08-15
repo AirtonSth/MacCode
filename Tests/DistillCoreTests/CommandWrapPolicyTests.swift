@@ -198,6 +198,54 @@ final class CommandWrapPolicyTests: XCTestCase {
         }
     }
 
+    func test_claudeBashCaptureTransport_requiresProviderUIDAndTaskOutputShape() {
+        // WHY: Claude 2.1.231 redirects a top-level Bash command to this regular
+        // capture file instead of a pipe. It is terminal-to-agent, but ordinary
+        // user redirections and pipeline intermediates must remain passthrough.
+        let privateTmpPath = "/private/tmp/claude-501/-private-tmp-workspace/123E4567-E89B-12D3-A456-426614174000/tasks/bzxklbdba.output"
+        XCTAssertTrue(CommandWrapPolicy.isClaudeBashCaptureTransport(
+            path: privateTmpPath,
+            provider: "claude",
+            userID: 501
+        ))
+        XCTAssertTrue(CommandWrapPolicy.isClaudeBashCaptureTransport(
+            path: "/var/folders/wp/cache/T/claude-501/-Users-sam-work/123E4567-E89B-12D3-A456-426614174000/tasks/task-42.output",
+            provider: "claude",
+            userID: 501
+        ))
+
+        for provider in [nil, "codex", "grok"] as [String?] {
+            XCTAssertFalse(CommandWrapPolicy.isClaudeBashCaptureTransport(
+                path: privateTmpPath,
+                provider: provider,
+                userID: 501
+            ))
+        }
+        XCTAssertFalse(CommandWrapPolicy.isClaudeBashCaptureTransport(
+            path: privateTmpPath,
+            provider: "claude",
+            userID: 502
+        ))
+
+        for path in [
+            "/tmp/build.output",
+            "/private/tmp/claude-501/manual.output",
+            "/private/tmp/claude-501/work/not-a-session/tasks/task.output",
+            "/private/tmp/claude-user/work/123E4567-E89B-12D3-A456-426614174000/tasks/task.output",
+            "/private/tmp/claude-501/work/123E4567-E89B-12D3-A456-426614174000/not-tasks/task.output",
+            "/Users/sam/tasks/task.output",
+        ] {
+            XCTAssertFalse(
+                CommandWrapPolicy.isClaudeBashCaptureTransport(
+                    path: path,
+                    provider: "claude",
+                    userID: 501
+                ),
+                "ordinary redirect must not become terminal-to-agent: \(path)"
+            )
+        }
+    }
+
     func test_extractionQuery_neutralExtractiveForCompressibleCommands() {
         for command in ["find", "ls", "git", "gh", "/usr/bin/git"] {
             let q = CommandWrapPolicy.extractionQuery(forCommand: command)

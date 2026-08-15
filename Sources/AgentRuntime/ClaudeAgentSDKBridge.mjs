@@ -310,14 +310,18 @@ function isExactOutputBashCommand(toolInput) {
 
 function tokenSaverToolDecision(toolName, toolInput, output) {
   const normalized = normalizeToolName(toolName);
-  // Every tool compresses (no allowlist); only exact-byte tools, Skill content,
-  // and sub-threshold output are skipped. Skill is protected before threshold.
+  // Every non-Bash tool compresses (no allowlist); only exact-byte tools, Skill
+  // content, and sub-threshold output are skipped. Claude normalizes Bash stdout
+  // before PostToolUse without preserving its terminal-LF state, so Bash must
+  // fail open here. PATH wrappers and explicit `| distill` see the exact bytes.
   const profile = TOKEN_SAVER_PROFILES.get(normalized) || TOKEN_SAVER_DEFAULT_PROFILE;
   let skipReason = null;
   if (TOKEN_SAVER_EXCLUDED_TOOLS.has(normalized)) {
     skipReason = normalized === 'skill' ? 'skill_content' : 'excluded_tool';
   } else if (normalized === 'bash' && isExactOutputBashCommand(toolInput)) {
     skipReason = 'exact_output_shell';
+  } else if (normalized === 'bash') {
+    skipReason = 'normalized_bash_output';
   } else if (Buffer.byteLength(output || '', 'utf8') <= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES) {
     skipReason = 'below_threshold';
   }
@@ -461,8 +465,8 @@ async function tokenSaverPostToolUse(input) {
   });
   if (!output || output.length >= rawOutput.length) return {};
   const replaced = replaceToolOutputText(input.tool_response, output);
-  // SDK: updatedToolOutput works for all tools; updatedMCPToolOutput is MCP-only.
-  // Set both so Bash/Grep/etc. are actually replaced while MCP still works.
+  // SDK: updatedToolOutput works for built-in tools; updatedMCPToolOutput is
+  // MCP-only. Set both so eligible non-Bash output is replaced in either lane.
   return {
     continue: true,
     hookSpecificOutput: {

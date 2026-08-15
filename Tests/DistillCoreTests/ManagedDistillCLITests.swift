@@ -635,11 +635,12 @@ final class ManagedDistillCLITests: XCTestCase {
         let encoded = try JSONEncoder().encode(sidecarResponse)
         let recorder = RequestRecorder()
 
-        // Claude PostToolUse envelope field names from ClaudeAgentSDKBridge.mjs.
+        // Non-Bash tools retain their exact response string in the hook envelope,
+        // so PostToolUse remains a valid compression lane for those tools.
         let hookJSON: [String: Any] = [
             "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "tool_input": ["command": "make test"],
+            "tool_name": "WebFetch",
+            "tool_input": ["url": "https://example.invalid/build-log"],
             "tool_response": rawToolOutput,
         ]
         let stdin = try JSONSerialization.data(withJSONObject: hookJSON)
@@ -674,57 +675,51 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(requests.first?.provider, "claude")
     }
 
-    func test_hookPostToolUse_bashObject_preservesResponseShape() async throws {
-        // WHY: Claude CLI validates updatedToolOutput against the built-in tool's
-        // response schema. Returning compressed text as a bare string makes Bash
-        // reject the hook and replay the original output into provider context.
-        let rawToolOutput = String(repeating: "build line noise that should compress away\n", count: 40)
-            + "BUILD FAILED: 3 errors\n"
-        let compressed = "BUILD FAILED: 3 errors"
-        let sidecarResponse = DistillResponse(
-            requestID: UUID(),
-            output: compressed,
-            inputCharacters: rawToolOutput.count,
-            inputTokens: TokenEstimator.estimate(rawToolOutput),
-            outputTokens: TokenEstimator.estimate(compressed),
-            originalHandle: "hook-shape",
-            routeStage: .deterministic
-        )
-        let encoded = try JSONEncoder().encode(sidecarResponse)
-        let hookJSON: [String: Any] = [
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "tool_input": ["command": "make test"],
-            "tool_response": [
-                "stdout": rawToolOutput,
-                "stderr": "compiler warning kept verbatim",
-                "interrupted": false,
-                "isImage": false,
-                "noOutputExpected": false,
-            ] as [String: Any],
-        ]
-        let stdin = try JSONSerialization.data(withJSONObject: hookJSON)
+    func test_hookPostToolUse_bashObject_withOrWithoutTerminalLF_failsOpenWithoutTransport() async throws {
+        // WHY: Claude Code normalizes Bash stdout before PostToolUse and removes
+        // leading/trailing blank lines. The hook receives the same object shape for
+        // a process that emitted a terminal LF and one that did not, so storing
+        // either string as the byte-exact original would be dishonest. PATH wrappers
+        // capture the real bytes before Claude normalization; Bash PostToolUse must
+        // therefore fail open and leave Claude's original response object untouched.
+        let recorder = RequestRecorder()
+        let base = String(repeating: "build line noise that should compress away\n", count: 40)
+            + "BUILD FAILED: 3 errors"
 
-        let cli = ManagedDistillCLI(
-            arguments: ["hook", "post-tool-use"],
-            stdin: stdin,
-            state: state,
-            provider: "claude"
-        ) { _ in
-            (encoded, 200)
+        for rawToolOutput in [base, base + "\n"] {
+            let hookJSON: [String: Any] = [
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": ["command": "make test"],
+                "tool_response": [
+                    "stdout": rawToolOutput,
+                    "stderr": "compiler warning kept verbatim",
+                    "interrupted": false,
+                    "isImage": false,
+                    "noOutputExpected": false,
+                ] as [String: Any],
+            ]
+            let stdin = try JSONSerialization.data(withJSONObject: hookJSON)
+            let cli = ManagedDistillCLI(
+                arguments: ["hook", "post-tool-use"],
+                stdin: stdin,
+                state: state,
+                provider: "claude"
+            ) { request in
+                await recorder.append(try! JSONDecoder().decode(DistillRequest.self, from: request.httpBody!))
+                return nil
+            }
+
+            let (out, code) = await cli.run()
+            XCTAssertEqual(code, 0)
+            XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
         }
 
-        let (out, code) = await cli.run()
-        XCTAssertEqual(code, 0)
-
-        let obj = try JSONSerialization.jsonObject(with: out) as? [String: Any]
-        let hookOut = obj?["hookSpecificOutput"] as? [String: Any]
-        let updated = try XCTUnwrap(hookOut?["updatedToolOutput"] as? [String: Any])
-        XCTAssertTrue((updated["stdout"] as? String)?.hasPrefix(compressed) == true)
-        XCTAssertEqual(updated["stderr"] as? String, "compiler warning kept verbatim")
-        XCTAssertEqual(updated["interrupted"] as? Bool, false)
-        XCTAssertEqual(updated["isImage"] as? Bool, false)
-        XCTAssertEqual(updated["noOutputExpected"] as? Bool, false)
+        let requests = await recorder.all()
+        XCTAssertTrue(
+            requests.isEmpty,
+            "ambiguous Bash stdout must never be stored or compressed by PostToolUse"
+        )
     }
 
     func test_hookPostToolUse_waveA_deliversUpdatedToolOutputBeforeLedgerTransport() async throws {
@@ -744,8 +739,8 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let hookJSON: [String: Any] = [
             "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "tool_input": ["command": "make test"],
+            "tool_name": "WebFetch",
+            "tool_input": ["url": "https://example.invalid/build-log"],
             "tool_response": rawToolOutput,
         ]
         let stdin = try JSONSerialization.data(withJSONObject: hookJSON)
@@ -795,8 +790,8 @@ final class ManagedDistillCLITests: XCTestCase {
     func test_hookPostToolUse_sidecarUnreachable_returnsEmptyObjectExitZero() async throws {
         let hookJSON: [String: Any] = [
             "hook_event_name": "PostToolUse",
-            "tool_name": "Bash",
-            "tool_input": ["command": "ls"],
+            "tool_name": "WebFetch",
+            "tool_input": ["url": "https://example.invalid/large"],
             "tool_response": "lots of tool output that would be compressed if the sidecar were up\n",
         ]
         let stdin = try JSONSerialization.data(withJSONObject: hookJSON)

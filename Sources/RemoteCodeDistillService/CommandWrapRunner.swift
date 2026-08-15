@@ -246,16 +246,34 @@ enum CommandWrapRunner {
 /// commands (the wrapper's parent becomes the agent itself).
 enum WrapPipeInspector {
     static func isTerminalToAgent() -> Bool {
-        guard let mine = pipeInfo(pid: getpid(), fd: 1) else { return false } // stdout not a pipe → not terminal
-        let peerHandle = mine.peer
-        var current: Int32? = parentPID(of: getpid())
-        var hops = 0
-        while let pid = current, pid > 1, hops < 12 {
-            if pipeHandles(of: pid).contains(peerHandle) { return true }
-            current = parentPID(of: pid)
-            hops += 1
+        if let mine = pipeInfo(pid: getpid(), fd: STDOUT_FILENO) {
+            let peerHandle = mine.peer
+            var current: Int32? = parentPID(of: getpid())
+            var hops = 0
+            while let pid = current, pid > 1, hops < 12 {
+                if pipeHandles(of: pid).contains(peerHandle) { return true }
+                current = parentPID(of: pid)
+                hops += 1
+            }
+            return false
         }
-        return false
+
+        // Claude Code 2.1.x captures a top-level Bash command in a regular
+        // `.../claude-<uid>/.../tasks/<id>.output` file. That file is the
+        // provider's terminal-to-agent transport, not a user redirect. Pipeline
+        // intermediates keep a pipe and therefore cannot enter this branch.
+        guard let path = filePath(fd: STDOUT_FILENO) else { return false }
+        return CommandWrapPolicy.isClaudeBashCaptureTransport(
+            path: path,
+            provider: ProcessInfo.processInfo.environment["REMOTE_CODE_AGENT_PROVIDER"],
+            userID: getuid()
+        )
+    }
+
+    private static func filePath(fd: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(fd, F_GETPATH, &buffer) != -1 else { return nil }
+        return String(cString: buffer)
     }
 
     private static func pipeInfo(pid: Int32, fd: Int32) -> (handle: UInt64, peer: UInt64)? {

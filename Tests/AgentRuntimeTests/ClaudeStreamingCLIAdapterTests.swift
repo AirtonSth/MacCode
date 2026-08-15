@@ -1806,10 +1806,11 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "rc_configure must relay the host `system_prompt` into session state (undefined keeps the SDK default empty prompt when Token Saver is off)")
     }
 
-    // The Claude PostToolUse fallback must distill EVERY tool (no 4-tool
-    // allowlist) once output passes its hook threshold, excluding only the
-    // exact-byte file tools and Skill content. Explicit `| distill` is governed
-    // by the system prompt for ordinary eligible output.
+    // The Claude PostToolUse fallback must distill every non-Bash tool (no
+    // 4-tool allowlist) once output passes its hook threshold, excluding only
+    // exact-byte file tools and Skill content. Bash fails open because Claude
+    // normalizes its response before the hook; PATH wrappers / explicit
+    // `| distill` are the byte-exact lanes for eligible shell output.
     func test_agentSDKBridgeTokenSaverCompressesAllToolsAbovePolicyThreshold() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -1840,6 +1841,8 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "Bash must skip exact-output shell tools (rg/grep/sed/...) per AGENTS.md")
         XCTAssertTrue(source.contains("isExactOutputBashCommand"),
                       "Bash exact-output detection must inspect command segments, not only the first token")
+        XCTAssertTrue(source.contains("normalized_bash_output"),
+                      "ordinary Bash must fail open after Claude normalizes away terminal-LF state")
         for command in WrappedCommandCatalog.exactOutputCommands {
             XCTAssertTrue(
                 source.contains("'\(command)'"),
@@ -1905,6 +1908,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           skillShouldCompress: skill.shouldCompress,
           skillSkipReason: skill.skipReason,
           ordinaryShouldCompress: ordinary.shouldCompress,
+          ordinarySkipReason: ordinary.skipReason,
           exactShouldCompress: exact.shouldCompress,
           exactSkipReason: exact.skipReason,
           exactMatrixSkipped: exactMatrix.every((decision) => !decision.shouldCompress && decision.skipReason === 'exact_output_shell'),
@@ -1934,8 +1938,9 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(json["skillShouldCompress"] as? Bool, false,
                        "Skill tool output must never enter Distill PostToolUse compression")
         XCTAssertEqual(json["skillSkipReason"] as? String, "skill_content")
-        XCTAssertEqual(json["ordinaryShouldCompress"] as? Bool, true,
-                       "ordinary large Bash output remains Distill-eligible")
+        XCTAssertEqual(json["ordinaryShouldCompress"] as? Bool, false,
+                       "ordinary Bash must fail open because Claude normalized its terminal-LF state")
+        XCTAssertEqual(json["ordinarySkipReason"] as? String, "normalized_bash_output")
         XCTAssertEqual(json["exactShouldCompress"] as? Bool, false,
                        "exact-output Bash (rg) stays excluded")
         XCTAssertEqual(json["exactMatrixSkipped"] as? Bool, true,
@@ -1945,6 +1950,113 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                              "fixture must exceed presentation truncation limit to prove completeness path")
         // Ensure the harness is grounded in the live bridge (no silent fallback).
         XCTAssertTrue(source.contains("'skill'"), "bridge source must list skill exclusion")
+    }
+
+    func test_agentSDKBridgePostToolUse_bashWithOrWithoutTerminalLFFailsOpenBeforeSidecar() throws {
+        let node = try XCTUnwrap(
+            ProcessLocator.resolve("node"),
+            "node is required for the bridge PostToolUse contract test"
+        )
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+
+        // WHY: Claude's SDK hands PostToolUse a normalized Bash response that
+        // cannot prove whether the real process emitted a terminal LF. Exercise
+        // the production hook with both apparent shapes and prove it returns an
+        // empty update before loading state or calling the sidecar. A non-Bash
+        // call remains compressible so this is not a blanket hook disable.
+        let harness = """
+        import { readFileSync } from 'fs';
+        const src = readFileSync(process.argv[2], 'utf8');
+        const helperStart = src.indexOf('const TOKEN_SAVER_MIN_BYTES');
+        const helperEnd = src.indexOf('function tokenSaverContractQuestion');
+        const hookStart = src.indexOf('async function tokenSaverPostToolUse');
+        const hookEnd = src.indexOf('function tokenSaverHooks');
+        if ([helperStart, helperEnd, hookStart, hookEnd].some((offset) => offset < 0)) {
+          throw new Error('bridge helper slice not found');
+        }
+        const factory = new Function(
+          'current',
+          'loadTokenSaverState',
+          'postTokenSaverDistill',
+          'randomUUID',
+          'tokenSaverContractQuestion',
+          src.slice(helperStart, helperEnd) + '\\n' + src.slice(hookStart, hookEnd)
+            + '\\nreturn tokenSaverPostToolUse;'
+        );
+        let stateLoads = 0;
+        let sidecarCalls = 0;
+        const hook = factory(
+          { env: { RC_TOKEN_SAVER_POST_TOOL_USE: '1', REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
+          () => { stateLoads += 1; return { base_url: 'http://127.0.0.1', auth_token: 'tok' }; },
+          async () => { sidecarCalls += 1; return 'DISTILLED_NON_BASH'; },
+          () => '123e4567-e89b-12d3-a456-426614174000',
+          () => 'contract'
+        );
+        const raw = Array.from({ length: 80 }, (_, i) => `diagnostic line ${i}`).join('\\n')
+          + '\\nFINAL_SENTINEL';
+        const bashInput = (stdout) => ({
+          hook_event_name: 'PostToolUse',
+          tool_name: 'Bash',
+          tool_input: { command: 'swift noisy.swift' },
+          tool_response: {
+            stdout,
+            stderr: '',
+            interrupted: false,
+            isImage: false,
+            noOutputExpected: false,
+          },
+        });
+        const bashWithoutLF = await hook(bashInput(raw));
+        const bashWithLF = await hook(bashInput(raw + '\\n'));
+        const callsAfterBash = sidecarCalls;
+        const loadsAfterBash = stateLoads;
+        const web = await hook({
+          hook_event_name: 'PostToolUse',
+          tool_name: 'WebFetch',
+          tool_input: { url: 'https://example.invalid/noisy' },
+          tool_response: raw,
+        });
+        console.log(JSON.stringify({
+          bashWithoutLF,
+          bashWithLF,
+          callsAfterBash,
+          loadsAfterBash,
+          sidecarCalls,
+          stateLoads,
+          webUpdated: web.hookSpecificOutput?.updatedToolOutput,
+          webMCPUpdated: web.hookSpecificOutput?.updatedMCPToolOutput,
+        }));
+        """
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-sdk-bash-normalized-output-\(UUID().uuidString).mjs")
+        try harness.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [tmp.path, bridge.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
+        let data = try XCTUnwrap(out.data(using: .utf8))
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual((json["bashWithoutLF"] as? [String: Any])?.count, 0)
+        XCTAssertEqual((json["bashWithLF"] as? [String: Any])?.count, 0)
+        XCTAssertEqual(json["callsAfterBash"] as? Int, 0)
+        XCTAssertEqual(json["loadsAfterBash"] as? Int, 0)
+        XCTAssertEqual(json["sidecarCalls"] as? Int, 1,
+                       "eligible non-Bash output must still call the sidecar")
+        XCTAssertEqual(json["stateLoads"] as? Int, 1)
+        XCTAssertEqual(json["webUpdated"] as? String, "DISTILLED_NON_BASH")
+        XCTAssertEqual(json["webMCPUpdated"] as? String, "DISTILLED_NON_BASH")
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {

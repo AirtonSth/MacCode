@@ -277,6 +277,53 @@ public enum CommandWrapPolicy {
         byteCount > minBytes(environment: environment) || lineCount > minLines(environment: environment)
     }
 
+    /// Claude Code writes a top-level Bash command's stdout/stderr directly to
+    /// a provider-owned task file instead of a pipe. A wrapped command whose
+    /// stdout is exactly this file is terminal-to-agent; a pipeline stage still
+    /// has a pipe, and an ordinary user redirect has a different path.
+    ///
+    /// Keep admission deliberately structural and narrow: the runtime provider
+    /// must be Claude and `claude-<uid>` must match the wrapper process's real
+    /// user ID. The current Claude layout is:
+    /// `<temp>/claude-<uid>/<workspace>/<session UUID>/tasks/<task>.output`.
+    public static func isClaudeBashCaptureTransport(
+        path: String,
+        provider: String?,
+        userID: UInt32
+    ) -> Bool {
+        guard provider == "claude" else { return false }
+        guard path.hasPrefix("/") else { return false }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard let claudeIndex = components.firstIndex(of: "claude-\(userID)") else {
+            return false
+        }
+
+        // Only OS temporary roots. `/tmp` canonicalizes to `/private/tmp` on
+        // macOS; Claude may also honor the per-user `/var/folders/.../T` root.
+        let prefix = Array(components[..<claudeIndex])
+        let isTmp = prefix == ["tmp"] || prefix == ["private", "tmp"]
+        let isDarwinUserTemp = prefix.count >= 4
+            && (prefix.starts(with: ["var", "folders"])
+                || prefix.starts(with: ["private", "var", "folders"]))
+            && prefix.last == "T"
+        guard isTmp || isDarwinUserTemp else { return false }
+
+        // Exactly workspace/session/tasks/file after `claude-<uid>`; the UUID
+        // prevents a user-created generic `tasks/foo.output` redirect matching.
+        guard components.count == claudeIndex + 5,
+              !components[claudeIndex + 1].isEmpty,
+              UUID(uuidString: components[claudeIndex + 2]) != nil,
+              components[claudeIndex + 3] == "tasks" else {
+            return false
+        }
+        let filename = components[claudeIndex + 4]
+        guard filename.hasSuffix(".output") else { return false }
+        let stem = filename.dropLast(".output".count)
+        return !stem.isEmpty && stem.allSatisfy {
+            $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_"
+        }
+    }
+
     /// The distill question every wrapped command sends. A neutral EXTRACTIVE query routes the
     /// distill service to its BERT encoder lane, which selects the most relevant lines VERBATIM —
     /// validated (E4B) to beat the generative LLM on code (real lines vs a lossy summary) AND on

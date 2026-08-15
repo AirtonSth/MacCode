@@ -244,6 +244,16 @@ public struct ManagedDistillCLI: Sendable {
         }
 
         let toolName = envelope["tool_name"] as? String ?? ""
+        // Claude Code normalizes Bash stdout before PostToolUse (it removes
+        // leading/trailing blank lines), and its Bash response object carries no
+        // byte count or terminator metadata. The hook therefore cannot know
+        // whether the real process emitted a terminal LF. Never create a claimed
+        // byte-exact recovery object from that ambiguous text. Eligible shell
+        // commands are compressed earlier by the provider-neutral PATH wrapper,
+        // while explicit `| distill` remains available for absolute binaries.
+        if Self.isBashTool(toolName) {
+            return emptyOK
+        }
         // Multimodal: any image part in tool_response → fail-open before text extract.
         // WHY: extractToolOutputText flattens text only; compressing would replace the whole
         // tool_response and drop the image (advisor: mixed text+image defect).
@@ -255,19 +265,11 @@ public struct ManagedDistillCLI: Sendable {
             return emptyOK
         }
 
-        // Policy gate: mutation tools stay raw; image-like text blobs skip Distill;
-        // exact-output Bash (rg/sed/cat/…) stays raw; small outputs fail-open.
-        // Prefer raw `command` from tool_input for exact-output shell detection;
-        // fall back to summarized fields for contracts.
+        // Policy gate: mutation tools stay raw; image-like text blobs and small
+        // outputs fail open. Bash has already failed open above because only the
+        // earlier PATH wrapper sees its exact bytes.
         let argsSummary = Self.summarizeToolInput(envelope["tool_input"])
-        let bashCommand: String? = {
-            guard let obj = envelope["tool_input"] as? [String: Any],
-                  let cmd = obj["command"] as? String else { return nil }
-            let t = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
-            return t.isEmpty ? nil : t
-        }()
-        // Thresholds align with CommandWrapPolicy defaults (aggressive wrap path),
-        // not the conservative 2k/30 hook plan defaults — small noisy Bash still compresses.
+        // Thresholds align with CommandWrapPolicy defaults (aggressive wrap path).
         let decision = ToolOutputCompressionPolicy(
             minBytes: CommandWrapPolicy.defaultMinBytes,
             minLines: CommandWrapPolicy.defaultMinLines,
@@ -275,7 +277,7 @@ public struct ManagedDistillCLI: Sendable {
         ).decision(
             toolName: toolName,
             output: rawOutput,
-            toolArgumentsSummary: bashCommand.map { "command=\($0)" } ?? (argsSummary.isEmpty ? nil : argsSummary)
+            toolArgumentsSummary: argsSummary.isEmpty ? nil : argsSummary
         )
         guard decision.shouldCompress else {
             return emptyOK
@@ -338,6 +340,15 @@ public struct ManagedDistillCLI: Sendable {
             t.removeLast()
         }
         return t
+    }
+
+    static func isBashTool(_ toolName: String) -> Bool {
+        let normalized = toolName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+            .lowercased()
+        return normalized == "bash"
     }
 
     /// True when tool_response contains an image content block or image-like base64 blob.
