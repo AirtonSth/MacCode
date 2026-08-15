@@ -1,5 +1,6 @@
 import AgentRuntime
 import CryptoKit
+import Darwin
 import Foundation
 import XCTest
 import CoreModel
@@ -71,27 +72,14 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         }
     }
 
-    func test_responseCorpusCountsCompleteFramesAndRequestRecoveryOverhead() throws {
-        // WHY: RCW1 response framing is overhead. A provider must not claim
-        // savings for a short O record whose complete frame expands plaintext.
+    func test_responseAndRequestFramingPreserveEscapingAndRecoveryOverhead() throws {
         let shortFrame = RCWireFrame(
             direction: .response,
             sequence: 1,
             records: [.init(kind: .outcome, value: "OK")]
         )
-        let shortWire = try RCWireProtocol.serialize(shortFrame)
-        let shortPlaintext = RCWireProtocol.renderEnglish([shortFrame])
+        XCTAssertEqual(try RCWireProtocol.serialize(shortFrame).utf8.count, 16)
 
-        XCTAssertEqual(shortWire.utf8.count, 16)
-        XCTAssertEqual(TokenEstimator.estimate(shortWire), 8)
-        XCTAssertEqual(TokenEstimator.estimate(shortPlaintext), 1)
-        XCTAssertNil(
-            profitableResponseSavings(wire: shortWire, plaintext: shortPlaintext),
-            "wire >= plaintext must never become a savings claim"
-        )
-
-        // Typed response records can amortize framing against the same terse
-        // plaintext with equivalent Human labels.
         let multiFrame = RCWireFrame(
             direction: .response,
             sequence: 1,
@@ -104,36 +92,380 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             ]
         )
         let multiWire = try RCWireProtocol.serialize(multiFrame)
-        let multiPlaintext = RCWireProtocol.renderEnglish([multiFrame])
-
         XCTAssertTrue(multiWire.contains("R\t" + #"Path C:\\tmp\tcache\nchanged"#))
         XCTAssertEqual(multiWire.utf8.count, 87)
-        XCTAssertEqual(multiPlaintext.utf8.count, 100)
-        XCTAssertEqual(TokenEstimator.estimate(multiWire), 23)
-        XCTAssertEqual(TokenEstimator.estimate(multiPlaintext), 25)
-        XCTAssertEqual(
-            profitableResponseSavings(wire: multiWire, plaintext: multiPlaintext),
-            2,
-            "only a strictly smaller complete frame may report response savings"
-        )
+        XCTAssertEqual(RCWireProtocol.renderEnglish([multiFrame]).utf8.count, 100)
 
-        // The recovery capability belongs to the request X record. Its handle
-        // and escaped bytes must remain visible to request-side accounting.
         let recoveryHandle = "[[rc:abc123]]"
-        let requestFrame = RCWireFrame(
+        let requestWire = try RCWireProtocol.serialize(.init(
             direction: .request,
             sequence: 1,
             records: [
                 .init(kind: .goal, value: "Check C:\\tmp\tcache\nnow"),
                 .init(kind: .exact, value: recoveryHandle),
             ]
-        )
-        let requestWire = try RCWireProtocol.serialize(requestFrame)
-
+        ))
         XCTAssertTrue(requestWire.contains("G\t" + #"Check C:\\tmp\tcache\nnow"#))
         XCTAssertTrue(requestWire.contains("X\t\(recoveryHandle)"))
         XCTAssertEqual(requestWire.utf8.count, 55)
         XCTAssertEqual(TokenEstimator.estimate(requestWire), 14)
+    }
+
+    func test_responseEfficiencyCorpusContract() throws {
+        let data = try responseCorpusData()
+        let cases = try loadResponseCorpus()
+        XCTAssertEqual(sha256Hex(data), frozenResponseCorpusSHA256)
+        XCTAssertEqual(cases.count, 10)
+        XCTAssertEqual(cases.map(\.id), frozenResponseCorpusIDs)
+        XCTAssertEqual(Set(cases.map(\.category)), [
+            "short", "natural_nominal", "multi_record", "progressive_multiframe",
+            "exact_literal_code_path", "multilingual", "repetition_template", "opaque_incompressible",
+        ])
+        XCTAssertTrue(Set(cases.map(\.language)).isSuperset(of: ["en", "pt", "ja", "ar", "zxx"]))
+        XCTAssertEqual(Set(cases.flatMap(\.frames).flatMap(\.records).map(\.kind.rawValue)),
+                       Set(["O", "A", "E", "R", "Q"]))
+        for item in cases {
+            let frames = try item.rcWireFrames()
+            XCTAssertFalse(frames.flatMap(\.records).contains { $0.kind == .exact })
+            XCTAssertEqual(RCWireProtocol.renderEnglish(frames), item.humanBaseline)
+            let wire = try item.serializedWire()
+            let projection = try XCTUnwrap(RCWireProtocol.strictResponseProjection(raw: wire))
+            XCTAssertEqual(projection.rawWire, wire)
+            XCTAssertEqual(projection.deterministicHuman, item.humanBaseline)
+        }
+        let nominal = try XCTUnwrap(cases.first { $0.id == "reported-disposable-workspace-answer" })
+        XCTAssertTrue(nominal.humanBaseline.hasPrefix("A disposable local workspace improves software testing"))
+        XCTAssertFalse(nominal.humanBaseline.contains("Explain in one short"))
+    }
+
+    func test_responseBenchmarkRejectsFrozenCorpusAndCounterEvidenceTable() throws {
+        let data = try responseCorpusData()
+        let corpus = try loadResponseCorpus()
+        let measurements = try responseMeasurements(corpus)
+        let counter = responseCounter(cases: corpus, measurements: measurements)
+        let first = try XCTUnwrap(corpus.first)
+        let firstMeasurement = try XCTUnwrap(measurements.first)
+        var preamble = measurements
+        preamble[0] = .init(id: first.id, human: first.humanBaseline,
+                            wire: "Provider response:\n" + firstMeasurement.wire,
+                            caveman: firstMeasurement.caveman)
+        let mutated = try XCTUnwrap(String(data: data, encoding: .utf8))
+            .replacingOccurrences(of: "\"OK\"", with: "\"NO\"").data(using: .utf8)!
+        let objects = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        let reversed = try JSONSerialization.data(
+            withJSONObject: Array(objects.reversed()), options: [.prettyPrinted, .sortedKeys])
+        let divergent = benchmarkPinnedCavemanProvenance.replacing(
+            binarySHA: String(repeating: "0", count: 64))
+        let one = responseCase(id: "counter-control", outcome: "Counter control Human.")
+        let oneMeasurement = try responseMeasurement(one)
+        let oneCounts = [
+            AgentSkillInstaller.rcWireAgentInstructionsTemplate: 10,
+            one.humanBaseline: 100, oneMeasurement.wire: 45,
+        ]
+        var drift = 0
+        let driftingCounter = BenchmarkTokenCounter(diagnostic: exactTokenDiagnostic,
+            sourceSHA256: String(repeating: "d", count: 64), count: { _ in drift += 1; return drift })
+        let mismatched = ResponseEfficiencyCase(
+            id: one.id, category: one.category, language: one.language,
+            frames: one.frames, humanBaseline: one.humanBaseline + " changed")
+        let mismatchedMeasurement = ResponseBenchmarkMeasurement(id: one.id,
+            human: mismatched.humanBaseline, wire: oneMeasurement.wire, caveman: oneMeasurement.caveman)
+        func evaluate(_ cases: [ResponseEfficiencyCase], _ rows: [ResponseBenchmarkMeasurement],
+                      _ counter: BenchmarkTokenCounter) throws {
+            _ = try ResponseBenchmarkHarness.evaluateRowsForUnitTest(
+                corpus: cases, measurements: rows, counter: counter)
+        }
+        let invalid: [(String, String, () throws -> Void)] = [
+            ("estimated", "exact-local-tokenizer", {
+                _ = try self.responseReport(corpusData: data, measurements: measurements,
+                    counter: BenchmarkTokenCounter(environment: [:]))
+            }),
+            ("missing-row", "all response corpus rows", {
+                _ = try self.responseReport(corpusData: data, measurements: Array(measurements.dropLast()),
+                                            counter: counter)
+            }),
+            ("duplicate-row", "duplicate response row", {
+                _ = try self.responseReport(corpusData: data, measurements: measurements + [firstMeasurement],
+                                            counter: counter)
+            }),
+            ("preamble", "byte-zero RCW1 A", {
+                _ = try self.responseReport(corpusData: data, measurements: preamble, counter: counter)
+            }),
+            ("consistent-mutation", "frozen response corpus", {
+                _ = try self.responseReport(corpusData: mutated, measurements: measurements, counter: counter)
+            }),
+            ("reversed-order", "frozen response corpus", {
+                _ = try self.responseReport(corpusData: reversed,
+                    measurements: Array(measurements.reversed()), counter: counter)
+            }),
+            ("render", "Human render mismatch", {
+                try evaluate([mismatched], [mismatchedMeasurement], self.exactTokenCounter(oneCounts))
+            }),
+            ("provenance", "Caveman provenance", {
+                _ = try self.responseReport(corpusData: data, measurements: measurements,
+                    counter: counter, provenance: divergent)
+            }),
+            ("missing-counter-sha", "source SHA-256", {
+                try evaluate([one], [oneMeasurement], self.exactTokenCounter(oneCounts, sourceSHA256: nil))
+            }),
+            ("count-drift", "unstable token count", {
+                try evaluate([one], [oneMeasurement], driftingCounter)
+            }),
+            ("zero-wire", "frame token count must be positive", {
+                var counts = oneCounts; counts[oneMeasurement.wire] = 0
+                try evaluate([one], [oneMeasurement], self.exactTokenCounter(counts))
+            }),
+            ("zero-abi", "ABI token count must be positive", {
+                var counts = oneCounts; counts[AgentSkillInstaller.rcWireAgentInstructionsTemplate] = 0
+                try evaluate([one], [oneMeasurement], self.exactTokenCounter(counts))
+            }),
+        ]
+        for (name, expected, attempt) in invalid {
+            XCTAssertThrowsError(try attempt(), name) { error in
+                XCTAssertTrue(error.localizedDescription.contains(expected), "\(name): \(error)")
+            }
+        }
+    }
+
+    func test_responseBenchmarkDecisionsProfitabilityAndTotalsCoverEveryRow() throws {
+        let above = responseCase(id: "above-45", outcome: "Above ratio Human baseline.")
+        let observed = responseCase(id: "observed-37-over-29", outcome: "Observed false saving Human baseline.")
+        let cavemanLimited = responseCase(id: "caveman-limited", outcome: "Caveman comparison Human baseline.")
+        let boundary = responseCase(id: "artificial-45-percent-control", outcome: "Synthetic boundary Human baseline.")
+        XCTAssertFalse(try loadResponseCorpus().contains { $0.id == boundary.id })
+        let aboveMeasurement = try responseMeasurement(above)
+        let observedMeasurement = try responseMeasurement(observed)
+        let cavemanMeasurement = try responseMeasurement(
+            cavemanLimited, cavemanOutput: "compact caveman", handleBehavior: .changedWithVerifiedHandle)
+        let boundaryMeasurement = try responseMeasurement(
+            boundary, cavemanOutput: "synthetic caveman output", handleBehavior: .changedWithVerifiedHandle)
+        let evaluation = try ResponseBenchmarkHarness.evaluateRowsForUnitTest(
+            corpus: [above, observed, cavemanLimited, boundary],
+            measurements: [aboveMeasurement, observedMeasurement, cavemanMeasurement, boundaryMeasurement],
+            counter: exactTokenCounter([
+                AgentSkillInstaller.rcWireAgentInstructionsTemplate: 10,
+                above.humanBaseline: 100, aboveMeasurement.wire: 46,
+                observed.humanBaseline: 29, observedMeasurement.wire: 37,
+                cavemanLimited.humanBaseline: 100, cavemanMeasurement.wire: 45,
+                cavemanMeasurement.caveman.output: 50,
+                boundary.humanBaseline: 100, boundaryMeasurement.wire: 45,
+                boundaryMeasurement.caveman.output: 80,
+            ])
+        )
+        let byID = Dictionary(uniqueKeysWithValues: evaluation.rows.map { ($0.id, $0) })
+        let failed = try XCTUnwrap(byID[above.id])
+        XCTAssertEqual(failed.decision, .humanFailOpen)
+        XCTAssertEqual(failed.effectiveDeliveredTokens, failed.humanTokens)
+        XCTAssertEqual(failed.claimedSavedTokensVsHuman, 0)
+        XCTAssertEqual(failed.claimedSavedTokensVsCaveman, 0)
+        XCTAssertTrue(byID[observed.id]?.disqualificationReasons.contains(.aboveMaximumTokenRatio) == true)
+        XCTAssertEqual(byID[cavemanLimited.id]?.disqualificationReasons,
+                       [.effectiveNotSmallerThanCaveman])
+        let qualified = try XCTUnwrap(byID[boundary.id])
+        XCTAssertEqual(qualified.decision, .rcw1)
+        XCTAssertEqual(qualified.candidateFrameTokens, 45)
+        XCTAssertEqual(qualified.candidateVsHumanPPM, 450_000)
+        XCTAssertEqual(qualified.abiTokens, 10)
+        XCTAssertEqual(qualified.candidateEffectiveTokens, 55)
+        XCTAssertEqual(qualified.effectiveDeliveredTokens, 55)
+        XCTAssertEqual(qualified.claimedSavedTokensVsHuman, 45)
+        XCTAssertEqual(qualified.claimedSavedTokensVsCaveman, 25)
+        XCTAssertEqual(
+            [evaluation.totals.rows, evaluation.totals.qualifiedRows,
+             evaluation.totals.disqualifiedRows], [4, 1, 3])
+        XCTAssertEqual(
+            [evaluation.totals.humanTokens, evaluation.totals.candidateFrameTokens,
+             evaluation.totals.abiTokens, evaluation.totals.candidateEffectiveTokens,
+             evaluation.totals.effectiveDeliveredTokens, evaluation.totals.cavemanTokens,
+             evaluation.totals.claimedSavedTokensVsHuman,
+             evaluation.totals.claimedSavedTokensVsCaveman],
+            [329, 173, 40, 213, 284, 259, 45, 25])
+        XCTAssertEqual(evaluation.totals.failureCounts[ResponseQualificationFailure.aboveMaximumTokenRatio.rawValue], 2)
+    }
+
+    func test_responseReportMetadataCSVAndOutputPathContract() throws {
+        let data = try responseCorpusData()
+        let corpus = try loadResponseCorpus()
+        let measurements = try responseMeasurements(corpus)
+        let counter = responseCounter(cases: corpus, measurements: measurements)
+        let report = try responseReport(corpusData: data, measurements: measurements, counter: counter)
+        XCTAssertEqual(report.schemaVersion, 4)
+        XCTAssertEqual(report.codec, "rcw1-v1")
+        XCTAssertEqual(report.corpusSHA256, frozenResponseCorpusSHA256)
+        XCTAssertEqual(report.runnerSourceSHA256, try responseRunnerSourceSHA256())
+        XCTAssertEqual(report.counterSourceSHA256, counter.sourceSHA256)
+        XCTAssertFalse(report.methodology.providerReportedTokens)
+        XCTAssertFalse(report.methodology.providerBound)
+        XCTAssertTrue(report.methodology.abiCountedOncePerRow)
+        XCTAssertEqual(report.rows.count, 10)
+        XCTAssertTrue(report.rows.allSatisfy { $0.cavemanSHA256.count == 64 })
+        let csvLines = report.csv.split(whereSeparator: \.isNewline).map(String.init)
+        XCTAssertEqual(csvLines.count, 12, "header + 10 all-row records + one totals record")
+        XCTAssertEqual(csvLines.filter { $0.hasPrefix("row,") }.count, 10)
+        XCTAssertEqual(csvLines.filter { $0.hasPrefix("row,") }.map {
+            String($0.split(separator: ",")[1])
+        }, report.rows.map(\.id))
+        XCTAssertTrue(csvLines.last?.hasPrefix("totals,") == true)
+        XCTAssertEqual(csvLines.first?.split(separator: ",").count,
+                       csvLines.last?.split(separator: ",", omittingEmptySubsequences: false).count)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: responseJSONData(report)) as? [String: Any])
+        XCTAssertEqual(json["schema_version"] as? Int, 4)
+        XCTAssertEqual((json["rows"] as? [[String: Any]])?.count, 10)
+        XCTAssertNil(try responseReportOutputBundle(environment: [:]))
+        let aliasStem = "remotecode-response-\(UUID().uuidString.lowercased())"
+        let fixtureAlias = URL(fileURLWithPath: "/tmp/\(aliasStem)-fixture.json")
+        try FileManager.default.createSymbolicLink(
+            atPath: fixtureAlias.path, withDestinationPath: responseCorpusURL().path)
+        defer { try? FileManager.default.removeItem(at: fixtureAlias) }
+        for environment in [
+            ["REMOTE_CODE_RCW1_RESPONSE_REPORT_JSON": "/tmp/report.json"],
+            ["REMOTE_CODE_RCW1_RESPONSE_REPORT_CSV": "/tmp/report.csv"],
+            ["REMOTE_CODE_RCW1_RESPONSE_REPORT_JSON": "/tmp/\(aliasStem)-same/report.json",
+             "REMOTE_CODE_RCW1_RESPONSE_REPORT_CSV": "/tmp/\(aliasStem)-same/report.json"],
+            ["REMOTE_CODE_RCW1_RESPONSE_REPORT_JSON": responseCorpusURL().path,
+             "REMOTE_CODE_RCW1_RESPONSE_REPORT_CSV": "/tmp/report.csv"],
+            ["REMOTE_CODE_RCW1_RESPONSE_REPORT_JSON": "/tmp/\(aliasStem)-alias/report.json",
+             "REMOTE_CODE_RCW1_RESPONSE_REPORT_CSV": "/private/tmp/\(aliasStem)-alias/report.json"],
+            ["REMOTE_CODE_RCW1_RESPONSE_REPORT_JSON": fixtureAlias.path,
+             "REMOTE_CODE_RCW1_RESPONSE_REPORT_CSV": "/private/tmp/\(aliasStem).csv"],
+        ] {
+            XCTAssertThrowsError(try responseReportOutputBundle(environment: environment))
+        }
+        _ = try XCTUnwrap(responseReportOutputBundle(environment: [
+            "REMOTE_CODE_RCW1_RESPONSE_REPORT_JSON": "/tmp/\(aliasStem)-bundle/report.json",
+            "REMOTE_CODE_RCW1_RESPONSE_REPORT_CSV": "/private/tmp/\(aliasStem)-bundle/report.csv",
+        ]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: "/private/tmp/\(aliasStem)-bundle"))
+        let caseSensitive = try XCTUnwrap(URL(fileURLWithPath: "/private/tmp")
+            .resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])
+            .volumeSupportsCaseSensitiveNames)
+        let caseEnvironment = [
+            "REMOTE_CODE_RCW1_RESPONSE_REPORT_JSON": "/tmp/\(aliasStem)-case/Report.json",
+            "REMOTE_CODE_RCW1_RESPONSE_REPORT_CSV": "/private/tmp/\(aliasStem)-case/report.json",
+        ]
+        if caseSensitive {
+            XCTAssertNoThrow(try responseReportOutputBundle(environment: caseEnvironment))
+        } else {
+            XCTAssertThrowsError(try responseReportOutputBundle(environment: caseEnvironment))
+        }
+    }
+
+    func test_responseReportOutputSelectionPinsParentAgainstSymlinkSwap() throws {
+        // WHY: a validated output path must not become a write into the fixture after its parent is swapped.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remotecode-output-swap-\(UUID().uuidString)", isDirectory: true)
+        let selected = root.appendingPathComponent("selected", isDirectory: true)
+        let held = root.appendingPathComponent("held", isDirectory: true)
+        let protected = root.appendingPathComponent("protected", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: protected, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let protectedJSON = protected.appendingPathComponent("sentinel")
+        let sentinel = Data("protected fixture bytes".utf8)
+        try sentinel.write(to: protectedJSON)
+        let bundleName = "report-bundle"
+        let output = try responseOutputBundle(
+            at: selected.appendingPathComponent(bundleName))
+        try FileManager.default.moveItem(at: selected, to: held)
+        try FileManager.default.createSymbolicLink(atPath: selected.path, withDestinationPath: protected.path)
+        let json = Data(#"{"same_report":true}"#.utf8)
+        let csv = "same_report,true\n"
+        let receipt = try output.emit(json: json, csv: csv)
+        let heldBundle = held.appendingPathComponent(bundleName)
+        XCTAssertEqual(try Data(contentsOf: protectedJSON), sentinel)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: protected.appendingPathComponent(bundleName).path))
+        XCTAssertEqual(try Data(contentsOf: heldBundle.appendingPathComponent("report.json")), json)
+        XCTAssertEqual(try String(contentsOf: heldBundle.appendingPathComponent("report.csv")), csv)
+        XCTAssertTrue(receipt.jsonPath.hasSuffix("/held/\(bundleName)/report.json"))
+        XCTAssertTrue(receipt.csvPath.hasSuffix("/held/\(bundleName)/report.csv"))
+    }
+
+    func test_responseReportOutputPairFailurePublishesNothing() throws {
+        // WHY: failure to write either representation must leave no half-published report.
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remotecode-output-pair-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let bundle = parent.appendingPathComponent("report-bundle")
+        let output = try responseOutputBundle(
+            at: bundle, csvName: String(repeating: "c", count: 300) + ".csv")
+        XCTAssertThrowsError(try output.emit(json: Data("{}".utf8), csv: "header\n"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bundle.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: parent.path), [])
+    }
+
+    func test_responseReportReceiptPinsCommittedBundleAfterNameReplacement() throws {
+        // WHY: a post-commit rename must not make the receipt identify unrelated replacement bytes.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remotecode-output-receipt-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bundle = root.appendingPathComponent("report-bundle", isDirectory: true)
+        let held = root.appendingPathComponent("held", isDirectory: true)
+        let output = try responseOutputBundle(at: bundle)
+        let json = Data(#"{"same_report":true}"#.utf8)
+        let csv = "same_report,true\n"
+        let replacementJSON = Data(#"{"replacement":true}"#.utf8)
+        let replacementCSV = "replacement,true\n"
+        let receipt = try output.emit(json: json, csv: csv) {
+            try FileManager.default.moveItem(at: bundle, to: held)
+            try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: false)
+            try replacementJSON.write(to: bundle.appendingPathComponent("report.json"))
+            try replacementCSV.write(to: bundle.appendingPathComponent("report.csv"),
+                                     atomically: false, encoding: .utf8)
+        }
+        XCTAssertTrue(receipt.jsonPath.hasSuffix("/held/report.json"))
+        XCTAssertTrue(receipt.csvPath.hasSuffix("/held/report.csv"))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: receipt.jsonPath)), json)
+        XCTAssertEqual(try String(contentsOfFile: receipt.csvPath), csv)
+        XCTAssertEqual(try Data(contentsOf: bundle.appendingPathComponent("report.json")), replacementJSON)
+        XCTAssertEqual(try String(contentsOf: bundle.appendingPathComponent("report.csv")), replacementCSV)
+        XCTAssertEqual(try Data(contentsOf: held.appendingPathComponent("report.json")), json)
+        XCTAssertEqual(try String(contentsOf: held.appendingPathComponent("report.csv")), csv)
+    }
+
+    func test_emitMeasuredResponseBenchmarkReportWhenExplicitlyRequested() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let output = try responseReportOutputBundle(environment: environment) else {
+            throw XCTSkip("Set both REMOTE_CODE_RCW1_RESPONSE_REPORT_JSON and _CSV for the offline report.")
+        }
+        let cavemanGo = URL(fileURLWithPath: try requiredEnvironmentValue(
+            "REMOTE_CODE_RCW1_BENCHMARK_CAVEMAN_GO", environment: environment)).standardizedFileURL
+        let cavemanCheckout = URL(fileURLWithPath: try requiredEnvironmentValue(
+            "REMOTE_CODE_RCW1_BENCHMARK_CAVEMAN_CHECKOUT", environment: environment)).standardizedFileURL
+        let counter = try BenchmarkTokenCounter(environment: environment)
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let initial = try responseRunSnapshot(repository: repository, counter: counter)
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remotecode-rcw1-response-\(UUID().uuidString.lowercased())", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let cavemanEngine = temporaryDirectory.appendingPathComponent("caveman-engine")
+        let provenance = try buildPinnedCavemanEngine(
+            go: cavemanGo, checkout: cavemanCheckout, output: cavemanEngine)
+        let database = temporaryDirectory.appendingPathComponent("ccr.db")
+        let corpusData = try responseCorpusData()
+        let corpus = try JSONDecoder().decode([ResponseEfficiencyCase].self, from: corpusData)
+        let observed = try corpus.map { item in
+            ResponseBenchmarkMeasurement(id: item.id, human: item.humanBaseline,
+                wire: try item.serializedWire(), caveman: try runCaveman(
+                    engine: cavemanEngine, input: item.humanBaseline,
+                    database: database, home: temporaryDirectory))
+        }
+        let report = try responseReport(
+            corpusData: corpusData, measurements: observed, counter: counter,
+            head: initial.remoteCodeHead, runnerSourceSHA256: initial.runnerSourceSHA256,
+            provenance: provenance)
+        let json = try responseJSONData(report)
+        let csv = report.csv
+        try validatePinnedCavemanBinary(cavemanEngine)
+        let final = try responseRunSnapshot(repository: repository, counter: counter)
+        guard final == initial else { throw benchmarkError("response report receipts drifted during capture") }
+        let receipt = try output.emit(json: json, csv: csv)
+        print("RCW1_RESPONSE_REPORT_JSON=\(receipt.jsonPath)")
+        print("RCW1_RESPONSE_REPORT_CSV=\(receipt.csvPath)")
     }
 
     func test_emitMeasuredRequestBenchmarkReportWhenExplicitlyRequested() throws {
@@ -929,12 +1261,14 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             throw benchmarkError("Caveman did not emit a valid forced-text observation")
         }
 
-        if output == input {
-            guard report.recoveryHandle == nil || report.recoveryHandle?.isEmpty == true else {
+        let recoveryHandle = nonempty(report.recoveryHandle)
+        let changed = output != input
+        if !changed {
+            guard recoveryHandle == nil else {
                 throw benchmarkError("Caveman pass-through unexpectedly minted a recovery handle")
             }
         } else {
-            guard let handle = nonempty(report.recoveryHandle) else {
+            guard let handle = recoveryHandle else {
                 throw benchmarkError("Caveman changed model-visible bytes without a recovery handle")
             }
             let recovered = try subprocess(
@@ -947,8 +1281,108 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
                 throw benchmarkError("Caveman recovery did not reproduce the exact Human input")
             }
         }
-        return CavemanObservation(output: output)
+        return .init(output: output,
+                     handleBehavior: changed ? .changedWithVerifiedHandle : .passThroughNoHandle)
     }
+
+    private func exactTokenCounter(_ counts: [String: Int],
+        sourceSHA256: String? = String(repeating: "c", count: 64)) -> BenchmarkTokenCounter {
+        BenchmarkTokenCounter(diagnostic: exactTokenDiagnostic, sourceSHA256: sourceSHA256) { text in
+            guard let count = counts[text] else { throw benchmarkError("missing unit token count") }
+            return count
+        }
+    }
+    private func responseMeasurements(_ cases: [ResponseEfficiencyCase]) throws -> [ResponseBenchmarkMeasurement] {
+        try cases.map { try responseMeasurement($0) }
+    }
+    private func responseMeasurement(
+        _ item: ResponseEfficiencyCase,
+        cavemanOutput: String? = nil,
+        handleBehavior: CavemanHandleBehavior = .passThroughNoHandle
+    ) throws -> ResponseBenchmarkMeasurement {
+        .init(id: item.id, human: item.humanBaseline, wire: try item.serializedWire(),
+              caveman: .init(output: cavemanOutput ?? item.humanBaseline,
+                             handleBehavior: handleBehavior))
+    }
+    private func responseCounter(cases: [ResponseEfficiencyCase],
+                                 measurements: [ResponseBenchmarkMeasurement]) -> BenchmarkTokenCounter {
+        var counts = [AgentSkillInstaller.rcWireAgentInstructionsTemplate: 10]
+        for item in cases { counts[item.humanBaseline] = 100 }
+        for measurement in measurements {
+            counts[measurement.wire] = 60
+            counts[measurement.caveman.output] = counts[measurement.caveman.output] ?? 100
+        }
+        return exactTokenCounter(counts)
+    }
+    private func responseReport(
+        corpusData: Data,
+        measurements: [ResponseBenchmarkMeasurement],
+        counter: BenchmarkTokenCounter,
+        head: String = String(repeating: "f", count: 40),
+        runnerSourceSHA256: String? = nil,
+        provenance: CavemanBenchmarkProvenance = benchmarkPinnedCavemanProvenance
+    ) throws -> ResponseBenchmarkReport {
+        try ResponseBenchmarkHarness.build(
+            corpusData: corpusData, measurements: measurements,
+            remoteCodeHead: head, runnerSourceSHA256: runnerSourceSHA256 ?? responseRunnerSourceSHA256(),
+            cavemanProvenance: provenance, counter: counter)
+    }
+    private func responseJSONData(_ report: ResponseBenchmarkReport) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        return try encoder.encode(report)
+    }
+    private func responseReportOutputBundle(
+        environment: [String: String]
+    ) throws -> ResponseReportOutputBundle? {
+        let json = nonempty(environment["REMOTE_CODE_RCW1_RESPONSE_REPORT_JSON"])
+        let csv = nonempty(environment["REMOTE_CODE_RCW1_RESPONSE_REPORT_CSV"])
+        guard json != nil || csv != nil else { return nil }
+        guard let json, let csv else { throw benchmarkError("response report requires both JSON and CSV paths") }
+        return try ResponseReportOutputBundle(jsonPath: json, csvPath: csv)
+    }
+    private func responseOutputBundle(
+        at bundle: URL, csvName: String = "report.csv"
+    ) throws -> ResponseReportOutputBundle {
+        try ResponseReportOutputBundle(
+            jsonPath: bundle.appendingPathComponent("report.json").path,
+            csvPath: bundle.appendingPathComponent(csvName).path)
+    }
+    private func responseRunSnapshot(repository: URL,
+                                     counter: BenchmarkTokenCounter) throws -> ResponseRunSnapshot {
+        try counter.validateSourceSHA256()
+        guard let counterSHA = counter.sourceSHA256, counterSHA.count == 64,
+              counterSHA.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            throw benchmarkError("response report requires token counter source SHA-256")
+        }
+        let status = try subprocessText(executable: "/usr/bin/git", arguments: [
+            "-C", repository.path, "status", "--porcelain=v1", "--untracked-files=all",
+        ]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard status.isEmpty else { throw benchmarkError("response report requires a clean RemoteCode worktree") }
+        let head = try subprocessText(executable: "/usr/bin/git",
+            arguments: ["-C", repository.path, "rev-parse", "HEAD"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return .init(remoteCodeHead: head, runnerSourceSHA256: try responseRunnerSourceSHA256(),
+                     counterSourceSHA256: counterSHA)
+    }
+    private func responseCase(id: String, outcome: String) -> ResponseEfficiencyCase {
+        .init(id: id, category: "unit_control", language: "en",
+              frames: [.init(sequence: 1, records: [.init(kind: .outcome, value: outcome)])],
+              humanBaseline: outcome)
+    }
+    private func loadResponseCorpus() throws -> [ResponseEfficiencyCase] {
+        try JSONDecoder().decode([ResponseEfficiencyCase].self, from: responseCorpusData()) }
+    private func responseCorpusData() throws -> Data { try Data(contentsOf: responseCorpusURL()) }
+    private func responseCorpusURL() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures", isDirectory: true)
+            .appendingPathComponent("rcw1-response-efficiency-corpus.json")
+    }
+    private func responseRunnerSourceSHA256() throws -> String {
+        sha256Hex(try Data(contentsOf: URL(fileURLWithPath: #filePath))) }
 
     private func loadCorpus() throws -> [EfficiencyCase] {
         let data = try Data(contentsOf: corpusURL())
@@ -971,6 +1405,227 @@ private struct BenchmarkSubprocessResult {
 
 private struct CavemanObservation {
     let output: String
+    let handleBehavior: CavemanHandleBehavior
+}
+
+private struct ResponseRunSnapshot: Equatable {
+    let remoteCodeHead: String
+    let runnerSourceSHA256: String
+    let counterSourceSHA256: String
+}
+private struct ResponseReportEmissionReceipt { let jsonPath, csvPath: String }
+private final class ResponseReportOutputBundle {
+    private struct Request { let ancestorPath, bundleName, fileName: String }
+    private struct OpenedAncestor { let fd: Int32; let status: stat; let caseSensitive: Bool }
+    private struct FileIdentity {
+        let device: dev_t
+        let inode: ino_t
+        let size: off_t
+        init(_ status: stat) {
+            device = status.st_dev; inode = status.st_ino; size = status.st_size
+        }
+        func matches(_ status: stat) -> Bool {
+            device == status.st_dev && inode == status.st_ino && size == status.st_size
+        }
+    }
+    private var ancestorFD: Int32
+    private let device: dev_t; private let inode: ino_t
+    private let bundleName, jsonName, csvName: String
+    private var emissionAttempted = false
+    init(jsonPath: String, csvPath: String) throws {
+        let json = try Self.request(path: jsonPath)
+        let csv = try Self.request(path: csvPath)
+        let jsonAncestor = try Self.openAncestor(json.ancestorPath)
+        do {
+            let csvAncestor = try Self.openAncestor(csv.ancestorPath)
+            defer { _ = Darwin.close(csvAncestor.fd) }
+            guard jsonAncestor.status.st_dev == csvAncestor.status.st_dev,
+                  jsonAncestor.status.st_ino == csvAncestor.status.st_ino else {
+                throw benchmarkError("response JSON and CSV must share one directory bundle")
+            }
+            let sensitive = jsonAncestor.caseSensitive && csvAncestor.caseSensitive
+            guard Self.sameName(json.bundleName, csv.bundleName, sensitive: sensitive),
+                  !Self.sameName(json.fileName, csv.fileName, sensitive: sensitive) else {
+                throw benchmarkError("response JSON and CSV require one bundle and distinct basenames")
+            }
+            var target = stat()
+            let targetResult = Darwin.fstatat(
+                jsonAncestor.fd, json.bundleName, &target, AT_SYMLINK_NOFOLLOW)
+            guard targetResult == -1, errno == ENOENT else {
+                throw benchmarkError("response report directory bundle must not exist")
+            }
+            ancestorFD = jsonAncestor.fd
+            device = jsonAncestor.status.st_dev; inode = jsonAncestor.status.st_ino
+            bundleName = json.bundleName; jsonName = json.fileName; csvName = csv.fileName
+        } catch {
+            _ = Darwin.close(jsonAncestor.fd)
+            throw error
+        }
+    }
+    deinit { _ = closeAncestor() }
+    func emit(json jsonData: Data, csv csvText: String,
+              afterCommit: () throws -> Void = {}) throws -> ResponseReportEmissionReceipt {
+        guard !emissionAttempted else { throw benchmarkError("response report bundle emits only once") }
+        emissionAttempted = true
+        let stagingName = ".rcw1-response-\(UUID().uuidString.lowercased()).tmp"
+        var committed = false
+        var stagingFD: Int32 = -1, openFile: Int32 = -1
+        var jsonIdentity: FileIdentity?, csvIdentity: FileIdentity?
+        do {
+            try validateAncestorAndAbsentTarget()
+            guard Darwin.mkdirat(ancestorFD, stagingName, mode_t(S_IRWXU)) == 0 else {
+                throw Self.posixError("mkdirat")
+            }
+            stagingFD = Darwin.openat(ancestorFD, stagingName,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard stagingFD >= 0 else { throw Self.posixError("staging openat") }
+            for (name, payload) in [(jsonName, jsonData), (csvName, Data(csvText.utf8))] {
+                openFile = Darwin.openat(stagingFD, name,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(S_IRUSR | S_IWUSR))
+                guard openFile >= 0 else { throw Self.posixError("file openat") }
+                try Self.writeAll(payload, to: openFile)
+                guard Darwin.fsync(openFile) == 0 else { throw Self.posixError("file fsync") }
+                var fileStatus = stat()
+                guard Darwin.fstat(openFile, &fileStatus) == 0 else {
+                    throw Self.posixError("file fstat")
+                }
+                let identity = FileIdentity(fileStatus)
+                if name == jsonName { jsonIdentity = identity } else { csvIdentity = identity }
+                let closeResult = Darwin.close(openFile); openFile = -1
+                guard closeResult == 0 else { throw Self.posixError("file close") }
+            }
+            guard Darwin.fsync(stagingFD) == 0 else { throw Self.posixError("staging fsync") }
+            guard Darwin.renameatx_np(ancestorFD, stagingName, ancestorFD, bundleName,
+                                      UInt32(RENAME_EXCL)) == 0 else {
+                throw Self.posixError("bundle renameat")
+            }
+            committed = true
+            try afterCommit()
+            guard Darwin.fsync(ancestorFD) == 0 else { throw Self.posixError("ancestor fsync") }
+            guard let jsonIdentity, let csvIdentity else {
+                throw benchmarkError("response report file identity is unavailable")
+            }
+            try Self.validateFile(named: jsonName, identity: jsonIdentity, in: stagingFD)
+            try Self.validateFile(named: csvName, identity: csvIdentity, in: stagingFD)
+            let receipt = try emissionReceipt(bundleFD: stagingFD)
+            let stagingClose = Darwin.close(stagingFD); stagingFD = -1
+            guard stagingClose == 0 else { throw Self.posixError("bundle close") }
+            guard closeAncestor() == 0 else { throw benchmarkError("response ancestor close failed") }
+            return receipt
+        } catch {
+            var cleanupOK = openFile < 0 || Darwin.close(openFile) == 0
+            if !committed, stagingFD >= 0 {
+                cleanupOK = cleanupStaging(fd: stagingFD, named: stagingName) && cleanupOK
+            }
+            if stagingFD >= 0, Darwin.close(stagingFD) != 0 { cleanupOK = false }
+            stagingFD = -1
+            let closeOK = closeAncestor() == 0
+            guard cleanupOK, closeOK else {
+                throw benchmarkError(committed
+                    ? "response report descriptor close failed after commit"
+                    : "response report cleanup failed closed")
+            }
+            throw error
+        }
+    }
+    private func validateAncestorAndAbsentTarget() throws {
+        var status = stat()
+        guard ancestorFD >= 0, Darwin.fstat(ancestorFD, &status) == 0,
+              status.st_dev == device, status.st_ino == inode else {
+            throw benchmarkError("response report ancestor descriptor drifted")
+        }
+        var target = stat()
+        let result = Darwin.fstatat(ancestorFD, bundleName, &target, AT_SYMLINK_NOFOLLOW)
+        guard result == -1, errno == ENOENT else {
+            throw benchmarkError("response report directory bundle already exists")
+        }
+    }
+    private func emissionReceipt(bundleFD: Int32) throws -> ResponseReportEmissionReceipt {
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard Darwin.fcntl(bundleFD, F_GETPATH, &path) == 0 else {
+            throw Self.posixError("bundle F_GETPATH")
+        }
+        let bundle = URL(fileURLWithPath: String(cString: path))
+        return .init(jsonPath: bundle.appendingPathComponent(jsonName).path,
+                     csvPath: bundle.appendingPathComponent(csvName).path)
+    }
+    private func cleanupStaging(fd: Int32, named name: String) -> Bool {
+        var cleanupOK = true
+        for fileName in [jsonName, csvName] where
+            Darwin.unlinkat(fd, fileName, 0) != 0 && errno != ENOENT {
+            cleanupOK = false
+        }
+        if Darwin.fsync(fd) != 0 { cleanupOK = false }
+        var descriptorStatus = stat(), namedStatus = stat()
+        guard Darwin.fstat(fd, &descriptorStatus) == 0,
+              Darwin.fstatat(ancestorFD, name, &namedStatus, AT_SYMLINK_NOFOLLOW) == 0,
+              descriptorStatus.st_dev == namedStatus.st_dev,
+              descriptorStatus.st_ino == namedStatus.st_ino else {
+            return false
+        }
+        if Darwin.unlinkat(ancestorFD, name, AT_REMOVEDIR) != 0 { cleanupOK = false }
+        return cleanupOK && Darwin.fsync(ancestorFD) == 0
+    }
+    private func closeAncestor() -> Int32 {
+        guard ancestorFD >= 0 else { return 0 }
+        let result = Darwin.close(ancestorFD); ancestorFD = -1
+        return result
+    }
+    private static func request(path: String) throws -> Request {
+        guard !path.contains("\0") else { throw benchmarkError("response report output path contains NUL") }
+        let file = URL(fileURLWithPath: path).standardizedFileURL
+        let bundle = file.deletingLastPathComponent()
+        let ancestor = bundle.deletingLastPathComponent()
+        guard let resolved = realpath(ancestor.path, nil) else {
+            throw benchmarkError("response report bundle ancestor cannot be resolved")
+        }
+        defer { free(resolved) }
+        let bundleName = bundle.lastPathComponent.precomposedStringWithCanonicalMapping
+        let fileName = file.lastPathComponent.precomposedStringWithCanonicalMapping
+        guard !bundleName.isEmpty, !fileName.isEmpty, bundleName != ".", bundleName != "..",
+              fileName != ".", fileName != ".." else {
+            throw benchmarkError("response report bundle or basename is invalid")
+        }
+        return .init(ancestorPath: String(cString: resolved),
+                     bundleName: bundleName, fileName: fileName)
+    }
+    private static func openAncestor(_ path: String) throws -> OpenedAncestor {
+        let descriptor = Darwin.open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw benchmarkError("response report ancestor cannot be opened") }
+        var status = stat()
+        let sensitivity = Darwin.fpathconf(descriptor, _PC_CASE_SENSITIVE)
+        guard Darwin.fstat(descriptor, &status) == 0, sensitivity == 0 || sensitivity == 1 else {
+            _ = Darwin.close(descriptor)
+            throw benchmarkError("response report ancestor identity is unavailable")
+        }
+        return .init(fd: descriptor, status: status, caseSensitive: sensitivity == 1)
+    }
+    private static func sameName(_ lhs: String, _ rhs: String, sensitive: Bool) -> Bool {
+        sensitive ? lhs == rhs : lhs.folding(options: [.caseInsensitive], locale: nil)
+            == rhs.folding(options: [.caseInsensitive], locale: nil)
+    }
+    private static func writeAll(_ data: Data, to descriptor: Int32) throws {
+        try data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            var offset = 0
+            while offset < bytes.count {
+                let result = Darwin.write(descriptor, base.advanced(by: offset), bytes.count - offset)
+                if result < 0, errno == EINTR { continue }
+                guard result > 0 else { throw posixError("write") }
+                offset += result
+            }
+        }
+    }
+    private static func validateFile(named name: String, identity: FileIdentity,
+                                     in directoryFD: Int32) throws {
+        var status = stat()
+        guard Darwin.fstatat(directoryFD, name, &status, AT_SYMLINK_NOFOLLOW) == 0,
+              identity.matches(status) else {
+            throw benchmarkError("response report file identity drifted")
+        }
+    }
+    private static func posixError(_ operation: String) -> NSError {
+        benchmarkError("response report \(operation) failed (errno \(errno))") }
 }
 
 private struct CavemanCompressReport: Decodable {
@@ -1061,12 +1716,6 @@ private func subprocess(
     return BenchmarkSubprocessResult(stdout: output, stderr: error)
 }
 
-private func profitableResponseSavings(wire: String, plaintext: String) -> Int? {
-    let wireTokens = TokenEstimator.estimate(wire)
-    let plaintextTokens = TokenEstimator.estimate(plaintext)
-    guard wireTokens < plaintextTokens else { return nil }
-    return plaintextTokens - wireTokens
-}
 
 private struct EfficiencyCase: Decodable {
     let id: String
@@ -1091,6 +1740,260 @@ private struct EfficiencyCase: Decodable {
     }
 }
 
+private let frozenResponseCorpusSHA256 = "35b3722d6a58e593a2770a6d727e5796fbd7e80c9f8aa90f013ed7c691537029"
+private let frozenResponseCorpusIDs = [
+    "short-ok", "reported-disposable-workspace-answer", "multi-record-all-kinds",
+    "progressive-multiframe", "exact-code-path", "portuguese-natural", "japanese-natural",
+    "arabic-natural", "repeated-evidence-template", "opaque-incompressible",
+]
+private let exactTokenDiagnostic = TokenCounterDiagnostic(
+    name: "response-unit", version: "1", encoding: "fixture-exact",
+    measurementKind: "exact-local-tokenizer")
+
+private struct ResponseEfficiencyCase: Decodable {
+    let id, category, language: String
+    let frames: [ResponseLogicalFrame]
+    let humanBaseline: String
+    func rcWireFrames() throws -> [RCWireFrame] {
+        let result = frames.map { frame in
+            RCWireFrame(direction: .response, sequence: frame.sequence,
+                records: frame.records.map { .init(kind: $0.kind, value: $0.value) })
+        }
+        guard !result.isEmpty,
+              result.flatMap(\.records).allSatisfy({ $0.kind != .exact }) else {
+            throw benchmarkError("\(id) response fixture must contain non-X logical records")
+        }
+        _ = try result.map(RCWireProtocol.serialize)
+        return result
+    }
+    func serializedWire() throws -> String { try rcWireFrames().map(RCWireProtocol.serialize).joined() }
+    enum CodingKeys: String, CodingKey { case id, category, language, frames
+        case humanBaseline = "human_baseline" }
+}
+private struct ResponseLogicalFrame: Decodable {
+    let sequence: Int; let records: [ResponseLogicalRecord] }
+private struct ResponseLogicalRecord: Decodable {
+    let kind: RCWireRecordKind; let value: String }
+private struct ResponseBenchmarkMeasurement {
+    let id, human, wire: String; let caveman: CavemanObservation }
+private enum ResponseQualificationFailure: String, Encodable, CaseIterable, Equatable {
+    case aboveMaximumTokenRatio = "above_maximum_token_ratio"
+    case effectiveNotSmallerThanHuman = "effective_not_smaller_than_human"
+    case effectiveNotSmallerThanCaveman = "effective_not_smaller_than_caveman"
+}
+private enum ResponseBenchmarkDecision: String, Encodable, Equatable {
+    case rcw1, humanFailOpen = "human_fail_open" }
+private enum CavemanHandleBehavior: Equatable {
+    case passThroughNoHandle, changedWithVerifiedHandle }
+private enum ResponseBenchmarkHarness {
+    static func build(corpusData: Data, measurements: [ResponseBenchmarkMeasurement],
+        remoteCodeHead: String, runnerSourceSHA256: String,
+        cavemanProvenance: CavemanBenchmarkProvenance,
+        counter: BenchmarkTokenCounter) throws -> ResponseBenchmarkReport {
+        let corpusSHA256 = sha256Hex(corpusData)
+        guard corpusSHA256 == frozenResponseCorpusSHA256 else {
+            throw benchmarkError("report requires the frozen response corpus bytes")
+        }
+        let corpus = try JSONDecoder().decode([ResponseEfficiencyCase].self, from: corpusData)
+        guard corpus.map(\.id) == frozenResponseCorpusIDs else {
+            throw benchmarkError("report requires the frozen response corpus ID order")
+        }
+        guard remoteCodeHead.count == 40,
+              remoteCodeHead.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+              runnerSourceSHA256.count == 64,
+              runnerSourceSHA256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            throw benchmarkError("report requires RemoteCode HEAD and runner source SHA-256")
+        }
+        guard cavemanProvenance == benchmarkPinnedCavemanProvenance else {
+            throw benchmarkError("Caveman provenance must match the pinned exact-source build")
+        }
+        try counter.validateSourceSHA256()
+        let evaluated = try evaluateRowsForUnitTest(corpus: corpus,
+            measurements: measurements, counter: counter)
+        try counter.validateSourceSHA256()
+        guard let counterSourceSHA256 = counter.sourceSHA256 else {
+            throw benchmarkError("response report requires token counter source SHA-256")
+        }
+        return .init(
+            schemaVersion: 4, codec: "rcw1-v1", corpusSHA256: corpusSHA256,
+            remoteCodeHead: remoteCodeHead, runnerSourceSHA256: runnerSourceSHA256,
+            counterSourceSHA256: counterSourceSHA256,
+            tokenCounter: counter.diagnostic, methodology: .init(),
+            cavemanProvenance: cavemanProvenance, rows: evaluated.rows, totals: evaluated.totals)
+    }
+    static func evaluateRowsForUnitTest(corpus: [ResponseEfficiencyCase],
+        measurements: [ResponseBenchmarkMeasurement], counter: BenchmarkTokenCounter
+    ) throws -> (rows: [ResponseBenchmarkRow], totals: ResponseBenchmarkTotals) {
+        guard counter.diagnostic.measurementKind == "exact-local-tokenizer" else {
+            throw benchmarkError("response report requires measurement_kind=exact-local-tokenizer")
+        }
+        guard let sourceSHA256 = counter.sourceSHA256, sourceSHA256.count == 64,
+              sourceSHA256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            throw benchmarkError("response report requires token counter source SHA-256")
+        }
+        let corpusIDs = corpus.map(\.id)
+        let measuredIDs = measurements.map(\.id)
+        guard Set(corpusIDs).count == corpusIDs.count else {
+            throw benchmarkError("response corpus contains duplicate IDs")
+        }
+        guard Set(measuredIDs).count == measuredIDs.count else {
+            throw benchmarkError("duplicate response row")
+        }
+        guard Set(measuredIDs) == Set(corpusIDs) else {
+            throw benchmarkError("measurements must include all response corpus rows exactly once")
+        }
+        var counts: [String: Int] = [:]
+        func stableCount(_ text: String) throws -> Int {
+            if let count = counts[text] { return count }
+            let first = try counter.count(text)
+            let second = try counter.count(text)
+            guard first == second else { throw benchmarkError("unstable token count") }
+            counts[text] = first
+            return first
+        }
+        let abiTokens = try stableCount(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
+        guard abiTokens > 0 else { throw benchmarkError("response ABI token count must be positive") }
+        let byID = Dictionary(uniqueKeysWithValues: measurements.map { ($0.id, $0) })
+        let rows = try corpus.map { try evaluate(item: $0, measurement: byID[$0.id]!,
+                                                 abiTokens: abiTokens, count: stableCount) }
+        return (rows, ResponseBenchmarkTotals(rows: rows))
+    }
+    private static func evaluate(item: ResponseEfficiencyCase,
+        measurement: ResponseBenchmarkMeasurement, abiTokens: Int,
+        count: (String) throws -> Int) throws -> ResponseBenchmarkRow {
+        let frames = try item.rcWireFrames()
+        guard RCWireProtocol.renderEnglish(frames) == item.humanBaseline else {
+            throw benchmarkError("\(item.id) Human render mismatch")
+        }
+        guard measurement.human == item.humanBaseline else {
+            throw benchmarkError("\(item.id) Human is not byte-exact")
+        }
+        guard let projection = RCWireProtocol.strictResponseProjection(raw: measurement.wire) else {
+            throw benchmarkError("\(item.id) response must begin with byte-zero RCW1 A")
+        }
+        guard measurement.wire == (try frames.map(RCWireProtocol.serialize).joined()),
+              projection.rawWire == measurement.wire,
+              projection.deterministicHuman == item.humanBaseline else {
+            throw benchmarkError("\(item.id) response round-trip is not byte-exact")
+        }
+        let changed = measurement.caveman.output != measurement.human
+        guard !measurement.caveman.output.isEmpty,
+              measurement.caveman.handleBehavior
+                == (changed ? .changedWithVerifiedHandle : .passThroughNoHandle) else {
+            throw benchmarkError("\(item.id) Caveman handle behavior is inconsistent")
+        }
+        let human = try count(measurement.human)
+        let frame = try count(measurement.wire)
+        let caveman = try count(measurement.caveman.output)
+        guard human > 0, caveman > 0 else {
+            throw benchmarkError("\(item.id) invalid token count")
+        }
+        guard frame > 0 else { throw benchmarkError("\(item.id) frame token count must be positive") }
+        let (effective, addOverflow) = frame.addingReportingOverflow(abiTokens)
+        let (wire100, wireOverflow) = frame.multipliedReportingOverflow(by: 100)
+        let (human45, humanOverflow) = human.multipliedReportingOverflow(by: 45)
+        guard !addOverflow, !wireOverflow, !humanOverflow else {
+            throw benchmarkError("\(item.id) response token arithmetic overflow")
+        }
+        var reasons: [ResponseQualificationFailure] = []
+        if wire100 > human45 { reasons.append(.aboveMaximumTokenRatio) }
+        if effective >= human { reasons.append(.effectiveNotSmallerThanHuman) }
+        if effective >= caveman { reasons.append(.effectiveNotSmallerThanCaveman) }
+        let decision: ResponseBenchmarkDecision = reasons.isEmpty ? .rcw1 : .humanFailOpen
+        return .init(
+            id: item.id,
+            humanSHA256: sha256Hex(Data(measurement.human.utf8)),
+            candidateFrameSHA256: sha256Hex(Data(measurement.wire.utf8)),
+            cavemanSHA256: sha256Hex(Data(measurement.caveman.output.utf8)),
+            decision: decision, humanTokens: human, candidateFrameTokens: frame,
+            candidateVsHumanPPM: ratioPPM(frame, human), abiTokens: abiTokens,
+            candidateEffectiveTokens: effective,
+            effectiveDeliveredTokens: decision == .rcw1 ? effective : human, cavemanTokens: caveman,
+            cavemanRecoveryHandlePresent: measurement.caveman.handleBehavior == .changedWithVerifiedHandle,
+            disqualificationReasons: reasons,
+            claimedSavedTokensVsHuman: decision == .rcw1 ? human - effective : 0,
+            claimedSavedTokensVsCaveman: decision == .rcw1 ? caveman - effective : 0)
+    }
+}
+
+private struct ResponseBenchmarkReport: Encodable {
+    let schemaVersion: Int; let codec, corpusSHA256, remoteCodeHead: String
+    let runnerSourceSHA256, counterSourceSHA256: String
+    let tokenCounter: TokenCounterDiagnostic; let methodology: ResponseBenchmarkMethodology
+    let cavemanProvenance: CavemanBenchmarkProvenance
+    let rows: [ResponseBenchmarkRow]; let totals: ResponseBenchmarkTotals
+    var csv: String {
+        let header = [
+            "record_type", "id", "decision", "human_sha256", "candidate_frame_sha256", "caveman_sha256",
+            "human_tokens", "candidate_frame_tokens", "candidate_vs_human_ppm", "abi_tokens",
+            "candidate_effective_tokens", "effective_delivered_tokens", "caveman_tokens",
+            "claimed_saved_tokens_vs_human", "claimed_saved_tokens_vs_caveman",
+            "caveman_recovery_handle_present", "disqualification_reasons", "row_count",
+            "qualified_rows", "disqualified_rows", "failure_counts",
+        ]
+        let body = rows.map { row in
+            [
+                "row", row.id, row.decision.rawValue, row.humanSHA256, row.candidateFrameSHA256,
+                row.cavemanSHA256, String(row.humanTokens), String(row.candidateFrameTokens),
+                String(row.candidateVsHumanPPM), String(row.abiTokens),
+                String(row.candidateEffectiveTokens), String(row.effectiveDeliveredTokens),
+                String(row.cavemanTokens), String(row.claimedSavedTokensVsHuman),
+                String(row.claimedSavedTokensVsCaveman), String(row.cavemanRecoveryHandlePresent),
+                row.disqualificationReasons.map(\.rawValue).joined(separator: "|"), "", "", "", "",
+            ]
+        }
+        let failures = totals.failureCounts.sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }.joined(separator: "|")
+        let total = [
+            "totals", "", "", "", "", "", String(totals.humanTokens), String(totals.candidateFrameTokens),
+            "", String(totals.abiTokens),
+            String(totals.candidateEffectiveTokens), String(totals.effectiveDeliveredTokens),
+            String(totals.cavemanTokens), String(totals.claimedSavedTokensVsHuman),
+            String(totals.claimedSavedTokensVsCaveman), "", "", String(totals.rows),
+            String(totals.qualifiedRows), String(totals.disqualifiedRows), failures,
+        ]
+        return ([header] + body + [total]).map { $0.map(csvField).joined(separator: ",") }
+            .joined(separator: "\n") + "\n"
+    }
+}
+
+private struct ResponseBenchmarkMethodology: Encodable {
+    let providerReportedTokens = false, providerBound = false, abiCountedOncePerRow = true
+    let qualificationRule = "complete frame <=45% Human; frame + one ABI < Human and pinned Caveman"
+}
+private struct ResponseBenchmarkRow: Encodable {
+    let id, humanSHA256, candidateFrameSHA256, cavemanSHA256: String
+    let decision: ResponseBenchmarkDecision; let humanTokens, candidateFrameTokens: Int
+    let candidateVsHumanPPM, abiTokens, candidateEffectiveTokens: Int
+    let effectiveDeliveredTokens, cavemanTokens: Int
+    let cavemanRecoveryHandlePresent: Bool
+    let disqualificationReasons: [ResponseQualificationFailure]
+    let claimedSavedTokensVsHuman, claimedSavedTokensVsCaveman: Int
+}
+private struct ResponseBenchmarkTotals: Encodable {
+    let rows, qualifiedRows, disqualifiedRows, humanTokens: Int
+    let candidateFrameTokens, abiTokens, candidateEffectiveTokens: Int
+    let effectiveDeliveredTokens, cavemanTokens: Int
+    let claimedSavedTokensVsHuman, claimedSavedTokensVsCaveman: Int
+    let failureCounts: [String: Int]
+    init(rows source: [ResponseBenchmarkRow]) {
+        rows = source.count
+        qualifiedRows = source.filter { $0.decision == .rcw1 }.count
+        disqualifiedRows = rows - qualifiedRows
+        humanTokens = source.reduce(0) { $0 + $1.humanTokens }
+        candidateFrameTokens = source.reduce(0) { $0 + $1.candidateFrameTokens }
+        abiTokens = source.reduce(0) { $0 + $1.abiTokens }
+        candidateEffectiveTokens = source.reduce(0) { $0 + $1.candidateEffectiveTokens }
+        effectiveDeliveredTokens = source.reduce(0) { $0 + $1.effectiveDeliveredTokens }
+        cavemanTokens = source.reduce(0) { $0 + $1.cavemanTokens }
+        claimedSavedTokensVsHuman = source.reduce(0) { $0 + $1.claimedSavedTokensVsHuman }
+        claimedSavedTokensVsCaveman = source.reduce(0) { $0 + $1.claimedSavedTokensVsCaveman }
+        failureCounts = Dictionary(uniqueKeysWithValues: ResponseQualificationFailure.allCases.map { reason in
+            (reason.rawValue, source.filter { $0.disqualificationReasons.contains(reason) }.count)
+        })
+    }
+}
+
 private let benchmarkPinnedCavemanProvenance = CavemanBenchmarkProvenance(
     sourceCommit: "27d5a3981a347890211bb1bf2439e5c821a63bc9",
     goVersion: "go version go1.26.5 darwin/arm64",
@@ -1098,7 +2001,7 @@ private let benchmarkPinnedCavemanProvenance = CavemanBenchmarkProvenance(
     binarySHA: "d37718e84d5233a0c841f7d75fded0219cfdaee3af9a533198ebaf60db1bf9a3"
 )
 
-private struct CavemanBenchmarkProvenance: Equatable {
+private struct CavemanBenchmarkProvenance: Encodable, Equatable {
     let sourceCommit: String
     let goVersion: String
     let buildCommand: String
@@ -1116,6 +2019,13 @@ private struct CavemanBenchmarkProvenance: Equatable {
             buildCommand: buildCommand ?? self.buildCommand,
             binarySHA: binarySHA ?? self.binarySHA
         )
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case sourceCommit = "source_commit"
+        case goVersion = "go_version"
+        case buildCommand = "build_command"
+        case binarySHA = "binary_sha"
     }
 }
 
@@ -1208,6 +2118,8 @@ private enum BenchmarkFailOpenReason: String, Codable, CaseIterable, Equatable {
 
 private struct BenchmarkTokenCounter {
     let diagnostic: TokenCounterDiagnostic
+    let sourceSHA256: String?
+    private let sourceExecutableURL: URL?
     private let countImplementation: (String) throws -> Int
 
     init(environment: [String: String]) throws {
@@ -1219,6 +2131,8 @@ private struct BenchmarkTokenCounter {
                 encoding: "utf8-char-word-heuristic",
                 measurementKind: "estimated"
             )
+            sourceSHA256 = nil
+            sourceExecutableURL = nil
             countImplementation = { TokenEstimator.estimate($0) }
             return
         }
@@ -1226,6 +2140,9 @@ private struct BenchmarkTokenCounter {
         guard executable.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: executable) else {
             throw benchmarkError("token counter must be an executable absolute path: \(executable)")
         }
+        let executableURL = URL(fileURLWithPath: executable).standardizedFileURL
+        sourceSHA256 = sha256Hex(try Data(contentsOf: executableURL))
+        sourceExecutableURL = executableURL
         let diagnosticData = try Self.invoke(executable: executable, argument: "--diagnostic", input: Data())
         let decodedDiagnostic = try JSONDecoder().decode(TokenCounterDiagnostic.self, from: diagnosticData)
         guard [
@@ -1248,18 +2165,29 @@ private struct BenchmarkTokenCounter {
             }
             return value
         }
+        try validateSourceSHA256()
     }
 
     init(
         diagnostic: TokenCounterDiagnostic,
+        sourceSHA256: String? = nil,
         count: @escaping (String) throws -> Int
     ) {
         self.diagnostic = diagnostic
+        self.sourceSHA256 = sourceSHA256
+        sourceExecutableURL = nil
         countImplementation = count
     }
 
     func count(_ text: String) throws -> Int {
         try countImplementation(text)
+    }
+
+    func validateSourceSHA256() throws {
+        guard let sourceExecutableURL, let sourceSHA256 else { return }
+        guard sha256Hex(try Data(contentsOf: sourceExecutableURL)) == sourceSHA256 else {
+            throw benchmarkError("token counter executable source SHA-256 drifted")
+        }
     }
 
     private static func invoke(executable: String, argument: String, input: Data) throws -> Data {
