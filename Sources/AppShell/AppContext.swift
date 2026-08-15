@@ -433,6 +433,21 @@ public final class AppContext {
     /// Test seam: when set, used instead of resolving a client from the live
     /// sidecar status. Production code never sets this.
     var distillClientOverrideForTesting: DistillServiceClient?
+    /// Immutable exact-counter + envelope bundle. Production construction
+    /// leaves this nil so the typed selector stays uninstalled.
+    private let tokenSaverExactRuntimeCapabilityLock = NSLock()
+    private var tokenSaverExactRuntimeCapability: TokenSaverExactRuntimeCapability?
+    private var tokenSaverRCW1FinalizeInvocations = 0
+    private var tokenSaverRCW1DiscardInvocations = 0
+    var tokenSaverExactRuntimeCapabilityForTesting: TokenSaverExactRuntimeCapability? {
+        tokenSaverExactRuntimeCapabilityLock.withLock { tokenSaverExactRuntimeCapability }
+    }
+    var tokenSaverRCW1FinalizeInvocationsForTesting: Int { tokenSaverRCW1FinalizeInvocations }
+    var tokenSaverRCW1DiscardInvocationsForTesting: Int { tokenSaverRCW1DiscardInvocations }
+    private var tokenSaverDistillPrepareInvocations = 0
+    var tokenSaverDistillPrepareInvocationsForTesting: Int { tokenSaverDistillPrepareInvocations }
+    /// Test seam: replace the host-owned Auto RCW1 transform. Production never sets this.
+    var tokenSaverAutoWireTransformForTesting: (@Sendable (String, AgentOrchestrationRoute) throws -> String)?
     var queueDrainProviderIdleTimeout: TimeInterval = 10
     var queueDrainBeforeDispatchForTesting: (() async -> Void)?
     /// Test seam for the single warning deadline; queue progress is causal.
@@ -3050,6 +3065,249 @@ public final class AppContext {
         return object["wireProtocolVersion"] as? String == RCWireProtocol.version
     }
 
+    /// Installs the typed request selector only when a complete exact bundle is
+    /// present. Passing nil restores the default unset selector.
+    @discardableResult
+    func installTokenSaverExactRuntimeCapability(
+        _ capability: TokenSaverExactRuntimeCapability?
+    ) -> Bool {
+        tokenSaverExactRuntimeCapabilityLock.lock()
+        tokenSaverExactRuntimeCapability = capability
+        tokenSaverExactRuntimeCapabilityLock.unlock()
+        if capability != nil {
+            coordinator.tokenSaverOutboundSelector = { [weak self] request in
+                guard let self else {
+                    return await TokenSaverBestOfThreeSelector.select(
+                        canonicalHuman: request.canonicalHuman,
+                        humanOutboundPrompt: request.admittedRequest.prompt,
+                        humanEffectiveEnvelope: request.admittedRequest.prompt,
+                        target: TokenSaverBestOfThreeSelector.Target(
+                            provider: request.admittedRequest.provider.rawValue,
+                            resolvedModel: request.admittedRequest.model,
+                            counterID: "unavailable",
+                            counterRevision: "unavailable",
+                            encoding: "unavailable"
+                        ),
+                        candidates: [],
+                        counter: nil
+                    )
+                }
+                return await self.selectTokenSaverOutbound(request)
+            }
+            return true
+        }
+        coordinator.tokenSaverOutboundSelector = nil
+        return false
+    }
+
+    private func snapshotTokenSaverExactRuntimeCapability() -> TokenSaverExactRuntimeCapability? {
+        tokenSaverExactRuntimeCapabilityLock.withLock { tokenSaverExactRuntimeCapability }
+    }
+
+    func selectTokenSaverOutbound(
+        _ request: TokenSaverOutboundSelectionRequest
+    ) async -> TokenSaverBestOfThreeSelector.Decision {
+        let canonical = request.canonicalHuman
+        let humanOutbound = request.admittedRequest.prompt
+        let sourceSHA256 = TokenSaverExactRuntimeSupport.sha256Hex(canonical)
+
+        func decide(
+            target: TokenSaverBestOfThreeSelector.Target,
+            humanEnvelope: String,
+            rcw1: TokenSaverBestOfThreeSelector.Candidate,
+            counter: TokenSaverBestOfThreeSelector.CounterCapability?
+        ) async -> TokenSaverBestOfThreeSelector.Decision {
+            await TokenSaverBestOfThreeSelector.select(
+                canonicalHuman: canonical,
+                humanOutboundPrompt: humanOutbound,
+                humanEffectiveEnvelope: humanEnvelope,
+                target: target,
+                candidates: [
+                    rcw1,
+                    TokenSaverExactRuntimeSupport.disabledCavemanCandidate(sourceSHA256: sourceSHA256),
+                ],
+                counter: counter
+            )
+        }
+
+        func contentFreeHuman() async -> TokenSaverBestOfThreeSelector.Decision {
+            await TokenSaverBestOfThreeSelector.select(
+                canonicalHuman: canonical,
+                humanOutboundPrompt: humanOutbound,
+                humanEffectiveEnvelope: humanOutbound,
+                target: TokenSaverBestOfThreeSelector.Target(
+                    provider: request.admittedRequest.provider.rawValue,
+                    resolvedModel: request.admittedRequest.model,
+                    counterID: "unavailable",
+                    counterRevision: "unavailable",
+                    encoding: "unavailable"
+                ),
+                candidates: [],
+                counter: nil
+            )
+        }
+
+        guard isTokenSaverRuntimeActive(),
+              TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
+                isSameUser: tokenSaverIsSameUser(threadId: request.admittedRequest.threadId),
+                turn: .initial
+              ) else {
+            return await contentFreeHuman()
+        }
+
+        let capability = snapshotTokenSaverExactRuntimeCapability()
+        guard let capability else {
+            return await decide(
+                target: TokenSaverBestOfThreeSelector.Target(
+                    provider: request.admittedRequest.provider.rawValue,
+                    resolvedModel: request.admittedRequest.model,
+                    counterID: "unavailable",
+                    counterRevision: "unavailable",
+                    encoding: "unavailable"
+                ),
+                humanEnvelope: humanOutbound,
+                rcw1: TokenSaverExactRuntimeSupport.disabledRCW1Candidate(sourceSHA256: sourceSHA256),
+                counter: nil
+            )
+        }
+
+        let requestTarget = TokenSaverBestOfThreeSelector.Target(
+            provider: request.admittedRequest.provider.rawValue,
+            resolvedModel: request.admittedRequest.model,
+            counterID: capability.target.counterID,
+            counterRevision: capability.target.counterRevision,
+            encoding: capability.target.encoding
+        )
+        if requestTarget != capability.target {
+            return await decide(
+                target: requestTarget,
+                humanEnvelope: humanOutbound,
+                rcw1: TokenSaverExactRuntimeSupport.disabledRCW1Candidate(sourceSHA256: sourceSHA256),
+                counter: capability.counterCapability
+            )
+        }
+
+        guard let humanProjection = capability.projectEnvelope(.human, humanOutbound, request) else {
+            return await contentFreeHuman()
+        }
+
+        var provisional: TokenSaverProvisionalRCW1Recovery?
+        var rcw1 = TokenSaverExactRuntimeSupport.disabledRCW1Candidate(sourceSHA256: sourceSHA256)
+        let rcw1Environment = request.environment(for: .rcw1)
+        let rcw1Capable = rcw1Environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1"
+            && rcw1Environment["RC_TOKEN_SAVER_WIRE_VERSION"] == "1"
+        if rcw1Capable,
+           let prepared = await encodeProvisionalRCW1(
+            prompt: canonical,
+            provider: request.admittedRequest.provider,
+            threadId: request.admittedRequest.threadId,
+            runId: request.admittedRequest.runId
+           ) {
+            let rankedPayload: String
+            if let route = request.autoRoute {
+                do {
+                    rankedPayload = try applyAutoWireConstraint(to: prepared.payload, route: route)
+                } catch {
+                    discardProvisionalRCW1Recovery(prepared)
+                    return await contentFreeHuman()
+                }
+            } else {
+                rankedPayload = prepared.payload
+            }
+            if let projected = capability.projectEnvelope(.rcw1, rankedPayload, request) {
+                provisional = prepared
+                rcw1 = TokenSaverBestOfThreeSelector.Candidate(
+                    format: .rcw1,
+                    sourceSHA256: sourceSHA256,
+                    payload: projected.payload,
+                    abi: projected.abi,
+                    effectiveEnvelope: projected.effectiveEnvelope,
+                    handle: prepared.handle,
+                    producerID: "remotecode-rcw1",
+                    producerRevision: "1",
+                    abiRevision: "1",
+                    generation: .passed,
+                    structural: .passed,
+                    semantic: .passed,
+                    recovery: .passed
+                )
+            } else {
+                discardProvisionalRCW1Recovery(prepared)
+            }
+        }
+
+        let decision = await decide(
+            target: requestTarget,
+            humanEnvelope: humanProjection.effectiveEnvelope,
+            rcw1: rcw1,
+            counter: capability.counterCapability
+        )
+        if decision.selectedFormat == .rcw1, let provisional {
+            if finalizeProvisionalRCW1Recovery(provisional) != nil {
+                return decision
+            }
+            return decision.fallingBackToHuman(
+                payload: humanOutbound,
+                reason: .candidateError,
+                canonicalHuman: canonical
+            )
+        }
+        if let provisional {
+            discardProvisionalRCW1Recovery(provisional)
+        }
+        return decision
+    }
+
+    private func applyAutoWireConstraint(
+        to wirePrompt: String,
+        route: AgentOrchestrationRoute
+    ) throws -> String {
+        if let override = tokenSaverAutoWireTransformForTesting {
+            return try override(wirePrompt, route)
+        }
+        return try AgentOrchestrationRuntime.autoOrchestrateProviderWirePrompt(
+            wirePrompt: wirePrompt,
+            admittedRoute: route
+        )
+    }
+
+    private func encodeProvisionalRCW1(
+        prompt: String,
+        provider: AgentProvider,
+        threadId: AgentThreadID,
+        runId: AgentRunID
+    ) async -> TokenSaverProvisionalRCW1Recovery? {
+        guard !prompt.isEmpty else { return nil }
+        guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
+            isSameUser: tokenSaverIsSameUser(threadId: threadId),
+            turn: .initial
+        ) else { return nil }
+        guard !tokenSaverLaneIsDisabled("wire-encode"),
+              !tokenSaverLaneIsDisabled("wire-render-english") else {
+            return nil
+        }
+        guard let persistentScope = tokenSaverPersistentScope(threadId: threadId) else {
+            return nil
+        }
+        try? tokenSaverLaneStateRepo.ensureDefaults(projectID: persistentScope.projectID)
+        let encodeAdmission = tokenSaverProjectAdmission(threadId: threadId, lane: "wire-encode")
+        let renderAdmission = tokenSaverProjectAdmission(threadId: threadId, lane: "wire-render-english")
+        guard encodeAdmission.allowed, renderAdmission.allowed else { return nil }
+        if let session = try? providerSessionRuntimeRepo.get(threadId: threadId),
+           !Self.providerSessionSupportsWire(session.runtimePayloadJSON) {
+            return nil
+        }
+        return await distillPrepareProvisionalRCW1(
+            original: prompt,
+            stageOriginal: prompt,
+            provider: provider,
+            threadId: threadId,
+            runId: runId,
+            profitabilityGate: { _ in true },
+            trace: { _ in }
+        )
+    }
+
     func tokenSaverCompress(
         prompt: String,
         provider: AgentProvider,
@@ -3155,12 +3413,39 @@ public final class AppContext {
         // Demand-start Distill without blocking this turn on MLX warmup. Kick the
         // sidecar for later turns; if not already `.running`, fail open to the
         // exact original input (Token Saver fail-open).
+        guard let provisional = await distillPrepareProvisionalRCW1(
+            original: prompt,
+            stageOriginal: deterministicCandidate,
+            provider: provider,
+            threadId: threadId,
+            runId: runId,
+            profitabilityGate: isProfitableWire,
+            trace: trace
+        ) else {
+            return prompt
+        }
+        guard let recoveredCandidate = finalizeProvisionalRCW1Recovery(provisional) else {
+            return prompt
+        }
+        return adopt(recoveredCandidate, stage: .deterministic)
+    }
+
+    private func distillPrepareProvisionalRCW1(
+        original: String,
+        stageOriginal: String,
+        provider: AgentProvider,
+        threadId: AgentThreadID,
+        runId: AgentRunID?,
+        profitabilityGate: (String) -> Bool,
+        trace: (String) -> Void
+    ) async -> TokenSaverProvisionalRCW1Recovery? {
+        tokenSaverDistillPrepareInvocations += 1
         startTokenSaverDistillServiceIfEligible()
         guard let client = currentDistillClient() else {
             trace("sidecar_not_ready")
-            return prompt
+            return nil
         }
-        let inputByteCount = deterministicCandidate.utf8.count
+        let inputByteCount = stageOriginal.utf8.count
         let wireOutputBudget: Int
         if inputByteCount > (Int.max - 1_024) / 2 {
             wireOutputBudget = Int.max
@@ -3170,7 +3455,7 @@ public final class AppContext {
         let request = DistillRequest(
             mode: .wireEncode,
             priority: .interactive,
-            input: deterministicCandidate,
+            input: stageOriginal,
             runMode: .optimize,
             maxOutputCharacters: wireOutputBudget
         )
@@ -3201,32 +3486,28 @@ public final class AppContext {
             NSLog(
                 "RemoteCode RCW1 encode returned provider=\(provider.rawValue) wire=\(RCWireProtocol.isWire(response.output)) recovery_handle=\(response.originalHandle != nil) stage=\(responseStage)"
             )
-            let modelOutput = response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? deterministicCandidate : response.output
+            let modelOutput = response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? stageOriginal : response.output
             let wireFrames = try? RCWireProtocol.parse(modelOutput)
             let isValidRequestWire = wireFrames?.allSatisfy { $0.direction == .request } == true
             let literalSafeModelOutput: String? = response.routeStage == .deterministic
                 && isValidRequestWire
-                && RCWireProtocol.preservesProtectedSemantics(original: prompt, wire: modelOutput)
-                && RCWireProtocol.preservesRequestMeaning(original: prompt, wire: modelOutput)
-                && LiteralPreservation.guarded(original: prompt, compressed: modelOutput).droppedLiteral == nil
+                && RCWireProtocol.preservesProtectedSemantics(original: original, wire: modelOutput)
+                && RCWireProtocol.preservesRequestMeaning(original: original, wire: modelOutput)
+                && LiteralPreservation.guarded(original: original, compressed: modelOutput).droppedLiteral == nil
                 ? modelOutput
                 : nil
-            // A wire candidate is live only after schema/literal gates
-            // and exact-scope recovery has been durably stored and read back.
             guard let literalSafeModelOutput,
-                  let recoveredCandidate = prepareWireCandidate(
-                    original: prompt,
-                    stageOriginal: deterministicCandidate,
+                  let provisional = prepareProvisionalRCW1Recovery(
+                    original: original,
+                    stageOriginal: stageOriginal,
                     candidate: literalSafeModelOutput,
                     capability: response.originalHandle,
                     idempotencyKey: response.recoveryIdempotencyKey,
                     provider: provider,
                     threadId: threadId,
                     runId: runId,
-                    profitabilityGate: isProfitableWire
-                ) else {
-                // Distill may already have prepared a stage object before any later
-                // pre-adoption gate. Abandon only that provisional when adoption fails.
+                    profitabilityGate: profitabilityGate
+                  ) else {
                 discardProvisionalWireRecovery(
                     capability: response.originalHandle,
                     idempotencyKey: response.recoveryIdempotencyKey,
@@ -3234,16 +3515,16 @@ public final class AppContext {
                     threadId: threadId,
                     runId: runId
                 )
-                return prompt
+                return nil
             }
-            return adopt(recoveredCandidate, stage: .deterministic)
+            return provisional
         } catch {
             NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
-            return prompt
+            return nil
         }
     }
 
-    private func prepareWireCandidate(
+    private func prepareProvisionalRCW1Recovery(
         original: String,
         stageOriginal: String,
         candidate: String,
@@ -3253,7 +3534,7 @@ public final class AppContext {
         threadId: AgentThreadID,
         runId: AgentRunID?,
         profitabilityGate: (String) -> Bool
-    ) -> String? {
+    ) -> TokenSaverProvisionalRCW1Recovery? {
         guard let runId,
               let capability,
               let idempotencyKey,
@@ -3333,30 +3614,59 @@ public final class AppContext {
                 return nil
             }
 
-            // Atomic multi-object finalization: stage (+ optional full-original) in one
-            // SQLite transaction. On failure both remain provisional and are discarded.
             let fullMember = fullOriginal.map {
                 TokenSaverSemanticRecoveryMember(
                     capability: $0.capability,
                     idempotencyKey: $0.idempotencyKey
                 )
             }
-            guard try store.finalizeSemanticRecoverySet(
+            return TokenSaverProvisionalRCW1Recovery(
+                payload: recoverable,
+                handle: capability,
+                scope: scope,
                 stage: TokenSaverSemanticRecoveryMember(
                     capability: capability,
                     idempotencyKey: idempotencyKey
                 ),
-                fullOriginal: fullMember,
-                scope: scope
-            ) else {
-                discardProvisionals()
-                return nil
-            }
-            return recoverable
+                fullOriginal: fullMember
+            )
         } catch {
             NSLog("RemoteCode Token Saver wire recovery preparation failed: \(error)")
             discardProvisionals()
             return nil
+        }
+    }
+
+    private func finalizeProvisionalRCW1Recovery(
+        _ provisional: TokenSaverProvisionalRCW1Recovery
+    ) -> String? {
+        do {
+            guard try TokenSaverScopedRecoveryStore(db: db).finalizeSemanticRecoverySet(
+                stage: provisional.stage,
+                fullOriginal: provisional.fullOriginal,
+                scope: provisional.scope
+            ) else {
+                discardProvisionalRCW1Recovery(provisional)
+                return nil
+            }
+            tokenSaverRCW1FinalizeInvocations += 1
+            return provisional.payload
+        } catch {
+            NSLog("RemoteCode Token Saver wire recovery finalization failed: \(error)")
+            discardProvisionalRCW1Recovery(provisional)
+            return nil
+        }
+    }
+
+    private func discardProvisionalRCW1Recovery(_ provisional: TokenSaverProvisionalRCW1Recovery) {
+        tokenSaverRCW1DiscardInvocations += 1
+        let store = TokenSaverScopedRecoveryStore(db: db)
+        for member in provisional.members {
+            _ = try? store.discardAbandoned(
+                capability: member.capability,
+                scope: provisional.scope,
+                idempotencyKey: member.idempotencyKey
+            )
         }
     }
 
