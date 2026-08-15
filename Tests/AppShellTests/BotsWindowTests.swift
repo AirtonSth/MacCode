@@ -558,6 +558,33 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(reopened.screen, .fleet)
     }
 
+    func test_botsShellDestinationSurvivesRelaunch_becauseAgenticBotsIsUserWorkflowState() throws {
+        // WHY: bots.screen already restores Fleet/Studio/Desk. The Agentic |
+        // Bots switcher still dumped the user on the workspace after relaunch.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let first = MainWindowController(context: context, router: router)
+        router.windowController = first
+        first.presentBotsInMainContent()
+        XCTAssertEqual(first.window.title, "Bots")
+        XCTAssertEqual(
+            try context.settingsRepo.get(MainWindowController.botsShellSettingsKey) ?? "",
+            "1"
+        )
+
+        let reopened = MainWindowController(context: context, router: router)
+        XCTAssertEqual(reopened.window.title, "Bots", "relaunch must reopen the Bots destination")
+
+        first.presentWorkspaceContent()
+        XCTAssertEqual(
+            try context.settingsRepo.get(MainWindowController.botsShellSettingsKey) ?? "",
+            "0"
+        )
+        let workspace = MainWindowController(context: context, router: router)
+        XCTAssertNotEqual(workspace.window.title, "Bots")
+    }
+
     func test_deletedBotDoesNotRestoreItsDesk_becauseTheTeammateIsGone() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -1694,6 +1721,8 @@ final class BotsWindowTests: XCTestCase {
 
         XCTAssertTrue(main.contains("presentBotsInMainContent"))
         XCTAssertTrue(main.contains("installBotsContent"))
+        XCTAssertTrue(main.contains("shell.botsSelected"))
+        XCTAssertTrue(main.contains("restoreBotsShellDestinationIfNeeded"))
         XCTAssertFalse(
             main.contains("vm.openFleet()"),
             "remounting Bots must keep Desk/Studio, not force Fleet Home"
