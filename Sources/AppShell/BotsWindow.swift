@@ -1485,7 +1485,7 @@ public struct BotsRosterList: View {
             .padding(.bottom, DS.Space.sm)
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
+                LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
                     if vm.fleet.isEmpty {
                         Text(vm.searchText.isEmpty ? "No bots yet" : "No matches")
                             .font(DS.Font.body)
@@ -1498,7 +1498,7 @@ public struct BotsRosterList: View {
                         }
                     }
                 }
-                .padding(.horizontal, DS.Space.lg)
+                .padding(.horizontal, DS.Space.sm)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -1533,7 +1533,7 @@ public struct BotsRosterList: View {
         return Button {
             vm.openHome(bot)
         } label: {
-            HStack(spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
                 ZStack(alignment: .bottomTrailing) {
                     BotsAvatarView(name: bot.name, handle: bot.handle, size: 22)
                     Circle()
@@ -1552,7 +1552,7 @@ public struct BotsRosterList: View {
                         .foregroundColor(DS.Palette.textTertiary)
                         .lineLimit(1)
                 }
-                Spacer(minLength: DS.Space.md)
+                Spacer(minLength: 0)
                 if let provider = vm.providerLabel(for: bot) {
                     Text(provider)
                         .font(DS.Font.caption2)
@@ -1560,7 +1560,7 @@ public struct BotsRosterList: View {
                         .lineLimit(1)
                 }
             }
-            .padding(.horizontal, DS.Space.lg)
+            .padding(.horizontal, DS.Space.sm)
             .frame(height: 38)
             .background(
                 RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
