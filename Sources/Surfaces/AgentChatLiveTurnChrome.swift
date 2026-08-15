@@ -96,7 +96,32 @@ public enum AgentChatLiveTurnChrome {
                 work.append(item)
             }
         }
-        return (reasoning, work, split.outside)
+        return (reasoning, work, deduplicatedAssistantItems(split.outside))
+    }
+
+    /// Claude often emits a streaming assistantMessage and then a snapshot
+    /// item with the same body in one turn. Paint that answer once.
+    static func deduplicatedAssistantItems(_ items: [AssistantItem]) -> [AssistantItem] {
+        var result: [AssistantItem] = []
+        result.reserveCapacity(items.count)
+        for item in items {
+            guard item.type == .assistantMessage else {
+                result.append(item)
+                continue
+            }
+            let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let index = result.firstIndex(where: {
+                $0.type == .assistantMessage && assistantTextsMatch($0.body, body)
+            }) {
+                let existing = result[index].body.trimmingCharacters(in: .whitespacesAndNewlines)
+                if body.count > existing.count {
+                    result[index] = item
+                }
+                continue
+            }
+            result.append(item)
+        }
+        return result
     }
 
     public static func workItems(in turn: AssistantTurnSnapshot) -> [AssistantItem] {

@@ -1410,6 +1410,68 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(hidden, [false, true])
     }
 
+    func test_deskTimelinePaintsOneReplyWhenClaudeEmitsStreamAndSnapshot() {
+        // WHY: live Batatilson turns persist one assistant row but Claude's
+        // stream also writes two assistantMessage items. The teammate must
+        // answer once.
+        let answer = "Sou Batatilson da Silva, Gerente de Marketing, e não alterei nenhum arquivo."
+        let user = BotDeskMessage(
+            role: .user,
+            text: "Brain inspector proof. Reply one short sentence. Do not change files.",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let persisted = BotDeskMessage(
+            role: .assistant,
+            text: answer,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_007)
+        )
+        let turn = AssistantTurnSnapshot(
+            turnId: "t-brain",
+            items: [
+                AssistantItem(
+                    id: "stream",
+                    turnId: "t-brain",
+                    type: .assistantMessage,
+                    state: .completed,
+                    body: answer,
+                    startedAtMs: 1_700_000_004_000,
+                    finishedAtMs: 1_700_000_006_000
+                ),
+                AssistantItem(
+                    id: "snapshot",
+                    turnId: "t-brain",
+                    type: .assistantMessage,
+                    state: .completed,
+                    body: answer,
+                    startedAtMs: 1_700_000_005_000,
+                    finishedAtMs: 1_700_000_006_000
+                ),
+            ],
+            finalAssistantMessage: answer,
+            finished: true
+        )
+        let items = BotsDeskFollowThrough.timeline(
+            messages: [user, persisted],
+            workLog: [],
+            turns: [turn],
+            hideWorkLog: true
+        )
+        let answers = items.compactMap { item -> String? in
+            switch item {
+            case .message(let message) where message.role == .assistant:
+                return message.text
+            case .liveTurn(let live, let hide):
+                XCTAssertFalse(hide)
+                let outside = AgentChatLiveTurnChrome.compose(live).outside
+                XCTAssertEqual(outside.map(\.body), [answer])
+                return outside.first?.body
+            default:
+                return nil
+            }
+        }
+        XCTAssertEqual(answers, [answer])
+    }
+
     func test_openingAnotherBotDoesNotKeepPreviousLiveTurns_becauseEachDeskOwnsItsThread() throws {
         // WHY: applyDeskLiveReplay used the previous bot's deskLiveTimeline as
         // "current". isRicher then kept Batatilson's Worked rows on New Agent.

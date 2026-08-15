@@ -232,4 +232,42 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         XCTAssertTrue(AgentChatLiveTurnChrome.isRicher(live, than: persisted))
         XCTAssertFalse(AgentChatLiveTurnChrome.isRicher(persisted, than: live))
     }
+
+    func test_composeKeepsOneAssistantWhenClaudeEmitsStreamAndSnapshot() {
+        // WHY: a real Claude Desk turn writes a streaming assistantMessage
+        // and then a snapshot item with the same body. Two replies is a lie.
+        let answer = "Sou Batatilson da Silva, Gerente de Marketing, e não alterei nenhum arquivo."
+        let turn = AssistantTurnSnapshot(
+            turnId: "F18B4835-C8AC-4C5B-8D0D-FD8A915CA0EF",
+            items: [
+                AssistantItem(
+                    id: "483520EA-C4E5-471D-A409-1B8501E14F90",
+                    turnId: "F18B4835-C8AC-4C5B-8D0D-FD8A915CA0EF",
+                    type: .assistantMessage,
+                    state: .completed,
+                    body: answer,
+                    startedAtMs: 1,
+                    finishedAtMs: 2
+                ),
+                AssistantItem(
+                    id: "793AAE89-A3B1-4F24-962E-A5D76186A18E",
+                    turnId: "F18B4835-C8AC-4C5B-8D0D-FD8A915CA0EF",
+                    type: .assistantMessage,
+                    state: .completed,
+                    body: answer,
+                    startedAtMs: 2,
+                    finishedAtMs: 3
+                ),
+            ],
+            finalAssistantMessage: answer,
+            finished: true
+        )
+        let composition = AgentChatLiveTurnChrome.compose(turn)
+        XCTAssertEqual(composition.outside.map(\.id), ["483520EA-C4E5-471D-A409-1B8501E14F90"])
+        XCTAssertEqual(composition.outside.map(\.body), [answer])
+        XCTAssertFalse(
+            AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn),
+            "the item is the answer; the turn final must not paint a third copy"
+        )
+    }
 }
