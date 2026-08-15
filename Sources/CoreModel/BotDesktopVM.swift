@@ -3,6 +3,7 @@ import Foundation
 public enum BotDesktopVMRunState: String, Codable, Sendable, Equatable {
     case stopped
     case failed
+    case starting
     case running
 }
 
@@ -54,12 +55,17 @@ public struct BotDesktopVMIdentity: Codable, Sendable, Equatable {
             return "Local VM · stopped"
         case .failed:
             return "Local VM · failed"
+        case .starting:
+            return "Local VM · starting"
         case .running:
             return "Local VM · running"
         }
     }
 
     public var honestyLabel: String {
+        if state == .starting {
+            return "Starting. Virtualization.framework is still bringing the guest up. Same Mac host; not isolated."
+        }
         if state == .running {
             return "Running. Guest started via Virtualization.framework. Same Mac host; not isolated."
         }

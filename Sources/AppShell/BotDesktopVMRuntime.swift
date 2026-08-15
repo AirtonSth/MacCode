@@ -7,10 +7,12 @@ import Virtualization
 
 public struct BotDesktopVMBootAttempt: Equatable, Sendable {
     public var didStart: Bool
+    public var isStarting: Bool
     public var failure: String?
 
-    public init(didStart: Bool, failure: String? = nil) {
+    public init(didStart: Bool, isStarting: Bool = false, failure: String? = nil) {
         self.didStart = didStart
+        self.isStarting = isStarting
         self.failure = failure
     }
 }
@@ -65,10 +67,14 @@ public final class SystemBotDesktopVirtualizationProbe: BotDesktopVirtualization
             if let error = box.error {
                 return BotDesktopVMBootAttempt(didStart: false, failure: error.localizedDescription)
             }
+            machine = vm
             if vm.state == .running {
-                machine = vm
                 return BotDesktopVMBootAttempt(didStart: true)
             }
+            if vm.state == .starting {
+                return BotDesktopVMBootAttempt(didStart: false, isStarting: true)
+            }
+            machine = nil
             return BotDesktopVMBootAttempt(
                 didStart: false,
                 failure: "Virtual machine did not reach running (state \(vm.state.rawValue))."
@@ -145,6 +151,9 @@ public struct BotDesktopVMRuntime {
             let attempt = probe.boot(diskImage: disk)
             if attempt.didStart {
                 identity.state = .running
+                identity.lastError = nil
+            } else if attempt.isStarting {
+                identity.state = .starting
                 identity.lastError = nil
             } else {
                 identity.state = .failed

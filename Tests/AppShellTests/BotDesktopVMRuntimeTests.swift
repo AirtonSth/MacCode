@@ -110,6 +110,34 @@ final class BotDesktopVMRuntimeTests: XCTestCase {
         XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
     }
 
+    func test_startPersistsStarting_whenHypervisorIsStillComingUp() throws {
+        // WHY: VZ state 4 is starting. Reporting boot-failed while the guest
+        // is still coming up is a lie and hides a live Virtualization session.
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bot-desktops-rt-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = BotDesktopVMStore(root: root)
+        let runtime = BotDesktopVMRuntime(
+            store: store,
+            probe: FixedVirtualizationProbe(
+                isSupported: true,
+                bootResult: BotDesktopVMBootAttempt(didStart: false, isStarting: true)
+            )
+        )
+        let botID = BotID()
+        let identity = try store.ensure(botID: botID)
+        try Data(repeating: 0, count: 64).write(
+            to: URL(fileURLWithPath: identity.bundlePath).appendingPathComponent("Disk.img")
+        )
+
+        let started = try runtime.start(botID: botID)
+        XCTAssertEqual(started.state, .starting)
+        XCTAssertNil(started.lastError)
+        XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("starting"))
+        XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
+        XCTAssertFalse(started.honestyLabel.localizedCaseInsensitiveContains("boot failed"))
+    }
+
     func test_systemProbeSourceInstallsEFIBootLoader_becauseNilBootLoaderCannotStartAGuest() throws {
         let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)

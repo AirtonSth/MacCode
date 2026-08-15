@@ -175,6 +175,17 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(failed.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
         XCTAssertFalse(failed.honestyLabel.localizedCaseInsensitiveContains("active now"))
         XCTAssertEqual(failed.statusPill, "Local VM · failed")
+
+        let starting = BotDesktopVMIdentity(
+            botID: BotID(),
+            bundlePath: "/tmp/bot-desktop",
+            state: .starting,
+            virtualizationSupported: true
+        )
+        XCTAssertTrue(starting.honestyLabel.localizedCaseInsensitiveContains("starting"))
+        XCTAssertTrue(starting.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
+        XCTAssertFalse(starting.honestyLabel.localizedCaseInsensitiveContains("boot failed"))
+        XCTAssertEqual(starting.statusPill, "Local VM · starting")
     }
 
     func test_routineCopy_doesNotClaimAppClosedExecution() {
