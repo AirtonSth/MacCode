@@ -1657,6 +1657,53 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Summarize overnight"))
     }
 
+    func test_previewBrainMatchesSendReceipt_becauseSourceEffectiveMustBeTheAdapterPayload() throws {
+        // WHY: owner-readable Brain Inspector is false if Studio preview
+        // compiles a different envelope than Desk send persists.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(
+            name: "Piper",
+            title: "Scout",
+            description: "Looks around",
+            soul: "Be brief.",
+            provider: .claude
+        )
+        vm.openDesk(bot)
+        vm.memoryDraft = "Prefers dark mode"
+        vm.addMemory()
+        vm.composerText = "Summarize overnight"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(preview.compiledPayload, BotsDeskFollowThrough.composeRunPrompt(
+            bot: bot,
+            revision: try XCTUnwrap(vm.selectedRevision),
+            userText: "Summarize overnight",
+            memory: vm.memoryItems,
+            skills: vm.skillBindings
+        ))
+        XCTAssertTrue(preview.compiledPayload.contains("Prefers dark mode"))
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .user })?.text, "Summarize overnight")
+        XCTAssertEqual(preview.payloadDigest.count, 64)
+        try context.botStore.insertContextReceipt(preview)
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(
+            reopened.lastContextReceipt?.payloadDigest,
+            preview.payloadDigest,
+            "Brain receipts are workflow state and must survive remount"
+        )
+        XCTAssertEqual(reopened.lastContextReceipt?.compiledPayload, preview.compiledPayload)
+
+        reopened.beginEdit(bot)
+        reopened.studioDraft.soul = "Stand up for the brief."
+        let studioPreview = try XCTUnwrap(reopened.inspectedBrain)
+        XCTAssertTrue(reopened.inspectedBrainIsPreview)
+        XCTAssertFalse(reopened.inspectedBrainIsLastCall)
+        XCTAssertTrue(
+            studioPreview.layers.contains { $0.kind == .soul && $0.text == "Stand up for the brief." },
+            "Studio Brain must compile the draft, not the last Desk send"
+        )
+    }
+
     func test_hiddenBotsAreExcludedFromDefaultFleet() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -1882,10 +1929,18 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.desk.role.user"))
         XCTAssertTrue(bots.contains("bots.desk.role.assistant"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.inspector\")"))
+        XCTAssertTrue(bots.contains("bots.studio.tab.brain"))
+        XCTAssertTrue(bots.contains("bots.desk.inspector.tab.brain"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.memory"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.routines"))
+        XCTAssertTrue(bots.contains("bots.desk.inspector.brain"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.memory"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.routines"))
+        XCTAssertTrue(bots.contains("bots.brain.honesty"))
+        XCTAssertTrue(bots.contains("bots.brain.source"))
+        XCTAssertTrue(bots.contains("bots.brain.effective"))
+        XCTAssertTrue(bots.contains("bots.brain.whyMemory"))
+        XCTAssertTrue(bots.contains("bots.brain.digest"))
         XCTAssertTrue(bots.contains("bots.memory.field"))
         XCTAssertTrue(bots.contains("bots.memory.add"))
         XCTAssertTrue(bots.contains("bots.memory.list"))

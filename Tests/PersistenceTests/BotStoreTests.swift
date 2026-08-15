@@ -27,7 +27,7 @@ final class BotStoreTests: XCTestCase {
             "bots", "bot_revisions", "bot_handles", "bot_handle_tombstones",
             "bot_conversations", "bot_memory_items", "bot_memory_item_revisions",
             "bot_attention_items", "bot_routine_definitions", "bot_routine_activations",
-            "bot_skill_bindings",
+            "bot_skill_bindings", "bot_context_receipts",
         ] {
             let exists = try db.prepare(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?;"
@@ -205,6 +205,52 @@ final class BotStoreTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? BotStoreError, .invalidRow("skill id must be a catalog id, not a path"))
         }
+    }
+
+    func test_contextReceiptRoundTrip_becausePreviewMustMatchThePersistedCall() throws {
+        // WHY: Brain Inspector Source/Effective is a lie if the last receipt
+        // cannot be reopened after restart.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "Looks around",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let revision = try XCTUnwrap(store.getRevision(id: try XCTUnwrap(bot.currentRevisionID)))
+        let conversation = BotConversation(botID: bot.id, title: "Desk")
+        try store.upsertConversation(conversation)
+        let trusted = try store.putMemory(
+            botID: bot.id, content: "Prefers dark mode", provenance: "user",
+            trusted: true, source: "chat"
+        )
+        var forgotten = try store.putMemory(
+            botID: bot.id, content: "Old secret", provenance: "user",
+            trusted: true, source: "chat"
+        )
+        try store.forgetMemory(id: forgotten.id)
+        forgotten = try XCTUnwrap(store.getMemory(id: forgotten.id))
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Summarize overnight",
+            memory: [trusted, forgotten],
+            conversationID: conversation.id
+        )
+        try store.insertContextReceipt(receipt)
+
+        let loaded = try XCTUnwrap(
+            store.latestContextReceipt(botID: bot.id, conversationID: conversation.id)
+        )
+        XCTAssertEqual(loaded.payloadDigest, receipt.payloadDigest)
+        XCTAssertEqual(loaded.compiledPayload, receipt.compiledPayload)
+        XCTAssertTrue(loaded.compiledPayload.contains("Prefers dark mode"))
+        XCTAssertFalse(loaded.compiledPayload.contains("Old secret"))
+        XCTAssertEqual(
+            loaded.memoryLayers.first(where: { $0.text == "Old secret" })?.included,
+            false
+        )
     }
 
     func test_delete_tombstonesHandleSoReuseIsNotSilent() throws {

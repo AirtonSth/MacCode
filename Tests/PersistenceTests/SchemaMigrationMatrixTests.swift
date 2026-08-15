@@ -438,8 +438,9 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         // The composed head has Message identity, named checkpoint list,
         // Token Saver per-thread totals (59), reserved no-op (60), lifecycle
         // support (61), bounded maintenance lookup support (62), the
-        // durable RCW1 request/response/display rows (67-69), and Bot
-        // control-plane identity (70-71). Versions 63-66 are retired.
+        // durable RCW1 request/response/display rows (67-69), Bot
+        // control-plane identity (70-71), and context receipts (72).
+        // Versions 63-66 are retired.
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
@@ -453,6 +454,8 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             67,
             68,
             69,
+            70,
+            71,
             Schema.currentVersion
         ])
         XCTAssertGreaterThanOrEqual(Schema.currentVersion, 70)

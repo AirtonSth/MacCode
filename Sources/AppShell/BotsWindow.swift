@@ -176,6 +176,7 @@ public enum BotsScreen: String, Equatable {
 }
 
 public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
+    case brain
     case memory
     case routines
 
@@ -183,6 +184,7 @@ public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
 
     public var title: String {
         switch self {
+        case .brain: return BotsChrome.Label.brain
         case .memory: return "Memory"
         case .routines: return "Routines"
         }
@@ -190,6 +192,7 @@ public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
 
     public var accessibilityIdentifier: String {
         switch self {
+        case .brain: return "bots.desk.inspector.tab.brain"
         case .memory: return "bots.desk.inspector.tab.memory"
         case .routines: return "bots.desk.inspector.tab.routines"
         }
@@ -198,6 +201,7 @@ public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
 
 public enum BotStudioTab: String, CaseIterable, Identifiable {
     case profile
+    case brain
     case memory
     case skills
     case routines
@@ -209,6 +213,7 @@ public enum BotStudioTab: String, CaseIterable, Identifiable {
     public var title: String {
         switch self {
         case .profile: return "Profile"
+        case .brain: return BotsChrome.Label.brain
         case .memory: return "Memory"
         case .skills: return "Skills"
         case .routines: return "Routines"
@@ -220,11 +225,33 @@ public enum BotStudioTab: String, CaseIterable, Identifiable {
     public var accessibilityIdentifier: String {
         switch self {
         case .profile: return "bots.studio.tab.profile"
+        case .brain: return "bots.studio.tab.brain"
         case .memory: return "bots.studio.tab.memory"
         case .skills: return "bots.studio.tab.skills"
         case .routines: return "bots.studio.tab.routines"
         case .security: return "bots.studio.tab.security"
         case .desktop: return "bots.studio.tab.desktop"
+        }
+    }
+}
+
+public enum BotBrainInspectorPane: String, CaseIterable, Identifiable {
+    case source
+    case effective
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .source: return BotsChrome.Label.source
+        case .effective: return BotsChrome.Label.effective
+        }
+    }
+
+    public var accessibilityIdentifier: String {
+        switch self {
+        case .source: return "bots.brain.pane.source"
+        case .effective: return "bots.brain.pane.effective"
         }
     }
 }
@@ -269,6 +296,8 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var memoryItems: [BotMemoryItem] = []
     @Published public private(set) var skillBindings: [BotSkillBinding] = []
     @Published public private(set) var selectedRevision: BotRevision?
+    @Published public private(set) var lastContextReceipt: ContextAssemblyReceipt?
+    @Published public var brainPane: BotBrainInspectorPane = .source
     @Published public private(set) var routines: [BotRoutine] = []
     @Published public var memoryDraft: String = ""
     @Published public var skillDraft: String = ""
@@ -912,6 +941,37 @@ public final class BotsViewModel: ObservableObject {
 
     public var studioApprovalLabel: String { "Supervised" }
 
+    public var inspectedBrain: ContextAssemblyReceipt? {
+        if screen == .studio {
+            return previewBrain()
+        }
+        return lastContextReceipt ?? previewBrain()
+    }
+
+    public var inspectedBrainIsPreview: Bool {
+        screen == .studio || lastContextReceipt == nil
+    }
+
+    public var inspectedBrainIsLastCall: Bool {
+        screen != .studio && lastContextReceipt?.runID != nil
+    }
+
+    public func previewBrain(userText: String? = nil) -> ContextAssemblyReceipt? {
+        let text = (userText ?? composerText)
+        let request = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let bot = selectedBot ?? studioPreviewBot() else { return nil }
+        guard let revision = studioPreviewRevision(for: bot) ?? selectedRevision else { return nil }
+        let memory = (try? botStore.listMemory(botID: bot.id, includeForgotten: true)) ?? memoryItems
+        return BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: request,
+            memory: memory,
+            skills: skillBindings,
+            conversationID: selectedConversation?.id
+        )
+    }
+
     public var studioHasUnpublishedChanges: Bool {
         guard let revision = selectedRevision else { return studioDraft.isNew }
         let bot = selectedBot
@@ -1147,6 +1207,7 @@ public final class BotsViewModel: ObservableObject {
             skillBindings = try botStore.listSkillBindings(botID: id)
             reloadMemory(botID: id)
             reloadRoutines(botID: id)
+            reloadContextReceipt(botID: id)
             restoreDeskMessages(botID: id)
             restoreDeskWorkLog(botID: id)
             restoreDeskLiveTurn(botID: id)
@@ -1387,6 +1448,67 @@ public final class BotsViewModel: ObservableObject {
         } catch {
             errorMessage = String(describing: error)
         }
+    }
+
+    private func reloadContextReceipt(botID: BotID) {
+        do {
+            if let conversationID = selectedConversation?.id,
+               let receipt = try botStore.latestContextReceipt(botID: botID, conversationID: conversationID) {
+                lastContextReceipt = receipt
+            } else {
+                lastContextReceipt = try botStore.latestContextReceipt(botID: botID)
+            }
+        } catch {
+            lastContextReceipt = nil
+        }
+    }
+
+    private func studioPreviewBot() -> BotDefinition? {
+        if let selectedBot { return selectedBot }
+        let handle = BotHandle.normalize(studioDraft.handle) ?? "draft"
+        return BotDefinition(
+            handle: handle,
+            name: studioDraft.name,
+            title: studioDraft.title,
+            description: studioDraft.description,
+            avatarSymbol: studioDraft.avatarSymbol
+        )
+    }
+
+    private func studioPreviewRevision(for bot: BotDefinition) -> BotRevision? {
+        let draft = BotRevisionDraft(
+            name: studioDraft.name,
+            title: studioDraft.title,
+            description: studioDraft.description,
+            soul: studioDraft.soul,
+            provider: studioDraft.provider,
+            providerInstanceID: studioDraft.providerInstanceID.isEmpty
+                ? studioDraft.provider.rawValue
+                : studioDraft.providerInstanceID,
+            model: studioDraft.model.isEmpty ? Self.defaultModel(for: studioDraft.provider) : studioDraft.model,
+            permissionMode: .supervised,
+            desktopKind: resolvedDesktopKind(studioDraft.desktopKind)
+        )
+        if screen != .studio, let selectedRevision { return selectedRevision }
+        return BotRevision(
+            id: selectedRevision?.id ?? BotRevisionID(),
+            botID: bot.id,
+            revisionNumber: selectedRevision?.revisionNumber ?? 0,
+            name: draft.name,
+            title: draft.title,
+            description: draft.description,
+            soul: draft.soul,
+            provider: draft.provider,
+            providerInstanceID: draft.providerInstanceID,
+            model: draft.model,
+            reasoningEffort: selectedRevision?.reasoningEffort ?? .medium,
+            compatibleRouteSet: selectedRevision?.compatibleRouteSet ?? ["default"],
+            permissionMode: draft.permissionMode,
+            desktopKind: draft.desktopKind,
+            digest: BotRevision.digest(botID: bot.id, draft: draft),
+            publishedAt: selectedRevision?.publishedAt ?? Date(),
+            supersedesRevisionID: selectedRevision?.id
+        )
     }
 
     private func reloadRoutines(botID: BotID) {
@@ -1671,18 +1793,23 @@ public final class BotsViewModel: ObservableObject {
             if selectedBotID == bot.id, screen == .desk {
                 startDeskLiveTurnWatch(botID: bot.id, threadID: thread.id)
             }
-            let memory = (try? botStore.listMemory(botID: bot.id)) ?? []
+            let memory = (try? botStore.listMemory(botID: bot.id, includeForgotten: true)) ?? []
             let skills = (try? botStore.listSkillBindings(botID: bot.id)) ?? []
-            let prompt = BotsDeskFollowThrough.composeRunPrompt(
+            var receipt = BotBrainCompiler.assemble(
                 bot: bot,
                 revision: revision,
                 userText: userText,
                 memory: memory,
-                skills: skills
+                skills: skills,
+                conversationID: conversation.id
             )
+            try botStore.insertContextReceipt(receipt)
+            if selectedBotID == bot.id {
+                lastContextReceipt = receipt
+            }
             let result = try await router.sendAgentMessage(
                 thread: thread.id,
-                text: prompt,
+                text: receipt.compiledPayload,
                 provider: revision.provider,
                 model: model,
                 permissionMode: .supervised,
@@ -1690,6 +1817,13 @@ public final class BotsViewModel: ObservableObject {
                 providerInstanceId: revision.providerInstanceID,
                 attachments: attachments
             )
+            if let runId = result.runId {
+                receipt.runID = runId
+                try? botStore.insertContextReceipt(receipt)
+                if selectedBotID == bot.id {
+                    lastContextReceipt = receipt
+                }
+            }
             return result.runId
         } catch {
             errorMessage = String(describing: error)
@@ -2686,6 +2820,8 @@ public struct BotsRootView: View {
                 switch vm.studioTab {
                 case .profile:
                     studioProfile
+                case .brain:
+                    studioBrain
                 case .memory:
                     memoryTab
                 case .skills:
@@ -3185,6 +3321,8 @@ public struct BotsRootView: View {
 
             Group {
                 switch resolvedInspectorTab {
+                case .brain:
+                    inspectorBrain
                 case .memory:
                     inspectorMemory
                 case .routines:
@@ -3200,9 +3338,189 @@ public struct BotsRootView: View {
 
     private var resolvedInspectorTab: BotDeskInspectorTab {
         if vm.inspectorTab == .memory && !vm.isMemoryActive {
-            return .routines
+            return .brain
         }
         return vm.inspectorTab
+    }
+
+    private var studioBrain: some View {
+        ScrollView {
+            brainInspector(compact: false)
+                .padding(DS.Space.xxl)
+        }
+        .accessibilityIdentifier("bots.studio.brain")
+    }
+
+    private var inspectorBrain: some View {
+        ScrollView {
+            brainInspector(compact: true)
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.bottom, DS.Space.md)
+        }
+        .accessibilityIdentifier("bots.desk.inspector.brain")
+    }
+
+    private func brainInspector(compact: Bool) -> some View {
+        let receipt = vm.inspectedBrain
+        return VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
+                Text("What this Bot sees")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                Spacer(minLength: 0)
+                if vm.inspectedBrainIsLastCall {
+                    DSPill("Last call", tone: .accent)
+                } else if vm.inspectedBrainIsPreview {
+                    DSPill("Preview", tone: .neutral)
+                } else {
+                    DSPill("Compiled", tone: .neutral)
+                }
+            }
+            Text(vm.inspectedBrainIsLastCall ? BotsChrome.Label.brainReceiptHonesty : BotsChrome.Label.brainPreviewHonesty)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.warning)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("bots.brain.honesty")
+            HStack(spacing: DS.Space.sm) {
+                ForEach(BotBrainInspectorPane.allCases) { pane in
+                    let selected = vm.brainPane == pane
+                    Button {
+                        vm.brainPane = pane
+                    } label: {
+                        Text(pane.title)
+                            .font(DS.Font.caption.weight(selected ? .semibold : .regular))
+                            .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
+                            .padding(.horizontal, DS.Space.md)
+                            .padding(.vertical, DS.Space.sm)
+                            .background(selected ? DS.Palette.accent : DS.Palette.surfaceRaised)
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(selected ? .isSelected : [])
+                    .accessibilityIdentifier(pane.accessibilityIdentifier)
+                }
+                Spacer(minLength: 0)
+            }
+            if let receipt {
+                brainReceiptMeta(receipt, compact: compact)
+                if vm.brainPane == .source {
+                    brainSource(receipt)
+                } else {
+                    brainEffective(receipt)
+                }
+                brainWhyMemory(receipt)
+                brainCapabilities(receipt)
+            } else {
+                Text("Save or select a Bot to compile Source and Effective Brain.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+        }
+    }
+
+    private func brainReceiptMeta(_ receipt: ContextAssemblyReceipt, compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Revision \(receipt.revisionNumber) · \(vm.providerChipTitle(receipt.provider)) · \(receipt.model.isEmpty ? "model unset" : receipt.model) · \(receipt.permissionMode.rawValue)")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+            Text("payload \(receipt.payloadDigest)")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(DS.Palette.textTertiary)
+                .textSelection(.enabled)
+                .accessibilityIdentifier("bots.brain.digest")
+            if !compact {
+                Text("compiler \(receipt.compilerVersion) · no opaque RemoteCode layer")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+        }
+        .accessibilityIdentifier("bots.brain.receipt")
+    }
+
+    private func brainSource(_ receipt: ContextAssemblyReceipt) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            ForEach(receipt.layers) { layer in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: DS.Space.sm) {
+                        DSPill(layer.included ? "Included" : "Excluded", tone: layer.included ? .success : .neutral)
+                        Text(layer.title)
+                            .font(DS.Font.caption.weight(.semibold))
+                            .foregroundColor(DS.Palette.text)
+                    }
+                    if !layer.text.isEmpty {
+                        Text(layer.text)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(layer.reason)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .accessibilityIdentifier("bots.brain.source")
+    }
+
+    private func brainEffective(_ receipt: ContextAssemblyReceipt) -> some View {
+        Text(receipt.compiledPayload.isEmpty ? "(empty payload)" : receipt.compiledPayload)
+            .font(.system(.caption, design: .monospaced))
+            .foregroundColor(DS.Palette.text)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(DS.Space.md)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .accessibilityIdentifier("bots.brain.effective")
+    }
+
+    private func brainWhyMemory(_ receipt: ContextAssemblyReceipt) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            Text("Why this memory?")
+                .font(DS.Font.bodyStrong)
+                .foregroundColor(DS.Palette.text)
+            if receipt.memoryLayers.isEmpty {
+                Text("No memory items were considered.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            } else {
+                ForEach(receipt.memoryLayers) { layer in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(layer.text.isEmpty ? "(empty fact)" : layer.text)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .textSelection(.enabled)
+                        Text(layer.reason)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
+                }
+            }
+        }
+        .accessibilityIdentifier("bots.brain.whyMemory")
+    }
+
+    private func brainCapabilities(_ receipt: ContextAssemblyReceipt) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            Text("What this Bot can do")
+                .font(DS.Font.bodyStrong)
+                .foregroundColor(DS.Palette.text)
+            Text("Supervised route only. Host-brokered writes stay off.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+            Text(receipt.desktopKind.honestyLabel)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.warning)
+                .fixedSize(horizontal: false, vertical: true)
+            let skills = receipt.layers.filter { $0.kind == .skill && $0.included }.map(\.text)
+            Text(skills.isEmpty ? "No enabled skills." : "Skills: \(skills.joined(separator: ", "))")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+        }
+        .accessibilityIdentifier("bots.brain.capabilities")
     }
 
     private var inspectorMemory: some View {

@@ -25,8 +25,9 @@ public enum Schema {
     /// pre-release builds and must never be reused; v67 owns durable RCW1
     /// requests, v68 owns durable RCW1 assistant responses, v69 owns
     /// per-message Human/RCW1 display preferences, v70 owns the Bot
-    /// control-plane identity tables, and v71 owns per-Bot skill enablement.
-    public static let currentVersion: Int = 71
+    /// control-plane identity tables, v71 owns per-Bot skill enablement,
+    /// and v72 owns Bot context-assembly receipts.
+    public static let currentVersion: Int = 72
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1333,6 +1334,25 @@ public enum Schema {
         );
         CREATE INDEX IF NOT EXISTS idx_bot_skill_bindings_bot
             ON bot_skill_bindings(bot_id, enabled);
+        """),
+        // Last compiled Brain payload per model-call attempt. Source/Effective
+        // preview reads the same JSON the send path persisted.
+        SchemaStep(72, """
+        CREATE TABLE IF NOT EXISTS bot_context_receipts (
+            id TEXT PRIMARY KEY NOT NULL,
+            bot_id TEXT NOT NULL,
+            conversation_id TEXT,
+            run_id TEXT,
+            revision_id TEXT NOT NULL,
+            payload_digest TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            assembled_at TEXT NOT NULL,
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_context_receipts_bot
+            ON bot_context_receipts(bot_id, assembled_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_bot_context_receipts_conversation
+            ON bot_context_receipts(conversation_id, assembled_at DESC);
         """),
     ]
 
