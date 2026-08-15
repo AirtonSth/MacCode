@@ -1420,26 +1420,19 @@ public struct BotsRosterList: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button(action: vm.beginCreate) {
-                actionRow(symbol: "plus", title: BotsChrome.Label.newBot)
-            }
-            .buttonStyle(.plain)
-            .disabled(!vm.isControlPlaneActive)
-            .help("Create a named teammate")
-            .accessibilityIdentifier("bots.new")
-            .padding(.horizontal, DS.Space.md)
-            .padding(.bottom, DS.Space.lg)
-
-            HStack(spacing: DS.Space.sm) {
-                Text(BotsChrome.Label.myBots)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-                Spacer(minLength: 0)
+            HStack(spacing: DS.Space.xs) {
+                Button(action: vm.beginCreate) {
+                    actionRow(symbol: "plus", title: BotsChrome.Label.newBot)
+                }
+                .buttonStyle(.plain)
+                .disabled(!vm.isControlPlaneActive)
+                .help("Create a named teammate")
+                .accessibilityIdentifier("bots.new")
                 Button(action: vm.openAttention) {
                     Image(systemName: vm.openAttentionCount == 0 ? "bell" : "bell.badge")
-                        .font(.system(size: 13, weight: .regular))
+                        .font(.system(size: 14, weight: .regular))
                         .foregroundColor(vm.openAttentionCount == 0 ? DS.Palette.textSecondary : DS.Palette.warning)
-                        .frame(width: 28, height: 32)
+                        .frame(width: 42, height: 42)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -1454,6 +1447,15 @@ public struct BotsRosterList: View {
                         : "Attention \(vm.openAttentionCount)"
                 )
                 .accessibilityIdentifier("bots.roster.attention")
+            }
+            .padding(.horizontal, DS.Space.md)
+            .padding(.bottom, DS.Space.lg)
+
+            HStack(spacing: DS.Space.sm) {
+                Text(BotsChrome.Label.myBots)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer(minLength: 0)
             }
             .padding(.horizontal, DS.Space.lg)
             .padding(.bottom, DS.Space.sm)
@@ -1496,7 +1498,7 @@ public struct BotsRosterList: View {
                         }
                     }
                 }
-                .padding(.horizontal, DS.Space.sm)
+                .padding(.horizontal, DS.Space.lg)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -1531,7 +1533,7 @@ public struct BotsRosterList: View {
         return Button {
             vm.openHome(bot)
         } label: {
-            HStack(spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.md) {
                 ZStack(alignment: .bottomTrailing) {
                     BotsAvatarView(name: bot.name, handle: bot.handle, size: 22)
                     Circle()
@@ -1550,7 +1552,7 @@ public struct BotsRosterList: View {
                         .foregroundColor(DS.Palette.textTertiary)
                         .lineLimit(1)
                 }
-                Spacer(minLength: 0)
+                Spacer(minLength: DS.Space.md)
                 if let provider = vm.providerLabel(for: bot) {
                     Text(provider)
                         .font(DS.Font.caption2)
@@ -1558,7 +1560,7 @@ public struct BotsRosterList: View {
                         .lineLimit(1)
                 }
             }
-            .padding(.horizontal, DS.Space.sm)
+            .padding(.horizontal, DS.Space.lg)
             .frame(height: 38)
             .background(
                 RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
