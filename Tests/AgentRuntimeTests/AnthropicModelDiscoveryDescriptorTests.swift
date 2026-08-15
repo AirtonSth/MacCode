@@ -20,7 +20,10 @@ final class AnthropicModelDiscoveryDescriptorTests: XCTestCase {
         // supportedReasoningEfforts is empty, and a previously chosen effort is
         // silently reset — every current reasoning-capable family must
         // advertise the full Claude effort set or the feature disappears.
-        for id in ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-5"] {
+        for id in [
+            "claude-fable-5", "claude-mythos-5", "claude-opus-4-8",
+            "claude-opus-5", "claude-sonnet-5"
+        ] {
             let d = descriptor(id: id)
             XCTAssertEqual(d?.supportsReasoning, true, "\(id) must support reasoning")
             XCTAssertEqual(d?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases,
@@ -36,16 +39,17 @@ final class AnthropicModelDiscoveryDescriptorTests: XCTestCase {
         XCTAssertEqual(d?.supportedReasoningEfforts, [])
     }
 
-    func test_unknownFutureFamily_defaultsToReasoningCapable() {
-        // WHY (intent of the fix): the gate must EXCLUDE known non-reasoning
-        // families rather than allowlist known names — the old opus/sonnet
-        // substring allowlist silently stripped the effort/ultracode picker
-        // from Fable 5 when it shipped, and would do the same for the next
-        // flagship rename.
-        let d = descriptor(id: "claude-zenith-6")
-        XCTAssertEqual(d?.supportsReasoning, true,
-            "an unrecognized (non-haiku) family must default to reasoning-capable so future flagships keep the effort picker")
-        XCTAssertEqual(d?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases)
+    func test_unknownAndLegacyFamilies_failClosedWithoutEffortPicker() {
+        // WHY: Claude's effort support is an allowlist. Guessing even low/high
+        // makes the CLI reject legacy and future custom models.
+        for id in [
+            "claude-zenith-6", "claude-3-opus", "claude-opus-4-0",
+            "claude-opus-4-1", "claude-sonnet-4-0", "claude-sonnet-4-5"
+        ] {
+            let d = descriptor(id: id)
+            XCTAssertEqual(d?.supportsReasoning, false, "\(id) has no verified effort contract")
+            XCTAssertEqual(d?.supportedReasoningEfforts, [])
+        }
     }
 
     // MARK: - Static fallback alias list

@@ -473,7 +473,7 @@ public final class GrokACPClient: @unchecked Sendable {
             }
             if let effort = request.reasoningEffort,
                GrokRunner.modelSupportsReasoningEffort(model) {
-                args.append(contentsOf: GrokRunner.effortArgs(effort))
+                args.append(contentsOf: GrokRunner.effortArgs(effort, model: model))
             }
             args.append(contentsOf: ["--no-leader", "stdio"])
             return args
@@ -484,7 +484,7 @@ public final class GrokACPClient: @unchecked Sendable {
               request.providerThreadId == nil,
               request.permissionMode == .autoAcceptEdits,
               let effort = request.reasoningEffort,
-              [.low, .medium, .high, .xhigh, .max].contains(effort) else {
+              GrokRunner.grok45ReasoningEfforts.contains(effort) else {
             throw GrokACPError.unsupported(
                 "invalid sam-grok-worker Agent App runtime profile"
             )
@@ -625,16 +625,13 @@ public final class GrokACPClient: @unchecked Sendable {
         return try Self.openResult(result, fallbackSessionId: sessionId)
     }
 
-    /// Map host `AgentReasoningEffort` to Grok ACP / CLI wire tokens.
-    /// Agent `parse_reasoning_effort_meta` accepts minimal/low/medium/high/xhigh/max;
-    /// `ultracode` is Claude-only and is ignored unless mapped (same as GrokRunner.effortArgs → high).
-    static func wireReasoningEffort(_ effort: AgentReasoningEffort) -> String {
-        switch effort {
-        case .ultracode:
-            return "high"
-        case .minimal, .low, .medium, .high, .xhigh, .max:
-            return effort.rawValue
-        }
+    /// Model-aware ACP value. Nil means the selected model does not advertise
+    /// reasoning configuration, so no acknowledgement can honestly be claimed.
+    static func wireReasoningEffort(
+        _ effort: AgentReasoningEffort,
+        modelId: String = ""
+    ) -> String? {
+        GrokRunner.normalizedReasoningEffort(effort, model: modelId)?.rawValue
     }
 
     /// `reasoningEffort` is the ACP `_meta.reasoningEffort` wire value (grok-build
@@ -646,8 +643,9 @@ public final class GrokACPClient: @unchecked Sendable {
         reasoningEffort: AgentReasoningEffort? = nil
     ) async throws {
         var params: JSONObject = ["sessionId": sessionId, "modelId": modelId]
-        if let reasoningEffort {
-            params["_meta"] = ["reasoningEffort": Self.wireReasoningEffort(reasoningEffort)]
+        if let reasoningEffort,
+           let wireEffort = Self.wireReasoningEffort(reasoningEffort, modelId: modelId) {
+            params["_meta"] = ["reasoningEffort": wireEffort]
         }
         _ = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
     }

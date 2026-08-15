@@ -685,6 +685,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     private func sessionForAsync(_ request: AgentRunRequest,
                                  provisioningCallback: (@Sendable (AgentRunEvent) -> Void)?) async throws -> Session {
         let claudeExecutablePath = try resolveClaudeExecutable(request.providerBinary)
+        let effectiveReasoningEffort = ClaudeRunner.normalizedReasoningEffort(
+            request.reasoningEffort,
+            model: request.model
+        )
         lock.lock()
         if let existing = sessions[request.threadId] {
             // Model/permission changes switch live over the bridge (rc_set_model /
@@ -693,7 +697,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             // switch: respawn with resume, mirroring ClaudeStreamingCLIAdapter.canReuse.
             // An in-flight turn keeps the session (sendTurn rejects it right after,
             // exactly as before; recoverSession just re-attaches).
-            if (existing.reasoningEffort == request.reasoningEffort && existing.claudeExecutablePath == claudeExecutablePath) || existing.inFlightRunId != nil {
+            if (existing.reasoningEffort == effectiveReasoningEffort && existing.claudeExecutablePath == claudeExecutablePath) || existing.inFlightRunId != nil {
                 lock.unlock()
                 do {
                     try applyRuntimeSwitchIfNeeded(existing, request: request)
@@ -855,7 +859,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             executablePath: node,
             arguments: [bridgeScriptPath] + request.extraArgs,
             currentDirectory: request.cwd,
-            environment: request.environment,
+            environment: ClaudeRunner.thinkingEnvironment(request.environment),
             runAsUser: request.runAsUser,
             askpassPath: askpass
         )
@@ -873,7 +877,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                               model: request.model,
                               permissionMode: request.permissionMode,
                               interactionMode: request.interactionMode,
-                              reasoningEffort: request.reasoningEffort,
+                              reasoningEffort: ClaudeRunner.normalizedReasoningEffort(
+                                request.reasoningEffort,
+                                model: request.model
+                              ),
                               providerThreadId: effectiveProviderThreadId,
                               claudeExecutablePath: claudeExecutablePath)
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self, weak session] handle in
@@ -1664,7 +1671,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             "interaction_mode": request.interactionMode.rawValue,
             "provider_thread_id": providerThreadId ?? "",
             "session_id": request.threadId.value.uuidString,
-            "environment": request.environment
+            "environment": ClaudeRunner.thinkingEnvironment(request.environment)
         ]
         if let expectedSDKVersion = Self.pinnedNPMVersion(in: Self.sdkPackageSpec()) {
             payload["expected_sdk_version"] = expectedSDKVersion
@@ -1676,12 +1683,19 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             payload["claude_executable_path"] = claudeExecutablePath
         }
         // Effort + ultracode settings reuse ClaudeRunner's canonical CLI mapping
-        // (ultracode → xhigh effort + {"ultracode":true,"enableWorkflows":true},
-        // effort always sent) so the SDK bridge and the streaming CLI never drift.
-        if let effort = ClaudeRunner.effortArgs(request.reasoningEffort).last {
+        // (native ultracode effort + {"ultracode":true,"enableWorkflows":true})
+        // so the SDK bridge and the streaming CLI never drift.
+        let normalizedEffort = ClaudeRunner.normalizedReasoningEffort(
+            request.reasoningEffort,
+            model: request.model
+        )
+        if let effort = ClaudeRunner.effortArgs(normalizedEffort, model: request.model).last {
             payload["effort"] = effort
         }
-        if let settings = ClaudeRunner.ultracodeSettingsArgs(request.reasoningEffort).last {
+        if let settings = ClaudeRunner.ultracodeSettingsArgs(
+            normalizedEffort,
+            environment: request.environment
+        ).last {
             payload["settings"] = settings
         }
         payload["system_prompt"] = Self.claudeSystemPrompt(environment: request.environment)

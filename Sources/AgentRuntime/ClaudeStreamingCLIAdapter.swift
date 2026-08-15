@@ -602,7 +602,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let stderrPipe = Pipe()
         // Route through `sudo -u` when a different macOS user is selected so the
         // provider reads that user's ~/.claude (their logged-in account + MCP).
-        let baseEnv = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.claude))
+        let thinkingEnvironment = ClaudeRunner.thinkingEnvironment(request.environment)
+        let baseEnv = CodexRunner.processEnvironment(overrides: thinkingEnvironment, purpose: .agentTurn(.claude))
         let isForeignUser = (request.runAsUser.map { $0.uid != getuid() } == true)
         // Clear Claude's stale negative MCP-auth cache so this headless session
         // re-probes remote OAuth MCP servers (Linear, etc.) live — terminal
@@ -621,7 +622,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             executablePath: path,
             arguments: ClaudeRunner.buildStreamingArgs(request),
             currentDirectory: request.cwd,
-            environment: request.environment,
+            environment: thinkingEnvironment,
             runAsUser: request.runAsUser,
             askpassPath: askpass
         )
@@ -639,7 +640,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                               reasoningEffort: request.reasoningEffort,
                               interactionMode: request.interactionMode,
                               foreignUserUID: foreignUserUID)
-        session.environment = request.environment
+        session.environment = thinkingEnvironment
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self, weak session] handle in
             guard let self, let session else { return }
             session.stdoutReadLock.lock()

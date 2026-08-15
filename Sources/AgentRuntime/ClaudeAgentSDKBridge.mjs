@@ -633,8 +633,8 @@ function ensureQuery() {
       systemPrompt: current.systemPrompt,
       tools: { type: 'preset', preset: 'claude_code' },
       mcpServers,
-      // Reasoning effort for the query ('low'…'max'; the host maps ultracode to
-      // 'xhigh' + the ultracode/enableWorkflows settings payload below).
+      // Reasoning effort for the query ('low'…'max' plus native 'ultracode';
+      // the host also supplies the equivalent ultracode/workflow settings).
       effort: current.effort,
       settings: current.settings,
       // Load filesystem settings so the SDK discovers Agent Skills (e.g. the managed

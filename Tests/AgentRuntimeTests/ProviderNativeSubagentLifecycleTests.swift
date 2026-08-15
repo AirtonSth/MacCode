@@ -155,7 +155,8 @@ final class ProviderNativeSubagentLifecycleTests: XCTestCase {
             provider: .grok,
             model: "grok-4.5",
             cwd: harness.root,
-            prompt: "spawn native worker"
+            prompt: "spawn native worker",
+            reasoningEffort: .high
         ))
 
         let accepted = try await waitForReceipt(
@@ -166,6 +167,10 @@ final class ProviderNativeSubagentLifecycleTests: XCTestCase {
         XCTAssertEqual(accepted.provider, .grok)
         XCTAssertEqual(accepted.threadId, harness.thread.id)
         XCTAssertNotEqual(accepted.nodeId, "root")
+        XCTAssertNil(
+            accepted.reasoningEffort,
+            "native lifecycle events do not acknowledge the child's reasoning effort"
+        )
 
         let finalized = try await waitForReceipt(
             runtime: harness.runtime,

@@ -482,6 +482,13 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         if case .agentTurn(.claude) = purpose, env["CLAUDE_CODE_ENABLE_REFRESH_MCP_TOOLS"] == nil {
             env["CLAUDE_CODE_ENABLE_REFRESH_MCP_TOOLS"] = "1"
         }
+        // Apply Claude thinking controls after every GUI/login/override merge.
+        // Removing a key from the caller's overrides is not a tombstone: an
+        // inherited shell value would otherwise reappear and override the
+        // explicit CLI/SDK effort or disable interleaved thinking.
+        if case .agentTurn(.claude) = purpose {
+            env = ClaudeRunner.thinkingEnvironment(env)
+        }
         return env
     }
 }

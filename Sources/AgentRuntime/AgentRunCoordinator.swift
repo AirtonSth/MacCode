@@ -825,6 +825,21 @@ public enum AgentDeletedThreadRetirementOutcome: Equatable, Sendable {
 }
 
 public final class AgentRunCoordinator: @unchecked Sendable {
+    static func normalizedProviderReasoningEffort(
+        provider: AgentProvider,
+        model: String,
+        requested: AgentReasoningEffort?
+    ) -> AgentReasoningEffort? {
+        switch provider {
+        case .claude:
+            return ClaudeRunner.normalizedReasoningEffort(requested, model: model)
+        case .grok:
+            return requested.flatMap { GrokRunner.normalizedReasoningEffort($0, model: model) }
+        case .codex:
+            return requested
+        }
+    }
+
     private struct ProviderTurnScope: Equatable {
         let tokenSaverEnabled: Bool
         let workspaceID: String?
@@ -1640,6 +1655,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 forKey: AgentDelegationCapabilityTransport.environmentKey
             )
         }
+        let effectiveReasoningEffort = Self.normalizedProviderReasoningEffort(
+            provider: request.provider,
+            model: request.model,
+            requested: request.reasoningEffort
+        )
         let effectiveRequest = AgentRunRequest(
             runId: request.runId,
             threadId: request.threadId,
@@ -1652,7 +1672,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             attachments: request.attachments,
             providerThreadId: resumeCursor,
             permissionMode: recoveryContext?.runtimeMode ?? request.permissionMode,
-            reasoningEffort: request.reasoningEffort,
+            reasoningEffort: effectiveReasoningEffort,
             serviceTier: recoveryContext?.serviceTier ?? request.serviceTier,
             interactionMode: recoveryContext?.interactionMode ?? request.interactionMode,
             providerBinary: request.providerBinary,
@@ -2112,7 +2132,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
-    /// Auto without orchestration: bind Source picker host to DEEP (opus/sol/grok-4.5 high).
+    /// Auto without orchestration: bind Source picker host to DEEP (opus/sol/grok-4.6 high).
     private static func autoDeepFallbackRequest(
         _ request: AgentRunRequest,
         configuration: AgentRoutingConfiguration,
@@ -6765,9 +6785,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             ?? parentRun?.providerInstanceId
             ?? parentProvider.rawValue
         let parentModel = metadata?.model ?? parentReceipt?.model ?? parentRun?.model ?? "unknown"
-        // Native collab events do not publish child effort; inherit the parent's
-        // bound effort so Subagents still shows provider · model · reasoning.
-        let parentEffort = parentReceipt?.reasoningEffort
 
         let updates = ProviderNativeSubagentLifecycle.updates(
             from: event,
@@ -6784,7 +6801,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         ? parentProviderInstanceId
                         : update.provider.rawValue,
                     model: update.provider == parentProvider ? parentModel : "unknown",
-                    reasoningEffort: update.provider == parentProvider ? parentEffort : nil,
+                    // Provider-native lifecycle events do not acknowledge the
+                    // child's actual effort. Keep it unknown instead of
+                    // presenting the parent's request as provider evidence.
+                    reasoningEffort: nil,
                     nodeId: update.nodeId,
                     parentRunId: parentRunId
                 )

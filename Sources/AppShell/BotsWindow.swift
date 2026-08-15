@@ -824,7 +824,7 @@ public final class BotsViewModel: ObservableObject {
         switch provider {
         case .claude: return "opus"
         case .codex: return AgentDefaultModelSelection.codexBuiltInDefault
-        case .grok: return "grok-4.5"
+        case .grok: return "grok-4.6"
         }
     }
 

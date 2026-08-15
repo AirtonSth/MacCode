@@ -1559,9 +1559,9 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
                     provider: provider,
                     providerInstanceId: providerInstanceId,
                     model: model,
-                    // Explicit child effort wins; otherwise inherit the parent's
-                    // bound effort so Subagents can show provider · model · effort.
-                    reasoningEffort: reasoningEffort ?? parent.reasoningEffort,
+                    // Record only an effort carried by the child admission or
+                    // provider event. Parent effort is not child-provider ack.
+                    reasoningEffort: reasoningEffort,
                     capabilitySnapshotId: parent.capabilitySnapshotId,
                     decisionReason: "external-controlled-child",
                     admittedAt: admittedAt,
@@ -2484,7 +2484,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
 
     /// Same-host DEEP binding when Auto cannot orchestrate (package/rollout/kill
     /// switch). Still never switches provider — only drops `$remote-code-orchestrate`
-    /// and uses the host-matrix DEEP row (opus / sol / grok-4.5 high).
+    /// and uses the host-matrix DEEP row (opus / sol / grok-4.6 high).
     public func routeDeepFallback(
         configuration: AgentRoutingConfiguration,
         providerSnapshots: [AgentProviderSnapshot]
@@ -2782,20 +2782,26 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     ) -> AgentModelSelection {
         let binding = lightMatrixBinding(for: provider)
         let providerModels = availableModels.filter { $0.provider == provider }
+        // Claude's catalog also contains legacy Sonnet families whose effort
+        // flag is unsupported. They cannot satisfy the LIGHT reasoning
+        // contract even though their ids fuzzy-match the current alias.
+        let selectableModels = provider == .claude
+            ? providerModels.filter { !$0.supportedReasoningEfforts.isEmpty }
+            : providerModels
         let selectedId: String
         if let exact = binding.preferredModelIds.first(where: { preferred in
-            !preferred.isEmpty && providerModels.contains(where: { $0.id == preferred })
+            !preferred.isEmpty && selectableModels.contains(where: { $0.id == preferred })
         }) {
             selectedId = exact
         } else if let fuzzy = binding.preferredModelIds.first(where: { preferred in
             guard !preferred.isEmpty else { return false }
             let needle = preferred.lowercased()
-            return providerModels.contains {
+            return selectableModels.contains {
                 let id = $0.id.lowercased()
                 return id == needle || id.hasPrefix(needle) || id.contains(needle)
             }
         }),
-           let match = providerModels.first(where: {
+           let match = selectableModels.first(where: {
                let id = $0.id.lowercased()
                let needle = fuzzy.lowercased()
                return id == needle || id.hasPrefix(needle) || id.contains(needle)
@@ -2805,10 +2811,10 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             // Force the matrix LIGHT id even when the live catalog omitted it so
             // Auto never falls back to a DEEP/default model on the controller.
             selectedId = binding.preferredModelIds.first(where: { !$0.isEmpty })
-                ?? providerModels.first(where: { !$0.id.isEmpty })?.id
+                ?? selectableModels.first(where: { !$0.id.isEmpty })?.id
                 ?? ""
         }
-        let selectedDescriptor = providerModels.first { $0.id == selectedId }
+        let selectedDescriptor = selectableModels.first { $0.id == selectedId }
         let effort: AgentReasoningEffort
         if let selectedDescriptor,
            !selectedDescriptor.supportedReasoningEfforts.isEmpty,
@@ -2834,15 +2840,15 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         case .codex:
             return (["gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.5"], .medium)
         case .claude:
-            // host-runtime-matrix LIGHT: haiku / high
-            return (["haiku", "claude-haiku", "claude-3-5-haiku", "claude-haiku-4"], .high)
+            // LIGHT still requires observable reasoning; Haiku has no effort control.
+            return (["sonnet", "claude-sonnet", "claude-sonnet-5", "claude-sonnet-4-6"], .high)
         case .grok:
-            return (["grok-4.5"], .medium)
+            return (["grok-4.6", "grok-4.5"], .medium)
         }
     }
 
     /// DEEP (non-orchestrated Auto fallback) binding — same host only.
-    /// Codex → sol/high, Claude → opus/high, Grok → grok-4.5/high.
+    /// Codex → sol/high, Claude → opus/high, Grok → grok-4.6/high.
     public static func deepMatrixBinding(for provider: AgentProvider) -> (preferredModelIds: [String], effort: AgentReasoningEffort) {
         switch provider {
         case .codex:
@@ -2850,7 +2856,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         case .claude:
             return (["opus", "claude-opus", "claude-4-opus", "claude-3-opus"], .high)
         case .grok:
-            return (["grok-4.5"], .high)
+            return (["grok-4.6", "grok-4.5"], .high)
         }
     }
 

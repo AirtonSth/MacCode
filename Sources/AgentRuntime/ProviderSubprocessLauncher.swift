@@ -25,6 +25,7 @@ public enum ProviderSubprocessLauncher {
             arguments: arguments,
             environment: environment,
             currentDirectory: currentDirectory,
+            provider: provider,
             runAsUser: runAsUser,
             askpassPath: askpassPath
         )

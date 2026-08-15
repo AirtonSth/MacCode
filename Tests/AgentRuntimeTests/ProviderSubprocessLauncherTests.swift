@@ -89,6 +89,34 @@ final class ProviderSubprocessLauncherTests: XCTestCase {
         XCTAssertEqual(process.environment?["SUDO_ASKPASS"], "/tmp/remotecode-test-askpass")
     }
 
+    func test_foreignClaudeLaunchPreservesOnlyEnabledThinkingControls() throws {
+        let process = try ProviderSubprocessLauncher.makeProcess(
+            provider: .claude,
+            executablePath: "/usr/local/bin/claude",
+            arguments: ["--print", "hello"],
+            currentDirectory: FileManager.default.currentDirectoryPath,
+            environment: ClaudeRunner.thinkingEnvironment([
+                "CLAUDE_CODE_EFFORT_LEVEL": "low",
+                "DISABLE_INTERLEAVED_THINKING": "1"
+            ]),
+            runAsUser: AgentRunAsUser(
+                generatedUID: "target-generated-uid",
+                shortName: "target-user",
+                uid: getuid() + 1,
+                gid: getgid(),
+                homePath: "/Users/target-user"
+            )
+        )
+
+        XCTAssertTrue(process.arguments?.contains(
+            "--preserve-env=PATH,CLAUDE_CODE_DISABLE_THINKING,MAX_THINKING_TOKENS"
+        ) == true, "sudo env_reset must retain only the allowlisted Claude thinking controls")
+        XCTAssertEqual(process.environment?["CLAUDE_CODE_DISABLE_THINKING"], "0")
+        XCTAssertEqual(process.environment?["MAX_THINKING_TOKENS"], "32000")
+        XCTAssertNil(process.environment?["CLAUDE_CODE_EFFORT_LEVEL"])
+        XCTAssertNil(process.environment?["DISABLE_INTERLEAVED_THINKING"])
+    }
+
     func test_providerSourceLaunchSitesAreArchitecturallyBoundToTheLauncher() throws {
         // WHY: a unit test of the launcher alone cannot prevent a future adapter
         // from constructing Process directly. Keep the source-level inventory

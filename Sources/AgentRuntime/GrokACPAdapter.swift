@@ -673,7 +673,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         do {
             let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
             let targetModel = model.isEmpty ? session.model : model
-            let targetEffort = request.reasoningEffort
+            let targetEffort = request.reasoningEffort.flatMap {
+                GrokRunner.normalizedReasoningEffort($0, model: targetModel)
+            }
             let needsModelBind = !model.isEmpty && model != session.model
             let needsEffortBind = targetEffort != session.reasoningEffort
             if needsModelBind || needsEffortBind {

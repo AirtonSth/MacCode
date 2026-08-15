@@ -378,7 +378,8 @@ final class ProviderProxyPolicyTests: XCTestCase {
             XCTAssertEqual(delegation.provider, .grok)
             XCTAssertEqual(delegation.promptFile, "/tmp/worker-prompt.txt")
             XCTAssertEqual(delegation.model, "grok-4.5")
-            XCTAssertEqual(delegation.reasoningEffort.rawValue, effort)
+            let normalizedEffort = ["xhigh": "high", "max": "high"][effort] ?? effort
+            XCTAssertEqual(delegation.reasoningEffort.rawValue, normalizedEffort)
             XCTAssertEqual(delegation.permissionMode, .autoAcceptEdits)
             XCTAssertEqual(delegation.outputFormat, .grokJSON)
             XCTAssertEqual(delegation.arguments, [
@@ -386,7 +387,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
                 "--prompt-file", "/tmp/worker-prompt.txt",
                 "--model", "grok-4.5",
                 "--permission", "auto_accept_edits",
-                "--reasoning-effort", effort,
+                "--reasoning-effort", normalizedEffort,
                 "--output-format", "grok-json",
                 "--runtime-profile", "sam-grok-worker-v1"
             ])
@@ -510,15 +511,129 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertTrue(claude.arguments.contains("agent-app"))
         XCTAssertFalse(claude.arguments.contains("--runtime-profile"))
 
-        let codex = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+        let claudeUltracode = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: ["--print", "--model", "claude-opus-4-7", "--effort", "ultracode"],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(claudeUltracode.reasoningEffort, .ultracode,
+                       "Agent App must retain Ultracode workflows instead of reducing it to an xhigh receipt")
+        let claudeOneMillionAlias = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: ["--print", "--model", "sonnet[1m]", "--effort", "xhigh"],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(claudeOneMillionAlias.reasoningEffort, .xhigh)
+        for modelWithoutExplicitEffort in [
+            "claude-opus-4-7", "claude-sonnet-4-6", "opus[1m]", "sonnet[1m]", "best"
+        ] {
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "claude",
+                arguments: ["--print", "--model", modelWithoutExplicitEffort],
+                promptFile: prompt
+            ), "nested Claude must stay raw so user/project effort configuration remains authoritative")
+        }
+        for rawModel in ["claude-haiku-4-5", "claude-unknown-future", ""] {
+            var arguments = ["--print"]
+            if !rawModel.isEmpty { arguments += ["--model", rawModel] }
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "claude", arguments: arguments, promptFile: prompt
+            ), "unknown, omitted, and no-effort Haiku contracts must stay on the raw CLI")
+        }
+        for unsupportedEffort in ["none", "ultra", "custom-future"] {
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "claude",
+                arguments: ["--print", "--model", "opus", "--effort", unsupportedEffort],
+                promptFile: prompt
+            ), "nonrepresentable Claude effort \(unsupportedEffort) must stay on the raw CLI")
+        }
+
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "codex",
             arguments: ["exec", "--json", "--full-auto", "do the work"],
             promptFile: prompt
+        ), "Codex without an explicit model or effort has no truthful nonoptional receipt")
+
+        for modelWithoutExplicitEffort in [
+            "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+            "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-spark"
+        ] {
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: ["exec", "--json", "--full-auto", "--model", modelWithoutExplicitEffort, "do the work"],
+                promptFile: prompt
+            ), "nested Codex must stay raw so config.toml effort, including ultra, remains authoritative")
+        }
+
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: [
+                "--config=model_reasoning_effort=\"low\"",
+                "exec", "--model", "gpt-5.6-sol",
+                "--config", "model_reasoning_effort='high'",
+                "-c=model_reasoning_effort=medium",
+                "-c", "model_reasoning_effort=max",
+                "-c", "model_reasoning_effort=unsupported",
+                "--", "-c", "model_reasoning_effort=low"
+            ],
+            promptFile: prompt
+        ), "the last custom Codex effort is valid to Codex but not representable by Agent App, so promotion must fail closed")
+
+        for unrepresentable in ["minimal", "ultra", "none", "", "custom-future", "ultracode"] {
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: [
+                    "exec", "--model", "gpt-5.6-sol",
+                    "-c", "model_reasoning_effort=max",
+                    "-c", "model_reasoning_effort=\(unrepresentable)", "work"
+                ],
+                promptFile: prompt
+            ), "last Codex effort '\(unrepresentable)' must override max and keep the raw CLI")
+        }
+
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=ultra", "work"],
+            promptFile: prompt
+        ), "Codex ultra is valid but not representable in the current receipt enum; keep the raw CLI")
+        let codexAfterUltra = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: [
+                "exec", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=ultra",
+                "-c", "model_reasoning_effort=high", "work"
+            ],
+            promptFile: prompt
         ))
-        XCTAssertEqual(codex.provider, .codex)
-        XCTAssertEqual(codex.permissionMode, .fullAccess)
-        XCTAssertEqual(codex.outputFormat, .json)
-        XCTAssertNil(codex.runtimeProfile)
+        XCTAssertEqual(codexAfterUltra.reasoningEffort, .high,
+                       "a later representable override must supersede ultra exactly like the CLI")
+
+        for maxModel in ["gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: ["exec", "--model", maxModel, "-c", "model_reasoning_effort=max", "work"],
+                promptFile: prompt
+            ))
+            XCTAssertEqual(delegation.reasoningEffort, .max,
+                           "\(maxModel) advertises max in the live app-server catalog")
+        }
+        for restrictedModel in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-spark"] {
+            let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: ["exec", "--model", restrictedModel, "-c", "model_reasoning_effort=max", "work"],
+                promptFile: prompt
+            ))
+            XCTAssertEqual(delegation.reasoningEffort, .xhigh,
+                           "max must clamp when model support is absent or not observable")
+        }
+        for unknownModel in ["", "gpt-custom-future"] {
+            var arguments = ["exec"]
+            if !unknownModel.isEmpty { arguments += ["--model", unknownModel] }
+            arguments += ["-c", "model_reasoning_effort=max", "work"]
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex", arguments: arguments, promptFile: prompt
+            ), "Agent App must not invent a receipt for an unknown Codex model contract")
+        }
 
         let grok = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
@@ -532,6 +647,29 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(grok.reasoningEffort, .high)
         XCTAssertEqual(grok.permissionMode, .fullAccess)
         XCTAssertNil(grok.runtimeProfile)
+
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: ["--prompt", "investigate", "--always-approve"],
+            promptFile: prompt
+        ), "nested Grok must stay raw so default_reasoning_effort from config.toml remains authoritative")
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: ["--prompt", "investigate", "--model", "grok-4.5", "--always-approve"],
+            promptFile: prompt
+        ), "even a known Grok model stays raw without an explicit effort flag")
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: ["--prompt", "investigate", "--model", "grok-custom-future", "--effort", "max"],
+            promptFile: prompt
+        ), "unknown custom Grok models must stay raw when reasoning support cannot be proven")
+        for unsupportedEffort in ["none", "ultra", "custom-future", "ultracode"] {
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "grok",
+                arguments: ["--prompt", "investigate", "--model", "grok-4.6", "--effort", unsupportedEffort],
+                promptFile: prompt
+            ), "nonrepresentable Grok effort \(unsupportedEffort) must stay on the raw CLI")
+        }
     }
 
     func test_nestedCLIAgentAppDelegation_rejectsAdminVersionAndResume() {
@@ -573,6 +711,36 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "claude",
             arguments: ["--print", "--model", "opus", "--effort", "high"]
+        ))
+    }
+
+    func test_nestedEligibilityRejectsRawFallbackContractsBeforeReadingPromptInput() {
+        // WHY: ProviderProxyRunner reads stdin only after this preflight. A
+        // mapping that later returns nil would otherwise consume stdin and fail
+        // instead of preserving the provider CLI's own config/default effort.
+        let rawCases: [(String, [String])] = [
+            ("claude", ["--print", "--model", "opus"]),
+            ("claude", ["--print", "--model", "opus", "--effort", "ultra"]),
+            ("codex", ["exec", "--model", "gpt-5.6-sol", "work"]),
+            ("codex", ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=minimal", "work"]),
+            ("codex", ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=none", "work"]),
+            ("grok", ["--model", "grok-4.6", "--prompt", "work"]),
+            ("grok", ["--model", "grok-4.6", "--effort", "ultra", "--prompt", "work"])
+        ]
+        for (provider, arguments) in rawCases {
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: provider,
+                arguments: arguments
+            ), "\(provider) raw fallback must be decided before stdin/temp-file materialization")
+        }
+
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"]
+        ))
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "grok",
+            arguments: ["--model", "grok-4.6", "--effort", "high", "--prompt", "work"]
         ))
     }
 

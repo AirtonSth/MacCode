@@ -33,28 +33,122 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         AnthropicModelDiscovery.latestAliasModels()
     }
 
-    /// `ultracode` is not a `--effort` flag value — the CLI rejects it
-    /// ("Unknown --effort value"). It is the `ultracode` settings key meaning
-    /// "xhigh effort + standing dynamic-workflow orchestration", so it maps to
-    /// `--effort xhigh` plus the settings payload below. Every other level maps
-    /// one-to-one; `nil`/`medium` default to medium so the flag is never omitted.
-    static func effortArgs(_ effort: AgentReasoningEffort?) -> [String] {
-        switch effort {
-        case .some(.minimal), .some(.low): return ["--effort", "low"]
-        case .some(.high): return ["--effort", "high"]
-        case .some(.xhigh): return ["--effort", "xhigh"]
-        case .some(.max): return ["--effort", "max"]
-        case .some(.ultracode): return ["--effort", "xhigh"]
-        case .some(.medium), .none: return ["--effort", "medium"]
+    static func supportedReasoningEfforts(for model: String) -> [AgentReasoningEffort] {
+        let rawID = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let id = rawID.hasSuffix("[1m]") ? String(rawID.dropLast(4)) : rawID
+        if id.contains("haiku") { return [] }
+        if id.hasPrefix("claude-opus-4-5") {
+            return [.low, .medium, .high]
+        }
+        if id.hasPrefix("claude-mythos-preview")
+            || id.hasPrefix("claude-sonnet-4-6")
+            || id.hasPrefix("claude-opus-4-6") {
+            return [.low, .medium, .high, .max]
+        }
+        if id == "best" || id == "fable" || id == "mythos" || id == "opus" || id == "sonnet"
+            || id.hasPrefix("claude-fable") || id.hasPrefix("claude-mythos-5")
+            || id.hasPrefix("claude-opus-5")
+            || id.hasPrefix("claude-opus-4-7") || id.hasPrefix("claude-opus-4-8")
+            || id.hasPrefix("claude-sonnet-5") {
+            return AgentReasoningEffort.claudeSupportedCases
+        }
+        // Claude effort support is an explicit model allowlist. Unknown/custom
+        // and legacy families keep manual thinking settings but expose no flag.
+        return []
+    }
+
+    static func normalizedReasoningEffort(
+        _ effort: AgentReasoningEffort?,
+        model: String
+    ) -> AgentReasoningEffort? {
+        let supported = supportedReasoningEfforts(for: model)
+        guard !supported.isEmpty else { return nil }
+        let requested = effort ?? .medium
+        if requested == .minimal { return .low }
+        if supported.contains(requested) { return requested }
+        switch requested {
+        case .xhigh, .ultracode:
+            return supported.contains(.high) ? .high : supported.last
+        case .max:
+            return supported.last
+        case .minimal, .low, .medium, .high:
+            return supported.contains(.medium) ? .medium : supported.last
         }
     }
 
-    /// Ultracode requires `enableWorkflows: true` for the Workflow tool to be
-    /// exposed; `ultracode: true` alone bumps effort to xhigh but leaves the
-    /// orchestration tool absent. Both keys are forced on for the spawned
-    /// session via `--settings` (which merges over the user's settings files).
-    /// Non-ultracode efforts pass no `--settings` so normal runs stay untouched.
-    static let ultracodeSettingsJSON = #"{"ultracode":true,"enableWorkflows":true}"#
+    /// Claude Code 2.1.203+ accepts `ultracode` as a native effort selector
+    /// meaning xhigh effort plus standing dynamic-workflow orchestration. Keep
+    /// that wire value and the equivalent settings payload below aligned.
+    /// Unsupported levels are normalized per model, and models such as Haiku
+    /// that expose no effort control omit the flag entirely.
+    static func effortArgs(
+        _ effort: AgentReasoningEffort?,
+        model: String = "opus"
+    ) -> [String] {
+        guard let effort = normalizedReasoningEffort(effort, model: model) else { return [] }
+        switch effort {
+        case .minimal, .low: return ["--effort", "low"]
+        case .high: return ["--effort", "high"]
+        case .xhigh: return ["--effort", "xhigh"]
+        case .max: return ["--effort", "max"]
+        case .ultracode: return ["--effort", "ultracode"]
+        case .medium: return ["--effort", "medium"]
+        }
+    }
+
+    /// Claude treats effort and extended thinking as separate controls. Keep
+    /// thinking explicitly enabled for every provider session; Ultracode adds
+    /// workflow orchestration to the same single settings payload.
+    static let ultracodeSettingsJSON = #"{"alwaysThinkingEnabled":true,"enableWorkflows":true,"env":{"CLAUDE_CODE_DISABLE_THINKING":"0","CLAUDE_CODE_EFFORT_LEVEL":"xhigh","DISABLE_INTERLEAVED_THINKING":"0","MAX_THINKING_TOKENS":"32000"},"showThinkingSummaries":true,"ultracode":true}"#
+
+    /// Environment overrides that keep a saved shell/user configuration from
+    /// silently disabling thinking after RemoteCode selected a reasoning effort.
+    /// A budget at or above Claude's 1024-token minimum is ignored by adaptive
+    /// models and remains a safe fixed-budget fallback for older supported models.
+    static func thinkingEnvironment(_ environment: [String: String]) -> [String: String] {
+        var result = environment
+        // Claude gives this inherited env var precedence over the explicit
+        // CLI/SDK session effort selected by RemoteCode.
+        result.removeValue(forKey: "CLAUDE_CODE_EFFORT_LEVEL")
+        result.removeValue(forKey: "DISABLE_INTERLEAVED_THINKING")
+        result["CLAUDE_CODE_DISABLE_THINKING"] = "0"
+        let budget = environment["MAX_THINKING_TOKENS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasValidBudget = budget.flatMap(Int.init).map { $0 >= 1024 } ?? false
+        if !hasValidBudget {
+            result["MAX_THINKING_TOKENS"] = "32000"
+        }
+        return result
+    }
+
+    /// Programmatic settings load after user/project/local settings and can
+    /// therefore reintroduce environment overrides after process launch. Pin
+    /// only the four thinking controls in our single high-precedence payload;
+    /// effort is aligned to the effective CLI/SDK value, or empty when the
+    /// selected model exposes no effort control. Enterprise managed policy
+    /// remains authoritative over programmatic settings.
+    private static func thinkingSettingsEnvironment(
+        _ environment: [String: String],
+        effort: AgentReasoningEffort?
+    ) -> [String: String] {
+        let normalized = thinkingEnvironment(environment)
+        let wireEffort: String = {
+            switch effort {
+            case .minimal, .low: return "low"
+            case .medium: return "medium"
+            case .high: return "high"
+            case .xhigh, .ultracode: return "xhigh"
+            case .max: return "max"
+            case .none: return ""
+            }
+        }()
+        return [
+            "CLAUDE_CODE_DISABLE_THINKING": "0",
+            "CLAUDE_CODE_EFFORT_LEVEL": wireEffort,
+            "DISABLE_INTERLEAVED_THINKING": "0",
+            "MAX_THINKING_TOKENS": normalized["MAX_THINKING_TOKENS"] ?? "32000"
+        ]
+    }
 
     /// Env gate for CLI PostToolUse tool-output compression via the managed
     /// `distill hook post-tool-use` command. Host sets this for Claude runs
@@ -63,15 +157,14 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
 
     /// Builds a single `--settings <json>` pair (never two) for the Claude CLI.
     ///
-    /// - Ultracode effort always injects `ultracode` + `enableWorkflows`.
+    /// - Every effort injects thinking enablement + visible summaries.
+    /// - Ultracode effort also injects `ultracode` + `enableWorkflows`.
     /// - When `RC_TOKEN_SAVER_POST_TOOL_USE=1`, also registers a PostToolUse
     ///   command hook pointing at the managed `distill` CLI
     ///   (`hook post-tool-use`, timeout 10s).
     /// - Both sources merge into ONE JSON payload so argv never carries two
     ///   `--settings` flags.
-    /// - Flag absent + non-ultracode returns `[]` (byte-identical to baseline).
-    ///
-    /// Shape is always `["--settings", "<json>"]` or `[]` so consumers that
+    /// Shape is always `["--settings", "<json>"]` so consumers that
     /// take `.last` (SDK bridge payload) still receive the JSON string alone.
     static func ultracodeSettingsArgs(
         _ effort: AgentReasoningEffort?,
@@ -79,15 +172,11 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     ) -> [String] {
         let wantsUltracode = effort == .ultracode
         let wantsPostToolUse = environment[tokenSaverPostToolUseEnvKey] == "1"
-        guard wantsUltracode || wantsPostToolUse else { return [] }
-
-        // Preserve the exact historical ultracode-only payload so SDK bridge
-        // equality checks and any string-stable consumers keep matching.
-        if wantsUltracode && !wantsPostToolUse {
-            return ["--settings", ultracodeSettingsJSON]
-        }
-
-        var settings: [String: Any] = [:]
+        var settings: [String: Any] = [
+            "alwaysThinkingEnabled": true,
+            "showThinkingSummaries": true,
+            "env": thinkingSettingsEnvironment(environment, effort: effort)
+        ]
         if wantsUltracode {
             settings["ultracode"] = true
             settings["enableWorkflows"] = true
@@ -134,6 +223,28 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         return ["--settings", json]
     }
 
+    /// RemoteCode owns the single settings payload that configures thinking
+    /// and merges managed hooks. Drop caller duplicates so a later extra arg
+    /// cannot silently disable that contract; preserve every unrelated arg.
+    private static func extraArgsWithoutSettings(_ extraArgs: [String]) -> [String] {
+        var sanitized: [String] = []
+        var index = 0
+        while index < extraArgs.count {
+            let argument = extraArgs[index]
+            if argument == "--settings" {
+                index += min(2, extraArgs.count - index)
+                continue
+            }
+            if argument.hasPrefix("--settings=") {
+                index += 1
+                continue
+            }
+            sanitized.append(argument)
+            index += 1
+        }
+        return sanitized
+    }
+
     /// Builds the `claude` CLI argv. Pure + static so the exact flag
     /// combination is regression-tested without spawning a process.
     /// `--print --output-format stream-json` MUST be accompanied by
@@ -142,8 +253,9 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         var args: [String] = ["--print", "--output-format", "stream-json", "--verbose"]
         args.append(contentsOf: ["--model", request.model])
         let prompt = request.providerPrompt
-        args.append(contentsOf: effortArgs(request.reasoningEffort))
-        args.append(contentsOf: ultracodeSettingsArgs(request.reasoningEffort, environment: request.environment))
+        let effort = normalizedReasoningEffort(request.reasoningEffort, model: request.model)
+        args.append(contentsOf: effortArgs(effort, model: request.model))
+        args.append(contentsOf: ultracodeSettingsArgs(effort, environment: request.environment))
         // Resume the prior session so the model keeps full context.
         if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
@@ -157,7 +269,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             case .fullAccess: args.append(contentsOf: ["--permission-mode", "bypassPermissions"])
             }
         }
-        args.append(contentsOf: request.extraArgs)
+        args.append(contentsOf: extraArgsWithoutSettings(request.extraArgs))
         args.append(prompt)
         return args
     }
@@ -179,8 +291,9 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             "--setting-sources", "user,project,local"
         ]
         args.append(contentsOf: ["--model", request.model])
-        args.append(contentsOf: effortArgs(request.reasoningEffort))
-        args.append(contentsOf: ultracodeSettingsArgs(request.reasoningEffort, environment: request.environment))
+        let effort = normalizedReasoningEffort(request.reasoningEffort, model: request.model)
+        args.append(contentsOf: effortArgs(effort, model: request.model))
+        args.append(contentsOf: ultracodeSettingsArgs(effort, environment: request.environment))
         if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
         } else {
@@ -207,7 +320,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             environment: request.environment
         )
         args.append(contentsOf: ["--append-system-prompt", appendedSystemPrompt])
-        args.append(contentsOf: request.extraArgs)
+        args.append(contentsOf: extraArgsWithoutSettings(request.extraArgs))
         return args
     }
 
@@ -237,7 +350,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
                 executablePath: path,
                 arguments: args,
                 currentDirectory: request.cwd,
-                environment: request.environment,
+                environment: Self.thinkingEnvironment(request.environment),
                 runAsUser: request.runAsUser
             )
         } catch {

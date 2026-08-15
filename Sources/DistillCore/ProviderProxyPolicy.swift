@@ -1138,13 +1138,17 @@ public enum ProviderProxyPolicy {
               !promptFile.isEmpty,
               values["--model"] == "grok-4.5",
               let effortValue = values["--effort"],
-              let effort = AgentReasoningEffort(rawValue: effortValue),
-              [.low, .medium, .high, .xhigh, .max].contains(effort),
+              let requestedEffort = AgentReasoningEffort(rawValue: effortValue),
+              [.low, .medium, .high, .xhigh, .max].contains(requestedEffort),
               values["--output-format"] == "json",
               values["--sandbox"] == "workspace",
               values["--disallowed-tools"] == "Agent" else {
             return nil
         }
+        let effort = GrokReasoningPolicy.normalizedEffort(
+            requestedEffort,
+            model: "grok-4.5"
+        )
         return ProviderAgentAppDelegation(
             provider: .grok,
             promptFile: promptFile,
@@ -1201,23 +1205,14 @@ public enum ProviderProxyPolicy {
         providerBasename: String,
         arguments: [String]
     ) -> Bool {
-        guard let provider = AgentProvider(rawValue: commandBasename(providerBasename)) else {
-            return false
-        }
-        if samGrokWorkerAgentAppDelegation(
+        // Use the full pure mapping as preflight so stdin is consumed only when
+        // materialization can actually promote. The placeholder is never read;
+        // delegation requires only an absolute host-visible prompt path.
+        nestedCLIAgentAppDelegation(
             providerBasename: providerBasename,
-            arguments: arguments
-        ) != nil {
-            return true
-        }
-        switch provider {
-        case .claude:
-            return nestedClaudeAgentAppEligible(arguments: arguments)
-        case .codex:
-            return nestedCodexAgentAppEligible(arguments: arguments)
-        case .grok:
-            return nestedGrokAgentAppEligible(arguments: arguments)
-        }
+            arguments: arguments,
+            promptFile: "/dev/null"
+        ) != nil
     }
 
     /// Extract an absolute `--prompt-file` from argv when present and well-formed.
@@ -1333,9 +1328,12 @@ public enum ProviderProxyPolicy {
         )
         guard !scan.malformed else { return nil }
         let model = scan.optionValues["--model"]?.last ?? ""
-        let effort = AgentReasoningEffort(
-            rawValue: scan.optionValues["--effort"]?.last ?? "medium"
-        ) ?? .medium
+        guard !model.isEmpty,
+              nestedClaudeModelSupportsReasoningEffort(model) else {
+            return nil
+        }
+        guard let rawEffort = scan.optionValues["--effort"]?.last,
+              let effort = AgentReasoningEffort(rawValue: rawEffort) else { return nil }
         let permission = mapClaudePermission(
             scan.optionValues["--permission-mode"]?.last
         )
@@ -1350,11 +1348,26 @@ public enum ProviderProxyPolicy {
             provider: .claude,
             promptFile: promptFile,
             model: model,
-            reasoningEffort: effort == .ultracode ? .xhigh : effort,
+            reasoningEffort: effort,
             permissionMode: permission,
             outputFormat: output,
             runtimeProfile: nil
         )
+    }
+
+    private static func nestedClaudeModelSupportsReasoningEffort(_ model: String) -> Bool {
+        let rawID = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let id = rawID.hasSuffix("[1m]") ? String(rawID.dropLast(4)) : rawID
+        if id == "best" || id == "fable" || id == "mythos" || id == "opus" || id == "sonnet"
+            || id.hasPrefix("claude-fable") || id.hasPrefix("claude-mythos-5")
+            || id.hasPrefix("claude-mythos-preview") || id.hasPrefix("claude-opus-5")
+            || id.hasPrefix("claude-opus-4-5") || id.hasPrefix("claude-opus-4-6")
+            || id.hasPrefix("claude-opus-4-7")
+            || id.hasPrefix("claude-opus-4-8") || id.hasPrefix("claude-sonnet-5")
+            || id.hasPrefix("claude-sonnet-4-6") {
+            return true
+        }
+        return false
     }
 
     private static func nestedClaudeInlinePrompt(arguments: [String]) -> String? {
@@ -1448,17 +1461,107 @@ public enum ProviderProxyPolicy {
             }
             return .autoAcceptEdits
         }()
+        guard let reasoningEffort = nestedCodexReasoningEffort(
+            arguments: arguments,
+            model: model
+        ) else { return nil }
         let output: ProviderAgentAppOutputFormat =
             scan.flags.contains("--json") ? .json : .text
         return ProviderAgentAppDelegation(
             provider: .codex,
             promptFile: promptFile,
             model: model,
-            reasoningEffort: .medium,
+            reasoningEffort: reasoningEffort,
             permissionMode: permission,
             outputFormat: output,
             runtimeProfile: nil
         )
+    }
+
+    /// Codex exposes reasoning through generic TOML config overrides rather
+    /// than a dedicated flag. Preserve the last override exactly as the CLI
+    /// resolves repeated `-c` / `--config` options. A syntactically present
+    /// value that this receipt enum cannot represent keeps the original CLI
+    /// path; malformed or unrelated config entries do not change resolution.
+    private static func nestedCodexReasoningEffort(
+        arguments: [String],
+        model: String
+    ) -> AgentReasoningEffort? {
+        guard nestedCodexModelIsKnown(model) else { return nil }
+        // Outer optional means "an explicit override was seen"; inner nil is
+        // a Codex value (`none`, `ultra`, custom, or empty) that this receipt
+        // enum cannot truthfully represent and therefore keeps the raw path.
+        var resolved: AgentReasoningEffort??
+        let optionBoundary = arguments.firstIndex(of: "--") ?? arguments.endIndex
+        var index = 0
+        while index < optionBoundary {
+            let argument = arguments[index]
+            let assignment: String
+            if argument == "-c" || argument == "--config" {
+                guard index + 1 < optionBoundary else { break }
+                assignment = arguments[index + 1]
+                index += 2
+            } else if argument.hasPrefix("-c=") {
+                assignment = String(argument.dropFirst(3))
+                index += 1
+            } else if argument.hasPrefix("--config=") {
+                assignment = String(argument.dropFirst("--config=".count))
+                index += 1
+            } else {
+                index += 1
+                continue
+            }
+            guard let separator = assignment.firstIndex(of: "=") else { continue }
+            let key = assignment[..<separator]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard key == "model_reasoning_effort" else { continue }
+            var value = assignment[assignment.index(after: separator)...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.count >= 2,
+               let first = value.first,
+               let last = value.last,
+               (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+                value.removeFirst()
+                value.removeLast()
+            }
+            guard let effort = AgentReasoningEffort(rawValue: value),
+                  effort != .minimal,
+                  effort != .ultracode else {
+                resolved = .some(nil)
+                continue
+            }
+            resolved = .some(
+                effort == .max && !nestedCodexModelSupportsMax(model)
+                    ? .xhigh
+                    : effort
+            )
+        }
+        if let resolved { return resolved }
+        return nil
+    }
+
+    private static func nestedCodexModelIsKnown(_ model: String) -> Bool {
+        let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if id == "gpt-5.6" || id.hasPrefix("gpt-5.6-sol") { return true }
+        if id.hasPrefix("gpt-5.6-terra") || id.hasPrefix("gpt-5.6-luna")
+            || id.hasPrefix("gpt-5.5") || id.hasPrefix("gpt-5.4") {
+            return true
+        }
+        if id.hasPrefix("gpt-5.3-spark") || id.hasPrefix("gpt-5.3-codex-spark") {
+            return true
+        }
+        return false
+    }
+
+    /// Live Codex app-server catalogs advertise `max` only for the 5.6 model
+    /// families below. Unknown/omitted models stay on the raw CLI because their
+    /// effort contract cannot be represented truthfully.
+    private static func nestedCodexModelSupportsMax(_ model: String) -> Bool {
+        let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return id == "gpt-5.6"
+            || id.hasPrefix("gpt-5.6-sol")
+            || id.hasPrefix("gpt-5.6-terra")
+            || id.hasPrefix("gpt-5.6-luna")
     }
 
     private static func nestedCodexInlinePrompt(arguments: [String]) -> String? {
@@ -1558,13 +1661,14 @@ public enum ProviderProxyPolicy {
             ]
         )
         guard !scan.malformed else { return nil }
-        let model = scan.optionValues["--model"]?.last
-            ?? scan.optionValues["-m"]?.last
-            ?? "grok-4.5"
-        let effortRaw = scan.optionValues["--effort"]?.last
-            ?? scan.optionValues["--reasoning-effort"]?.last
-            ?? "medium"
-        let effort = AgentReasoningEffort(rawValue: effortRaw) ?? .medium
+        guard let model = scan.optionValues["--model"]?.last
+            ?? scan.optionValues["-m"]?.last else { return nil }
+        guard !GrokReasoningPolicy.supportedEfforts(for: model).isEmpty else { return nil }
+        guard let effortRaw = scan.optionValues["--effort"]?.last
+            ?? scan.optionValues["--reasoning-effort"]?.last,
+              let requestedEffort = AgentReasoningEffort(rawValue: effortRaw),
+              requestedEffort != .ultracode else { return nil }
+        let effort = GrokReasoningPolicy.normalizedEffort(requestedEffort, model: model)
         let permission: AgentPermissionMode = {
             if scan.flags.contains("--always-approve") { return .fullAccess }
             switch (scan.optionValues["--permission-mode"]?.last ?? "").lowercased() {

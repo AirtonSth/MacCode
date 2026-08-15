@@ -130,7 +130,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
     // WHY: the SDK bridge is the production-default Claude adapter. If
     // rc_configure omits effort/settings, picking Ultracode (or any effort)
     // silently runs at the CLI default with no Workflow tool — the canonical
-    // ClaudeRunner mapping (ultracode → xhigh + ultracode/enableWorkflows
+    // ClaudeRunner mapping (ultracode wire effort + ultracode/enableWorkflows
     // settings) must reach the bridge verbatim.
     func test_rcConfigureCarriesUltracodeEffortAndSettings() async throws {
         guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
@@ -145,7 +145,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
         _ = try await adapter.sendTurn(AgentRunRequest(
             threadId: threadId,
             provider: .claude,
-            model: "claude-haiku-4-5-20251001",
+            model: "claude-opus-4-7",
             cwd: tmp.path,
             prompt: "first",
             reasoningEffort: .ultracode,
@@ -158,14 +158,79 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
 
         let configures = try Self.loggedCommands(at: commandLog, ofType: "rc_configure")
         XCTAssertEqual(configures.count, 1)
-        XCTAssertEqual(configures.first?["effort"] as? String, "xhigh",
-                       "ultracode must map to --effort xhigh on the SDK bridge exactly like ClaudeRunner.effortArgs does for the CLI")
+        XCTAssertEqual(configures.first?["effort"] as? String, "ultracode",
+                       "the SDK bridge must preserve Claude Code's native Ultracode selector")
         XCTAssertEqual(configures.first?["settings"] as? String, ClaudeRunner.ultracodeSettingsJSON,
                        "ultracode must carry the enableWorkflows settings payload — without it the Workflow tool is never exposed")
+        let settingsData = try XCTUnwrap((configures.first?["settings"] as? String)?.data(using: .utf8))
+        let settings = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: settingsData) as? [String: Any]
+        )
+        XCTAssertEqual(
+            (settings["env"] as? [String: String])?["CLAUDE_CODE_EFFORT_LEVEL"],
+            "xhigh",
+            "SDK settings must align with Ultracode's effective xhigh effort"
+        )
         XCTAssertEqual(configures.first?["bridge_protocol_version"] as? Int, ClaudeAgentSDKBridgeAdapter.bridgeProtocolVersion,
                        "the host and Node bridge must negotiate one explicit command schema before the SDK query starts")
         XCTAssertEqual(configures.first?["expected_sdk_version"] as? String, "0.3.157",
                        "the bridge handshake must verify the exact SDK version provisioned by the host")
+    }
+
+    func test_rcConfigureOmitsHaikuEffortButKeepsThinkingEnabledAndSanitized() async throws {
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = try Self.makeTempDir(prefix: "rc2-sdk-haiku-thinking")
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = tmp.appendingPathComponent("commands.jsonl")
+        try Self.loggingFakeBridgeSource(sessionId: "sdk-haiku-session")
+            .write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "first",
+            reasoningEffort: .max,
+            environment: [
+                "CLAUDE_CODE_DISABLE_THINKING": "1",
+                "MAX_THINKING_TOKENS": "0",
+                "CLAUDE_CODE_EFFORT_LEVEL": "low",
+                "DISABLE_INTERLEAVED_THINKING": "1"
+            ],
+            extraArgs: [commandLog.path]
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        try await waitForFinish(in: sink, expected: "DONE_1")
+        defer { try? adapter.stopSession(threadId: threadId) }
+
+        let configure = try XCTUnwrap(
+            Self.loggedCommands(at: commandLog, ofType: "rc_configure").first
+        )
+        XCTAssertNil(configure["effort"], "Haiku must not receive an unsupported SDK effort")
+        let settingsJSON = try XCTUnwrap(configure["settings"] as? String)
+        let settingsData = try XCTUnwrap(settingsJSON.data(using: .utf8))
+        let settings = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: settingsData) as? [String: Any]
+        )
+        XCTAssertEqual(settings["alwaysThinkingEnabled"] as? Bool, true)
+        XCTAssertEqual(settings["showThinkingSummaries"] as? Bool, true)
+        XCTAssertNil(settings["ultracode"])
+        let settingsEnvironment = try XCTUnwrap(settings["env"] as? [String: String])
+        XCTAssertEqual(settingsEnvironment["CLAUDE_CODE_DISABLE_THINKING"], "0")
+        XCTAssertEqual(settingsEnvironment["CLAUDE_CODE_EFFORT_LEVEL"], "")
+        XCTAssertEqual(settingsEnvironment["DISABLE_INTERLEAVED_THINKING"], "0")
+        XCTAssertEqual(settingsEnvironment["MAX_THINKING_TOKENS"], "32000")
+
+        let environment = try XCTUnwrap(configure["environment"] as? [String: String])
+        XCTAssertEqual(environment["CLAUDE_CODE_DISABLE_THINKING"], "0")
+        XCTAssertEqual(environment["MAX_THINKING_TOKENS"], "32000")
+        XCTAssertNil(environment["CLAUDE_CODE_EFFORT_LEVEL"])
+        XCTAssertNil(environment["DISABLE_INTERLEAVED_THINKING"])
     }
 
     func test_initializerClaudePathIsRuntimeAuthorityWhenRequestHasNoBinary() async throws {
@@ -354,7 +419,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
         _ = try await adapter.sendTurn(AgentRunRequest(
             threadId: threadId,
             provider: .claude,
-            model: "claude-haiku-4-5-20251001",
+            model: "claude-opus-4-7",
             cwd: tmp.path,
             prompt: "first",
             reasoningEffort: .medium,
@@ -370,7 +435,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
         _ = try await adapter.sendTurn(AgentRunRequest(
             threadId: threadId,
             provider: .claude,
-            model: "claude-haiku-4-5-20251001",
+            model: "claude-opus-4-7",
             cwd: tmp.path,
             prompt: "second",
             reasoningEffort: .ultracode,
@@ -388,10 +453,70 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
                        "an effort change must respawn the bridge session (one rc_configure per spawn) — the SDK has no live effort control")
         XCTAssertEqual(configures.first?["effort"] as? String, "medium",
                        "the effort flag is never omitted: nil/medium map to 'medium', mirroring ClaudeRunner")
-        XCTAssertEqual(configures.last?["effort"] as? String, "xhigh")
+        XCTAssertEqual(configures.last?["effort"] as? String, "ultracode")
         XCTAssertEqual(configures.last?["settings"] as? String, ClaudeRunner.ultracodeSettingsJSON)
         XCTAssertEqual(configures.last?["provider_thread_id"] as? String, "sdk-effort-session",
                        "the respawned session must resume the previous provider thread so no conversation context is lost")
+    }
+
+    func test_modelChangeRespawnsWhenEffectiveEffortOrWorkflowContractChanges() async throws {
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+
+        func assertRespawn(
+            from firstModel: String,
+            to secondModel: String,
+            effort: AgentReasoningEffort,
+            prefix: String,
+            firstExpectedEffort: String?,
+            secondExpectedEffort: String,
+            secondUsesUltracode: Bool
+        ) async throws {
+            let tmp = try Self.makeTempDir(prefix: prefix)
+            let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+            let commandLog = tmp.appendingPathComponent("commands.jsonl")
+            try Self.loggingFakeBridgeSource(sessionId: "\(prefix)-session")
+                .write(to: bridge, atomically: true, encoding: .utf8)
+
+            let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+            let threadId = AgentThreadID()
+            let first = EventSink()
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: threadId, provider: .claude, model: firstModel,
+                cwd: tmp.path, prompt: "first", reasoningEffort: effort,
+                extraArgs: [commandLog.path]
+            )) { event in Task { await first.record(event) } }
+            try await waitForFinish(in: first, expected: "DONE_1")
+
+            let second = EventSink()
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: threadId, provider: .claude, model: secondModel,
+                cwd: tmp.path, prompt: "second", reasoningEffort: effort,
+                extraArgs: [commandLog.path]
+            )) { event in Task { await second.record(event) } }
+            try await waitForFinish(in: second, expected: "DONE_1")
+            defer { try? adapter.stopSession(threadId: threadId) }
+
+            let configures = try Self.loggedCommands(at: commandLog, ofType: "rc_configure")
+            XCTAssertEqual(configures.count, 2, "a changed effective SDK contract must respawn")
+            XCTAssertEqual(configures.first?["effort"] as? String, firstExpectedEffort)
+            XCTAssertEqual(configures.last?["effort"] as? String, secondExpectedEffort)
+            XCTAssertEqual(
+                (configures.last?["settings"] as? String)?.contains(#""ultracode":true"#),
+                secondUsesUltracode
+            )
+            XCTAssertEqual(configures.last?["provider_thread_id"] as? String, "\(prefix)-session")
+        }
+
+        try await assertRespawn(
+            from: "claude-haiku-4-5", to: "claude-opus-5", effort: .medium,
+            prefix: "sdk-model-effort", firstExpectedEffort: nil,
+            secondExpectedEffort: "medium", secondUsesUltracode: false
+        )
+        try await assertRespawn(
+            from: "claude-mythos-preview", to: "claude-fable-5", effort: .ultracode,
+            prefix: "sdk-model-workflow", firstExpectedEffort: "high",
+            secondExpectedEffort: "ultracode", secondUsesUltracode: true
+        )
     }
 
     // MARK: - Adapter: sdk_error finishes the run as failed (F16)
@@ -555,10 +680,16 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
             let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
             let threadId = AgentThreadID()
             let sink = EventSink()
+            // Keep the model-switch case on two models with the same effective
+            // effort so it exercises rc_set_model. Haiku → Opus intentionally
+            // respawns now because the model-aware effort contract changes.
+            let initialModel = boundary == "model"
+                ? "claude-opus-4-6"
+                : "claude-haiku-4-5-20251001"
             _ = try await adapter.sendTurn(AgentRunRequest(
                 threadId: threadId,
                 provider: .claude,
-                model: "claude-haiku-4-5-20251001",
+                model: initialModel,
                 cwd: tmp.path,
                 prompt: "first",
                 extraArgs: [boundary, marker.path]

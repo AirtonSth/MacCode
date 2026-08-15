@@ -75,6 +75,7 @@ public enum RunAsUserProcessBootstrap {
         arguments: [String],
         environment: [String: String],
         currentDirectory: String,
+        provider: AgentProvider? = nil,
         runAsUser: AgentRunAsUser?,
         askpassPath: String? = nil,
         sudoPathOverride: String? = nil,
@@ -101,14 +102,18 @@ public enum RunAsUserProcessBootstrap {
             throw RunAsUserProcessBootstrapError.binaryNotAllowlisted(base)
         }
 
-        // sudo argv: sudo [-A|-n] --preserve-env=PATH -u <name> -H -- <binary> <args>
-        // `--preserve-env=PATH` keeps the app's PATH (Homebrew, /usr/bin, …) so the
-        // provider can still find node/git/rg after sudo's env_reset; `-H` sets the
-        // target's HOME so it reads THAT user's ~/.claude.
+        // Preserve PATH so providers can find node/git/rg after sudo's env_reset.
+        // Claude also needs the two positive thinking controls that the host
+        // configures. Effort stays on the explicit CLI/SDK payload, while
+        // inherited disabling controls remain absent. Never preserve the broad
+        // provider environment (it can carry credentials and routing secrets).
+        let preservedEnvironmentKeys = provider == .claude
+            ? ["PATH", "CLAUDE_CODE_DISABLE_THINKING", "MAX_THINKING_TOKENS"]
+            : ["PATH"]
         let authFlag = (askpassPath?.isEmpty == false) ? "-A" : "-n"
         var sudoArgs: [String] = [
             authFlag,
-            "--preserve-env=PATH",
+            "--preserve-env=\(preservedEnvironmentKeys.joined(separator: ","))",
             "-u", runAsUser.shortName,
             "-H",
             "--",

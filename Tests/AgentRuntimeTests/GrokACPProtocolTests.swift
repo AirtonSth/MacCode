@@ -61,7 +61,7 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertTrue(client.contains("foreignUserUID: foreignUserUID"))
     }
 
-    func test_samGrokWorkerProfileLaunchArgumentsPreserveEveryRawGuard() throws {
+    func test_samGrokWorkerProfileLaunchArgumentsPreserveSupportedRawGuard() throws {
         // WHY: promoting the raw worker into ACP must not weaken its security
         // contract. In particular, ACP acceptEdits does not replace Grok's
         // provider-side --always-approve behavior for non-edit tools.
@@ -72,7 +72,7 @@ final class GrokACPProtocolTests: XCTestCase {
             cwd: "/tmp",
             prompt: "inspect",
             permissionMode: .autoAcceptEdits,
-            reasoningEffort: .max,
+            reasoningEffort: .high,
             environment: [
                 AgentAppRuntimeProfile.environmentKey:
                     AgentAppRuntimeProfile.samGrokWorkerV1.rawValue
@@ -89,12 +89,22 @@ final class GrokACPProtocolTests: XCTestCase {
                 "--sandbox", "workspace",
                 "agent",
                 "--model", "grok-4.5",
-                "--reasoning-effort", "max",
+                "--reasoning-effort", "high",
                 "--always-approve",
                 "--no-leader",
                 "stdio"
             ]
         )
+    }
+
+    func test_samGrokWorkerProfileRejectsUnadvertisedMaxEffort() {
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(), provider: .grok, model: "grok-4.5",
+            cwd: "/tmp", prompt: "inspect", permissionMode: .autoAcceptEdits,
+            reasoningEffort: .max,
+            environment: [AgentAppRuntimeProfile.environmentKey: AgentAppRuntimeProfile.samGrokWorkerV1.rawValue]
+        )
+        XCTAssertThrowsError(try GrokACPClient.launchArguments(for: request))
     }
 
     func test_samGrokWorkerProfileFailsClosedForProviderSessionResume() {
@@ -151,7 +161,7 @@ final class GrokACPProtocolTests: XCTestCase {
     }
 
     func test_regularACPLaunchEmptyModelOmitsModelFlagAndMatchesEffortSemantics() throws {
-        // WHY: empty model means account default (Grok 4.5). Do not emit --model;
+        // WHY: empty model means account default (Grok 4.6). Do not emit --model;
         // still emit --reasoning-effort when effort is set, matching
         // GrokRunner.modelSupportsReasoningEffort("") == true.
         let request = AgentRunRequest(
@@ -1252,16 +1262,16 @@ final class GrokACPProtocolTests: XCTestCase {
         )
     }
 
-    /// WHY: ultracode is Claude-only; Grok agent parse_reasoning_effort_meta ignores
-    /// it. Map to high (same as GrokRunner CLI) so set_model meta is accepted (GROK-ACP-007).
-    func test_wireReasoningEffortMapsUltracodeToHigh() {
-        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.ultracode), "high")
-        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal), "minimal")
+    /// WHY: ACP and CLI must send only values advertised by the effective
+    /// account-default model (Grok 4.6), never stale shared-picker aliases.
+    func test_wireReasoningEffortNormalizesForDefaultGrok46() {
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.ultracode), "xhigh")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal), "low")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.low), "low")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.medium), "medium")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.high), "high")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.xhigh), "xhigh")
-        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.max), "max")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.max), "xhigh")
     }
 
     /// WHY: warm reattach + prompt still paid full gateway replay unless

@@ -177,6 +177,11 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                        "Claude fallback model options must lead with the current flagship alias instead of a hardcoded dated model id")
         XCTAssertEqual(fable?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases,
                        "Claude thinking-capable models must advertise the legal effort picker values, including Max")
+        let sonnet = models.first { $0.id == "sonnet" }
+        XCTAssertEqual(sonnet?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases,
+                       "the bare Sonnet alias currently resolves to Sonnet 5, which supports xhigh and max")
+        XCTAssertEqual(models.first { $0.id == "haiku" }?.supportedReasoningEfforts, [],
+                       "Haiku has no configurable thinking effort")
         XCTAssertFalse(fable?.supportsServiceTier == true,
                        "Claude models must not expose Codex-only fast service-tier controls")
         XCTAssertTrue(fable?.supportsCustomModel == true)
@@ -191,8 +196,33 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                     "type": "model"
                 ],
                 [
+                    "id": "claude-opus-4-6",
+                    "display_name": "Claude Opus 4.6",
+                    "type": "model"
+                ],
+                [
                     "id": "claude-sonnet-4-6",
                     "display_name": "Claude Sonnet 4.6",
+                    "type": "model"
+                ],
+                [
+                    "id": "claude-opus-5",
+                    "display_name": "Claude Opus 5",
+                    "type": "model"
+                ],
+                [
+                    "id": "claude-mythos-5",
+                    "display_name": "Claude Mythos 5",
+                    "type": "model"
+                ],
+                [
+                    "id": "claude-mythos-preview",
+                    "display_name": "Claude Mythos Preview",
+                    "type": "model"
+                ],
+                [
+                    "id": "claude-haiku-4-5",
+                    "display_name": "Claude Haiku 4.5",
                     "type": "model"
                 ],
                 [
@@ -202,9 +232,23 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                 ]
             ]
         ])
-        XCTAssertEqual(models.map(\.id), ["claude-opus-4-8", "claude-sonnet-4-6"],
+        XCTAssertEqual(models.map(\.id), [
+            "claude-opus-4-8", "claude-opus-4-6", "claude-sonnet-4-6",
+            "claude-opus-5", "claude-mythos-5", "claude-mythos-preview",
+            "claude-haiku-4-5"
+        ],
                        "Claude model discovery must accept the Anthropic Models API response instead of relying on bundled model IDs")
         XCTAssertEqual(models.first?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases)
+        let legacy46Efforts: [AgentReasoningEffort] = [.low, .medium, .high, .max]
+        XCTAssertEqual(models.first { $0.id == "claude-opus-4-6" }?.supportedReasoningEfforts, legacy46Efforts)
+        XCTAssertEqual(models.first { $0.id == "claude-sonnet-4-6" }?.supportedReasoningEfforts, legacy46Efforts)
+        XCTAssertEqual(models.first { $0.id == "claude-opus-5" }?.supportedReasoningEfforts,
+                       AgentReasoningEffort.claudeSupportedCases)
+        XCTAssertEqual(models.first { $0.id == "claude-mythos-5" }?.supportedReasoningEfforts,
+                       AgentReasoningEffort.claudeSupportedCases)
+        XCTAssertEqual(models.first { $0.id == "claude-mythos-preview" }?.supportedReasoningEfforts,
+                       legacy46Efforts)
+        XCTAssertEqual(models.first { $0.id == "claude-haiku-4-5" }?.supportedReasoningEfforts, [])
         XCTAssertTrue(models.allSatisfy(\.supportsCustomModel))
     }
 
@@ -234,9 +278,47 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertEqual(eff(.high), "high")
         XCTAssertEqual(eff(.xhigh), "xhigh", "Extra High must use Claude's native xhigh effort flag")
         XCTAssertEqual(eff(.max), "max", "Max must use Claude's native max effort flag")
-        XCTAssertEqual(eff(.ultracode), "xhigh",
-                       "Ultracode is not a --effort value (the CLI rejects it); it maps to xhigh effort")
+        XCTAssertEqual(eff(.ultracode), "ultracode",
+                       "Claude Code 2.1.203+ accepts ultracode as a native effort value")
         XCTAssertEqual(eff(nil), "medium", "no effort → a sane default, never omitted")
+    }
+
+    func test_effortIsNormalizedToTheSelectedClaudeModel() throws {
+        func effortFlag(model: String, effort: AgentReasoningEffort) -> String? {
+            let request = AgentRunRequest(
+                threadId: AgentThreadID(), provider: .claude, model: model,
+                cwd: "/tmp", prompt: "x", reasoningEffort: effort
+            )
+            let args = ClaudeRunner.buildArgs(request)
+            guard let index = args.firstIndex(of: "--effort") else { return nil }
+            return args[args.index(after: index)]
+        }
+
+        XCTAssertEqual(effortFlag(model: "claude-opus-4-7", effort: .xhigh), "xhigh")
+        XCTAssertEqual(effortFlag(model: "claude-opus-5", effort: .xhigh), "xhigh")
+        XCTAssertEqual(effortFlag(model: "claude-mythos-5", effort: .max), "max")
+        XCTAssertEqual(effortFlag(model: "sonnet", effort: .xhigh), "xhigh")
+        XCTAssertEqual(effortFlag(model: "opus[1m]", effort: .max), "max")
+        XCTAssertEqual(effortFlag(model: "sonnet[1m]", effort: .xhigh), "xhigh")
+        XCTAssertEqual(effortFlag(model: "best", effort: .ultracode), "ultracode",
+                       "official current aliases must retain the selected Claude effort")
+        XCTAssertEqual(effortFlag(model: "claude-opus-4-6", effort: .xhigh), "high")
+        XCTAssertEqual(effortFlag(model: "claude-sonnet-4-6", effort: .xhigh), "high")
+        XCTAssertEqual(effortFlag(model: "claude-mythos-preview", effort: .max), "max")
+        XCTAssertEqual(effortFlag(model: "claude-mythos-preview", effort: .xhigh), "high")
+        XCTAssertEqual(effortFlag(model: "claude-opus-4-5", effort: .max), "high")
+        XCTAssertNil(effortFlag(model: "claude-haiku-4-5", effort: .high),
+                     "manual/stale Haiku selection must not emit an unsupported effort flag")
+        XCTAssertNil(effortFlag(model: "claude-opus-4-1", effort: .high))
+        XCTAssertNil(effortFlag(model: "claude-custom-future", effort: .high))
+
+        let haikuArgs = ClaudeRunner.buildArgs(AgentRunRequest(
+            threadId: AgentThreadID(), provider: .claude, model: "claude-haiku-4-5",
+            cwd: "/tmp", prompt: "x", reasoningEffort: .high
+        ))
+        let settings = try parsedSettingsObject(haikuArgs)
+        XCTAssertEqual(settings["alwaysThinkingEnabled"] as? Bool, true,
+                       "Haiku still receives thinking enablement without a false effort tier")
     }
 
     private func ultracodeReq(_ effort: AgentReasoningEffort) -> AgentRunRequest {
@@ -254,8 +336,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
 
     func test_ultracodeEnablesEffortAndWorkflowsViaSettings() {
         let args = ClaudeRunner.buildArgs(ultracodeReq(.ultracode))
-        XCTAssertEqual(args[args.index(after: args.firstIndex(of: "--effort")!)], "xhigh",
-                       "Ultracode runs at xhigh effort")
+        XCTAssertEqual(args[args.index(after: args.firstIndex(of: "--effort")!)], "ultracode",
+                       "the CLI must receive its native Ultracode selector, which activates xhigh plus workflows")
         let settings = settingsValue(args)
         XCTAssertNotNil(settings, "Ultracode must inject --settings so the spawned session opts into ultracode")
         XCTAssertTrue(settings?.contains("\"ultracode\":true") == true,
@@ -266,19 +348,134 @@ final class ClaudeRunnerArgsTests: XCTestCase {
 
     func test_streamingUltracodeEnablesEffortAndWorkflowsViaSettings() {
         let args = ClaudeRunner.buildStreamingArgs(ultracodeReq(.ultracode))
-        XCTAssertEqual(args[args.index(after: args.firstIndex(of: "--effort")!)], "xhigh")
+        XCTAssertEqual(args[args.index(after: args.firstIndex(of: "--effort")!)], "ultracode")
         let settings = settingsValue(args)
         XCTAssertTrue(settings?.contains("\"ultracode\":true") == true)
         XCTAssertTrue(settings?.contains("\"enableWorkflows\":true") == true,
                       "durable streaming sessions must also opt into ultracode workflow orchestration")
     }
 
-    func test_nonUltracodeEffortsNeverInjectSettings() {
+    func test_allEffortsEnableThinkingWithOneSettingsPayload() throws {
         for effort in [AgentReasoningEffort.low, .medium, .high, .xhigh, .max] {
-            XCTAssertNil(settingsValue(ClaudeRunner.buildArgs(ultracodeReq(effort))),
-                         "\(effort) is a plain effort level and must not pollute the run with ultracode --settings")
-            XCTAssertNil(settingsValue(ClaudeRunner.buildStreamingArgs(ultracodeReq(effort))),
-                         "\(effort) streaming runs must not inject ultracode --settings")
+            for args in [
+                ClaudeRunner.buildArgs(ultracodeReq(effort)),
+                ClaudeRunner.buildStreamingArgs(ultracodeReq(effort))
+            ] {
+                XCTAssertEqual(settingsFlagCount(args), 1,
+                               "thinking, ultracode, and hooks must share one --settings payload")
+                let settings = try parsedSettingsObject(args)
+                XCTAssertEqual(settings["alwaysThinkingEnabled"] as? Bool, true,
+                               "every Claude run must explicitly enable extended thinking")
+                XCTAssertEqual(settings["showThinkingSummaries"] as? Bool, true,
+                               "visible summaries are the only observable thinking evidence; hidden CoT is never claimed")
+                let settingsEnvironment = try XCTUnwrap(settings["env"] as? [String: String])
+                XCTAssertEqual(settingsEnvironment["CLAUDE_CODE_DISABLE_THINKING"], "0")
+                XCTAssertEqual(settingsEnvironment["CLAUDE_CODE_EFFORT_LEVEL"], effort.rawValue)
+                XCTAssertEqual(settingsEnvironment["DISABLE_INTERLEAVED_THINKING"], "0")
+                XCTAssertEqual(settingsEnvironment["MAX_THINKING_TOKENS"], "32000")
+                XCTAssertNil(settings["ultracode"],
+                             "plain effort levels must not enable ultracode workflow orchestration")
+            }
+        }
+    }
+
+    func test_thinkingEnvironmentNeutralizesEveryDisablingBudgetAndPreservesPositive() throws {
+        for invalidBudget in [nil, "0", "-1", "1", "1023", "garbage", "", "   "] as [String?] {
+            var input = [
+                "CLAUDE_CODE_DISABLE_THINKING": "1",
+                "UNCHANGED": "yes"
+            ]
+            input["MAX_THINKING_TOKENS"] = invalidBudget
+
+            let environment = ClaudeRunner.thinkingEnvironment(input)
+
+            XCTAssertEqual(environment["CLAUDE_CODE_DISABLE_THINKING"], "0")
+            XCTAssertEqual(
+                environment["MAX_THINKING_TOKENS"],
+                "32000",
+                "Claude requires at least 1024 thinking tokens; invalid and subminimum budgets must use the safe default"
+            )
+            XCTAssertEqual(environment["UNCHANGED"], "yes")
+        }
+
+        for validBudget in ["1024", "4096"] {
+            let positive = ClaudeRunner.thinkingEnvironment(["MAX_THINKING_TOKENS": validBudget])
+            XCTAssertEqual(positive["MAX_THINKING_TOKENS"], validBudget,
+                           "a valid explicit user budget must be preserved at and above Claude's minimum")
+        }
+
+        for inheritedEffort in ["low", "max", "garbage"] {
+            let environment = ClaudeRunner.thinkingEnvironment([
+                "CLAUDE_CODE_EFFORT_LEVEL": inheritedEffort,
+                "DISABLE_INTERLEAVED_THINKING": "1",
+                "UNCHANGED": "yes"
+            ])
+            XCTAssertNil(
+                environment["CLAUDE_CODE_EFFORT_LEVEL"],
+                "Claude's effort env overrides the explicit CLI/SDK session effort and must not leak through"
+            )
+            XCTAssertNil(environment["DISABLE_INTERLEAVED_THINKING"])
+            XCTAssertEqual(environment["UNCHANGED"], "yes")
+        }
+
+        let finalEnvironment = CodexRunner.processEnvironment(
+            overrides: ClaudeRunner.thinkingEnvironment([:]),
+            purpose: .agentTurn(.claude),
+            base: [
+                "RC_LOGIN_SHELL_ENV_IMPORT": "0",
+                "CLAUDE_CODE_EFFORT_LEVEL": "low",
+                "DISABLE_INTERLEAVED_THINKING": "1",
+                "UNCHANGED": "yes"
+            ]
+        )
+        XCTAssertNil(finalEnvironment["CLAUDE_CODE_EFFORT_LEVEL"],
+                     "the final subprocess environment must tombstone inherited effort overrides")
+        XCTAssertNil(finalEnvironment["DISABLE_INTERLEAVED_THINKING"])
+        XCTAssertEqual(finalEnvironment["CLAUDE_CODE_DISABLE_THINKING"], "0")
+        XCTAssertEqual(finalEnvironment["MAX_THINKING_TOKENS"], "32000")
+        XCTAssertEqual(finalEnvironment["UNCHANGED"], "yes")
+
+        let positiveSettings = try parsedSettingsObject(ClaudeRunner.buildArgs(AgentRunRequest(
+            threadId: AgentThreadID(), provider: .claude, model: "claude-opus-4-7",
+            cwd: "/tmp", prompt: "x", reasoningEffort: .high,
+            environment: ["MAX_THINKING_TOKENS": "4096"]
+        )))
+        XCTAssertEqual(
+            (positiveSettings["env"] as? [String: String])?["MAX_THINKING_TOKENS"],
+            "4096",
+            "the high-precedence settings tombstone must preserve an explicit positive budget"
+        )
+        XCTAssertEqual(
+            (positiveSettings["env"] as? [String: String])?["CLAUDE_CODE_EFFORT_LEVEL"],
+            "high",
+            "programmatic settings must align with the explicit effective effort so local settings cannot override it"
+        )
+    }
+
+    func test_extraSettingsCannotDuplicateOrDisableThinking() throws {
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .claude,
+            model: "claude-opus-4-7",
+            cwd: "/tmp",
+            prompt: "hello",
+            reasoningEffort: .high,
+            extraArgs: [
+                "--settings", #"{"alwaysThinkingEnabled":false}"#,
+                #"--settings={"showThinkingSummaries":false}"#,
+                "--debug"
+            ]
+        )
+
+        for args in [ClaudeRunner.buildArgs(request), ClaudeRunner.buildStreamingArgs(request)] {
+            XCTAssertEqual(settingsFlagCount(args), 1,
+                           "caller extra args must not add a second settings payload")
+            XCTAssertFalse(args.contains { $0.hasPrefix("--settings=") },
+                           "inline caller settings must not bypass the single-payload contract")
+            let settings = try parsedSettingsObject(args)
+            XCTAssertEqual(settings["alwaysThinkingEnabled"] as? Bool, true)
+            XCTAssertEqual(settings["showThinkingSummaries"] as? Bool, true)
+            XCTAssertTrue(args.contains("--debug"), "unrelated extra args must be preserved")
         }
     }
 
@@ -325,40 +522,27 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             .path + " hook post-tool-use"
     }
 
-    /// (a) Flag absent + non-ultracode → argv is byte-identical to the baseline
-    /// that never injects `--settings` (HEAD behavior for the default `.cli` path).
-    func test_postToolUseFlagAbsent_nonUltracodeArgvByteIdenticalToBaseline() {
+    /// (a) Flag absent + non-ultracode → thinking still has one settings payload;
+    /// enabling the hook only replaces that payload rather than appending another.
+    func test_postToolUseFlagAbsent_nonUltracodeKeepsSingleThinkingSettingsPayload() throws {
         // Stable thread id so --session-id does not confound byte comparison.
         let threadId = AgentThreadID(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!)
         let baselineReq = postToolUseReq(effort: .high, postToolUse: false, threadId: threadId)
         let baseline = ClaudeRunner.buildStreamingArgs(baselineReq)
         let again = ClaudeRunner.buildStreamingArgs(baselineReq)
 
-        // Settings contribution is empty — the only mechanism that could inject
-        // --settings for non-ultracode — so argv cannot gain new flags.
-        XCTAssertEqual(
-            ClaudeRunner.ultracodeSettingsArgs(.high, environment: [:]),
-            [],
-            "flag-absent non-ultracode must contribute zero argv tokens (HEAD-identical)"
-        )
-        XCTAssertNil(settingsValue(baseline),
-                     "flag-absent non-ultracode streaming argv must not include --settings")
+        XCTAssertEqual(settingsFlagCount(baseline), 1)
+        let baselineSettings = try parsedSettingsObject(baseline)
+        XCTAssertEqual(baselineSettings["alwaysThinkingEnabled"] as? Bool, true)
+        XCTAssertEqual(baselineSettings["showThinkingSummaries"] as? Bool, true)
+        XCTAssertNil(baselineSettings["hooks"])
         XCTAssertEqual(baseline, again, "builder must be pure: identical inputs → identical argv")
 
-        // Flag present only adds the single --settings pair; stripping it must
-        // recover the flag-absent baseline byte-for-byte.
         let withFlag = ClaudeRunner.buildStreamingArgs(
             postToolUseReq(effort: .high, postToolUse: true, threadId: threadId)
         )
-        var stripped = withFlag
-        if let i = stripped.firstIndex(of: "--settings") {
-            stripped.remove(at: stripped.index(after: i))
-            stripped.remove(at: i)
-        }
-        XCTAssertEqual(
-            stripped, baseline,
-            "flag-absent argv must be byte-identical to flag-present argv with the --settings pair removed"
-        )
+        XCTAssertEqual(settingsFlagCount(withFlag), 1,
+                       "PostToolUse must merge into the existing thinking settings payload")
     }
 
     /// (b) Flag present + non-ultracode → exactly one --settings JSON with the
@@ -368,6 +552,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertEqual(settingsFlagCount(args), 1,
                        "must emit exactly one --settings (never two)")
         let settings = try parsedSettingsObject(args)
+        XCTAssertEqual(settings["alwaysThinkingEnabled"] as? Bool, true)
+        XCTAssertEqual(settings["showThinkingSummaries"] as? Bool, true)
         XCTAssertNil(settings["ultracode"],
                      "non-ultracode effort must not inject ultracode keys")
         XCTAssertNil(settings["enableWorkflows"],

@@ -468,8 +468,9 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         )
 
         XCTAssertEqual(admission.route.provider, .claude)
-        // Auto controller always binds LIGHT (Haiku), not the manual selection.
-        XCTAssertEqual(admission.route.selection.modelId, "haiku")
+        // Auto controller binds the LIGHT reasoning-capable model, not either
+        // the manual selection or Haiku (which has no effort control).
+        XCTAssertEqual(admission.route.selection.modelId, "sonnet")
         XCTAssertEqual(admission.route.selection.reasoningEffort, .high)
         XCTAssertEqual(
             admission.receipt.reasoningEffort,
@@ -2472,11 +2473,13 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         let grok = AgentOrchestrationRuntime.deepControllerSelection(
             provider: .grok,
             availableModels: [
+                AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok, supportsReasoning: true,
+                                     supportedReasoningEfforts: [.medium, .high, .xhigh]),
                 AgentModelDescriptor(id: "grok-4.5", label: "Grok", provider: .grok, supportsReasoning: true,
                                      supportedReasoningEfforts: [.medium, .high])
             ]
         )
-        XCTAssertEqual(grok.modelId, "grok-4.5")
+        XCTAssertEqual(grok.modelId, "grok-4.6")
         XCTAssertEqual(grok.reasoningEffort, .high)
     }
 
@@ -2511,11 +2514,13 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
             provider: .claude,
             availableModels: [
                 AgentModelDescriptor(id: "claude-live", label: "Live", provider: .claude, supportsReasoning: true),
-                AgentModelDescriptor(id: "haiku", label: "Haiku", provider: .claude, supportsReasoning: true,
-                                     supportedReasoningEfforts: [.low, .medium, .high])
+                AgentModelDescriptor(id: "haiku", label: "Haiku", provider: .claude, supportsReasoning: false),
+                AgentModelDescriptor(id: "sonnet", label: "Sonnet", provider: .claude, supportsReasoning: true,
+                                     supportedReasoningEfforts: [.low, .medium, .high, .xhigh])
             ]
         )
-        XCTAssertEqual(claude.modelId, "haiku")
+        XCTAssertEqual(claude.modelId, "sonnet",
+                       "Auto LIGHT must choose a reasoning-capable Claude model, never Haiku")
         XCTAssertEqual(claude.reasoningEffort, .high)
 
         let codex = AgentOrchestrationRuntime.lightControllerSelection(
@@ -2531,12 +2536,89 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         let grok = AgentOrchestrationRuntime.lightControllerSelection(
             provider: .grok,
             availableModels: [
+                AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok, supportsReasoning: true,
+                                     supportedReasoningEfforts: [.medium, .high, .xhigh]),
                 AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok, supportsReasoning: true,
                                      supportedReasoningEfforts: [.medium, .high])
             ]
         )
-        XCTAssertEqual(grok.modelId, "grok-4.5")
+        XCTAssertEqual(grok.modelId, "grok-4.6")
         XCTAssertEqual(grok.reasoningEffort, .medium)
+    }
+
+    func test_autoLightClaudeSkipsLegacySonnetWithoutEffortControl() {
+        let mixedCatalog = AgentOrchestrationRuntime.lightControllerSelection(
+            provider: .claude,
+            availableModels: [
+                AgentModelDescriptor(
+                    id: "claude-sonnet-4-5",
+                    label: "Sonnet 4.5",
+                    provider: .claude,
+                    supportsReasoning: false,
+                    supportedReasoningEfforts: []
+                ),
+                AgentModelDescriptor(
+                    id: "claude-sonnet-4-6-20260801",
+                    label: "Sonnet 4.6",
+                    provider: .claude,
+                    supportsReasoning: true,
+                    supportedReasoningEfforts: [.low, .medium, .high, .max]
+                )
+            ]
+        )
+        XCTAssertEqual(
+            mixedCatalog.modelId,
+            "claude-sonnet-4-6-20260801",
+            "LIGHT must not bind a legacy Sonnet whose effort control would be normalized away"
+        )
+        XCTAssertEqual(mixedCatalog.reasoningEffort, .high)
+
+        let legacyOnlyCatalog = AgentOrchestrationRuntime.lightControllerSelection(
+            provider: .claude,
+            availableModels: [
+                AgentModelDescriptor(
+                    id: "claude-sonnet-4-5",
+                    label: "Sonnet 4.5",
+                    provider: .claude,
+                    supportsReasoning: false,
+                    supportedReasoningEfforts: []
+                )
+            ]
+        )
+        XCTAssertEqual(
+            legacyOnlyCatalog.modelId,
+            "sonnet",
+            "when no catalog entry exposes effort, use the current reasoning-capable alias instead of a legacy model"
+        )
+        XCTAssertEqual(legacyOnlyCatalog.reasoningEffort, .high)
+    }
+
+    func test_manualClaudeEffortNormalizationMatchesProviderModelContract() {
+        func normalized(_ model: String, _ effort: AgentReasoningEffort?) -> AgentReasoningEffort? {
+            AgentRunCoordinator.normalizedProviderReasoningEffort(
+                provider: .claude,
+                model: model,
+                requested: effort
+            )
+        }
+
+        XCTAssertEqual(normalized("claude-opus-4-7", .xhigh), .xhigh)
+        XCTAssertEqual(normalized("claude-opus-5", .max), .max)
+        XCTAssertEqual(normalized("claude-mythos-5", .xhigh), .xhigh)
+        XCTAssertEqual(normalized("sonnet", .xhigh), .xhigh)
+        XCTAssertEqual(normalized("opus[1m]", .max), .max)
+        XCTAssertEqual(normalized("sonnet[1m]", .xhigh), .xhigh)
+        XCTAssertEqual(normalized("best", .ultracode), .ultracode)
+        XCTAssertEqual(normalized("claude-opus-4-6", .xhigh), .high)
+        XCTAssertEqual(normalized("claude-sonnet-4-6", nil), .medium)
+        XCTAssertEqual(normalized("claude-mythos-preview", .xhigh), .high)
+        XCTAssertEqual(normalized("claude-opus-4-5", .max), .high)
+        XCTAssertNil(normalized("claude-haiku-4-5", .high),
+                     "manual Haiku receipts must not claim an unsupported effort")
+        XCTAssertNil(normalized("claude-opus-4-1", .high),
+                     "legacy Claude models without an effort control must not claim one")
+        XCTAssertNil(normalized("claude-custom-future", .high),
+                     "custom Claude models must fail closed until their effort contract is observable")
     }
 
     func test_autoOrchestrateProviderPromptAlwaysInvokesSkill() {

@@ -143,20 +143,22 @@ final class GrokRunnerArgsTests: XCTestCase {
                      "empty model means account default; do not pass a blank --model")
     }
 
-    func test_reasoningEffortFlagMapsWireValuesOneToOne() {
-        func wire(_ effort: AgentReasoningEffort) -> String {
-            let a = GrokRunner.buildArgs(req(effort: effort))
+    func test_reasoningEffortFlagNormalizesToAdvertisedModelValues() {
+        func wire(_ effort: AgentReasoningEffort, model: String = "grok-4.6") -> String {
+            let a = GrokRunner.buildArgs(req(model: model, effort: effort))
             return a[a.index(after: a.firstIndex(of: "--reasoning-effort")!)]
         }
-        XCTAssertEqual(wire(.minimal), "minimal")
+        XCTAssertEqual(wire(.minimal), "low")
         XCTAssertEqual(wire(.low), "low")
         XCTAssertEqual(wire(.medium), "medium")
         XCTAssertEqual(wire(.high), "high")
-        XCTAssertEqual(wire(.xhigh), "xhigh",
-                       "Grok CLI accepts xhigh; Extra High must not silently collapse to high")
-        XCTAssertEqual(wire(.max), "max")
-        XCTAssertEqual(wire(.ultracode), "high",
-                       "ultracode is Claude-only; map to high so a stale picker value never rejects the run")
+        XCTAssertEqual(wire(.xhigh), "xhigh")
+        XCTAssertEqual(wire(.max), "xhigh",
+                       "Grok 4.6 does not advertise max; use its deepest supported level")
+        XCTAssertEqual(wire(.ultracode), "xhigh")
+        XCTAssertEqual(wire(.xhigh, model: "grok-4.5"), "high")
+        XCTAssertEqual(wire(.max, model: "grok-4.5"), "high",
+                       "Grok 4.5 supports only low/medium/high")
     }
 
     func test_composerModelOmitsReasoningEffortFlag() {
@@ -165,8 +167,16 @@ final class GrokRunnerArgsTests: XCTestCase {
                      "Grok Composer has supports_reasoning_effort=false; do not pass --reasoning-effort")
     }
 
+    func test_unknownCustomModelDoesNotInventReasoningContract() {
+        let a = GrokRunner.buildArgs(req(model: "grok-custom-future", effort: .max))
+        XCTAssertNil(a.firstIndex(of: "--reasoning-effort"),
+                     "unknown Grok models must fail closed instead of inheriting Grok 4.5 limits")
+    }
+
     func test_listModelsReasoningParityWithGrokCLICache() {
         let models = GrokRunner.listModels(installedVersion: nil)
+        let fourSix = try! XCTUnwrap(models.first { $0.id == "grok-4.6" })
+        XCTAssertEqual(fourSix.supportedReasoningEfforts, [.low, .medium, .high, .xhigh])
         let fourFive = try! XCTUnwrap(models.first { $0.id == "grok-4.5" })
         XCTAssertTrue(fourFive.supportsReasoning)
         XCTAssertEqual(fourFive.supportedReasoningEfforts, [.low, .medium, .high],
@@ -178,11 +188,12 @@ final class GrokRunnerArgsTests: XCTestCase {
         XCTAssertTrue(composer.supportedReasoningEfforts.isEmpty)
 
         let accountDefault = try! XCTUnwrap(models.first { $0.id == "" })
-        XCTAssertEqual(accountDefault.supportedReasoningEfforts, [.low, .medium, .high])
+        XCTAssertEqual(accountDefault.supportedReasoningEfforts, [.low, .medium, .high, .xhigh])
     }
 
     func test_listModelsIncludesGrokDefaults() {
         let models = GrokRunner.listModels(installedVersion: nil)
+        XCTAssertEqual(models.first?.id, "grok-4.6")
         XCTAssertTrue(models.contains { $0.id == "grok-4.5" && $0.provider == .grok })
         XCTAssertTrue(models.contains { $0.provider == .grok && $0.supportsCustomModel })
     }

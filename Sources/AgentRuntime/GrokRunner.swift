@@ -15,25 +15,29 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
         Self.listModels(installedVersion: nil)
     }
 
-    /// Effort levels advertised for reasoning Grok models (Grok 4.5 menu /
-    /// models_cache.json): low, medium, high. Default on the model is `high`.
-    /// CLI also accepts `none|minimal|xhigh|max` via flag, but those are not in
-    /// the Grok 4.5 picker — keep the UI aligned with the model menu.
-    public static let reasoningModelEfforts: [AgentReasoningEffort] = [.low, .medium, .high]
+    public static let grok46ReasoningEfforts = GrokReasoningPolicy.grok46Efforts
+    public static let grok45ReasoningEfforts = GrokReasoningPolicy.grok45Efforts
 
     /// Static catalog matching `grok models` / models_cache.json defaults.
     /// Empty model id means account default (omit `-m`).
     public static func listModels(installedVersion: String?) -> [AgentModelDescriptor] {
         [
             AgentModelDescriptor(
+                id: "grok-4.6",
+                label: "Grok 4.6",
+                provider: .grok,
+                supportsReasoning: true,
+                supportedReasoningEfforts: grok46ReasoningEfforts,
+                supportsCustomModel: true
+            ),
+            AgentModelDescriptor(
                 id: "grok-4.5",
                 label: "Grok 4.5",
                 provider: .grok,
                 supportsReasoning: true,
-                supportedReasoningEfforts: reasoningModelEfforts,
+                supportedReasoningEfforts: grok45ReasoningEfforts,
                 supportsCustomModel: true
             ),
-            // models_cache: supports_reasoning_effort == false
             AgentModelDescriptor(
                 id: "grok-composer-2.5-fast",
                 label: "Grok Composer 2.5 Fast",
@@ -41,13 +45,13 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
                 supportsReasoning: false,
                 supportsCustomModel: true
             ),
-            // Account default tracks Grok 4.5 (default model).
+            // Current account default tracks Grok 4.6.
             AgentModelDescriptor(
                 id: "",
                 label: "Default (account)",
                 provider: .grok,
                 supportsReasoning: true,
-                supportedReasoningEfforts: reasoningModelEfforts,
+                supportedReasoningEfforts: grok46ReasoningEfforts,
                 supportsCustomModel: true
             )
         ]
@@ -64,10 +68,10 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
         if !model.isEmpty {
             args.append(contentsOf: ["--model", model])
         }
-        // Only pass --reasoning-effort for models that support it (Grok 4.5 /
-        // account default). Composer-fast rejects/ignores effort; omit the flag.
-        if let effort = request.reasoningEffort, modelSupportsReasoningEffort(model) {
-            args.append(contentsOf: effortArgs(effort))
+        // Only pass --reasoning-effort for models that support it. Composer-fast
+        // rejects/ignores effort, so the model-aware mapper omits the flag.
+        if let effort = request.reasoningEffort {
+            args.append(contentsOf: effortArgs(effort, model: model))
         }
         if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
@@ -90,37 +94,29 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
         return args
     }
 
-    /// Wire values accepted by Grok Build CLI (`--reasoning-effort` / `--effort`):
-    /// `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (alias of xhigh).
-    /// `ultracode` is Claude-only and is rejected by the CLI — map to `high`.
-    static func effortArgs(_ effort: AgentReasoningEffort) -> [String] {
-        switch effort {
-        case .minimal:
-            return ["--reasoning-effort", "minimal"]
-        case .low:
-            return ["--reasoning-effort", "low"]
-        case .medium:
-            return ["--reasoning-effort", "medium"]
-        case .high:
-            return ["--reasoning-effort", "high"]
-        case .xhigh:
-            return ["--reasoning-effort", "xhigh"]
-        case .max:
-            return ["--reasoning-effort", "max"]
-        case .ultracode:
-            // Not a Grok CLI level; keep runs green if a stale thread carries it.
-            return ["--reasoning-effort", "high"]
-        }
+    /// Return only provider-advertised levels. Stale/shared picker values are
+    /// clamped to the selected model's deepest supported level; `max` is never
+    /// emitted because neither current Grok model advertises it.
+    static func effortArgs(_ effort: AgentReasoningEffort, model: String = "") -> [String] {
+        guard let effective = normalizedReasoningEffort(effort, model: model) else { return [] }
+        return ["--reasoning-effort", effective.rawValue]
     }
 
-    /// True when the selected model id supports reasoning effort (Grok 4.5 family /
-    /// account default). Explicit non-reasoning models (composer-fast) return false.
+    static func supportedReasoningEfforts(for model: String) -> [AgentReasoningEffort] {
+        GrokReasoningPolicy.supportedEfforts(for: model)
+    }
+
+    static func normalizedReasoningEffort(
+        _ effort: AgentReasoningEffort,
+        model: String
+    ) -> AgentReasoningEffort? {
+        let supported = supportedReasoningEfforts(for: model)
+        guard !supported.isEmpty else { return nil }
+        return GrokReasoningPolicy.normalizedEffort(effort, model: model)
+    }
+
     static func modelSupportsReasoningEffort(_ model: String) -> Bool {
-        let id = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        if id.isEmpty { return true } // account default == Grok 4.5
-        if id == "grok-composer-2.5-fast" { return false }
-        if id.hasPrefix("grok-composer") { return false }
-        return true
+        !supportedReasoningEfforts(for: model).isEmpty
     }
 
     static func terminalStatus(

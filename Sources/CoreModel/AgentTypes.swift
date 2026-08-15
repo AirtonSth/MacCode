@@ -20,12 +20,13 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
         [.low, .medium, .high, .xhigh]
     }
 
-    /// Claude Code's effort picker exposes two levels beyond the Codex picker:
-    /// `max` and `ultracode`. Both are kept out of `supportedCases` because
-    /// Codex models fall back to that list and the `codex` CLI rejects them.
-    /// `ultracode` is not a `--effort` flag value (the CLI rejects it); it is
-    /// the `ultracode` settings key, meaning "xhigh effort + standing dynamic
-    /// workflow orchestration". The runner translates it accordingly.
+    /// `supportedCases` is the conservative provider-neutral fallback. Live
+    /// Codex catalogs may expose `max` for specific models; callers with that
+    /// observable model contract should preserve it rather than using this list.
+    /// `ultracode` remains Claude-only and is not Codex's distinct `ultra` value.
+    /// Claude Code 2.1.203+ accepts it as a native effort selector meaning
+    /// "xhigh effort + standing dynamic workflow orchestration"; RemoteCode also
+    /// carries the equivalent settings contract for CLI/SDK consistency.
     public static var claudeSupportedCases: [AgentReasoningEffort] {
         [.low, .medium, .high, .xhigh, .max, .ultracode]
     }
@@ -41,6 +42,40 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
         case .xhigh: return "Extra High"
         case .max: return "Max"
         case .ultracode: return "Ultracode"
+        }
+    }
+}
+
+/// Current provider-advertised Grok reasoning contract shared by the primary
+/// runtime and nested CLI middleware. Keeping normalization in CoreModel avoids
+/// the two launch paths silently emitting different, unsupported wire values.
+public enum GrokReasoningPolicy {
+    public static let grok46Efforts: [AgentReasoningEffort] = [.low, .medium, .high, .xhigh]
+    public static let grok45Efforts: [AgentReasoningEffort] = [.low, .medium, .high]
+
+    public static func supportedEfforts(for model: String) -> [AgentReasoningEffort] {
+        let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if id.isEmpty || id.hasPrefix("grok-4.6") { return grok46Efforts }
+        if id.hasPrefix("grok-4.5") { return grok45Efforts }
+        if id.hasPrefix("grok-composer") { return [] }
+        // A custom/future model has no observable reasoning contract. Fail
+        // closed instead of guessing that it inherits a known model's limits.
+        return []
+    }
+
+    public static func normalizedEffort(
+        _ effort: AgentReasoningEffort,
+        model: String
+    ) -> AgentReasoningEffort {
+        let supported = supportedEfforts(for: model)
+        guard let deepest = supported.last else { return .medium }
+        switch effort {
+        case .minimal:
+            return supported.contains(.low) ? .low : (supported.first ?? deepest)
+        case .low, .medium, .high, .xhigh:
+            return supported.contains(effort) ? effort : deepest
+        case .max, .ultracode:
+            return deepest
         }
     }
 }

@@ -208,17 +208,13 @@ public enum AnthropicModelDiscovery {
     }
 
     private static func descriptor(id: String, label: String) -> AgentModelDescriptor {
-        let lower = "\(id) \(label)".lowercased()
-        // Reasoning support is the default: exclude the known non-reasoning
-        // family (haiku) instead of allowlisting names, so future top-tier
-        // models keep the effort/ultracode picker without a code change here.
-        let supportsReasoning = !lower.contains("haiku")
+        let reasoningEfforts = ClaudeRunner.supportedReasoningEfforts(for: id)
         return AgentModelDescriptor(
             id: id,
             label: label,
             provider: .claude,
-            supportsReasoning: supportsReasoning,
-            supportedReasoningEfforts: supportsReasoning ? AgentReasoningEffort.claudeSupportedCases : [],
+            supportsReasoning: !reasoningEfforts.isEmpty,
+            supportedReasoningEfforts: reasoningEfforts,
             supportsCustomModel: true,
             contextWindowTokens: contextWindowTokens(forID: id)
         )

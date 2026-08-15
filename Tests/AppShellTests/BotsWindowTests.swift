@@ -766,6 +766,37 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.studioApprovalLabel, "Supervised")
     }
 
+    func test_grokEmptyModelUsesCurrentFallbackBeforeProviderCatalogLoads() throws {
+        // WHY: Bots can be created or saved before the asynchronous provider
+        // catalog arrives. Every empty-model path must use the same current
+        // Grok default instead of silently pinning a new Bot to 4.5.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        XCTAssertTrue(vm.providers.isEmpty)
+
+        let created = try vm.create(
+            name: "Quinn",
+            provider: .grok,
+            model: "   "
+        )
+        let createdRevision = try XCTUnwrap(
+            try context.botStore.getRevision(id: try XCTUnwrap(created.currentRevisionID))
+        )
+        XCTAssertEqual(createdRevision.model, "grok-4.6")
+
+        vm.beginEdit(created)
+        vm.studioDraft.model = ""
+        let saved = try vm.saveStudio()
+        let savedRevision = try XCTUnwrap(
+            try context.botStore.getRevision(id: try XCTUnwrap(saved.currentRevisionID))
+        )
+        XCTAssertEqual(savedRevision.model, "grok-4.6")
+
+        vm.studioDraft.model = ""
+        vm.applyDefaultModel(for: .grok)
+        XCTAssertEqual(vm.studioDraft.model, "grok-4.6")
+    }
+
     func test_studioSkillsPersistAsCatalogBindings_becauseStudioOwnsTheBrain() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
