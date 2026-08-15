@@ -279,6 +279,11 @@ if [ ! -x "$CODESIGN_RESOLVER" ]; then
   chmod +x "$CODESIGN_RESOLVER" 2>/dev/null || true
 fi
 CODESIGN_IDENTITY="$("$CODESIGN_RESOLVER")"
+ENTITLEMENTS="$(cd "$(dirname "$0")/.." && pwd)/Sources/AppShell/RemoteCode.entitlements"
+if [ ! -f "$ENTITLEMENTS" ]; then
+  echo "[package] missing $ENTITLEMENTS (Dedicated local VM needs com.apple.security.virtualization)" >&2
+  exit 1
+fi
 if [ "$CODESIGN_IDENTITY" = "-" ]; then
   echo "[package] WARNING: signing ad-hoc. Network volume / folder TCC prompts can return after every rebuild." >&2
   echo "[package] Fix: export RC2_CODESIGN_IDENTITY=\"Apple Development: Your Name (TEAMID)\"  # or install one unique Apple Development cert" >&2
@@ -289,6 +294,9 @@ else
   codesign --force --sign "$CODESIGN_IDENTITY" --timestamp=none "$STAGING_APP/Contents/Resources/RemoteCodeScheduledTaskAgent"
   codesign --force --deep --sign "$CODESIGN_IDENTITY" --timestamp=none "$STAGING_APP"
 fi
+# Re-sign the outer app (no --deep) so Virtualization.framework is entitled
+# without rewriting Sparkle/helper signatures.
+codesign --force --sign "$CODESIGN_IDENTITY" --entitlements "$ENTITLEMENTS" --timestamp=none "$STAGING_APP"
 codesign --verify --deep --strict --verbose=2 "$STAGING_APP"
 # Surface identity summary so a packaging log proves TCC durability class.
 if command -v codesign >/dev/null 2>&1; then
