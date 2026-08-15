@@ -34,8 +34,8 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_openHomeShowsFleetOverview_becauseThePlanSeparatesRosterFromChat() throws {
-        // WHY: Fleet Home is the selected-bot overview. Opening it must not
-        // dump the user into Desk, or roster selection becomes a fake chat.
+        // WHY: Fleet Home is the selected-bot overview. openHome must stay
+        // on that screen so Studio / Open Chat remain distinct from Desk.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
@@ -46,6 +46,34 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.selectedBotID, bot.id)
         XCTAssertEqual(vm.providerLabel(for: bot), "Claude")
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).title, "Scout")
+    }
+
+    func test_rosterRowOpensDesk_becauseSidebarClickIsTheChat() throws {
+        // WHY: the sidebar list is the conversation switcher. A tap must
+        // open Desk, not park on Fleet Home.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openHome(bot)
+        XCTAssertEqual(vm.screen, .fleet)
+        vm.openDesk(bot)
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, bot.id)
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private func rosterRow") else {
+            return XCTFail("roster row must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private func ")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(
+            slice.contains("vm.openDesk(bot)"),
+            "clicking a roster bot must call openDesk, not openHome"
+        )
+        XCTAssertFalse(
+            slice.contains("vm.openHome(bot)"),
+            "roster tap must not land on Home"
+        )
     }
 
     func test_providerChipFollowsThePublishedRevision_becauseHomeMustNotHardcodeClaude() throws {

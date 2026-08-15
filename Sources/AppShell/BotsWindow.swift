@@ -1531,7 +1531,7 @@ public struct BotsRosterList: View {
         let state = vm.attentionState(for: bot)
         let preview = vm.rosterPreview(for: bot)
         return Button {
-            vm.openHome(bot)
+            vm.openDesk(bot)
         } label: {
             HStack(spacing: DS.Space.sm) {
                 ZStack(alignment: .bottomTrailing) {
