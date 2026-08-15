@@ -2531,6 +2531,7 @@ public struct SidebarRootView: View {
     }
 
     @ObservedObject var vm: SidebarViewModel
+    var botsVM: BotsViewModel?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showsInsomniaOptions = false
     @State private var showsTokenSaverDetails = false
@@ -2568,6 +2569,7 @@ public struct SidebarRootView: View {
 
     public init(
         vm: SidebarViewModel,
+        botsVM: BotsViewModel? = nil,
         onOpenSettings: @escaping () -> Void = {},
         onOpenAccount: @escaping () -> Void = {},
         onOpenScheduledTasks: @escaping () -> Void = {},
@@ -2575,6 +2577,7 @@ public struct SidebarRootView: View {
         onOpenBots: @escaping () -> Void = {}
     ) {
         self.vm = vm
+        self.botsVM = botsVM
         self.onOpenSettings = onOpenSettings
         self.onOpenAccount = onOpenAccount
         self.onOpenScheduledTasks = onOpenScheduledTasks
@@ -2624,6 +2627,26 @@ public struct SidebarRootView: View {
             .padding(.horizontal, DS.Space.md)
             .frame(height: 44)
 
+            BotsModeSwitcher(
+                isBotsSelected: vm.isBotsSelected,
+                onSelectAgentic: {
+                    if vm.isBotsSelected {
+                        botsVM?.onLeaveBots?()
+                    }
+                },
+                onSelectBots: {
+                    if !vm.isBotsSelected {
+                        onOpenBots()
+                    }
+                }
+            )
+            .padding(.horizontal, DS.Space.md)
+            .padding(.bottom, DS.Space.md)
+
+            if vm.isBotsSelected, let botsVM {
+                BotsRosterList(vm: botsVM)
+                    .transition(.opacity)
+            } else {
             VStack(alignment: .leading, spacing: DS.Space.xxs) {
                 Button { vm.newWorkspace() } label: {
                     sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
@@ -2777,9 +2800,11 @@ public struct SidebarRootView: View {
                     }
                 }
             }
+            }
 
             accountFooter
         }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: vm.isBotsSelected)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         // Subtle liquid-glass: a near-transparent tint over the
         // NSVisualEffectView the host sits in (see SidebarView).
@@ -5451,6 +5476,7 @@ public final class SidebarView: NSObject {
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
     private let viewModel: SidebarViewModel
+    public let botsViewModel: BotsViewModel
     private let host: NSHostingView<SidebarRootView>
     private var settingsController: SettingsWindowController?
     private var accountController: AccountWindowController?
@@ -5472,7 +5498,8 @@ public final class SidebarView: NSObject {
         self.router = router
         self.updater = updater
         self.viewModel = SidebarViewModel(context: context, router: router, updateChecker: updater)
-        let h = NSHostingView(rootView: SidebarRootView(vm: viewModel))
+        self.botsViewModel = BotsViewModel(context: context, router: router)
+        let h = NSHostingView(rootView: SidebarRootView(vm: viewModel, botsVM: botsViewModel))
         h.translatesAutoresizingMaskIntoConstraints = false
         // NSHostingView is opaque by default; let the vibrancy show.
         h.wantsLayer = true
@@ -5499,6 +5526,7 @@ public final class SidebarView: NSObject {
         super.init()
         h.rootView = SidebarRootView(
             vm: viewModel,
+            botsVM: botsViewModel,
             onOpenSettings: { [weak self] in self?.showSettings() },
             onOpenAccount: { [weak self] in self?.showAccount() },
             onOpenScheduledTasks: { [weak self] in self?.showScheduledTasks() },

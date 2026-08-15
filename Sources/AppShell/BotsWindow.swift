@@ -1343,9 +1343,77 @@ public final class BotsViewModel: ObservableObject {
     }
 }
 
-// MARK: - Root view
+// MARK: - Shared sidebar chrome
 
-public struct BotsRootView: View {
+/// One control for the single shell sidebar: Agentic (workspaces) or Bots (roster).
+public struct BotsModeSwitcher: View {
+    public var isBotsSelected: Bool
+    public var onSelectAgentic: () -> Void
+    public var onSelectBots: () -> Void
+
+    public init(
+        isBotsSelected: Bool,
+        onSelectAgentic: @escaping () -> Void,
+        onSelectBots: @escaping () -> Void
+    ) {
+        self.isBotsSelected = isBotsSelected
+        self.onSelectAgentic = onSelectAgentic
+        self.onSelectBots = onSelectBots
+    }
+
+    public var body: some View {
+        HStack(spacing: 4) {
+            segment(
+                title: BotsChrome.Label.agentic,
+                selected: !isBotsSelected,
+                usesBotsAccent: false,
+                identifier: "bots.chrome.agentic",
+                action: onSelectAgentic
+            )
+            segment(
+                title: BotsChrome.Label.bots,
+                selected: isBotsSelected,
+                usesBotsAccent: true,
+                identifier: "bots.chrome.bots",
+                action: onSelectBots
+            )
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("bots.chrome.mode")
+        .accessibilityLabel("Sidebar mode")
+        .accessibilityValue(isBotsSelected ? BotsChrome.Label.bots : BotsChrome.Label.agentic)
+    }
+
+    private func segment(
+        title: String,
+        selected: Bool,
+        usesBotsAccent: Bool,
+        identifier: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(DS.Font.body.weight(selected ? .semibold : .medium))
+                .foregroundColor(selected && usesBotsAccent ? BotsChrome.onPrimary : (
+                    selected ? DS.Palette.text : DS.Palette.textSecondary
+                ))
+                .frame(maxWidth: .infinity, minHeight: BotsChrome.hitTarget)
+                .background(
+                    selected
+                        ? (usesBotsAccent ? BotsChrome.primary : DS.Palette.surfaceRaised)
+                        : Color.clear
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityIdentifier(identifier)
+    }
+}
+
+/// Roster body shared by the shell sidebar and the detached Bots window.
+public struct BotsRosterList: View {
     @ObservedObject private var vm: BotsViewModel
 
     public init(vm: BotsViewModel) {
@@ -1353,78 +1421,7 @@ public struct BotsRootView: View {
     }
 
     public var body: some View {
-        HStack(spacing: 0) {
-            if showsRosterRail {
-                rosterRail
-                Rectangle()
-                    .fill(DS.Palette.line)
-                    .frame(width: 1)
-                    .accessibilityHidden(true)
-            }
-            Group {
-                switch vm.screen {
-                case .fleet:
-                    fleetScreen
-                case .studio:
-                    studioScreen
-                case .desk:
-                    deskScreen
-                case .attention:
-                    attentionScreen
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .frame(minWidth: 980, minHeight: 680)
-        .background(DS.Palette.bg)
-        .alert("Bots", isPresented: Binding(
-            get: { vm.errorMessage != nil },
-            set: { if !$0 { vm.errorMessage = nil } }
-        )) {
-            Button("OK") { vm.errorMessage = nil }
-        } message: {
-            Text(vm.errorMessage ?? "")
-        }
-        .confirmationDialog(
-            deleteTitle,
-            isPresented: Binding(
-                get: { vm.pendingDeleteID != nil },
-                set: { if !$0 { vm.pendingDeleteID = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("Delete", role: .destructive) {
-                if let id = vm.pendingDeleteID {
-                    vm.delete(id: id)
-                }
-                vm.pendingDeleteID = nil
-            }
-            Button("Cancel", role: .cancel) { vm.pendingDeleteID = nil }
-        } message: {
-            Text("This teammate is removed from the fleet. Conversations and routines are deleted.")
-        }
-        .onAppear { vm.reload() }
-    }
-
-    private var deleteTitle: String {
-        if let id = vm.pendingDeleteID, let bot = vm.bots.first(where: { $0.id == id }) {
-            return "Delete \(bot.name)?"
-        }
-        return "Delete this Bot?"
-    }
-
-    private var showsRosterRail: Bool {
-        vm.isControlPlaneActive
-    }
-
-    // MARK: Roster
-
-    private var rosterRail: some View {
         VStack(alignment: .leading, spacing: 0) {
-            agenticBotsSwitcher
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.top, DS.Space.xl)
-
             HStack(spacing: DS.Space.sm) {
                 Image(systemName: "magnifyingglass")
                     .foregroundColor(DS.Palette.textTertiary)
@@ -1432,6 +1429,7 @@ public struct BotsRootView: View {
                 TextField(BotsChrome.Label.search, text: $vm.searchText)
                     .textFieldStyle(.plain)
                     .foregroundColor(DS.Palette.text)
+                    .accessibilityLabel(BotsChrome.Label.search)
             }
             .padding(.horizontal, DS.Space.lg)
             .frame(minHeight: 40)
@@ -1492,35 +1490,8 @@ public struct BotsRootView: View {
                 .padding(.bottom, DS.Space.lg)
             }
         }
-        .frame(width: BotsChrome.rosterWidth)
-        .background(DS.Palette.surface)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityIdentifier("bots.roster")
-    }
-
-    private var agenticBotsSwitcher: some View {
-        HStack(spacing: 4) {
-            Button(BotsChrome.Label.agentic) {
-                vm.onLeaveBots?()
-            }
-            .buttonStyle(.plain)
-            .font(DS.Font.body.weight(.medium))
-            .foregroundColor(DS.Palette.textSecondary)
-            .frame(maxWidth: .infinity, minHeight: BotsChrome.hitTarget)
-            .background(DS.Palette.surfaceRaised)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .accessibilityIdentifier("bots.chrome.agentic")
-
-            Text(BotsChrome.Label.bots)
-                .font(DS.Font.body.weight(.semibold))
-                .foregroundColor(BotsChrome.onPrimary)
-                .frame(maxWidth: .infinity, minHeight: BotsChrome.hitTarget)
-                .background(BotsChrome.primary)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .accessibilityAddTraits(.isSelected)
-                .accessibilityIdentifier("bots.chrome.bots")
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("bots.chrome.mode")
     }
 
     private func rosterRow(_ bot: BotDefinition) -> some View {
@@ -1578,6 +1549,100 @@ public struct BotsRootView: View {
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("bots.roster.row.\(bot.handle)")
+    }
+}
+
+// MARK: - Root view
+
+public struct BotsRootView: View {
+    @ObservedObject private var vm: BotsViewModel
+    /// Standalone Bots window keeps its own rail. The main shell hosts the
+    /// roster inside the single sidebar instead.
+    private let embedsRosterRail: Bool
+
+    public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
+        self.vm = vm
+        self.embedsRosterRail = embedsRosterRail
+    }
+
+    public var body: some View {
+        HStack(spacing: 0) {
+            if showsRosterRail {
+                rosterRail
+                Rectangle()
+                    .fill(DS.Palette.line)
+                    .frame(width: 1)
+                    .accessibilityHidden(true)
+            }
+            Group {
+                switch vm.screen {
+                case .fleet:
+                    fleetScreen
+                case .studio:
+                    studioScreen
+                case .desk:
+                    deskScreen
+                case .attention:
+                    attentionScreen
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(minWidth: embedsRosterRail ? 980 : 700, minHeight: 680)
+        .background(DS.Palette.bg)
+        .alert("Bots", isPresented: Binding(
+            get: { vm.errorMessage != nil },
+            set: { if !$0 { vm.errorMessage = nil } }
+        )) {
+            Button("OK") { vm.errorMessage = nil }
+        } message: {
+            Text(vm.errorMessage ?? "")
+        }
+        .confirmationDialog(
+            deleteTitle,
+            isPresented: Binding(
+                get: { vm.pendingDeleteID != nil },
+                set: { if !$0 { vm.pendingDeleteID = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                if let id = vm.pendingDeleteID {
+                    vm.delete(id: id)
+                }
+                vm.pendingDeleteID = nil
+            }
+            Button("Cancel", role: .cancel) { vm.pendingDeleteID = nil }
+        } message: {
+            Text("This teammate is removed from the fleet. Conversations and routines are deleted.")
+        }
+        .onAppear { vm.reload() }
+    }
+
+    private var deleteTitle: String {
+        if let id = vm.pendingDeleteID, let bot = vm.bots.first(where: { $0.id == id }) {
+            return "Delete \(bot.name)?"
+        }
+        return "Delete this Bot?"
+    }
+
+    private var showsRosterRail: Bool {
+        embedsRosterRail && vm.isControlPlaneActive
+    }
+
+    private var rosterRail: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            BotsModeSwitcher(
+                isBotsSelected: true,
+                onSelectAgentic: { vm.onLeaveBots?() },
+                onSelectBots: {}
+            )
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.top, DS.Space.xl)
+            BotsRosterList(vm: vm)
+        }
+        .frame(width: BotsChrome.rosterWidth)
+        .background(DS.Palette.surface)
     }
 
     // MARK: Fleet

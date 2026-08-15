@@ -320,6 +320,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         sidebar.onPresentBots = { [weak self] in
             self?.presentBotsInMainContent()
         }
+        sidebar.botsViewModel.onLeaveBots = { [weak self] in
+            self?.presentWorkspaceContent()
+        }
         sidebar.onWorkspaceContentActivated = { [weak self] in
             self?.presentWorkspaceContent()
         }
@@ -980,6 +983,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 
     /// Bots shell destination: Fleet / Studio / Desk / Attention.
     func presentBotsInMainContent() {
+        guard shellContentMode != .bots else { return }
         shellContentMode = .bots
         sidebar.setBotsSelected(true)
         sidebar.setScheduledTasksSelected(false)
@@ -1065,14 +1069,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             pin(empty, to: workspaceContent)
             return
         }
-        let vm = botsViewModel ?? BotsViewModel(context: context, router: router)
+        let vm = sidebar.botsViewModel
         botsViewModel = vm
         vm.onLeaveBots = { [weak self] in
             self?.presentWorkspaceContent()
         }
         vm.reload()
         vm.openFleet()
-        let host = NSHostingView(rootView: BotsRootView(vm: vm))
+        let host = NSHostingView(rootView: BotsRootView(vm: vm, embedsRosterRail: false))
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
         host.layer?.backgroundColor = DS.NS.bg.cgColor
