@@ -41,9 +41,10 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
     }
 
     func test_workSoFarOwnsToolsAndReasoning_becauseLiveCompositionIsUserThenWorkThenFinal() {
-        // WHY: live composition is user → Work so far (all non-final items) →
-        // final markdown only when finished. Tools must not leak outside the
-        // disclosure the way a Supervised-run work-log card would.
+        // WHY: live composition is user → Thinking…/Thought → Work so far
+        // (non-final tools) → final markdown. Tools must not leak outside the
+        // disclosure the way a Supervised-run work-log card would, and thought
+        // must not hide inside a collapsed Work so far row.
         let turn = AssistantTurnSnapshot(
             turnId: "t1",
             items: [
@@ -52,11 +53,12 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
             ],
             finished: false
         )
-        let split = AgentChatLiveTurnChrome.splitTurn(turn)
-        XCTAssertEqual(split.work.map(\.id), ["r1", "tool1"])
-        XCTAssertTrue(split.outside.isEmpty, "live turns keep every non-final item inside Work so far")
-        XCTAssertEqual(AgentChatLiveTurnChrome.completedWorkLabel(turn, live: true, workBlockCount: 2),
-                       "Work so far · 2 steps in this turn")
+        let composition = AgentChatLiveTurnChrome.compose(turn)
+        XCTAssertEqual(composition.reasoning.map(\.id), ["r1"])
+        XCTAssertEqual(composition.work.map(\.id), ["tool1"])
+        XCTAssertTrue(composition.outside.isEmpty, "live turns keep tools inside Work so far")
+        XCTAssertEqual(AgentChatLiveTurnChrome.completedWorkLabel(turn, live: true, workBlockCount: 1),
+                       "Work so far")
         XCTAssertFalse(AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn))
     }
 
@@ -72,11 +74,12 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
             finalAssistantMessage: "Three failing tests remain.",
             finished: true
         )
-        let split = AgentChatLiveTurnChrome.splitTurn(turn)
-        XCTAssertEqual(split.work.map(\.type), [.reasoning, .tool])
-        XCTAssertTrue(split.outside.isEmpty, "final text lives on the turn, not as a duplicate item")
+        let composition = AgentChatLiveTurnChrome.compose(turn)
+        XCTAssertEqual(composition.reasoning.map(\.type), [.reasoning])
+        XCTAssertEqual(composition.work.map(\.type), [.tool])
+        XCTAssertTrue(composition.outside.isEmpty, "final text lives on the turn, not as a duplicate item")
         XCTAssertTrue(AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn))
-        XCTAssertEqual(AgentChatLiveTurnChrome.completedWorkLabel(turn, live: false, workBlockCount: 2),
+        XCTAssertEqual(AgentChatLiveTurnChrome.completedWorkLabel(turn, live: false, workBlockCount: 1),
                        "Worked for 2s")
     }
 
@@ -119,12 +122,32 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         let reasoning = try XCTUnwrap(turn.items.first { $0.type == .reasoning })
         XCTAssertEqual(AgentChatLiveTurnChrome.reasoningTitle(isStreaming: reasoning.state == .streaming), "Thought")
         XCTAssertEqual(AgentChatLiveTurnChrome.reasoningText(reasoning), "Checking the suite")
+        XCTAssertTrue(AgentChatLiveTurnChrome.compose(turn).reasoning.contains { $0.type == .reasoning })
         XCTAssertTrue(AgentChatLiveTurnChrome.workItems(in: turn).contains { $0.type == .tool })
         XCTAssertEqual(turn.finalAssistantMessage, "Three failing tests remain.")
         XCTAssertTrue(AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn))
         XCTAssertEqual(
-            AgentChatLiveTurnChrome.completedWorkLabel(turn, live: false, workBlockCount: 2),
-            AgentAppView.completedWorkLabel(turn, live: false, workBlockCount: 2)
+            AgentChatLiveTurnChrome.completedWorkLabel(turn, live: false, workBlockCount: 1),
+            AgentAppView.completedWorkLabel(turn, live: false, workBlockCount: 1)
         )
+    }
+
+    func test_isRicherKeepsLiveThoughtAheadOfLaggingPersist_becauseFlushMustNotEraseThinking() {
+        // WHY: Desk applies coordinator events immediately. A later SQLite
+        // replay that has not flushed the reasoning delta must not wipe the row.
+        var live = AssistantTimelineState()
+        live.apply(.turnStarted(turnId: "t1"))
+        live.apply(.itemStarted(item: AssistantItem(
+            id: "r1", turnId: "t1", type: .reasoning, state: .streaming,
+            body: "Checking the suite", startedAtMs: 1
+        )))
+        var persisted = AssistantTimelineState()
+        persisted.apply(.turnStarted(turnId: "t1"))
+        persisted.apply(.itemStarted(item: AssistantItem(
+            id: "r1", turnId: "t1", type: .reasoning, state: .streaming,
+            body: "", startedAtMs: 1
+        )))
+        XCTAssertTrue(AgentChatLiveTurnChrome.isRicher(live, than: persisted))
+        XCTAssertFalse(AgentChatLiveTurnChrome.isRicher(persisted, than: live))
     }
 }

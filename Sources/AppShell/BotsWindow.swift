@@ -278,10 +278,12 @@ public final class BotsViewModel: ObservableObject {
         self.settingsStore = SettingsStore(db: context.db)
         restoreInspectorTabIfNeeded()
         reload()
+        context.coordinator.addObserver(self)
     }
 
     deinit {
         deskLiveTurnWatch?.cancel()
+        context.coordinator.removeObserver(self)
     }
 
     public var selectedBot: BotDefinition? {
@@ -698,6 +700,10 @@ public final class BotsViewModel: ObservableObject {
     public func refreshDeskLiveTurn() {
         guard let id = selectedBotID else { return }
         restoreDeskLiveTurn(botID: id)
+    }
+
+    func applyDeskLiveEventForTesting(_ event: AssistantEvent, threadId: AgentThreadID) {
+        applyIncomingDeskEvent(event, threadId: threadId)
     }
 
     public func addAttachments(_ paths: [String]) {
@@ -1220,12 +1226,31 @@ public final class BotsViewModel: ObservableObject {
         if !force, liveStreamCountByBot[botID] == count { return }
         let events = context.coordinator.latestStreamEvents(threadId: threadID)
         let state = AgentChatLiveTurnChrome.timelineByReplaying(events)
+        let current = selectedBotID == botID
+            ? deskLiveTimeline
+            : (liveTimelineByBot[botID] ?? AssistantTimelineState())
+        if AgentChatLiveTurnChrome.isRicher(current, than: state) {
+            liveStreamCountByBot[botID] = max(count, liveStreamCountByBot[botID] ?? 0)
+            return
+        }
         liveTimelineByBot[botID] = state
         liveStreamCountByBot[botID] = count
         if selectedBotID == botID {
             deskLiveTimeline = state
             deskStreamEventCount = count
         }
+    }
+
+    private func applyIncomingDeskEvent(_ event: AssistantEvent, threadId: AgentThreadID) {
+        guard screen == .desk,
+              let botID = selectedBotID,
+              selectedConversation?.linkedAgentThreadID == threadId
+        else { return }
+        var next = deskLiveTimeline
+        next.apply(event)
+        next.enforceAggregateHotTextBudget()
+        deskLiveTimeline = next
+        liveTimelineByBot[botID] = next
     }
 
     private func refreshDeskLiveTurnIfCountChanged(botID: BotID, threadID: AgentThreadID) {
@@ -1532,6 +1557,51 @@ public final class BotsViewModel: ObservableObject {
                 finishedAt: Date()
             )
         )
+    }
+}
+
+extension BotsViewModel: AgentRunObserver {
+    nonisolated public func runCoordinator(
+        _ c: AgentRunCoordinator,
+        didReceive event: AssistantEvent,
+        run: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        Task { @MainActor [weak self] in
+            self?.applyIncomingDeskEvent(event, threadId: threadId)
+        }
+    }
+
+    nonisolated public func runCoordinator(
+        _ c: AgentRunCoordinator,
+        didFinish runId: AgentRunID,
+        threadId: AgentThreadID,
+        status: AgentRunStatus,
+        finalMessage: String?,
+        providerThreadId: String?
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self, self.screen == .desk, let botID = self.selectedBotID else { return }
+            guard self.selectedConversation?.linkedAgentThreadID == threadId else { return }
+            self.restoreDeskWorkLog(botID: botID)
+            self.restoreDeskLiveTurn(botID: botID)
+        }
+    }
+
+    nonisolated public func runCoordinator(
+        _ c: AgentRunCoordinator,
+        didChangeStatus status: AgentRunStatus,
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self, self.screen == .desk, let botID = self.selectedBotID else { return }
+            guard self.selectedConversation?.linkedAgentThreadID == threadId else { return }
+            self.restoreDeskWorkLog(botID: botID)
+            if BotsDeskFollowThrough.isTerminal(status) {
+                self.restoreDeskLiveTurn(botID: botID)
+            }
+        }
     }
 }
 

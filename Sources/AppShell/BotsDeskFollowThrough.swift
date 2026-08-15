@@ -130,9 +130,15 @@ enum BotsDeskFollowThrough {
         let logs = hideWorkLog ? [] : workLog
         let items = visibleMessages.map(BotDeskTimelineItem.message)
             + logs.map(BotDeskTimelineItem.workLog)
-            + turns.filter { !AgentChatLiveTurnChrome.workItems(in: $0).isEmpty
-                || AgentChatLiveTurnChrome.shouldRenderFinalMessage($0)
-                || !$0.items.filter { $0.type == .assistantMessage && !$0.body.isEmpty }.isEmpty
+            + turns.filter { turn in
+                let composition = AgentChatLiveTurnChrome.compose(turn)
+                return !composition.reasoning.isEmpty
+                    || !composition.work.isEmpty
+                    || AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn)
+                    || turn.items.contains {
+                        $0.type == .assistantMessage
+                            && !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    }
             }.map(BotDeskTimelineItem.liveTurn)
         return items.sorted { lhs, rhs in
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }

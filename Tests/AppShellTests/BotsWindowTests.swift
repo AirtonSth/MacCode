@@ -225,8 +225,10 @@ final class BotsWindowTests: XCTestCase {
             AgentWorkingStripPresentation.label(phase: .tools, elapsedSeconds: 9)
         )
         let live = try XCTUnwrap(vm.deskLiveTimeline.turns.first)
-        XCTAssertEqual(AgentChatLiveTurnChrome.splitTurn(live).work.map(\.type), [.reasoning, .tool])
-        XCTAssertTrue(AgentChatLiveTurnChrome.splitTurn(live).outside.isEmpty)
+        let composition = AgentChatLiveTurnChrome.compose(live)
+        XCTAssertEqual(composition.reasoning.map(\.type), [.reasoning])
+        XCTAssertEqual(composition.work.map(\.type), [.tool])
+        XCTAssertTrue(composition.outside.isEmpty)
     }
 
     func test_refreshDeskLiveTurnPicksUpNewStreamEvents_becauseThinkingMustAppearLive() throws {
@@ -273,6 +275,59 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(AgentChatLiveTurnChrome.reasoningTitle(isStreaming: reasoning.state == .streaming), "Thinking…")
         XCTAssertEqual(AgentChatLiveTurnChrome.reasoningText(reasoning), "Looking at the brief")
+        XCTAssertTrue(
+            vm.deskTimeline.contains { if case .liveTurn = $0 { return true }; return false },
+            "a reasoning-only turn must still paint Thinking… in the transcript"
+        )
+    }
+
+    func test_deskAppliesLiveCoordinatorEvents_becauseThinkingMustNotWaitForSQLite() throws {
+        // WHY: Agent App paints from didReceive events. Polling latestStreamEvents
+        // waits for the 250ms flush, so a live Thinking… row never appears on Desk.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(bot)
+        XCTAssertFalse(vm.deskPaintsLiveTurnChrome)
+
+        vm.applyDeskLiveEventForTesting(.turnStarted(turnId: "t-live"), threadId: thread.id)
+        vm.applyDeskLiveEventForTesting(.itemStarted(item: AssistantItem(
+            id: "r-live",
+            turnId: "t-live",
+            type: .reasoning,
+            state: .streaming,
+            body: "Considering the failing test",
+            startedAtMs: 10
+        )), threadId: thread.id)
+
+        XCTAssertTrue(vm.deskPaintsLiveTurnChrome, "live didReceive must paint Thinking… without a persist")
+        let reasoning = try XCTUnwrap(
+            vm.deskLiveTimeline.turns.first?.items.first { $0.type == .reasoning }
+        )
+        XCTAssertEqual(AgentChatLiveTurnChrome.reasoningTitle(isStreaming: true), "Thinking…")
+        XCTAssertEqual(AgentChatLiveTurnChrome.reasoningText(reasoning), "Considering the failing test")
+        XCTAssertTrue(vm.deskTimeline.contains { if case .liveTurn = $0 { return true }; return false })
+
+        vm.refreshDeskLiveTurn()
+        XCTAssertEqual(
+            AgentChatLiveTurnChrome.reasoningText(
+                try XCTUnwrap(vm.deskLiveTimeline.turns.first?.items.first { $0.type == .reasoning })
+            ),
+            "Considering the failing test",
+            "a lagging SQLite replay must not erase the live Thought row"
+        )
     }
 
     func test_currentGoalAndActivityDriveHomeFromRealConversations() throws {
@@ -1197,6 +1252,12 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("AgentChatUserBubble"))
         XCTAssertTrue(bots.contains("AgentChatAssistantReply"))
         XCTAssertTrue(bots.contains("AgentChatComposerBar"))
+        XCTAssertTrue(bots.contains("AgentChatLiveTurnView"))
+        XCTAssertTrue(bots.contains("applyIncomingDeskEvent"))
+        let liveChrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatLiveTurnChrome.swift"), encoding: .utf8)
+        XCTAssertTrue(liveChrome.contains("bots.desk.thought"))
+        XCTAssertTrue(liveChrome.contains("Thinking…"))
+        XCTAssertTrue(liveChrome.contains("Work so far"))
         XCTAssertTrue(bots.contains("onAttach"))
         XCTAssertTrue(bots.contains("stopDeskRun"))
         XCTAssertTrue(bots.contains("attachments: attached") || bots.contains("attachments: attached,"))

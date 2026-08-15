@@ -77,12 +77,52 @@ public enum AgentChatLiveTurnChrome {
         )
     }
 
+    /// Desk / Agent App live composition: Thinking…/Thought stays a visible
+    /// row. Work so far owns the non-final tools. Final markdown sits outside.
+    public static func compose(_ turn: AssistantTurnSnapshot) -> (
+        reasoning: [AssistantItem],
+        work: [AssistantItem],
+        outside: [AssistantItem]
+    ) {
+        let split = splitTurn(turn)
+        var reasoning: [AssistantItem] = []
+        var work: [AssistantItem] = []
+        reasoning.reserveCapacity(split.work.count)
+        work.reserveCapacity(split.work.count)
+        for item in split.work {
+            if item.type == .reasoning {
+                reasoning.append(item)
+            } else {
+                work.append(item)
+            }
+        }
+        return (reasoning, work, split.outside)
+    }
+
     public static func workItems(in turn: AssistantTurnSnapshot) -> [AssistantItem] {
-        splitTurn(turn).work
+        compose(turn).work
     }
 
     public static func paintsLiveTurnChrome(_ timeline: AssistantTimelineState) -> Bool {
-        timeline.turns.contains { !workItems(in: $0).isEmpty }
+        timeline.turns.contains {
+            let composition = compose($0)
+            return !composition.reasoning.isEmpty || !composition.work.isEmpty
+        }
+    }
+
+    /// Keep a live in-memory apply when SQLite replay is still catching up.
+    public static func isRicher(_ lhs: AssistantTimelineState, than rhs: AssistantTimelineState) -> Bool {
+        let lhsFinished = lhs.turns.filter(\.finished).count
+        let rhsFinished = rhs.turns.filter(\.finished).count
+        if rhsFinished > lhsFinished { return false }
+        let lhsItems = lhs.turns.flatMap(\.items)
+        let rhsItems = rhs.turns.flatMap(\.items)
+        if lhsItems.count != rhsItems.count { return lhsItems.count > rhsItems.count }
+        return liveTextWeight(lhsItems) > liveTextWeight(rhsItems)
+    }
+
+    private static func liveTextWeight(_ items: [AssistantItem]) -> Int {
+        items.reduce(0) { $0 + $1.body.utf8.count + ($1.output?.utf8.count ?? 0) }
     }
 
     public static func shouldRenderFinalMessage(_ turn: AssistantTurnSnapshot) -> Bool {
@@ -605,8 +645,8 @@ public struct AgentChatLiveTurnView: View {
     }
 
     public var body: some View {
-        let split = AgentChatLiveTurnChrome.splitTurn(turn)
-        let blocks = AgentChatLiveTurnChrome.workBlocks(from: split.work)
+        let composition = AgentChatLiveTurnChrome.compose(turn)
+        let blocks = AgentChatLiveTurnChrome.workBlocks(from: composition.work)
         let expanded = AgentCompletedWorkExpandPolicy.isExpanded(
             isLive: live,
             isLatestLiveTurn: live,
@@ -614,7 +654,15 @@ public struct AgentChatLiveTurnView: View {
             userCollapsedWhileLive: userCollapsedLive.contains(turn.turnId)
         )
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            if !split.work.isEmpty {
+            if !composition.reasoning.isEmpty {
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    ForEach(composition.reasoning) { item in
+                        AgentChatReasoningRow(item: item, expandedIDs: $expandedReasoning)
+                    }
+                }
+                .accessibilityIdentifier("bots.desk.thought")
+            }
+            if !composition.work.isEmpty {
                 AgentChatWorkSoFarDisclosure(
                     turn: turn,
                     live: live,
@@ -630,7 +678,7 @@ public struct AgentChatLiveTurnView: View {
                     expandedToolGroups: $expandedToolGroups
                 )
             }
-            ForEach(split.outside) { item in
+            ForEach(composition.outside) { item in
                 AgentChatLiveItemRow(
                     item: item,
                     expandedReasoning: $expandedReasoning,
