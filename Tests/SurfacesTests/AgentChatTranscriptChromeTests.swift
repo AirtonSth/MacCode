@@ -103,4 +103,21 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
             AgentWorkingStripPresentation.label(phase: .thinking, elapsedSeconds: 12)
         )
     }
+
+    func test_deskWorkingLabel_seesStreamingTools_becauseAThinkingPillIsNotEnough() {
+        // WHY: when the live turn is running tools, Desk must switch the
+        // composer phase to Tools — the same signal Agent App uses — not stay
+        // stuck on Thinking with hasStreamingTools hardcoded false.
+        let start = Date(timeIntervalSince1970: 0)
+        let now = Date(timeIntervalSince1970: 12)
+        XCTAssertEqual(
+            AgentChatTranscriptChrome.deskWorkingLabel(
+                runIsLive: true,
+                startedAt: start,
+                hasStreamingTools: true,
+                now: now
+            ),
+            AgentWorkingStripPresentation.label(phase: .tools, elapsedSeconds: 12)
+        )
+    }
 }

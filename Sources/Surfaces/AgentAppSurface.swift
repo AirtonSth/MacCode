@@ -13722,12 +13722,7 @@ public struct AgentAppView: View {
 
     // Per-turn duration from items' earliest start to latest finish.
     static func turnDurationLabel(_ turn: AssistantTurnSnapshot) -> String? {
-        guard let start = turn.items.map(\.startedAtMs).min() else { return nil }
-        let finishes = turn.items.compactMap(\.finishedAtMs)
-        guard finishes.count == turn.items.count, let end = finishes.max(), end >= start else { return nil }
-        let seconds = Int((end - start) / 1000)
-        guard seconds > 0 else { return nil }
-        return seconds < 60 ? "\(seconds)s" : "\(seconds / 60)m \(seconds % 60)s"
+        AgentChatLiveTurnChrome.turnDurationLabel(turn)
     }
 
     static func completedWorkLabel(
@@ -13735,16 +13730,7 @@ public struct AgentAppView: View {
         live: Bool = false,
         workBlockCount: Int = 0
     ) -> String {
-        if live {
-            if workBlockCount > 1 {
-                return "Work so far · \(workBlockCount) steps in this turn"
-            }
-            return "Work so far"
-        }
-        if let duration = turnDurationLabel(turn) {
-            return "Worked for \(duration)"
-        }
-        return "Worked"
+        AgentChatLiveTurnChrome.completedWorkLabel(turn, live: live, workBlockCount: workBlockCount)
     }
 
     /// Collapse reveal + open disclosures so a new follow-up paints like a

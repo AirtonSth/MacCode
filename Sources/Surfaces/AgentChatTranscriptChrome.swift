@@ -37,13 +37,18 @@ public enum AgentChatTranscriptChrome {
         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || attachmentCount > 0
     }
 
-    public static func deskWorkingLabel(runIsLive: Bool, startedAt: Date?, now: Date = Date()) -> String? {
+    public static func deskWorkingLabel(
+        runIsLive: Bool,
+        startedAt: Date?,
+        hasStreamingTools: Bool = false,
+        now: Date = Date()
+    ) -> String? {
         let phase = AgentWorkingStripPresentation.phase(
             runIsLive: runIsLive,
             isAwaitingBackground: false,
             backgroundShellCount: 0,
             activeSubagentCount: 0,
-            hasStreamingTools: false
+            hasStreamingTools: hasStreamingTools
         )
         let elapsed = startedAt.map { max(0, Int(now.timeIntervalSince($0))) }
         return AgentWorkingStripPresentation.label(phase: phase, elapsedSeconds: elapsed)

@@ -94,6 +94,187 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_deskReplaysStreamEventsOnOpen_becauseThinkingMustSurviveClose() throws {
+        // WHY: Desk is not a second Agent App window, but it must replay the
+        // linked thread's persisted stream events so Thought / Worked remain
+        // after close/reopen. A Working… bubble cannot do that.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_010),
+            finishedAt: Date(timeIntervalSince1970: 1_700_000_040)
+        )
+        try context.runRepo.upsert(run)
+        try persistStreamEvents(
+            context: context,
+            run: run,
+            events: [
+                .turnStarted(turnId: "t-desk"),
+                .itemStarted(item: AssistantItem(
+                    id: "r-desk",
+                    turnId: "t-desk",
+                    type: .reasoning,
+                    state: .streaming,
+                    body: "",
+                    startedAtMs: 1_700_000_010_000
+                )),
+                .itemDelta(itemId: "r-desk", bodyAppend: "Checking overnight failures", outputAppend: nil, summary: nil),
+                .itemCompleted(itemId: "r-desk", finalState: .completed),
+                .itemStarted(item: AssistantItem(
+                    id: "tool-desk",
+                    turnId: "t-desk",
+                    type: .tool,
+                    state: .completed,
+                    summary: "Bash",
+                    body: #"{"command":"swift test"}"#,
+                    startedAtMs: 1_700_000_020_000,
+                    finishedAtMs: 1_700_000_030_000
+                )),
+                .turnCompleted(turnId: "t-desk", finalMessage: "Three failing tests remain."),
+            ]
+        )
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "Summarize overnight",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Summarize overnight", linkedAgentThreadID: thread.id)
+        )
+
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.deskPaintsLiveTurnChrome, "reopen must paint Work so far / Thought, not only bubbles")
+        let turn = try XCTUnwrap(vm.deskLiveTimeline.turns.first)
+        let reasoning = try XCTUnwrap(turn.items.first { $0.type == .reasoning })
+        XCTAssertEqual(AgentChatLiveTurnChrome.reasoningTitle(isStreaming: reasoning.state == .streaming), "Thought")
+        XCTAssertTrue(AgentChatLiveTurnChrome.reasoningText(reasoning).contains("Checking overnight"))
+        XCTAssertTrue(AgentChatLiveTurnChrome.workItems(in: turn).contains { $0.type == .tool })
+        XCTAssertEqual(turn.finalAssistantMessage, "Three failing tests remain.")
+        XCTAssertFalse(
+            vm.deskTimeline.contains { if case .workLog = $0 { return true }; return false },
+            "Work so far replaces the generic Supervised-run card in the chat column"
+        )
+        XCTAssertTrue(vm.deskTimeline.contains { if case .liveTurn = $0 { return true }; return false })
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(bot)
+        XCTAssertTrue(reopened.deskPaintsLiveTurnChrome)
+        XCTAssertEqual(reopened.deskLiveTimeline.turns.first?.finalAssistantMessage, "Three failing tests remain.")
+        XCTAssertEqual(reopened.deskStreamEventCount, vm.deskStreamEventCount)
+    }
+
+    func test_deskWorkingStripSeesStreamingTools_becauseComposerMustNotHardcodeThinking() throws {
+        // WHY: a live tool stream must flip the composer phase to Tools. The old
+        // Desk path always passed hasStreamingTools:false, so thinking never
+        // looked like Agent App even while commands ran.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        let started = Date(timeIntervalSince1970: 1_700_000_000)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: started
+        )
+        try context.runRepo.upsert(run)
+        try persistStreamEvents(
+            context: context,
+            run: run,
+            events: [
+                .turnStarted(turnId: "t-live"),
+                .itemStarted(item: AssistantItem(
+                    id: "r-live",
+                    turnId: "t-live",
+                    type: .reasoning,
+                    state: .completed,
+                    body: "Need to run tests",
+                    startedAtMs: 1,
+                    finishedAtMs: 2
+                )),
+                .itemStarted(item: AssistantItem(
+                    id: "tool-live",
+                    turnId: "t-live",
+                    type: .tool,
+                    state: .streaming,
+                    summary: "Bash",
+                    body: #"{"command":"swift test"}"#,
+                    startedAtMs: 3
+                )),
+            ]
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.deskHasStreamingTools)
+        XCTAssertTrue(vm.deskPaintsLiveTurnChrome)
+        XCTAssertEqual(
+            vm.deskWorkingLabel(now: started.addingTimeInterval(9)),
+            AgentWorkingStripPresentation.label(phase: .tools, elapsedSeconds: 9)
+        )
+        let live = try XCTUnwrap(vm.deskLiveTimeline.turns.first)
+        XCTAssertEqual(AgentChatLiveTurnChrome.splitTurn(live).work.map(\.type), [.reasoning, .tool])
+        XCTAssertTrue(AgentChatLiveTurnChrome.splitTurn(live).outside.isEmpty)
+    }
+
+    func test_refreshDeskLiveTurnPicksUpNewStreamEvents_becauseThinkingMustAppearLive() throws {
+        // WHY: followLinkedRun used to poll only run status. Thinking cannot
+        // appear unless Desk also hydrates new stream events on the linked thread.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        )
+        try context.runRepo.upsert(run)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(bot)
+        XCTAssertFalse(vm.deskPaintsLiveTurnChrome)
+
+        try persistStreamEvents(
+            context: context,
+            run: run,
+            events: [
+                .turnStarted(turnId: "t-new"),
+                .itemStarted(item: AssistantItem(
+                    id: "r-new",
+                    turnId: "t-new",
+                    type: .reasoning,
+                    state: .streaming,
+                    body: "Looking at the brief",
+                    startedAtMs: 10
+                )),
+            ]
+        )
+        vm.refreshDeskLiveTurn()
+        XCTAssertTrue(vm.deskPaintsLiveTurnChrome)
+        let reasoning = try XCTUnwrap(
+            vm.deskLiveTimeline.turns.first?.items.first { $0.type == .reasoning }
+        )
+        XCTAssertEqual(AgentChatLiveTurnChrome.reasoningTitle(isStreaming: reasoning.state == .streaming), "Thinking…")
+        XCTAssertEqual(AgentChatLiveTurnChrome.reasoningText(reasoning), "Looking at the brief")
+    }
+
     func test_currentGoalAndActivityDriveHomeFromRealConversations() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -1082,6 +1263,23 @@ final class BotsWindowTests: XCTestCase {
             sidebar.contains("BotsModeSwitcher"),
             "Bots is entered from the Agentic/Bots switcher, not a dest row"
         )
+    }
+
+    private func persistStreamEvents(
+        context: AppContext,
+        run: AgentRun,
+        events: [AssistantEvent]
+    ) throws {
+        for (index, event) in events.enumerated() {
+            let data = try JSONEncoder().encode(event)
+            let json = try XCTUnwrap(String(data: data, encoding: .utf8))
+            try context.runRepo.appendStreamEvent(
+                runId: run.id,
+                seq: index + 1,
+                kind: event.debugDescription,
+                payloadJSON: json
+            )
+        }
     }
 
     private func makeContext() throws -> AppContext {

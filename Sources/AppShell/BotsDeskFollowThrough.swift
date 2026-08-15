@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import Surfaces
 
 /// Maps a linked Agent run onto Bot Desk / Attention so a teammate turn
 /// does not stay stuck on "Working…".
@@ -102,11 +103,37 @@ enum BotsDeskFollowThrough {
     /// Messages stay the conversation; a work-log row appears only when a
     /// linked Agent run exists. Same-timestamp work-log sits between You and
     /// the assistant so it reads as the turn's activity, not a fake Desktop.
+    ///
+    /// When the linked thread has live-turn chrome (Thinking / Work so far),
+    /// hide the generic Supervised-run card and the Working… placeholder so
+    /// Desk matches Agent App: user → work disclosure → final markdown.
     static func timeline(
         messages: [BotDeskMessage],
-        workLog: [BotDeskWorkLogRow]
+        workLog: [BotDeskWorkLogRow],
+        turns: [AssistantTurnSnapshot] = [],
+        hideWorkLog: Bool = false,
+        hideWorkingPlaceholder: Bool = false
     ) -> [BotDeskTimelineItem] {
-        let items = messages.map(BotDeskTimelineItem.message) + workLog.map(BotDeskTimelineItem.workLog)
+        let finals = Set(
+            turns.compactMap { turn -> String? in
+                let text = turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+                return (text?.isEmpty == false) ? text : nil
+            }
+        )
+        let visibleMessages = messages.filter { message in
+            guard message.role == .assistant else { return true }
+            if hideWorkingPlaceholder, message.text == workingPlaceholder { return false }
+            let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if finals.contains(trimmed) { return false }
+            return true
+        }
+        let logs = hideWorkLog ? [] : workLog
+        let items = visibleMessages.map(BotDeskTimelineItem.message)
+            + logs.map(BotDeskTimelineItem.workLog)
+            + turns.filter { !AgentChatLiveTurnChrome.workItems(in: $0).isEmpty
+                || AgentChatLiveTurnChrome.shouldRenderFinalMessage($0)
+                || !$0.items.filter { $0.type == .assistantMessage && !$0.body.isEmpty }.isEmpty
+            }.map(BotDeskTimelineItem.liveTurn)
         return items.sorted { lhs, rhs in
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
             return lhs.stableOrder < rhs.stableOrder

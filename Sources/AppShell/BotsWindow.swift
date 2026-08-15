@@ -1,4 +1,5 @@
 import AppKit
+import AgentRuntime
 import CoreModel
 import DesignSystemKit
 import Persistence
@@ -117,11 +118,13 @@ public struct BotDeskWorkLogRow: Identifiable, Equatable, Sendable {
 public enum BotDeskTimelineItem: Identifiable, Equatable, Sendable {
     case message(BotDeskMessage)
     case workLog(BotDeskWorkLogRow)
+    case liveTurn(AssistantTurnSnapshot)
 
-    public var id: UUID {
+    public var id: String {
         switch self {
-        case .message(let message): return message.id
-        case .workLog(let row): return row.id
+        case .message(let message): return "msg-\(message.id.uuidString)"
+        case .workLog(let row): return "log-\(row.id.uuidString)"
+        case .liveTurn(let turn): return "turn-\(turn.turnId)"
         }
     }
 
@@ -129,15 +132,18 @@ public enum BotDeskTimelineItem: Identifiable, Equatable, Sendable {
         switch self {
         case .message(let message): return message.createdAt
         case .workLog(let row): return row.createdAt
+        case .liveTurn(let turn): return AgentChatLiveTurnChrome.turnSortDate(turn)
         }
     }
 
     var stableOrder: Int {
         switch self {
         case .message(let message):
-            return message.role == .user ? 0 : 2
-        case .workLog:
+            return message.role == .user ? 0 : 3
+        case .liveTurn:
             return 1
+        case .workLog:
+            return 2
         }
     }
 }
@@ -225,6 +231,8 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var queuedFollowUps: [BotQueuedFollowUp] = []
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
     @Published public private(set) var deskWorkLog: [BotDeskWorkLogRow] = []
+    @Published public private(set) var deskLiveTimeline = AssistantTimelineState()
+    @Published public private(set) var deskStreamEventCount = 0
     @Published public private(set) var conversations: [BotConversation] = []
     @Published public private(set) var selectedConversation: BotConversation?
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
@@ -259,6 +267,9 @@ public final class BotsViewModel: ObservableObject {
     private var lastPreviewByBot: [BotID: String] = [:]
     private var lastUpdatedByBot: [BotID: Date] = [:]
     private var lastLinkedRunIDByBot: [BotID: AgentRunID] = [:]
+    private var liveTimelineByBot: [BotID: AssistantTimelineState] = [:]
+    private var liveStreamCountByBot: [BotID: Int] = [:]
+    private var deskLiveTurnWatch: Task<Void, Never>?
 
     public init(context: AppContext, router: AppCommandRouter? = nil) {
         self.context = context
@@ -267,6 +278,10 @@ public final class BotsViewModel: ObservableObject {
         self.settingsStore = SettingsStore(db: context.db)
         restoreInspectorTabIfNeeded()
         reload()
+    }
+
+    deinit {
+        deskLiveTurnWatch?.cancel()
     }
 
     public var selectedBot: BotDefinition? {
@@ -339,8 +354,22 @@ public final class BotsViewModel: ObservableObject {
         return []
     }
 
+    public var deskPaintsLiveTurnChrome: Bool {
+        AgentChatLiveTurnChrome.paintsLiveTurnChrome(deskLiveTimeline)
+    }
+
+    public var deskHasStreamingTools: Bool {
+        AgentChatLiveTurnChrome.hasStreamingTools(in: deskLiveTimeline)
+    }
+
     public var deskTimeline: [BotDeskTimelineItem] {
-        BotsDeskFollowThrough.timeline(messages: deskMessages, workLog: deskWorkLog)
+        BotsDeskFollowThrough.timeline(
+            messages: deskMessages,
+            workLog: deskWorkLog,
+            turns: deskLiveTimeline.turns,
+            hideWorkLog: deskPaintsLiveTurnChrome,
+            hideWorkingPlaceholder: deskPaintsLiveTurnChrome || deskRunIsLive
+        )
     }
 
     public func modelLabel(for bot: BotDefinition) -> String? {
@@ -647,12 +676,28 @@ public final class BotsViewModel: ObservableObject {
         AgentChatTranscriptChrome.admitsSend(text: composerText, attachmentCount: attachments.count)
     }
 
+    public func deskWorkingStartedAt() -> Date? {
+        if let started = deskWorkLog.first(where: { $0.statusLabel == "Working" })?.createdAt {
+            return started
+        }
+        if let turn = deskLiveTimeline.turns.last(where: { !$0.finished }) {
+            return AgentChatLiveTurnChrome.turnSortDate(turn)
+        }
+        return nil
+    }
+
     public func deskWorkingLabel(now: Date = Date()) -> String? {
         AgentChatTranscriptChrome.deskWorkingLabel(
             runIsLive: deskRunIsLive,
-            startedAt: deskWorkLog.first(where: { $0.statusLabel == "Working" })?.createdAt,
+            startedAt: deskWorkingStartedAt(),
+            hasStreamingTools: deskHasStreamingTools,
             now: now
         )
+    }
+
+    public func refreshDeskLiveTurn() {
+        guard let id = selectedBotID else { return }
+        restoreDeskLiveTurn(botID: id)
     }
 
     public func addAttachments(_ paths: [String]) {
@@ -713,11 +758,8 @@ public final class BotsViewModel: ObservableObject {
                     if let runId = started {
                         self.lastSendStartedProviderRun = true
                         self.lastLinkedRunIDByBot[bot.id] = runId
-                        self.appendDeskMessage(
-                            BotDeskMessage(role: .assistant, text: "Working…"),
-                            botID: bot.id
-                        )
                         self.restoreDeskWorkLog(botID: bot.id)
+                        self.restoreDeskLiveTurn(botID: bot.id)
                         await self.followLinkedRun(
                             bot: bot,
                             conversation: conversation,
@@ -1019,6 +1061,7 @@ public final class BotsViewModel: ObservableObject {
             reloadRoutines(botID: id)
             restoreDeskMessages(botID: id)
             restoreDeskWorkLog(botID: id)
+            restoreDeskLiveTurn(botID: id)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -1150,6 +1193,64 @@ public final class BotsViewModel: ObservableObject {
         if let last = visible.last, !last.text.isEmpty {
             lastPreviewByBot[botID] = last.text
             lastUpdatedByBot[botID] = last.createdAt
+        }
+    }
+
+    private func restoreDeskLiveTurn(botID: BotID) {
+        let conversation = conversationForBot(botID)
+        guard let threadID = conversation?.linkedAgentThreadID else {
+            liveTimelineByBot[botID] = AssistantTimelineState()
+            liveStreamCountByBot[botID] = 0
+            if selectedBotID == botID {
+                deskLiveTimeline = AssistantTimelineState()
+                deskStreamEventCount = 0
+                deskLiveTurnWatch?.cancel()
+                deskLiveTurnWatch = nil
+            }
+            return
+        }
+        applyDeskLiveReplay(botID: botID, threadID: threadID, force: true)
+        if selectedBotID == botID, screen == .desk, deskRunIsLive {
+            startDeskLiveTurnWatch(botID: botID, threadID: threadID)
+        }
+    }
+
+    private func applyDeskLiveReplay(botID: BotID, threadID: AgentThreadID, force: Bool = false) {
+        let count = context.coordinator.countStreamEvents(threadId: threadID)
+        if !force, liveStreamCountByBot[botID] == count { return }
+        let events = context.coordinator.latestStreamEvents(threadId: threadID)
+        let state = AgentChatLiveTurnChrome.timelineByReplaying(events)
+        liveTimelineByBot[botID] = state
+        liveStreamCountByBot[botID] = count
+        if selectedBotID == botID {
+            deskLiveTimeline = state
+            deskStreamEventCount = count
+        }
+    }
+
+    private func refreshDeskLiveTurnIfCountChanged(botID: BotID, threadID: AgentThreadID) {
+        applyDeskLiveReplay(botID: botID, threadID: threadID, force: false)
+    }
+
+    private func startDeskLiveTurnWatch(botID: BotID, threadID: AgentThreadID) {
+        deskLiveTurnWatch?.cancel()
+        deskLiveTurnWatch = Task { [weak self] in
+            var lastCount = -1
+            while !Task.isCancelled {
+                guard let self else { return }
+                guard self.selectedBotID == botID, self.screen == .desk else { return }
+                let count = self.context.coordinator.countStreamEvents(threadId: threadID)
+                if count != lastCount {
+                    lastCount = count
+                    self.applyDeskLiveReplay(botID: botID, threadID: threadID, force: true)
+                }
+                let run = self.linkedRun(for: threadID, botID: botID)
+                if let run, BotsDeskFollowThrough.isTerminal(run.status) {
+                    self.applyDeskLiveReplay(botID: botID, threadID: threadID, force: true)
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
         }
     }
 
@@ -1313,9 +1414,15 @@ public final class BotsViewModel: ObservableObject {
     ) async {
         let threadID = conversation.linkedAgentThreadID
             ?? selectedConversation?.linkedAgentThreadID
+        if let threadID {
+            startDeskLiveTurnWatch(botID: bot.id, threadID: threadID)
+        }
         for _ in 0..<120 {
             if Task.isCancelled { return }
             try? await Task.sleep(nanoseconds: 500_000_000)
+            if let threadID {
+                refreshDeskLiveTurnIfCountChanged(botID: bot.id, threadID: threadID)
+            }
             let run = try? context.runRepo.get(id: runId)
             let activeId = threadID.flatMap { context.coordinator.activeRunId(threadId: $0) }
             let terminal = run.map { BotsDeskFollowThrough.isTerminal($0.status) } ?? false
@@ -1354,6 +1461,7 @@ public final class BotsViewModel: ObservableObject {
             lastLinkedRunIDByBot[bot.id] = run.id
         }
         restoreDeskWorkLog(botID: bot.id, preferredRun: run)
+        restoreDeskLiveTurn(botID: bot.id)
         let status = run?.status ?? .interrupted
         let viewingDesk = isViewing(bot.id)
         next.attentionState = BotsDeskFollowThrough.conversationState(for: status, viewingDesk: viewingDesk)
@@ -2828,7 +2936,19 @@ public struct BotsRootView: View {
                             deskBubble(message, columnWidth: geo.size.width)
                         case .workLog(let row):
                             deskWorkLogRow(row)
+                        case .liveTurn(let turn):
+                            AgentChatLiveTurnView(
+                                turn: turn,
+                                live: vm.deskRunIsLive && !turn.finished
+                            )
                         }
+                    }
+                    if vm.deskRunIsLive, let started = vm.deskWorkingStartedAt() {
+                        AgentChatWorkingStatusStrip(
+                            startedAt: started,
+                            isStopping: vm.isStopping,
+                            onStop: { vm.stopDeskRun() }
+                        )
                     }
                 }
                 .padding(.horizontal, DS.Space.xxl)
