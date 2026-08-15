@@ -7,9 +7,11 @@ Product intent this loop: ship remaining P1a-honest work **including Dedicated l
 
 ## Open
 
-- [ ] dedicated-local-vm-boot Leftover after identity/start-stop: boot a real guest from a restore image (IPSW / Disk.img). No isolated-network / takeover / app-closed claims until those actually work. — seen: 2026-08-15
+- [ ] dedicated-local-vm-guest Leftover after hypervisor boot attempt: codesign `com.apple.security.virtualization` and start a real guest from a valid restore image / IPSW. E2E 2026-08-15: Start with Disk.img failed honestly — “doesn’t have the com.apple.security.virtualization entitlement.” No isolated-network / takeover / app-closed claims until those actually work. — seen: 2026-08-15
 
 ## Done
+
+- [x] dedicated-local-vm-boot Start with a Disk.img calls Virtualization.framework. Running is persisted only if the guest starts; otherwise honesty is “Stopped. Boot failed: … not isolated.” Successful IPSW/macOS guest remains leftover. — seen: 2026-08-15 — done: this fire
 
 - [x] dedicated-local-vm-runtime Persist a per-Bot VM identity on disk and probe Virtualization.framework. Start/Stop stay honest: stopped, no guest image (or unsupported). No running/isolation/takeover claims. Guest boot remains leftover. — seen: 2026-08-15 — done: this fire
 

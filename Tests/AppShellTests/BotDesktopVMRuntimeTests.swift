@@ -3,8 +3,19 @@ import CoreModel
 import Persistence
 @testable import AppShell
 
-private struct FixedVirtualizationProbe: BotDesktopVirtualizationProbe {
+private final class FixedVirtualizationProbe: BotDesktopVirtualizationProbe {
     let isSupported: Bool
+    var bootResult: BotDesktopVMBootAttempt
+    var haltCount = 0
+
+    init(isSupported: Bool, bootResult: BotDesktopVMBootAttempt = BotDesktopVMBootAttempt(didStart: false, failure: "unused")) {
+        self.isSupported = isSupported
+        self.bootResult = bootResult
+    }
+
+    func boot(diskImage: URL) -> BotDesktopVMBootAttempt { bootResult }
+
+    func halt() { haltCount += 1 }
 }
 
 final class BotDesktopVMRuntimeTests: XCTestCase {
@@ -41,5 +52,61 @@ final class BotDesktopVMRuntimeTests: XCTestCase {
         let started = try runtime.start(botID: BotID())
         XCTAssertEqual(started.lastError, BotDesktopVMIdentity.virtualizationUnsupportedCode)
         XCTAssertEqual(started.state, .stopped)
+    }
+
+    func test_startWithDiskImageAttemptsHypervisorBoot_becauseAGuestFileMustNotBeIgnored() throws {
+        // WHY: A Disk.img next to the identity is a real guest artifact. Start
+        // must call Virtualization.framework and persist running or a failed boot.
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bot-desktops-rt-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = FixedVirtualizationProbe(
+            isSupported: true,
+            bootResult: BotDesktopVMBootAttempt(didStart: false, failure: "The disk image is not a valid virtual disk.")
+        )
+        let store = BotDesktopVMStore(root: root)
+        let runtime = BotDesktopVMRuntime(store: store, probe: probe)
+        let botID = BotID()
+        let identity = try store.ensure(botID: botID)
+        try Data(repeating: 0, count: 64).write(
+            to: URL(fileURLWithPath: identity.bundlePath).appendingPathComponent("Disk.img")
+        )
+
+        let started = try runtime.start(botID: botID)
+        XCTAssertEqual(started.state, .failed)
+        XCTAssertEqual(started.lastError, BotDesktopVMIdentity.bootFailedCode)
+        XCTAssertEqual(started.lastErrorDetail, "The disk image is not a valid virtual disk.")
+        XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("boot failed"))
+        XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
+        XCTAssertFalse(started.honestyLabel.localizedCaseInsensitiveContains("active now"))
+
+        let stopped = try runtime.stop(botID: botID)
+        XCTAssertEqual(probe.haltCount, 1)
+        XCTAssertEqual(stopped.state, .stopped)
+    }
+
+    func test_startPersistsRunningOnlyWhenHypervisorStarts() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bot-desktops-rt-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = BotDesktopVMStore(root: root)
+        let runtime = BotDesktopVMRuntime(
+            store: store,
+            probe: FixedVirtualizationProbe(
+                isSupported: true,
+                bootResult: BotDesktopVMBootAttempt(didStart: true)
+            )
+        )
+        let botID = BotID()
+        let identity = try store.ensure(botID: botID)
+        try Data(repeating: 0, count: 64).write(
+            to: URL(fileURLWithPath: identity.bundlePath).appendingPathComponent("Disk.img")
+        )
+
+        let started = try runtime.start(botID: botID)
+        XCTAssertEqual(started.state, .running)
+        XCTAssertNil(started.lastError)
+        XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("running"))
+        XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
     }
 }

@@ -162,6 +162,19 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(identity.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
         XCTAssertFalse(identity.honestyLabel.localizedCaseInsensitiveContains("active now"))
         XCTAssertEqual(identity.statusPill, "Local VM · stopped")
+
+        let failed = BotDesktopVMIdentity(
+            botID: BotID(),
+            bundlePath: "/tmp/bot-desktop",
+            state: .failed,
+            lastError: BotDesktopVMIdentity.bootFailedCode,
+            lastErrorDetail: "The disk image is not a valid virtual disk.",
+            virtualizationSupported: true
+        )
+        XCTAssertTrue(failed.honestyLabel.localizedCaseInsensitiveContains("boot failed"))
+        XCTAssertTrue(failed.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
+        XCTAssertFalse(failed.honestyLabel.localizedCaseInsensitiveContains("active now"))
+        XCTAssertEqual(failed.statusPill, "Local VM · failed")
     }
 
     func test_routineCopy_doesNotClaimAppClosedExecution() {

@@ -5,11 +5,27 @@ import Persistence
 import Virtualization
 #endif
 
-public protocol BotDesktopVirtualizationProbe: Sendable {
-    var isSupported: Bool { get }
+public struct BotDesktopVMBootAttempt: Equatable, Sendable {
+    public var didStart: Bool
+    public var failure: String?
+
+    public init(didStart: Bool, failure: String? = nil) {
+        self.didStart = didStart
+        self.failure = failure
+    }
 }
 
-public struct SystemBotDesktopVirtualizationProbe: BotDesktopVirtualizationProbe {
+public protocol BotDesktopVirtualizationProbe: AnyObject {
+    var isSupported: Bool { get }
+    func boot(diskImage: URL) -> BotDesktopVMBootAttempt
+    func halt()
+}
+
+public final class SystemBotDesktopVirtualizationProbe: BotDesktopVirtualizationProbe {
+    #if canImport(Virtualization)
+    private var machine: VZVirtualMachine?
+    #endif
+
     public init() {}
 
     public var isSupported: Bool {
@@ -18,6 +34,67 @@ public struct SystemBotDesktopVirtualizationProbe: BotDesktopVirtualizationProbe
         #else
         false
         #endif
+    }
+
+    public func boot(diskImage: URL) -> BotDesktopVMBootAttempt {
+        #if canImport(Virtualization)
+        halt()
+        do {
+            let attachment = try VZDiskImageStorageDeviceAttachment(url: diskImage, readOnly: false)
+            let config = VZVirtualMachineConfiguration()
+            config.cpuCount = max(1, min(2, ProcessInfo.processInfo.processorCount))
+            config.memorySize = 512 * 1024 * 1024
+            config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: attachment)]
+            try config.validate()
+            let vm = VZVirtualMachine(configuration: config)
+            let box = StartBox()
+            vm.start { result in
+                if case .failure(let error) = result {
+                    box.error = error
+                }
+                box.signal()
+            }
+            _ = box.wait(seconds: 8)
+            if let error = box.error {
+                return BotDesktopVMBootAttempt(didStart: false, failure: error.localizedDescription)
+            }
+            if vm.state == .running {
+                machine = vm
+                return BotDesktopVMBootAttempt(didStart: true)
+            }
+            return BotDesktopVMBootAttempt(
+                didStart: false,
+                failure: "Virtual machine did not reach running (state \(vm.state.rawValue))."
+            )
+        } catch {
+            return BotDesktopVMBootAttempt(didStart: false, failure: error.localizedDescription)
+        }
+        #else
+        return BotDesktopVMBootAttempt(didStart: false, failure: "Virtualization is not available.")
+        #endif
+    }
+
+    public func halt() {
+        #if canImport(Virtualization)
+        guard let machine else { return }
+        if machine.canStop {
+            let box = StartBox()
+            machine.stop { _ in box.signal() }
+            _ = box.wait(seconds: 4)
+        }
+        self.machine = nil
+        #endif
+    }
+}
+
+private final class StartBox: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    var error: Error?
+
+    func signal() { semaphore.signal() }
+
+    func wait(seconds: TimeInterval) -> DispatchTimeoutResult {
+        semaphore.wait(timeout: .now() + seconds)
     }
 }
 
@@ -45,15 +122,23 @@ public struct BotDesktopVMRuntime {
         var identity = try store.ensure(botID: botID, now: now)
         identity.virtualizationSupported = probe.isSupported
         identity.updatedAt = now
+        identity.lastErrorDetail = nil
         if !identity.virtualizationSupported {
             identity.state = .stopped
             identity.lastError = BotDesktopVMIdentity.virtualizationUnsupportedCode
-        } else if !hasGuestImage(at: identity.bundlePath) {
-            identity.state = .stopped
-            identity.lastError = BotDesktopVMIdentity.noGuestImageCode
+        } else if let disk = guestImageURL(at: identity.bundlePath) {
+            let attempt = probe.boot(diskImage: disk)
+            if attempt.didStart {
+                identity.state = .running
+                identity.lastError = nil
+            } else {
+                identity.state = .failed
+                identity.lastError = BotDesktopVMIdentity.bootFailedCode
+                identity.lastErrorDetail = attempt.failure
+            }
         } else {
             identity.state = .stopped
-            identity.lastError = BotDesktopVMIdentity.bootNotShippedCode
+            identity.lastError = BotDesktopVMIdentity.noGuestImageCode
         }
         try store.save(identity)
         return identity
@@ -61,6 +146,7 @@ public struct BotDesktopVMRuntime {
 
     @discardableResult
     public func stop(botID: BotID, now: Date = Date()) throws -> BotDesktopVMIdentity {
+        probe.halt()
         var identity = try store.ensure(botID: botID, now: now)
         identity.state = .stopped
         identity.virtualizationSupported = probe.isSupported
@@ -69,9 +155,11 @@ public struct BotDesktopVMRuntime {
         return identity
     }
 
-    private func hasGuestImage(at bundlePath: String) -> Bool {
+    private func guestImageURL(at bundlePath: String) -> URL? {
         let bundle = URL(fileURLWithPath: bundlePath, isDirectory: true)
         let names = ["Disk.img", "Restore.ipsw", "guest.img"]
-        return names.contains { fileManager.fileExists(atPath: bundle.appendingPathComponent($0).path) }
+        return names
+            .map { bundle.appendingPathComponent($0) }
+            .first { fileManager.fileExists(atPath: $0.path) }
     }
 }
