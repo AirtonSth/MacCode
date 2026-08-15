@@ -120,6 +120,8 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var selectedConversation: BotConversation?
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
     @Published public private(set) var memoryItems: [BotMemoryItem] = []
+    @Published public private(set) var skillBindings: [BotSkillBinding] = []
+    @Published public private(set) var selectedRevision: BotRevision?
     @Published public private(set) var routines: [BotRoutine] = []
     @Published public var memoryDraft: String = ""
     @Published public var routineName: String = ""
@@ -205,6 +207,7 @@ public final class BotsViewModel: ObservableObject {
         refreshFlags()
         reloadFleet()
         reloadAttention()
+        restoreSelectedBotIfNeeded()
         if let selectedBotID {
             reloadSelectedBot(id: selectedBotID)
         }
@@ -258,12 +261,26 @@ public final class BotsViewModel: ObservableObject {
         screen = .fleet
         reloadFleet()
         reloadAttention()
+        restoreSelectedBotIfNeeded()
+        if let selectedBotID {
+            reloadSelectedBot(id: selectedBotID)
+        }
+        persistSelection()
+    }
+
+    public func openHome(_ bot: BotDefinition) {
+        selectedBotID = bot.id
+        screen = .fleet
+        persistSelection()
+        reloadAttention()
+        reloadSelectedBot(id: bot.id)
     }
 
     public func openDesk(_ bot: BotDefinition) {
         selectedBotID = bot.id
         detailTab = .desk
         screen = .desk
+        persistSelection()
         markOpenedConversationRead(botID: bot.id)
         reloadSelectedBot(id: bot.id)
     }
@@ -696,12 +713,73 @@ public final class BotsViewModel: ObservableObject {
         do {
             conversations = try botStore.listConversations(botID: id)
             selectedConversation = conversations.first
+            if let bot = try botStore.get(id: id) {
+                selectedRevision = try currentRevision(for: bot)
+            } else {
+                selectedRevision = nil
+            }
+            skillBindings = try botStore.listSkillBindings(botID: id)
             reloadMemory(botID: id)
             reloadRoutines(botID: id)
             restoreDeskMessages(botID: id)
         } catch {
             errorMessage = String(describing: error)
         }
+    }
+
+    public func providerLabel(for bot: BotDefinition) -> String? {
+        guard let provider = resolvedProvider(for: bot) else { return nil }
+        switch provider {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        case .grok: return "Grok"
+        }
+    }
+
+    public func resolvedProvider(for bot: BotDefinition) -> AgentProvider? {
+        if selectedBotID == bot.id, let provider = selectedRevision?.provider {
+            return provider
+        }
+        if let revisionID = bot.currentRevisionID,
+           let revision = try? botStore.getRevision(id: revisionID) {
+            return revision.provider
+        }
+        return nil
+    }
+
+    private static let selectedBotDefaultsKey = "bots.selectedBotID"
+
+    private func persistSelection() {
+        UserDefaults.standard.set(selectedBotID?.value.uuidString.lowercased(), forKey: Self.selectedBotDefaultsKey)
+    }
+
+    private func restoreSelectedBotIfNeeded() {
+        if let selectedBotID, fleet.contains(where: { $0.id == selectedBotID }) {
+            return
+        }
+        if let raw = UserDefaults.standard.string(forKey: Self.selectedBotDefaultsKey),
+           let uuid = UUID(uuidString: raw),
+           fleet.contains(where: { $0.id == BotID(uuid) }) {
+            selectedBotID = BotID(uuid)
+            return
+        }
+        selectedBotID = fleet.first?.id
+    }
+
+    public var liveMemoryCount: Int {
+        memoryItems.filter { $0.forgottenAt == nil }.count
+    }
+
+    public var enabledSkillCount: Int {
+        skillBindings.filter(\.enabled).count
+    }
+
+    public var enabledRoutineCount: Int {
+        routines.filter(\.activation.isEnabled).count
+    }
+
+    public var pendingApprovalCount: Int {
+        attentionItems.filter { $0.acknowledgedAt == nil && $0.kind == .approval && $0.botID == selectedBotID }.count
     }
 
     private func reloadMemory(botID: BotID) {
@@ -1131,9 +1209,9 @@ public struct BotsRootView: View {
     }
 
     private func rosterRow(_ bot: BotDefinition) -> some View {
-        let selected = vm.selectedBotID == bot.id && vm.screen != .fleet && vm.screen != .attention
+        let selected = vm.selectedBotID == bot.id && vm.screen != .attention
         return Button {
-            vm.openDesk(bot)
+            vm.openHome(bot)
         } label: {
             HStack(alignment: .top, spacing: DS.Space.md) {
                 Image(systemName: bot.avatarSymbol)
@@ -1181,14 +1259,15 @@ public struct BotsRootView: View {
 
     private var fleetScreen: some View {
         VStack(alignment: .leading, spacing: 0) {
-            fleetHeader
             if !vm.isControlPlaneActive {
+                fleetHeader
                 DSEmptyState(
                     icon: "person.2",
                     title: "Turn on Bot control plane in Settings",
                     subtitle: "Bots stay off until the control plane is enabled."
                 )
             } else if vm.fleet.isEmpty {
+                fleetHeader
                 DSEmptyState(
                     icon: "person.2",
                     title: vm.searchText.isEmpty ? "No bots yet" : "No matching bots",
@@ -1196,7 +1275,10 @@ public struct BotsRootView: View {
                         ? "Create a Bot, give it a job, send a first task."
                         : "Try another search or show hidden teammates."
                 )
+            } else if let bot = vm.selectedBot {
+                fleetHome(bot)
             } else {
+                fleetHeader
                 ScrollView {
                     LazyVStack(spacing: DS.Space.md) {
                         ForEach(vm.fleet, id: \.id) { bot in
@@ -1208,6 +1290,206 @@ public struct BotsRootView: View {
                 }
             }
         }
+    }
+
+    private func fleetHome(_ bot: BotDefinition) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: DS.Space.xl) {
+                fleetHomeHeader(bot)
+                HStack(alignment: .top, spacing: DS.Space.xl) {
+                    VStack(alignment: .leading, spacing: DS.Space.lg) {
+                        fleetHomeActivity(bot)
+                        fleetHomeRoutine(bot)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    fleetHomeDesktop(bot)
+                        .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
+                }
+                fleetHomeStats()
+            }
+            .padding(DS.Space.xxl)
+        }
+        .accessibilityIdentifier("bots.home")
+    }
+
+    private func fleetHomeHeader(_ bot: BotDefinition) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.lg) {
+            Image(systemName: bot.avatarSymbol)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundColor(DS.Palette.accent)
+                .frame(width: 48, height: 48)
+                .background(DS.Palette.accent.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: DS.Space.sm) {
+                    Text(bot.name)
+                        .font(DS.Font.title2.weight(.semibold))
+                        .foregroundColor(DS.Palette.text)
+                        .accessibilityIdentifier("bots.home.name")
+                    Text("@\(bot.handle)")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                    if let provider = vm.providerLabel(for: bot) {
+                        DSPill(provider, tone: .accent)
+                            .accessibilityIdentifier("bots.home.provider")
+                    }
+                    attentionBadge(vm.attentionState(for: bot))
+                }
+                Text(bot.title.isEmpty ? "No job yet" : bot.title)
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityIdentifier("bots.home.title")
+                if !bot.description.isEmpty {
+                    Text(bot.description)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(2)
+                }
+                if let stamp = vm.rosterTimestamp(for: bot) {
+                    Text(stamp, style: .relative)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityIdentifier("bots.home.lastActivity")
+                }
+            }
+            Spacer(minLength: DS.Space.lg)
+            HStack(spacing: DS.Space.md) {
+                Button("Studio") { vm.beginEdit(bot) }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("bots.home.studio")
+                Button("Open Chat") { vm.openDesk(bot) }
+                    .buttonStyle(DSPrimaryButtonStyle())
+                    .accessibilityIdentifier("bots.home.chat")
+            }
+        }
+    }
+
+    private func fleetHomeActivity(_ bot: BotDefinition) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG("Latest activity")
+            Text(vm.rosterPreview(for: bot))
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.text)
+            if let stamp = vm.rosterTimestamp(for: bot) {
+                Text(stamp, style: .relative)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+        }
+        .dsPanel(padding: DS.Space.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("bots.home.activity")
+    }
+
+    private func fleetHomeRoutine(_ bot: BotDefinition) -> some View {
+        let routine = vm.routines.first(where: { $0.activation.isEnabled })
+        return VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG("Latest routine")
+            if let routine {
+                Text(routine.definition.name)
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                Text(routine.definition.scheduleNote.isEmpty ? "No schedule yet" : routine.definition.scheduleNote)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            } else {
+                Text("No active routine for \(bot.name)")
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+            Text(BotRoutineCopy.testRunHonestyCaption)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.warning)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .dsPanel(padding: DS.Space.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("bots.home.routine")
+    }
+
+    private func fleetHomeStats() -> some View {
+        HStack(alignment: .top, spacing: DS.Space.md) {
+            fleetStatCard(
+                title: "Memory",
+                value: "\(vm.liveMemoryCount)",
+                detail: vm.isMemoryActive ? "facts" : "off",
+                identifier: "bots.home.memory"
+            )
+            fleetStatCard(
+                title: "Skills",
+                value: "\(vm.enabledSkillCount)",
+                detail: "enabled",
+                identifier: "bots.home.skills"
+            )
+            fleetStatCard(
+                title: "Routines",
+                value: "\(vm.enabledRoutineCount)",
+                detail: vm.isAutonomyActive ? "active" : "app-closed off",
+                identifier: "bots.home.routines"
+            )
+            fleetStatCard(
+                title: "Approvals",
+                value: "\(vm.pendingApprovalCount)",
+                detail: "pending",
+                identifier: "bots.home.approvals"
+            )
+        }
+    }
+
+    private func fleetStatCard(title: String, value: String, detail: String, identifier: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            Text(value)
+                .font(DS.Font.title2.weight(.semibold))
+                .foregroundColor(DS.Palette.text)
+            Text(detail)
+                .font(DS.Font.caption2)
+                .foregroundColor(DS.Palette.textSecondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsPanel(padding: DS.Space.lg)
+        .accessibilityIdentifier(identifier)
+    }
+
+    private func fleetHomeDesktop(_ bot: BotDefinition) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
+                DSSectionHeaderG("Desktop")
+                Spacer(minLength: 0)
+                DSPill("Logical space", tone: .neutral)
+            }
+            VStack(spacing: DS.Space.md) {
+                Image(systemName: "desktopcomputer")
+                    .font(.system(size: 28, weight: .regular))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityHidden(true)
+                Text("Logical execution space")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                    .multilineTextAlignment(.center)
+                Text(vm.desktopHonestyLabel)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.warning)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("bots.home.desktop.honesty")
+            }
+            .frame(maxWidth: .infinity, minHeight: 168)
+            .padding(DS.Space.lg)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            if let model = vm.selectedRevision?.model, !model.isEmpty {
+                Text(model)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+        }
+        .dsPanel(padding: DS.Space.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("bots.home.desktop")
+        .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
     }
 
     private var fleetHeader: some View {

@@ -1068,6 +1068,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         let vm = botsViewModel ?? BotsViewModel(context: context, router: router)
         botsViewModel = vm
         vm.reload()
+        vm.openFleet()
         let host = NSHostingView(rootView: BotsRootView(vm: vm))
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true

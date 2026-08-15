@@ -18,6 +18,127 @@ final class BotsWindowTests: XCTestCase {
         directory = nil
     }
 
+    func test_openHomeShowsFleetOverview_becauseThePlanSeparatesRosterFromChat() throws {
+        // WHY: Fleet Home is the selected-bot overview. Opening it must not
+        // dump the user into Desk, or roster selection becomes a fake chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        XCTAssertEqual(vm.screen, .desk)
+        vm.openHome(bot)
+        XCTAssertEqual(vm.screen, .fleet)
+        XCTAssertEqual(vm.selectedBotID, bot.id)
+        XCTAssertEqual(vm.providerLabel(for: bot), "Claude")
+        XCTAssertEqual(try XCTUnwrap(vm.selectedBot).title, "Scout")
+    }
+
+    func test_providerChipFollowsThePublishedRevision_becauseHomeMustNotHardcodeClaude() throws {
+        // WHY: a Grok teammate shown as "Claude" teaches the user the
+        // overview is decorative. The chip is the live route, not a mock.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let grok = try vm.create(name: "Quinn", title: "Reviewer", provider: .grok)
+        XCTAssertEqual(vm.providerLabel(for: grok), "Grok")
+        vm.openHome(grok)
+        XCTAssertEqual(vm.providerLabel(for: grok), "Grok")
+        XCTAssertEqual(vm.resolvedProvider(for: grok), .grok)
+    }
+
+    func test_openFleetSelectsFirstTeammate_becauseHomeNeedsASelectedBot() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.selectedBotID = nil
+        vm.openFleet()
+        XCTAssertEqual(vm.selectedBotID, bot.id)
+        XCTAssertEqual(vm.screen, .fleet)
+    }
+
+    func test_reloadOnFleetSelectsFirstTeammate_becauseSidebarOpenMustLandOnOverview() throws {
+        // WHY: first paint of Bots is reload(), not openFleet(). A nil
+        // selection would show the empty list instead of the selected overview.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.selectedBotID = nil
+        vm.screen = .fleet
+        vm.reload()
+        XCTAssertEqual(vm.selectedBotID, bot.id)
+        XCTAssertEqual(vm.screen, .fleet)
+    }
+
+    func test_openChatFromHomeOpensDesk_becauseConversationLivesOnDeskNotFleet() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openHome(bot)
+        XCTAssertEqual(vm.screen, .fleet)
+        vm.openDesk(bot)
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.detailTab, .desk)
+    }
+
+    func test_studioFromHomeOpensStudio_becauseBrainEditsStayOffTheOverview() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openHome(bot)
+        vm.beginEdit(bot)
+        XCTAssertEqual(vm.screen, .studio)
+        XCTAssertEqual(vm.studioDraft.botID, bot.id)
+    }
+
+    func test_fleetHomeCountsAreLive_becauseOverviewMustNotInventCapacity() throws {
+        // WHY: Memory/Skills/Routines/Approvals are owner-facing truth.
+        // Hardcoded 87% / 12 skills / "Running • macOS VM" would be a lie.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try context.botStore.putMemory(
+            botID: bot.id,
+            content: "Prefers dark mode",
+            provenance: "user",
+            trusted: true,
+            source: "studio"
+        )
+        let forgotten = try context.botStore.putMemory(
+            botID: bot.id,
+            content: "Old secret",
+            provenance: "user",
+            trusted: true,
+            source: "studio"
+        )
+        try context.botStore.forgetMemory(id: forgotten.id)
+        try context.botStore.setSkillBinding(
+            BotSkillBinding(botID: bot.id, skillID: "weekly-account-health", enabled: true)
+        )
+        try context.botStore.setSkillBinding(
+            BotSkillBinding(botID: bot.id, skillID: "off-skill", enabled: false)
+        )
+        try context.botStore.saveRoutine(
+            BotRoutineDefinition(
+                botID: bot.id,
+                name: "Morning scan",
+                prompt: "Scan overnight failures",
+                scheduleNote: "Weekdays 9:00"
+            )
+        )
+        let routine = try XCTUnwrap(context.botStore.listRoutines(botID: bot.id).first)
+        try context.botStore.setRoutineEnabled(id: routine.definition.id, enabled: true)
+        try context.botStore.upsertAttention(
+            BotAttentionItem(botID: bot.id, kind: .approval, title: "Approve vendor brief")
+        )
+
+        vm.openHome(bot)
+
+        XCTAssertEqual(vm.liveMemoryCount, 1, "forgotten facts must not inflate Memory")
+        XCTAssertEqual(vm.enabledSkillCount, 1, "disabled skills must not inflate Skills")
+        XCTAssertEqual(vm.enabledRoutineCount, 1)
+        XCTAssertEqual(vm.pendingApprovalCount, 1)
+        XCTAssertFalse(vm.isAutonomyActive, "P1a routines stay app-closed off")
+    }
+
     func test_beginCreateOpensDeskImmediately_becauseATeammateShouldNotRequireStudioFirst() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -107,6 +228,10 @@ final class BotsWindowTests: XCTestCase {
             vm.desktopHonestyLabel.lowercased().contains("not isolated"),
             "Studio must repeat the logical-space honesty label"
         )
+        XCTAssertEqual(
+            vm.desktopHonestyLabel,
+            "Same macOS account; not isolated. Not a dedicated Desktop."
+        )
         XCTAssertTrue(
             BotDesktopKind.logicalExecutionSpaceHonestyLabel.lowercased().contains("not isolated")
         )
@@ -115,6 +240,17 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("desktopHonestyLabel"))
         XCTAssertTrue(source.contains("Not shipped"))
         XCTAssertFalse(source.contains("Isolated / Dedicated VM"))
+        XCTAssertFalse(
+            source.contains("Running • macOS VM"),
+            "Fleet Home must not paint the concept's fake dedicated VM"
+        )
+        XCTAssertFalse(
+            source.contains("Dedicated Desktop"),
+            "P1a has no dedicated Desktop; the concept screenshot is not the contract"
+        )
+        XCTAssertTrue(source.contains("bots.home.desktop.honesty"))
+        XCTAssertTrue(source.contains("BotRoutineCopy.testRunHonestyCaption"))
+        XCTAssertTrue(source.contains("app-closed off"))
     }
 
     func test_attentionItemAppearsAfterSendThatNeedsTheUser() throws {
@@ -332,6 +468,7 @@ final class BotsWindowTests: XCTestCase {
 
         XCTAssertTrue(main.contains("presentBotsInMainContent"))
         XCTAssertTrue(main.contains("installBotsContent"))
+        XCTAssertTrue(main.contains("vm.openFleet()"))
         XCTAssertTrue(main.contains("case bots"))
         XCTAssertTrue(main.contains("visibleWorkspaceLabel.stringValue = \"Bots\""))
         XCTAssertTrue(sidebar.contains("onPresentBots"))
@@ -342,6 +479,15 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.fleet.row."))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.roster\")"))
         XCTAssertTrue(bots.contains("bots.roster.row."))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.home\")"))
+        XCTAssertTrue(bots.contains("bots.home.chat"))
+        XCTAssertTrue(bots.contains("bots.home.studio"))
+        XCTAssertTrue(bots.contains("bots.home.desktop"))
+        XCTAssertTrue(bots.contains("bots.home.activity"))
+        XCTAssertTrue(bots.contains("bots.home.memory"))
+        XCTAssertTrue(bots.contains("bots.home.skills"))
+        XCTAssertTrue(bots.contains("bots.home.routines"))
+        XCTAssertTrue(bots.contains("bots.home.approvals"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.composer\")"))
         XCTAssertFalse(main.contains("SurfaceType.bot"))
         XCTAssertFalse(bots.contains("SurfaceType.bot"))
