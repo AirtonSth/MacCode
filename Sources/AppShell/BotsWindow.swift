@@ -143,6 +143,8 @@ public final class BotsViewModel: ObservableObject {
     private let settingsStore: SettingsStore
     private var messagesByBot: [BotID: [BotDeskMessage]] = [:]
     private var attentionStateByBot: [BotID: BotAttentionState] = [:]
+    private var lastPreviewByBot: [BotID: String] = [:]
+    private var lastUpdatedByBot: [BotID: Date] = [:]
 
     public init(context: AppContext, router: AppCommandRouter? = nil) {
         self.context = context
@@ -178,7 +180,25 @@ public final class BotsViewModel: ObservableObject {
     public var openAttentionCount: Int { attentionItems.count }
 
     public func attentionState(for bot: BotDefinition) -> BotAttentionState {
-        attentionStateByBot[bot.id] ?? .none
+        let state = attentionStateByBot[bot.id] ?? .none
+        if isViewing(bot.id), state == .unreadActivity { return .none }
+        return state
+    }
+
+    public func isViewing(_ botID: BotID) -> Bool {
+        selectedBotID == botID && screen == .desk
+    }
+
+    public func rosterPreview(for bot: BotDefinition) -> String {
+        if let preview = lastPreviewByBot[bot.id], !preview.isEmpty {
+            return BotsDeskFollowThrough.displayUserText(from: preview)
+        }
+        if !bot.title.isEmpty { return bot.title }
+        return "No job yet"
+    }
+
+    public func rosterTimestamp(for bot: BotDefinition) -> Date? {
+        lastUpdatedByBot[bot.id]
     }
 
     public func reload() {
@@ -256,7 +276,6 @@ public final class BotsViewModel: ObservableObject {
                 if conversation.attentionState == .unreadActivity {
                     conversation.attentionState = .none
                 }
-                conversation.updatedAt = Date()
                 try botStore.upsertConversation(conversation)
             }
             for item in try botStore.listAttention() where item.botID == botID && item.acknowledgedAt == nil && item.kind == .unread {
@@ -614,6 +633,29 @@ public final class BotsViewModel: ObservableObject {
     private func reloadFleet() {
         do {
             bots = try botStore.list(includeHidden: showHidden)
+            var previews: [BotID: String] = [:]
+            var updated: [BotID: Date] = [:]
+            for bot in bots {
+                if let last = messagesByBot[bot.id]?.last, !last.text.isEmpty {
+                    previews[bot.id] = last.text
+                    updated[bot.id] = last.createdAt
+                    continue
+                }
+                guard let conversation = try botStore.listConversations(botID: bot.id).first else { continue }
+                if let threadID = conversation.linkedAgentThreadID,
+                   let stored = try? context.messageRepo.listRecent(threadId: threadID, limit: 8),
+                   let last = stored.last(where: { $0.role == .user || $0.role == .assistant }) {
+                    previews[bot.id] = last.role == .user
+                        ? BotsDeskFollowThrough.displayUserText(from: last.content)
+                        : last.content
+                    updated[bot.id] = last.createdAt
+                } else if !conversation.title.isEmpty {
+                    previews[bot.id] = conversation.title
+                    updated[bot.id] = conversation.updatedAt
+                }
+            }
+            lastPreviewByBot = previews
+            lastUpdatedByBot = updated
             rebuildAttentionStates()
         } catch {
             errorMessage = String(describing: error)
@@ -678,11 +720,18 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    private func conversationForBot(_ botID: BotID) -> BotConversation? {
+        if let selected = selectedConversation, selected.botID == botID {
+            return selected
+        }
+        return (try? botStore.listConversations(botID: botID).first)
+    }
+
     private func restoreDeskMessages(botID: BotID) {
         let cached = messagesByBot[botID] ?? []
+        let conversation = conversationForBot(botID)
         var persisted: [BotDeskMessage] = []
-        if let conversation = selectedConversation,
-           let threadID = conversation.linkedAgentThreadID,
+        if let threadID = conversation?.linkedAgentThreadID,
            let stored = try? context.messageRepo.listRecent(threadId: threadID, limit: 80),
            !stored.isEmpty {
             persisted = stored.compactMap { message -> BotDeskMessage? in
@@ -701,18 +750,27 @@ public final class BotsViewModel: ObservableObject {
                 return BotDeskMessage(role: role, text: text, createdAt: message.createdAt)
             }
         }
-        let visible = BotsDeskFollowThrough.visibleDeskMessages(cached: cached, persisted: persisted)
-        if visible.isEmpty, let conversation = selectedConversation, !conversation.title.isEmpty {
-            deskMessages = [BotDeskMessage(role: .user, text: conversation.title, createdAt: conversation.createdAt)]
-        } else {
+        var visible = BotsDeskFollowThrough.visibleDeskMessages(cached: cached, persisted: persisted)
+        if visible.isEmpty, let conversation, !conversation.title.isEmpty {
+            visible = [BotDeskMessage(role: .user, text: conversation.title, createdAt: conversation.createdAt)]
+        }
+        messagesByBot[botID] = visible
+        if selectedBotID == botID {
             deskMessages = visible
         }
-        messagesByBot[botID] = deskMessages
+        if let last = visible.last, !last.text.isEmpty {
+            lastPreviewByBot[botID] = last.text
+            lastUpdatedByBot[botID] = last.createdAt
+        }
     }
 
     private func appendDeskMessage(_ message: BotDeskMessage, botID: BotID) {
-        deskMessages.append(message)
+        if selectedBotID == botID {
+            deskMessages.append(message)
+        }
         messagesByBot[botID, default: []].append(message)
+        lastPreviewByBot[botID] = message.text
+        lastUpdatedByBot[botID] = message.createdAt
     }
 
     @discardableResult
@@ -738,7 +796,9 @@ public final class BotsViewModel: ObservableObject {
             next.attentionState = .needsAttention
             next.updatedAt = Date()
             try botStore.upsertConversation(next)
-            selectedConversation = next
+            if selectedConversation?.id == next.id {
+                selectedConversation = next
+            }
             try botStore.upsertAttention(
                 BotAttentionItem(
                     botID: bot.id,
@@ -850,14 +910,30 @@ public final class BotsViewModel: ObservableObject {
         conversation: BotConversation,
         run: AgentRun?
     ) {
+        var next = conversation
+        if let selected = selectedConversation, selected.id == conversation.id {
+            next = selected
+        } else if let stored = try? botStore.listConversations(botID: bot.id).first(where: { $0.id == conversation.id }) {
+            next = stored
+            if next.linkedAgentThreadID == nil {
+                next.linkedAgentThreadID = conversation.linkedAgentThreadID
+            }
+        }
         restoreDeskMessages(botID: bot.id)
         let status = run?.status ?? .interrupted
-        var next = selectedConversation ?? conversation
-        next.attentionState = BotsDeskFollowThrough.conversationState(for: status)
+        let viewingDesk = isViewing(bot.id)
+        next.attentionState = BotsDeskFollowThrough.conversationState(for: status, viewingDesk: viewingDesk)
+        if viewingDesk {
+            next.unread = false
+        } else if status == .completed {
+            next.unread = true
+        }
         next.updatedAt = Date()
         do {
             try botStore.upsertConversation(next)
-            selectedConversation = next
+            if selectedConversation?.id == next.id {
+                selectedConversation = next
+            }
             if let kind = BotsDeskFollowThrough.attentionKind(for: status) {
                 try botStore.upsertAttention(
                     BotAttentionItem(
@@ -893,6 +969,24 @@ public final class BotsViewModel: ObservableObject {
     static func composeRunPrompt(bot: BotDefinition, revision: BotRevision, userText: String) -> String {
         BotsDeskFollowThrough.composeRunPrompt(bot: bot, revision: revision, userText: userText)
     }
+
+    func applyFollowThroughForTests(
+        bot: BotDefinition,
+        conversation: BotConversation,
+        status: AgentRunStatus
+    ) {
+        applyFollowThrough(
+            bot: bot,
+            conversation: conversation,
+            run: AgentRun(
+                threadId: conversation.linkedAgentThreadID ?? AgentThreadID(),
+                provider: .claude,
+                model: "test",
+                status: status,
+                finishedAt: Date()
+            )
+        )
+    }
 }
 
 // MARK: - Root view
@@ -905,17 +999,27 @@ public struct BotsRootView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            switch vm.screen {
-            case .fleet:
-                fleetScreen
-            case .studio:
-                studioScreen
-            case .desk:
-                deskScreen
-            case .attention:
-                attentionScreen
+        HStack(spacing: 0) {
+            if showsRosterRail {
+                rosterRail
+                Rectangle()
+                    .fill(DS.Palette.line)
+                    .frame(width: 1)
+                    .accessibilityHidden(true)
             }
+            Group {
+                switch vm.screen {
+                case .fleet:
+                    fleetScreen
+                case .studio:
+                    studioScreen
+                case .desk:
+                    deskScreen
+                case .attention:
+                    attentionScreen
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 980, minHeight: 680)
         .background(DS.Palette.bg)
@@ -953,6 +1057,124 @@ public struct BotsRootView: View {
             return "Delete \(bot.name)?"
         }
         return "Delete this Bot?"
+    }
+
+    private var showsRosterRail: Bool {
+        vm.isControlPlaneActive && !vm.bots.isEmpty
+    }
+
+    // MARK: Roster
+
+    private var rosterRail: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: DS.Space.sm) {
+                Text("Teammates")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                Spacer(minLength: 0)
+                Button(action: vm.openAttention) {
+                    Image(systemName: vm.openAttentionCount == 0 ? "bell" : "bell.badge")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(vm.openAttentionCount == 0 ? DS.Palette.textTertiary : DS.Palette.warning)
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    vm.openAttentionCount == 0
+                        ? "Attention"
+                        : "Attention \(vm.openAttentionCount)"
+                )
+                .accessibilityIdentifier("bots.roster.attention")
+                Button(action: vm.beginCreate) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(DS.Palette.text)
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .disabled(!vm.isControlPlaneActive)
+                .accessibilityLabel("New Bot")
+                .accessibilityIdentifier("bots.roster.new")
+            }
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.top, DS.Space.xl)
+            .padding(.bottom, DS.Space.md)
+
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityHidden(true)
+                TextField("Search", text: $vm.searchText)
+                    .textFieldStyle(.plain)
+                    .foregroundColor(DS.Palette.text)
+            }
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.vertical, DS.Space.sm)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.bottom, DS.Space.md)
+
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(vm.fleet, id: \.id) { bot in
+                        rosterRow(bot)
+                    }
+                }
+                .padding(.horizontal, DS.Space.sm)
+                .padding(.bottom, DS.Space.lg)
+            }
+        }
+        .frame(width: 268)
+        .background(DS.Palette.surface)
+        .accessibilityIdentifier("bots.roster")
+    }
+
+    private func rosterRow(_ bot: BotDefinition) -> some View {
+        let selected = vm.selectedBotID == bot.id && vm.screen != .fleet && vm.screen != .attention
+        return Button {
+            vm.openDesk(bot)
+        } label: {
+            HStack(alignment: .top, spacing: DS.Space.md) {
+                Image(systemName: bot.avatarSymbol)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Palette.accent)
+                    .frame(width: 28, height: 28)
+                    .background(DS.Palette.accent.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+                        Text(rosterNameLine(bot))
+                            .font(DS.Font.caption.weight(.semibold))
+                            .foregroundColor(DS.Palette.text)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        if let stamp = vm.rosterTimestamp(for: bot) {
+                            Text(stamp, style: .time)
+                                .font(DS.Font.caption2)
+                                .foregroundColor(DS.Palette.textTertiary)
+                        }
+                    }
+                    Text(vm.rosterPreview(for: bot))
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .lineLimit(2)
+                }
+            }
+            .padding(.horizontal, DS.Space.md)
+            .padding(.vertical, DS.Space.md)
+            .background(selected ? DS.Palette.accent.opacity(0.12) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("bots.roster.row.\(bot.handle)")
+    }
+
+    private func rosterNameLine(_ bot: BotDefinition) -> String {
+        if bot.title.isEmpty { return bot.name }
+        return "\(bot.name) · \(bot.title)"
     }
 
     // MARK: Fleet
@@ -1086,7 +1308,7 @@ public struct BotsRootView: View {
                             DSPill("Hidden", tone: .neutral)
                         }
                     }
-                    Text(bot.title.isEmpty ? "No job yet" : bot.title)
+                    Text(vm.rosterPreview(for: bot))
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.textSecondary)
                         .lineLimit(1)
@@ -1355,7 +1577,9 @@ public struct BotsRootView: View {
 
     private func deskHeader(_ bot: BotDefinition) -> some View {
         HStack(spacing: DS.Space.lg) {
-            backButton { vm.openFleet() }
+            if !showsRosterRail {
+                backButton { vm.openFleet() }
+            }
             Image(systemName: bot.avatarSymbol)
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(DS.Palette.accent)
@@ -1490,7 +1714,7 @@ public struct BotsRootView: View {
             DSSectionHeaderG("Brain / Memory")
             if vm.isMemoryActive {
                 HStack(alignment: .top, spacing: DS.Space.md) {
-                    studioMultiline(text: $vm.memoryDraft, minHeight: 56)
+                    studioMultiline(text: $vm.memoryDraft, minHeight: 56, maxHeight: 72)
                     Button("Add") { vm.addMemory() }
                         .buttonStyle(DSPrimaryButtonStyle())
                         .disabled(vm.memoryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -1569,7 +1793,7 @@ public struct BotsRootView: View {
                     .foregroundColor(DS.Palette.textTertiary)
             }
             labeledField("Name") { studioField(placeholder: "Morning scan", text: $vm.routineName) }
-            labeledField("Prompt") { studioMultiline(text: $vm.routinePrompt, minHeight: 72) }
+            labeledField("Instruction") { studioMultiline(text: $vm.routinePrompt, minHeight: 72, maxHeight: 140) }
             labeledField("When") { studioField(placeholder: "Weekdays 9:00", text: $vm.routineScheduleNote) }
             Button("Save routine") { vm.saveRoutine() }
                 .buttonStyle(DSSecondaryButtonStyle())
@@ -1724,12 +1948,12 @@ public struct BotsRootView: View {
             )
     }
 
-    private func studioMultiline(text: Binding<String>, minHeight: CGFloat) -> some View {
+    private func studioMultiline(text: Binding<String>, minHeight: CGFloat, maxHeight: CGFloat? = nil) -> some View {
         TextEditor(text: text)
             .font(DS.Font.body)
             .foregroundColor(DS.Palette.text)
             .scrollContentBackground(.hidden)
-            .frame(minHeight: minHeight)
+            .frame(minHeight: minHeight, maxHeight: maxHeight)
             .padding(.horizontal, DS.Space.md)
             .padding(.vertical, DS.Space.md)
             .background(DS.Palette.surfaceRaised)

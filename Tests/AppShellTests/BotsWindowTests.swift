@@ -140,10 +140,98 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(BotsDeskFollowThrough.conversationState(for: .running), .working)
         XCTAssertEqual(BotsDeskFollowThrough.conversationState(for: .completed), .unreadActivity)
         XCTAssertEqual(BotsDeskFollowThrough.conversationState(for: .failed), .needsAttention)
+        XCTAssertEqual(
+            BotsDeskFollowThrough.conversationState(for: .completed, viewingDesk: true),
+            .none,
+            "the open Desk is already being read; Unread is for the rest of the fleet"
+        )
+        XCTAssertEqual(
+            BotsDeskFollowThrough.conversationState(for: .completed, viewingDesk: false),
+            .unreadActivity
+        )
         XCTAssertNil(BotsDeskFollowThrough.attentionKind(for: .completed))
         XCTAssertEqual(BotsDeskFollowThrough.attentionKind(for: .failed), .blocked)
         XCTAssertTrue(BotsDeskFollowThrough.isTerminal(.completed))
         XCTAssertFalse(BotsDeskFollowThrough.isTerminal(.running))
+    }
+
+    func test_rosterPreviewPrefersLastDeskLine_becauseGrokShowsTheLastLine() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.send("Say hello in one short sentence.")
+        XCTAssertEqual(vm.rosterPreview(for: bot), BotsViewModel.assistantPlaceholder)
+    }
+
+    func test_openDeskHidesUnreadOnTheViewedBot_becauseYouAreAlreadyReadingIt() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Standup", unread: true, attentionState: .unreadActivity)
+        )
+        vm.reload()
+        XCTAssertEqual(vm.attentionState(for: bot), .unreadActivity)
+        vm.openDesk(bot)
+        XCTAssertEqual(vm.attentionState(for: bot), .none)
+    }
+
+    func test_studioDoesNotHideUnread_becauseOnlyTheOpenDeskIsBeingRead() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Standup", unread: true, attentionState: .unreadActivity)
+        )
+        vm.reload()
+        vm.beginEdit(bot)
+        XCTAssertEqual(vm.screen, .studio)
+        XCTAssertEqual(vm.attentionState(for: bot), .unreadActivity)
+    }
+
+    func test_markingDeskReadDoesNotRewriteActivityTimestamp() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let stamped = Date(timeIntervalSince1970: 1_700_000_000)
+        try context.botStore.upsertConversation(
+            BotConversation(
+                botID: bot.id,
+                title: "Standup",
+                unread: true,
+                attentionState: .unreadActivity,
+                createdAt: stamped,
+                updatedAt: stamped
+            )
+        )
+        vm.openDesk(bot)
+        let stored = try XCTUnwrap(context.botStore.listConversations(botID: bot.id).first)
+        XCTAssertEqual(stored.updatedAt, stamped)
+        XCTAssertFalse(stored.unread)
+    }
+
+    func test_followThroughOnBackgroundBotDoesNotOverwriteOpenDesk() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        let piperConversation = BotConversation(botID: piper.id, title: "From Piper")
+        try context.botStore.upsertConversation(piperConversation)
+        vm.openDesk(quinn)
+        let quinnMessages = vm.deskMessages
+
+        vm.applyFollowThroughForTests(bot: piper, conversation: piperConversation, status: .completed)
+
+        XCTAssertEqual(vm.selectedBotID, quinn.id)
+        XCTAssertEqual(vm.deskMessages, quinnMessages)
+        XCTAssertEqual(
+            try context.botStore.listConversations(botID: piper.id).first?.attentionState,
+            .unreadActivity
+        )
+        XCTAssertEqual(vm.attentionState(for: piper), .unreadActivity)
+        XCTAssertEqual(vm.attentionState(for: quinn), .none)
     }
 
     func test_visibleDeskMessagesPrefersPersistedAssistantOverWorkingCache() {
@@ -252,6 +340,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(sidebar.contains("accessibilityIdentifier(\"sidebar.bots\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.new\")"))
         XCTAssertTrue(bots.contains("bots.fleet.row."))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.roster\")"))
+        XCTAssertTrue(bots.contains("bots.roster.row."))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.composer\")"))
         XCTAssertFalse(main.contains("SurfaceType.bot"))
         XCTAssertFalse(bots.contains("SurfaceType.bot"))

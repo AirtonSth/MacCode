@@ -15,6 +15,13 @@ enum BotsDeskFollowThrough {
         }
     }
 
+    /// A completed turn on the open Desk is already being read — do not badge it Unread.
+    static func conversationState(for status: AgentRunStatus, viewingDesk: Bool) -> BotAttentionState {
+        let state = conversationState(for: status)
+        if viewingDesk && state == .unreadActivity { return .none }
+        return state
+    }
+
     static func attentionKind(for status: AgentRunStatus) -> BotAttentionItemKind? {
         switch status {
         case .pending, .running, .completed:
