@@ -85,6 +85,10 @@ public enum RCWireProtocol {
         #"\b(?:do\s+not|does\s+not|did\s+not|not|never|without|unless|except|only|must\s+not|cannot|can't|don't|won't)\b"#
     ].compactMap { try? NSRegularExpression(pattern: $0, options: [.caseInsensitive]) }
 
+    public static func exactGoalRepetitionContext(count: Int) -> String {
+        "Human repeated G verbatim \(count) times."
+    }
+
     public static func prefixDisposition(_ text: String) -> RCWirePrefixDisposition {
         guard !text.isEmpty else { return .undecided }
         if version.hasPrefix(text) { return .undecided }
@@ -156,6 +160,38 @@ public enum RCWireProtocol {
     ) -> Bool {
         let source = frames.flatMap(\.records).map(\.value).joined(separator: "\n")
         return protectedSemanticSpans(in: source).allSatisfy { rendered.contains($0) }
+    }
+
+    /// Strict reconstructive gate for Human -> RCW1 request translation.
+    ///
+    /// A frame is accepted only when its G bytes are the exact Human input, or
+    /// when one G unit plus one host-owned count declaration reconstructs every
+    /// Human byte. Semantic paraphrases are intentionally unsupported: if Swift
+    /// cannot prove reversibility, the caller sends exact Human instead.
+    public static func preservesRequestMeaning(original: String, wire: String) -> Bool {
+        guard let frames = try? parse(wire),
+              frames.allSatisfy({ $0.direction == .request }) else { return false }
+        let records = frames.flatMap(\.records)
+        guard records.allSatisfy({ record in
+            switch record.kind {
+            case .goal, .context, .constraint:
+                return true
+            case .exact:
+                return record.value.hasPrefix("[[rc:") && record.value.hasSuffix("]]")
+            case .outcome, .action, .evidence, .risk, .question:
+                return false
+            }
+        }) else { return false }
+
+        let goal = records.filter { $0.kind == .goal }.map(\.value).joined()
+        guard !goal.isEmpty else { return false }
+        let auxiliary = records.filter { $0.kind == .context || $0.kind == .constraint }
+        guard auxiliary.count <= 1 else { return false }
+        guard let declaration = auxiliary.first else { return goal == original }
+        guard let count = exactGoalRepetitionCount(in: declaration.value), count >= 3 else {
+            return false
+        }
+        return originalIsExactRepetition(of: goal, count: count, original: original)
     }
 
     public static func requiresDeterministicRendering(_ frames: [RCWireFrame]) -> Bool {
@@ -377,6 +413,38 @@ public enum RCWireProtocol {
             }
         }
         return spans
+    }
+
+    private static func exactGoalRepetitionCount(in value: String) -> Int? {
+        let prefix = "Human repeated G verbatim "
+        let suffix = " times."
+        guard value.hasPrefix(prefix), value.hasSuffix(suffix) else { return nil }
+        let start = value.index(value.startIndex, offsetBy: prefix.count)
+        let end = value.index(value.endIndex, offsetBy: -suffix.count)
+        let digits = value[start..<end]
+        guard !digits.isEmpty, digits.allSatisfy(\.isNumber) else { return nil }
+        return Int(digits)
+    }
+
+    private static func originalIsExactRepetition(of unit: String, count: Int, original: String) -> Bool {
+        guard !unit.isEmpty, count <= original.utf8.count else { return false }
+        let originalBytes = original.utf8.count
+        let unitBytes = unit.utf8.count
+        for separator in ["", " ", "\n", "\n\n"] {
+            let separatorBytes = separator.utf8.count
+            let (unitsBytes, unitsOverflow) = unitBytes.multipliedReportingOverflow(by: count)
+            let (separatorsBytes, separatorsOverflow) = separatorBytes.multipliedReportingOverflow(by: count - 1)
+            let (expectedBytes, sumOverflow) = unitsBytes.addingReportingOverflow(separatorsBytes)
+            guard !unitsOverflow, !separatorsOverflow, !sumOverflow,
+                  expectedBytes == originalBytes else {
+                continue
+            }
+            let reconstructed = separator.isEmpty
+                ? String(repeating: unit, count: count)
+                : Array(repeating: unit, count: count).joined(separator: separator)
+            if reconstructed == original { return true }
+        }
+        return false
     }
 
     private static func escape(_ value: String) -> String {

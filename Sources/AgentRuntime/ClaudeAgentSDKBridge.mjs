@@ -72,7 +72,10 @@ const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['edit', 'write', 'multiedit', 'noteb
 // AGENTS.md: never distill exact-output shell tools. Bash commands whose primary
 // binary is one of these must stay full stdout for line slices / matches.
 const TOKEN_SAVER_EXACT_OUTPUT_BASH = new Set([
-  'rg', 'grep', 'sed', 'awk', 'cat', 'head', 'tail', 'nl', 'cut', 'tr', 'diff',
+  'rg', 'grep', 'egrep', 'fgrep', 'ag', 'ugrep',
+  'sed', 'awk', 'gawk', 'nawk', 'cut', 'tr', 'paste',
+  'cat', 'head', 'tail', 'nl', 'tac',
+  'diff', 'cmp', 'od', 'hexdump', 'xxd', 'base64',
   'jq', 'yq',
 ]);
 // Per-tool compression contracts. Tools not listed here fall back to
@@ -131,28 +134,92 @@ function shellCommandSegments(command) {
     .filter(Boolean);
 }
 
+function unquoteShellToken(token) {
+  return String(token || '').replace(/^[\"']+|[\"']+$/g, '');
+}
+
+function shellWords(input) {
+  const words = [];
+  let current = '';
+  let quote = null;
+  let escaping = false;
+  let hasToken = false;
+  for (const character of String(input || '')) {
+    if (escaping) {
+      current += character;
+      escaping = false;
+      hasToken = true;
+      continue;
+    }
+    if (quote !== null) {
+      if (character === quote) {
+        quote = null;
+        hasToken = true;
+      } else if (quote === '"' && character === '\\') {
+        escaping = true;
+      } else {
+        current += character;
+        hasToken = true;
+      }
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (hasToken) {
+        words.push(current);
+        current = '';
+        hasToken = false;
+      }
+    } else if (character === "'" || character === '"') {
+      quote = character;
+      hasToken = true;
+    } else if (character === '\\') {
+      escaping = true;
+      hasToken = true;
+    } else {
+      current += character;
+      hasToken = true;
+    }
+  }
+  if (escaping) current += '\\';
+  if (hasToken) words.push(current);
+  return words;
+}
+
 function stripShellPrefixes(segment) {
-  let tokens = String(segment || '').trim().split(/\s+/).filter(Boolean);
+  let tokens = shellWords(segment);
   // Peel common launch prefixes until stable: env [-u NAME] [-i] VAR=val,
   // FOO=bar, command/builtin/exec wrappers.
   let progressed = true;
   while (progressed && tokens.length > 0) {
     progressed = false;
-    const head = tokens[0];
+    const rawHead = tokens[0];
+    const head = (rawHead.split(/[/\\]/).pop() || rawHead).toLowerCase();
     if (head === 'env') {
       tokens.shift();
       while (tokens.length > 0) {
-        const t = tokens[0];
-        if (t === '-i' || t === '-0' || t === '-S' || t === '--ignore-environment') {
+        const t = unquoteShellToken(tokens[0]);
+        if (t === '--') {
+          tokens.shift();
+          break;
+        }
+        if (t === '-S') {
+          tokens.shift();
+          if (tokens.length > 0) {
+            const splitString = tokens.shift();
+            tokens.unshift(...shellWords(splitString));
+          }
+          continue;
+        }
+        if (t === '-i' || t === '-0' || t === '-v' || /^-[0iv]+$/.test(t) || t === '--ignore-environment') {
           tokens.shift();
           continue;
         }
-        if (t === '-u' || t === '--unset') {
+        if (t === '-u' || t === '--unset' || t === '-C' || t === '-P' || t === '--chdir' || t === '--path') {
           tokens.shift();
           if (tokens.length) tokens.shift();
           continue;
         }
-        if (t.startsWith('-u') && t.length > 2) {
+        if ((t.startsWith('-u') || t.startsWith('-C') || t.startsWith('-P')) && t.length > 2) {
           tokens.shift();
           continue;
         }
@@ -167,6 +234,11 @@ function stripShellPrefixes(segment) {
     }
     if (head === 'command' || head === 'builtin' || head === 'exec') {
       tokens.shift();
+      while (tokens.length > 0 && tokens[0].startsWith('-')) {
+        const option = tokens.shift();
+        if (option === '--') break;
+        if (head === 'exec' && option === '-a' && tokens.length > 0) tokens.shift();
+      }
       progressed = true;
       continue;
     }
@@ -176,13 +248,12 @@ function stripShellPrefixes(segment) {
       continue;
     }
   }
-  return tokens.join(' ').trim();
+  return tokens;
 }
 
 function firstCommandToken(segment) {
-  const text = stripShellPrefixes(segment);
-  if (!text) return '';
-  const token = text.split(/\s+/)[0] || '';
+  const tokens = stripShellPrefixes(segment);
+  const token = unquoteShellToken(tokens[0] || '');
   // path/to/rg or /usr/bin/grep → basename
   const base = token.split(/[/\\]/).pop() || token;
   return base.toLowerCase();
@@ -193,7 +264,7 @@ function gitExactOutputSubcommand(segment) {
   // Global options that take a value: -C, -c, --git-dir, --work-tree, --namespace, ...
   // Apply the same env/prefix stripping as firstCommandToken so
   // `FOO=bar git show HEAD` is recognized.
-  const parts = stripShellPrefixes(segment).split(/\s+/).filter(Boolean);
+  const parts = stripShellPrefixes(segment).map(unquoteShellToken);
   if ((parts[0] || '').toLowerCase().split(/[/\\]/).pop() !== 'git') return null;
   const valueOptions = new Set([
     '-C', '-c', '--git-dir', '--work-tree', '--namespace',

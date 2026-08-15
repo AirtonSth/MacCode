@@ -1,7 +1,35 @@
 import XCTest
 @testable import AgentRuntime
+@testable import DistillCore
 
 final class DistillInstructionsTemplateTests: XCTestCase {
+    func test_rcWireABIIsCompactAndPinsMinimumProviderNeutralContract() {
+        // WHY: this block is paid on every admitted provider turn. The previous
+        // tutorial-sized ABI cost more tokens than the prompt it was meant to save.
+        let wire = AgentSkillInstaller.rcWireAgentInstructionsTemplate
+
+        XCTAssertLessThanOrEqual(
+            TokenEstimator.estimate(wire),
+            50,
+            "the always-loaded RCW1 ABI must not erase prompt savings"
+        )
+        XCTAssertLessThanOrEqual(wire.utf8.count, 200)
+        XCTAssertTrue(wire.contains("REMOTE_CODE_WIRE_V1"))
+        XCTAssertTrue(wire.contains("Current RCW1 Q"))
+        XCTAssertTrue(wire.contains("G/C/K=task"))
+        XCTAssertTrue(wire.contains("X=handle"))
+        XCTAssertTrue(wire.contains(#"RCW1 A:O/A/E/R/Q+".""#))
+        XCTAssertTrue(wire.contains("full tokens<=45%"))
+        XCTAssertTrue(wire.contains("semantically identical terse text"))
+        XCTAssertTrue(wire.contains("else same text"))
+        XCTAssertFalse(wire.contains("tokens<same terse text"),
+                       "the former any-positive-savings gate was too permissive")
+        XCTAssertFalse(wire.contains("Reply only RCW1 A"),
+                       "an unprofitable response must fail open to terse plaintext")
+        XCTAssertTrue(wire.contains("literals/negation/order/approval"))
+        XCTAssertTrue(wire.contains("tools native"))
+    }
+
     func test_instructionsCarryHardPipeHeuristicAndRetrieveNote() {
         let t = AgentSkillInstaller.distillAgentInstructionsTemplate
         // WHY: the shipped policy is fidelity-based, not volume-based. An earlier
@@ -114,16 +142,18 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         )
         XCTAssertEqual(wireOnly, "base only",
                        "a per-turn flag cannot enable protocol code while Token Saver capability is off")
-        XCTAssertTrue(on.contains("authoritative per-turn admission"),
+        XCTAssertTrue(on.contains("Current RCW1 Q"),
                       "the request header, not an environment variable, is authoritative per turn")
-        XCTAssertTrue(on.contains("including progress/commentary and the final answer"),
-                      "all user-visible assistant text must stay inside the decodable wire contract")
-        XCTAssertTrue(on.contains("Never emit ordinary prose outside the frame"),
-                      "mixed plain and wire responses would bypass the deterministic renderer")
-        XCTAssertTrue(on.contains("optional recovery metadata"),
+        XCTAssertTrue(on.contains("full tokens<=45%"),
+                      "providers must enforce the complete response-frame profitability threshold")
+        XCTAssertTrue(on.contains("semantically identical terse text"),
+                      "the token comparison must hold response meaning constant")
+        XCTAssertTrue(on.contains("else same text"),
+                      "an expanding response must fail open to the same terse plaintext")
+        XCTAssertTrue(on.contains("X=handle"),
                       "a recovery handle must not make providers retrieve redundant prompt text by default")
-        XCTAssertTrue(on.contains("Never ask the user to run or approve retrieval in ordinary prose"),
-                      "retrieval approvals belong to native provider callbacks, never an undecodable chat response")
+        XCTAssertTrue(on.contains("tools native"),
+                      "tool and approval callbacks remain provider-native, never encoded as chat prose")
         XCTAssertFalse(on.contains("R0 micro"))
     }
 }

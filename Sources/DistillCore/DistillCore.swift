@@ -927,9 +927,13 @@ public struct LocalDistillRuntime: DistillRuntime {
     }
 
     public func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
-        // Every LocalDistillRuntime path is deterministic (no model), so the engine
-        // attribution is uniformly `.deterministic`.
-        DistillStageResult(output: try await Self.deterministicOutput(request), stage: .deterministic)
+        if request.mode == .wireEncode {
+            if let repeated = MLXDistillRuntime.deterministicExactRepeatWireOutput(for: request) {
+                return DistillStageResult(output: repeated, stage: .deterministic)
+            }
+            return DistillStageResult(output: request.input, stage: .verbatim)
+        }
+        return DistillStageResult(output: try await Self.deterministicOutput(request), stage: .deterministic)
     }
 
     private static func deterministicOutput(_ request: DistillRequest) async throws -> String {
@@ -960,7 +964,7 @@ public struct LocalDistillRuntime: DistillRuntime {
         case .longText, .watchSummary:
             return String(request.input.prefix(request.maxOutputCharacters))
         case .wireEncode:
-            return (try? RCWireProtocol.serializeRequestText(request.input)) ?? request.input
+            return request.input
         case .wireRenderEnglish:
             guard let frames = try? RCWireProtocol.parse(request.input) else { return request.input }
             return RCWireProtocol.renderEnglish(frames)
@@ -1476,6 +1480,12 @@ public struct MLXDistillRuntime: DistillRuntime {
         if let deterministic = Self.deterministicCommandOutput(for: request) {
             return DistillStageResult(output: deterministic, stage: .deterministic)
         }
+        if let repeated = Self.deterministicExactRepeatWireOutput(for: request) {
+            return DistillStageResult(output: repeated, stage: .deterministic)
+        }
+        if request.mode == .wireEncode {
+            return DistillStageResult(output: request.input, stage: .verbatim)
+        }
 
         // Deterministic content routing (G4): lossless structural compression of
         // JSON/log on the pure "compress this" modes, before the model is invoked.
@@ -1541,6 +1551,100 @@ public struct MLXDistillRuntime: DistillRuntime {
         return Self.guardLossyProseOutput(protocolOutput, request: request)
     }
 
+    /// Collapses only an entire natural-language request repeated byte-for-byte
+    /// at least three times. The frame keeps one exact copy plus the truthful
+    /// repetition count, preserving multiplicity, literals, negation, and order.
+    /// Near-duplicates and mixed surrounding prose fail open to exact Human.
+    /// The service attaches its normal recovery record downstream.
+    static func deterministicExactRepeatWireOutput(for request: DistillRequest) -> String? {
+        guard request.mode == .wireEncode,
+              let repetition = exactRepeatedNaturalLanguageUnit(in: request.input),
+              let goalWire = try? RCWireProtocol.serializeRequestText(repetition.unit),
+              let wire = try? RCWireProtocol.addingRequestRecords(
+                [.init(
+                    kind: .context,
+                    value: RCWireProtocol.exactGoalRepetitionContext(count: repetition.count)
+                )],
+                to: goalWire
+              ) else {
+            return nil
+        }
+        let guarded = guardLossyProseOutput(wire, request: request)
+        guard guarded == wire,
+              wire.utf8.count < request.input.utf8.count else {
+            return nil
+        }
+        return wire
+    }
+
+    private static func exactRepeatedNaturalLanguageUnit(in input: String) -> (unit: String, count: Int)? {
+        let maximumDeterministicRepeatBytes = 512 * 1_024
+        let inputBytes = Array(input.utf8)
+        guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !input.contains("```"),
+              inputBytes.count <= maximumDeterministicRepeatBytes else {
+            return nil
+        }
+
+        for separator in ["", " ", "\n", "\n\n"] {
+            if let repetition = exactPeriodicUnit(
+                inputBytes: inputBytes,
+                separatorBytes: Array(separator.utf8)
+            ), isNaturalLanguageRepeatUnit(repetition.unit) {
+                return repetition
+            }
+        }
+        return nil
+    }
+
+    /// KMP prefix-function period detection keeps the repeat lane linear in the
+    /// bounded request size. For a separated repetition, `input + separator` is
+    /// exactly `(unit + separator) * count`.
+    private static func exactPeriodicUnit(
+        inputBytes: [UInt8],
+        separatorBytes: [UInt8]
+    ) -> (unit: String, count: Int)? {
+        var bytes = inputBytes
+        bytes.append(contentsOf: separatorBytes)
+        guard bytes.count >= 3 else { return nil }
+
+        var prefix = [Int](repeating: 0, count: bytes.count)
+        for index in 1..<bytes.count {
+            var matched = prefix[index - 1]
+            while matched > 0, bytes[index] != bytes[matched] {
+                matched = prefix[matched - 1]
+            }
+            if bytes[index] == bytes[matched] { matched += 1 }
+            prefix[index] = matched
+        }
+
+        let periodBytes = bytes.count - prefix[bytes.count - 1]
+        guard periodBytes > separatorBytes.count,
+              bytes.count.isMultiple(of: periodBytes) else {
+            return nil
+        }
+        let count = bytes.count / periodBytes
+        guard count >= 3 else { return nil }
+        let unitEnd = periodBytes - separatorBytes.count
+        guard separatorBytes.isEmpty
+                || Array(bytes[unitEnd..<periodBytes]) == separatorBytes,
+              let unit = String(bytes: bytes[..<unitEnd], encoding: .utf8) else {
+            return nil
+        }
+        return (unit, count)
+    }
+
+    private static func isNaturalLanguageRepeatUnit(_ unit: String) -> Bool {
+        let classified = unit.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard classified.utf8.count >= 40,
+              classified.contains(where: { $0.isWhitespace }),
+              let terminal = classified.last,
+              ".!?。！？؟".contains(terminal) else {
+            return false
+        }
+        return classified.unicodeScalars.lazy.filter { CharacterSet.letters.contains($0) }.prefix(20).count == 20
+    }
+
     static func wireRequestFrame(semanticBrief: String) -> String? {
         let brief = semanticBrief.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !brief.isEmpty else { return nil }
@@ -1596,11 +1700,19 @@ public struct MLXDistillRuntime: DistillRuntime {
         case .wireEncode:
             guard let frames = try? RCWireProtocol.parse(output),
                   frames.allSatisfy({ $0.direction == .request }),
-                  RCWireProtocol.preservesProtectedSemantics(original: request.input, wire: output) else {
+                  RCWireProtocol.preservesProtectedSemantics(original: request.input, wire: output),
+                  RCWireProtocol.preservesRequestMeaning(original: request.input, wire: output) else {
                 return request.input
             }
+            let semanticBytes = frames
+                .flatMap(\.records)
+                .filter { $0.kind != .exact }
+                .reduce(into: 0) { $0 += $1.value.utf8.count }
+            guard semanticBytes < request.input.utf8.count else { return request.input }
             let literalGuarded = LiteralPreservation.guarded(original: request.input, compressed: output)
-            return literalGuarded.droppedLiteral == nil ? output : request.input
+            return literalGuarded.droppedLiteral == nil
+                ? output
+                : request.input
         }
     }
 

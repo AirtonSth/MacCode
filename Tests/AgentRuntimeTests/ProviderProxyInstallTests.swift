@@ -158,6 +158,154 @@ final class ProviderProxyInstallTests: XCTestCase {
         XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: userFile.path))
     }
 
+    func test_installProviderProxies_repairsManagedAliasFromRenamedRemoteCodeBundle() throws {
+        // WHY: E2E/canary app products use names such as RemoteCodeRCW1Test.app.
+        // A new live bundle must reclaim all managed aliases from that old build.
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let activeBinary = try fakeServiceBinary(in: home)
+        let realBins = try fakeProviderBins(in: home, names: ProviderProxyCatalog.providers)
+        let oldContents = home
+            .appendingPathComponent("RemoteCodeRCW1Test.app/Contents", isDirectory: true)
+        let oldBinary = oldContents
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("RemoteCodeDistillService")
+        try FileManager.default.createDirectory(
+            at: oldBinary.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("old service".utf8).write(to: oldBinary)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: oldBinary.path
+        )
+        let info: [String: Any] = [
+            "CFBundleIdentifier": "io.remotecode.desktop.debug",
+            "CFBundleExecutable": "RemoteCode",
+            "CFBundlePackageType": "APPL",
+        ]
+        let plist = try PropertyListSerialization.data(
+            fromPropertyList: info,
+            format: .xml,
+            options: 0
+        )
+        try plist.write(to: oldContents.appendingPathComponent("Info.plist"))
+
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let managedBin = installer.managedCLIBinURL
+        try FileManager.default.createDirectory(at: managedBin, withIntermediateDirectories: true)
+        for name in ProviderProxyCatalog.providers + [AgentSkillInstaller.agentAppMiddlewareCommand] {
+            try FileManager.default.createSymbolicLink(
+                at: managedBin.appendingPathComponent(name),
+                withDestinationURL: oldBinary
+            )
+        }
+
+        let installed = try installer.installProviderProxies(
+            serviceBinaryURL: activeBinary,
+            searchDirectoriesOverride: [realBins.path]
+        )
+        let agentApp = try XCTUnwrap(
+            installer.installAgentAppMiddleware(serviceBinaryURL: activeBinary)
+        )
+
+        XCTAssertEqual(Set(installed), Set(ProviderProxyCatalog.providers))
+        XCTAssertEqual(agentApp, managedBin.appendingPathComponent("remote-code"))
+        for name in ProviderProxyCatalog.providers + [AgentSkillInstaller.agentAppMiddlewareCommand] {
+            XCTAssertEqual(
+                try FileManager.default.destinationOfSymbolicLink(
+                    atPath: managedBin.appendingPathComponent(name).path
+                ),
+                activeBinary.path
+            )
+        }
+    }
+
+    func test_installProviderProxies_repairsDanglingAliasFromRemovedCanonicalBundle() throws {
+        // WHY: an app upgrade may remove the old canonical RemoteCode.app
+        // before reconciliation; its now-dangling managed aliases must heal.
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let activeBinary = try fakeServiceBinary(in: home)
+        let realBins = try fakeProviderBins(in: home, names: ProviderProxyCatalog.providers)
+        let removedBinary = home
+            .appendingPathComponent("old/RemoteCode.app/Contents/MacOS")
+            .appendingPathComponent("RemoteCodeDistillService")
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let managedBin = installer.managedCLIBinURL
+        try FileManager.default.createDirectory(at: managedBin, withIntermediateDirectories: true)
+        for name in ProviderProxyCatalog.providers + [AgentSkillInstaller.agentAppMiddlewareCommand] {
+            try FileManager.default.createSymbolicLink(
+                at: managedBin.appendingPathComponent(name),
+                withDestinationURL: removedBinary
+            )
+        }
+
+        let installed = try installer.installProviderProxies(
+            serviceBinaryURL: activeBinary,
+            searchDirectoriesOverride: [realBins.path]
+        )
+        let agentApp = try XCTUnwrap(
+            installer.installAgentAppMiddleware(serviceBinaryURL: activeBinary)
+        )
+
+        XCTAssertEqual(Set(installed), Set(ProviderProxyCatalog.providers))
+        XCTAssertEqual(agentApp, managedBin.appendingPathComponent("remote-code"))
+        for name in ProviderProxyCatalog.providers + [AgentSkillInstaller.agentAppMiddlewareCommand] {
+            XCTAssertEqual(
+                try FileManager.default.destinationOfSymbolicLink(
+                    atPath: managedBin.appendingPathComponent(name).path
+                ),
+                activeBinary.path
+            )
+        }
+    }
+
+    func test_installProviderProxies_preservesLookalikeAppWithForeignBundleIdentifier() throws {
+        // WHY: an .app-shaped path and service basename alone are not proof that
+        // RemoteCode owns a user's symlink in the managed directory.
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let activeBinary = try fakeServiceBinary(in: home)
+        let realBins = try fakeProviderBins(in: home, names: ["grok"])
+        let foreignContents = home
+            .appendingPathComponent("RemoteCodeLookalike.app/Contents", isDirectory: true)
+        let foreignBinary = foreignContents
+            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("RemoteCodeDistillService")
+        try FileManager.default.createDirectory(
+            at: foreignBinary.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("foreign service".utf8).write(to: foreignBinary)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: foreignBinary.path
+        )
+        let plist = try PropertyListSerialization.data(
+            fromPropertyList: ["CFBundleIdentifier": "com.example.lookalike"],
+            format: .xml,
+            options: 0
+        )
+        try plist.write(to: foreignContents.appendingPathComponent("Info.plist"))
+
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let link = installer.managedCLIBinURL.appendingPathComponent("grok")
+        try FileManager.default.createDirectory(
+            at: link.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: foreignBinary)
+
+        XCTAssertFalse(
+            try installer.installProviderProxies(
+                serviceBinaryURL: activeBinary,
+                searchDirectoriesOverride: [realBins.path]
+            ).contains("grok")
+        )
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: link.path),
+            foreignBinary.path
+        )
+    }
+
     func test_providerProxyPreservesAndDoesNotAdvertiseForeignSameBasenameSymlink() throws {
         // WHY: executable basename is attacker-controlled and is not ownership
         // evidence for installing, advertising, or removing a provider proxy.

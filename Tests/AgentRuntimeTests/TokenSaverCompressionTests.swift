@@ -80,8 +80,8 @@ private final class ScriptedFinalRunner: AgentProviderRunner, @unchecked Sendabl
         Task.detached {
             try? await Task.sleep(nanoseconds: 20_000_000)
             let providerThreadId = request.providerThreadId ?? UUID().uuidString
-            let turnId = "turn-final"
-            let itemId = "assistant-final"
+            let turnId = "turn-final-\(request.runId.value.uuidString)"
+            let itemId = "assistant-final-\(request.runId.value.uuidString)"
             onEvent(.status(.running))
             onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
             onEvent(.event(.turnStarted(turnId: turnId)))
@@ -534,6 +534,74 @@ final class TokenSaverCompressionTests: XCTestCase {
                        "the displayed user message must remain the original, uncompressed text")
     }
 
+    /// WHY: human -> RCW1 is a translation of the user message itself. Keying
+    /// disclosure only to a later reasoning/assistant item leaves the user row
+    /// with no way to render its Human/RCW1 toggle.
+    func test_wirePromptPublishesUserMessageDisclosureForAllProviders() async throws {
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let tmp = NSTemporaryDirectory()
+                + "rc2-user-wire-disclosure-\(provider.rawValue)-\(UUID().uuidString)"
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            let threadRepo = AgentThreadRepository(db: db)
+            let messageRepo = AgentMessageRepository(db: db)
+            let runRepo = AgentRunRepository(db: db)
+            let thread = AgentThread(title: "user wire disclosure", provider: provider, model: "fake-model")
+            try threadRepo.upsert(thread)
+            let runner = PromptCapturingRunner(provider: provider)
+            let coordinator = AgentRunCoordinator(
+                runRepo: runRepo,
+                messageRepo: messageRepo,
+                threadRepo: threadRepo,
+                providers: [provider: runner]
+            )
+            let observer = RecordingObserver()
+            coordinator.addObserver(observer)
+
+            let human = "Inspect the real provider path and report one result."
+            let wire = "RCW1\tQ\t1\nG\tInspect the real provider path and report one result.\n.\n"
+            coordinator.promptCompressor = { _, _, _, _ in wire }
+            let runID = AgentRunID()
+
+            _ = try await coordinator.startRun(.init(
+                runId: runID,
+                threadId: thread.id,
+                provider: provider,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: human
+            ))
+            await runner.waitForPromptCapture()
+            try await waitForRun(runID, in: runRepo)
+
+            let disclosure = observer.recordedEvents.compactMap { event -> AssistantWireTranslation? in
+                guard case .wireTranslation(let translation) = event,
+                      translation.messageId == runID.value.uuidString else { return nil }
+                return translation
+            }.first
+            XCTAssertEqual(disclosure?.fallbackReason, "outbound_wire_request", "\(provider) user disclosure")
+            XCTAssertEqual(disclosure?.wireRequestText, wire, "\(provider) exact provider-bound RCW1")
+            XCTAssertEqual(disclosure?.originalText, "", "\(provider) must not duplicate a large RCW1 request")
+            XCTAssertEqual(disclosure?.rewrittenText, "", "\(provider) human text already lives in AgentMessage")
+
+            let messages = (try? messageRepo.list(threadId: thread.id)) ?? []
+            XCTAssertEqual(
+                messages.first(where: { $0.id == AgentMessageID(runID.value) })?.content,
+                human,
+                "\(provider) visible user message stays human"
+            )
+
+            var timeline = AssistantTimelineState()
+            for event in coordinator.latestStreamEvents(threadId: thread.id) {
+                timeline.apply(event)
+            }
+            XCTAssertEqual(
+                timeline.tokenSaverTranslationsByMessageId[runID.value.uuidString]?.wireRequestText,
+                wire,
+                "\(provider) restart replay must retain the user-row RCW1 toggle metadata"
+            )
+        }
+    }
+
     func test_followUpCompressorTransformsOutboundButPreservesVerbatimAnswer() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-ts-followup-compress-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -650,6 +718,88 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertEqual(translation.originalText, wire,
                        "persisted stream replay must retain the original provider wire for disclosure")
         XCTAssertEqual(translation.rewrittenText, rendered)
+        let durable = try await waitForDurableRCW1Response(
+            messageRepo,
+            threadId: thread.id,
+            messageId: assistant.id
+        )
+        XCTAssertEqual(durable.wireResponseText, wire,
+                       "the exact provider response must also survive outside the capped stream")
+        XCTAssertEqual(durable.messageId, assistant.id)
+    }
+
+    func test_identicalReadableResponsesKeepDistinctRunOwnedRCW1Associations() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-ts-identical-response-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let wire = "RCW1\tA\t1\nO\tThe same readable result.\n.\n"
+        let readable = "The same readable result."
+        let runner = ScriptedFinalRunner(provider: .claude, finalMessage: wire)
+        let thread = AgentThread(title: "identical wire", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.claude: runner]
+        )
+        coordinator.finalResponseTranslator = { _, _, _, _ in readable }
+
+        let firstRun = AgentRunID()
+        _ = try await coordinator.startRun(.init(
+            runId: firstRun,
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "First turn."
+        ))
+        let firstAssistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
+        _ = try await waitForDurableRCW1Response(
+            messageRepo,
+            threadId: thread.id,
+            messageId: firstAssistant.id
+        )
+        let idleDeadline = Date().addingTimeInterval(3)
+        while Date() < idleDeadline, coordinator.activeRunId(threadId: thread.id) != nil {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertNil(coordinator.activeRunId(threadId: thread.id))
+
+        let secondRun = AgentRunID()
+        _ = try await coordinator.startRun(.init(
+            runId: secondRun,
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Second turn."
+        ))
+        let deadline = Date().addingTimeInterval(3)
+        var assistants: [AgentMessage] = []
+        while Date() < deadline {
+            assistants = ((try? messageRepo.list(threadId: thread.id)) ?? [])
+                .filter { $0.role == .assistant && $0.content == readable }
+            if assistants.count == 2 { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(assistants.count, 2,
+                       "equal prose from separate turns must not be collapsed by content")
+        XCTAssertEqual(Set(assistants.map(\.id)).count, 2)
+        let durable = try await waitForDurableRCW1Responses(
+            messageRepo,
+            threadId: thread.id,
+            messageIds: assistants.map(\.id),
+            expectedCount: 2
+        )
+        XCTAssertEqual(Set(durable.values.map(\.runId)), Set([firstRun, secondRun]))
+        for assistant in assistants {
+            XCTAssertEqual(durable[assistant.id]?.wireResponseText, wire)
+            XCTAssertEqual(durable[assistant.id]?.messageId, assistant.id)
+        }
     }
 
     func test_providerPreambleBeforeWireIsRenderedWithoutTransportLeak() async throws {
@@ -800,9 +950,17 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertTrue(visible.contains("Evidence: Focused tests passed."))
         XCTAssertFalse(visible.contains("RCW1"), "raw wire must never leak into the primary transcript")
 
-        var timeline = AssistantTimelineState()
-        for event in coordinator.latestStreamEvents(threadId: thread.id) { timeline.apply(event) }
-        let metadata = try XCTUnwrap(timeline.tokenSaverTranslationsByItemId["stream-item"])
+        let disclosureDeadline = Date().addingTimeInterval(3)
+        var pendingMetadata: AssistantSR1Translation?
+        while Date() < disclosureDeadline, pendingMetadata == nil {
+            var timeline = AssistantTimelineState()
+            for event in coordinator.latestStreamEvents(threadId: thread.id) { timeline.apply(event) }
+            pendingMetadata = timeline.tokenSaverTranslationsByItemId["stream-item"]
+            if pendingMetadata == nil {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+        let metadata = try XCTUnwrap(pendingMetadata)
         XCTAssertEqual(metadata.originalText, wire)
         XCTAssertTrue(metadata.rewrittenText.contains("Focused tests passed"))
     }
@@ -986,6 +1144,13 @@ final class TokenSaverCompressionTests: XCTestCase {
             XCTAssertLessThan(admissionIndex, completionIndex, "the toggle must not wait for thread completion")
         }
 
+        while Date() < deadline,
+              !coordinator.latestStreamEvents(threadId: thread.id).contains(where: {
+                  guard case .wireTranslation(let translation) = $0 else { return false }
+                  return translation.itemId == "stream-item"
+              }) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
         var timeline = AssistantTimelineState()
         for event in coordinator.latestStreamEvents(threadId: thread.id) {
             timeline.apply(event)
@@ -1117,9 +1282,17 @@ final class TokenSaverCompressionTests: XCTestCase {
         }
         XCTAssertEqual(observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(), plain,
                        "provider plaintext must keep streaming immediately instead of waiting for translation")
-        var timeline = AssistantTimelineState()
-        for event in coordinator.latestStreamEvents(threadId: thread.id) { timeline.apply(event) }
-        let metadata = try XCTUnwrap(timeline.tokenSaverTranslationsByItemId["stream-item"])
+        let disclosureDeadline = Date().addingTimeInterval(3)
+        var pendingMetadata: AssistantSR1Translation?
+        while Date() < disclosureDeadline, pendingMetadata == nil {
+            var timeline = AssistantTimelineState()
+            for event in coordinator.latestStreamEvents(threadId: thread.id) { timeline.apply(event) }
+            pendingMetadata = timeline.tokenSaverTranslationsByItemId["stream-item"]
+            if pendingMetadata == nil {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+        let metadata = try XCTUnwrap(pendingMetadata)
         XCTAssertEqual(metadata.wireRequestText, requestWire,
                        "the progress item must expose the exact admitted RCW1 request before the final reply")
         XCTAssertEqual(metadata.originalText, "",
@@ -1158,5 +1331,38 @@ final class TokenSaverCompressionTests: XCTestCase {
         }
         XCTFail("timed out waiting for persisted wire translation metadata")
         throw XCTSkip("wire translation metadata did not persist")
+    }
+
+    private func waitForDurableRCW1Response(
+        _ messageRepo: AgentMessageRepository,
+        threadId: AgentThreadID,
+        messageId: AgentMessageID
+    ) async throws -> AgentMessageRCW1Response {
+        let values = try await waitForDurableRCW1Responses(
+            messageRepo,
+            threadId: threadId,
+            messageIds: [messageId],
+            expectedCount: 1
+        )
+        return try XCTUnwrap(values[messageId])
+    }
+
+    private func waitForDurableRCW1Responses(
+        _ messageRepo: AgentMessageRepository,
+        threadId: AgentThreadID,
+        messageIds: [AgentMessageID],
+        expectedCount: Int
+    ) async throws -> [AgentMessageID: AgentMessageRCW1Response] {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let values = (try? messageRepo.rcw1ResponseTranslations(
+                threadId: threadId,
+                messageIds: messageIds
+            )) ?? [:]
+            if values.count == expectedCount { return values }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("timed out waiting for durable RCW1 response metadata")
+        throw XCTSkip("durable RCW1 response metadata did not persist")
     }
 }

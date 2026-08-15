@@ -749,7 +749,7 @@ public enum TokenSaverExecutionReceiptSeam {
         let statePath = environment["REMOTE_CODE_DISTILL_STATE_PATH"]
         var updated = scrub(environment)
         updated.merge(self.environment(from: receipt)) { _, receiptValue in receiptValue }
-        if receipt.capabilities.postToolUse == true, let statePath, !statePath.isEmpty {
+        if receipt.capabilities.distill == true, let statePath, !statePath.isEmpty {
             updated["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
         }
         return updated
@@ -1742,6 +1742,29 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         ) else {
             markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
             throw AgentRunAcceptanceError.cancelled
+        }
+        if recordUserMessage, RCWireProtocol.isWire(outboundPrompt) {
+            // The human prompt is stored on AgentMessage; persist only the
+            // provider-bound RCW1 bytes here so the user row can disclose the
+            // exact translation without tripling large prompts in the hot-text
+            // budget. The user message id is intentionally the run id.
+            try messageRepo.upsertRCW1RequestTranslation(
+                messageId: AgentMessageID(effectiveRequest.runId.value),
+                wireRequestText: outboundPrompt
+            )
+            handle(
+                event: .event(.wireTranslation(AssistantWireTranslation(
+                    messageId: effectiveRequest.runId.value.uuidString,
+                    originalText: "",
+                    rewrittenText: "",
+                    fallbackReason: "outbound_wire_request",
+                    wireRequestText: outboundPrompt
+                ))),
+                runId: runId,
+                threadId: effectiveRequest.threadId,
+                allowFinalResponseTranslation: false
+            )
+            onWireTranslatedMessageId?(AgentMessageID(effectiveRequest.runId.value))
         }
         agentRunLog.info("run.started thread=\(effectiveRequest.threadId.value.uuidString, privacy: .public) run=\(effectiveRequest.runId.value.uuidString, privacy: .public) provider=\(effectiveRequest.provider.rawValue, privacy: .public) model=\(effectiveRequest.model, privacy: .public)")
 
@@ -5118,25 +5141,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard !text.isEmpty else {
             return PersistAssistantOutcome(message: nil, deferredIssue: nil, pendingMessageAppendNotification: nil)
         }
-        // PERF-MAC_AGENT-006: the common duplicate is the same turn's final
-        // message arriving via both `turnCompleted` and `finished`. Skip the
-        // full-history load when the text matches the last one we persisted;
-        // only fall back to the O(history) scan on a cache miss (which still
-        // guards the rare cross-turn duplicate before appending).
-        lock.lock()
-        let cachedLast = lastPersistedAssistantContent[threadId]
-        lock.unlock()
-        if cachedLast == text {
-            return PersistAssistantOutcome(message: nil, deferredIssue: nil, pendingMessageAppendNotification: nil)
-        }
-        let existing: [AgentMessage]
+        // One run owns one deterministic assistant-message identity. Provider
+        // callbacks may repeat the same final for that run, but two distinct
+        // turns are allowed to return byte-identical prose and must remain two
+        // independently toggleable transcript rows. Never dedupe by content.
+        let messageId = Self.terminalAssistantMessageId(runId: runId)
+        let existing: AgentMessage?
         do {
-            existing = try messageRepo.list(threadId: threadId)
+            existing = try messageRepo.get(id: messageId)
         } catch {
             return PersistAssistantOutcome(
                 message: nil,
                 deferredIssue: DeferredPersistenceIssue(
-                    operation: "message.list",
+                    operation: "message.get.assistant",
                     error: error,
                     runId: runId,
                     threadId: threadId
@@ -5144,15 +5161,35 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 pendingMessageAppendNotification: nil
             )
         }
-        guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
-            // Warm the cache on history-scan hit too, subject to the same size cap.
-            let byteCountHit = text.utf8.count
-            if !Self.shouldEvictLastPersistedContent(threadClosed: false, entryByteCount: byteCountHit) {
-                lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
+        if let existing {
+            guard existing.threadId == threadId,
+                  existing.role == .assistant,
+                  existing.content == text else {
+                return PersistAssistantOutcome(
+                    message: nil,
+                    deferredIssue: DeferredPersistenceIssue(
+                        operation: "message.identity.assistant",
+                        error: SQLiteError.execute(
+                            "Conflicting assistant message identity \(messageId.value.uuidString)."
+                        ),
+                        runId: runId,
+                        threadId: threadId
+                    ),
+                    pendingMessageAppendNotification: nil
+                )
             }
-            return PersistAssistantOutcome(message: nil, deferredIssue: nil, pendingMessageAppendNotification: nil)
+            return PersistAssistantOutcome(
+                message: existing,
+                deferredIssue: nil,
+                pendingMessageAppendNotification: nil
+            )
         }
-        let message = AgentMessage(threadId: threadId, role: .assistant, content: text)
+        let message = AgentMessage(
+            id: messageId,
+            threadId: threadId,
+            role: .assistant,
+            content: text
+        )
         do {
             try messageRepo.append(message)
         } catch {
@@ -6448,11 +6485,37 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerSession = nil
         }
 
+        let rcw1Response: AgentMessageRCW1Response? = {
+            guard let rawResponse = pending.continuationSourceFinalMessage,
+                  let messageId = pending.assistantMessage?.id ?? priorAssistantMessageId else {
+                return nil
+            }
+            let payload = RCWireProtocol.transportEnvelope(in: rawResponse)?.payload
+                ?? rawResponse
+            guard let frames = try? RCWireProtocol.parse(payload),
+                  !frames.isEmpty,
+                  frames.allSatisfy({ $0.direction == .response }) else {
+                return nil
+            }
+            let trimmedTurnId = completedTurnId?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let durableTurnId = trimmedTurnId?.isEmpty == false
+                ? trimmedTurnId!
+                : "run-\(runId.value.uuidString)"
+            return AgentMessageRCW1Response(
+                messageId: messageId,
+                runId: runId,
+                turnId: durableTurnId,
+                wireResponseText: rawResponse
+            )
+        }()
+
         let result = try runRepo.persistTerminalGraph(
             assistantMessage: pending.assistantMessage,
             run: run,
             thread: thread,
-            providerSession: providerSession
+            providerSession: providerSession,
+            rcw1Response: rcw1Response
         )
 
         lock.lock()

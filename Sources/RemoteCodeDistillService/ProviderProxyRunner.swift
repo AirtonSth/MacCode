@@ -380,6 +380,11 @@ enum ProviderProxyRunner {
         let admission: PaidRuntimeAdmission?
     }
 
+    private struct LivePaidState {
+        let settings: AppSettings
+        let subscribed: Bool
+    }
+
     /// Re-read the persisted setting for every nested provider launch. Inherited
     /// environment is only capability transport; it cannot resurrect Token
     /// Saver or Graphify after the user turns either feature off.
@@ -398,8 +403,9 @@ enum ProviderProxyRunner {
                 ?? environment["RC_TOKEN_SAVER_THREAD_ID"]
                 ?? ""
         ),
-        let settings = liveAppSettings(environment: environment),
-        settings.tokenSaverEnabled else {
+        let liveState = livePaidState(environment: environment),
+        liveState.settings.tokenSaverEnabled,
+        liveState.subscribed else {
             return ValidatedPaidRuntime(
                 environment: ProviderProxyPolicy.paidRuntimeEnvironment(
                     environment: environment,
@@ -426,7 +432,7 @@ enum ProviderProxyRunner {
             }
         }
 
-        let graphifyActive = settings.isGraphifyRuntimeActive
+        let graphifyActive = liveState.settings.isGraphifyRuntimeActive
             && receipt.capabilities.graphify == true
         var validated = ProviderProxyPolicy.paidRuntimeEnvironment(
             environment: environment,
@@ -447,7 +453,7 @@ enum ProviderProxyRunner {
                 validated.removeValue(forKey: key)
             }
         }
-        if receipt.capabilities.postToolUse != true {
+        if receipt.capabilities.distill != true {
             validated.removeValue(forKey: "REMOTE_CODE_DISTILL_STATE_PATH")
         }
         return ValidatedPaidRuntime(
@@ -459,9 +465,9 @@ enum ProviderProxyRunner {
         )
     }
 
-    private static func liveAppSettings(
+    private static func livePaidState(
         environment: [String: String]
-    ) -> AppSettings? {
+    ) -> LivePaidState? {
         let override = environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let channel = bundledReleaseChannel()
@@ -471,7 +477,20 @@ enum ProviderProxyRunner {
                 channel: channel ?? .debug,
                 appSupportOverride: override?.isEmpty == false ? override : nil
             ).run()
-            return SettingsStore(db: db).reload()
+            let repository = SettingsRepository(db: db)
+            let subscribed: Bool = {
+                guard let json = try? repository.get("private.account.session"),
+                      let data = json.data(using: .utf8),
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let user = object["user"] as? [String: Any] else {
+                    return false
+                }
+                return user["subscribed"] as? Bool == true
+            }()
+            return LivePaidState(
+                settings: SettingsStore(db: db).reload(),
+                subscribed: subscribed
+            )
         } catch {
             return nil
         }
@@ -525,7 +544,7 @@ enum ProviderProxyRunner {
             )
             let retargeted = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
                 receipt: seed,
-                sidecarAvailable: sidecarLive || parent.capabilities.distill == true,
+                sidecarAvailable: sidecarLive,
                 provider: targetProvider,
                 waveLive: parent.waveLive
             )
@@ -558,7 +577,7 @@ enum ProviderProxyRunner {
                 waveLive: retargeted.waveLive
             )
             var childRuntime = TokenSaverExecutionReceiptSeam.environment(from: childReceipt)
-            if childCapabilities.postToolUse == true,
+            if childCapabilities.distill == true,
                let statePath {
                 childRuntime["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
             }

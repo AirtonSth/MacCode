@@ -252,10 +252,14 @@ final class ProviderProxyPolicyTests: XCTestCase {
             childRunId: child,
             childDelegationCapability: String(repeating: "d", count: 64),
             tokenSaverEnvironment: [
-                "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": "codex-child"
+                "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": "codex-child",
+                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/codex-child-state"
             ]
         )
-        XCTAssertNil(claudeToCodex["REMOTE_CODE_DISTILL_STATE_PATH"])
+        XCTAssertEqual(
+            claudeToCodex["REMOTE_CODE_DISTILL_STATE_PATH"],
+            "/tmp/codex-child-state"
+        )
 
         let grokToClaude = ProviderProxyPolicy.childScopedEnvironment(
             environment: ["REMOTE_CODE_AGENT_PROVIDER": "grok"],

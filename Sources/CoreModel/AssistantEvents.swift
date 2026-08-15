@@ -63,8 +63,8 @@ public struct AssistantSR1Translation: Codable, Sendable, Equatable {
     }
 }
 
-/// Persisted metadata for an RCW1 provider response. The historical SR1 type
-/// remains decode-only so existing transcripts keep rendering after upgrade.
+/// Persisted metadata for an RCW1 request or provider response. The historical
+/// SR1 type remains decode-only so existing transcripts keep rendering.
 public struct AssistantWireTranslation: Codable, Sendable, Equatable {
     public var itemId: String?
     public var messageId: String?
@@ -886,10 +886,12 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
                 + s(translation.itemId) + s(translation.messageId)
                 + translation.originalText.utf8.count + translation.rewrittenText.utf8.count
                 + translation.protocolVersion.utf8.count + s(translation.fallbackReason)
+                + s(translation.wireRequestText)
         case .sr1Translation(let translation):
             return envelope
                 + s(translation.itemId) + s(translation.messageId)
                 + translation.originalText.utf8.count + translation.rewrittenText.utf8.count
+                + s(translation.wireRequestText)
         case .error(let message, _):
             return envelope + message.utf8.count
         }
@@ -970,6 +972,15 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     }
     public var tokenSaverTranslationsByMessageId: [String: AssistantSR1Translation] {
         sr1TranslationsByMessageId
+    }
+
+    /// Injective identity for an evictable provider item inside one turn.
+    /// Provider item IDs may repeat after a turn boundary.
+    public static func tokenSaverTimelineItemTranslationKey(
+        turnId: String,
+        itemId: String
+    ) -> String {
+        "item|\(turnId.utf8.count)|\(turnId)|\(itemId.utf8.count)|\(itemId)"
     }
     private var pendingItemDeltas: [String: PendingItemDelta]
     // F39: insertion order of pendingItemDeltas keys so the cap evicts oldest-first
@@ -1524,14 +1535,14 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 wireRequestText: translation.wireRequestText
             )
             if let itemId = translation.itemId, !itemId.isEmpty {
-                sr1TranslationsByItemId[itemId] = compatibility
+                indexTokenSaverTranslation(compatibility, itemId: itemId)
             }
             if let messageId = translation.messageId, !messageId.isEmpty {
                 sr1TranslationsByMessageId[messageId] = compatibility
             }
         case .sr1Translation(let translation):
             if let itemId = translation.itemId, !itemId.isEmpty {
-                sr1TranslationsByItemId[itemId] = translation
+                indexTokenSaverTranslation(translation, itemId: itemId)
             }
             if let messageId = translation.messageId, !messageId.isEmpty {
                 sr1TranslationsByMessageId[messageId] = translation
@@ -1564,6 +1575,23 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         trimTurns()
     }
 
+    /// Translation events follow their item event in provider streams. Resolve
+    /// newest-first so a reused provider item ID is attached to the current turn,
+    /// while retaining the legacy item-only entry for old snapshots/readers.
+    private mutating func indexTokenSaverTranslation(
+        _ translation: AssistantSR1Translation,
+        itemId: String
+    ) {
+        sr1TranslationsByItemId[itemId] = translation
+        guard let turnId = turns.reversed().first(where: { turn in
+            turn.items.contains(where: { $0.id == itemId })
+        })?.turnId else { return }
+        sr1TranslationsByItemId[Self.tokenSaverTimelineItemTranslationKey(
+            turnId: turnId,
+            itemId: itemId
+        )] = translation
+    }
+
     private mutating func trimTurns() {
         guard turns.count > Self.liveTurnLimit else { return }
         let dropCount = turns.count - Self.liveTurnLimit
@@ -1574,7 +1602,13 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         // outside the timeline and are reset on thread switch, so they stay here.)
         if !sr1TranslationsByItemId.isEmpty {
             for turn in turns.prefix(dropCount) {
-                for item in turn.items { sr1TranslationsByItemId.removeValue(forKey: item.id) }
+                for item in turn.items {
+                    sr1TranslationsByItemId.removeValue(forKey: item.id)
+                    sr1TranslationsByItemId.removeValue(forKey: Self.tokenSaverTimelineItemTranslationKey(
+                        turnId: turn.turnId,
+                        itemId: item.id
+                    ))
+                }
             }
         }
         turns.removeFirst(dropCount)
@@ -1592,6 +1626,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         if dropFromRest > 0, !sr1TranslationsByItemId.isEmpty {
             for item in rest.prefix(dropFromRest) {
                 sr1TranslationsByItemId.removeValue(forKey: item.id)
+                sr1TranslationsByItemId.removeValue(forKey: Self.tokenSaverTimelineItemTranslationKey(
+                    turnId: turns[idx].turnId,
+                    itemId: item.id
+                ))
             }
         }
         turns[idx].items = [first] + Array(rest.suffix(keepRest))

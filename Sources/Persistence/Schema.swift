@@ -21,10 +21,11 @@ public enum Schema {
     public static let checkpointListSchemaVersion: Int =
         sharedIntegrationBaseVersion + 2
 
-    /// Must equal the highest SchemaStep version (checkpoint list at 58, Token
-    /// Saver per-thread attribution at 59, fork lifecycle support at 61, and
-    /// bounded historical-maintenance lookup support at 62).
-    public static let currentVersion: Int = 62
+    /// Must equal the highest SchemaStep version. Versions 63-66 were used by
+    /// pre-release builds and must never be reused; v67 owns durable RCW1
+    /// requests, v68 owns durable RCW1 assistant responses, and v69 owns
+    /// per-message Human/RCW1 display preferences.
+    public static let currentVersion: Int = 69
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1126,6 +1127,49 @@ public enum Schema {
             WHERE state = 'local_committed'
                OR state = 'compensated'
                OR state = 'abandoned';
+        """),
+        // Durable human -> RCW1 disclosure belongs to the retained user message,
+        // not the evictable provider stream. The FK keeps storage bounded by the
+        // existing 100-message transcript window and removes rows on prune/delete.
+        SchemaStep(67, """
+        CREATE TABLE IF NOT EXISTS agent_message_rcw1_requests (
+            message_id TEXT PRIMARY KEY NOT NULL,
+            wire_request_text TEXT NOT NULL,
+            protocol_version TEXT NOT NULL CHECK(protocol_version = 'RCW1'),
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(message_id) REFERENCES agent_messages(id) ON DELETE CASCADE
+        );
+        """),
+        // Durable RCW1 -> human disclosure belongs to the canonical retained
+        // assistant message. Stream events are capped and cannot be the owner of
+        // exact provider bytes across event pruning or app relaunch. run_id and
+        // turn_id provide identity-safe timeline association without comparing
+        // response text (two turns may legitimately return identical prose).
+        SchemaStep(68, """
+        CREATE TABLE IF NOT EXISTS agent_message_rcw1_responses (
+            message_id TEXT PRIMARY KEY NOT NULL,
+            run_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL CHECK(length(trim(turn_id)) > 0),
+            wire_response_text TEXT NOT NULL,
+            protocol_version TEXT NOT NULL CHECK(protocol_version = 'RCW1'),
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(message_id) REFERENCES agent_messages(id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_message_rcw1_responses_run
+            ON agent_message_rcw1_responses(run_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_message_rcw1_responses_turn
+            ON agent_message_rcw1_responses(turn_id);
+        """),
+        // Canonical transcript messages own their display choice. Absence means
+        // Human; the repository deletes default rows. The FK bounds preferences
+        // by live messages and preserves exact state through relational Undo.
+        SchemaStep(69, """
+        CREATE TABLE IF NOT EXISTS agent_message_token_saver_display_preferences (
+            message_id TEXT PRIMARY KEY NOT NULL,
+            display_mode TEXT NOT NULL CHECK(display_mode IN ('human', 'rcw1')),
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(message_id) REFERENCES agent_messages(id) ON DELETE CASCADE
+        );
         """),
     ]
 

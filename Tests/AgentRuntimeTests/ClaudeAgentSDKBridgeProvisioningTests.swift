@@ -106,6 +106,29 @@ final class ClaudeAgentSDKBridgeProvisioningTests: XCTestCase {
             "the default SDK must resolve to its exact pinned peers without any registry call")
     }
 
+    /// WHY: two RemoteCode builds can run concurrently. A shared fixed bridge
+    /// filename lets the older app overwrite the newer PostToolUse interceptor
+    /// while its Node process is starting.
+    func test_cachedBridgeFileName_isContentAddressed() {
+        let older = ClaudeAgentSDKBridgeAdapter.cachedBridgeFileName(
+            source: "return { updatedMCPToolOutput: output };"
+        )
+        let current = ClaudeAgentSDKBridgeAdapter.cachedBridgeFileName(
+            source: "return { updatedToolOutput: output, updatedMCPToolOutput: output };"
+        )
+
+        XCTAssertNotEqual(older, current)
+        XCTAssertEqual(
+            current,
+            ClaudeAgentSDKBridgeAdapter.cachedBridgeFileName(
+                source: "return { updatedToolOutput: output, updatedMCPToolOutput: output };"
+            ),
+            "identical bridge bytes must resolve to one stable cache path"
+        )
+        XCTAssertTrue(current.hasPrefix("ClaudeAgentSDKBridge-"))
+        XCTAssertTrue(current.hasSuffix(".mjs"))
+    }
+
     // WHY: the platform-native package must track the running platform/arch, never
     // a hardcoded value, so Apple Silicon / Intel / Rosetta each get the right
     // binary. The host fallback must still produce a well-formed platform-arch.

@@ -1931,8 +1931,10 @@ public final class AppContext {
             env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
             env["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
         }
-        // Claude PostToolUse needs the sidecar state file path (not a secret).
-        if receipt.capabilities.postToolUse == true {
+        // Every Distill entry point needs the exact sidecar lease. PostToolUse
+        // remains Claude-only, while Codex/Grok consume this through the managed
+        // PATH wrapper and explicit `distill` CLI.
+        if receipt.capabilities.distill == true {
             env["REMOTE_CODE_DISTILL_STATE_PATH"] = appSupportDirectory
                 .appendingPathComponent("Distill", isDirectory: true)
                 .appendingPathComponent("DistillCLIState.json")
@@ -2860,8 +2862,8 @@ public final class AppContext {
     /// Token Saver prompt compression. Returns the distilled text to send to the
     /// provider, or the original prompt unchanged when Token Saver is off, the
     /// sidecar/recovery path is unavailable, literal preservation fails, or
-    /// anything else makes RCW1 unsafe. Every non-empty prompt otherwise uses
-    /// RCW1 v1 regardless of language, length, or risk class.
+    /// the final marker-inclusive payload cannot prove substantial net savings.
+    /// Ineligible and non-profitable prompts always fail open to exact Human text.
 
     private func tokenSaverProjectAdmission(
         threadId: AgentThreadID,
@@ -3061,6 +3063,11 @@ public final class AppContext {
             trace("empty_prompt")
             return prompt
         }
+        let inputTokens = TokenEstimator.estimate(prompt)
+        guard inputTokens >= 80 else {
+            trace("below_profitability_floor")
+            return prompt
+        }
         let turn: TokenSaverAdapterMatrix.CrossUserTurn =
             cacheState.contains("follow") ? .followUp : .initial
         guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
@@ -3116,25 +3123,30 @@ public final class AppContext {
         // provider; an unrelated prose/dedupe transform is not a valid fallback.
         let deterministicCandidate = prompt
 
-        // RCW1 is the transport contract whenever Token Saver is active. Savings
-        // remain honest: a longer wire prompt is sent but records no savings.
-        func adopt(_ candidate: String, stage: TokenSaverRouteStage) -> String {
-            let inputTokens = TokenEstimator.estimate(prompt)
+        let grammarTokens = TokenEstimator.estimate(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
+        func isProfitableWire(_ candidate: String) -> Bool {
             let outputTokens = TokenEstimator.estimate(candidate)
-            let grammarTokens = TokenEstimator.estimate(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
-            guard RCWireProtocol.isWire(candidate) else { return prompt }
-            if outputTokens + grammarTokens < inputTokens {
-                recordTokenSaverSidecarSavings(
-                    provider: provider,
-                    threadId: threadId,
-                    mode: DistillMode.wireEncode.rawValue,
-                    inputTokens: inputTokens,
-                    outputTokens: outputTokens + grammarTokens,
-                    savedTokens: inputTokens - outputTokens - grammarTokens,
-                    cacheState: cacheState,
-                    routeStage: stage
-                )
-            }
+            guard RCWireProtocol.isWire(candidate) else { return false }
+            return outputTokens <= (inputTokens * 45) / 100
+                && candidate.utf8.count < prompt.utf8.count
+                && outputTokens + grammarTokens < inputTokens
+        }
+
+        // Recovery is finalized only after the marker-inclusive payload passes
+        // every profitability condition, so a rejected frame cannot leave a live
+        // exact-content capability behind.
+        func adopt(_ candidate: String, stage: TokenSaverRouteStage) -> String {
+            let outputTokens = TokenEstimator.estimate(candidate)
+            recordTokenSaverSidecarSavings(
+                provider: provider,
+                threadId: threadId,
+                mode: DistillMode.wireEncode.rawValue,
+                inputTokens: inputTokens,
+                outputTokens: outputTokens + grammarTokens,
+                savedTokens: inputTokens - outputTokens - grammarTokens,
+                cacheState: cacheState,
+                routeStage: stage
+            )
             return candidate
         }
 
@@ -3190,8 +3202,10 @@ public final class AppContext {
             let modelOutput = response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? deterministicCandidate : response.output
             let wireFrames = try? RCWireProtocol.parse(modelOutput)
             let isValidRequestWire = wireFrames?.allSatisfy { $0.direction == .request } == true
-            let literalSafeModelOutput: String? = isValidRequestWire
+            let literalSafeModelOutput: String? = response.routeStage == .deterministic
+                && isValidRequestWire
                 && RCWireProtocol.preservesProtectedSemantics(original: prompt, wire: modelOutput)
+                && RCWireProtocol.preservesRequestMeaning(original: prompt, wire: modelOutput)
                 && LiteralPreservation.guarded(original: prompt, compressed: modelOutput).droppedLiteral == nil
                 ? modelOutput
                 : nil
@@ -3206,8 +3220,9 @@ public final class AppContext {
                     idempotencyKey: response.recoveryIdempotencyKey,
                     provider: provider,
                     threadId: threadId,
-                    runId: runId
-                  ) else {
+                    runId: runId,
+                    profitabilityGate: isProfitableWire
+                ) else {
                 // Distill may already have prepared a stage object before any later
                 // pre-adoption gate. Abandon only that provisional when adoption fails.
                 discardProvisionalWireRecovery(
@@ -3219,7 +3234,7 @@ public final class AppContext {
                 )
                 return prompt
             }
-            return adopt(recoveredCandidate, stage: response.routeStage ?? .llmMLX)
+            return adopt(recoveredCandidate, stage: .deterministic)
         } catch {
             NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
             return prompt
@@ -3234,7 +3249,8 @@ public final class AppContext {
         idempotencyKey: String?,
         provider: AgentProvider,
         threadId: AgentThreadID,
-        runId: AgentRunID?
+        runId: AgentRunID?,
+        profitabilityGate: (String) -> Bool
     ) -> String? {
         guard let runId,
               let capability,
@@ -3309,6 +3325,10 @@ public final class AppContext {
             var recoverable = candidate
             for marker in recoveryMarkers {
                 recoverable = try RCWireProtocol.addingExactRecord(marker, to: recoverable)
+            }
+            guard profitabilityGate(recoverable) else {
+                discardProvisionals()
+                return nil
             }
 
             // Atomic multi-object finalization: stage (+ optional full-original) in one
@@ -3619,7 +3639,7 @@ public final class AppContext {
         }
     }
 
-    func tokenSaverRenderWireResponse(_ response: String, provider: AgentProvider, threadId: AgentThreadID, runId: AgentRunID? = nil) async -> String {
+    func tokenSaverRenderWireResponse(_ response: String, provider _: AgentProvider, threadId _: AgentThreadID, runId _: AgentRunID? = nil) async -> String {
         guard RCWireProtocol.isWire(response) else {
             return response
         }
@@ -3631,56 +3651,11 @@ public final class AppContext {
         guard !fallback.isEmpty else {
             return "Token Saver decoded an empty provider response. The original response was preserved below the Token Saver optimized disclosure."
         }
-        // Once a provider has emitted a valid wire frame, toggling Token Saver
-        // off or tripping either kill switch must still leave a readable answer.
-        // The total Swift renderer is independent of the local model and is safe
-        // for replay after restart.
-        guard !RCWireProtocol.requiresDeterministicRendering(frames) else { return fallback }
-        guard isTokenSaverRuntimeActive(),
-              !tokenSaverLaneIsDisabled("wire-encode"),
-              !tokenSaverLaneIsDisabled("wire-render-english"),
-              tokenSaverProjectAdmission(threadId: threadId, lane: "wire-render-english").allowed else {
-            return fallback
-        }
-        guard let client = currentDistillClient() else {
-            return fallback
-        }
-        let request = DistillRequest(
-            mode: .wireRenderEnglish,
-            priority: .interactive,
-            input: response,
-            question: inferredUserLanguageIdentifier(threadId: threadId),
-            maxOutputCharacters: max(1_200, min(12_000, response.count * 4))
-        )
-        do {
-            let response: DistillResponse
-            if let runId,
-               let scope = tokenSaverPersistentScope(threadId: threadId) {
-                response = try await client.distill(
-                    request,
-                    recoveryContext: .init(
-                        workspaceID: scope.workspaceID,
-                        projectID: scope.projectID,
-                        threadID: threadId.value.uuidString,
-                        provider: provider.rawValue,
-                        attemptID: runId.value.uuidString,
-                        operationID: "wire-render:\(runId.value.uuidString)"
-                    )
-                )
-            } else {
-                response = try await client.distill(request)
-            }
-            let rendered = response.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            let humanText = !rendered.isEmpty
-                && !RCWireProtocol.isWire(rendered)
-                && RCWireProtocol.renderedTextPreservesProtectedSemantics(rendered, frames: frames)
-                ? rendered
-                : fallback
-            return humanText
-        } catch {
-            NSLog("RemoteCode Token Saver RCW1 deterministic renderer used (provider=\(provider.rawValue)): \(error)")
-            return fallback
-        }
+        // RCW1 -> Human is a total, deterministic projection of the provider's
+        // records. A prose model could omit or invert an ordinary assertion that
+        // contains no regex-protected literal, so it is never allowed to rewrite
+        // the canonical Human view.
+        return fallback
     }
 
     private static func describe(_ status: TokenSaverDistillServiceStatus) -> String {

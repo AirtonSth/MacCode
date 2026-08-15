@@ -40,11 +40,8 @@ fi
 # Stop only this worktree's executable. A global `pkill -x RemoteCode` could
 # interrupt another checkout or the user's stable Agent App session.
 app_exec="$PWD/$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-running_pids="$(ps -axo pid=,command= | awk -v exec="$app_exec" '{
-  pid = $1
-  sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
-  if (index($0, exec) == 1) print pid
-}')"
+running_pids="$(ps -axo pid=,command= \
+  | awk -v executable="$app_exec" -f scripts/exact-executable-pids.awk)"
 for pid in $running_pids; do
   kill "$pid" 2>/dev/null || true
 done

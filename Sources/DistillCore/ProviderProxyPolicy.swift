@@ -513,9 +513,9 @@ public enum ProviderProxyPolicy {
         for key in updated.keys where key.hasPrefix("RC_TOKEN_SAVER_") {
             updated.removeValue(forKey: key)
         }
-        // This hook is Claude-only. A Claude parent cannot leak it into a
-        // Codex/Grok child, and a Claude child receives it only when the
-        // retargeted, host-validated environment explicitly includes it.
+        // Never inherit a parent's lease path implicitly. Every admitted child
+        // receives the host-validated path in tokenSaverEnvironment, regardless
+        // of provider; only the PostToolUse capability itself is Claude-only.
         updated.removeValue(forKey: "REMOTE_CODE_DISTILL_STATE_PATH")
         updated.merge(tokenSaverEnvironment) { _, receiptValue in receiptValue }
         // Root and attempt are deliberately the same external-child identity:

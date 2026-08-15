@@ -376,6 +376,8 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertNil(codex["RC_TOKEN_SAVER_ATTEMPT_ID"], "the coordinator binds a fresh attempt per run")
         XCTAssertNil(codex["RC_TOKEN_SAVER_POST_TOOL_USE"],
                      "PostToolUse auto-compression is Claude-SDK-only; Codex must not carry it")
+        XCTAssertNotNil(codex["REMOTE_CODE_DISTILL_STATE_PATH"],
+                        "Codex PATH wrappers need the same sidecar lease as explicit distill")
 
         let claude = ctx.tokenSaverAgentEnvironment(provider: .claude, threadId: claudeThread.id)
         XCTAssertEqual(claude["RC_TOKEN_SAVER_DISTILL_HINT"], "1")

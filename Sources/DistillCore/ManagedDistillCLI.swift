@@ -315,10 +315,11 @@ public struct ManagedDistillCLI: Sendable {
             return emptyOK
         }
 
+        let replaced = Self.replaceToolOutputText(envelope["tool_response"], with: compressed)
         let payload: [String: Any] = [
             "hookSpecificOutput": [
                 "hookEventName": "PostToolUse",
-                "updatedToolOutput": compressed,
+                "updatedToolOutput": replaced,
             ] as [String: Any],
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
@@ -382,6 +383,28 @@ public struct ManagedDistillCLI: Sendable {
             if let s = obj[key] as? String { return s }
         }
         return ""
+    }
+
+    /// Mirrors ClaudeAgentSDKBridge.mjs `replaceToolOutputText` so command hooks
+    /// return the same response shape Claude validates for each built-in tool.
+    static func replaceToolOutputText(_ value: Any?, with text: String) -> Any {
+        if value is String { return text }
+        if value is [Any] {
+            return [["type": "text", "text": text]]
+        }
+        if var obj = value as? [String: Any] {
+            if obj["content"] is [Any] {
+                obj["content"] = [["type": "text", "text": text]]
+                return obj
+            }
+            for key in ["text", "output", "stdout", "stderr", "result"] {
+                if obj[key] is String {
+                    obj[key] = text
+                    return obj
+                }
+            }
+        }
+        return text
     }
 
     /// Conservative compress contract for the PostToolUse hook (provider-agnostic default).

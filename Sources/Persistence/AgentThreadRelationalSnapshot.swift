@@ -179,6 +179,9 @@ private extension AgentThreadRepository {
     static let relationalTableSpecs: [TableSpec] = [
         TableSpec(name: "agent_threads", predicate: "id IN (%@)"),
         TableSpec(name: "agent_messages", predicate: "thread_id IN (%@)"),
+        TableSpec(name: "agent_message_rcw1_requests", predicate: "message_id IN (SELECT id FROM agent_messages WHERE thread_id IN (%@))"),
+        TableSpec(name: "agent_message_rcw1_responses", predicate: "message_id IN (SELECT id FROM agent_messages WHERE thread_id IN (%@))"),
+        TableSpec(name: "agent_message_token_saver_display_preferences", predicate: "message_id IN (SELECT id FROM agent_messages WHERE thread_id IN (%@))"),
         TableSpec(name: "agent_runs", predicate: "thread_id IN (%@)"),
         TableSpec(name: "agent_stream_events", predicate: "run_id IN (SELECT id FROM agent_runs WHERE thread_id IN (%@))"),
         TableSpec(name: "agent_turn_snapshots", predicate: "thread_id IN (%@)"),

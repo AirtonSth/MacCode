@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import CryptoKit
 
 struct ClaudeSDKSessionRecord: Sendable, Equatable {
     let sessionId: String
@@ -927,6 +928,13 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let specs: [String]             // exact-pinned install argv: sdk + native + peers
     }
 
+    static func cachedBridgeFileName(source: String) -> String {
+        let digest = SHA256.hash(data: Data(source.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "ClaudeAgentSDKBridge-\(digest).mjs"
+    }
+
     private func resolvedBridgeScriptPath(onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws -> String {
         guard let sourcePath = ClaudeAgentSDKBridgeLocator.resolvePath(override: bridgeScriptPathOverride) else {
             throw AgentProviderAdapterError.unsupported(
@@ -961,7 +969,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             throw AgentRunError.missingBinary("npm")
         }
         let cache = try sdkRuntimeCacheDirectory()
-        let cachedBridge = cache.appendingPathComponent(ClaudeAgentSDKBridgeLocator.fileName)
+        // Multiple RemoteCode builds may coexist. Keep the shared dependency
+        // tree, but make bridge bytes immutable per content hash so an older app
+        // cannot overwrite a newer PostToolUse implementation during launch.
+        let cachedBridge = cache.appendingPathComponent(Self.cachedBridgeFileName(source: source))
         if !FileManager.default.isReadableFile(atPath: cachedBridge.path)
             || ((try? String(contentsOf: cachedBridge, encoding: .utf8)) != source) {
             try source.write(to: cachedBridge, atomically: true, encoding: .utf8)

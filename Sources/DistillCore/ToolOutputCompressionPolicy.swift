@@ -248,6 +248,158 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
     // decision and allocated CharacterSet(charactersIn: "|&;\n") per call.
     private static let shellSegmentSeparators = CharacterSet(charactersIn: "|&;\n")
 
+    private static func isShellAssignment(_ token: String) -> Bool {
+        guard let equals = token.firstIndex(of: "="), equals != token.startIndex else {
+            return false
+        }
+        let name = token[..<equals]
+        guard let first = name.unicodeScalars.first,
+              first == "_" || CharacterSet.letters.contains(first) else {
+            return false
+        }
+        return name.unicodeScalars.dropFirst().allSatisfy {
+            $0 == "_" || CharacterSet.alphanumerics.contains($0)
+        }
+    }
+
+    private static func unquotedShellToken(_ token: String) -> String {
+        token.trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+    }
+
+    /// Minimal shell lexer for prefix inspection. It preserves whitespace inside
+    /// quotes and removes quoting/escapes without evaluating expansions.
+    private static func shellWords(_ input: String) -> [String] {
+        var words: [String] = []
+        var current = ""
+        var quote: Character?
+        var escaping = false
+        var hasToken = false
+        for character in input {
+            if escaping {
+                current.append(character)
+                escaping = false
+                hasToken = true
+                continue
+            }
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                    hasToken = true
+                } else if activeQuote == "\"", character == "\\" {
+                    escaping = true
+                } else {
+                    current.append(character)
+                    hasToken = true
+                }
+                continue
+            }
+            if character.isWhitespace {
+                if hasToken {
+                    words.append(current)
+                    current = ""
+                    hasToken = false
+                }
+            } else if character == "'" || character == "\"" {
+                quote = character
+                hasToken = true
+            } else if character == "\\" {
+                escaping = true
+                hasToken = true
+            } else {
+                current.append(character)
+                hasToken = true
+            }
+        }
+        if escaping { current.append("\\") }
+        if hasToken { words.append(current) }
+        return words
+    }
+
+    private static func strippingShellPrefixes(_ input: [String]) -> [String] {
+        var tokens = input
+        var changed = true
+        while changed, !tokens.isEmpty {
+            changed = false
+            let head = (tokens[0] as NSString).lastPathComponent.lowercased()
+            if head == "env" {
+                tokens.removeFirst()
+                while let token = tokens.first {
+                    let option = unquotedShellToken(token)
+                    if option == "--" {
+                        tokens.removeFirst()
+                        break
+                    } else if option == "-S" {
+                        tokens.removeFirst()
+                        if !tokens.isEmpty {
+                            let splitString = tokens.removeFirst()
+                            tokens.insert(contentsOf: shellWords(splitString), at: 0)
+                        }
+                    } else if option == "-u" || option == "--unset"
+                        || option == "-C" || option == "-P"
+                        || option == "--chdir" || option == "--path" {
+                        tokens.removeFirst()
+                        if !tokens.isEmpty { tokens.removeFirst() }
+                    } else if option == "-i" || option == "-0" || option == "-v"
+                        || option == "--ignore-environment"
+                        || (option.count > 1 && option.first == "-"
+                            && option.dropFirst().allSatisfy { $0 == "0" || $0 == "i" || $0 == "v" })
+                        || option.hasPrefix("-u")
+                        || (option.hasPrefix("-C") && option.count > 2)
+                        || (option.hasPrefix("-P") && option.count > 2) {
+                        tokens.removeFirst()
+                    } else if isShellAssignment(option) {
+                        tokens.removeFirst()
+                    } else {
+                        break
+                    }
+                }
+                changed = true
+            } else if head == "command" || head == "builtin" || head == "exec" {
+                tokens.removeFirst()
+                while tokens.first?.hasPrefix("-") == true {
+                    let option = tokens.removeFirst()
+                    if option == "--" { break }
+                    if head == "exec", option == "-a", !tokens.isEmpty {
+                        tokens.removeFirst()
+                    }
+                }
+                changed = true
+            } else if isShellAssignment(tokens[0]) {
+                tokens.removeFirst()
+                changed = true
+            }
+        }
+        return tokens
+    }
+
+    private static func gitSubcommand(in arguments: [String]) -> String? {
+        let valueOptions: Set<String> = [
+            "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+            "--config-env", "--super-prefix",
+        ]
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            if valueOptions.contains(argument) {
+                index += 2
+                continue
+            }
+            if argument.hasPrefix("--git-dir=")
+                || argument.hasPrefix("--work-tree=")
+                || argument.hasPrefix("--namespace=")
+                || (argument.hasPrefix("-c") && argument.count > 2) {
+                index += 1
+                continue
+            }
+            if argument.hasPrefix("-") {
+                index += 1
+                continue
+            }
+            return argument.lowercased()
+        }
+        return nil
+    }
+
     /// Segment-aware check shared with wrapper intent: pipes/and chains may mix tools.
     public static func shellCommandLooksExactOutput(_ command: String) -> Bool {
         let segments = command
@@ -255,18 +407,15 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         for segment in segments {
-            let tokens = segment
-                .split(whereSeparator: { $0.isWhitespace })
-                .map(String.init)
-                .filter { !$0.isEmpty }
+            let rawTokens = shellWords(segment)
+            let tokens = strippingShellPrefixes(rawTokens)
             guard let primaryRaw = tokens.first else { continue }
-            let primary = (primaryRaw as NSString).lastPathComponent.lowercased()
+            let primary = (unquotedShellToken(primaryRaw) as NSString).lastPathComponent.lowercased()
             if WrappedCommandCatalog.isExactOutputCommand(primary) {
                 return true
             }
-            if primary == "git" {
-                let args = Array(tokens.dropFirst())
-                if CommandWrapPolicy.isExactGitSubcommand(args) {
+            if primary == "git", let subcommand = gitSubcommand(in: Array(tokens.dropFirst())) {
+                if CommandWrapPolicy.isExactGitSubcommand([subcommand]) {
                     return true
                 }
             }

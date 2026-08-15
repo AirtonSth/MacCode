@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 @testable import DistillCore
 
 final class ToolOutputCompressionPolicyTests: XCTestCase {
@@ -51,6 +52,41 @@ final class ToolOutputCompressionPolicyTests: XCTestCase {
             toolArgumentsSummary: "command=make test"
         )
         XCTAssertTrue(make.shouldCompress)
+    }
+
+    func test_bashExactOutputShellRecognizesCatalogPrefixesAndGitGlobalOptions() {
+        let prefixedCommands = WrappedCommandCatalog.exactOutputCommands.flatMap { command in
+            [
+                "FOO=1 \(command) sample",
+                "/usr/bin/env FOO=1 \(command) sample",
+                "env -- \(command) sample",
+                "command \(command) sample",
+                "/usr/bin/command -- \(command) sample",
+            ]
+        }
+        for command in prefixedCommands + [
+            "env -S rg needle Sources",
+            "env -S 'rg -n needle Sources'",
+            "env -C /tmp rg -n needle Sources",
+            "env -P /usr/bin rg -n needle Sources",
+            "env -v rg -n needle Sources",
+            "env -iv rg -n needle Sources",
+            "FOO='a b' rg -n needle Sources",
+            "env FOO='a b' rg -n needle Sources",
+            "exec -a 'display name' rg -n needle Sources",
+            "\"/usr/bin/env\" FOO=1 rg -n needle Sources",
+            "\"/usr/bin/command\" -- rg -n needle Sources",
+            "exec -a display-name rg -n needle Sources",
+            "git -C repo show HEAD",
+            "env FOO=1 git --git-dir=.git grep needle",
+            "exec git -c color.ui=false cat-file -p HEAD",
+        ] {
+            XCTAssertTrue(
+                ToolOutputCompressionPolicy.shellCommandLooksExactOutput(command),
+                "exact-output command must bypass PostToolUse Distill: \(command)"
+            )
+        }
+        XCTAssertFalse(ToolOutputCompressionPolicy.shellCommandLooksExactOutput("env FOO=1 swift test"))
     }
 
     func test_profilesMatchPlanForSearchShellAndWebFetch() {

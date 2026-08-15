@@ -31,11 +31,8 @@ running_bundle_pids() {
   [ -e "$exec_path" ] || return 0
   local abs_exec
   abs_exec="$(cd "$(dirname "$exec_path")" && pwd -P)/$(basename "$exec_path")"
-  ps -axo pid=,command= | awk -v exec="$abs_exec" '{
-    pid = $1
-    sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
-    if (index($0, exec) == 1) { print pid }
-  }'
+  ps -axo pid=,command= \
+    | awk -v executable="$abs_exec" -f scripts/exact-executable-pids.awk
 }
 
 wait_for_bundle_exit() {

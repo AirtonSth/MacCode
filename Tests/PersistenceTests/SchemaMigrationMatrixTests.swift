@@ -437,7 +437,9 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         )
         // The composed head has Message identity, named checkpoint list,
         // Token Saver per-thread totals (59), reserved no-op (60), lifecycle
-        // support (61), then bounded maintenance lookup support (62).
+        // support (61), bounded maintenance lookup support (62), and the
+        // durable RCW1 request/response/display rows (67-69). Versions 63-66
+        // are retired and must never be reused.
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
@@ -447,8 +449,15 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             59,
             60,
             61,
+            62,
+            67,
+            68,
             Schema.currentVersion
         ])
+        XCTAssertFalse(
+            Schema.steps.contains { (63...66).contains($0.version) },
+            "schema versions 63-66 are retired and must never be reused"
+        )
     }
 
     // MARK: - v25 → head
@@ -604,6 +613,40 @@ final class SchemaMigrationMatrixTests: XCTestCase {
                          "a crash here would break every launch after the first")
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion,
                        "re-running must not alter the recorded version")
+    }
+
+    func test_v67ToHeadAddsDurableRCW1ResponsesWithoutChangingMessages() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 67 })
+        let threadId = UUID().uuidString
+        let messageId = UUID().uuidString
+        try db.execute("""
+            INSERT INTO agent_threads(
+                id, title, provider, model, status, created_at, updated_at,
+                diff_additions, diff_deletions, has_unread, pinned, sort_order,
+                permission_mode, reasoning_effort, execution_mode, service_tier,
+                interaction_mode
+            ) VALUES(
+                '\(threadId)', 'v67', 'codex', 'test', 'completed',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                0, 0, 0, 0, 0, 'supervised', 'medium', 'local', 'auto', 'default'
+            );
+            INSERT INTO agent_messages(
+                id, thread_id, role, content, created_at, attachments_json,
+                body_sha256, body_bytes, body_revision
+            ) VALUES(
+                '\(messageId)', '\(threadId)', 'assistant', 'Readable',
+                '2026-01-01T00:00:00Z', '[]', '', 8, 1
+            );
+            """)
+
+        try Schema.migrateSteps(db, Schema.steps)
+
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+        XCTAssertEqual(try rowCount(db, table: "agent_messages"), 1,
+                       "the canonical human transcript must survive the v68 migration")
+        XCTAssertEqual(try rowCount(db, table: "agent_message_rcw1_responses"), 0,
+                       "migration creates storage but never fabricates transport bytes")
     }
 
     func test_v59ToHeadDoesNotScrubTheCorpusInsideMigration() throws {

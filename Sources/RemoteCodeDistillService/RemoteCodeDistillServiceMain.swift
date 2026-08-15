@@ -736,6 +736,16 @@ struct RemoteCodeDistillServiceMain {
             // Explicit override is authoritative — do not fall through to channel paths.
             candidates = [override]
         } else {
+            if let appSupport = env["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !appSupport.isEmpty {
+                candidates.append(
+                    URL(fileURLWithPath: appSupport, isDirectory: true)
+                        .appendingPathComponent("Distill", isDirectory: true)
+                        .appendingPathComponent("DistillCLIState.json")
+                        .path
+                )
+            }
             for channel in [ReleaseChannel.stable, .canary, .debug] {
                 candidates.append(
                     AppPaths.appSupportDirectory(for: channel)

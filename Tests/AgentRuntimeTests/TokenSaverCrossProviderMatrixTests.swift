@@ -63,8 +63,9 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                 "\(provider) must exempt GUI from | distill"
             )
             XCTAssertTrue(prompt.contains("NEVER pipe"), "\(provider) exact-output still forbidden")
-            XCTAssertTrue(prompt.contains("REMOTE_CODE_WIRE_V1"),
+            XCTAssertTrue(prompt.contains(AgentSkillInstaller.rcWireAgentInstructionsTemplate),
                           "every Token Saver session must trust RCW1 before a later encoded follow-up arrives")
+            assertWireResponseProfitabilityContract(prompt, context: "\(provider) primary")
             XCTAssertFalse(prompt.contains("R0 micro"), "removed Distill Language must not return")
 
             if provider == .claude {
@@ -110,8 +111,9 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             )
             let prompt = AgentSkillInstaller.tokenSaverProviderPrompt("", environment: processEnv)
             XCTAssertTrue(prompt.contains("| distill"), "\(provider) nested dialect")
-            XCTAssertTrue(prompt.contains("REMOTE_CODE_WIRE_V1"),
+            XCTAssertTrue(prompt.contains(AgentSkillInstaller.rcWireAgentInstructionsTemplate),
                           "\(provider) nested session must support a later encoded turn")
+            assertWireResponseProfitabilityContract(prompt, context: "\(provider) nested")
         }
     }
 
@@ -154,8 +156,9 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                     prompt.contains("| distill"),
                     "\(parent)→\(child) must inject mandatory | distill dialect"
                 )
-                XCTAssertTrue(prompt.contains("REMOTE_CODE_WIRE_V1"),
+                XCTAssertTrue(prompt.contains(AgentSkillInstaller.rcWireAgentInstructionsTemplate),
                               "\(parent)→\(child) must install the trusted session capability")
+                assertWireResponseProfitabilityContract(prompt, context: "\(parent)→\(child)")
             }
         }
     }
@@ -289,6 +292,32 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
         XCTAssertTrue(args.contains("Read,Glob,Grep"))
     }
 
+    private func assertWireResponseProfitabilityContract(
+        _ prompt: String,
+        context: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(
+            prompt.contains("full tokens<=45%"),
+            "\(context) must admit RCW1 only at the complete-frame 45% threshold",
+            file: file,
+            line: line
+        )
+        XCTAssertTrue(
+            prompt.contains("semantically identical terse text"),
+            "\(context) must compare RCW1 with terse plaintext holding meaning constant",
+            file: file,
+            line: line
+        )
+        XCTAssertTrue(
+            prompt.contains("else same text"),
+            "\(context) must fail open to plaintext when response framing expands tokens",
+            file: file,
+            line: line
+        )
+    }
+
     func test_providerProxyArguments_nestedClaudeSkipsSettingsWhenTokenSaverOff() {
         // WHY: fail-open — without POST_TOOL_USE the proxy must not rewrite argv.
         let args = AgentSkillInstaller.providerProxyArguments(
@@ -322,6 +351,213 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
         XCTAssertNotNil(hooks["PostToolUse"], "PostToolUse must be merged in")
     }
 
+    func test_providerProxyArguments_nestedClaudePreservesExistingHooksAndSettingsFile() throws {
+        let env = TokenSaverExecutionReceiptSeam.environment(from: admit(.claude))
+        let existingHook: [String: Any] = [
+            "matcher": "Bash",
+            "hooks": [["type": "command", "command": "/tmp/caller-hook"]]
+        ]
+        let settings: [String: Any] = [
+            "custom": true,
+            "hooks": ["PostToolUse": [existingHook]]
+        ]
+        let file = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-settings-\(UUID().uuidString).json")
+        let settingsData = try JSONSerialization.data(withJSONObject: settings)
+        try settingsData.write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let args = AgentSkillInstaller.providerProxyArguments(
+            provider: .claude,
+            arguments: ["--print", "--settings", file.path, "-p", "hi"],
+            environment: env
+        )
+        let index = try XCTUnwrap(args.firstIndex(of: "--settings"))
+        let data = try XCTUnwrap(args[index + 1].data(using: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["custom"] as? Bool, true)
+        let hooks = try XCTUnwrap(object["hooks"] as? [String: Any])
+        let post = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]])
+        XCTAssertEqual(post.count, 2, "caller and RemoteCode PostToolUse hooks must coexist")
+        let commands = post.flatMap { entry -> [String] in
+            guard let hookEntries = entry["hooks"] as? [[String: Any]] else { return [] }
+            return hookEntries.compactMap { $0["command"] as? String }
+        }
+        XCTAssertTrue(commands.contains("/tmp/caller-hook"))
+        XCTAssertTrue(commands.contains { $0.contains("distill hook post-tool-use") })
+        let fileData = try Data(contentsOf: file)
+        XCTAssertEqual(fileData, settingsData,
+                       "merging must not edit the caller's settings file")
+    }
+
+    func test_providerProxyArguments_nestedClaudeMergesEffectiveLastInlineSettingsIdempotently() throws {
+        // WHY: Claude resolves duplicate --settings options with the last value.
+        // RemoteCode must merge its hook into that effective inline object without
+        // mutating a shadowed caller setting or duplicating the hook on re-entry.
+        let env = TokenSaverExecutionReceiptSeam.environment(from: admit(.claude))
+        let shadowed = #"{"custom":"shadowed"}"#
+        let effective = #"{"custom":"effective","hooks":{"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/tmp/caller-hook"}]}]}}"#
+        let original = [
+            "--print",
+            "--settings", shadowed,
+            "--settings=\(effective)",
+            "-p", "hi",
+        ]
+
+        let args = AgentSkillInstaller.ensuringClaudePostToolUseSettings(
+            provider: .claude,
+            arguments: original,
+            environment: env
+        )
+
+        let shadowedIndex = try XCTUnwrap(args.firstIndex(of: "--settings"))
+        XCTAssertEqual(args[shadowedIndex + 1], shadowed,
+                       "an earlier shadowed setting must remain byte-identical")
+        let effectiveArgument = try XCTUnwrap(args.last(where: { $0.hasPrefix("--settings=") }))
+        let mergedJSON = String(effectiveArgument.dropFirst("--settings=".count))
+        let data = try XCTUnwrap(mergedJSON.data(using: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["custom"] as? String, "effective")
+        let hooks = try XCTUnwrap(object["hooks"] as? [String: Any])
+        let post = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]])
+        XCTAssertEqual(post.count, 2, "caller and RemoteCode PostToolUse hooks must coexist once")
+        let commands = post.flatMap { entry -> [String] in
+            guard let hookEntries = entry["hooks"] as? [[String: Any]] else { return [] }
+            return hookEntries.compactMap { $0["command"] as? String }
+        }
+        XCTAssertTrue(commands.contains("/tmp/caller-hook"))
+        XCTAssertEqual(commands.filter { $0.contains("distill hook post-tool-use") }.count, 1)
+        XCTAssertEqual(
+            AgentSkillInstaller.ensuringClaudePostToolUseSettings(
+                provider: .claude,
+                arguments: args,
+                environment: env
+            ),
+            args,
+            "merging the effective last inline settings object must be idempotent"
+        )
+    }
+
+    func test_providerProxyArguments_nestedCodexMergesExistingDeveloperInstructions() {
+        let env = TokenSaverExecutionReceiptSeam.environment(from: admit(.codex))
+        let args = AgentSkillInstaller.providerProxyArguments(
+            provider: .codex,
+            arguments: ["exec", "--config", "developer_instructions=\"KEEP_CALLER\"", "do work"],
+            environment: env
+        )
+        let joined = args.joined(separator: "\n")
+        XCTAssertTrue(joined.contains("KEEP_CALLER"), "caller instructions must survive")
+        XCTAssertTrue(joined.contains("TOKEN_SAVER_SAFETY_ABI_V1"), "Distill policy must be appended")
+        XCTAssertEqual(args.filter { $0 == "--config" }.count, 1,
+                       "merge must not add a competing developer_instructions override")
+    }
+
+    func test_providerProxyArguments_nestedCodexMergesEffectiveInlineDeveloperInstructions() {
+        let env = TokenSaverExecutionReceiptSeam.environment(from: admit(.codex))
+        let args = AgentSkillInstaller.providerProxyArguments(
+            provider: .codex,
+            arguments: [
+                "exec",
+                "--config", "developer_instructions=\"SHADOWED\"",
+                "--config=developer_instructions=\"EFFECTIVE\"",
+                "do work",
+            ],
+            environment: env
+        )
+        XCTAssertEqual(args[2], "developer_instructions=\"SHADOWED\"")
+        XCTAssertTrue(args[3].hasPrefix("--config=developer_instructions=\"EFFECTIVE\\n\\n"))
+        XCTAssertTrue(args[3].contains("TOKEN_SAVER_SAFETY_ABI_V1"))
+        XCTAssertEqual(
+            AgentSkillInstaller.providerProxyArguments(
+                provider: .codex,
+                arguments: args,
+                environment: env
+            ),
+            args,
+            "merging the effective inline override must be idempotent"
+        )
+    }
+
+    func test_providerProxyArguments_nestedCodexPreservesTripleQuotedTOMLDelimiter() {
+        // WHY: a TOML multiline basic string must keep its triple-quote delimiter;
+        // collapsing it to a single quote pair makes the generated CLI config invalid.
+        let env = TokenSaverExecutionReceiptSeam.environment(from: admit(.codex))
+        let args = AgentSkillInstaller.providerProxyArguments(
+            provider: .codex,
+            arguments: [
+                "exec",
+                #"--config=developer_instructions="""KEEP_CALLER""""#,
+                "do work",
+            ],
+            environment: env
+        )
+
+        XCTAssertTrue(
+            args[1].hasPrefix(#"--config=developer_instructions="""KEEP_CALLER\n\n"#),
+            "the existing triple-quoted value must remain the effective prefix"
+        )
+        XCTAssertTrue(args[1].hasSuffix(#""""#), "the TOML multiline delimiter must remain balanced")
+        XCTAssertTrue(args[1].contains("TOKEN_SAVER_SAFETY_ABI_V1"))
+    }
+
+    func test_providerProxyArguments_nestedCodexMergesLiteralAndSpacedDeveloperInstructions() {
+        let env = TokenSaverExecutionReceiptSeam.environment(from: admit(.codex))
+        for override in [
+            "developer_instructions='KEEP_LITERAL'",
+            "developer_instructions = \"KEEP_SPACED\"",
+            "developer_instructions=KEEP_RAW",
+        ] {
+            let args = AgentSkillInstaller.providerProxyArguments(
+                provider: .codex,
+                arguments: ["exec", "-c", override, "do work"],
+                environment: env
+            )
+            XCTAssertEqual(args.filter { $0 == "-c" }.count, 1,
+                           "the effective caller override must be merged in place")
+            XCTAssertTrue(args[2].hasPrefix("developer_instructions=\"KEEP_"))
+            XCTAssertTrue(args[2].contains("TOKEN_SAVER_SAFETY_ABI_V1"), override)
+            XCTAssertEqual(
+                AgentSkillInstaller.providerProxyArguments(
+                    provider: .codex,
+                    arguments: args,
+                    environment: env
+                ),
+                args,
+                "literal/spaced merges must stay idempotent"
+            )
+        }
+    }
+
+    func test_providerProxyArguments_nestedCodexIgnoresSafetyMarkerInsideTOMLComment() {
+        let env = TokenSaverExecutionReceiptSeam.environment(from: admit(.codex))
+        let comment = "TOKEN_SAVER_SAFETY_ABI_V1 is not active here"
+        let original = [
+            "exec",
+            "-c", "developer_instructions=\"KEEP_CALLER\" # \(comment)",
+            "do work",
+        ]
+
+        let args = AgentSkillInstaller.providerProxyArguments(
+            provider: .codex,
+            arguments: original,
+            environment: env
+        )
+        XCTAssertTrue(args[2].hasPrefix("developer_instructions=\"KEEP_CALLER\\n\\n"))
+        XCTAssertTrue(args[2].contains("MANDATORY default-pipe:"),
+                      "a marker in a TOML comment must not bypass the semantic Distill prompt")
+        XCTAssertTrue(args[2].hasSuffix("# \(comment)"),
+                      "merging the semantic value must preserve the caller's trailing comment")
+        XCTAssertEqual(
+            AgentSkillInstaller.providerProxyArguments(
+                provider: .codex,
+                arguments: args,
+                environment: env
+            ),
+            args,
+            "semantic marker detection must remain idempotent after the first merge"
+        )
+    }
+
     func test_tokenSaverOutputPolicy_forcesShellAndGraphifyCoverageForAllProviders() {
         // WHY: Grok/Codex native tools cannot rewrite; dialect must force
         // Graphify + shell+|distill coverage for Claude/Codex/Grok alike.
@@ -336,6 +572,10 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                 distillPrompt.contains("read_file") || distillPrompt.contains("native")
                     || distillPrompt.contains("Coverage first"),
                 "\(provider) must constrain native multi-file reads"
+            )
+            XCTAssertTrue(
+                distillPrompt.contains(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")),
+                "\(provider) must receive the complete canonical exact-output command catalog"
             )
             env["RC_GRAPHIFY_ENABLED"] = "1"
             env["RC_GRAPHIFY_GRAPH_JSON"] = "/tmp/graph.json"

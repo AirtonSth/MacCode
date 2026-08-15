@@ -1,5 +1,6 @@
 import XCTest
 import CryptoKit
+import CoreModel
 @testable import DistillCore
 
 final class DistillReversibleStoreServiceTests: XCTestCase {
@@ -436,6 +437,43 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         XCTAssertEqual(store.preparationCount, 0)
         let unchangedCalls = await runtime.calls
         XCTAssertEqual(unchangedCalls, 1)
+    }
+
+    func test_scopedWireEncodeRejectedCandidateFailsOpenWithoutRecovery() async throws {
+        let store = InMemoryScopedStore()
+        let unsafeWire = try RCWireProtocol.serializeRequestText("Delete the file after checking it.")
+        let runtime = CountingRuntime(transform: { input in
+            MLXDistillRuntime.guardLossyProseOutput(
+                unsafeWire,
+                request: DistillRequest(mode: .wireEncode, input: input)
+            )
+        })
+        let server = DistillHTTPServer(
+            configuration: try .init(authToken: "tok", appSupportDirectory: NSTemporaryDirectory()),
+            scheduler: DistillScheduler(runtime: runtime, maxConcurrentRequests: 1),
+            scopedRecoveryStore: store
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        let original = "Do not delete /tmp/Keep.swift:42; preserve UUID 123e4567-e89b-12d3-a456-426614174000 exactly."
+        let request = DistillRequest(mode: .wireEncode, input: original, runMode: .optimize)
+
+        let result = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "tok",
+            body: try JSONEncoder().encode(request),
+            headers: recoveryHeaders(invocationID: "wire-unsafe", operationID: "wire-guard-fallback")
+        )
+        let response = try JSONDecoder().decode(DistillResponse.self, from: result.data)
+
+        XCTAssertEqual(result.status, 200)
+        XCTAssertEqual(response.output, original)
+        XCTAssertFalse(RCWireProtocol.isWire(response.output))
+        XCTAssertNil(response.originalHandle)
+        XCTAssertNil(response.recoveryIdempotencyKey)
+        XCTAssertNil(store.preparedLane)
+        XCTAssertEqual(store.preparationCount, 0)
     }
 
     func test_terminalRetryDoesNotReoptimizeOrRevokeMarkerAndIndependentCallsRemainIndependent() async throws {

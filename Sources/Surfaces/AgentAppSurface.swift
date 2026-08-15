@@ -575,10 +575,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// items live in the timeline rather than `agent_messages`, so publishing
     /// only message-id metadata made their raw transport impossible to inspect.
     @Published public private(set) var tokenSaverTranslationsByItemId: [String: AssistantSR1Translation] = [:]
+    /// Safe view projection keyed by the length-prefixed `(turnId, itemId)` pair.
+    /// Provider item IDs are not globally unique, so UI rows must never read raw
+    /// transport from the legacy item-id-only map when an ID repeats in a thread.
+    private var tokenSaverTranslationsByTimelineItemKey: [String: AssistantSR1Translation] = [:]
     /// Final-message optimization callbacks can arrive before the matching
     /// timeline translation. Keep those live badges separate so an unrelated
     /// progress-item translation cannot clear them during the next stream batch.
     private var liveTokenSaverOptimizedMessageIds: Set<AgentMessageID> = []
+    /// Provider-bound RCW1 requests belong to durable user messages, not the
+    /// evictable stream window. Keep the selected thread's bounded projection
+    /// separate so timeline refresh/backpressure cannot erase its disclosure.
+    private var persistedUserRCW1RequestsByMessageId: [AgentMessageID: String] = [:]
+    /// Exact provider RCW1 responses are durable children of retained assistant
+    /// messages. The turn projection is identity-only; ambiguous provider turn
+    /// ids deliberately return no match instead of comparing visible prose.
+    private var persistedAssistantRCW1ResponsesByMessageId: [AgentMessageID: AgentMessageRCW1Response] = [:]
+    private var persistedAssistantMessageIdByTurnId: [String: AgentMessageID] = [:]
+    private var ambiguousPersistedAssistantTurnIds: Set<String> = []
+    @Published public private(set) var tokenSaverOriginalDisplayMessageIds: Set<AgentMessageID> = []
+    private var tokenSaverDisplayModeWriteGeneration: [AgentMessageID: UInt64] = [:]
+    private var tokenSaverDisplayModeWriteTasks: [AgentMessageID: Task<Void, Never>] = [:]
     @Published public private(set) var tokenSaverTranslationRetryMessageIds: Set<AgentMessageID> = []
     /// The UI holds only a bounded recent message page. Older durable messages
     /// remain in SQLite and are intentionally outside the hot screen-memory set.
@@ -698,6 +715,129 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         tokenSaverTranslationsByItemId[itemId]
     }
 
+    public func tokenSaverTranslation(
+        forTurnId turnId: String,
+        itemId: String
+    ) -> AssistantSR1Translation? {
+        tokenSaverTranslationsByTimelineItemKey[
+            Self.tokenSaverTimelineItemTranslationKey(turnId: turnId, itemId: itemId)
+        ]
+    }
+
+    nonisolated static func tokenSaverTimelineItemTranslationKey(
+        turnId: String,
+        itemId: String
+    ) -> String {
+        AssistantTimelineState.tokenSaverTimelineItemTranslationKey(
+            turnId: turnId,
+            itemId: itemId
+        )
+    }
+
+    nonisolated static func safelyIndexedTokenSaverItemTranslations(
+        _ translations: [String: AssistantSR1Translation],
+        turns: [AssistantTurnSnapshot]
+    ) -> [String: AssistantSR1Translation] {
+        var occurrenceCounts: [String: Int] = [:]
+        for turn in turns {
+            for item in turn.items {
+                occurrenceCounts[item.id, default: 0] += 1
+            }
+        }
+
+        var indexed: [String: AssistantSR1Translation] = [:]
+        for turn in turns {
+            for item in turn.items {
+                let key = tokenSaverTimelineItemTranslationKey(
+                    turnId: turn.turnId,
+                    itemId: item.id
+                )
+                if let exact = translations[key] {
+                    indexed[key] = exact
+                } else if occurrenceCounts[item.id] == 1,
+                          let legacy = translations[item.id] {
+                    indexed[key] = legacy
+                }
+            }
+        }
+        return indexed
+    }
+
+    public func tokenSaverMessageId(forRCW1TurnId turnId: String) -> AgentMessageID? {
+        guard !ambiguousPersistedAssistantTurnIds.contains(turnId) else { return nil }
+        return persistedAssistantMessageIdByTurnId[turnId]
+    }
+
+    public func tokenSaverDisplaysOriginal(for messageId: AgentMessageID) -> Bool {
+        tokenSaverOriginalDisplayMessageIds.contains(messageId)
+    }
+
+    public func setTokenSaverDisplaysOriginal(
+        _ displaysOriginal: Bool,
+        for messageId: AgentMessageID
+    ) {
+        let previousValue = tokenSaverOriginalDisplayMessageIds.contains(messageId)
+        guard previousValue != displaysOriginal else { return }
+        if displaysOriginal {
+            tokenSaverOriginalDisplayMessageIds.insert(messageId)
+        } else {
+            tokenSaverOriginalDisplayMessageIds.remove(messageId)
+        }
+        let generation = (tokenSaverDisplayModeWriteGeneration[messageId] ?? 0) &+ 1
+        tokenSaverDisplayModeWriteGeneration[messageId] = generation
+        let previousTask = tokenSaverDisplayModeWriteTasks[messageId]
+        let repository = messageRepo
+        let mode: AgentMessageTokenSaverDisplayMode = displaysOriginal ? .rcw1 : .human
+        tokenSaverDisplayModeWriteTasks[messageId] = Task { @MainActor [weak self] in
+            await previousTask?.value
+            do {
+                try await Self.persistTokenSaverDisplayModeOffMain(
+                    repository: repository,
+                    messageId: messageId,
+                    mode: mode
+                )
+            } catch {
+                guard let self,
+                      self.tokenSaverDisplayModeWriteGeneration[messageId] == generation else {
+                    return
+                }
+                if previousValue {
+                    self.tokenSaverOriginalDisplayMessageIds.insert(messageId)
+                } else {
+                    self.tokenSaverOriginalDisplayMessageIds.remove(messageId)
+                }
+                self.statusMessage = "Token Saver display choice could not be saved: \(error.localizedDescription)"
+            }
+            guard let self,
+                  self.tokenSaverDisplayModeWriteGeneration[messageId] == generation else {
+                return
+            }
+            self.tokenSaverDisplayModeWriteGeneration.removeValue(forKey: messageId)
+            self.tokenSaverDisplayModeWriteTasks.removeValue(forKey: messageId)
+        }
+    }
+
+    nonisolated static func persistTokenSaverDisplayModeOffMain(
+        repository: AgentMessageRepository,
+        messageId: AgentMessageID,
+        mode: AgentMessageTokenSaverDisplayMode
+    ) async throws {
+        try await Task.detached(priority: .userInitiated) {
+            try repository.setTokenSaverDisplayMode(messageId: messageId, mode: mode)
+        }.value
+    }
+
+    /// A durable response without an injective turn link cannot safely lend its
+    /// toggle to timeline text. Keep its canonical message row visible instead.
+    public func tokenSaverRequiresDurableMessageRow(for messageId: AgentMessageID) -> Bool {
+        guard let response = persistedAssistantRCW1ResponsesByMessageId[messageId] else {
+            return false
+        }
+        let turnId = response.turnId
+        return tokenSaverMessageId(forRCW1TurnId: turnId) != messageId
+            || !timeline.turns.contains(where: { $0.turnId == turnId })
+    }
+
     public func retryTokenSaverTranslation(for id: AgentMessageID) {
         guard !tokenSaverTranslationRetryMessageIds.contains(id),
               let raw = tokenSaverOriginalTextsByMessageId[id],
@@ -782,6 +922,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 guard let self else { return }
                 self.liveTokenSaverOptimizedMessageIds.insert(msgId)
                 self.tokenSaverOptimizedMessageIds.insert(msgId)
+                guard let threadId = self.selectedThreadId else { return }
+                let persisted = await Self.loadPersistedUserRCW1RequestsOffMain(
+                    repository: self.messageRepo,
+                    threadId: threadId,
+                    messageIds: [msgId]
+                )
+                let persistedResponses = await Self.loadPersistedAssistantRCW1ResponsesOffMain(
+                    repository: self.messageRepo,
+                    threadId: threadId,
+                    messageIds: [msgId]
+                )
+                guard self.selectedThreadId == threadId else { return }
+                self.mergePersistedUserRCW1Requests(persisted)
+                self.mergePersistedAssistantRCW1Responses(persistedResponses)
             }
         }
         // XCTest: same-stack rail load so selectThread(initial) sees rows.
@@ -965,9 +1119,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timeline = AssistantTimelineState()
         tokenSaverOptimizedMessageIds = []
         liveTokenSaverOptimizedMessageIds = []
+        persistedUserRCW1RequestsByMessageId = [:]
+        persistedAssistantRCW1ResponsesByMessageId = [:]
+        persistedAssistantMessageIdByTurnId = [:]
+        ambiguousPersistedAssistantTurnIds = []
+        tokenSaverOriginalDisplayMessageIds = []
+        tokenSaverDisplayModeWriteGeneration = [:]
+        tokenSaverDisplayModeWriteTasks = [:]
         tokenSaverOriginalTextsByMessageId = [:]
         tokenSaverWireRequestTextsByMessageId = [:]
         tokenSaverTranslationsByItemId = [:]
+        tokenSaverTranslationsByTimelineItemKey = [:]
     }
 
     /// Used by the multi-surface rail reload hub (EventBus fan-out).
@@ -1643,9 +1805,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // from the opened thread's replayed timeline.
         tokenSaverOptimizedMessageIds = []
         liveTokenSaverOptimizedMessageIds = []
+        persistedUserRCW1RequestsByMessageId = [:]
+        persistedAssistantRCW1ResponsesByMessageId = [:]
+        persistedAssistantMessageIdByTurnId = [:]
+        ambiguousPersistedAssistantTurnIds = []
+        tokenSaverOriginalDisplayMessageIds = []
+        tokenSaverDisplayModeWriteGeneration = [:]
+        tokenSaverDisplayModeWriteTasks = [:]
         tokenSaverOriginalTextsByMessageId = [:]
         tokenSaverWireRequestTextsByMessageId = [:]
         tokenSaverTranslationsByItemId = [:]
+        tokenSaverTranslationsByTimelineItemKey = [:]
         // Per-thread provider state: the opened thread republishes its own
         // count on its next snapshot, so carrying the previous thread's
         // shell count over would advertise work that isn't this thread's.
@@ -2715,9 +2885,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let repository = messageRepo
         messageHistoryLoadTask = Task { @MainActor [weak self] in
             let loaded = await Self.loadMessagePageOffMain(repository: repository, threadId: id)
+            let loadedRows = loaded?.rows ?? []
+            let persistedRequests = await Self.loadPersistedUserRCW1RequestsOffMain(
+                repository: repository,
+                threadId: id,
+                messageIds: Array(loadedRows.lazy.filter { $0.role == .user }.map(\.id))
+            )
+            let persistedResponses = await Self.loadPersistedAssistantRCW1ResponsesOffMain(
+                repository: repository,
+                threadId: id,
+                messageIds: Array(loadedRows.lazy.filter { $0.role == .assistant }.map(\.id))
+            )
+            let persistedDisplayModes = await Self.loadPersistedTokenSaverDisplayModesOffMain(
+                repository: repository,
+                threadId: id,
+                messageIds: loadedRows.map(\.id)
+            )
             guard let self, !Task.isCancelled, !self.isDisposed,
                   self.selectedThreadId == id else { return }
-            let loadedRows = loaded?.rows ?? []
             // Rows appended in-memory while the page was being read (system
             // notes, the send() user-message mirror) must survive the swap —
             // the page snapshot predates them. Optimistic mirrors share the
@@ -2727,6 +2912,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 inMemory: self.messages,
                 threadId: id
             )
+            self.mergePersistedUserRCW1Requests(persistedRequests)
+            self.mergePersistedAssistantRCW1Responses(persistedResponses)
+            self.mergePersistedTokenSaverDisplayModes(persistedDisplayModes)
             self.messageHistoryIsPartial = loaded?.hasMoreOlder ?? false
             // Queue rows are not transcript bubbles; only re-apply plan
             // suppression after the durable message merge.
@@ -2824,6 +3012,48 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }.value
     }
 
+    nonisolated static func loadPersistedUserRCW1RequestsOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID,
+        messageIds: [AgentMessageID]
+    ) async -> [AgentMessageID: String] {
+        guard !messageIds.isEmpty else { return [:] }
+        return await Task.detached(priority: .userInitiated) {
+            (try? repository.rcw1RequestTranslations(
+                threadId: threadId,
+                messageIds: messageIds
+            )) ?? [:]
+        }.value
+    }
+
+    nonisolated static func loadPersistedAssistantRCW1ResponsesOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID,
+        messageIds: [AgentMessageID]
+    ) async -> [AgentMessageID: AgentMessageRCW1Response] {
+        guard !messageIds.isEmpty else { return [:] }
+        return await Task.detached(priority: .userInitiated) {
+            (try? repository.rcw1ResponseTranslations(
+                threadId: threadId,
+                messageIds: messageIds
+            )) ?? [:]
+        }.value
+    }
+
+    nonisolated static func loadPersistedTokenSaverDisplayModesOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID,
+        messageIds: [AgentMessageID]
+    ) async -> [AgentMessageID: AgentMessageTokenSaverDisplayMode] {
+        guard !messageIds.isEmpty else { return [:] }
+        return await Task.detached(priority: .userInitiated) {
+            (try? repository.tokenSaverDisplayModes(
+                threadId: threadId,
+                messageIds: messageIds
+            )) ?? [:]
+        }.value
+    }
+
     /// Pure merge: older page prepended before current hot rows (dedupe by id).
     /// WHY: keyset `before` pages must expand the hot window without dropping
     /// in-memory mirrors or reordering the newest suffix.
@@ -2880,6 +3110,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threadId: expectedThread,
                 before: cursor
             )
+            let loadedRows = loaded?.rows ?? []
+            let persistedRequests = await Self.loadPersistedUserRCW1RequestsOffMain(
+                repository: repository,
+                threadId: expectedThread,
+                messageIds: Array(loadedRows.lazy.filter { $0.role == .user }.map(\.id))
+            )
+            let persistedResponses = await Self.loadPersistedAssistantRCW1ResponsesOffMain(
+                repository: repository,
+                threadId: expectedThread,
+                messageIds: Array(loadedRows.lazy.filter { $0.role == .assistant }.map(\.id))
+            )
+            let persistedDisplayModes = await Self.loadPersistedTokenSaverDisplayModesOffMain(
+                repository: repository,
+                threadId: expectedThread,
+                messageIds: loadedRows.map(\.id)
+            )
             guard let self, !self.isDisposed,
                   self.selectedThreadId == expectedThread,
                   Self.shouldClearLoadingOlderMessages(
@@ -2891,6 +3137,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 older: loaded.rows,
                 current: self.messages
             )
+            self.mergePersistedUserRCW1Requests(persistedRequests)
+            self.mergePersistedAssistantRCW1Responses(persistedResponses)
+            self.mergePersistedTokenSaverDisplayModes(persistedDisplayModes)
             self.messageHistoryIsPartial = loaded.hasMoreOlder
             if !loaded.hasMoreOlder {
                 NSLog("[AgentApp] older message pages exhausted for thread \(expectedThread.value.uuidString)")
@@ -5122,9 +5371,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         historyReplayNotice = nil
         tokenSaverOptimizedMessageIds = []
         liveTokenSaverOptimizedMessageIds = []
+        persistedUserRCW1RequestsByMessageId = [:]
+        persistedAssistantRCW1ResponsesByMessageId = [:]
+        persistedAssistantMessageIdByTurnId = [:]
+        ambiguousPersistedAssistantTurnIds = []
+        tokenSaverOriginalDisplayMessageIds = []
+        tokenSaverDisplayModeWriteGeneration = [:]
+        tokenSaverDisplayModeWriteTasks = [:]
         tokenSaverOriginalTextsByMessageId = [:]
         tokenSaverWireRequestTextsByMessageId = [:]
         tokenSaverTranslationsByItemId = [:]
+        tokenSaverTranslationsByTimelineItemKey = [:]
         providerThreadSnapshotStatusMessage = nil
         providerThreadSnapshotLastConfirmedAt = nil
         selectedThreadHasRecoverableContext = false
@@ -7825,6 +8082,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 requests[id] = request
             }
         }
+        let visibleUserMessageIds = Set(
+            messages.lazy.filter { $0.role == .user }.map(\.id)
+        )
+        for (id, request) in requests
+            where visibleUserMessageIds.contains(id) && RCWireProtocol.isWire(request) {
+            persistedUserRCW1RequestsByMessageId[id] = request
+        }
+        ids.formUnion(persistedUserRCW1RequestsByMessageId.keys)
+        requests.merge(persistedUserRCW1RequestsByMessageId) { _, durable in durable }
+        ids.formUnion(persistedAssistantRCW1ResponsesByMessageId.keys)
+        for (messageId, response) in persistedAssistantRCW1ResponsesByMessageId {
+            originals[messageId] = response.wireResponseText
+        }
         ids.formUnion(liveTokenSaverOptimizedMessageIds)
         // Two callers, two semantics:
         // - Live-stream batches REPLACE, so translations evicted by the hot-text
@@ -7851,6 +8121,56 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if itemTranslations != tokenSaverTranslationsByItemId {
             tokenSaverTranslationsByItemId = itemTranslations
+        }
+        tokenSaverTranslationsByTimelineItemKey = Self.safelyIndexedTokenSaverItemTranslations(
+            itemTranslations,
+            turns: sourceTimeline.turns
+        )
+    }
+
+    private func mergePersistedUserRCW1Requests(
+        _ persisted: [AgentMessageID: String]
+    ) {
+        guard !persisted.isEmpty else { return }
+        persistedUserRCW1RequestsByMessageId.merge(persisted) { _, durable in durable }
+        tokenSaverOptimizedMessageIds.formUnion(persisted.keys)
+        tokenSaverWireRequestTextsByMessageId.merge(persisted) { _, durable in durable }
+    }
+
+    private func mergePersistedAssistantRCW1Responses(
+        _ persisted: [AgentMessageID: AgentMessageRCW1Response]
+    ) {
+        guard !persisted.isEmpty else { return }
+        for (messageId, response) in persisted {
+            persistedAssistantRCW1ResponsesByMessageId[messageId] = response
+            tokenSaverOptimizedMessageIds.insert(messageId)
+            tokenSaverOriginalTextsByMessageId[messageId] = response.wireResponseText
+            let turnId = response.turnId
+            guard !ambiguousPersistedAssistantTurnIds.contains(turnId) else {
+                continue
+            }
+            if let existing = persistedAssistantMessageIdByTurnId[turnId],
+               existing != messageId {
+                persistedAssistantMessageIdByTurnId.removeValue(forKey: turnId)
+                ambiguousPersistedAssistantTurnIds.insert(turnId)
+            } else {
+                persistedAssistantMessageIdByTurnId[turnId] = messageId
+            }
+        }
+    }
+
+    func mergePersistedTokenSaverDisplayModes(
+        _ modes: [AgentMessageID: AgentMessageTokenSaverDisplayMode]
+    ) {
+        // A page read may predate a click whose write is still in flight. Keep
+        // the newer optimistic choice for that exact message until it settles.
+        for (messageId, mode) in modes
+            where tokenSaverDisplayModeWriteGeneration[messageId] == nil {
+            if mode == .rcw1 {
+                tokenSaverOriginalDisplayMessageIds.insert(messageId)
+            } else {
+                tokenSaverOriginalDisplayMessageIds.remove(messageId)
+            }
         }
     }
 }
@@ -9383,7 +9703,76 @@ public struct AgentAppView: View {
         case original
 
         var id: String { rawValue }
-        var label: String { self == .translated ? "Translated" : "Original" }
+        var label: String { self == .translated ? "Human" : "RCW1" }
+    }
+
+    struct TokenSaverDisplaySelections: Equatable {
+        static let maximumPersistedItemCount = 512
+        static let maximumRawBytes = 256 * 1_024
+        static let maximumItemKeyBytes = 1_024
+
+        private(set) var originalItemKeys: [String]
+
+        init(rawValue: String = "[]") {
+            guard rawValue.utf8.count <= Self.maximumRawBytes,
+                  let data = rawValue.data(using: .utf8),
+                  let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+                originalItemKeys = []
+                return
+            }
+            var seen: Set<String> = []
+            let newestUnique = decoded.reversed().filter { key in
+                !key.isEmpty
+                    && key.utf8.count <= Self.maximumItemKeyBytes
+                    && seen.insert(key).inserted
+            }.reversed()
+            originalItemKeys = Array(newestUnique.suffix(Self.maximumPersistedItemCount))
+            trimToEncodedByteLimit()
+        }
+
+        func mode(for itemKey: String) -> TokenSaverDisplayMode {
+            originalItemKeys.contains(itemKey) ? .original : .translated
+        }
+
+        mutating func set(_ mode: TokenSaverDisplayMode, for itemKey: String) {
+            originalItemKeys.removeAll { $0 == itemKey }
+            if mode == .original,
+               !itemKey.isEmpty,
+               itemKey.utf8.count <= Self.maximumItemKeyBytes {
+                originalItemKeys.append(itemKey)
+                if originalItemKeys.count > Self.maximumPersistedItemCount {
+                    originalItemKeys.removeFirst(originalItemKeys.count - Self.maximumPersistedItemCount)
+                }
+                trimToEncodedByteLimit()
+            }
+        }
+
+        mutating func removeSelections(threadIds: Set<String>) {
+            guard !threadIds.isEmpty else { return }
+            let prefixes = threadIds.map(AgentAppView.tokenSaverThreadDisplayKeyPrefix)
+            originalItemKeys.removeAll { key in
+                prefixes.contains { prefix in key.hasPrefix(prefix) }
+            }
+        }
+
+        var rawValue: String {
+            guard let data = try? JSONEncoder().encode(originalItemKeys),
+                  let value = String(data: data, encoding: .utf8) else {
+                return "[]"
+            }
+            return value
+        }
+
+        private mutating func trimToEncodedByteLimit() {
+            while !originalItemKeys.isEmpty {
+                guard let data = try? JSONEncoder().encode(originalItemKeys) else {
+                    originalItemKeys = []
+                    return
+                }
+                if data.count <= Self.maximumRawBytes { return }
+                originalItemKeys.removeFirst()
+            }
+        }
     }
 
     private static let threadRailWidthRange: ClosedRange<CGFloat> = 320...360
@@ -9457,12 +9846,17 @@ public struct AgentAppView: View {
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
     @State private var pendingSessionApproval: PendingSessionApprovalConfirmation?
     @State private var expandedRequestPreviews: Set<String> = []
-    /// One durable transcript preference: switching any optimized item to RCW1
-    /// switches every optimized item, and survives closing/reopening the app.
-    @AppStorage("agent.tokenSaver.displayMode.v1") private var tokenSaverDisplayModeRaw = TokenSaverDisplayMode.translated.rawValue
+    /// Durable per-item overrides. Missing identifiers stay in the readable
+    /// Human mode, so changing one translated row never changes another.
+    @AppStorage("agent.tokenSaver.displayModesByItem.v2") private var tokenSaverDisplaySelectionsRaw = "[]"
+    @State private var tokenSaverTransientOriginalDisplayKeys: Set<String> = []
     @State private var declineReasonDrafts: [String: String] = [:]
     // P1: thread delete confirmation — ids staged here until user confirms.
     @State private var pendingDeleteThreadIds: Set<AgentThreadID> = []
+    /// Preferences follow the same ten-second lifecycle as thread deletion.
+    /// IDs stay staged while Undo can restore them; only a finalized deletion
+    /// removes their per-row modes from UserDefaults.
+    @State private var tokenSaverPendingCleanupThreadIds: Set<AgentThreadID> = []
     /// Clear All confirmation for the thread rail.
     @State private var pendingClearAllThreads = false
     // UX-XPLAT-007: checkpoint revert confirmation — staged turn count until user confirms.
@@ -9494,38 +9888,109 @@ public struct AgentAppView: View {
         "Token Saver optimized"
     }
 
-    static func resolvedTokenSaverDisplayMode(_ rawValue: String) -> TokenSaverDisplayMode {
-        TokenSaverDisplayMode(rawValue: rawValue) ?? .translated
-    }
-
     static func tokenSaverCopyText(
         translated: String,
         original: String,
         request: String?,
         mode: TokenSaverDisplayMode
     ) -> String {
-        guard mode == .original else { return translated }
+        guard mode == .original,
+              hasInspectableAssistantRCW1Response(original) else { return translated }
         let requestSection = request.map { "What was sent\n\($0)\n\n" } ?? ""
         return requestSection + "Original provider response\n" + original
     }
 
-    /// Resolve the durable assistant row represented by a timeline-owned final.
-    ///
-    /// The transcript deliberately hides a persisted assistant row when the same
-    /// answer is already rendered by its turn. Token Saver metadata is keyed by
-    /// that durable row, so the visible turn must inherit the row's disclosure or
-    /// the optimization badge disappears even though replay retained the event.
-    static func tokenSaverOptimizedMessageID(
-        matching visibleText: String,
-        messages: [AgentMessage],
-        optimizedMessageIDs: Set<AgentMessageID>
+    /// A request or plain fallback is never a raw assistant response. Accept a
+    /// strict RCW1 response envelope only; malformed/preamble-only text fails safe.
+    static func hasInspectableAssistantRCW1Response(_ original: String) -> Bool {
+        let trimmed = original.trimmingCharacters(in: .whitespacesAndNewlines)
+        let payload = RCWireProtocol.transportEnvelope(in: trimmed)?.payload ?? trimmed
+        guard let frames = try? RCWireProtocol.parse(payload), !frames.isEmpty else {
+            return false
+        }
+        return frames.allSatisfy { $0.direction == .response }
+    }
+
+    static func hasInspectableUserRCW1Request(_ request: String?) -> Bool {
+        guard let request else { return false }
+        let trimmed = request.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let frames = try? RCWireProtocol.parse(trimmed), !frames.isEmpty else {
+            return false
+        }
+        return frames.allSatisfy { $0.direction == .request }
+    }
+
+    /// Composition gate shared by every picker call site. Assistant/progress
+    /// rows require actual RCW1 A bytes; only the durable user row may disclose
+    /// an outbound RCW1 Q before any provider response exists.
+    static func showsTokenSaverDisplayControl(
+        original: String,
+        request: String?,
+        allowsRequestOnlyRCW1: Bool
+    ) -> Bool {
+        hasInspectableAssistantRCW1Response(original)
+            || (allowsRequestOnlyRCW1 && hasInspectableUserRCW1Request(request))
+    }
+
+    static func showsTokenSaverOriginalContent(
+        original: String,
+        mode: TokenSaverDisplayMode
+    ) -> Bool {
+        mode == .original && hasInspectableAssistantRCW1Response(original)
+    }
+
+    static func tokenSaverUserMessageDisplayText(
+        human: String,
+        wireRequest: String?,
+        mode: TokenSaverDisplayMode
+    ) -> String {
+        guard mode == .original, let wireRequest, RCWireProtocol.isWire(wireRequest) else {
+            return human
+        }
+        return wireRequest
+    }
+
+    static func tokenSaverMessageDisplayKey(_ messageId: String) -> String {
+        "message|\(messageId.utf8.count)|\(messageId)"
+    }
+
+    static func tokenSaverTimelineItemDisplayKey(turnId: String, itemId: String) -> String {
+        AgentAppViewModel.tokenSaverTimelineItemTranslationKey(
+            turnId: turnId,
+            itemId: itemId
+        )
+    }
+
+    /// Only the newest assistant item in a turn may borrow the durable final
+    /// message identity. Earlier commentary keeps its own composite timeline key.
+    static func durableFinalMessageId(
+        for item: AssistantItem,
+        in turn: AssistantTurnSnapshot,
+        candidate: AgentMessageID?
     ) -> AgentMessageID? {
-        messages.last(where: { message in
-            message.role == .assistant
-                && optimizedMessageIDs.contains(message.id)
-                && (assistantText(message.content, matches: visibleText)
-                    || assistantText(visibleText, matches: message.content))
-        })?.id
+        guard let candidate,
+              item.type == .assistantMessage,
+              item.turnId == turn.turnId,
+              turn.items.last(where: { candidateItem in
+                  candidateItem.type == .assistantMessage
+                      && !candidateItem.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+              })?.id == item.id else {
+            return nil
+        }
+        return candidate
+    }
+
+    static func tokenSaverTurnDisplayKey(_ turnId: String) -> String {
+        "turn|\(turnId.utf8.count)|\(turnId)"
+    }
+
+    static func tokenSaverThreadDisplayKeyPrefix(_ threadId: String) -> String {
+        "thread|\(threadId.utf8.count)|\(threadId)|"
+    }
+
+    static func tokenSaverThreadScopedDisplayKey(threadId: String, itemKey: String) -> String {
+        tokenSaverThreadDisplayKeyPrefix(threadId)
+            + "row|\(itemKey.utf8.count)|\(itemKey)"
     }
 
     static let fullAccessScopeDescription =
@@ -11097,7 +11562,9 @@ public struct AgentAppView: View {
         // leave generation still so hide-set is not rehashed at token rate.
         let generation = vm.transcriptState.contentGeneration
         if hiddenPersistedAssistantMessageCache.generation == generation {
-            return hiddenPersistedAssistantMessageCache.ids
+            return Set(hiddenPersistedAssistantMessageCache.ids.filter {
+                !vm.tokenSaverRequiresDurableMessageRow(for: $0)
+            })
         }
         let key = Self.hiddenPersistedAssistantContentKey(
             messages: vm.messages,
@@ -11105,7 +11572,9 @@ public struct AgentAppView: View {
         )
         if hiddenPersistedAssistantMessageCache.key == key {
             hiddenPersistedAssistantMessageCache.generation = generation
-            return hiddenPersistedAssistantMessageCache.ids
+            return Set(hiddenPersistedAssistantMessageCache.ids.filter {
+                !vm.tokenSaverRequiresDurableMessageRow(for: $0)
+            })
         }
         let ids = Self.hiddenPersistedAssistantMessageIDs(
             messages: vm.messages,
@@ -11115,7 +11584,7 @@ public struct AgentAppView: View {
         hiddenPersistedAssistantMessageCache.generation = generation
         hiddenPersistedAssistantMessageCache.key = key
         hiddenPersistedAssistantMessageCache.ids = ids
-        return ids
+        return Set(ids.filter { !vm.tokenSaverRequiresDurableMessageRow(for: $0) })
     }
 
     public var body: some View {
@@ -11169,6 +11638,9 @@ public struct AgentAppView: View {
             // Registration happens in AgentAppViewModel.init.
         }
         .onDeleteCommand { deleteSelectedThreads() }
+        .onChange(of: vm.pendingThreadDeletionUndo?.attachmentGCPinID) { _ in
+            reconcileTokenSaverDisplaySelectionCleanup()
+        }
         // P1: confirm before deleting threads — irreversible and instant otherwise.
         .confirmationDialog(
             pendingDeleteThreadIds.count == 1
@@ -13337,7 +13809,15 @@ public struct AgentAppView: View {
     private func messageRow(_ msg: AgentMessage, columnWidth: CGFloat = 10_000) -> some View {
         switch msg.role {
         case .user:
-            let displayText = Self.userMessageDisplayText(msg.content)
+            let wireRequest = vm.tokenSaverWireRequestText(for: msg.id)
+            let hasWireTranslation = vm.tokenSaverOptimizedMessageIds.contains(msg.id)
+                && wireRequest.map(RCWireProtocol.isWire) == true
+            let displayIdentifier = Self.tokenSaverMessageDisplayKey(msg.id.value.uuidString)
+            let displayText = Self.tokenSaverUserMessageDisplayText(
+                human: Self.userMessageDisplayText(msg.content),
+                wireRequest: wireRequest,
+                mode: tokenSaverDisplayMode(for: displayIdentifier, messageId: msg.id)
+            )
             // Cap width against the live column so the bubble wraps instead of
             // painting past the timeline edge. Height is content-driven — never
             // a fixed frame and never a line-count truncate/"Show more" gate.
@@ -13363,11 +13843,22 @@ public struct AgentAppView: View {
                     }
                     .frame(maxWidth: bubbleMax, alignment: .trailing)
                     .accessibilityIdentifier("agent.userMessageBubble")
+                    if hasWireTranslation, let wireRequest {
+                        tokenSaverDisplayControl(
+                            identifierSuffix: displayIdentifier,
+                            messageId: msg.id,
+                            original: wireRequest,
+                            request: wireRequest,
+                            allowsRequestOnlyRCW1: true,
+                            alignment: .trailing
+                        )
+                        .frame(maxWidth: bubbleMax, alignment: .trailing)
+                    }
                     // UX-MAC_AGENT-017: subtle relative timestamp so long threads
                     // show when each message was sent. Keep meta inside the bubble
                     // column so copy + relative time never spill past the pane.
                     HStack(spacing: DS.Space.xs) {
-                        Button { copyToPasteboard(msg.content) } label: {
+                        Button { copyToPasteboard(displayText) } label: {
                             Image(systemName: "doc.on.doc")
                                 .font(.system(size: 11, weight: .regular))
                                 .frame(width: 18, height: 18)
@@ -13406,6 +13897,7 @@ public struct AgentAppView: View {
                     let showBadge = Self.showsTokenSaverOptimizedBadge(
                         wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)
                     )
+                    let displayKey = Self.tokenSaverMessageDisplayKey(msg.id.value.uuidString)
                     VStack(alignment: .leading, spacing: DS.Space.xs) {
                         if showBadge, let original = vm.tokenSaverOriginalText(for: msg.id) {
                             let request = vm.tokenSaverWireRequestText(for: msg.id)
@@ -13413,7 +13905,9 @@ public struct AgentAppView: View {
                                 translated: msg.content,
                                 original: original,
                                 request: request,
-                                identifierSuffix: msg.id.value.uuidString,
+                                identifierSuffix: displayKey,
+                                displayKey: displayKey,
+                                messageId: msg.id,
                                 retryMessageId: msg.id
                             )
                             assistantCopyBar(
@@ -13421,7 +13915,7 @@ public struct AgentAppView: View {
                                     translated: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content),
                                     original: original,
                                     request: request,
-                                    mode: tokenSaverDisplayMode
+                                    mode: tokenSaverDisplayMode(for: displayKey, messageId: msg.id)
                                 ),
                                 identifierSuffix: msg.id.value.uuidString
                             )
@@ -13449,45 +13943,91 @@ public struct AgentAppView: View {
         }
     }
 
-    private var tokenSaverDisplayMode: TokenSaverDisplayMode {
-        Self.resolvedTokenSaverDisplayMode(tokenSaverDisplayModeRaw)
+    private func tokenSaverDisplaySelectionKey(for itemKey: String) -> String {
+        let threadID = vm.selectedThreadId?.value.uuidString ?? "no-thread"
+        return Self.tokenSaverThreadScopedDisplayKey(threadId: threadID, itemKey: itemKey)
     }
 
-    private var tokenSaverDisplayModeBinding: Binding<TokenSaverDisplayMode> {
+    private func tokenSaverDisplayMode(
+        for itemKey: String,
+        messageId: AgentMessageID? = nil
+    ) -> TokenSaverDisplayMode {
+        if let messageId {
+            return vm.tokenSaverDisplaysOriginal(for: messageId) ? .original : .translated
+        }
+        let selectionKey = tokenSaverDisplaySelectionKey(for: itemKey)
+        if tokenSaverTransientOriginalDisplayKeys.contains(selectionKey) {
+            return .original
+        }
+        let selections = TokenSaverDisplaySelections(rawValue: tokenSaverDisplaySelectionsRaw)
+        return selections.mode(for: selectionKey)
+    }
+
+    private func tokenSaverDisplayModeBinding(
+        for itemKey: String,
+        messageId: AgentMessageID? = nil
+    ) -> Binding<TokenSaverDisplayMode> {
         Binding(
-            get: { tokenSaverDisplayMode },
-            set: { tokenSaverDisplayModeRaw = $0.rawValue }
+            get: { tokenSaverDisplayMode(for: itemKey, messageId: messageId) },
+            set: { mode in
+                if let messageId {
+                    vm.setTokenSaverDisplaysOriginal(mode == .original, for: messageId)
+                    return
+                }
+                let selectionKey = tokenSaverDisplaySelectionKey(for: itemKey)
+                if mode == .original {
+                    tokenSaverTransientOriginalDisplayKeys.insert(selectionKey)
+                } else {
+                    tokenSaverTransientOriginalDisplayKeys.remove(selectionKey)
+                }
+                var selections = TokenSaverDisplaySelections(rawValue: tokenSaverDisplaySelectionsRaw)
+                selections.set(mode, for: selectionKey)
+                tokenSaverDisplaySelectionsRaw = selections.rawValue
+            }
         )
     }
 
     @ViewBuilder
     private func tokenSaverDisplayControl(
         identifierSuffix: String,
+        displayKey: String? = nil,
+        messageId: AgentMessageID? = nil,
         original: String,
-        request: String?
+        request: String?,
+        allowsRequestOnlyRCW1: Bool = false,
+        alignment: Alignment = .leading
     ) -> some View {
-        let usesRCW1 = request?.isEmpty == false || RCWireProtocol.containsTransportCandidate(original)
-        HStack(spacing: DS.Space.sm) {
-            Label("Token Saver optimized", systemImage: "arrow.left.arrow.right")
-                .font(DS.Font.caption2)
-                .foregroundColor(DS.Palette.textTertiary)
-                .lineLimit(1)
-            Picker("Token Saver display", selection: tokenSaverDisplayModeBinding) {
-                Text("Translated").tag(TokenSaverDisplayMode.translated)
-                Text(usesRCW1 ? "RCW1" : "Original").tag(TokenSaverDisplayMode.original)
+        let itemKey = displayKey ?? identifierSuffix
+        let selectionKey = tokenSaverDisplaySelectionKey(for: itemKey)
+        let showsControl = Self.showsTokenSaverDisplayControl(
+            original: original,
+            request: request,
+            allowsRequestOnlyRCW1: allowsRequestOnlyRCW1
+        )
+        let displayMode = tokenSaverDisplayMode(for: itemKey, messageId: messageId)
+        if showsControl {
+            HStack(spacing: DS.Space.sm) {
+                Label("Token Saver optimized", systemImage: "arrow.left.arrow.right")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+                Picker("Token Saver display", selection: tokenSaverDisplayModeBinding(for: itemKey, messageId: messageId)) {
+                    Text("Human").tag(TokenSaverDisplayMode.translated)
+                    Text("RCW1").tag(TokenSaverDisplayMode.original)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                .frame(width: 150)
+                .accessibilityLabel("Token Saver display")
+                .accessibilityValue(displayMode == .translated ? "Human" : "RCW1")
+                .accessibilityHint("Switches only this transcript item between readable and original transport text.")
+                .accessibilityIdentifier("agent.tokenSaver.displayMode.\(selectionKey)")
+                .help("Show translated text or the exact Token Saver transport")
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .controlSize(.small)
-            .frame(width: 150)
-            .accessibilityLabel("Token Saver display")
-            .accessibilityValue(tokenSaverDisplayMode == .translated ? "Translated" : (usesRCW1 ? "RCW1" : "Original"))
-            .accessibilityHint("Switches every optimized item in this transcript between readable and original transport text.")
-            .accessibilityIdentifier("agent.tokenSaver.displayMode.\(identifierSuffix)")
-            .help("Show translated text or the exact Token Saver transport")
+            .frame(minHeight: 32)
+            .frame(maxWidth: .infinity, alignment: alignment)
         }
-        .frame(minHeight: 32)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -13547,33 +14087,40 @@ public struct AgentAppView: View {
         original: String,
         request: String?,
         identifierSuffix: String,
+        displayKey: String? = nil,
+        messageId: AgentMessageID? = nil,
         retryMessageId: AgentMessageID? = nil,
         cacheMarkdown: Bool = true
     ) -> some View {
+        let itemKey = displayKey ?? identifierSuffix
+        let selectionKey = tokenSaverDisplaySelectionKey(for: itemKey)
         let effectiveOriginal = original.isEmpty ? translated : original
-        tokenSaverDisplayControl(
-            identifierSuffix: identifierSuffix,
+        if Self.showsTokenSaverOriginalContent(
             original: effectiveOriginal,
-            request: request
-        )
-        if tokenSaverDisplayMode == .translated {
-            assistantProse(translated, cacheMarkdown: cacheMarkdown)
-        } else {
+            mode: tokenSaverDisplayMode(for: itemKey, messageId: messageId)
+        ) {
             tokenSaverOriginalContent(
                 original: effectiveOriginal,
                 request: request,
-                identifierSuffix: identifierSuffix,
+                identifierSuffix: selectionKey,
                 retryMessageId: retryMessageId
             )
+        } else {
+            assistantProse(translated, cacheMarkdown: cacheMarkdown)
         }
-    }
-
-    private func tokenSaverOptimizedMessageID(matching visibleText: String) -> AgentMessageID? {
-        Self.tokenSaverOptimizedMessageID(
-            matching: visibleText,
-            messages: vm.messages,
-            optimizedMessageIDs: vm.tokenSaverOptimizedMessageIds
-        )
+        if Self.showsTokenSaverDisplayControl(
+            original: effectiveOriginal,
+            request: request,
+            allowsRequestOnlyRCW1: false
+        ) {
+            tokenSaverDisplayControl(
+                identifierSuffix: identifierSuffix,
+                displayKey: itemKey,
+                messageId: messageId,
+                original: effectiveOriginal,
+                request: request
+            )
+        }
     }
 
     @ViewBuilder
@@ -13593,6 +14140,7 @@ public struct AgentAppView: View {
         // turns, instead of re-running on every body pass.
         let inputs = turnRenderInputs(for: turn)
         let blocks = inputs.visibleBlocks
+        let durableFinalMessageId = vm.tokenSaverMessageId(forRCW1TurnId: turn.turnId)
         VStack(alignment: .leading, spacing: DS.Space.xl) {
             // Finished turns and live turns both fold settled work into one
             // disclosure so follow-ups read as chat (answer + compact work), not
@@ -13603,7 +14151,8 @@ public struct AgentAppView: View {
                     turn: turn,
                     blocks: inputs.completedWorkBlocks,
                     workBlockCount: inputs.completedWorkBlockCount,
-                    live: !turn.finished
+                    live: !turn.finished,
+                    durableFinalMessageId: durableFinalMessageId
                 )
             }
             // Full access: no plan review card — plans auto-implement without Approve.
@@ -13615,7 +14164,15 @@ public struct AgentAppView: View {
             // Final assistant item rows (finished only). Live leaves this empty by composition.
             ForEach(blocks) { block in
                 switch block {
-                case .item(let item): itemRow(item)
+                case .item(let item):
+                    itemRow(
+                        item,
+                        durableFinalMessageId: Self.durableFinalMessageId(
+                            for: item,
+                            in: turn,
+                            candidate: durableFinalMessageId
+                        )
+                    )
                 case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
                 }
             }
@@ -13623,14 +14180,19 @@ public struct AgentAppView: View {
             // already rendered it (prevents the answer showing twice).
             if let final = turn.finalAssistantMessage, inputs.shouldRenderFinal {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    if let messageId = tokenSaverOptimizedMessageID(matching: final),
+                    if let messageId = durableFinalMessageId,
                        let original = vm.tokenSaverOriginalText(for: messageId) {
+                        let displayKey = Self.tokenSaverMessageDisplayKey(
+                            messageId.value.uuidString
+                        )
                         let request = vm.tokenSaverWireRequestText(for: messageId)
                         tokenSaverContent(
                             translated: final,
                             original: original,
                             request: request,
-                            identifierSuffix: messageId.value.uuidString,
+                            identifierSuffix: displayKey,
+                            displayKey: displayKey,
+                            messageId: messageId,
                             retryMessageId: messageId,
                             cacheMarkdown: turn.finished
                         )
@@ -13639,7 +14201,7 @@ public struct AgentAppView: View {
                                 translated: BackgroundAwaitContinuation.strippingAwaitingMarker(final),
                                 original: original,
                                 request: request,
-                                mode: tokenSaverDisplayMode
+                                mode: tokenSaverDisplayMode(for: displayKey, messageId: messageId)
                             ),
                             identifierSuffix: turn.turnId
                         )
@@ -13658,7 +14220,8 @@ public struct AgentAppView: View {
         turn: AssistantTurnSnapshot,
         blocks: [TurnRenderBlock],
         workBlockCount: Int,
-        live: Bool = false
+        live: Bool = false,
+        durableFinalMessageId: AgentMessageID? = nil
     ) -> some View {
         let expanded = isCompletedWorkExpanded(for: turn)
         let reveal = workDisclosureRevealByTurn[turn.turnId] ?? 0
@@ -13719,7 +14282,15 @@ public struct AgentAppView: View {
                     }
                     ForEach(slice.rows) { block in
                         switch block {
-                        case .item(let item): itemRow(item)
+                        case .item(let item):
+                            itemRow(
+                                item,
+                                durableFinalMessageId: Self.durableFinalMessageId(
+                                    for: item,
+                                    in: turn,
+                                    candidate: durableFinalMessageId
+                                )
+                            )
                         case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
                         }
                     }
@@ -13734,27 +14305,40 @@ public struct AgentAppView: View {
 
 
     @ViewBuilder
-    private func itemRow(_ item: AssistantItem) -> some View {
+    private func itemRow(
+        _ item: AssistantItem,
+        durableFinalMessageId: AgentMessageID? = nil
+    ) -> some View {
         switch item.type {
         case .assistantMessage:
             if Self.shouldRenderAssistantItemBody(item.body, persistedAssistantTexts: persistedAssistantTexts) {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    if let translation = vm.tokenSaverTranslation(forItemId: item.id) {
-                        tokenSaverContent(
-                            translated: item.body,
-                            original: translation.originalText,
-                            request: translation.wireRequestText,
-                            identifierSuffix: item.id,
-                            cacheMarkdown: item.state != .streaming
+                    if let messageId = durableFinalMessageId,
+                       let original = vm.tokenSaverOriginalText(for: messageId) {
+                        let displayKey = Self.tokenSaverMessageDisplayKey(
+                            messageId.value.uuidString
                         )
-                    } else if let messageId = tokenSaverOptimizedMessageID(matching: item.body),
-                              let original = vm.tokenSaverOriginalText(for: messageId) {
                         tokenSaverContent(
                             translated: item.body,
                             original: original,
                             request: vm.tokenSaverWireRequestText(for: messageId),
-                            identifierSuffix: item.id,
+                            identifierSuffix: displayKey,
+                            displayKey: displayKey,
+                            messageId: messageId,
                             retryMessageId: messageId,
+                            cacheMarkdown: item.state != .streaming
+                        )
+                    } else if let translation = vm.tokenSaverTranslation(
+                        forTurnId: item.turnId,
+                        itemId: item.id
+                    ) {
+                        let displayKey = Self.tokenSaverTimelineItemDisplayKey(turnId: item.turnId, itemId: item.id)
+                        tokenSaverContent(
+                            translated: item.body,
+                            original: translation.originalText,
+                            request: translation.wireRequestText,
+                            identifierSuffix: displayKey,
+                            displayKey: displayKey,
                             cacheMarkdown: item.state != .streaming
                         )
                     } else {
@@ -13763,23 +14347,32 @@ public struct AgentAppView: View {
                 }
             }
         case .reasoning:
-            if let translation = vm.tokenSaverTranslation(forItemId: item.id) {
+            if let translation = vm.tokenSaverTranslation(
+                forTurnId: item.turnId,
+                itemId: item.id
+            ) {
                 let text = reasoningText(item)
+                let displayKey = Self.tokenSaverTimelineItemDisplayKey(turnId: item.turnId, itemId: item.id)
+                let original = translation.originalText.isEmpty ? text : translation.originalText
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    if Self.showsTokenSaverOriginalContent(
+                        original: original,
+                        mode: tokenSaverDisplayMode(for: displayKey)
+                    ) {
+                        tokenSaverOriginalContent(
+                            original: original,
+                            request: translation.wireRequestText,
+                            identifierSuffix: tokenSaverDisplaySelectionKey(for: displayKey)
+                        )
+                    } else {
+                        reasoningRow(item)
+                    }
                     tokenSaverDisplayControl(
-                        identifierSuffix: item.id,
-                        original: translation.originalText.isEmpty ? text : translation.originalText,
+                        identifierSuffix: displayKey,
+                        displayKey: displayKey,
+                        original: original,
                         request: translation.wireRequestText
                     )
-                    if tokenSaverDisplayMode == .translated {
-                        reasoningRow(item)
-                    } else {
-                        tokenSaverOriginalContent(
-                            original: translation.originalText.isEmpty ? text : translation.originalText,
-                            request: translation.wireRequestText,
-                            identifierSuffix: item.id
-                        )
-                    }
                 }
             } else {
                 reasoningRow(item)
@@ -15999,6 +16592,8 @@ public struct AgentAppView: View {
         guard !ids.isEmpty else { return }
         Task {
             guard await vm.deleteThreads(ids) else { return }
+            tokenSaverPendingCleanupThreadIds.formUnion(ids)
+            reconcileTokenSaverDisplaySelectionCleanup()
             selectedThreadIds.subtract(ids)
             if let lastSelectedThreadId, ids.contains(lastSelectedThreadId) {
                 self.lastSelectedThreadId = selectedThreadIds.first
@@ -16014,11 +16609,43 @@ public struct AgentAppView: View {
 
     private func commitClearAllThreads() {
         pendingClearAllThreads = false
+        let clearingThreadIds = Set(vm.threads.map(\.id))
         Task {
             guard await vm.clearAllThreads() else { return }
+            tokenSaverPendingCleanupThreadIds.formUnion(clearingThreadIds)
+            reconcileTokenSaverDisplaySelectionCleanup()
             selectedThreadIds = []
             lastSelectedThreadId = nil
         }
+    }
+
+    private func removeTokenSaverDisplaySelections(for threadIds: Set<AgentThreadID>) {
+        var selections = TokenSaverDisplaySelections(rawValue: tokenSaverDisplaySelectionsRaw)
+        let rawThreadIds = Set(threadIds.map { $0.value.uuidString })
+        selections.removeSelections(threadIds: rawThreadIds)
+        tokenSaverDisplaySelectionsRaw = selections.rawValue
+        let prefixes = rawThreadIds.map(Self.tokenSaverThreadDisplayKeyPrefix)
+        tokenSaverTransientOriginalDisplayKeys = Set(
+            tokenSaverTransientOriginalDisplayKeys.filter { key in
+                !prefixes.contains { prefix in key.hasPrefix(prefix) }
+            }
+        )
+    }
+
+    private func reconcileTokenSaverDisplaySelectionCleanup() {
+        guard !tokenSaverPendingCleanupThreadIds.isEmpty else { return }
+        let undoable = Set(
+            vm.pendingThreadDeletionUndo?.snapshots.map(\.thread.id) ?? []
+        )
+        let present = Set(vm.threads.map(\.id))
+        let finalized = tokenSaverPendingCleanupThreadIds
+            .subtracting(undoable)
+            .subtracting(present)
+        if !finalized.isEmpty {
+            removeTokenSaverDisplaySelections(for: finalized)
+        }
+        tokenSaverPendingCleanupThreadIds.subtract(finalized)
+        tokenSaverPendingCleanupThreadIds.subtract(present)
     }
 
     // MARK: Plan notes sidebar

@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 @testable import DistillCore
 
 /// Proves the lossy-prose literal guard is wired into the runtime's output path (P5-T2),
@@ -49,6 +50,41 @@ final class LossyProseGuardTests: XCTestCase {
         let lossy = "Database migration stopped before writing schema version."
         let guarded = MLXDistillRuntime.guardLossyProseOutput(lossy, request: request(.longText, input: input))
         XCTAssertEqual(guarded, input, "I8: reverse coverage keeps salient failure words")
+    }
+
+    func test_wireEncode_rejectedCandidatesFailOpenToExactHumanInput() throws {
+        let cases = [
+            (
+                reason: "parse",
+                input: "Inspect the workspace safely.",
+                candidate: "RCW1\tQ\t1\nG\tmissing terminator"
+            ),
+            (
+                reason: "protected semantics",
+                input: "Do not deploy before confirming code 5012.",
+                candidate: try RCWireProtocol.serializeRequestText("Deploy after checking the result.")
+            ),
+            (
+                reason: "pinned literal",
+                input: "Preserve /tmp/Keep.swift exactly.",
+                candidate: try RCWireProtocol.serializeRequestText("Preserve the file exactly.")
+            ),
+        ]
+
+        for testCase in cases {
+            let wireRequest = request(.wireEncode, input: testCase.input)
+            let guarded = MLXDistillRuntime.guardLossyProseOutput(
+                testCase.candidate,
+                request: wireRequest
+            )
+
+            XCTAssertEqual(
+                guarded,
+                testCase.input,
+                testCase.reason
+            )
+            XCTAssertFalse(RCWireProtocol.isWire(guarded), testCase.reason)
+        }
     }
 
     func test_faithfulnessGateAcceptsWhenSalientWordsAndLiteralsRemain() {

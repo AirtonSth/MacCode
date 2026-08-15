@@ -77,6 +77,26 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         XCTAssertEqual(ok.code, 0)
         XCTAssertTrue(ok.out.contains("PASS"), "real CLI binary compressed via the live sidecar; got: \(ok.out)")
 
+        // Codex and Grok use the global PATH wrapper rather than Claude's
+        // PostToolUse hook. They still must discover an isolated workspace's
+        // lease from the shared app-support contract alone.
+        for provider in ["codex", "grok"] {
+            var providerEnvironment = liveEnvironment
+            providerEnvironment.removeValue(forKey: "REMOTE_CODE_DISTILL_STATE_PATH")
+            providerEnvironment["REMOTE_CODE_AGENT_PROVIDER"] = provider
+            let providerResult = try runProcess(
+                binary,
+                ["cli", "Did the build pass? Return PASS or FAIL only."],
+                env: providerEnvironment,
+                stdin: "build passed\n0 failures"
+            )
+            XCTAssertEqual(providerResult.code, 0, "\(provider) app-support lease lookup")
+            XCTAssertTrue(
+                providerResult.out.contains("PASS"),
+                "\(provider) must reach Distill without a Claude-only state override; got: \(providerResult.out)"
+            )
+        }
+
         // A stale env + state + installed symlink cannot override the live paid
         // setting. No request reaches the still-running sidecar.
         settings.update { $0.tokenSaverEnabled = false }

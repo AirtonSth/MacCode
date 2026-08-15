@@ -1153,8 +1153,8 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "Token Saver on: system prompt carries the `| distill` piping rule")
         XCTAssertTrue(on.contains("NEVER pipe `| distill` only for exact-output"),
                       "Token Saver on: system prompt carries the never-pipe rule for byte-exact output")
-        XCTAssertTrue(on.contains("S=state"),
-                      "Token Saver on: system prompt carries distill-language prefixes")
+        XCTAssertTrue(on.contains(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")),
+                      "Token Saver on: system prompt carries the canonical exact-output catalog")
 
         let off = try await configureCommand(tokenSaverOn: false)
         // Background-await stays; Distill is paid (Token Saver only).
@@ -1698,8 +1698,12 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(FileManager.default.isReadableFile(atPath: cachedPackage.path),
                       "SDK provisioning must leave the package in the runtime cache used by the launched bridge")
         let commands = try String(contentsOf: commandLog, encoding: .utf8)
-        XCTAssertTrue(commands.contains(cache.appendingPathComponent("ClaudeAgentSDKBridge.mjs").path),
-                      "adapter must launch the cached bridge after provisioning dependencies")
+        let bridgeSource = try String(contentsOf: bridge, encoding: .utf8)
+        let cachedBridge = cache.appendingPathComponent(
+            ClaudeAgentSDKBridgeAdapter.cachedBridgeFileName(source: bridgeSource)
+        )
+        XCTAssertTrue(commands.contains(cachedBridge.path),
+                      "adapter must launch the content-addressed cached bridge after provisioning dependencies")
         try adapter.stopSession(threadId: threadId)
     }
 
@@ -1836,6 +1840,12 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "Bash must skip exact-output shell tools (rg/grep/sed/...) per AGENTS.md")
         XCTAssertTrue(source.contains("isExactOutputBashCommand"),
                       "Bash exact-output detection must inspect command segments, not only the first token")
+        for command in WrappedCommandCatalog.exactOutputCommands {
+            XCTAssertTrue(
+                source.contains("'\(command)'"),
+                "Claude SDK hook must protect the canonical exact-output command: \(command)"
+            )
+        }
         XCTAssertTrue(source.contains("updatedToolOutput"),
                       "PostToolUse must use updatedToolOutput so built-in tools actually receive compressed output")
     }
@@ -1871,12 +1881,33 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         const skill = mod.tokenSaverToolDecision('Skill', { skill: 'remote-code-orchestrate' }, largeSkill);
         const ordinary = mod.tokenSaverToolDecision('Bash', { command: 'swift test' }, largeSkill);
         const exact = mod.tokenSaverToolDecision('Bash', { command: 'rg -n foo Sources' }, largeSkill);
+        const exactMatrix = [
+          'FOO=1 egrep needle file',
+          '/usr/bin/env FOO=1 xxd fixture.bin',
+          'env -- xxd fixture.bin',
+          'command base64 fixture.bin',
+          '/usr/bin/command -- base64 fixture.bin',
+          'env -S rg needle Sources',
+          "env -S 'rg -n needle Sources'",
+          'env -C /tmp rg -n needle Sources',
+          'env -P /usr/bin rg -n needle Sources',
+          'env -v rg -n needle Sources',
+          'env -iv rg -n needle Sources',
+          "FOO='a b' rg -n needle Sources",
+          "env FOO='a b' rg -n needle Sources",
+          "exec -a 'display name' rg -n needle Sources",
+          '"/usr/bin/env" FOO=1 rg -n needle Sources',
+          '"/usr/bin/command" -- rg -n needle Sources',
+          'exec -a display-name rg -n needle Sources',
+          'git -C repo show HEAD',
+        ].map((command) => mod.tokenSaverToolDecision('Bash', { command }, largeSkill));
         console.log(JSON.stringify({
           skillShouldCompress: skill.shouldCompress,
           skillSkipReason: skill.skipReason,
           ordinaryShouldCompress: ordinary.shouldCompress,
           exactShouldCompress: exact.shouldCompress,
           exactSkipReason: exact.skipReason,
+          exactMatrixSkipped: exactMatrix.every((decision) => !decision.shouldCompress && decision.skipReason === 'exact_output_shell'),
           skillExcluded: mod.TOKEN_SAVER_EXCLUDED_TOOLS.has('skill'),
           skillLen: largeSkill.length,
         }));
@@ -1907,6 +1938,8 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                        "ordinary large Bash output remains Distill-eligible")
         XCTAssertEqual(json["exactShouldCompress"] as? Bool, false,
                        "exact-output Bash (rg) stays excluded")
+        XCTAssertEqual(json["exactMatrixSkipped"] as? Bool, true,
+                       "prefixes, extended catalog commands, and git global options must stay exact")
         XCTAssertEqual(json["skillExcluded"] as? Bool, true)
         XCTAssertGreaterThan(json["skillLen"] as? Int ?? 0, 6000,
                              "fixture must exceed presentation truncation limit to prove completeness path")

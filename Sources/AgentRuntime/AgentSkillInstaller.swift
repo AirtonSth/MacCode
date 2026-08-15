@@ -227,11 +227,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary / pass-fail / key lines, you MUST pipe.
       Applies to: build, test, lint, install, docker, kubectl, terraform, find, ls, git/gh/glab (including `gh api`, merges, status), package managers, python/bun one-shots, curl/aws/cloud CLIs, compound scripts, CI/logs, and **any other ordinary command** not listed under NEVER below.
       Host PATH wrappers auto-compress **all subcommands** of wrapped binaries (no read-only allowlist) when terminal-to-agent and above threshold — still pipe `| distill` yourself so extraction is explicit. Same policy for primary, nested subagents, and cross-provider orchestration (Claude/Codex/Grok).
-    - NEVER pipe `| distill` only when you need the **exact** full stdout (or the tool is not a normal shell pipe target):
-      search/match: rg, grep, egrep, fgrep, ag, ugrep, git grep
-      line/stream edit or dump: sed, awk, cat, head, tail, nl, cut, tr, paste
-      exact compare/bytes: diff, cmp, od, hexdump, xxd, base64
-      structure extractors when parsing: jq, yq
+    - NEVER pipe `| distill` when you need exact stdout from: \(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")); or git grep/show/cat-file/blame.
       Also skip: GUI / interactive / TUI apps, non-pipable calls, patches/apply, hash/token copy, or RemoteCodeDistillService unavailable.
     - NEVER Distill skill content: Skill tool output and requested/returned SKILL.md bodies are a protected verbatim category — return them complete (no summary, recovery handle, truncation, or savings accounting).
     - Never call Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
@@ -256,7 +252,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Distill is only for local command/tool-output reduction. It is not a conversation style or user command.
     Token Saver — Claude/Codex/Grok (primary, nested, subagents): large surveys → Graphify query-first when `$RC_GRAPHIFY_GRAPH_JSON` is set, else shell + PATH wrappers / `| distill`. Avoid flooding native multi-file read_file/grep (Grok/Codex cannot rewrite those; Claude PostToolUse helps but shell coverage is higher). Native reads only for small exact slices.
     MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary/pass-fail/key lines, you MUST pipe. Host PATH wrappers auto-compress all subcommands of wrapped binaries (incl. gh api; no read-only allowlist); still pipe yourself for an explicit extraction question. Applies primary + nested + cross-provider (Claude/Codex/Grok) whenever Token Saver is admitted.
-    NEVER pipe `| distill` only for exact-output (agent needs full stdout): rg, grep, egrep, fgrep, sed, awk, cat, head, tail, nl, cut, tr, diff, jq, yq, git grep/show/cat-file/blame; also patches/hashes/tokens, GUI/interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
+    NEVER pipe `| distill` only for exact-output (agent needs full stdout): \(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")); git grep/show/cat-file/blame; also patches/hashes/tokens, GUI/interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
     Omitting `| distill` on a non-exact, non-GUI shell command is a policy violation.
     NEVER Distill skill content: Skill tool output and requested/returned SKILL bodies must stay complete/verbatim (no summary, `[[rc:]]` handle, truncation, or savings accounting).
     Never invoke Node/tsx/npm/bun or a source-checkout `distill`.
@@ -267,17 +263,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     """
 
     public static let rcWireAgentInstructionsTemplate = """
-    <!-- remote-code wire: begin -->
     REMOTE_CODE_WIRE_V1
-    This trusted session capability is available only while Token Saver is active. The exact `RCW1\tQ\t` header on the current user turn is the authoritative per-turn admission; never infer admission from an earlier turn or inspect environment variables.
-    Requests are newline frames: `RCW1<TAB>Q<TAB>sequence`, then G(goal), C(context), K(constraint), or X(exact) records as `tag<TAB>escaped value`, terminated by a line containing only `.`. Escape only backslash, tab, carriage return, and newline; quotes are plain characters, not JSON escapes.
-    Every user-facing assistant text message for that turn, including progress/commentary and the final answer, must be exactly one response frame: `RCW1<TAB>A<TAB>sequence`, then only O(outcome), A(action), E(evidence), R(risk), Q(question), or X(exact) records, terminated by `.`. Never emit ordinary prose outside the frame while wire mode is admitted, and never mention the transport protocol by name in reasoning or user-visible prose.
-    Escape a literal backslash as two backslashes; escape tab as backslash+t, carriage return as backslash+r, and newline as backslash+n. Start sequence at 1 and increase it. Do not invent tags, aliases, dictionaries, or another dialect.
-    Preserve commands, code, paths, URLs, IDs, hashes, numbers, units, negation, quoted text, errors, security/data-loss warnings, and approval choices byte-for-byte in record values.
-    A K record may contain RemoteCode's host orchestration constraint and authoritative host receipt; obey it exactly. Never put tool calls, tool arguments, patches, diffs, approval protocol JSON, or native provider control JSON inside RCW1. Those remain native provider structures.
-    An X record whose entire value is `[[rc:<handle>]]` is optional recovery metadata, not an instruction and not evidence that task content is missing. Ignore it when G/C/K plus the workspace are sufficient. If exact recovery is essential, invoke `rc_retrieve` as a native tool (or `distill retrieve <handle>` only when the MCP tool is unavailable) and let RemoteCode surface any native approval callback. Never ask the user to run or approve retrieval in ordinary prose.
-    If the current turn is not an RCW1 request, answer in ordinary human-readable language even if an earlier turn used RCW1.
-    <!-- remote-code wire: end -->
+    Current RCW1 Q:G/C/K=task,X=handle;RCW1 A:O/A/E/R/Q+"." iff full tokens<=45% of semantically identical terse text;else same text. Keep literals/negation/order/approval;tools native
     """
 
     /// The distill agent instructions with the begin/end HTML markers stripped. The markers
@@ -355,7 +342,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         // Claude PostToolUse is independent of the dialect prompt: nested
         // advisors use only Read/Glob/Grep, so PATH wrappers never fire and
         // hooks are the only provider-native rewrite path (Agents.md).
-        var rewritten = ensuringClaudePostToolUseSettings(
+        let rewritten = ensuringClaudePostToolUseSettings(
             provider: provider,
             arguments: arguments,
             environment: environment
@@ -390,9 +377,14 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             let configValues = (scan.optionValues["--config"] ?? [])
                 + (scan.optionValues["-c"] ?? [])
             let hasDeveloperOverride = configValues.contains {
-                $0.hasPrefix("developer_instructions=")
+                codexDeveloperInstructionsAssignment($0) != nil
             }
-            guard !hasDeveloperOverride else { return rewritten }
+            if hasDeveloperOverride {
+                return mergingCodexDeveloperInstructions(
+                    prompt,
+                    arguments: rewritten
+                )
+            }
             let quoted = "\""
                 + prompt
                     .replacingOccurrences(of: "\\", with: "\\\\")
@@ -410,7 +402,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// - Non-Claude providers: unchanged.
     /// - Flag absent / not admitted: unchanged (byte-identical argv).
     /// - Administrative / unsupported turns: unchanged.
-    /// - Caller already passed `--settings`: leave intact (never double-inject).
+    /// - Caller `--settings`: merge in memory; never edit the caller's file.
     /// - Settings builder fails: leave argv unchanged.
     static func ensuringClaudePostToolUseSettings(
         provider: AgentProvider,
@@ -436,17 +428,55 @@ public final class AgentSkillInstaller: @unchecked Sendable {
               let ptuHooks = ptuObject["hooks"] as? [String: Any] else {
             return arguments
         }
-        // Merge into an existing inline JSON --settings when present (nested CLIs
-        // sometimes already pass --settings). File-path --settings stays untouched.
-        if let settingsIndex = arguments.firstIndex(of: "--settings"),
-           settingsIndex + 1 < arguments.count {
-            let existing = arguments[settingsIndex + 1]
-            if existing.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"),
-               let existingData = existing.data(using: .utf8),
+        // Merge into the effective (last) inline JSON or JSON settings file.
+        // The caller's file is never edited; path-form becomes an equivalent
+        // inline object at the same argv position. Both `--settings value` and
+        // `--settings=value` are supported by the Claude CLI.
+        enum SettingsLocation {
+            case separate(valueIndex: Int)
+            case inline(argumentIndex: Int)
+        }
+        let boundary = arguments.firstIndex(of: "--") ?? arguments.endIndex
+        var effectiveSettings: (location: SettingsLocation, value: String)?
+        var scanIndex = 0
+        while scanIndex < boundary {
+            let argument = arguments[scanIndex]
+            if argument == "--settings" {
+                guard scanIndex + 1 < boundary else { return arguments }
+                effectiveSettings = (.separate(valueIndex: scanIndex + 1), arguments[scanIndex + 1])
+                scanIndex += 2
+                continue
+            }
+            if argument.hasPrefix("--settings=") {
+                effectiveSettings = (
+                    .inline(argumentIndex: scanIndex),
+                    String(argument.dropFirst("--settings=".count))
+                )
+            }
+            scanIndex += 1
+        }
+        if let effectiveSettings {
+            let existing = effectiveSettings.value
+            let existingData: Data? = {
+                if existing.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{") {
+                    return existing.data(using: .utf8)
+                }
+                return FileManager.default.contents(atPath: existing)
+            }()
+            if let existingData,
                var existingObject = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any] {
                 var hooks = existingObject["hooks"] as? [String: Any] ?? [:]
-                if hooks["PostToolUse"] == nil {
-                    hooks["PostToolUse"] = ptuHooks["PostToolUse"]
+                let existingPost = hooks["PostToolUse"] as? [[String: Any]] ?? []
+                let requiredPost = ptuHooks["PostToolUse"] as? [[String: Any]] ?? []
+                let existingJSON = (try? JSONSerialization.data(
+                    withJSONObject: existingPost,
+                    options: [.sortedKeys]
+                )).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                let mergedPost = existingJSON.contains("distill hook post-tool-use")
+                    ? existingPost
+                    : existingPost + requiredPost
+                if !mergedPost.isEmpty {
+                    hooks["PostToolUse"] = mergedPost
                     existingObject["hooks"] = hooks
                     if let merged = try? JSONSerialization.data(
                         withJSONObject: existingObject,
@@ -454,17 +484,191 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                     ),
                        let mergedJSON = String(data: merged, encoding: .utf8) {
                         var out = arguments
-                        out[settingsIndex + 1] = mergedJSON
+                        switch effectiveSettings.location {
+                        case .separate(let valueIndex):
+                            out[valueIndex] = mergedJSON
+                        case .inline(let argumentIndex):
+                            out[argumentIndex] = "--settings=" + mergedJSON
+                        }
                         return out
                     }
                 }
-                // Already has PostToolUse — leave intact.
-                return arguments
             }
-            // Path-form --settings: cannot safely merge; leave intact (fail open).
+            // Unknown/non-JSON settings remain byte-identical (fail open).
             return arguments
         }
         return settingsArgs + arguments
+    }
+
+    private static func mergingCodexDeveloperInstructions(
+        _ prompt: String,
+        arguments: [String]
+    ) -> [String] {
+        let escapedPrompt = prompt
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+        enum OverrideLocation {
+            case separate(valueIndex: Int)
+            case inline(argumentIndex: Int, option: String)
+        }
+        var effectiveOverride: (
+            location: OverrideLocation,
+            assignment: CodexDeveloperInstructionsAssignment
+        )?
+        let boundary = arguments.firstIndex(of: "--") ?? arguments.endIndex
+        var index = 0
+        while index < boundary {
+            let argument = arguments[index]
+            if argument == "--config" || argument == "-c" {
+                guard index + 1 < boundary else { return arguments }
+                let value = arguments[index + 1]
+                if let assignment = codexDeveloperInstructionsAssignment(value) {
+                    effectiveOverride = (
+                        .separate(valueIndex: index + 1),
+                        assignment
+                    )
+                }
+                index += 2
+                continue
+            }
+            if let option = ["--config", "-c"].first(where: {
+                argument.hasPrefix("\($0)=")
+            }) {
+                let value = String(argument.dropFirst(option.count + 1))
+                if let assignment = codexDeveloperInstructionsAssignment(value) {
+                    effectiveOverride = (
+                        .inline(argumentIndex: index, option: option),
+                        assignment
+                    )
+                }
+            }
+            index += 1
+        }
+        guard let effectiveOverride else { return arguments }
+        let encoded = effectiveOverride.assignment.encoded
+        if encoded.contains("TOKEN_SAVER_SAFETY_ABI_V1") {
+            return arguments
+        }
+        let delimiter: String
+        if encoded.hasPrefix("\"\"\"") && encoded.hasSuffix("\"\"\"") {
+            delimiter = "\"\"\""
+        } else if encoded.hasPrefix("'''") && encoded.hasSuffix("'''") {
+            delimiter = "'''"
+        } else if encoded.hasPrefix("\"") && encoded.hasSuffix("\"") {
+            delimiter = "\""
+        } else if encoded.hasPrefix("'") && encoded.hasSuffix("'") {
+            delimiter = "'"
+        } else {
+            // Codex accepts an unquoted fallback value and gives the last
+            // override precedence. Treat it as caller text, then canonicalize
+            // the merged result to a TOML basic string.
+            delimiter = ""
+        }
+        let body = delimiter.isEmpty
+            ? encoded
+            : String(encoded.dropFirst(delimiter.count).dropLast(delimiter.count))
+        let mergedEncoded: String
+        if delimiter.isEmpty || delimiter.hasPrefix("'") {
+            // TOML literal strings do not interpret \n or escaping. Re-encode
+            // their semantic value as a basic string before appending policy.
+            let escapedBody = body
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+                .replacingOccurrences(of: "\n", with: "\\n")
+                .replacingOccurrences(of: "\r", with: "\\r")
+            mergedEncoded = "\"" + escapedBody + "\\n\\n" + escapedPrompt + "\""
+        } else {
+            mergedEncoded = delimiter + body + "\\n\\n" + escapedPrompt + delimiter
+        }
+        let value = "developer_instructions=" + mergedEncoded
+            + effectiveOverride.assignment.trailingComment
+        var merged = arguments
+        switch effectiveOverride.location {
+        case .separate(let valueIndex):
+            merged[valueIndex] = value
+        case .inline(let argumentIndex, let option):
+            merged[argumentIndex] = option + "=" + value
+        }
+        return merged
+    }
+
+    /// Decode only the TOML assignment shape that Codex treats as its effective
+    /// developer prompt. Values remain encoded so merging can preserve basic vs
+    /// multiline semantics without implementing a general TOML parser.
+    private struct CodexDeveloperInstructionsAssignment {
+        let encoded: String
+        let trailingComment: String
+    }
+
+    private static func codexDeveloperInstructionsAssignment(
+        _ configuration: String
+    ) -> CodexDeveloperInstructionsAssignment? {
+        guard let equals = configuration.firstIndex(of: "=") else { return nil }
+        let key = configuration[..<equals]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard key == "developer_instructions" else { return nil }
+        let rawValue = configuration[configuration.index(after: equals)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let (encoded, comment) = splitCodexTOMLValueAndComment(rawValue)
+        guard !encoded.isEmpty else { return nil }
+        return CodexDeveloperInstructionsAssignment(
+            encoded: encoded,
+            trailingComment: comment.map { " # " + $0 } ?? ""
+        )
+    }
+
+    /// Split a single TOML value from a trailing comment without treating `#`
+    /// inside basic, literal, or multiline strings as comment syntax.
+    private static func splitCodexTOMLValueAndComment(
+        _ rawValue: String
+    ) -> (value: String, comment: String?) {
+        let characters = Array(rawValue)
+        var index = 0
+        var quote: Character?
+        var tripleQuoted = false
+        while index < characters.count {
+            let character = characters[index]
+            if let activeQuote = quote {
+                if activeQuote == "\"", character == "\\", !tripleQuoted {
+                    index = min(index + 2, characters.count)
+                    continue
+                }
+                if character == activeQuote {
+                    if tripleQuoted {
+                        if index + 2 < characters.count,
+                           characters[index + 1] == activeQuote,
+                           characters[index + 2] == activeQuote {
+                            quote = nil
+                            tripleQuoted = false
+                            index += 3
+                            continue
+                        }
+                    } else {
+                        quote = nil
+                    }
+                }
+                index += 1
+                continue
+            }
+            if character == "#" {
+                let value = String(characters[..<index])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let comment = String(characters[(index + 1)...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return (value, comment)
+            }
+            if character == "\"" || character == "'" {
+                quote = character
+                tripleQuoted = index + 2 < characters.count
+                    && characters[index + 1] == character
+                    && characters[index + 2] == character
+                index += tripleQuoted ? 3 : 1
+                continue
+            }
+            index += 1
+        }
+        return (rawValue.trimmingCharacters(in: .whitespacesAndNewlines), nil)
     }
 
     /// Restrict prompt/rules injection to provider invocations whose turn ABI
@@ -959,16 +1163,28 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         if let preferred, fileManager.isExecutableFile(atPath: preferred.path) {
             return preferred.resolvingSymlinksInPath()
         }
-        // Prefer this installer's managed-bin wrappers (per-user home) before
-        // process-global resolution. After app moves/upgrades, wrappers often
-        // still point at the live service while Bundle.main / SwiftPM paths lag;
-        // also keeps sandboxed test homes from picking up the host SPM binary.
-        if let recovered = recoverServiceBinaryFromManagedWrappers() {
-            return recovered
-        }
-        if let resolved = Self.resolveServiceBinary(fileManager: fileManager),
-           fileManager.isExecutableFile(atPath: resolved.path) {
-            return resolved.resolvingSymlinksInPath()
+        let usesProductionManagedBin = cliBinDirectory.standardizedFileURL.path
+            == Self.defaultManagedCLIBinDirectory().standardizedFileURL.path
+        if usesProductionManagedBin {
+            // A running app bundle is authoritative. Recovering the shared
+            // wrapper first let an older concurrently-running build repoint the
+            // current app back to its stale service binary.
+            if let resolved = Self.resolveServiceBinary(fileManager: fileManager),
+               fileManager.isExecutableFile(atPath: resolved.path) {
+                return resolved.resolvingSymlinksInPath()
+            }
+            if let recovered = recoverServiceBinaryFromManagedWrappers() {
+                return recovered
+            }
+        } else {
+            // Sandboxed/custom homes must not pick up a process-global build.
+            if let recovered = recoverServiceBinaryFromManagedWrappers() {
+                return recovered
+            }
+            if let resolved = Self.resolveServiceBinary(fileManager: fileManager),
+               fileManager.isExecutableFile(atPath: resolved.path) {
+                return resolved.resolvingSymlinksInPath()
+            }
         }
         throw AgentSkillCLIError.serviceBinaryUnavailable
     }
@@ -1308,10 +1524,37 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         }
         let path = destination.path
         return path.contains("/RemoteCode.app/Contents/MacOS/")
+            || isRemoteCodeAppBundleService(destination)
             || path.contains("/.build/")
             || path.contains("/Build/Products/")
             || path.contains("/.remote-code/runtime/")
             || path.contains("/remote-code-macos-la-bootstrap-")
+    }
+
+    /// Development and canary builds may use a product name other than
+    /// `RemoteCode.app`. The bundle identifier is the stable ownership marker;
+    /// relying on the product name stranded managed aliases on an older build.
+    private func isRemoteCodeAppBundleService(_ destination: URL) -> Bool {
+        let macOSDirectory = destination.deletingLastPathComponent()
+        let contentsDirectory = macOSDirectory.deletingLastPathComponent()
+        let appBundle = contentsDirectory.deletingLastPathComponent()
+        guard macOSDirectory.lastPathComponent == "MacOS",
+              contentsDirectory.lastPathComponent == "Contents",
+              appBundle.pathExtension == "app",
+              let plistData = fileManager.contents(
+                atPath: contentsDirectory.appendingPathComponent("Info.plist").path
+              ),
+              let plist = try? PropertyListSerialization.propertyList(
+                from: plistData,
+                options: [],
+                format: nil
+              ) as? [String: Any],
+              let bundleIdentifier = plist["CFBundleIdentifier"] as? String
+        else {
+            return false
+        }
+        return bundleIdentifier == "io.remotecode.desktop"
+            || bundleIdentifier.hasPrefix("io.remotecode.desktop.")
     }
 
     private func removeManagedWrapperSymlinks(

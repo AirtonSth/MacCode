@@ -218,6 +218,20 @@ final class RCWireProtocolTests: XCTestCase {
         ), "local polishing must never reverse negation or drop exact commands/numbers")
     }
 
+    func test_renderSafetyRejectsNegationOnlyInversion() {
+        let frame = RCWireFrame(direction: .response, sequence: 1, records: [
+            .init(kind: .outcome, value: "The tests did not pass.")
+        ])
+
+        XCTAssertFalse(
+            RCWireProtocol.renderedTextPreservesProtectedSemantics(
+                "The tests passed.",
+                frames: [frame]
+            ),
+            "local Human rendering must not erase the only negation in a response"
+        )
+    }
+
     func test_securityAndApprovalFramesRequireDeterministicRendering() {
         XCTAssertTrue(RCWireProtocol.requiresDeterministicRendering([
             .init(direction: .response, sequence: 1, records: [
