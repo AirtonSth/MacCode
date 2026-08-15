@@ -1069,6 +1069,100 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskWorkLog.first?.statusLabel, "Done")
     }
 
+    func test_queuedFollowUpStaysOnOwningBot_becauseDrainMustNotSendToAnotherDesk() throws {
+        // WHY: send-while-live queues the follow-up. Completing Piper's run
+        // used selectedBot, so a switch to Quinn delivered Piper's words
+        // to the wrong teammate. The queue is per Desk and only drains
+        // onto the bot that accepted it.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        let thread = AgentThread(title: "From Piper", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        let piperRun = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        )
+        try context.runRepo.upsert(piperRun)
+        let piperConversation = BotConversation(
+            botID: piper.id,
+            title: "From Piper",
+            linkedAgentThreadID: thread.id
+        )
+        try context.botStore.upsertConversation(piperConversation)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.deskRunIsLive)
+        vm.composerText = "follow up for Piper"
+        vm.send()
+        XCTAssertEqual(vm.queuedFollowUps.map(\.text), ["follow up for Piper"])
+        XCTAssertFalse(
+            vm.deskMessages.contains { $0.text == "follow up for Piper" },
+            "queued follow-ups wait in the queue, not as a sent bubble"
+        )
+
+        vm.openDesk(quinn)
+        XCTAssertTrue(
+            vm.queuedFollowUps.isEmpty,
+            "Quinn's Desk must not inherit Piper's queue"
+        )
+        var finished = piperRun
+        finished.status = .completed
+        finished.finishedAt = Date()
+        try context.runRepo.upsert(finished)
+        vm.applyFollowThroughForTests(bot: piper, conversation: piperConversation, status: .completed)
+        XCTAssertFalse(
+            vm.deskMessages.contains { $0.text == "follow up for Piper" },
+            "Piper's drained follow-up must not land on Quinn"
+        )
+        XCTAssertFalse(
+            (try context.botStore.listConversations(botID: quinn.id))
+                .contains { $0.title.contains("follow up for Piper") }
+        )
+
+        vm.openDesk(piper)
+        XCTAssertTrue(
+            vm.queuedFollowUps.isEmpty,
+            "returning to idle Piper drains the follow-up onto Piper, not Quinn"
+        )
+        XCTAssertTrue(
+            vm.deskMessages.contains { $0.text == "follow up for Piper" },
+            "Piper must receive the words that were queued on Piper"
+        )
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+    }
+
+    func test_queuedFollowUpCanBeRemoved_becauseAHiddenQueueIsNotASend() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.deskRunIsLive)
+        vm.composerText = "keep this off the wire"
+        vm.send()
+        let queued = try XCTUnwrap(vm.queuedFollowUps.first)
+        vm.removeQueuedFollowUp(queued)
+        XCTAssertTrue(vm.queuedFollowUps.isEmpty)
+        vm.reload()
+        XCTAssertTrue(vm.queuedFollowUps.isEmpty, "reload must not resurrect a cancelled follow-up")
+        XCTAssertFalse(vm.deskMessages.contains { $0.text == "keep this off the wire" })
+    }
+
     func test_deskTimelineHidesPersistedAssistantThatDuplicatesTheTurn_becauseRepliesMustNotDouble() {
         // WHY: Desk hydrates messageRepo AND replays stream events. The same
         // greeting must not appear as a bubble and again as the turn final.
@@ -1609,6 +1703,9 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(chatChrome.contains("agent.attach"))
         XCTAssertTrue(chatChrome.contains("agent.workingPhase"))
         XCTAssertTrue(chatChrome.contains("agent.composer.stop"))
+        XCTAssertTrue(bots.contains("bots.desk.queued"))
+        XCTAssertTrue(bots.contains("bots.desk.queued.header"))
+        XCTAssertTrue(bots.contains("bots.desk.queued.remove"))
         XCTAssertTrue(bots.contains("bots.desk.composer"))
         XCTAssertTrue(chatChrome.contains("accessibilityIdentifier(composerIdentifier)"))
         XCTAssertTrue(chatChrome.contains("\"bots.desk.composer\""))

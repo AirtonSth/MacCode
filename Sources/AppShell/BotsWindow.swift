@@ -8,11 +8,13 @@ import SwiftUI
 
 // MARK: - Drafts & rows
 
-public struct BotQueuedFollowUp: Equatable {
+public struct BotQueuedFollowUp: Equatable, Identifiable {
+    public let id: UUID
     public var text: String
     public var attachments: [AgentAttachment]
 
-    public init(text: String, attachments: [AgentAttachment] = []) {
+    public init(id: UUID = UUID(), text: String, attachments: [AgentAttachment] = []) {
+        self.id = id
         self.text = text
         self.attachments = attachments
     }
@@ -275,6 +277,7 @@ public final class BotsViewModel: ObservableObject {
     private var lastLinkedRunIDByBot: [BotID: AgentRunID] = [:]
     private var liveTimelineByBot: [BotID: AssistantTimelineState] = [:]
     private var liveStreamCountByBot: [BotID: Int] = [:]
+    private var queuedFollowUpsByBot: [BotID: [BotQueuedFollowUp]] = [:]
     private var deskLiveTurnWatch: Task<Void, Never>?
 
     public init(context: AppContext, router: AppCommandRouter? = nil) {
@@ -486,6 +489,8 @@ public final class BotsViewModel: ObservableObject {
         persistSelection()
         markOpenedConversationRead(botID: bot.id)
         reloadSelectedBot(id: bot.id)
+        syncQueuedFollowUps()
+        drainQueuedFollowUp()
     }
 
     private func markOpenedConversationRead(botID: BotID) {
@@ -736,6 +741,12 @@ public final class BotsViewModel: ObservableObject {
         attachments.removeAll { $0 == attachment }
     }
 
+    public func removeQueuedFollowUp(_ item: BotQueuedFollowUp) {
+        guard let botID = selectedBotID else { return }
+        queuedFollowUpsByBot[botID]?.removeAll { $0.id == item.id }
+        syncQueuedFollowUps()
+    }
+
     public func stopDeskRun() {
         guard let threadID = selectedConversation?.linkedAgentThreadID else { return }
         isStopping = true
@@ -756,7 +767,10 @@ public final class BotsViewModel: ObservableObject {
         attachments = []
         lastSendStartedProviderRun = false
         if deskRunIsLive, text == nil {
-            queuedFollowUps.append(BotQueuedFollowUp(text: message, attachments: attached))
+            enqueueFollowUp(
+                BotQueuedFollowUp(text: message, attachments: attached),
+                botID: bot.id
+            )
             return
         }
         do {
@@ -1092,6 +1106,7 @@ public final class BotsViewModel: ObservableObject {
             restoreDeskMessages(botID: id)
             restoreDeskWorkLog(botID: id)
             restoreDeskLiveTurn(botID: id)
+            syncQueuedFollowUps()
         } catch {
             errorMessage = String(describing: error)
         }
@@ -1546,9 +1561,25 @@ public final class BotsViewModel: ObservableObject {
         applyFollowThrough(bot: bot, conversation: conversation, run: try? context.runRepo.get(id: runId))
     }
 
+    private func enqueueFollowUp(_ item: BotQueuedFollowUp, botID: BotID) {
+        queuedFollowUpsByBot[botID, default: []].append(item)
+        syncQueuedFollowUps()
+    }
+
+    private func syncQueuedFollowUps() {
+        queuedFollowUps = selectedBotID.flatMap { queuedFollowUpsByBot[$0] } ?? []
+    }
+
     private func drainQueuedFollowUp() {
-        guard !queuedFollowUps.isEmpty else { return }
-        let next = queuedFollowUps.removeFirst()
+        guard let bot = selectedBot else { return }
+        guard !deskRunIsLive else { return }
+        guard var items = queuedFollowUpsByBot[bot.id], !items.isEmpty else {
+            syncQueuedFollowUps()
+            return
+        }
+        let next = items.removeFirst()
+        queuedFollowUpsByBot[bot.id] = items
+        syncQueuedFollowUps()
         composerText = next.text
         attachments = next.attachments
         send()
@@ -1608,7 +1639,9 @@ public final class BotsViewModel: ObservableObject {
         deskSendInFlight = false
         if BotsDeskFollowThrough.isTerminal(status) {
             deskSendInFlightStartedAt = nil
-            drainQueuedFollowUp()
+            if isViewing(bot.id) {
+                drainQueuedFollowUp()
+            }
         }
     }
 
@@ -2893,6 +2926,9 @@ public struct BotsRootView: View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
                 deskTimeline(bot)
+                if !vm.queuedFollowUps.isEmpty {
+                    deskQueuedFollowUps
+                }
                 composerBar(bot)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -3177,6 +3213,47 @@ public struct BotsRootView: View {
         default:
             return .neutral
         }
+    }
+
+    private var deskQueuedFollowUps: some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "text.line.first.and.arrowtriangle.forward")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(DS.Palette.accent)
+                    .accessibilityHidden(true)
+                Text("Queued")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.accent)
+                Text("\(vm.queuedFollowUps.count)")
+                    .font(DS.Font.caption.monospacedDigit())
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer(minLength: 0)
+            }
+            .accessibilityIdentifier("bots.desk.queued.header")
+            ForEach(vm.queuedFollowUps) { item in
+                HStack(alignment: .top, spacing: DS.Space.md) {
+                    Text(AgentChatTranscriptChrome.displayUserLine(
+                        text: item.text,
+                        attachments: item.attachments
+                    ))
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(3)
+                    Spacer(minLength: DS.Space.sm)
+                    Button("Remove") { vm.removeQueuedFollowUp(item) }
+                        .buttonStyle(.plain)
+                        .font(DS.Font.caption.weight(.medium))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .accessibilityIdentifier("bots.desk.queued.remove")
+                }
+            }
+        }
+        .padding(.horizontal, DS.Space.xxl)
+        .padding(.vertical, DS.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.bg)
+        .accessibilityIdentifier("bots.desk.queued")
     }
 
     private func composerBar(_ bot: BotDefinition) -> some View {
