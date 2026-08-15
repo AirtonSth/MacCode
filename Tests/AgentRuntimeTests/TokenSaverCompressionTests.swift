@@ -1,6 +1,7 @@
 import XCTest
 @testable import AgentRuntime
 import CoreModel
+import CryptoKit
 import Persistence
 
 /// Provider runner that records the exact prompt it was handed, so we can prove
@@ -214,6 +215,306 @@ private final class UserInputCapturingAdapter: AgentProviderAdapter, @unchecked 
     func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
     func stopAll() {}
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+}
+
+private enum PromptAcceptanceMode { case accepted, notAccepted, unknown }
+private struct SimulatedPromptWriteError: Error {}
+private let rcw1Cap = TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey
+private let rcw1Ver = "RC_TOKEN_SAVER_WIRE_VERSION"
+
+private final class PromptCapturingAcceptanceAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider
+    let acceptanceMode: PromptAcceptanceMode
+    private let lock = NSLock()
+    private var _request: AgentRunRequest?
+
+    init(provider: AgentProvider = .codex, acceptanceMode: PromptAcceptanceMode = .accepted) {
+        self.provider = provider
+        self.acceptanceMode = acceptanceMode
+    }
+
+    var request: AgentRunRequest? { lock.withLock { _request } }
+    func listModels() async -> [AgentModelDescriptor] { [] }
+    func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        try await sendTurn(request, onEvent: onEvent)
+    }
+    func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        let capture = { self.lock.withLock { self._request = request } }
+        switch (acceptanceMode, request.acceptancePermit) {
+        case (.accepted, let permit?):
+            try permit.withAcceptance(capture)
+        case (.unknown, let permit?):
+            do {
+                try permit.withAcceptance {
+                    capture()
+                    throw SimulatedPromptWriteError()
+                }
+            } catch is SimulatedPromptWriteError {}
+        case (.accepted, nil), (.notAccepted, _), (.unknown, nil):
+            capture()
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+    func interruptTurn(threadId: AgentThreadID) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {}
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {}
+    func stopSession(threadId: AgentThreadID) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {}
+    func listSessions() -> [AgentProviderSessionSummary] { [] }
+    func hasSession(threadId: AgentThreadID) -> Bool { false }
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
+    func stopAll() {}
+    func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+}
+
+private final class Best3Recorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var deliveries: [TokenSaverOutboundDelivery] = []
+    private var selections: [TokenSaverOutboundSelectionRequest] = []
+    var events: [TokenSaverOutboundDelivery] { lock.withLock { deliveries } }
+    var requests: [TokenSaverOutboundSelectionRequest] { lock.withLock { selections } }
+    func record(_ event: TokenSaverOutboundDelivery) { lock.withLock { deliveries.append(event) } }
+    func record(_ request: TokenSaverOutboundSelectionRequest) { lock.withLock { selections.append(request) } }
+}
+
+private struct Best3Harness {
+    let tmp: String
+    let messageRepo: AgentMessageRepository
+    let sessionRepo: ProviderSessionRuntimeRepository
+    let coordinator: AgentRunCoordinator
+    let adapter: PromptCapturingAcceptanceAdapter
+    let recorder: Best3Recorder
+    let observer: RecordingObserver
+    let thread: AgentThread
+
+    static func make(title: String, acceptanceMode: PromptAcceptanceMode = .accepted) throws -> Best3Harness {
+        let tmp = NSTemporaryDirectory() + "rc2-ts-best3-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: title, provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let adapter = PromptCapturingAcceptanceAdapter(acceptanceMode: acceptanceMode)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo, providerAdapters: [.codex: adapter]
+        )
+        let observer = RecordingObserver()
+        coordinator.addObserver(observer)
+        return Best3Harness(
+            tmp: tmp, messageRepo: messageRepo, sessionRepo: sessionRepo,
+            coordinator: coordinator, adapter: adapter, recorder: Best3Recorder(),
+            observer: observer, thread: thread
+        )
+    }
+
+    func injectScopedRCW1() {
+        coordinator.runEnvironmentProvider = { _, _, base in
+            var env = base
+            env[rcw1Cap] = "1"
+            env[rcw1Ver] = "1"
+            return env
+        }
+    }
+
+    func injectReceiptBearingEnvironment(
+        calls: CallLog,
+        staleRoot: String = "11111111-1111-1111-1111-111111111111",
+        staleAttempt: String = "22222222-2222-2222-2222-222222222222"
+    ) {
+        coordinator.runEnvironmentProvider = { provider, threadId, base in
+            calls.add("environment")
+            let receipt = TokenSaverExecutionReceiptSeam.admit(
+                tokenSaverEnabled: true,
+                sameUser: true,
+                sidecarAvailable: true,
+                provider: provider,
+                threadId: threadId.value.uuidString,
+                rootRunId: staleRoot,
+                attemptId: staleAttempt,
+                workspaceId: "20000000-0000-0000-0000-000000000002",
+                projectId: "30000000-0000-0000-0000-000000000003"
+            )
+            var env = base
+            env.merge(TokenSaverExecutionReceiptSeam.environment(from: receipt)) { _, next in next }
+            env[rcw1Ver] = "1"
+            return env
+        }
+    }
+
+    func select(_ body: @escaping @Sendable (TokenSaverOutboundSelectionRequest) async -> TokenSaverBestOfThreeSelector.Decision) {
+        let recorder = self.recorder
+        coordinator.tokenSaverOutboundSelector = { request in
+            recorder.record(request)
+            return await body(request)
+        }
+        coordinator.onTokenSaverOutboundDelivery = { recorder.record($0) }
+    }
+
+    func start(_ prompt: String, runID: AgentRunID = AgentRunID()) async throws -> AgentRunID {
+        _ = try await coordinator.startRun(.init(
+            runId: runID, threadId: thread.id, provider: .codex,
+            model: "fake-model", cwd: tmp, prompt: prompt
+        ))
+        return runID
+    }
+
+    func sessionWireVersion() throws -> String? {
+        guard let json = try sessionRepo.get(threadId: thread.id)?.runtimePayloadJSON,
+              let data = json.data(using: .utf8),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return object["wireProtocolVersion"] as? String
+    }
+}
+
+private func sha256Hex(_ text: String) -> String {
+    SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+}
+
+private func assertUnboundHumanFallback(
+    harness: Best3Harness,
+    arms: Best3Arms,
+    runID: AgentRunID,
+    reason: TokenSaverBestOfThreeSelector.Reason = .candidateError
+) throws {
+    let sent = try XCTUnwrap(harness.adapter.request?.prompt)
+    let receipt = try XCTUnwrap(harness.recorder.events.first?.receipt)
+    XCTAssertEqual(sent, arms.human)
+    XCTAssertEqual(
+        try harness.messageRepo.get(id: AgentMessageID(runID.value))?.content,
+        arms.human
+    )
+    XCTAssertTrue(
+        try harness.messageRepo.rcw1RequestTranslations(
+            threadId: harness.thread.id, messageIds: [AgentMessageID(runID.value)]
+        ).isEmpty
+    )
+    XCTAssertFalse(harness.observer.recordedEvents.contains {
+        if case .wireTranslation = $0 { return true }
+        return false
+    })
+    XCTAssertNil(try harness.sessionWireVersion())
+    XCTAssertNil(harness.adapter.request?.environment[rcw1Cap])
+    XCTAssertNil(harness.adapter.request?.environment[rcw1Ver])
+    XCTAssertEqual(receipt.selectedFormat, .human)
+    XCTAssertEqual(receipt.reason, reason)
+    XCTAssertEqual(receipt.modeledContextDelta, 0)
+    XCTAssertEqual(receipt.sourceSHA256, sha256Hex(arms.human))
+    XCTAssertTrue(receipt.costs.isEmpty)
+    XCTAssertTrue(receipt.arms.isEmpty)
+    XCTAssertNil(receipt.counter)
+    XCTAssertFalse(receipt.billingClaim)
+}
+
+private enum Best3Winner { case rcw1, caveman, human }
+
+private struct Best3Arms {
+    let human = "Canonical Human request stays visible."
+    let rcwOutbound: String
+    let cavemanOutbound: String
+    private let rcwHandle = "rcv1.runtime"
+    private let cavemanHandle = "cave.runtime"
+
+    init(cavemanLooksLikeRCW1: Bool = false) {
+        rcwOutbound = "RCW1\tQ\t1\nG\tRuntime request\nX\t[[rc:\(rcwHandle)]]\n.\n"
+        cavemanOutbound = cavemanLooksLikeRCW1
+            ? "RCW1\tQ\t1\nG\tCaveman winner must not be RCW1\nX\t[[ccr:\(cavemanHandle)]]\n.\n"
+            : "CAVE Runtime request [[ccr:\(cavemanHandle)]]"
+    }
+
+    func payload(_ winner: Best3Winner) -> String {
+        switch winner {
+        case .rcw1: rcwOutbound
+        case .caveman: cavemanOutbound
+        case .human: human
+        }
+    }
+
+    var malformedRCW1: String {
+        "RCW1\tQ\t1\nG\tRuntime request\nX\t[[rc:\(rcwHandle)]]"
+    }
+
+    var responseDirectionRCW1: String {
+        "RCW1\tA\t1\nO\tnot a request [[rc:\(rcwHandle)]]\n.\n"
+    }
+
+    func decision(
+        _ winner: Best3Winner,
+        rcwPayload: String? = nil,
+        canonicalHuman: String? = nil,
+        humanOutboundPrompt: String? = nil,
+        provider: String = "codex",
+        resolvedModel: String = "fake-model"
+    ) async -> TokenSaverBestOfThreeSelector.Decision {
+        let human = canonicalHuman ?? self.human
+        let humanOutbound = humanOutboundPrompt ?? self.human
+        let rcwOutbound = rcwPayload ?? self.rcwOutbound
+        let rcwABI = "RCW1 ABI", caveABI = "Caveman ABI"
+        let humanEnv = "BASE ABI\n\(humanOutbound)"
+        let rcwEnv = "\(rcwABI)\n\(rcwOutbound)", caveEnv = "\(caveABI)\n\(cavemanOutbound)"
+        let envelopes: (Int, Int, Int) = switch winner {
+        case .rcw1: (110, 30, 60)
+        case .caveman: (110, 90, 30)
+        case .human: (25, 50, 55)
+        }
+        let source = SHA256.hash(data: Data(human.utf8)).map { String(format: "%02x", $0) }.joined()
+        func arm(_ format: TokenSaverBestOfThreeSelector.Format, payload: String, abi: String, envelope: String, handle: String) -> TokenSaverBestOfThreeSelector.Candidate {
+            .init(
+                format: format, sourceSHA256: source, payload: payload, abi: abi,
+                effectiveEnvelope: envelope, handle: handle,
+                producerID: format == .rcw1 ? "remotecode-rcw1" : "caveman",
+                producerRevision: "1", abiRevision: "1",
+                generation: .passed, structural: .passed, semantic: .passed, recovery: .passed
+            )
+        }
+        let counts = [
+            humanOutbound: envelopes.0 - 10, humanEnv: envelopes.0,
+            rcwOutbound: 20, rcwHandle: 4, rcwABI: 5, rcwEnv: envelopes.1,
+            cavemanOutbound: 20, cavemanHandle: 4, caveABI: 5, caveEnv: envelopes.2,
+        ]
+        return await TokenSaverBestOfThreeSelector.select(
+            canonicalHuman: human,
+            humanOutboundPrompt: humanOutbound,
+            humanEffectiveEnvelope: humanEnv,
+            target: .init(
+                provider: provider,
+                resolvedModel: resolvedModel,
+                counterID: "runtime-counter",
+                counterRevision: "1",
+                encoding: "fixture"
+            ),
+            candidates: [
+                arm(.rcw1, payload: rcwOutbound, abi: rcwABI, envelope: rcwEnv, handle: rcwHandle),
+                arm(.caveman, payload: cavemanOutbound, abi: caveABI, envelope: caveEnv, handle: cavemanHandle),
+            ],
+            counter: .init(counter: .init(
+                id: "runtime-counter", revision: "1", encoding: "fixture",
+                provider: provider, resolvedModel: resolvedModel, quality: .exactLocalTokenizer
+            )) { text in
+                guard let count = counts[text] else { throw NSError(domain: "counter", code: 1) }
+                return count
+            }
+        )
+    }
+
+    static func humanFallback(_ human: String) async -> TokenSaverBestOfThreeSelector.Decision {
+        await TokenSaverBestOfThreeSelector.select(
+            canonicalHuman: human, humanOutboundPrompt: human, humanEffectiveEnvelope: human,
+            target: .init(provider: "codex", resolvedModel: "fake-model", counterID: "runtime-counter", counterRevision: "1", encoding: "fixture"),
+            candidates: [], counter: nil
+        )
+    }
+}
+
+private final class CallLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _steps: [String] = []
+    var steps: [String] { lock.withLock { _steps } }
+    var count: Int { steps.count }
+    func add(_ step: String) { lock.withLock { _steps.append(step) } }
 }
 
 private final class ScopeRefreshingAdapter: AgentProviderAdapter, @unchecked Sendable {
@@ -507,6 +808,341 @@ final class TokenSaverCompressionTests: XCTestCase {
                      "coordinator must not invent a providerThreadId when continuity was never established")
     }
 
+    /// WHY: legacy hosts keep compressor-then-env. Env-first is a regression.
+    func test_legacyCompressorRunsBeforeEnvironmentProvider() async throws {
+        let (coordinator, _, thread, tmp, runner) = try makeCoordinator()
+        let order = CallLog()
+        coordinator.promptCompressor = { prompt, _, _, _ in
+            order.add("compressor")
+            return "RCW1\tQ\t1\nG\t\(prompt)\n.\n"
+        }
+        coordinator.runEnvironmentProvider = { _, _, base in
+            order.add("environment")
+            var env = base
+            env[rcw1Cap] = "1"
+            return env
+        }
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id, provider: .codex, model: "fake-model",
+            cwd: tmp, prompt: "legacy order"
+        ))
+        await waitForPrompt(runner)
+        XCTAssertEqual(order.steps, ["compressor", "environment"])
+        XCTAssertEqual(runner.capturedEnvironment[rcw1Cap], "1")
+        XCTAssertEqual(runner.capturedEnvironment[rcw1Ver], "1")
+        XCTAssertTrue(RCWireProtocol.isWire(runner.capturedPrompt ?? ""))
+    }
+
+    /// WHY: typed RCW1 is valid only with capability=1 and a structural all-Q
+    /// request. Missing ABI, malformed frames, or A-direction must send Human.
+    func test_typedRCW1DecisionFailsClosedWithoutCapabilityOrValidAllQRequest() async throws {
+        enum Case { case missingCapability, malformed, responseDirection }
+        for item in [Case.missingCapability, .malformed, .responseDirection] {
+            let harness = try Best3Harness.make(title: "best3 fail-closed \(item)")
+            let arms = Best3Arms()
+            if item != .missingCapability {
+                harness.injectScopedRCW1()
+            }
+            let selectedPayload: String = switch item {
+            case .missingCapability: arms.rcwOutbound
+            case .malformed: arms.malformedRCW1
+            case .responseDirection: arms.responseDirectionRCW1
+            }
+            harness.select { request in
+                if item == .missingCapability {
+                    XCTAssertNil(request.admittedEnvironment[rcw1Cap])
+                    XCTAssertNil(request.environment(for: .rcw1)[rcw1Cap])
+                    XCTAssertNil(request.environment(for: .rcw1)[rcw1Ver])
+                } else {
+                    XCTAssertEqual(request.environment(for: .rcw1)[rcw1Cap], "1")
+                    XCTAssertEqual(request.environment(for: .rcw1)[rcw1Ver], "1")
+                }
+                return await arms.decision(.rcw1, rcwPayload: selectedPayload)
+            }
+            let runID: AgentRunID
+            do {
+                runID = try await harness.start(arms.human)
+            } catch {
+                XCTFail("\(item) must fail closed to Human without throwing: \(error)")
+                continue
+            }
+            let env = harness.adapter.request?.environment ?? [:]
+            XCTAssertEqual(
+                harness.adapter.request?.prompt,
+                arms.human,
+                "\(item) must send the Auto-shaped Human outbound, not RCW1"
+            )
+            XCTAssertEqual(
+                try harness.messageRepo.get(id: AgentMessageID(runID.value))?.content,
+                arms.human,
+                "\(item) displayed user message stays canonical Human"
+            )
+            XCTAssertTrue(
+                try harness.messageRepo.rcw1RequestTranslations(
+                    threadId: harness.thread.id, messageIds: [AgentMessageID(runID.value)]
+                ).isEmpty,
+                "\(item) must not persist RCW1 disclosure"
+            )
+            XCTAssertFalse(harness.observer.recordedEvents.contains {
+                if case .wireTranslation = $0 { return true }
+                return false
+            }, "\(item) must not emit a wire translation event")
+            XCTAssertNil(try harness.sessionWireVersion(),
+                         "\(item) must not persist RCW1 session metadata")
+            XCTAssertNil(env[rcw1Cap], "\(item) Human fallback cannot inherit RCW1 capability")
+            XCTAssertNil(env[rcw1Ver], "\(item) Human fallback cannot inherit RCW1 version")
+            XCTAssertEqual(harness.recorder.events.count, 1)
+            XCTAssertEqual(harness.recorder.events.first?.receipt.selectedFormat, .human)
+            XCTAssertEqual(harness.recorder.events.first?.receipt.reason, .candidateError)
+            XCTAssertEqual(harness.recorder.events.first?.receipt.modeledContextDelta, 0)
+            XCTAssertFalse(harness.recorder.events.first?.receipt.billingClaim ?? true)
+            XCTAssertEqual(harness.recorder.events.first?.outcome, .accepted)
+        }
+    }
+
+    /// WHY: a structurally valid, capability-present RCW1 Decision bound to
+    /// another canonical Human must not send those bytes or persist its costs.
+    func test_staleSourceSHAWithValidCapableRCW1SendsHumanAndDropsEvidence() async throws {
+        let harness = try Best3Harness.make(title: "c7 stale source rcw1")
+        let arms = Best3Arms()
+        harness.injectScopedRCW1()
+        harness.select { _ in
+            await arms.decision(
+                .rcw1,
+                canonicalHuman: "stale canonical Human from another turn",
+                humanOutboundPrompt: "stale canonical Human from another turn"
+            )
+        }
+        let runID = try await harness.start(arms.human)
+        try assertUnboundHumanFallback(harness: harness, arms: arms, runID: runID)
+    }
+
+    /// WHY: a valid Caveman winner whose Human Cost hashes a different Auto
+    /// outbound must fail closed before send and drop the unbound evidence.
+    func test_staleHumanOutboundSHAWithValidCavemanSendsHumanAndDropsEvidence() async throws {
+        let harness = try Best3Harness.make(title: "c7 stale human outbound caveman")
+        let arms = Best3Arms()
+        harness.injectScopedRCW1()
+        harness.select { _ in
+            await arms.decision(
+                .caveman,
+                humanOutboundPrompt: "AUTO HUMAN: \(arms.human)"
+            )
+        }
+        let runID = try await harness.start(arms.human)
+        try assertUnboundHumanFallback(harness: harness, arms: arms, runID: runID)
+    }
+
+    /// WHY: content hashes are not a tokenizer identity. A valid, capable RCW1
+    /// Decision ranked for another provider must not ride identical bytes onto
+    /// the current target or persist that other tokenizer's costs.
+    func test_staleCounterProviderWithValidCapableRCW1SendsHumanAndDropsEvidence() async throws {
+        let harness = try Best3Harness.make(title: "c7 stale counter provider rcw1")
+        let arms = Best3Arms()
+        harness.injectScopedRCW1()
+        harness.select { request in
+            XCTAssertEqual(request.admittedRequest.provider, .codex)
+            XCTAssertEqual(request.admittedRequest.model, "fake-model")
+            let decision = await arms.decision(.rcw1, provider: "claude")
+            XCTAssertEqual(decision.selectedFormat, .rcw1)
+            XCTAssertEqual(decision.reason, .uniqueStrictMinimum)
+            XCTAssertEqual(decision.counter?.provider, "claude")
+            XCTAssertEqual(decision.counter?.resolvedModel, "fake-model")
+            XCTAssertGreaterThan(decision.modeledContextDelta, 0)
+            return decision
+        }
+        let runID = try await harness.start(arms.human)
+        try assertUnboundHumanFallback(
+            harness: harness,
+            arms: arms,
+            runID: runID,
+            reason: .counterBindingMismatch
+        )
+    }
+
+    /// WHY: the same candidate bytes ranked on another resolved model are not
+    /// evidence for this model's tokenizer. Send current admitted Human.
+    func test_staleCounterResolvedModelWithValidCavemanSendsHumanAndDropsEvidence() async throws {
+        let harness = try Best3Harness.make(title: "c7 stale counter model caveman")
+        let arms = Best3Arms()
+        harness.injectScopedRCW1()
+        harness.select { request in
+            XCTAssertEqual(request.admittedRequest.provider, .codex)
+            XCTAssertEqual(request.admittedRequest.model, "fake-model")
+            let decision = await arms.decision(.caveman, resolvedModel: "other-model")
+            XCTAssertEqual(decision.selectedFormat, .caveman)
+            XCTAssertEqual(decision.reason, .uniqueStrictMinimum)
+            XCTAssertEqual(decision.counter?.provider, "codex")
+            XCTAssertEqual(decision.counter?.resolvedModel, "other-model")
+            XCTAssertGreaterThan(decision.modeledContextDelta, 0)
+            return decision
+        }
+        let runID = try await harness.start(arms.human)
+        try assertUnboundHumanFallback(
+            harness: harness,
+            arms: arms,
+            runID: runID,
+            reason: .counterBindingMismatch
+        )
+    }
+
+    /// WHY: exact current-target counter evidence is the only optimized path.
+    /// Matching provider/model must keep the ranked arm and its receipt.
+    func test_boundCounterProviderAndModelDecisionRemainsOptimized() async throws {
+        let cases: [(Best3Winner, TokenSaverBestOfThreeSelector.Format)] = [
+            (.rcw1, .rcw1),
+            (.caveman, .caveman),
+        ]
+        for (winner, format) in cases {
+            let harness = try Best3Harness.make(title: "c7 bound counter \(format.rawValue)")
+            let arms = Best3Arms()
+            harness.injectScopedRCW1()
+            harness.select { request in
+                XCTAssertEqual(request.admittedRequest.provider.rawValue, "codex")
+                XCTAssertEqual(request.admittedRequest.model, "fake-model")
+                let decision = await arms.decision(winner)
+                XCTAssertEqual(decision.selectedFormat, format)
+                XCTAssertEqual(decision.counter?.provider, "codex")
+                XCTAssertEqual(decision.counter?.resolvedModel, "fake-model")
+                return decision
+            }
+            let runID = try await harness.start(arms.human)
+            let env = harness.adapter.request?.environment ?? [:]
+            let receipt = try XCTUnwrap(harness.recorder.events.first?.receipt)
+            XCTAssertEqual(harness.adapter.request?.prompt, arms.payload(winner))
+            XCTAssertEqual(
+                try harness.messageRepo.get(id: AgentMessageID(runID.value))?.content,
+                arms.human
+            )
+            XCTAssertEqual(receipt.selectedFormat, format)
+            XCTAssertEqual(receipt.reason, .uniqueStrictMinimum)
+            XCTAssertGreaterThan(receipt.modeledContextDelta, 0)
+            XCTAssertEqual(receipt.counter?.provider, "codex")
+            XCTAssertEqual(receipt.counter?.resolvedModel, "fake-model")
+            XCTAssertFalse(receipt.costs.isEmpty)
+            XCTAssertFalse(receipt.arms.isEmpty)
+            XCTAssertFalse(receipt.billingClaim)
+            if winner == .rcw1 {
+                XCTAssertEqual(env[rcw1Cap], "1")
+                XCTAssertEqual(env[rcw1Ver], "1")
+                XCTAssertEqual(
+                    try harness.messageRepo.rcw1RequestTranslations(
+                        threadId: harness.thread.id, messageIds: [AgentMessageID(runID.value)]
+                    )[AgentMessageID(runID.value)],
+                    arms.rcwOutbound
+                )
+                XCTAssertEqual(try harness.sessionWireVersion(), RCWireProtocol.version)
+            } else {
+                XCTAssertNil(env[rcw1Cap], "\(format.rawValue) must not inherit RCW1 capability")
+                XCTAssertNil(env[rcw1Ver], "\(format.rawValue) must not inherit RCW1 version")
+                XCTAssertTrue(
+                    try harness.messageRepo.rcw1RequestTranslations(
+                        threadId: harness.thread.id, messageIds: [AgentMessageID(runID.value)]
+                    ).isEmpty
+                )
+                XCTAssertNil(try harness.sessionWireVersion())
+            }
+        }
+    }
+
+    /// WHY: capability/malformed fallback may keep measured arms only when the
+    /// Decision already binds to this turn and Human Cost matches the sent bytes.
+    func test_boundInvalidRCW1FallbackPreservesTruthfulEvidence() async throws {
+        let harness = try Best3Harness.make(title: "c7 bound invalid rcw1")
+        let arms = Best3Arms()
+        harness.injectScopedRCW1()
+        harness.select { _ in
+            await arms.decision(.rcw1, rcwPayload: arms.malformedRCW1)
+        }
+        let runID = try await harness.start(arms.human)
+        let sent = try XCTUnwrap(harness.adapter.request?.prompt)
+        let receipt = try XCTUnwrap(harness.recorder.events.first?.receipt)
+        let humanCost = try XCTUnwrap(receipt.costs.first { $0.format == .human })
+        XCTAssertEqual(sent, arms.human)
+        XCTAssertEqual(
+            try harness.messageRepo.get(id: AgentMessageID(runID.value))?.content,
+            arms.human
+        )
+        XCTAssertTrue(
+            try harness.messageRepo.rcw1RequestTranslations(
+                threadId: harness.thread.id, messageIds: [AgentMessageID(runID.value)]
+            ).isEmpty
+        )
+        XCTAssertNil(try harness.sessionWireVersion())
+        XCTAssertNil(harness.adapter.request?.environment[rcw1Cap])
+        XCTAssertNil(harness.adapter.request?.environment[rcw1Ver])
+        XCTAssertEqual(receipt.selectedFormat, .human)
+        XCTAssertEqual(receipt.reason, .candidateError)
+        XCTAssertEqual(receipt.modeledContextDelta, 0)
+        XCTAssertEqual(receipt.sourceSHA256, sha256Hex(arms.human))
+        XCTAssertEqual(humanCost.payloadSHA256, sha256Hex(sent))
+        XCTAssertFalse(receipt.costs.isEmpty)
+        XCTAssertFalse(receipt.arms.isEmpty)
+        XCTAssertNotNil(receipt.counter)
+        XCTAssertFalse(receipt.billingClaim)
+    }
+
+    /// WHY: stamp-after-projection lets Human/Caveman regain capability and
+    /// drops RCW1 VERSION. Counted projection must equal the sent environment.
+    func test_typedReceiptBearingCountedEnvironmentEqualsSentEnvironment() async throws {
+        let cases: [(Best3Winner, TokenSaverBestOfThreeSelector.Format)] = [
+            (.human, .human),
+            (.rcw1, .rcw1),
+            (.caveman, .caveman),
+        ]
+        for (winner, format) in cases {
+            let harness = try Best3Harness.make(title: "best3 receipt \(format.rawValue)")
+            let arms = Best3Arms()
+            let envCalls = CallLog()
+            harness.injectReceiptBearingEnvironment(calls: envCalls)
+            harness.select { request in
+                XCTAssertEqual(envCalls.count, 1, "\(format) runEnvironmentProvider must run before selection")
+                return await arms.decision(winner)
+            }
+            let runID = try await harness.start(arms.human)
+            XCTAssertEqual(envCalls.count, 1, "\(format) must call runEnvironmentProvider exactly once")
+            let selection = try XCTUnwrap(harness.recorder.requests.first)
+            let sent = harness.adapter.request?.environment ?? [:]
+            let projected = selection.environment(for: format)
+            let attempt = runID.value.uuidString
+            let admittedReceipt = try XCTUnwrap(
+                TokenSaverExecutionReceiptSeam.receipt(from: selection.admittedEnvironment)
+            )
+            let projectedReceipt = try XCTUnwrap(TokenSaverExecutionReceiptSeam.receipt(from: projected))
+            let sentReceipt = try XCTUnwrap(TokenSaverExecutionReceiptSeam.receipt(from: sent))
+            XCTAssertEqual(admittedReceipt.rootRunId, attempt)
+            XCTAssertEqual(admittedReceipt.attemptId, attempt)
+            XCTAssertEqual(admittedReceipt.provider, "codex")
+            XCTAssertEqual(projectedReceipt.rootRunId, attempt)
+            XCTAssertEqual(projectedReceipt.attemptId, attempt)
+            XCTAssertEqual(projectedReceipt.provider, "codex")
+            XCTAssertEqual(sentReceipt.rootRunId, attempt)
+            XCTAssertEqual(sentReceipt.attemptId, attempt)
+            XCTAssertEqual(sentReceipt.provider, "codex")
+            XCTAssertEqual(selection.admittedEnvironment["RC_TOKEN_SAVER_ROOT_RUN_ID"], attempt)
+            XCTAssertEqual(selection.admittedEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"], attempt)
+            XCTAssertEqual(projected[rcw1Cap], sent[rcw1Cap])
+            XCTAssertEqual(projected[rcw1Ver], sent[rcw1Ver])
+            XCTAssertEqual(projected["RC_TOKEN_SAVER_ROOT_RUN_ID"], sent["RC_TOKEN_SAVER_ROOT_RUN_ID"])
+            XCTAssertEqual(projected["RC_TOKEN_SAVER_ATTEMPT_ID"], sent["RC_TOKEN_SAVER_ATTEMPT_ID"])
+            XCTAssertEqual(harness.adapter.request?.provider, .codex)
+            if format == .rcw1 {
+                XCTAssertEqual(sent[rcw1Cap], "1")
+                XCTAssertEqual(sent[rcw1Ver], "1")
+                XCTAssertEqual(projected[rcw1Cap], "1")
+                XCTAssertEqual(projected[rcw1Ver], "1")
+            } else {
+                XCTAssertNil(sent[rcw1Cap], "\(format) must not inherit RCW1 capability")
+                XCTAssertNil(sent[rcw1Ver], "\(format) must not inherit RCW1 version")
+                XCTAssertNil(projected[rcw1Cap])
+                XCTAssertNil(projected[rcw1Ver])
+            }
+            XCTAssertEqual(harness.recorder.events.count, 1)
+            XCTAssertEqual(harness.recorder.events.first?.receipt.selectedFormat, format)
+            XCTAssertFalse(harness.recorder.events.first?.receipt.billingClaim ?? true)
+        }
+    }
+
     func test_promptCompressorTransformsOutboundButPreservesDisplayedMessage() async throws {
         let (coordinator, messageRepo, thread, tmp, runner) = try makeCoordinator()
         coordinator.promptCompressor = { prompt, _, _, _ in "COMPRESSED::" + prompt.uppercased() }
@@ -532,6 +1168,128 @@ final class TokenSaverCompressionTests: XCTestCase {
         let messages = (try? messageRepo.list(threadId: thread.id)) ?? []
         XCTAssertEqual(messages.first(where: { $0.role == .user })?.content, original,
                        "the displayed user message must remain the original, uncompressed text")
+    }
+
+    /// WHY: format, not prefix sniffing, decides the transport lane.
+    func test_bestOfThreeWinnerAppliesFormatSpecificWireAdmission() async throws {
+        let cases: [(Best3Winner, TokenSaverBestOfThreeSelector.Format, TokenSaverBestOfThreeSelector.Reason)] = [
+            (.rcw1, .rcw1, .uniqueStrictMinimum),
+            (.caveman, .caveman, .uniqueStrictMinimum),
+            (.human, .human, .humanLowestCost),
+        ]
+        for (winner, format, reason) in cases {
+            let harness = try Best3Harness.make(title: "best3 \(format.rawValue)")
+            let arms = Best3Arms(cavemanLooksLikeRCW1: winner == .caveman)
+            if winner == .caveman {
+                XCTAssertTrue(RCWireProtocol.isWire(arms.cavemanOutbound), "Caveman fixture must look like RCW1")
+            }
+            let compressorCalls = CallLog()
+            harness.injectScopedRCW1()
+            harness.coordinator.promptCompressor = { prompt, _, _, _ in
+                compressorCalls.add("compressor")
+                return "COMPRESSOR-MUST-NOT-RUN::\(prompt)"
+            }
+            harness.select { request in
+                if winner == .rcw1 {
+                    XCTAssertEqual(request.canonicalHuman, arms.human)
+                    XCTAssertEqual(request.admittedRequest.provider, .codex)
+                    XCTAssertEqual(request.admittedRequest.model, "fake-model")
+                    XCTAssertNil(request.autoRoute, "manual runs must not invent an Auto route")
+                }
+                XCTAssertEqual(request.admittedEnvironment[rcw1Cap], "1")
+                XCTAssertEqual(request.admittedEnvironment[rcw1Ver], "1")
+                XCTAssertEqual(request.environment(for: .rcw1)[rcw1Cap], "1")
+                XCTAssertEqual(request.environment(for: .rcw1)[rcw1Ver], "1")
+                XCTAssertNil(request.environment(for: .human)[rcw1Cap])
+                XCTAssertNil(request.environment(for: .human)[rcw1Ver])
+                XCTAssertNil(request.environment(for: .caveman)[rcw1Cap])
+                XCTAssertNil(request.environment(for: .caveman)[rcw1Ver])
+                return await arms.decision(winner)
+            }
+            let runID = try await harness.start(arms.human)
+            let selection = try XCTUnwrap(harness.recorder.requests.first)
+            let env = harness.adapter.request?.environment ?? [:]
+            let projected = selection.environment(for: format)
+            XCTAssertEqual(env[rcw1Cap], projected[rcw1Cap])
+            XCTAssertEqual(env[rcw1Ver], projected[rcw1Ver])
+            XCTAssertEqual(compressorCalls.count, 0, "typed selector must replace, not chain, the String compressor")
+            XCTAssertEqual(harness.adapter.request?.prompt, arms.payload(winner))
+            XCTAssertEqual(try harness.messageRepo.get(id: AgentMessageID(runID.value))?.content, arms.human)
+            XCTAssertEqual(harness.recorder.events.count, 1)
+            XCTAssertEqual(harness.recorder.events.first?.outcome, .accepted)
+            XCTAssertEqual(harness.recorder.events.first?.receipt.selectedFormat, format)
+            XCTAssertEqual(harness.recorder.events.first?.receipt.reason, reason)
+            XCTAssertFalse(harness.recorder.events.first?.receipt.billingClaim ?? true)
+            if winner == .rcw1 {
+                XCTAssertEqual(env[rcw1Cap], "1")
+                XCTAssertEqual(env[rcw1Ver], "1")
+                XCTAssertEqual(
+                    try harness.messageRepo.rcw1RequestTranslations(
+                        threadId: harness.thread.id, messageIds: [AgentMessageID(runID.value)]
+                    )[AgentMessageID(runID.value)],
+                    arms.rcwOutbound
+                )
+                XCTAssertEqual(try harness.sessionWireVersion(), RCWireProtocol.version)
+                XCTAssertEqual(harness.recorder.events.first?.provider, .codex)
+                XCTAssertEqual(harness.recorder.events.first?.resolvedModel, "fake-model")
+                XCTAssertEqual(harness.recorder.events.first?.runId, runID)
+            } else {
+                XCTAssertNil(env[rcw1Cap], "\(format.rawValue) must not inherit the scoped RCW1 capability")
+                XCTAssertNil(env[rcw1Ver], "\(format.rawValue) must not receive the RCW1 wire version")
+                XCTAssertTrue(
+                    try harness.messageRepo.rcw1RequestTranslations(
+                        threadId: harness.thread.id, messageIds: [AgentMessageID(runID.value)]
+                    ).isEmpty
+                )
+                XCTAssertFalse(harness.observer.recordedEvents.contains {
+                    if case .wireTranslation = $0 { return true }
+                    return false
+                })
+                XCTAssertNil(try harness.sessionWireVersion(),
+                             "\(format.rawValue) must not persist RCW1 session metadata")
+            }
+        }
+    }
+
+    /// WHY: one local-write observation per decision; never billing.
+    func test_bestOfThreeDeliveryCallbackReportsLocalWriteOutcome() async throws {
+        enum Case { case refused, notAccepted, unknown }
+        for item in [Case.refused, .notAccepted, .unknown] {
+            let mode: PromptAcceptanceMode = item == .unknown ? .unknown : .notAccepted
+            let harness = try Best3Harness.make(title: "best3 outcome", acceptanceMode: mode)
+            let human = "Canonical Human fallback remains exact."
+            harness.select { _ in await Best3Arms.humanFallback(human) }
+            harness.coordinator.providerAdmissionCheck = { _, _ in
+                harness.coordinator.onTokenSaverOutboundDelivery = { _ in
+                    XCTFail("post-selection handler rebind must not steal this decision's local-write receipt")
+                }
+                if item == .refused {
+                    throw AgentProviderAdapterError.unsupported("post-selection admission refused")
+                }
+            }
+            let runID = AgentRunID()
+            do {
+                _ = try await harness.start(human, runID: runID)
+                if item == .refused {
+                    XCTFail("startRun must throw after the selected decision when admission refuses")
+                }
+            } catch let error as AgentProviderAdapterError {
+                guard item == .refused, case .unsupported(let detail) = error else {
+                    return XCTFail("unexpected startRun error \(error)")
+                }
+                XCTAssertEqual(detail, "post-selection admission refused")
+            }
+            if item == .refused {
+                XCTAssertNil(harness.adapter.request, "refused admission must not write the selected prompt")
+            } else {
+                XCTAssertEqual(harness.adapter.request?.prompt, human)
+                XCTAssertEqual(harness.recorder.events.first?.receipt.reason, .candidateError)
+            }
+            XCTAssertEqual(harness.recorder.events.count, 1)
+            XCTAssertEqual(harness.recorder.events.first?.outcome, item == .unknown ? .unknown : .notAccepted)
+            XCTAssertEqual(harness.recorder.events.first?.receipt.selectedFormat, .human)
+            XCTAssertFalse(harness.recorder.events.first?.receipt.billingClaim ?? true)
+        }
     }
 
     /// WHY: human -> RCW1 is a translation of the user message itself. Keying

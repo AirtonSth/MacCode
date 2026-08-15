@@ -245,16 +245,170 @@ public enum TokenSaverBestOfThreeSelector {
         public func arm(_ format: Format) -> ArmReceipt? {
             arms.first { $0.format == format }
         }
+
+        fileprivate init(
+            sourceSHA256: String,
+            selectedFormat: Format,
+            selectedPayload: String,
+            reason: Reason,
+            modeledContextDelta: Int,
+            counter: Counter?,
+            costs: [Cost],
+            arms: [ArmReceipt]
+        ) {
+            self.sourceSHA256 = sourceSHA256
+            self.selectedFormat = selectedFormat
+            self.selectedPayload = selectedPayload
+            self.reason = reason
+            self.modeledContextDelta = modeledContextDelta
+            self.counter = counter
+            self.costs = costs
+            self.arms = arms
+        }
+
+        /// True when this Decision's hashes bind to the current canonical Human
+        /// and admitted outbound. Caller-supplied hashes are never trusted:
+        /// CoreModel recomputes SHA256 over the current UTF-8 bytes.
+        package func isBoundToCurrentHuman(
+            canonicalHuman: String,
+            admittedPrompt: String
+        ) -> Bool {
+            let source = TokenSaverBestOfThreeSelector.sha256Hex(canonicalHuman)
+            let admitted = TokenSaverBestOfThreeSelector.sha256Hex(admittedPrompt)
+            guard sourceSHA256 == source,
+                  let humanCost = cost(.human),
+                  humanCost.payloadSHA256 == admitted else {
+                return false
+            }
+            if selectedFormat == .human {
+                return TokenSaverBestOfThreeSelector.sha256Hex(selectedPayload) == humanCost.payloadSHA256
+            }
+            guard let selectedArm = arm(selectedFormat), selectedArm.eligible,
+                  let selectedCost = cost(selectedFormat),
+                  selectedCost.payloadSHA256 == TokenSaverBestOfThreeSelector.sha256Hex(selectedPayload) else {
+                return false
+            }
+            return true
+        }
+
+        /// Identity when Human bytes and, for an optimized arm, package-owned
+        /// counter provider/model bind to this request. Optimized decisions
+        /// without exact current-target counter evidence fail closed. Human
+        /// with no counter stays Human with its original reason; Human with
+        /// mismatched counter evidence stays Human as counterBindingMismatch
+        /// and drops that evidence.
+        package func bindingToCurrentHuman(
+            canonicalHuman: String,
+            admittedPrompt: String,
+            provider: String,
+            resolvedModel: String
+        ) -> Decision {
+            let contentBound = isBoundToCurrentHuman(
+                canonicalHuman: canonicalHuman,
+                admittedPrompt: admittedPrompt
+            )
+            let counterMatches = counterMatchesCurrentTarget(
+                provider: provider,
+                resolvedModel: resolvedModel
+            )
+            if selectedFormat == .human {
+                let source = TokenSaverBestOfThreeSelector.sha256Hex(canonicalHuman)
+                let admitted = TokenSaverBestOfThreeSelector.sha256Hex(admittedPrompt)
+                let selected = TokenSaverBestOfThreeSelector.sha256Hex(selectedPayload)
+                guard sourceSHA256 == source, selected == admitted else {
+                    return fallingBackToHuman(
+                        payload: admittedPrompt,
+                        reason: .candidateError,
+                        canonicalHuman: canonicalHuman
+                    )
+                }
+                if counter == nil || counterMatches {
+                    return self
+                }
+                return reboundHumanWithoutEvidence(
+                    payload: admittedPrompt,
+                    reason: .counterBindingMismatch,
+                    canonicalHuman: canonicalHuman
+                )
+            }
+            if contentBound && counterMatches {
+                return self
+            }
+            if contentBound {
+                return reboundHumanWithoutEvidence(
+                    payload: admittedPrompt,
+                    reason: .counterBindingMismatch,
+                    canonicalHuman: canonicalHuman
+                )
+            }
+            return fallingBackToHuman(
+                payload: admittedPrompt,
+                reason: .candidateError,
+                canonicalHuman: canonicalHuman
+            )
+        }
+
+        private func counterMatchesCurrentTarget(provider: String, resolvedModel: String) -> Bool {
+            guard let counter else { return false }
+            return counter.provider == provider && counter.resolvedModel == resolvedModel
+        }
+
+        private func reboundHumanWithoutEvidence(
+            payload: String,
+            reason: Reason,
+            canonicalHuman: String
+        ) -> Decision {
+            Decision(
+                sourceSHA256: TokenSaverBestOfThreeSelector.sha256Hex(canonicalHuman),
+                selectedFormat: .human,
+                selectedPayload: payload,
+                reason: reason,
+                modeledContextDelta: 0,
+                counter: nil,
+                costs: [],
+                arms: []
+            )
+        }
+
+        /// Content-free Human fallback. Keeps already-measured costs, arms, and
+        /// counter only when those values bind to the current Human context and
+        /// the exact payload that will be sent.
+        package func fallingBackToHuman(
+            payload: String,
+            reason: Reason,
+            canonicalHuman: String
+        ) -> Decision {
+            let bound = isBoundToCurrentHuman(
+                canonicalHuman: canonicalHuman,
+                admittedPrompt: payload
+            )
+            return Decision(
+                sourceSHA256: TokenSaverBestOfThreeSelector.sha256Hex(canonicalHuman),
+                selectedFormat: .human,
+                selectedPayload: payload,
+                reason: reason,
+                modeledContextDelta: 0,
+                counter: bound ? counter : nil,
+                costs: bound ? costs : [],
+                arms: bound ? arms : []
+            )
+        }
     }
 
     package static func select(
         canonicalHuman: String,
+        humanOutboundPrompt: String,
         humanEffectiveEnvelope: String,
         target: Target,
         candidates: [Candidate],
         counter capability: CounterCapability?
     ) async -> Decision {
         let sourceSHA256 = sha256Hex(canonicalHuman)
+        let validHumanIdentity = !canonicalHuman.isEmpty
+            && !humanOutboundPrompt.isEmpty
+            && !humanEffectiveEnvelope.isEmpty
+            && occursExactlyOnce(canonicalHuman, in: humanOutboundPrompt)
+            && occursExactlyOnce(humanOutboundPrompt, in: humanEffectiveEnvelope)
         let arms = candidates
             .map { armReceipt($0, sourceSHA256: sourceSHA256) }
             .sorted { formatRank($0.format) < formatRank($1.format) }
@@ -267,7 +421,7 @@ public enum TokenSaverBestOfThreeSelector {
             Decision(
                 sourceSHA256: sourceSHA256,
                 selectedFormat: .human,
-                selectedPayload: canonicalHuman,
+                selectedPayload: validHumanIdentity ? humanOutboundPrompt : canonicalHuman,
                 reason: reason,
                 modeledContextDelta: 0,
                 counter: counter,
@@ -276,9 +430,7 @@ public enum TokenSaverBestOfThreeSelector {
             )
         }
 
-        guard !canonicalHuman.isEmpty,
-              !humanEffectiveEnvelope.isEmpty,
-              occursExactlyOnce(canonicalHuman, in: humanEffectiveEnvelope),
+        guard validHumanIdentity,
               validTarget(target),
               candidates.count == 2,
               Set(candidates.map(\.format)) == Set([.rcw1, .caveman]),
@@ -304,7 +456,7 @@ public enum TokenSaverBestOfThreeSelector {
         let costs: [Cost]
         do {
             costs = try await measure(
-                canonicalHuman: canonicalHuman,
+                humanOutboundPrompt: humanOutboundPrompt,
                 humanEffectiveEnvelope: humanEffectiveEnvelope,
                 candidates: candidates,
                 with: capability
@@ -355,16 +507,16 @@ public enum TokenSaverBestOfThreeSelector {
     }
 
     private static func measure(
-        canonicalHuman: String,
+        humanOutboundPrompt: String,
         humanEffectiveEnvelope: String,
         candidates: [Candidate],
         with capability: CounterCapability
     ) async throws -> [Cost] {
-        let humanPayloadTokens = try await positiveCount(canonicalHuman, with: capability)
+        let humanPayloadTokens = try await positiveCount(humanOutboundPrompt, with: capability)
         let humanEnvelopeTokens = try await positiveCount(humanEffectiveEnvelope, with: capability)
         var costs = [Cost(
             format: .human,
-            payloadSHA256: sha256Hex(canonicalHuman),
+            payloadSHA256: sha256Hex(humanOutboundPrompt),
             handleSHA256: nil,
             abiSHA256: nil,
             effectiveEnvelopeSHA256: sha256Hex(humanEffectiveEnvelope),
@@ -479,7 +631,7 @@ public enum TokenSaverBestOfThreeSelector {
         Format.allCases.firstIndex(of: format) ?? Format.allCases.count
     }
 
-    private static func sha256Hex(_ text: String) -> String {
+    fileprivate static func sha256Hex(_ text: String) -> String {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 

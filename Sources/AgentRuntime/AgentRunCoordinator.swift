@@ -10,6 +10,86 @@ import os
 // through the unified logging system, keyed by thread/run ids.
 private let agentRunLog = Logger(subsystem: "io.remotecode.agent", category: "run")
 
+/// Immutable host input for one best-of-three request decision. The admitted
+/// request already carries the provider/model chosen by Auto; the admitted
+/// environment is the scoped merge the provider ABI/system framing will see.
+/// Canonical Human stays separate so every arm is prepared from identical text.
+public struct TokenSaverOutboundSelectionRequest: Sendable {
+    public let canonicalHuman: String
+    public let admittedRequest: AgentRunRequest
+    public let autoRoute: AgentOrchestrationRoute?
+    public let admittedEnvironment: [String: String]
+
+    package init(
+        canonicalHuman: String,
+        admittedRequest: AgentRunRequest,
+        autoRoute: AgentOrchestrationRoute?,
+        admittedEnvironment: [String: String]
+    ) {
+        self.canonicalHuman = canonicalHuman
+        self.admittedRequest = admittedRequest
+        self.autoRoute = autoRoute
+        self.admittedEnvironment = admittedEnvironment
+    }
+
+    /// Per-format ABI environment counted and sent for one arm. Never invents
+    /// `RC_TOKEN_SAVER_WIRE_CAPABILITY`; version is `1` only when that
+    /// capability is already exactly `1`.
+    public func environment(
+        for format: TokenSaverBestOfThreeSelector.Format
+    ) -> [String: String] {
+        Self.environment(admittedEnvironment, for: format)
+    }
+
+    public static func environment(
+        _ base: [String: String],
+        for format: TokenSaverBestOfThreeSelector.Format
+    ) -> [String: String] {
+        var env = base
+        switch format {
+        case .human, .caveman:
+            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey)
+            env.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
+        case .rcw1:
+            if env[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1" {
+                env["RC_TOKEN_SAVER_WIRE_VERSION"] = "1"
+            } else {
+                env.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
+            }
+        }
+        return env
+    }
+}
+
+/// Content-free observation emitted exactly once for each typed selection when
+/// `startRun` exits after that decision. `outcome` is the local guarded-write
+/// result from `AgentRunAcceptancePermit`; it is not provider ACK, delivery,
+/// savings, or billing.
+public struct TokenSaverOutboundDelivery: Sendable {
+    public let receipt: TokenSaverBestOfThreeSelector.DecisionReceipt
+    public let provider: AgentProvider
+    public let resolvedModel: String
+    public let threadId: AgentThreadID
+    public let runId: AgentRunID
+    public let outcome: AgentRunAcceptanceOutcome
+
+    package init(
+        receipt: TokenSaverBestOfThreeSelector.DecisionReceipt,
+        provider: AgentProvider,
+        resolvedModel: String,
+        threadId: AgentThreadID,
+        runId: AgentRunID,
+        outcome: AgentRunAcceptanceOutcome
+    ) {
+        self.receipt = receipt
+        self.provider = provider
+        self.resolvedModel = resolvedModel
+        self.threadId = threadId
+        self.runId = runId
+        self.outcome = outcome
+    }
+}
+
 /// Resolves an async translator/timeout race exactly once without structured
 /// concurrency waiting for the losing task. A local model can block in native
 /// code and ignore cancellation; the provider turn still has to complete.
@@ -825,6 +905,13 @@ public enum AgentDeletedThreadRetirementOutcome: Equatable, Sendable {
 }
 
 public final class AgentRunCoordinator: @unchecked Sendable {
+    private static func isStructurallyValidRCW1Request(_ payload: String) -> Bool {
+        guard let frames = try? RCWireProtocol.parse(payload), !frames.isEmpty else {
+            return false
+        }
+        return frames.allSatisfy { $0.direction == .request }
+    }
+
     static func normalizedProviderReasoningEffort(
         provider: AgentProvider,
         model: String,
@@ -1116,6 +1203,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// user message. Must be fail-open — return the input unchanged on any
     /// error or when Token Saver is disabled.
     public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID?) async -> String)?
+    /// Best-of-three request hook. When present it owns final Auto-aware prompt
+    /// shaping and returns the exact provider-bound payload selected from Human,
+    /// RCW1, and Caveman. The legacy String compressor remains the fallback for
+    /// hosts that have not installed the typed selector.
+    public var tokenSaverOutboundSelector: (@Sendable (
+        _ request: TokenSaverOutboundSelectionRequest
+    ) async -> TokenSaverBestOfThreeSelector.Decision)?
+    /// Fires exactly once for every typed selection, including Human fallbacks
+    /// and all pre-write/provider-write failures.
+    public var onTokenSaverOutboundDelivery: (@Sendable (
+        _ delivery: TokenSaverOutboundDelivery
+    ) -> Void)?
     /// Token Saver hook for free-form follow-up answers. Defaults to
     /// `promptCompressor` when nil, but app shells can provide a separate hook
     /// to tag telemetry as `prompt_followup`.
@@ -1437,6 +1536,26 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runId: runId,
             acceptancePermit: request.acceptancePermit ?? AgentRunAcceptancePermit()
         )
+        var outboundDecisionContext: (
+            receipt: TokenSaverBestOfThreeSelector.DecisionReceipt,
+            provider: AgentProvider,
+            resolvedModel: String,
+            threadId: AgentThreadID,
+            runId: AgentRunID,
+            deliver: (@Sendable (TokenSaverOutboundDelivery) -> Void)?
+        )?
+        defer {
+            if let outboundDecisionContext {
+                outboundDecisionContext.deliver?(TokenSaverOutboundDelivery(
+                    receipt: outboundDecisionContext.receipt,
+                    provider: outboundDecisionContext.provider,
+                    resolvedModel: outboundDecisionContext.resolvedModel,
+                    threadId: outboundDecisionContext.threadId,
+                    runId: outboundDecisionContext.runId,
+                    outcome: pendingProviderStart.acceptancePermit.outcome
+                ))
+            }
+        }
         lock.lock()
         let registeredPendingStart: Bool
         if pendingProviderStarts[request.threadId] == nil {
@@ -1590,57 +1709,120 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // original prompt is preserved verbatim as the displayed user message.
         let preservedUserContent = request.userMessageContent ?? request.prompt
         var outboundPrompt = request.prompt
-        if let promptCompressor {
-            let transformed = await promptCompressor(
-                preservedUserContent,
+        var selectedTransportFormat: TokenSaverBestOfThreeSelector.Format?
+        var effectiveEnvironment = request.environment
+        let selectedSelector = tokenSaverOutboundSelector
+        let selectedDelivery = onTokenSaverOutboundDelivery
+        let attemptId = request.runId.value.uuidString
+        if let selectedSelector {
+            // Typed path: Auto already bound provider/model. Stamp the scoped
+            // env with this attempt before selection, then project by format.
+            let scopedEnvironment = await runEnvironmentProvider?(
                 request.provider,
                 request.threadId,
-                request.runId
+                request.environment
+            ) ?? [:]
+            effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
+            effectiveEnvironment = TokenSaverExecutionReceiptSeam.stampIdentity(
+                environment: effectiveEnvironment,
+                rootRunId: attemptId,
+                attemptId: attemptId,
+                provider: request.provider
             )
-            if let route = admittedRequest.autoRoute {
-                if RCWireProtocol.isWire(transformed) {
-                    outboundPrompt = (try? AgentOrchestrationRuntime.autoOrchestrateProviderWirePrompt(
-                        wirePrompt: transformed,
-                        admittedRoute: route
-                    )) ?? request.prompt
-                } else {
-                    outboundPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
-                        userPrompt: transformed,
-                        admittedRoute: route
+            let selectionRequest = TokenSaverOutboundSelectionRequest(
+                canonicalHuman: preservedUserContent,
+                admittedRequest: request,
+                autoRoute: admittedRequest.autoRoute,
+                admittedEnvironment: effectiveEnvironment
+            )
+            var decision = await selectedSelector(selectionRequest)
+                .bindingToCurrentHuman(
+                    canonicalHuman: preservedUserContent,
+                    admittedPrompt: request.prompt,
+                    provider: request.provider.rawValue,
+                    resolvedModel: request.model
+                )
+            if decision.selectedFormat == .rcw1 {
+                let projected = selectionRequest.environment(for: .rcw1)
+                let capable = projected[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1"
+                if !capable || !Self.isStructurallyValidRCW1Request(decision.selectedPayload) {
+                    decision = decision.fallingBackToHuman(
+                        payload: request.prompt,
+                        reason: .candidateError,
+                        canonicalHuman: preservedUserContent
                     )
                 }
-            } else {
-                outboundPrompt = transformed
             }
+            outboundPrompt = decision.selectedPayload
+            selectedTransportFormat = decision.selectedFormat
+            effectiveEnvironment = selectionRequest.environment(for: decision.selectedFormat)
+            outboundDecisionContext = (
+                decision.receipt,
+                request.provider,
+                request.model,
+                request.threadId,
+                request.runId,
+                selectedDelivery
+            )
+        } else {
+            // Legacy path: compressor (including Auto shaping) first, then one
+            // scoped-environment composition. Do not invert or double-run env.
+            if let promptCompressor {
+                let transformed = await promptCompressor(
+                    preservedUserContent,
+                    request.provider,
+                    request.threadId,
+                    request.runId
+                )
+                if let route = admittedRequest.autoRoute {
+                    if RCWireProtocol.isWire(transformed) {
+                        outboundPrompt = (try? AgentOrchestrationRuntime.autoOrchestrateProviderWirePrompt(
+                            wirePrompt: transformed,
+                            admittedRoute: route
+                        )) ?? request.prompt
+                    } else {
+                        outboundPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
+                            userPrompt: transformed,
+                            admittedRoute: route
+                        )
+                    }
+                } else {
+                    outboundPrompt = transformed
+                }
+            }
+            let scopedEnvironment = await runEnvironmentProvider?(
+                request.provider,
+                request.threadId,
+                request.environment
+            ) ?? [:]
+            effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
         }
+        let isWireOutbound = selectedTransportFormat.map { $0 == .rcw1 }
+            ?? RCWireProtocol.isWire(outboundPrompt)
         lock.lock()
-        if RCWireProtocol.isWire(outboundPrompt) {
+        if isWireOutbound {
             activeWireRequestTexts[request.runId] = outboundPrompt
         } else {
             activeWireRequestTexts.removeValue(forKey: request.runId)
         }
         lock.unlock()
-        var effectiveEnvironment = request.environment
-        let scopedEnvironment = await runEnvironmentProvider?(request.provider, request.threadId, request.environment) ?? [:]
-        effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
-        // Per-turn atomic wire admission. The session-level capability teaches
-        // the provider the ABI, while this key asks for RCW1 output only when
-        // this exact outbound prompt was safely encoded. Its absence is the
-        // authoritative plaintext reset for reused provider sessions.
-        if RCWireProtocol.isWire(outboundPrompt) {
-            effectiveEnvironment["RC_TOKEN_SAVER_WIRE_VERSION"] = "1"
-        } else {
-            effectiveEnvironment.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
+        // Per-turn atomic wire admission for the legacy String compressor only.
+        // Typed selection already applied the shared format projection above.
+        if selectedTransportFormat == nil {
+            if isWireOutbound {
+                effectiveEnvironment["RC_TOKEN_SAVER_WIRE_VERSION"] = "1"
+            } else {
+                effectiveEnvironment.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
+            }
+            // Host-authoritative attempt identity: stamp discrete keys + compact receipt
+            // so nested Codex/Claude/Grok workers inherit the same attempt for attribution.
+            effectiveEnvironment = TokenSaverExecutionReceiptSeam.stampIdentity(
+                environment: effectiveEnvironment,
+                rootRunId: attemptId,
+                attemptId: attemptId,
+                provider: request.provider
+            )
         }
-        // Host-authoritative attempt identity: stamp discrete keys + compact receipt
-        // so nested Codex/Claude/Grok workers inherit the same attempt for attribution.
-        let attemptId = request.runId.value.uuidString
-        effectiveEnvironment = TokenSaverExecutionReceiptSeam.stampIdentity(
-            environment: effectiveEnvironment,
-            rootRunId: attemptId,
-            attemptId: attemptId,
-            provider: request.provider
-        )
         // Parent linkage is lifecycle metadata, not a paid Token Saver lane.
         // Keep it available when Token Saver is off so nested receipts still
         // attach to the actual controller run.
@@ -1774,7 +1956,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
             throw AgentRunAcceptanceError.cancelled
         }
-        if recordUserMessage, RCWireProtocol.isWire(outboundPrompt) {
+        if recordUserMessage, isWireOutbound {
             // The human prompt is stored on AgentMessage; persist only the
             // provider-bound RCW1 bytes here so the user row can disclose the
             // exact translation without tripling large prompts in the hot-text

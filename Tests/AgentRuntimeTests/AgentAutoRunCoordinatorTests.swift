@@ -1,3 +1,4 @@
+import CryptoKit
 import XCTest
 import CoreModel
 @testable import Persistence
@@ -62,7 +63,11 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         )
     }
 
-    private func request(threadId: AgentThreadID, runId: AgentRunID = AgentRunID()) -> AgentRunRequest {
+    private func request(
+        threadId: AgentThreadID,
+        runId: AgentRunID = AgentRunID(),
+        environment: [String: String] = [:]
+    ) -> AgentRunRequest {
         AgentRunRequest(
             runId: runId,
             threadId: threadId,
@@ -75,7 +80,8 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
             permissionMode: .supervised,
             reasoningEffort: .medium,
             serviceTier: .auto,
-            interactionMode: .default
+            interactionMode: .default,
+            environment: environment
         )
     }
 
@@ -193,6 +199,330 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         XCTAssertEqual(receipt.threadId, thread.id)
         XCTAssertEqual(receipt.provider, .codex)
         XCTAssertEqual(receipt.model, "gpt-5.6-luna")
+    }
+
+    func testAutoRoutingExposesAdmittedProviderAndModelToTokenSaverSelector() async throws {
+        // WHY: the typed selector must run only after Auto has bound the real
+        // provider/model. Using the pre-route Claude/manual identity would rank
+        // and send bytes for the wrong host.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let receiptRepo = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: receiptRepo,
+            packageVerification: { true },
+            killSwitch: { false },
+            costEstimator: { _, usage in usage?.totalTokens }
+        )
+        let thread = AgentThread(
+            title: "auto selector",
+            provider: .claude,
+            model: "claude-manual",
+            routingConfiguration: autoConfiguration(runtime: runtime)
+        )
+        try threadRepo.upsert(thread)
+        let claude = RecordingProviderRunner(provider: .claude)
+        let codex = RecordingProviderRunner(provider: .codex)
+        let snapshot = liveSnapshot()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            orchestrationRuntime: runtime,
+            providerSnapshotSupplier: { [snapshot] in [snapshot] },
+            providers: [.claude: claude, .codex: codex]
+        )
+        let deliveries = AutoTokenSaverDeliveryProbe()
+        let selectorCalls = AutoTokenSaverSelectionProbe()
+        let human = "route this run"
+        let selectedPayload = "SELECTED:\(human)"
+        coordinator.runEnvironmentProvider = { provider, _, base in
+            var env = base
+            env["RC_SCOPED_PROVIDER"] = provider.rawValue
+            env[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] = "1"
+            return env
+        }
+        coordinator.tokenSaverOutboundSelector = { request in
+            selectorCalls.record(request)
+            XCTAssertEqual(request.canonicalHuman, human)
+            XCTAssertEqual(request.admittedRequest.provider, .codex)
+            XCTAssertEqual(request.admittedRequest.model, "gpt-5.6-luna")
+            XCTAssertEqual(request.admittedRequest.providerInstanceId, "codex-live")
+            XCTAssertEqual(request.autoRoute?.provider, .codex)
+            XCTAssertEqual(request.autoRoute?.selection.effectiveModel, "gpt-5.6-luna")
+            XCTAssertNotEqual(request.admittedRequest.provider, .claude)
+            XCTAssertNotEqual(request.admittedRequest.model, "claude-manual")
+            XCTAssertEqual(request.admittedRequest.environment["RC_ORIGINAL_ROUTE"], "pre-auto")
+            XCTAssertNil(
+                request.admittedRequest.environment["RC_SCOPED_PROVIDER"],
+                "admittedRequest.environment is the Auto-merged request, not the scoped overlay"
+            )
+            XCTAssertEqual(request.admittedEnvironment["RC_ORIGINAL_ROUTE"], "pre-auto")
+            XCTAssertEqual(
+                request.admittedEnvironment["RC_SCOPED_PROVIDER"],
+                "codex",
+                "admittedEnvironment must be the scoped env for the resolved provider/model"
+            )
+            XCTAssertEqual(
+                request.admittedEnvironment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey],
+                "1"
+            )
+            XCTAssertNil(request.admittedEnvironment["RC_TOKEN_SAVER_WIRE_VERSION"])
+            XCTAssertEqual(
+                request.environment(for: .rcw1)[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey],
+                "1"
+            )
+            XCTAssertEqual(request.environment(for: .rcw1)["RC_TOKEN_SAVER_WIRE_VERSION"], "1")
+            XCTAssertNil(request.environment(for: .human)[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey])
+            XCTAssertNil(request.environment(for: .human)["RC_TOKEN_SAVER_WIRE_VERSION"])
+            XCTAssertNil(request.environment(for: .caveman)[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey])
+            XCTAssertNil(request.environment(for: .caveman)["RC_TOKEN_SAVER_WIRE_VERSION"])
+            XCTAssertNotEqual(request.admittedEnvironment, request.admittedRequest.environment)
+            return await TokenSaverBestOfThreeSelector.select(
+                canonicalHuman: request.canonicalHuman,
+                humanOutboundPrompt: selectedPayload,
+                humanEffectiveEnvelope: "ENV:\(selectedPayload)",
+                target: .init(
+                    provider: request.admittedRequest.provider.rawValue,
+                    resolvedModel: request.admittedRequest.model,
+                    counterID: "auto-counter",
+                    counterRevision: "1",
+                    encoding: "fixture"
+                ),
+                candidates: [],
+                counter: nil
+            )
+        }
+        coordinator.onTokenSaverOutboundDelivery = { deliveries.record($0) }
+        let runId = AgentRunID()
+
+        _ = try await coordinator.startRun(request(
+            threadId: thread.id,
+            runId: runId,
+            environment: ["RC_ORIGINAL_ROUTE": "pre-auto"]
+        ))
+
+        XCTAssertEqual(selectorCalls.requests.count, 1)
+        XCTAssertEqual(claude.startCount, 0)
+        XCTAssertEqual(codex.startCount, 1)
+        XCTAssertEqual(
+            codex.lastRequest?.prompt,
+            selectorCalls.requests[0].admittedRequest.prompt,
+            "unbound selector bytes cannot be sent; fail closed to the admitted Auto Human"
+        )
+        XCTAssertNotEqual(codex.lastRequest?.prompt, selectedPayload)
+        XCTAssertEqual(codex.lastRequest?.provider, .codex)
+        XCTAssertEqual(codex.lastRequest?.model, "gpt-5.6-luna")
+        XCTAssertEqual(codex.lastRequest?.userMessageContent, human)
+        let projected = selectorCalls.requests[0].environment(for: .human)
+        XCTAssertNil(projected[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey])
+        XCTAssertNil(projected["RC_TOKEN_SAVER_WIRE_VERSION"])
+        XCTAssertEqual(
+            codex.lastRequest?.environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey],
+            projected[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey]
+        )
+        XCTAssertEqual(
+            codex.lastRequest?.environment["RC_TOKEN_SAVER_WIRE_VERSION"],
+            projected["RC_TOKEN_SAVER_WIRE_VERSION"]
+        )
+        XCTAssertEqual(try messageRepo.get(id: AgentMessageID(runId.value))?.content, human)
+        XCTAssertEqual(deliveries.events.count, 1)
+        XCTAssertEqual(deliveries.events.first?.provider, .codex)
+        XCTAssertEqual(deliveries.events.first?.resolvedModel, "gpt-5.6-luna")
+        XCTAssertEqual(deliveries.events.first?.receipt.selectedFormat, .human)
+        XCTAssertFalse(deliveries.events.first?.receipt.billingClaim ?? true)
+    }
+
+    func testAutoTypedRCW1WithoutCapabilitySendsAutoShapedHuman() async throws {
+        // WHY: a typed RCW1 pick without RC_TOKEN_SAVER_WIRE_CAPABILITY=1 must
+        // fail closed to the already Auto-shaped Human outbound, not send RCW1
+        // after merely dropping VERSION.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: AgentOrchestrationRepository(db: db),
+            packageVerification: { true },
+            killSwitch: { false },
+            costEstimator: { _, usage in usage?.totalTokens }
+        )
+        let thread = AgentThread(
+            title: "auto fail-closed rcw1",
+            provider: .claude,
+            model: "claude-manual",
+            routingConfiguration: autoConfiguration(runtime: runtime)
+        )
+        try threadRepo.upsert(thread)
+        let claude = RecordingProviderRunner(provider: .claude)
+        let codex = RecordingProviderRunner(provider: .codex)
+        let snapshot = liveSnapshot()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            orchestrationRuntime: runtime,
+            providerSnapshotSupplier: { [snapshot] in [snapshot] },
+            providers: [.claude: claude, .codex: codex]
+        )
+        let deliveries = AutoTokenSaverDeliveryProbe()
+        let selectorCalls = AutoTokenSaverSelectionProbe()
+        let human = "route this run"
+        let handle = "rcv1.runtime"
+        let rcwPayload = "RCW1\tQ\t1\nG\tRuntime request\nX\t[[rc:\(handle)]]\n.\n"
+        coordinator.tokenSaverOutboundSelector = { request in
+            selectorCalls.record(request)
+            XCTAssertEqual(request.admittedRequest.provider, .codex)
+            XCTAssertEqual(request.admittedRequest.model, "gpt-5.6-luna")
+            XCTAssertNil(request.admittedEnvironment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey])
+            XCTAssertNil(request.environment(for: .rcw1)[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey])
+            let humanOutbound = request.admittedRequest.prompt
+            let humanEnvelope = "BASE ABI\n\(humanOutbound)"
+            let rcwABI = "RCW1 ABI"
+            let rcwEnvelope = "\(rcwABI)\n\(rcwPayload)"
+            let cavePayload = "CAVE Runtime request [[ccr:cave.runtime]]"
+            let caveABI = "Caveman ABI"
+            let caveEnvelope = "\(caveABI)\n\(cavePayload)"
+            let source = SHA256.hash(data: Data(request.canonicalHuman.utf8))
+                .map { String(format: "%02x", $0) }.joined()
+            func arm(
+                _ format: TokenSaverBestOfThreeSelector.Format,
+                payload: String,
+                abi: String,
+                envelope: String,
+                handle: String
+            ) -> TokenSaverBestOfThreeSelector.Candidate {
+                .init(
+                    format: format, sourceSHA256: source, payload: payload, abi: abi,
+                    effectiveEnvelope: envelope, handle: handle,
+                    producerID: format == .rcw1 ? "remotecode-rcw1" : "caveman",
+                    producerRevision: "1", abiRevision: "1",
+                    generation: .passed, structural: .passed, semantic: .passed, recovery: .passed
+                )
+            }
+            let counts = [
+                humanOutbound: 100, humanEnvelope: 110,
+                rcwPayload: 20, handle: 4, rcwABI: 5, rcwEnvelope: 30,
+                cavePayload: 20, "cave.runtime": 4, caveABI: 5, caveEnvelope: 60,
+            ]
+            return await TokenSaverBestOfThreeSelector.select(
+                canonicalHuman: request.canonicalHuman,
+                humanOutboundPrompt: humanOutbound,
+                humanEffectiveEnvelope: humanEnvelope,
+                target: .init(
+                    provider: request.admittedRequest.provider.rawValue,
+                    resolvedModel: request.admittedRequest.model,
+                    counterID: "auto-counter",
+                    counterRevision: "1",
+                    encoding: "fixture"
+                ),
+                candidates: [
+                    arm(.rcw1, payload: rcwPayload, abi: rcwABI, envelope: rcwEnvelope, handle: handle),
+                    arm(.caveman, payload: cavePayload, abi: caveABI, envelope: caveEnvelope, handle: "cave.runtime"),
+                ],
+                counter: .init(counter: .init(
+                    id: "auto-counter", revision: "1", encoding: "fixture",
+                    provider: request.admittedRequest.provider.rawValue,
+                    resolvedModel: request.admittedRequest.model,
+                    quality: .exactLocalTokenizer
+                )) { text in
+                    guard let count = counts[text] else { throw NSError(domain: "counter", code: 1) }
+                    return count
+                }
+            )
+        }
+        coordinator.onTokenSaverOutboundDelivery = { deliveries.record($0) }
+        let runId = AgentRunID()
+
+        _ = try await coordinator.startRun(request(threadId: thread.id, runId: runId))
+
+        let selection = try XCTUnwrap(selectorCalls.requests.first)
+        let expectedHuman = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
+            userPrompt: human,
+            admittedRoute: selection.autoRoute
+        )
+        XCTAssertEqual(expectedHuman, selection.admittedRequest.prompt)
+        XCTAssertEqual(codex.startCount, 1)
+        XCTAssertEqual(claude.startCount, 0)
+        XCTAssertEqual(codex.lastRequest?.prompt, expectedHuman)
+        XCTAssertEqual(codex.lastRequest?.userMessageContent, human)
+        XCTAssertNil(codex.lastRequest?.environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey])
+        XCTAssertNil(codex.lastRequest?.environment["RC_TOKEN_SAVER_WIRE_VERSION"])
+        XCTAssertTrue(
+            try messageRepo.rcw1RequestTranslations(
+                threadId: thread.id, messageIds: [AgentMessageID(runId.value)]
+            ).isEmpty
+        )
+        XCTAssertEqual(try messageRepo.get(id: AgentMessageID(runId.value))?.content, human)
+        XCTAssertEqual(deliveries.events.count, 1)
+        XCTAssertEqual(deliveries.events.first?.receipt.selectedFormat, .human)
+        XCTAssertEqual(deliveries.events.first?.receipt.reason, .candidateError)
+        XCTAssertEqual(deliveries.events.first?.receipt.modeledContextDelta, 0)
+        XCTAssertFalse(deliveries.events.first?.receipt.billingClaim ?? true)
+    }
+
+    func testAutoAdmissionFailureDoesNotInvokeTokenSaverSelector() async throws {
+        // WHY: a rejected Auto route never produced an admitted provider/model.
+        // Invoking the selector on the original Claude/manual request would
+        // invent a decision for a host that will not run.
+        let runtime = AgentOrchestrationRuntime(
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(
+            title: "blocked auto selector",
+            provider: .claude,
+            model: "claude-manual",
+            routingConfiguration: autoConfiguration(runtime: runtime)
+        )
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            orchestrationRuntime: runtime,
+            providerSnapshotSupplier: { [] },
+            providers: [
+                .claude: RecordingProviderRunner(provider: .claude),
+                .codex: RecordingProviderRunner(provider: .codex),
+            ]
+        )
+        let selectorCalls = AutoTokenSaverSelectionProbe()
+        let deliveries = AutoTokenSaverDeliveryProbe()
+        coordinator.tokenSaverOutboundSelector = { request in
+            selectorCalls.record(request)
+            return await TokenSaverBestOfThreeSelector.select(
+                canonicalHuman: request.canonicalHuman,
+                humanOutboundPrompt: request.canonicalHuman,
+                humanEffectiveEnvelope: request.canonicalHuman,
+                target: .init(
+                    provider: "unused", resolvedModel: "unused",
+                    counterID: "unused", counterRevision: "1", encoding: "fixture"
+                ),
+                candidates: [],
+                counter: nil
+            )
+        }
+        coordinator.onTokenSaverOutboundDelivery = { deliveries.record($0) }
+
+        do {
+            _ = try await coordinator.startRun(request(threadId: thread.id))
+            XCTFail("Auto admission failure must not start any provider.")
+        } catch {
+            XCTAssertTrue(error is AgentOrchestrationAdmissionError)
+        }
+
+        XCTAssertTrue(selectorCalls.requests.isEmpty)
+        XCTAssertTrue(deliveries.events.isEmpty)
     }
 
     func testImmutableRoutingSnapshotPreventsTOCTOUAndUsesAdmittedProviderLaunchEnvironment() async throws {
@@ -879,6 +1209,32 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
                          "Admission must fail before the run graph is persisted as started.")
             return error as? AgentOrchestrationAdmissionError
         }
+    }
+}
+
+private final class AutoTokenSaverSelectionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _requests: [TokenSaverOutboundSelectionRequest] = []
+
+    var requests: [TokenSaverOutboundSelectionRequest] {
+        lock.withLock { _requests }
+    }
+
+    func record(_ request: TokenSaverOutboundSelectionRequest) {
+        lock.withLock { _requests.append(request) }
+    }
+}
+
+private final class AutoTokenSaverDeliveryProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _events: [TokenSaverOutboundDelivery] = []
+
+    var events: [TokenSaverOutboundDelivery] {
+        lock.withLock { _events }
+    }
+
+    func record(_ event: TokenSaverOutboundDelivery) {
+        lock.withLock { _events.append(event) }
     }
 }
 
