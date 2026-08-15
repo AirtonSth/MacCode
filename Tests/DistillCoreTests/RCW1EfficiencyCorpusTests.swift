@@ -241,6 +241,20 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         XCTAssertNil(floorFailOpen.observedRouteStage)
     }
 
+    func test_cavemanBenchmarkRejectsBinaryNotMatchingPinnedSourceBuild() throws {
+        // WHY: naming an arbitrary prebuilt binary beside the pinned checkout
+        // must not let release code masquerade as the exact source-pin build.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remotecode-caveman-provenance-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let engine = directory.appendingPathComponent("caveman-engine")
+        try Data("not-the-pinned-source-build".utf8).write(to: engine)
+
+        XCTAssertThrowsError(try validatePinnedCavemanBinary(engine))
+    }
+
     func test_captureMeasuredRequestBenchmarkWhenExplicitlyRequested() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard let capturePath = environment["REMOTE_CODE_RCW1_BENCHMARK_CAPTURE_JSON"],
@@ -253,21 +267,21 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             "REMOTE_CODE_RCW1_BENCHMARK_ENCODER_REVISION",
             environment: environment
         )
-        let cavemanEnginePath = try requiredEnvironmentValue(
-            "REMOTE_CODE_RCW1_BENCHMARK_CAVEMAN_ENGINE",
+        let cavemanGoPath = try requiredEnvironmentValue(
+            "REMOTE_CODE_RCW1_BENCHMARK_CAVEMAN_GO",
             environment: environment
         )
         let cavemanCheckoutPath = try requiredEnvironmentValue(
             "REMOTE_CODE_RCW1_BENCHMARK_CAVEMAN_CHECKOUT",
             environment: environment
         )
-        let cavemanEngine = URL(fileURLWithPath: cavemanEnginePath).standardizedFileURL
+        let cavemanGo = URL(fileURLWithPath: cavemanGoPath).standardizedFileURL
         let cavemanCheckout = URL(fileURLWithPath: cavemanCheckoutPath).standardizedFileURL
         let captureURL = URL(fileURLWithPath: capturePath).standardizedFileURL
 
-        guard cavemanEnginePath.hasPrefix("/"),
-              FileManager.default.isExecutableFile(atPath: cavemanEngine.path) else {
-            throw benchmarkError("Caveman engine must be an executable absolute path")
+        guard cavemanGoPath.hasPrefix("/"),
+              FileManager.default.isExecutableFile(atPath: cavemanGo.path) else {
+            throw benchmarkError("Caveman Go compiler must be an executable absolute path")
         }
         guard cavemanCheckoutPath.hasPrefix("/"),
               FileManager.default.fileExists(atPath: cavemanCheckout.path) else {
@@ -277,17 +291,6 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             throw benchmarkError("capture path must not overwrite the frozen corpus")
         }
 
-        let observedCavemanRevision = try subprocessText(
-            executable: "/usr/bin/git",
-            arguments: ["-C", cavemanCheckout.path, "rev-parse", "HEAD"]
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard observedCavemanRevision == benchmarkPinnedCavemanRevision else {
-            throw benchmarkError(
-                "Caveman checkout revision \(observedCavemanRevision) does not match pinned \(benchmarkPinnedCavemanRevision)"
-            )
-        }
-        let cavemanEngineSHA256 = try validateOfficialCavemanEngine(cavemanEngine)
-
         let temporaryDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("remotecode-rcw1-caveman-\(UUID().uuidString.lowercased())", isDirectory: true)
         try FileManager.default.createDirectory(
@@ -296,6 +299,12 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             attributes: [.posixPermissions: 0o700]
         )
         defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let cavemanEngine = temporaryDirectory.appendingPathComponent("caveman-engine")
+        let cavemanProvenance = try buildPinnedCavemanEngine(
+            go: cavemanGo,
+            checkout: cavemanCheckout,
+            output: cavemanEngine
+        )
         let cavemanDatabase = temporaryDirectory.appendingPathComponent("ccr.db")
         let runtime = LocalDistillRuntime()
         var rows: [MeasuredBenchmarkRow] = []
@@ -316,15 +325,18 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         }
 
         let run = MeasuredBenchmarkRun(
-            schemaVersion: 2,
+            schemaVersion: 3,
             runID: UUID().uuidString.lowercased(),
             capturedAt: ISO8601DateFormatter().string(from: Date()),
-            source: "opt-in-test LocalDistillRuntime.distillStaged + pinned official caveman-engine sha256=\(cavemanEngineSHA256)",
+            source: "opt-in-test LocalDistillRuntime.distillStaged + reproducible exact-source Caveman build",
             encoder: "LocalDistillRuntime.distillStaged",
             encoderRevision: encoderRevision,
             provider: nonempty(environment["REMOTE_CODE_RCW1_BENCHMARK_PROVIDER"]),
             providerModel: nonempty(environment["REMOTE_CODE_RCW1_BENCHMARK_PROVIDER_MODEL"]),
-            cavemanRevision: observedCavemanRevision,
+            cavemanSourceCommit: cavemanProvenance.sourceCommit,
+            cavemanGoVersion: cavemanProvenance.goVersion,
+            cavemanBuildCommand: cavemanProvenance.buildCommand,
+            cavemanBinarySHA: cavemanProvenance.binarySHA,
             rows: rows
         )
         XCTAssertEqual(run.rows.count, 24)
@@ -341,12 +353,14 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             MeasuredBenchmarkRun.self,
             from: Data(contentsOf: captureURL)
         )
-        XCTAssertEqual(roundTrip.schemaVersion, 2)
+        XCTAssertEqual(roundTrip.schemaVersion, 3)
         XCTAssertEqual(roundTrip.rows.count, 24)
         print("RCW1_BENCHMARK_CAPTURE_JSON=\(captureURL.path)")
         print("RCW1_BENCHMARK_ENCODER_REVISION=\(encoderRevision)")
-        print("RCW1_BENCHMARK_CAVEMAN_REVISION=\(observedCavemanRevision)")
-        print("RCW1_BENCHMARK_CAVEMAN_ENGINE_SHA256=\(cavemanEngineSHA256)")
+        print("RCW1_BENCHMARK_CAVEMAN_SOURCE_COMMIT=\(cavemanProvenance.sourceCommit)")
+        print("RCW1_BENCHMARK_CAVEMAN_GO_VERSION=\(cavemanProvenance.goVersion)")
+        print("RCW1_BENCHMARK_CAVEMAN_BUILD_COMMAND=\(cavemanProvenance.buildCommand)")
+        print("RCW1_BENCHMARK_CAVEMAN_BINARY_SHA=\(cavemanProvenance.binarySHA)")
     }
 
     func test_benchmarkHarnessRequiresAll24FrozenRowsAndLabelsFallbackCounterEstimated() throws {
@@ -356,7 +370,7 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         let counter = try BenchmarkTokenCounter(environment: [:])
         XCTAssertEqual(counter.diagnostic.measurementKind, "estimated")
         let partial = MeasuredBenchmarkRun(
-            schemaVersion: 2,
+            schemaVersion: 3,
             runID: "deterministic-harness-unit-test",
             capturedAt: "2000-01-01T00:00:00Z",
             source: "unit-test-not-provider-evidence",
@@ -364,7 +378,10 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             encoderRevision: "unit-test",
             provider: nil,
             providerModel: nil,
-            cavemanRevision: benchmarkPinnedCavemanRevision,
+            cavemanSourceCommit: benchmarkPinnedCavemanProvenance.sourceCommit,
+            cavemanGoVersion: benchmarkPinnedCavemanProvenance.goVersion,
+            cavemanBuildCommand: benchmarkPinnedCavemanProvenance.buildCommand,
+            cavemanBinarySHA: benchmarkPinnedCavemanProvenance.binarySHA,
             rows: []
         )
 
@@ -375,6 +392,31 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             counter: counter
         )) { error in
             XCTAssertTrue(error.localizedDescription.contains("all 24 frozen corpus rows"))
+        }
+    }
+
+    func test_benchmarkHarnessRejectsEveryUnpinnedCavemanProvenanceField() throws {
+        // WHY: a captured JSON file is untrusted input to report generation;
+        // every provenance receipt must remain pinned, not merely non-empty.
+        let corpus = try loadCorpus()
+        let pinned = benchmarkPinnedCavemanProvenance
+        let invalid: [(String, CavemanBenchmarkProvenance)] = [
+            ("source_commit", pinned.replacing(sourceCommit: String(repeating: "0", count: 40))),
+            ("go_version", pinned.replacing(goVersion: "go version forged")),
+            ("build_command", pinned.replacing(buildCommand: "go build forged")),
+            ("binary_sha", pinned.replacing(binarySHA: String(repeating: "0", count: 64))),
+        ]
+
+        for (field, provenance) in invalid {
+            XCTAssertThrowsError(try MeasuredBenchmarkHarness.build(
+                corpus: corpus,
+                measurements: completeFailOpenUnitRun(
+                    corpus: corpus,
+                    cavemanProvenance: provenance
+                ),
+                measurementArtifact: "/not-written/forged-\(field).json",
+                counter: BenchmarkTokenCounter(environment: [:])
+            ), "\(field) must be pinned")
         }
     }
 
@@ -408,7 +450,7 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             counter: BenchmarkTokenCounter(environment: [:])
         )
 
-        XCTAssertEqual(report.schemaVersion, 2)
+        XCTAssertEqual(report.schemaVersion, 3)
         XCTAssertEqual(report.rows.count, 24)
         XCTAssertEqual(report.totals.rows, 24)
         XCTAssertEqual(report.totals.rcw1Rows, 1)
@@ -627,10 +669,11 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
     private func completeFailOpenUnitRun(
         corpus: [EfficiencyCase],
         overrides: [String: MeasuredBenchmarkRow] = [:],
-        belowFloorIDs: Set<String> = []
+        belowFloorIDs: Set<String> = [],
+        cavemanProvenance: CavemanBenchmarkProvenance = benchmarkPinnedCavemanProvenance
     ) -> MeasuredBenchmarkRun {
         MeasuredBenchmarkRun(
-            schemaVersion: 2,
+            schemaVersion: 3,
             runID: "deterministic-harness-unit-test",
             capturedAt: "2000-01-01T00:00:00Z",
             source: "unit-test-not-provider-evidence",
@@ -638,7 +681,10 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
             encoderRevision: "unit-test",
             provider: nil,
             providerModel: nil,
-            cavemanRevision: benchmarkPinnedCavemanRevision,
+            cavemanSourceCommit: cavemanProvenance.sourceCommit,
+            cavemanGoVersion: cavemanProvenance.goVersion,
+            cavemanBuildCommand: cavemanProvenance.buildCommand,
+            cavemanBinarySHA: cavemanProvenance.binarySHA,
             rows: corpus.map { item in
                 overrides[item.id] ?? MeasuredBenchmarkRow(
                     id: item.id,
@@ -783,20 +829,77 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private func validateOfficialCavemanEngine(_ engine: URL) throws -> String {
-        let data = try Data(contentsOf: engine)
-        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        let manifestURL = engine.deletingLastPathComponent().appendingPathComponent("checksums.txt")
-        guard let manifest = try? String(contentsOf: manifestURL, encoding: .utf8) else {
-            throw benchmarkError("official Caveman checksums.txt must be beside the engine binary")
+    private func buildPinnedCavemanEngine(
+        go: URL,
+        checkout: URL,
+        output: URL
+    ) throws -> CavemanBenchmarkProvenance {
+        let sourceCommit = try subprocessText(
+            executable: "/usr/bin/git",
+            arguments: ["-C", checkout.path, "rev-parse", "HEAD"]
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard sourceCommit == benchmarkPinnedCavemanProvenance.sourceCommit else {
+            throw benchmarkError(
+                "Caveman source_commit \(sourceCommit) does not match pinned "
+                    + benchmarkPinnedCavemanProvenance.sourceCommit
+            )
         }
-        let expectedSuffix = "  \(engine.lastPathComponent)"
-        guard manifest.split(whereSeparator: \.isNewline).contains(where: { line in
-            line.hasPrefix(digest) && line.hasSuffix(expectedSuffix)
-        }) else {
-            throw benchmarkError("Caveman engine SHA-256 is absent from official checksums.txt")
+        let sourceChanges = try subprocessText(
+            executable: "/usr/bin/git",
+            arguments: ["-C", checkout.path, "status", "--porcelain=v1", "--untracked-files=all"]
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard sourceChanges.isEmpty else {
+            throw benchmarkError("Caveman source checkout must be clean before the pinned build")
         }
-        return digest
+        let goVersion = try subprocessText(
+            executable: go.path,
+            arguments: ["version"]
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard goVersion == benchmarkPinnedCavemanProvenance.goVersion else {
+            throw benchmarkError("Caveman Go toolchain does not match pinned \(benchmarkPinnedCavemanProvenance.goVersion)")
+        }
+
+        var buildEnvironment = ProcessInfo.processInfo.environment
+        buildEnvironment["CGO_ENABLED"] = "0"
+        buildEnvironment["GOENV"] = "off"
+        buildEnvironment["GOOS"] = "darwin"
+        buildEnvironment["GOARCH"] = "arm64"
+        buildEnvironment["GOTOOLCHAIN"] = "local"
+        buildEnvironment["GOWORK"] = "off"
+        buildEnvironment["GOFLAGS"] = ""
+        _ = try subprocess(
+            executable: go.path,
+            arguments: [
+                "-C", checkout.path, "build", "-mod=readonly", "-trimpath",
+                "-o", output.path, "./engine/cmd/caveman-engine",
+            ],
+            input: Data(),
+            environment: buildEnvironment
+        )
+        try validatePinnedCavemanBinary(output)
+        let buildInfo = try subprocessText(
+            executable: go.path,
+            arguments: ["version", "-m", output.path]
+        )
+        let receipts = Set(buildInfo.split(whereSeparator: \.isNewline).map {
+            $0.trimmingCharacters(in: .whitespaces)
+        })
+        guard [
+            "path\tgithub.com/JuliusBrussee/caveman/engine/cmd/caveman-engine",
+            "build\t-trimpath=true", "build\tCGO_ENABLED=0",
+            "build\tGOARCH=arm64", "build\tGOOS=darwin",
+            "build\tvcs.revision=\(sourceCommit)", "build\tvcs.modified=false",
+        ].allSatisfy(receipts.contains) else {
+            throw benchmarkError("Caveman binary build metadata does not match the exact-source recipe")
+        }
+        return benchmarkPinnedCavemanProvenance
+    }
+
+    private func validatePinnedCavemanBinary(_ engine: URL) throws {
+        let binarySHA = sha256Hex(try Data(contentsOf: engine))
+        guard binarySHA == benchmarkPinnedCavemanProvenance.binarySHA else {
+            throw benchmarkError("Caveman binary_sha does not match the reproducible exact-source build")
+        }
     }
 
     private func runCaveman(
@@ -988,7 +1091,37 @@ private struct EfficiencyCase: Decodable {
     }
 }
 
-private let benchmarkPinnedCavemanRevision = "27d5a3981a347890211bb1bf2439e5c821a63bc9"
+private let benchmarkPinnedCavemanProvenance = CavemanBenchmarkProvenance(
+    sourceCommit: "27d5a3981a347890211bb1bf2439e5c821a63bc9",
+    goVersion: "go version go1.26.5 darwin/arm64",
+    buildCommand: "CGO_ENABLED=0 GOENV=off GOOS=darwin GOARCH=arm64 GOTOOLCHAIN=local GOWORK=off GOFLAGS='' go -C <SOURCE> build -mod=readonly -trimpath -o <OUTPUT> ./engine/cmd/caveman-engine",
+    binarySHA: "d37718e84d5233a0c841f7d75fded0219cfdaee3af9a533198ebaf60db1bf9a3"
+)
+
+private struct CavemanBenchmarkProvenance: Equatable {
+    let sourceCommit: String
+    let goVersion: String
+    let buildCommand: String
+    let binarySHA: String
+
+    func replacing(
+        sourceCommit: String? = nil,
+        goVersion: String? = nil,
+        buildCommand: String? = nil,
+        binarySHA: String? = nil
+    ) -> Self {
+        Self(
+            sourceCommit: sourceCommit ?? self.sourceCommit,
+            goVersion: goVersion ?? self.goVersion,
+            buildCommand: buildCommand ?? self.buildCommand,
+            binarySHA: binarySHA ?? self.binarySHA
+        )
+    }
+}
+
+private func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
 
 private struct MeasuredBenchmarkRun: Codable {
     let schemaVersion: Int
@@ -999,7 +1132,10 @@ private struct MeasuredBenchmarkRun: Codable {
     let encoderRevision: String
     let provider: String?
     let providerModel: String?
-    let cavemanRevision: String
+    let cavemanSourceCommit: String
+    let cavemanGoVersion: String
+    let cavemanBuildCommand: String
+    let cavemanBinarySHA: String
     let rows: [MeasuredBenchmarkRow]
 
     enum CodingKeys: String, CodingKey {
@@ -1009,7 +1145,10 @@ private struct MeasuredBenchmarkRun: Codable {
         case capturedAt = "captured_at"
         case encoderRevision = "encoder_revision"
         case providerModel = "provider_model"
-        case cavemanRevision = "caveman_revision"
+        case cavemanSourceCommit = "source_commit"
+        case cavemanGoVersion = "go_version"
+        case cavemanBuildCommand = "build_command"
+        case cavemanBinarySHA = "binary_sha"
     }
 }
 
@@ -1193,7 +1332,7 @@ private enum MeasuredBenchmarkHarness {
             )
         }
         return BenchmarkReport(
-            schemaVersion: 2,
+            schemaVersion: 3,
             measurementArtifact: measurementArtifact,
             run: .init(measurements),
             tokenCounter: counter.diagnostic,
@@ -1214,16 +1353,27 @@ private enum MeasuredBenchmarkHarness {
     }
 
     private static func validateRunMetadata(_ run: MeasuredBenchmarkRun) throws {
-        guard run.schemaVersion == 2 else { throw benchmarkError("unsupported measurement schema") }
+        guard run.schemaVersion == 3 else { throw benchmarkError("unsupported measurement schema") }
         for (name, value) in [
             ("run_id", run.runID), ("captured_at", run.capturedAt), ("source", run.source),
             ("encoder", run.encoder), ("encoder_revision", run.encoderRevision),
-            ("caveman_revision", run.cavemanRevision),
+            ("source_commit", run.cavemanSourceCommit),
+            ("go_version", run.cavemanGoVersion),
+            ("build_command", run.cavemanBuildCommand),
+            ("binary_sha", run.cavemanBinarySHA),
         ] where value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw benchmarkError("measurement metadata is missing \(name)")
         }
-        guard run.cavemanRevision == benchmarkPinnedCavemanRevision else {
-            throw benchmarkError("caveman_revision must equal pinned \(benchmarkPinnedCavemanRevision)")
+        let provenance = CavemanBenchmarkProvenance(
+            sourceCommit: run.cavemanSourceCommit,
+            goVersion: run.cavemanGoVersion,
+            buildCommand: run.cavemanBuildCommand,
+            binarySHA: run.cavemanBinarySHA
+        )
+        guard provenance == benchmarkPinnedCavemanProvenance else {
+            throw benchmarkError(
+                "measurement Caveman provenance must match the reproducible exact-source build"
+            )
         }
     }
 
@@ -1440,7 +1590,10 @@ private struct BenchmarkRunMetadata: Encodable {
     let encoderRevision: String
     let provider: String?
     let providerModel: String?
-    let cavemanRevision: String
+    let cavemanSourceCommit: String
+    let cavemanGoVersion: String
+    let cavemanBuildCommand: String
+    let cavemanBinarySHA: String
 
     init(_ measured: MeasuredBenchmarkRun) {
         runID = measured.runID
@@ -1450,7 +1603,10 @@ private struct BenchmarkRunMetadata: Encodable {
         encoderRevision = measured.encoderRevision
         provider = measured.provider
         providerModel = measured.providerModel
-        cavemanRevision = measured.cavemanRevision
+        cavemanSourceCommit = measured.cavemanSourceCommit
+        cavemanGoVersion = measured.cavemanGoVersion
+        cavemanBuildCommand = measured.cavemanBuildCommand
+        cavemanBinarySHA = measured.cavemanBinarySHA
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1459,7 +1615,10 @@ private struct BenchmarkRunMetadata: Encodable {
         case capturedAt = "captured_at"
         case encoderRevision = "encoder_revision"
         case providerModel = "provider_model"
-        case cavemanRevision = "caveman_revision"
+        case cavemanSourceCommit = "source_commit"
+        case cavemanGoVersion = "go_version"
+        case cavemanBuildCommand = "build_command"
+        case cavemanBinarySHA = "binary_sha"
     }
 }
 
