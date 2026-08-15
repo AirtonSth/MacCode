@@ -5,9 +5,9 @@ Compared plan-bots `index.html` (P1a) + assets (`bots-home.png`, `bot-studio.png
 
 ## Open
 
-- [ ] inspector-drafts Inspector memory/skill/routine field drafts are process-wide and leak across bots — evidence: typed `only-new-agent-2-memory-draft-1805` on New Agent (@new-agent-2) Studio Memory; Batatilson Desk Memory showed the same unsent text; Batatilson Studio Skills still held leftover `weekly-account-health`. Code: `BotsViewModel.memoryDraft` / `skillDraft` / `routineName` / `routinePrompt` / `routineScheduleNote` are single fields, not keyed by BotID (unlike composer drafts). — seen: 2026-08-15
-
 ## Done
+
+- [x] inspector-drafts Inspector memory/skill/routine field drafts are process-wide and leak across bots — evidence: typed `only-new-agent-2-memory-draft-1805` on New Agent (@new-agent-2) Studio Memory; Batatilson Desk Memory showed the same unsent text; Batatilson Studio Skills still held leftover `weekly-account-health`. Code: `BotsViewModel.memoryDraft` / `skillDraft` / `routineName` / `routinePrompt` / `routineScheduleNote` are single fields, not keyed by BotID (unlike composer drafts). — seen: 2026-08-15 — done: 903c77d7
 
 - [x] Brain Inspector P1a (Source vs Effective, context receipts) still unshipped vs plan-bots — evidence: loop leftover after persist-switcher fire — seen: 2026-08-15 — done: 3414e347
 - [x] Live Desk still duplicates some historical assistant bubbles — evidence: prior Desk isolation/order fires left residual dups on Batatilson — seen: 2026-08-15 — done: 0550e618
