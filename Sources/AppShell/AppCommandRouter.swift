@@ -305,6 +305,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var terminalRestartPreparedDiscardAdditionalBarrierForTesting: (() -> SurfaceTerminationBarrier?)?
     var queueDispatchBeforeProviderStartForTesting: (() async -> Void)?
     var beforePullRequestThreadCommitForTesting: (() throws -> Void)?
+    /// Fires after inbound attachments pass `validatedForRetry` on the managed store.
+    var sendAgentMessageResolvedAttachmentsProbeForTesting: (([AgentAttachment]) -> Void)?
     var codexForkProtocolSupportProbe: (String, [String: String]) -> Bool = { binary, environment in
         CodexForkProtocolSupport.probe(binary: binary, environment: environment).isSupported
     }
@@ -3463,6 +3465,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ?? existing.routingConfiguration
         let autoRoutingActive = effectiveRouting?.mode == .auto
         let resolvedAttachments = try resolveInboundAgentAttachments(attachments)
+        sendAgentMessageResolvedAttachmentsProbeForTesting?(resolvedAttachments)
         if !autoRoutingActive {
             try await preflightAgentRun(
                 thread: existing,

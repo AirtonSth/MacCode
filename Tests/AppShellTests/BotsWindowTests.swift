@@ -21,26 +21,50 @@ final class BotsWindowTests: XCTestCase {
         directory = nil
     }
 
-    func test_deskSendAdmitsAndClearsAttachments_becauseAnexosMustReachTheTurn() throws {
+    func test_deskSendAdmitsAndClearsAttachments_becauseAnexosMustReachTheTurn() async throws {
         // WHY: Desk must stage, preview, remove, and send files through the
-        // real bot send path — not a decorative chip list.
+        // real bot send path — not a decorative chip list. sendAgentMessage
+        // only accepts blobs already in the managed agent-attachments store.
         let context = try makeContext()
-        let vm = BotsViewModel(context: context)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.openDesk(bot)
         let file = (directory as NSString).appendingPathComponent("brief.pdf")
         FileManager.default.createFile(atPath: file, contents: Data("hi".utf8))
         vm.addAttachments([file])
         XCTAssertEqual(vm.attachments.map(\.displayName), ["brief.pdf"])
-        vm.removeAttachment(vm.attachments[0])
+        let staged = try XCTUnwrap(vm.attachments.first)
+        XCTAssertNotEqual(staged.path, file, "raw user paths must be copied into the managed store")
+        XCTAssertNotNil(staged.id)
+        XCTAssertNotNil(staged.sha256)
+        let store = AgentAttachmentStore(
+            root: context.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)
+        )
+        XCTAssertEqual(try store.validatedForRetry(staged), staged)
+
+        vm.removeAttachment(staged)
         XCTAssertTrue(vm.attachments.isEmpty)
         vm.addAttachments([file])
         vm.composerText = ""
         XCTAssertTrue(vm.deskSendEnabled)
+
+        let exp = expectation(description: "sendAgentMessage resolved attachments")
+        var received: [AgentAttachment] = []
+        router.sendAgentMessageResolvedAttachmentsProbeForTesting = { attachments in
+            received = attachments
+            exp.fulfill()
+        }
         vm.send()
         XCTAssertTrue(vm.attachments.isEmpty, "send must consume staged files")
         XCTAssertEqual(vm.deskMessages.first?.text, "📎 brief.pdf")
-        XCTAssertTrue(vm.deskSendEnabled == false)
+        await fulfillment(of: [exp], timeout: 3)
+        XCTAssertEqual(received.count, 1, "Bots send must call sendAgentMessage with the staged file")
+        let sent = try XCTUnwrap(received.first)
+        XCTAssertEqual(try store.validatedForRetry(sent), sent)
+        XCTAssertTrue(sent.path.hasPrefix(store.root.path + "/"))
+        router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
     }
 
     func test_deskWorkingLabelFollowsALiveWorkLog_becauseDeskMustShowWorking() throws {
@@ -995,6 +1019,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("onAttach"))
         XCTAssertTrue(bots.contains("stopDeskRun"))
         XCTAssertTrue(bots.contains("attachments: attached") || bots.contains("attachments: attached,"))
+        XCTAssertTrue(bots.contains("attachmentStore().stage"))
         XCTAssertTrue(chatChrome.contains("agent.attach"))
         XCTAssertTrue(chatChrome.contains("agent.workingPhase"))
         XCTAssertTrue(chatChrome.contains("agent.composer.stop"))

@@ -657,7 +657,7 @@ public final class BotsViewModel: ObservableObject {
 
     public func addAttachments(_ paths: [String]) {
         do {
-            let staged = try AgentAttachmentResolver.resolve(paths: paths)
+            let staged = try attachmentStore().stage(paths: paths)
             var known = Set(attachments.map(\.path))
             for attachment in staged where known.insert(attachment.path).inserted {
                 attachments.append(attachment)
@@ -926,6 +926,12 @@ public final class BotsViewModel: ObservableObject {
         if let router { return router }
         let existing: AppCommandRouter? = context.router
         return existing
+    }
+
+    private func attachmentStore() -> AgentAttachmentStore {
+        AgentAttachmentStore(
+            root: context.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)
+        )
     }
 
     private func refreshFlags() {
