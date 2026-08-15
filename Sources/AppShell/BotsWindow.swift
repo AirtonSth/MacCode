@@ -644,7 +644,7 @@ public final class BotsViewModel: ObservableObject {
             } else if conversations.contains(where: { $0.unread || $0.attentionState == .unreadActivity }) {
                 states[bot.id] = .unreadActivity
             } else {
-                states[bot.id] = .none
+                states[bot.id] = BotAttentionState.none
             }
         }
         attentionStateByBot = states
@@ -685,14 +685,20 @@ public final class BotsViewModel: ObservableObject {
            let threadID = conversation.linkedAgentThreadID,
            let stored = try? context.messageRepo.listRecent(threadId: threadID, limit: 80),
            !stored.isEmpty {
-            persisted = stored.reversed().compactMap { message -> BotDeskMessage? in
+            persisted = stored.compactMap { message -> BotDeskMessage? in
                 let role: BotDeskMessage.Role
+                let text: String
                 switch message.role {
-                case .user: role = .user
-                case .assistant: role = .assistant
-                default: return nil
+                case .user:
+                    role = .user
+                    text = BotsDeskFollowThrough.displayUserText(from: message.content)
+                case .assistant:
+                    role = .assistant
+                    text = message.content
+                default:
+                    return nil
                 }
-                return BotDeskMessage(role: role, text: message.content, createdAt: message.createdAt)
+                return BotDeskMessage(role: role, text: text, createdAt: message.createdAt)
             }
         }
         let visible = BotsDeskFollowThrough.visibleDeskMessages(cached: cached, persisted: persisted)

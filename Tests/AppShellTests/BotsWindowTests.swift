@@ -162,6 +162,18 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(visible.contains { $0.text == BotsDeskFollowThrough.workingPlaceholder })
     }
 
+    func test_displayUserTextStripsProviderEnvelope_becauseTheDeskMustShowTheTeammateLine() {
+        let envelope = """
+        You are Piper — Scout.
+
+        User request:
+
+        Summarize overnight
+        """
+        XCTAssertEqual(BotsDeskFollowThrough.displayUserText(from: envelope), "Summarize overnight")
+        XCTAssertEqual(BotsDeskFollowThrough.displayUserText(from: "Just the ask"), "Just the ask")
+    }
+
     func test_composeRunPromptIncludesTrustedMemoryAndEnabledSkills() {
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "Looks around")
         let revision = BotRevision(

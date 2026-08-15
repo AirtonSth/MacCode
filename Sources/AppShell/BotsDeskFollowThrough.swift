@@ -44,6 +44,13 @@ enum BotsDeskFollowThrough {
         return persisted
     }
 
+    /// Persist stores the provider envelope; the desk must show the teammate line.
+    static func displayUserText(from persisted: String) -> String {
+        let marker = "User request:"
+        guard let range = persisted.range(of: marker) else { return persisted }
+        return persisted[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func isTerminal(_ status: AgentRunStatus) -> Bool {
         switch status {
         case .completed, .failed, .cancelled, .interrupted:
