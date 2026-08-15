@@ -571,7 +571,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(first.window.title, "Bots")
         XCTAssertEqual(
             try context.settingsRepo.get(MainWindowController.botsShellSettingsKey) ?? "",
-            "1"
+            "bots"
         )
 
         let reopened = MainWindowController(context: context, router: router)
@@ -580,10 +580,59 @@ final class BotsWindowTests: XCTestCase {
         first.presentWorkspaceContent()
         XCTAssertEqual(
             try context.settingsRepo.get(MainWindowController.botsShellSettingsKey) ?? "",
-            "0"
+            "workspace"
         )
         let workspace = MainWindowController(context: context, router: router)
         XCTAssertNotEqual(workspace.window.title, "Bots")
+        XCTAssertNotEqual(workspace.window.title, "Schedule Tasks")
+        XCTAssertNotEqual(workspace.window.title, "Active Threads")
+    }
+
+    func test_legacyBotsShellFlagStillRestoresBots_becauseOlderSettingsMustNotDropTheSwitcher() throws {
+        // WHY: v72-era rows stored "1"/"0". A dest-string persist cannot
+        // leave those users on the workspace after an upgrade.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        try context.settingsRepo.set(MainWindowController.botsShellSettingsKey, "1")
+        let restored = MainWindowController(context: context, router: router)
+        XCTAssertEqual(restored.window.title, "Bots")
+    }
+
+    func test_scheduleTasksDestinationSurvivesRelaunch_becauseShellDestIsUserWorkflowState() throws {
+        // WHY: persist used to write "not Bots" for Schedule Tasks, so
+        // relaunch dumped the user on the workspace.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let first = MainWindowController(context: context, router: router)
+        router.windowController = first
+        first.presentScheduledTasksInMainContent()
+        XCTAssertEqual(first.window.title, "Schedule Tasks")
+        XCTAssertEqual(
+            try context.settingsRepo.get(MainWindowController.botsShellSettingsKey) ?? "",
+            "scheduledTasks"
+        )
+
+        let reopened = MainWindowController(context: context, router: router)
+        XCTAssertEqual(reopened.window.title, "Schedule Tasks")
+    }
+
+    func test_activeThreadsDestinationSurvivesRelaunch_becauseShellDestIsUserWorkflowState() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let first = MainWindowController(context: context, router: router)
+        router.windowController = first
+        first.presentActiveThreadsInMainContent()
+        XCTAssertEqual(first.window.title, "Active Threads")
+        XCTAssertEqual(
+            try context.settingsRepo.get(MainWindowController.botsShellSettingsKey) ?? "",
+            "activeThreads"
+        )
+
+        let reopened = MainWindowController(context: context, router: router)
+        XCTAssertEqual(reopened.window.title, "Active Threads")
     }
 
     func test_deletedBotDoesNotRestoreItsDesk_becauseTheTeammateIsGone() throws {

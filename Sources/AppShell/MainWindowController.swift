@@ -1515,15 +1515,28 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     }
 
     private func persistBotsShellDestination() {
-        try? context?.settingsRepo.set(
-            Self.botsShellSettingsKey,
-            shellContentMode == .bots ? "1" : "0"
-        )
+        let value: String
+        switch shellContentMode {
+        case .bots: value = "bots"
+        case .scheduledTasks: value = "scheduledTasks"
+        case .activeThreads: value = "activeThreads"
+        case .workspace: value = "workspace"
+        }
+        try? context?.settingsRepo.set(Self.botsShellSettingsKey, value)
     }
 
     private func restoreBotsShellDestinationIfNeeded() {
-        guard ((try? context?.settingsRepo.get(Self.botsShellSettingsKey)) ?? nil) == "1" else { return }
-        presentBotsInMainContent()
+        let raw = (try? context?.settingsRepo.get(Self.botsShellSettingsKey)) ?? nil
+        switch raw {
+        case "1", "bots":
+            presentBotsInMainContent()
+        case "scheduledTasks":
+            presentScheduledTasksInMainContent()
+        case "activeThreads":
+            presentActiveThreadsInMainContent()
+        default:
+            break
+        }
     }
 }
 
