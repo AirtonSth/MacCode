@@ -2,6 +2,7 @@ import XCTest
 import CoreModel
 @testable import AppShell
 @testable import Persistence
+import Surfaces
 
 @MainActor
 final class BotsWindowTests: XCTestCase {
@@ -18,6 +19,18 @@ final class BotsWindowTests: XCTestCase {
             try? FileManager.default.removeItem(atPath: directory)
         }
         directory = nil
+    }
+
+    func test_currentGoalAndActivityDriveHomeFromRealConversations() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.send("Ship the beta brief")
+        XCTAssertEqual(vm.currentGoal(for: bot), "Ship the beta brief")
+        XCTAssertFalse(vm.activityRows(for: bot).isEmpty)
+        XCTAssertEqual(BotsChrome.hitTarget, 44)
+        XCTAssertEqual(BotsChrome.Label.openChat, "Open Chat")
     }
 
     func test_openHomeShowsFleetOverview_becauseThePlanSeparatesRosterFromChat() throws {
@@ -494,6 +507,11 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(assistant.role, .assistant)
         XCTAssertEqual(user.createdAt, userAt)
         XCTAssertEqual(assistant.createdAt, assistantAt)
+        XCTAssertEqual(
+            AgentChatTranscriptChrome.relativeTimestamp(userAt, now: userAt),
+            "just now",
+            "Desk timestamps must use the Agent App 'just now' window"
+        )
     }
 
     func test_deskWorkLogAppearsOnlyWhenALinkedRunExists() {
@@ -835,6 +853,9 @@ final class BotsWindowTests: XCTestCase {
         let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
         let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let chrome = try String(contentsOf: sourceURL("Sources/AppShell/BotsChrome.swift"), encoding: .utf8)
+        let types = try String(contentsOf: sourceURL("Sources/CoreModel/BotTypes.swift"), encoding: .utf8)
+        let chatChrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatTranscriptChrome.swift"), encoding: .utf8)
 
         XCTAssertTrue(main.contains("presentBotsInMainContent"))
         XCTAssertTrue(main.contains("installBotsContent"))
@@ -864,6 +885,18 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.studio.tab.skills"))
         XCTAssertTrue(bots.contains("bots.studio.tab.routines"))
         XCTAssertTrue(bots.contains("bots.studio.tab.desktop"))
+        XCTAssertTrue(bots.contains("bots.studio.tab.security"))
+        XCTAssertTrue(bots.contains("bots.chrome.agentic"))
+        XCTAssertTrue(bots.contains("bots.home.goal"))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.agentic))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.currentGoal))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.todaysActivity))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.nextRoutine))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.myBots))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.openChat))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.saveBot))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.instructions))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.security))
         XCTAssertTrue(bots.contains("bots.studio.identity"))
         XCTAssertTrue(bots.contains("bots.studio.routing"))
         XCTAssertTrue(bots.contains("bots.studio.soul"))
@@ -872,7 +905,13 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("Role & Identity"))
         XCTAssertTrue(bots.contains("Provider routing"))
         XCTAssertTrue(bots.contains("Configuration summary"))
-        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.composer\")"))
+        XCTAssertTrue(bots.contains("AgentChatUserBubble"))
+        XCTAssertTrue(bots.contains("AgentChatAssistantReply"))
+        XCTAssertTrue(bots.contains("AgentChatComposerBar"))
+        XCTAssertTrue(bots.contains("bots.desk.composer"))
+        XCTAssertTrue(chatChrome.contains("accessibilityIdentifier(composerIdentifier)"))
+        XCTAssertTrue(chatChrome.contains("\"bots.desk.composer\""))
+        XCTAssertTrue(chatChrome.contains("arrow.up"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.timeline\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.workLog\")"))
@@ -904,7 +943,17 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.routines.honesty"))
         XCTAssertFalse(bots.contains("BotDetailTab"))
         XCTAssertFalse(bots.contains("detailTab = .desk"))
-        XCTAssertTrue(bots.contains("BOT ROSTER"))
+        XCTAssertTrue(bots.contains("BOT ROSTER") || chrome.contains("BOT ROSTER"))
+        XCTAssertTrue(bots.contains(BotsChrome.Label.agentic) || chrome.contains(BotsChrome.Label.agentic))
+        XCTAssertTrue(bots.contains(BotsChrome.Label.currentGoal) || chrome.contains(BotsChrome.Label.currentGoal))
+        XCTAssertTrue(bots.contains(BotsChrome.Label.todaysActivity) || chrome.contains(BotsChrome.Label.todaysActivity))
+        XCTAssertTrue(bots.contains(BotsChrome.Label.nextRoutine) || chrome.contains(BotsChrome.Label.nextRoutine))
+        for label in BotsChrome.allVisibleLabels {
+            XCTAssertTrue(
+                chrome.contains(label) || bots.contains(label) || types.contains(label),
+                "shipped Bots chrome must show \(label)"
+            )
+        }
         XCTAssertFalse(bots.contains("Take over"))
         XCTAssertFalse(bots.contains("Dedicated macOS VM"))
         XCTAssertFalse(bots.contains("Active now in macOS VM"))

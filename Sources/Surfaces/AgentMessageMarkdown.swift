@@ -570,12 +570,18 @@ enum AgentMessageMarkdown {
     }
 }
 
-struct AgentMessageMarkdownView: View {
+public struct AgentMessageMarkdownView: View {
     let text: String
     var compact: Bool = false
     /// When false (live streaming rows), parse results are not inserted into NSCache
     /// so growing partial bodies cannot thrash occupancy (R4-B).
     var cacheResults: Bool = true
+
+    public init(text: String, compact: Bool = false, cacheResults: Bool = true) {
+        self.text = text
+        self.compact = compact
+        self.cacheResults = cacheResults
+    }
 
     /// IMP-010: tracks which code block (by enumeration offset) is hovered.
     @State private var hoveredCode: Int? = nil
@@ -583,7 +589,7 @@ struct AgentMessageMarkdownView: View {
     /// so the button can show transient "Copied" feedback.
     @State private var copiedCode: Int? = nil
 
-    var body: some View {
+    public var body: some View {
         VStack(alignment: .leading, spacing: compact ? DS.Space.sm : DS.Space.md) {
             ForEach(Array(AgentMessageMarkdown.selectionGroups(from: AgentMessageMarkdown.blocks(from: text, cache: cacheResults)).enumerated()), id: \.offset) { index, group in
                 if group.count == 1, let block = group.first, isIsolatedBlock(block) {

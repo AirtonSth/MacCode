@@ -1067,6 +1067,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         }
         let vm = botsViewModel ?? BotsViewModel(context: context, router: router)
         botsViewModel = vm
+        vm.onLeaveBots = { [weak self] in
+            self?.presentWorkspaceContent()
+        }
         vm.reload()
         vm.openFleet()
         let host = NSHostingView(rootView: BotsRootView(vm: vm))

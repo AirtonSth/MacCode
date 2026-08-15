@@ -2,6 +2,7 @@ import AppKit
 import CoreModel
 import DesignSystemKit
 import Persistence
+import Surfaces
 import SwiftUI
 
 // MARK: - Drafts & rows
@@ -164,6 +165,7 @@ public enum BotStudioTab: String, CaseIterable, Identifiable {
     case memory
     case skills
     case routines
+    case security
     case desktop
 
     public var id: String { rawValue }
@@ -174,6 +176,7 @@ public enum BotStudioTab: String, CaseIterable, Identifiable {
         case .memory: return "Memory"
         case .skills: return "Skills"
         case .routines: return "Routines"
+        case .security: return BotsChrome.Label.security
         case .desktop: return "Desktop"
         }
     }
@@ -184,6 +187,7 @@ public enum BotStudioTab: String, CaseIterable, Identifiable {
         case .memory: return "bots.studio.tab.memory"
         case .skills: return "bots.studio.tab.skills"
         case .routines: return "bots.studio.tab.routines"
+        case .security: return "bots.studio.tab.security"
         case .desktop: return "bots.studio.tab.desktop"
         }
     }
@@ -229,6 +233,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var isDesktopRemoteActive = false
     @Published public private(set) var lastSendStartedProviderRun = false
     @Published public var pendingDeleteID: BotID?
+    public var onLeaveBots: (() -> Void)?
 
     public let desktopHonestyLabel = BotDesktopKind.logicalExecutionSpaceHonestyLabel
 
@@ -296,6 +301,29 @@ public final class BotsViewModel: ObservableObject {
 
     public func rosterTimestamp(for bot: BotDefinition) -> Date? {
         lastUpdatedByBot[bot.id]
+    }
+
+    public func currentGoal(for bot: BotDefinition) -> String {
+        if let conversation = selectedConversation, conversation.botID == bot.id,
+           !conversation.title.isEmpty {
+            return BotsDeskFollowThrough.displayUserText(from: conversation.title)
+        }
+        let preview = rosterPreview(for: bot)
+        if preview == "No job yet" { return "No current goal" }
+        return preview
+    }
+
+    public func activityRows(for bot: BotDefinition) -> [BotActivityRow] {
+        let cached = messagesByBot[bot.id] ?? []
+        let source = cached.isEmpty && selectedBotID == bot.id ? deskMessages : cached
+        let rows = source.suffix(4).map { message in
+            BotActivityRow(id: message.id, text: message.text, createdAt: message.createdAt)
+        }
+        if !rows.isEmpty { return Array(rows) }
+        if let preview = lastPreviewByBot[bot.id], let stamp = lastUpdatedByBot[bot.id] {
+            return [BotActivityRow(text: preview, createdAt: stamp)]
+        }
+        return []
     }
 
     public var deskTimeline: [BotDeskTimelineItem] {
@@ -926,13 +954,16 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    public func providerLabel(for bot: BotDefinition) -> String? {
-        guard let provider = resolvedProvider(for: bot) else { return nil }
+    public func providerChipTitle(_ provider: AgentProvider) -> String {
         switch provider {
         case .claude: return "Claude"
         case .codex: return "Codex"
         case .grok: return "Grok"
         }
+    }
+
+    public func providerLabel(for bot: BotDefinition) -> String? {
+        resolvedProvider(for: bot).map(providerChipTitle)
     }
 
     public func resolvedProvider(for bot: BotDefinition) -> AgentProvider? {
@@ -1383,24 +1414,61 @@ public struct BotsRootView: View {
     }
 
     private var showsRosterRail: Bool {
-        vm.isControlPlaneActive && !vm.bots.isEmpty
+        vm.isControlPlaneActive
     }
 
     // MARK: Roster
 
     private var rosterRail: some View {
         VStack(alignment: .leading, spacing: 0) {
+            agenticBotsSwitcher
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.top, DS.Space.xl)
+
             HStack(spacing: DS.Space.sm) {
-                Text("BOT ROSTER")
-                    .font(DS.Font.caption2.weight(.semibold))
+                Image(systemName: "magnifyingglass")
                     .foregroundColor(DS.Palette.textTertiary)
-                    .tracking(1.1)
+                    .accessibilityHidden(true)
+                TextField(BotsChrome.Label.search, text: $vm.searchText)
+                    .textFieldStyle(.plain)
+                    .foregroundColor(DS.Palette.text)
+            }
+            .padding(.horizontal, DS.Space.lg)
+            .frame(minHeight: 40)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.top, DS.Space.lg)
+
+            Button(action: vm.beginCreate) {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: "plus")
+                    Text(BotsChrome.Label.newBot)
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(BotsPrimaryButtonStyle())
+            .disabled(!vm.isControlPlaneActive)
+            .accessibilityIdentifier("bots.new")
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.top, DS.Space.md)
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(BotsChrome.Label.botRoster)
+                        .font(DS.Font.caption2.weight(.semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .tracking(1.1)
+                    Text(BotsChrome.Label.myBots)
+                        .font(DS.Font.caption.weight(.medium))
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
                 Spacer(minLength: 0)
                 Button(action: vm.openAttention) {
                     Image(systemName: vm.openAttentionCount == 0 ? "bell" : "bell.badge")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(vm.openAttentionCount == 0 ? DS.Palette.textTertiary : DS.Palette.warning)
-                        .frame(width: 28, height: 28)
+                        .frame(width: BotsChrome.hitTarget, height: BotsChrome.hitTarget)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(
@@ -1409,73 +1477,85 @@ public struct BotsRootView: View {
                         : "Attention \(vm.openAttentionCount)"
                 )
                 .accessibilityIdentifier("bots.roster.attention")
-                Button(action: vm.beginCreate) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(DS.Palette.text)
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.plain)
-                .disabled(!vm.isControlPlaneActive)
-                .accessibilityLabel("New Bot")
-                .accessibilityIdentifier("bots.roster.new")
             }
             .padding(.horizontal, DS.Space.lg)
             .padding(.top, DS.Space.xl)
-            .padding(.bottom, DS.Space.md)
-
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityHidden(true)
-                TextField("Search", text: $vm.searchText)
-                    .textFieldStyle(.plain)
-                    .foregroundColor(DS.Palette.text)
-            }
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.vertical, DS.Space.sm)
-            .background(DS.Palette.surfaceRaised)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.bottom, DS.Space.md)
+            .padding(.bottom, DS.Space.sm)
 
             ScrollView {
-                LazyVStack(spacing: 2) {
+                LazyVStack(spacing: DS.Space.sm) {
                     ForEach(vm.fleet, id: \.id) { bot in
                         rosterRow(bot)
                     }
                 }
-                .padding(.horizontal, DS.Space.sm)
+                .padding(.horizontal, DS.Space.lg)
                 .padding(.bottom, DS.Space.lg)
             }
         }
-        .frame(width: 268)
+        .frame(width: BotsChrome.rosterWidth)
         .background(DS.Palette.surface)
         .accessibilityIdentifier("bots.roster")
     }
 
+    private var agenticBotsSwitcher: some View {
+        HStack(spacing: 4) {
+            Button(BotsChrome.Label.agentic) {
+                vm.onLeaveBots?()
+            }
+            .buttonStyle(.plain)
+            .font(DS.Font.body.weight(.medium))
+            .foregroundColor(DS.Palette.textSecondary)
+            .frame(maxWidth: .infinity, minHeight: BotsChrome.hitTarget)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .accessibilityIdentifier("bots.chrome.agentic")
+
+            Text(BotsChrome.Label.bots)
+                .font(DS.Font.body.weight(.semibold))
+                .foregroundColor(BotsChrome.onPrimary)
+                .frame(maxWidth: .infinity, minHeight: BotsChrome.hitTarget)
+                .background(BotsChrome.primary)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .accessibilityAddTraits(.isSelected)
+                .accessibilityIdentifier("bots.chrome.bots")
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("bots.chrome.mode")
+    }
+
     private func rosterRow(_ bot: BotDefinition) -> some View {
         let selected = vm.selectedBotID == bot.id && vm.screen != .attention
+        let state = vm.attentionState(for: bot)
         return Button {
             vm.openHome(bot)
         } label: {
-            HStack(alignment: .top, spacing: DS.Space.md) {
-                Image(systemName: bot.avatarSymbol)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(DS.Palette.accent)
-                    .frame(width: 28, height: 28)
-                    .background(DS.Palette.accent.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
-                        Text(rosterNameLine(bot))
-                            .font(DS.Font.caption.weight(.semibold))
+            HStack(alignment: .center, spacing: DS.Space.md) {
+                ZStack(alignment: .bottomTrailing) {
+                    BotsAvatarView(name: bot.name, handle: bot.handle, size: 36)
+                    Circle()
+                        .fill(state == .working ? DS.Palette.warning : DS.Palette.success)
+                        .frame(width: 8, height: 8)
+                        .overlay(Circle().stroke(DS.Palette.surface, lineWidth: 1.5))
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: DS.Space.sm) {
+                        Text(bot.name)
+                            .font(DS.Font.bodyStrong)
                             .foregroundColor(DS.Palette.text)
                             .lineLimit(1)
                         Spacer(minLength: 0)
+                        if let provider = vm.providerLabel(for: bot) {
+                            Text(provider)
+                                .font(DS.Font.caption2.weight(.semibold))
+                                .foregroundColor(DS.Palette.textSecondary)
+                        }
+                    }
+                    HStack(spacing: DS.Space.sm) {
+                        Text(BotsChrome.statusTitle(for: state))
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
                         if let stamp = vm.rosterTimestamp(for: bot) {
-                            Text(stamp, style: .time)
+                            Text(stamp, style: .relative)
                                 .font(DS.Font.caption2)
                                 .foregroundColor(DS.Palette.textTertiary)
                         }
@@ -1483,22 +1563,21 @@ public struct BotsRootView: View {
                     Text(vm.rosterPreview(for: bot))
                         .font(DS.Font.caption2)
                         .foregroundColor(DS.Palette.textSecondary)
-                        .lineLimit(2)
+                        .lineLimit(1)
                 }
             }
-            .padding(.horizontal, DS.Space.md)
-            .padding(.vertical, DS.Space.md)
-            .background(selected ? DS.Palette.accent.opacity(0.12) : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .padding(DS.Space.md)
+            .frame(minHeight: 56)
+            .background(selected ? BotsChrome.primarySoft : DS.Palette.surfaceRaised)
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(selected ? BotsChrome.primary.opacity(0.55) : DS.Palette.line, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier("bots.roster.row.\(bot.handle)")
-    }
-
-    private func rosterNameLine(_ bot: BotDefinition) -> String {
-        if bot.title.isEmpty { return bot.name }
-        return "\(bot.name) · \(bot.title)"
     }
 
     // MARK: Fleet
@@ -1542,8 +1621,10 @@ public struct BotsRootView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: DS.Space.xl) {
                 fleetHomeHeader(bot)
+                fleetHomeRouting(bot)
                 HStack(alignment: .top, spacing: DS.Space.xl) {
                     VStack(alignment: .leading, spacing: DS.Space.lg) {
+                        fleetHomeGoal(bot)
                         fleetHomeActivity(bot)
                         fleetHomeRoutine(bot)
                     }
@@ -1560,66 +1641,102 @@ public struct BotsRootView: View {
 
     private func fleetHomeHeader(_ bot: BotDefinition) -> some View {
         HStack(alignment: .top, spacing: DS.Space.lg) {
-            Image(systemName: bot.avatarSymbol)
-                .font(.system(size: 22, weight: .semibold))
-                .foregroundColor(DS.Palette.accent)
-                .frame(width: 48, height: 48)
-                .background(DS.Palette.accent.opacity(0.12))
-                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+            BotsAvatarView(name: bot.name, handle: bot.handle, size: 52)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: DS.Space.sm) {
                     Text(bot.name)
                         .font(DS.Font.title2.weight(.semibold))
                         .foregroundColor(DS.Palette.text)
                         .accessibilityIdentifier("bots.home.name")
-                    Text("@\(bot.handle)")
+                    Circle()
+                        .fill(DS.Palette.success)
+                        .frame(width: 8, height: 8)
+                    Text(BotsChrome.statusTitle(for: vm.attentionState(for: bot)))
                         .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    if let provider = vm.providerLabel(for: bot) {
-                        DSPill(provider, tone: .accent)
-                            .accessibilityIdentifier("bots.home.provider")
-                    }
+                        .foregroundColor(DS.Palette.textSecondary)
                     attentionBadge(vm.attentionState(for: bot))
                 }
                 Text(bot.title.isEmpty ? "No job yet" : bot.title)
                     .font(DS.Font.body)
                     .foregroundColor(DS.Palette.textSecondary)
                     .accessibilityIdentifier("bots.home.title")
-                if !bot.description.isEmpty {
-                    Text(bot.description)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(2)
-                }
-                if let stamp = vm.rosterTimestamp(for: bot) {
-                    Text(stamp, style: .relative)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .accessibilityIdentifier("bots.home.lastActivity")
-                }
             }
             Spacer(minLength: DS.Space.lg)
-            HStack(spacing: DS.Space.md) {
-                Button("Studio") { vm.beginEdit(bot) }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .accessibilityIdentifier("bots.home.studio")
-                Button("Open Chat") { vm.openDesk(bot) }
-                    .buttonStyle(DSPrimaryButtonStyle())
-                    .accessibilityIdentifier("bots.home.chat")
+            Button(action: { vm.openDesk(bot) }) {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: "bubble.left")
+                    Text(BotsChrome.Label.openChat)
+                }
             }
+            .buttonStyle(BotsPrimaryButtonStyle())
+            .accessibilityIdentifier("bots.home.chat")
         }
+    }
+
+    private func fleetHomeRouting(_ bot: BotDefinition) -> some View {
+        HStack(spacing: DS.Space.md) {
+            Text("Routing")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            ForEach([AgentProvider.claude, .codex, .grok], id: \.self) { provider in
+                let selected = vm.resolvedProvider(for: bot) == provider
+                Text(vm.providerChipTitle(provider))
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(selected ? BotsChrome.onPrimary : DS.Palette.textSecondary)
+                    .padding(.horizontal, DS.Space.lg)
+                    .frame(minHeight: 32)
+                    .background(selected ? BotsChrome.primary : DS.Palette.surfaceRaised)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .accessibilityIdentifier(selected ? "bots.home.provider" : "bots.home.route.\(provider.rawValue)")
+            }
+            Spacer(minLength: 0)
+            Button("Studio") { vm.beginEdit(bot) }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .accessibilityIdentifier("bots.home.studio")
+        }
+    }
+
+    private func fleetHomeGoal(_ bot: BotDefinition) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            Label(BotsChrome.Label.currentGoal, systemImage: "target")
+                .font(DS.Font.bodyStrong)
+                .foregroundColor(DS.Palette.text)
+            Text(vm.currentGoal(for: bot))
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.text)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .dsPanel(padding: DS.Space.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("bots.home.goal")
     }
 
     private func fleetHomeActivity(_ bot: BotDefinition) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeaderG("Latest activity")
-            Text(vm.rosterPreview(for: bot))
-                .font(DS.Font.body)
+            Label(BotsChrome.Label.todaysActivity, systemImage: "waveform.path.ecg")
+                .font(DS.Font.bodyStrong)
                 .foregroundColor(DS.Palette.text)
-            if let stamp = vm.rosterTimestamp(for: bot) {
-                Text(stamp, style: .relative)
-                    .font(DS.Font.caption)
+            let rows = vm.activityRows(for: bot)
+            if rows.isEmpty {
+                Text("No activity yet")
+                    .font(DS.Font.body)
                     .foregroundColor(DS.Palette.textTertiary)
+            } else {
+                ForEach(rows) { row in
+                    HStack(alignment: .firstTextBaseline, spacing: DS.Space.md) {
+                        Circle()
+                            .fill(BotsChrome.primary)
+                            .frame(width: 6, height: 6)
+                        Text(row.text)
+                            .font(DS.Font.body)
+                            .foregroundColor(DS.Palette.text)
+                            .lineLimit(2)
+                        Spacer(minLength: DS.Space.sm)
+                        Text(row.createdAt, style: .time)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
+                }
             }
         }
         .dsPanel(padding: DS.Space.lg)
@@ -1630,7 +1747,9 @@ public struct BotsRootView: View {
     private func fleetHomeRoutine(_ bot: BotDefinition) -> some View {
         let routine = vm.routines.first(where: { $0.activation.isEnabled })
         return VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeaderG("Latest routine")
+            Label(BotsChrome.Label.nextRoutine, systemImage: "calendar")
+                .font(DS.Font.bodyStrong)
+                .foregroundColor(DS.Palette.text)
             if let routine {
                 Text(routine.definition.name)
                     .font(DS.Font.bodyStrong)
@@ -1702,30 +1821,39 @@ public struct BotsRootView: View {
     private func fleetHomeDesktop(_ bot: BotDefinition) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             HStack(spacing: DS.Space.sm) {
-                DSSectionHeaderG("Desktop")
+                Label(BotsChrome.Label.desktop, systemImage: "desktopcomputer")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
                 Spacer(minLength: 0)
                 DSPill("Logical space", tone: .neutral)
             }
-            VStack(spacing: DS.Space.md) {
-                Image(systemName: "desktopcomputer")
-                    .font(.system(size: 28, weight: .regular))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityHidden(true)
-                Text("Logical execution space")
-                    .font(DS.Font.bodyStrong)
-                    .foregroundColor(DS.Palette.text)
-                    .multilineTextAlignment(.center)
-                Text(vm.desktopHonestyLabel)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.warning)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("bots.home.desktop.honesty")
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color(hex: 0x2A1848), Color(hex: 0x7B5CFF).opacity(0.55), Color(hex: 0x171D24)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                VStack(spacing: DS.Space.md) {
+                    Image(systemName: "desktopcomputer")
+                        .font(.system(size: 28, weight: .regular))
+                        .foregroundColor(.white.opacity(0.9))
+                        .accessibilityHidden(true)
+                    Text("Logical execution space")
+                        .font(DS.Font.bodyStrong)
+                        .foregroundColor(.white)
+                    Text(vm.desktopHonestyLabel)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.warning)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("bots.home.desktop.honesty")
+                }
+                .padding(DS.Space.lg)
             }
-            .frame(maxWidth: .infinity, minHeight: 168)
-            .padding(DS.Space.lg)
-            .background(DS.Palette.surfaceRaised)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .frame(maxWidth: .infinity, minHeight: 188)
             if let model = vm.selectedRevision?.model, !model.isEmpty {
                 Text(model)
                     .font(DS.Font.caption)
@@ -1916,6 +2044,8 @@ public struct BotsRootView: View {
                     skillsTab
                 case .routines:
                     routinesTab
+                case .security:
+                    studioSecurity
                 case .desktop:
                     ScrollView {
                         studioDesktop
@@ -1959,10 +2089,10 @@ public struct BotsRootView: View {
                     .accessibilityIdentifier("bots.studio.role")
             }
             Spacer(minLength: DS.Space.lg)
-            Button("Save Bot") {
+            Button(BotsChrome.Label.saveBot) {
                 do { _ = try vm.saveStudio() } catch { vm.errorMessage = String(describing: error) }
             }
-            .buttonStyle(DSPrimaryButtonStyle())
+            .buttonStyle(BotsPrimaryButtonStyle())
             .disabled(!vm.isControlPlaneActive)
             .accessibilityIdentifier("bots.studio.save")
         }
@@ -1972,7 +2102,7 @@ public struct BotsRootView: View {
     }
 
     private var studioTabs: some View {
-        HStack(spacing: DS.Space.md) {
+        HStack(spacing: DS.Space.xl) {
             ForEach(BotStudioTab.allCases) { tab in
                 if tab == .memory && !vm.isMemoryActive {
                     EmptyView()
@@ -1981,13 +2111,15 @@ public struct BotsRootView: View {
                     Button {
                         vm.studioTab = tab
                     } label: {
-                        Text(tab.title)
-                            .font(DS.Font.body.weight(selected ? .semibold : .regular))
-                            .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
-                            .padding(.horizontal, DS.Space.lg)
-                            .padding(.vertical, DS.Space.sm)
-                            .background(selected ? DS.Palette.accent : DS.Palette.surfaceRaised)
-                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        VStack(spacing: 6) {
+                            Text(tab.title)
+                                .font(DS.Font.body.weight(selected ? .semibold : .regular))
+                                .foregroundColor(selected ? BotsChrome.primary : DS.Palette.textSecondary)
+                            Rectangle()
+                                .fill(selected ? BotsChrome.primary : Color.clear)
+                                .frame(height: 2)
+                        }
+                        .frame(minHeight: BotsChrome.hitTarget, alignment: .bottom)
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(selected ? .isSelected : [])
@@ -1997,7 +2129,9 @@ public struct BotsRootView: View {
             Spacer()
         }
         .padding(.horizontal, DS.Space.xxl)
-        .padding(.vertical, DS.Space.lg)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(DS.Palette.line).frame(height: 1)
+        }
     }
 
     private var studioProfile: some View {
@@ -2082,7 +2216,7 @@ public struct BotsRootView: View {
 
     private var studioSoul: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
-            DSSectionHeaderG("Soul / instructions")
+            DSSectionHeaderG(BotsChrome.Label.instructions)
             studioMultiline(text: $vm.studioDraft.soul, minHeight: 140)
             Text("Published with the Bot. This is not an Agent thread.")
                 .font(DS.Font.caption)
@@ -2163,6 +2297,25 @@ public struct BotsRootView: View {
         .buttonStyle(.plain)
         .disabled(!enabled)
         .accessibilityIdentifier(identifier)
+    }
+
+    private var studioSecurity: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: DS.Space.lg) {
+                DSSectionHeaderG(BotsChrome.Label.security)
+                Text("Approval policy and effect grants stay off until P1b. This tab is readable only.")
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textSecondary)
+                Text("No Allow once / Deny actions are live. Desktop isolation is not a security boundary.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .dsPanel(padding: DS.Space.lg)
+            .padding(DS.Space.xxl)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityIdentifier("bots.studio.security")
     }
 
     private var studioNotifications: some View {
@@ -2299,9 +2452,54 @@ public struct BotsRootView: View {
                 .fill(DS.Palette.line)
                 .frame(width: 1)
                 .accessibilityHidden(true)
-            deskInspector(bot)
-                .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
+            VStack(spacing: 0) {
+                deskDesktopPane(bot)
+                deskInspector(bot)
+            }
+            .frame(minWidth: BotsChrome.desktopPaneWidth, idealWidth: 360, maxWidth: 420)
         }
+    }
+
+    private func deskDesktopPane(_ bot: BotDefinition) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack {
+                Label("\(bot.name) Desktop", systemImage: "desktopcomputer")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                Spacer(minLength: 0)
+                DSPill("Logical space", tone: .neutral)
+            }
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color(hex: 0x2A1848), Color(hex: 0x7B5CFF).opacity(0.45), Color(hex: 0x171D24)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                VStack(spacing: DS.Space.sm) {
+                    Image(systemName: "macwindow")
+                        .font(.system(size: 26, weight: .regular))
+                        .foregroundColor(.white.opacity(0.92))
+                    Text("Logical execution space")
+                        .font(DS.Font.bodyStrong)
+                        .foregroundColor(.white)
+                    Text(vm.desktopHonestyLabel)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.warning)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("bots.desk.desktop.honesty")
+                }
+                .padding(DS.Space.lg)
+            }
+            .frame(maxWidth: .infinity, minHeight: 160)
+        }
+        .padding(DS.Space.lg)
+        .dsBar(edge: .bottom)
+        .accessibilityIdentifier("bots.desk.desktop")
+        .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
     }
 
     private func deskInspector(_ bot: BotDefinition) -> some View {
@@ -2343,8 +2541,6 @@ public struct BotsRootView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-
-            deskDesktopHonesty(bot)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(DS.Palette.surface)
@@ -2435,57 +2631,47 @@ public struct BotsRootView: View {
     }
 
     private func deskTimeline(_ bot: BotDefinition) -> some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
-                if vm.deskTimeline.isEmpty {
-                    Text("Message \(bot.name) to give it a first task.")
-                        .font(DS.Font.body)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.top, DS.Space.xl)
-                }
-                ForEach(vm.deskTimeline) { item in
-                    switch item {
-                    case .message(let message):
-                        deskBubble(message, bot: bot)
-                    case .workLog(let row):
-                        deskWorkLogRow(row)
+        GeometryReader { geo in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: DS.Space.xl) {
+                    if vm.deskTimeline.isEmpty {
+                        Text("Message \(bot.name) to give it a first task.")
+                            .font(DS.Font.body)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, DS.Space.xl)
+                    }
+                    ForEach(vm.deskTimeline) { item in
+                        switch item {
+                        case .message(let message):
+                            deskBubble(message, columnWidth: geo.size.width)
+                        case .workLog(let row):
+                            deskWorkLogRow(row)
+                        }
                     }
                 }
+                .padding(.horizontal, DS.Space.xxl)
+                .padding(.vertical, DS.Space.xl)
             }
-            .padding(.horizontal, DS.Space.xxl)
-            .padding(.vertical, DS.Space.xl)
         }
         .accessibilityIdentifier("bots.desk.timeline")
     }
 
-    private func deskBubble(_ message: BotDeskMessage, bot: BotDefinition) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.md) {
-            Text(message.createdAt, style: .time)
-                .font(DS.Font.caption2)
-                .foregroundColor(DS.Palette.textTertiary)
-                .frame(width: 56, alignment: .trailing)
-                .accessibilityIdentifier("bots.desk.timestamp")
-            VStack(alignment: .leading, spacing: DS.Space.xs) {
-                Text(message.role == .user ? "You" : bot.name)
-                    .font(DS.Font.caption.weight(.semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityIdentifier(
-                        message.role == .user ? "bots.desk.role.user" : "bots.desk.role.assistant"
-                    )
-                    .accessibilityLabel(message.role == .user ? "user" : "assistant")
-                Text(message.text)
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                    .textSelection(.enabled)
-                    .padding(DS.Space.lg)
-                    .frame(maxWidth: 720, alignment: .leading)
-                    .background(message.role == .user ? DS.Palette.surfaceRaised : DS.Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                    )
+    private func deskBubble(_ message: BotDeskMessage, columnWidth: CGFloat) -> some View {
+        Group {
+            if message.role == .user {
+                AgentChatUserBubble(
+                    text: message.text,
+                    createdAt: message.createdAt,
+                    columnWidth: columnWidth,
+                    accessibilityIdentifier: "agent.userMessageBubble",
+                    roleIdentifier: "bots.desk.role.user"
+                )
+            } else {
+                AgentChatAssistantReply(
+                    text: message.text,
+                    roleIdentifier: "bots.desk.role.assistant"
+                )
             }
         }
     }
@@ -2530,56 +2716,17 @@ public struct BotsRootView: View {
         }
     }
 
-    private func deskDesktopHonesty(_ bot: BotDefinition) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            HStack(spacing: DS.Space.sm) {
-                Text("Desktop")
-                    .font(DS.Font.caption.weight(.semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                Spacer(minLength: 0)
-                DSPill("Logical space", tone: .neutral)
-            }
-            Text("Logical execution space")
-                .font(DS.Font.caption.weight(.medium))
-                .foregroundColor(DS.Palette.text)
-            Text(vm.desktopHonestyLabel)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.warning)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityIdentifier("bots.desk.desktop.honesty")
-        }
-        .padding(DS.Space.lg)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DS.Palette.surfaceRaised)
-        .accessibilityIdentifier("bots.desk.desktop")
-        .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
-    }
-
     private func composerBar(_ bot: BotDefinition) -> some View {
-        HStack(alignment: .bottom, spacing: DS.Space.md) {
-            TextField("Message \(bot.name)…", text: $vm.composerText, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...6)
-                .font(DS.Font.body)
-                .foregroundColor(DS.Palette.text)
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.vertical, DS.Space.md)
-                .background(DS.Palette.surfaceRaised)
-                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                )
-                .accessibilityIdentifier("bots.desk.composer")
-                .onSubmit { vm.send() }
-            Button("Send") { vm.send() }
-                .buttonStyle(DSPrimaryButtonStyle())
-                .disabled(vm.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .accessibilityIdentifier("bots.desk.send")
-        }
-        .padding(.horizontal, DS.Space.xxl)
-        .padding(.vertical, DS.Space.lg)
-        .dsBar(edge: .top)
+        AgentChatComposerBar(
+            text: $vm.composerText,
+            placeholder: AgentChatTranscriptChrome.composerPlaceholder(
+                providerDisplayName: vm.providerLabel(for: bot) ?? bot.name
+            ),
+            sendEnabled: !vm.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            onSend: { vm.send() },
+            composerIdentifier: "bots.desk.composer",
+            sendIdentifier: "bots.desk.send"
+        )
     }
 
     // MARK: Memory

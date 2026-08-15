@@ -10654,11 +10654,12 @@ public struct AgentAppView: View {
 
     /// Max width for user prompt bubbles. Short text hugs content; long text wraps here.
     /// Kept well under the old 600pt hard fill so chat bubbles stay compact.
-    static let userMessageBubbleMaxWidth: CGFloat = 420
+    /// Shared with Bots Desk via `AgentChatTranscriptChrome`.
+    static let userMessageBubbleMaxWidth: CGFloat = AgentChatTranscriptChrome.userMessageBubbleMaxWidth
     /// Leading spacer so user bubbles stay right-aligned with a readable gutter.
-    static let userMessageBubbleLeadingGutter: CGFloat = 48
+    static let userMessageBubbleLeadingGutter: CGFloat = AgentChatTranscriptChrome.userMessageBubbleLeadingGutter
     /// Floor so a very narrow agent column still shows a usable bubble.
-    static let userMessageBubbleMinWidth: CGFloat = 160
+    static let userMessageBubbleMinWidth: CGFloat = AgentChatTranscriptChrome.userMessageBubbleMinWidth
 
     /// Flexible bubble cap for the current transcript column.
     /// Long prompts wrap at this width; short prompts still hug via `fixedSize`.
@@ -10666,9 +10667,7 @@ public struct AgentAppView: View {
     /// minus the leading gutter — prevents the bubble + copy/timestamp meta from
     /// painting over the timeline edge and adjacent chrome.
     static func userMessageBubbleWidthCap(columnWidth: CGFloat) -> CGFloat {
-        let usable = columnWidth - userMessageBubbleLeadingGutter
-        guard usable.isFinite, usable > 0 else { return userMessageBubbleMinWidth }
-        return min(userMessageBubbleMaxWidth, max(userMessageBubbleMinWidth, usable))
+        AgentChatTranscriptChrome.userMessageBubbleWidthCap(columnWidth: columnWidth)
     }
     nonisolated static let runningTranscriptContextSlack: TimeInterval = 2
     // PERF-MAC_AGENT-023: idle/completed threads render their transcript in an
@@ -13698,25 +13697,13 @@ public struct AgentAppView: View {
     }
 
     // UX-MAC_AGENT-017: relative ("2m ago") + absolute (hover) timestamps.
-    private static let relativeTimestampFormatter: RelativeDateTimeFormatter = {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .abbreviated
-        return f
-    }()
-    private static let absoluteTimestampFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateStyle = .medium
-        f.timeStyle = .short
-        return f
-    }()
-
+    // Shared with Bots Desk so both transcripts format time the same way.
     static func relativeTimestamp(_ date: Date, now: Date = Date()) -> String {
-        if now.timeIntervalSince(date) < 60 { return "just now" }
-        return relativeTimestampFormatter.localizedString(for: date, relativeTo: now)
+        AgentChatTranscriptChrome.relativeTimestamp(date, now: now)
     }
 
     static func absoluteTimestamp(_ date: Date) -> String {
-        absoluteTimestampFormatter.string(from: date)
+        AgentChatTranscriptChrome.absoluteTimestamp(date)
     }
 
     // UX-MAC_AGENT-018: composer chips classify by extension for the icon/thumbnail.
