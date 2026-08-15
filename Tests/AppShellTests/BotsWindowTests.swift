@@ -250,7 +250,11 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertTrue(source.contains("bots.home.desktop.honesty"))
         XCTAssertTrue(source.contains("BotRoutineCopy.testRunHonestyCaption"))
-        XCTAssertTrue(source.contains("app-closed off"))
+        XCTAssertTrue(source.contains("no app-closed runs"))
+        XCTAssertFalse(
+            source.contains("isAutonomyActive ? \"active\""),
+            "autonomy-on must not imply app-closed execution"
+        )
     }
 
     func test_attentionItemAppearsAfterSendThatNeedsTheUser() throws {

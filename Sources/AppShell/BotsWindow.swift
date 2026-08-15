@@ -1424,7 +1424,7 @@ public struct BotsRootView: View {
             fleetStatCard(
                 title: "Routines",
                 value: "\(vm.enabledRoutineCount)",
-                detail: vm.isAutonomyActive ? "active" : "app-closed off",
+                detail: "no app-closed runs",
                 identifier: "bots.home.routines"
             )
             fleetStatCard(
