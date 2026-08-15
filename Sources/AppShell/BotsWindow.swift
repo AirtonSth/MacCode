@@ -347,7 +347,6 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var isMemoryActive = true
     @Published public private(set) var isAutonomyActive = false
     @Published public private(set) var isDesktopVMActive = false
-    @Published public private(set) var isDesktopRemoteActive = false
     @Published public private(set) var lastSendStartedProviderRun = false
     @Published public var pendingDeleteID: BotID?
     public var onLeaveBots: (() -> Void)?
@@ -1173,7 +1172,6 @@ public final class BotsViewModel: ObservableObject {
         isMemoryActive = settings.isBotMemoryActive
         isAutonomyActive = settings.isBotAutonomyActive
         isDesktopVMActive = settings.isBotDesktopVMActive
-        isDesktopRemoteActive = settings.isBotDesktopRemoteActive
     }
 
     private func reloadFleet() {
@@ -3158,13 +3156,6 @@ public struct BotsRootView: View {
                 enabled: true,
                 status: "Guest not running",
                 identifier: "bots.studio.desktop.vm"
-            )
-            desktopOption(
-                kind: .managedRemoteMac,
-                title: "Managed remote Mac Desktop",
-                enabled: vm.isDesktopRemoteActive,
-                status: vm.isDesktopRemoteActive ? nil : "Not shipped",
-                identifier: "bots.studio.desktop.remote"
             )
             Text(vm.desktopHonestyLabel)
                 .font(DS.Font.caption)

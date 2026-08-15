@@ -53,7 +53,6 @@ public struct AppSettingsKeys {
         "botsEffectsEnabled",
         "botsAutonomyEnabled",
         "botsDesktopVMEnabled",
-        "botsDesktopRemoteEnabled",
         "botsChannelsEnabled",
     ]
 }
@@ -1791,18 +1790,6 @@ public struct SettingsView: View {
                 .accessibilityIdentifier("settings.bots.desktopVM.toggle")
             }
             Text("Select Dedicated local VM in Studio to persist the kind. A guest OS is not running yet; this toggle does not start one.")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-            settingRow("Managed remote Mac Desktop") {
-                Toggle("", isOn: Binding(
-                    get: { vm.appSettings.botsDesktopRemoteEnabled },
-                    set: { vm.setBotsDesktopRemoteEnabled($0) }
-                ))
-                .labelsHidden()
-                .disabled(!vm.appSettings.botsControlPlaneEnabled)
-                .accessibilityIdentifier("settings.bots.desktopRemote.toggle")
-            }
-            Text("Not shipped. A managed remote Mac is not available while this flag is off.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
             settingRow("Channels") {

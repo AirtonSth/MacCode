@@ -7,11 +7,11 @@ Product intent this loop: ship remaining P1a-honest work **including Dedicated l
 
 ## Open
 
-- [ ] hide-remote-mac Managed remote Mac Desktop is still advertised — evidence: Studio Profile rail + Studio Desktop tab show **Managed remote Mac Desktop · Not shipped**; Settings has a “Managed remote Mac Desktop” toggle; `BotDesktopKind.managedRemoteMac` honesty/copy and UI enums expose it. Product intent: remove it from Studio/options/copy/enums exposed in UI. Do not advertise it. — seen: 2026-08-15
-
 - [ ] dedicated-local-vm-runtime Leftover after the select/persist slice: a real dedicated guest (Virtualization.framework or equivalent), not a fake screenshot of a VM. Start/stop, persist the VM identity with the Bot, honest running/stopped copy. No isolated-network / takeover / app-closed claims until those actually work. — seen: 2026-08-15
 
 ## Done
+
+- [x] hide-remote-mac Managed remote Mac is no longer advertised — Studio Profile/Desktop offer only Logical execution space and Dedicated local VM; Settings has no remote-Mac toggle; leftover drafts fall back to logical. Persist enum remains decode-only. — seen: 2026-08-15 — done: this fire
 
 - [x] dedicated-local-vm Dedicated local VM Desktop is a selectable, persistable kind — New Agent (@new-agent-2) Studio Desktop/Profile can select it; revision keeps `dedicatedLocalVM`; Fleet/Desk show “Dedicated local VM” + “Guest is not running yet. Work still uses this Mac account; not isolated.” No Take over / Isolated network / “Active now in macOS VM”. Guest runtime remains open as dedicated-local-vm-runtime. — seen: 2026-08-15 — done: 4eea0030
 

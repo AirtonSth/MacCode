@@ -110,12 +110,20 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
         }
     }
 
+    /// Kinds Studio may offer. Managed remote Mac is persist-only and must not appear in UI.
+    public static let advertisedKinds: [BotDesktopKind] = [
+        .logicalExecutionSpace,
+        .dedicatedLocalVM,
+    ]
+
+    public var isAdvertised: Bool { Self.advertisedKinds.contains(self) }
+
     public func isSelectable(flags: BotControlPlaneFlags) -> Bool {
         switch self {
         case .logicalExecutionSpace, .dedicatedLocalVM:
             return flags.isBotControlPlaneActive
         case .managedRemoteMac:
-            return flags.isBotDesktopRemoteActive
+            return false
         }
     }
 }

@@ -825,8 +825,13 @@ final class BotsWindowTests: XCTestCase {
 
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("desktopHonestyLabel"))
-        XCTAssertTrue(source.contains("Not shipped"))
+        XCTAssertTrue(source.contains("not shipped in P1a"))
         XCTAssertTrue(source.contains("Guest not running"))
+        XCTAssertFalse(
+            source.contains("Managed remote Mac Desktop"),
+            "Studio must not advertise Managed remote Mac"
+        )
+        XCTAssertFalse(source.contains("bots.studio.desktop.remote"))
         XCTAssertFalse(source.contains("Isolated / Dedicated VM"))
         XCTAssertFalse(source.contains("Isolated network"))
         XCTAssertFalse(source.contains("Take over"))
@@ -2061,6 +2066,24 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.studioDraft.desktopKind, .dedicatedLocalVM)
     }
 
+    func test_studioDoesNotPersistManagedRemoteMac_becauseItIsNotAdvertised() throws {
+        // WHY: Product must not advertise Managed remote Mac. A leftover draft
+        // kind must fall back to logical space instead of publishing a hidden mode.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        vm.studioDraft.desktopKind = .managedRemoteMac
+        XCTAssertEqual(vm.displayedDesktopKind, .logicalExecutionSpace)
+
+        let saved = try vm.saveStudio()
+        let revision = try XCTUnwrap(
+            saved.currentRevisionID.flatMap { try context.botStore.getRevision(id: $0) }
+        )
+        XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
+        XCTAssertEqual(vm.displayedDesktopKind, .logicalExecutionSpace)
+    }
+
     func test_botsOpensInMainContent_andSidebarSitsUnderScheduleTasks() throws {
         let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
         let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
@@ -2205,6 +2228,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(bots.contains("Take over"))
         XCTAssertFalse(bots.contains("Dedicated macOS VM"))
         XCTAssertFalse(bots.contains("Active now in macOS VM"))
+        XCTAssertFalse(bots.contains("Managed remote Mac Desktop"))
+        let settings = try String(contentsOf: sourceURL("Sources/AppShell/SettingsWindow.swift"), encoding: .utf8)
+        XCTAssertFalse(settings.contains("Managed remote Mac Desktop"))
+        XCTAssertFalse(settings.contains("settings.bots.desktopRemote.toggle"))
         XCTAssertFalse(main.contains("SurfaceType.bot"))
         XCTAssertFalse(bots.contains("SurfaceType.bot"))
 

@@ -112,6 +112,14 @@ final class BotTypesTests: XCTestCase {
                 flags: BotControlPlaneFlags(botsControlPlaneEnabled: true, botsDesktopRemoteEnabled: false)
             )
         )
+        XCTAssertFalse(
+            BotDesktopKind.managedRemoteMac.isSelectable(
+                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true, botsDesktopRemoteEnabled: true)
+            ),
+            "Managed remote Mac must not be selectable even if a leftover persist flag is on"
+        )
+        XCTAssertEqual(BotDesktopKind.advertisedKinds, [.logicalExecutionSpace, .dedicatedLocalVM])
+        XCTAssertFalse(BotDesktopKind.managedRemoteMac.isAdvertised)
     }
 
     func test_controlPlaneFlags_failClosed_becauseLaterPhasesMustNotRunWithoutTheShippedSlice() {
