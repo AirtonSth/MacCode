@@ -8,7 +8,7 @@ import SwiftUI
 
 // MARK: - Drafts & rows
 
-public struct BotQueuedFollowUp: Equatable, Identifiable {
+public struct BotQueuedFollowUp: Equatable, Identifiable, Codable {
     public let id: UUID
     public var text: String
     public var attachments: [AgentAttachment]
@@ -285,6 +285,7 @@ public final class BotsViewModel: ObservableObject {
         self.router = router
         self.botStore = context.botStore
         self.settingsStore = SettingsStore(db: context.db)
+        restoreQueuedFollowUpsIfNeeded()
         restoreInspectorTabIfNeeded()
         restoreStudioTabIfNeeded()
         reload()
@@ -678,6 +679,9 @@ public final class BotsViewModel: ObservableObject {
                 screen = .fleet
                 persistSelection()
             }
+            queuedFollowUpsByBot[id] = nil
+            persistQueuedFollowUps()
+            syncQueuedFollowUps()
             reloadFleet()
             reloadAttention()
         } catch {
@@ -744,6 +748,10 @@ public final class BotsViewModel: ObservableObject {
     public func removeQueuedFollowUp(_ item: BotQueuedFollowUp) {
         guard let botID = selectedBotID else { return }
         queuedFollowUpsByBot[botID]?.removeAll { $0.id == item.id }
+        if queuedFollowUpsByBot[botID]?.isEmpty == true {
+            queuedFollowUpsByBot[botID] = nil
+        }
+        persistQueuedFollowUps()
         syncQueuedFollowUps()
     }
 
@@ -758,11 +766,12 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    public func send(_ text: String? = nil) {
+    @discardableResult
+    public func send(_ text: String? = nil) -> Bool {
         let attached = attachments
         let message = (text ?? composerText).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard AgentChatTranscriptChrome.admitsSend(text: message, attachmentCount: attached.count) else { return }
-        guard let bot = selectedBot else { return }
+        guard AgentChatTranscriptChrome.admitsSend(text: message, attachmentCount: attached.count) else { return false }
+        guard let bot = selectedBot else { return false }
         composerText = ""
         attachments = []
         lastSendStartedProviderRun = false
@@ -771,7 +780,7 @@ public final class BotsViewModel: ObservableObject {
                 BotQueuedFollowUp(text: message, attachments: attached),
                 botID: bot.id
             )
-            return
+            return true
         }
         do {
             let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attached)
@@ -810,8 +819,10 @@ public final class BotsViewModel: ObservableObject {
             } else {
                 recordNeedsAttention(bot: bot, conversation: conversation, userText: message)
             }
+            return true
         } catch {
             errorMessage = String(describing: error)
+            return false
         }
     }
 
@@ -1050,6 +1061,7 @@ public final class BotsViewModel: ObservableObject {
             lastPreviewByBot = previews
             lastUpdatedByBot = updated
             rebuildAttentionStates()
+            pruneQueuedFollowUpsToFleet()
         } catch {
             errorMessage = String(describing: error)
         }
@@ -1139,6 +1151,7 @@ public final class BotsViewModel: ObservableObject {
     private static let inspectorTabDefaultsKey = "bots.inspectorTab"
     private static let screenDefaultsKey = "bots.screen"
     private static let studioTabDefaultsKey = "bots.studioTab"
+    private static let queuedFollowUpsDefaultsKey = "bots.queuedFollowUps"
 
     private func persistSelection() {
         UserDefaults.standard.set(selectedBotID?.value.uuidString.lowercased(), forKey: Self.selectedBotDefaultsKey)
@@ -1154,6 +1167,46 @@ public final class BotsViewModel: ObservableObject {
 
     private func persistStudioTab() {
         UserDefaults.standard.set(studioTab.rawValue, forKey: Self.studioTabDefaultsKey)
+    }
+
+    private func persistQueuedFollowUps() {
+        let payload = Dictionary(uniqueKeysWithValues: queuedFollowUpsByBot.map {
+            ($0.key.value.uuidString.lowercased(), $0.value)
+        })
+        if payload.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.queuedFollowUpsDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.queuedFollowUpsDefaultsKey)
+        }
+    }
+
+    private func restoreQueuedFollowUpsIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.queuedFollowUpsDefaultsKey),
+              let payload = try? JSONDecoder().decode([String: [BotQueuedFollowUp]].self, from: data)
+        else { return }
+        var restored: [BotID: [BotQueuedFollowUp]] = [:]
+        for (raw, items) in payload {
+            guard let uuid = UUID(uuidString: raw) else { continue }
+            let kept = items.filter {
+                !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !$0.attachments.isEmpty
+            }
+            if !kept.isEmpty {
+                restored[BotID(uuid)] = kept
+            }
+        }
+        queuedFollowUpsByBot = restored
+    }
+
+    private func pruneQueuedFollowUpsToFleet() {
+        let live = Set(bots.map(\.id))
+        let next = queuedFollowUpsByBot.filter { live.contains($0.key) }
+        guard next.count != queuedFollowUpsByBot.count else { return }
+        queuedFollowUpsByBot = next
+        persistQueuedFollowUps()
+        syncQueuedFollowUps()
     }
 
     private func restoreInspectorTabIfNeeded() {
@@ -1563,6 +1616,7 @@ public final class BotsViewModel: ObservableObject {
 
     private func enqueueFollowUp(_ item: BotQueuedFollowUp, botID: BotID) {
         queuedFollowUpsByBot[botID, default: []].append(item)
+        persistQueuedFollowUps()
         syncQueuedFollowUps()
     }
 
@@ -1573,16 +1627,19 @@ public final class BotsViewModel: ObservableObject {
     private func drainQueuedFollowUp() {
         guard let bot = selectedBot else { return }
         guard !deskRunIsLive else { return }
-        guard var items = queuedFollowUpsByBot[bot.id], !items.isEmpty else {
+        guard let next = queuedFollowUpsByBot[bot.id]?.first else {
             syncQueuedFollowUps()
             return
         }
-        let next = items.removeFirst()
-        queuedFollowUpsByBot[bot.id] = items
-        syncQueuedFollowUps()
         composerText = next.text
         attachments = next.attachments
-        send()
+        guard send() else { return }
+        queuedFollowUpsByBot[bot.id]?.removeAll { $0.id == next.id }
+        if queuedFollowUpsByBot[bot.id]?.isEmpty == true {
+            queuedFollowUpsByBot[bot.id] = nil
+        }
+        persistQueuedFollowUps()
+        syncQueuedFollowUps()
     }
 
     private func applyFollowThrough(

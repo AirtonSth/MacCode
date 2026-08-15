@@ -14,6 +14,7 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.selectedBotID")
         UserDefaults.standard.removeObject(forKey: "bots.screen")
         UserDefaults.standard.removeObject(forKey: "bots.studioTab")
+        UserDefaults.standard.removeObject(forKey: "bots.queuedFollowUps")
     }
 
     override func tearDown() {
@@ -1161,6 +1162,68 @@ final class BotsWindowTests: XCTestCase {
         vm.reload()
         XCTAssertTrue(vm.queuedFollowUps.isEmpty, "reload must not resurrect a cancelled follow-up")
         XCTAssertFalse(vm.deskMessages.contains { $0.text == "keep this off the wire" })
+    }
+
+    func test_queuedFollowUpSurvivesRelaunch_becauseTypedWordsMustNotVanish() throws {
+        // WHY: a follow-up typed during a live turn is user work. Closing
+        // RemoteCode used to drop the in-memory queue.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.deskRunIsLive)
+        vm.composerText = "keep after relaunch"
+        vm.send()
+        XCTAssertEqual(vm.queuedFollowUps.map(\.text), ["keep after relaunch"])
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(bot)
+        XCTAssertTrue(reopened.deskRunIsLive, "the run is still live after relaunch")
+        XCTAssertEqual(reopened.queuedFollowUps.map(\.text), ["keep after relaunch"])
+        XCTAssertFalse(
+            reopened.deskMessages.contains { $0.text == "keep after relaunch" },
+            "relaunch must restore the queue, not send it onto a still-live turn"
+        )
+    }
+
+    func test_deletedBotDropsItsQueuedFollowUp_becauseTheTeammateIsGone() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(piper)
+        vm.composerText = "orphan this"
+        vm.send()
+        vm.delete(id: piper.id)
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(quinn)
+        XCTAssertTrue(reopened.queuedFollowUps.isEmpty)
+        XCTAssertFalse(reopened.deskMessages.contains { $0.text == "orphan this" })
     }
 
     func test_deskTimelineHidesPersistedAssistantThatDuplicatesTheTurn_becauseRepliesMustNotDouble() {
