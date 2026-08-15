@@ -249,6 +249,7 @@ final class BotsWindowTests: XCTestCase {
             "P1a has no dedicated Desktop; the concept screenshot is not the contract"
         )
         XCTAssertTrue(source.contains("bots.home.desktop.honesty"))
+        XCTAssertTrue(source.contains("bots.desk.desktop.honesty"))
         XCTAssertTrue(source.contains("BotRoutineCopy.testRunHonestyCaption"))
         XCTAssertTrue(source.contains("no app-closed runs"))
         XCTAssertFalse(
@@ -372,6 +373,187 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(vm.attentionState(for: piper), .unreadActivity)
         XCTAssertEqual(vm.attentionState(for: quinn), .none)
+    }
+
+    func test_deskIdentityExposesJobProviderModelAndSupervised() throws {
+        // WHY: Desk is the live teammate, not a generic chat. The header must
+        // show who is talking, their job, the real route, and supervised mode.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        XCTAssertEqual(try XCTUnwrap(vm.selectedBot).name, "Piper")
+        XCTAssertEqual(try XCTUnwrap(vm.selectedBot).handle, "piper")
+        XCTAssertEqual(try XCTUnwrap(vm.selectedBot).title, "Scout")
+        XCTAssertEqual(vm.providerLabel(for: bot), "Claude")
+        XCTAssertEqual(vm.modelLabel(for: bot), "opus")
+        XCTAssertEqual(vm.permissionLabel(for: bot), "Supervised")
+        XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+    }
+
+    func test_deskTimelineUsesUserAssistantLabelsAndTimestamps() {
+        // WHY: Grok Desk is a conversation log. A bubble without a time or
+        // speaker turns the teammate into a generic agent transcript.
+        let userAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let assistantAt = Date(timeIntervalSince1970: 1_700_000_030)
+        let items = BotsDeskFollowThrough.timeline(
+            messages: [
+                BotDeskMessage(role: .user, text: "Summarize overnight", createdAt: userAt),
+                BotDeskMessage(role: .assistant, text: "Three failing tests remain.", createdAt: assistantAt),
+            ],
+            workLog: []
+        )
+        XCTAssertEqual(items.count, 2)
+        guard case .message(let user) = items[0] else {
+            return XCTFail("first row must be the user line")
+        }
+        guard case .message(let assistant) = items[1] else {
+            return XCTFail("second row must be the assistant line")
+        }
+        XCTAssertEqual(user.role, .user)
+        XCTAssertEqual(assistant.role, .assistant)
+        XCTAssertEqual(user.createdAt, userAt)
+        XCTAssertEqual(assistant.createdAt, assistantAt)
+    }
+
+    func test_deskWorkLogAppearsOnlyWhenALinkedRunExists() {
+        // WHY: work-log rows are the linked provider turn. Inventing Desktop
+        // clicks or showing a row with no run would fake computer-use.
+        let started = Date(timeIntervalSince1970: 1_700_000_010)
+        let user = BotDeskMessage(
+            role: .user,
+            text: "Summarize overnight",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let assistant = BotDeskMessage(
+            role: .assistant,
+            text: "Three failing tests remain.",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_030)
+        )
+        XCTAssertTrue(
+            BotsDeskFollowThrough.timeline(messages: [user, assistant], workLog: []).allSatisfy {
+                if case .workLog = $0 { return false }
+                return true
+            }
+        )
+        let run = AgentRun(
+            threadId: AgentThreadID(),
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: started
+        )
+        let withRun = BotsDeskFollowThrough.timeline(
+            messages: [user, assistant],
+            workLog: BotsDeskFollowThrough.workLogRows(for: run)
+        )
+        XCTAssertEqual(withRun.count, 3)
+        guard case .workLog(let row) = withRun[1] else {
+            return XCTFail("linked run must insert a work-log between You and the assistant")
+        }
+        XCTAssertEqual(row.title, "Supervised run")
+        XCTAssertEqual(row.detail, "Claude · opus")
+        XCTAssertEqual(row.statusLabel, "Working")
+        XCTAssertEqual(BotsDeskFollowThrough.workLogStatusLabel(for: .completed), "Done")
+        XCTAssertTrue(BotsDeskFollowThrough.workLogRows(for: nil).isEmpty)
+    }
+
+    func test_openDeskRestoresTimelineAndWorkLogFromLinkedRun_becauseReopenMustNotLoseTheTurn() throws {
+        // WHY: closing and reopening RemoteCode must keep the Desk conversation
+        // and the honest work-log for the linked run — not an empty chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        let finishedAt = Date(timeIntervalSince1970: 1_700_000_040)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_010),
+            finishedAt: finishedAt
+        )
+        try context.runRepo.upsert(run)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "You are Piper — Scout.\n\nUser request:\n\nSummarize overnight",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .assistant,
+            content: "Three failing tests remain.",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_030)
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(
+                botID: bot.id,
+                title: "Summarize overnight",
+                linkedAgentThreadID: thread.id
+            )
+        )
+
+        vm.openDesk(bot)
+        XCTAssertEqual(vm.deskMessages.map(\.role), [.user, .assistant])
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+        XCTAssertEqual(vm.deskMessages.last?.text, "Three failing tests remain.")
+        XCTAssertEqual(vm.deskWorkLog.count, 1)
+        XCTAssertEqual(vm.deskWorkLog.first?.statusLabel, "Done")
+        XCTAssertEqual(vm.deskWorkLog.first?.detail, "Claude · opus")
+        XCTAssertEqual(vm.deskWorkLog.first?.runID, run.id)
+        XCTAssertEqual(vm.deskTimeline.count, 3)
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(bot)
+        XCTAssertEqual(reopened.deskMessages.map(\.text), vm.deskMessages.map(\.text))
+        XCTAssertEqual(reopened.deskWorkLog.map(\.runID), [run.id])
+        XCTAssertEqual(reopened.deskWorkLog.first?.statusLabel, "Done")
+
+        let context2 = try AppContext(channel: .debug, appSupportOverride: directory)
+        let vm2 = BotsViewModel(context: context2)
+        let listed = try XCTUnwrap(vm2.fleet.first(where: { $0.id == bot.id }))
+        vm2.openDesk(listed)
+        XCTAssertEqual(vm2.deskMessages.last?.text, "Three failing tests remain.")
+        XCTAssertEqual(vm2.deskWorkLog.first?.statusLabel, "Done")
+        XCTAssertEqual(vm2.permissionLabel(for: listed), "Supervised")
+    }
+
+    func test_followThroughWorkLogStaysOnOwningConversation() throws {
+        // WHY: a finished run on Piper must not paint Quinn's open Desk.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        let thread = AgentThread(title: "From Piper", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            finishedAt: Date()
+        )
+        try context.runRepo.upsert(run)
+        var piperConversation = BotConversation(
+            botID: piper.id,
+            title: "From Piper",
+            linkedAgentThreadID: thread.id
+        )
+        try context.botStore.upsertConversation(piperConversation)
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.deskWorkLog.isEmpty)
+
+        piperConversation.linkedAgentThreadID = thread.id
+        vm.applyFollowThroughForTests(bot: piper, conversation: piperConversation, status: .completed)
+
+        XCTAssertEqual(vm.selectedBotID, quinn.id)
+        XCTAssertTrue(vm.deskWorkLog.isEmpty, "Quinn's Desk must not inherit Piper's work-log")
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.deskWorkLog.first?.runID, run.id)
+        XCTAssertEqual(vm.deskWorkLog.first?.statusLabel, "Done")
     }
 
     func test_visibleDeskMessagesPrefersPersistedAssistantOverWorkingCache() {
@@ -580,6 +762,23 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("Provider routing"))
         XCTAssertTrue(bots.contains("Configuration summary"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.composer\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.timeline\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.workLog\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop.honesty\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.name\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.handle\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.job\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.provider\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.model\")"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.permission\")"))
+        XCTAssertTrue(bots.contains("bots.desk.role.user"))
+        XCTAssertTrue(bots.contains("bots.desk.role.assistant"))
+        XCTAssertTrue(bots.contains("BOT ROSTER"))
+        XCTAssertFalse(bots.contains("Take over"))
+        XCTAssertFalse(bots.contains("Dedicated macOS VM"))
+        XCTAssertFalse(bots.contains("Active now in macOS VM"))
         XCTAssertFalse(main.contains("SurfaceType.bot"))
         XCTAssertFalse(bots.contains("SurfaceType.bot"))
 

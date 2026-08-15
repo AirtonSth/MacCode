@@ -78,6 +78,59 @@ public struct BotDeskMessage: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct BotDeskWorkLogRow: Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let title: String
+    public let detail: String
+    public let statusLabel: String
+    public let createdAt: Date
+    public let runID: AgentRunID
+
+    public init(
+        id: UUID = UUID(),
+        title: String,
+        detail: String,
+        statusLabel: String,
+        createdAt: Date = Date(),
+        runID: AgentRunID
+    ) {
+        self.id = id
+        self.title = title
+        self.detail = detail
+        self.statusLabel = statusLabel
+        self.createdAt = createdAt
+        self.runID = runID
+    }
+}
+
+public enum BotDeskTimelineItem: Identifiable, Equatable, Sendable {
+    case message(BotDeskMessage)
+    case workLog(BotDeskWorkLogRow)
+
+    public var id: UUID {
+        switch self {
+        case .message(let message): return message.id
+        case .workLog(let row): return row.id
+        }
+    }
+
+    public var createdAt: Date {
+        switch self {
+        case .message(let message): return message.createdAt
+        case .workLog(let row): return row.createdAt
+        }
+    }
+
+    var stableOrder: Int {
+        switch self {
+        case .message(let message):
+            return message.role == .user ? 0 : 2
+        case .workLog:
+            return 1
+        }
+    }
+}
+
 public enum BotsScreen: String, Equatable {
     case fleet
     case studio
@@ -147,6 +200,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public var studioDraft = BotStudioDraft()
     @Published public var composerText: String = ""
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
+    @Published public private(set) var deskWorkLog: [BotDeskWorkLogRow] = []
     @Published public private(set) var conversations: [BotConversation] = []
     @Published public private(set) var selectedConversation: BotConversation?
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
@@ -179,6 +233,7 @@ public final class BotsViewModel: ObservableObject {
     private var attentionStateByBot: [BotID: BotAttentionState] = [:]
     private var lastPreviewByBot: [BotID: String] = [:]
     private var lastUpdatedByBot: [BotID: Date] = [:]
+    private var lastLinkedRunIDByBot: [BotID: AgentRunID] = [:]
 
     public init(context: AppContext, router: AppCommandRouter? = nil) {
         self.context = context
@@ -233,6 +288,32 @@ public final class BotsViewModel: ObservableObject {
 
     public func rosterTimestamp(for bot: BotDefinition) -> Date? {
         lastUpdatedByBot[bot.id]
+    }
+
+    public var deskTimeline: [BotDeskTimelineItem] {
+        BotsDeskFollowThrough.timeline(messages: deskMessages, workLog: deskWorkLog)
+    }
+
+    public func modelLabel(for bot: BotDefinition) -> String? {
+        if selectedBotID == bot.id,
+           let model = trimmedNonEmpty(selectedRevision?.model) {
+            return model
+        }
+        if let revisionID = bot.currentRevisionID,
+           let revision = try? botStore.getRevision(id: revisionID) {
+            return trimmedNonEmpty(revision.model)
+        }
+        return nil
+    }
+
+    public func permissionLabel(for bot: BotDefinition) -> String {
+        "Supervised"
+    }
+
+    private func trimmedNonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     public func reload() {
@@ -532,10 +613,12 @@ public final class BotsViewModel: ObservableObject {
                     )
                     if let runId = started {
                         self.lastSendStartedProviderRun = true
+                        self.lastLinkedRunIDByBot[bot.id] = runId
                         self.appendDeskMessage(
                             BotDeskMessage(role: .assistant, text: "Working…"),
                             botID: bot.id
                         )
+                        self.restoreDeskWorkLog(botID: bot.id)
                         await self.followLinkedRun(
                             bot: bot,
                             conversation: conversation,
@@ -818,6 +901,7 @@ public final class BotsViewModel: ObservableObject {
             reloadMemory(botID: id)
             reloadRoutines(botID: id)
             restoreDeskMessages(botID: id)
+            restoreDeskWorkLog(botID: id)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -936,6 +1020,37 @@ public final class BotsViewModel: ObservableObject {
             lastPreviewByBot[botID] = last.text
             lastUpdatedByBot[botID] = last.createdAt
         }
+    }
+
+    private func restoreDeskWorkLog(botID: BotID, preferredRun: AgentRun? = nil) {
+        let conversation = conversationForBot(botID)
+        guard let threadID = conversation?.linkedAgentThreadID else {
+            if selectedBotID == botID { deskWorkLog = [] }
+            return
+        }
+        let run: AgentRun?
+        if let preferredRun, preferredRun.threadId == threadID {
+            run = preferredRun
+        } else {
+            run = linkedRun(for: threadID, botID: botID)
+        }
+        let rows = BotsDeskFollowThrough.workLogRows(for: run)
+        if selectedBotID == botID {
+            deskWorkLog = rows
+        }
+    }
+
+    private func linkedRun(for threadID: AgentThreadID, botID: BotID) -> AgentRun? {
+        if let active = try? context.runRepo.latestActive(for: threadID) {
+            return active
+        }
+        if let runID = lastLinkedRunIDByBot[botID],
+           let stored = try? context.runRepo.get(id: runID),
+           stored.threadId == threadID {
+            return stored
+        }
+        return (try? context.runRepo.listRecentFinished(limit: 80))?
+            .first(where: { $0.threadId == threadID })
     }
 
     private func appendDeskMessage(_ message: BotDeskMessage, botID: BotID) {
@@ -1094,6 +1209,10 @@ public final class BotsViewModel: ObservableObject {
             }
         }
         restoreDeskMessages(botID: bot.id)
+        if let run {
+            lastLinkedRunIDByBot[bot.id] = run.id
+        }
+        restoreDeskWorkLog(botID: bot.id, preferredRun: run)
         let status = run?.status ?? .interrupted
         let viewingDesk = isViewing(bot.id)
         next.attentionState = BotsDeskFollowThrough.conversationState(for: status, viewingDesk: viewingDesk)
@@ -1242,9 +1361,10 @@ public struct BotsRootView: View {
     private var rosterRail: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: DS.Space.sm) {
-                Text("Teammates")
-                    .font(DS.Font.bodyStrong)
-                    .foregroundColor(DS.Palette.text)
+                Text("BOT ROSTER")
+                    .font(DS.Font.caption2.weight(.semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .tracking(1.1)
                 Spacer(minLength: 0)
                 Button(action: vm.openAttention) {
                     Image(systemName: vm.openAttentionCount == 0 ? "bell" : "bell.badge")
@@ -2091,6 +2211,7 @@ public struct BotsRootView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+                .accessibilityIdentifier("bots.desk")
             } else {
                 fleetScreen.onAppear { vm.openFleet() }
             }
@@ -2108,19 +2229,35 @@ public struct BotsRootView: View {
                 .frame(width: 32, height: 32)
                 .background(DS.Palette.accent.opacity(0.12))
                 .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            VStack(alignment: .leading, spacing: 1) {
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: DS.Space.sm) {
                     Text(bot.name)
                         .font(DS.Font.title2.weight(.semibold))
                         .foregroundColor(DS.Palette.text)
+                        .accessibilityIdentifier("bots.desk.name")
                     Text("@\(bot.handle)")
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityIdentifier("bots.desk.handle")
+                    if let provider = vm.providerLabel(for: bot) {
+                        DSPill(provider, tone: .accent)
+                            .accessibilityIdentifier("bots.desk.provider")
+                    }
+                    if let model = vm.modelLabel(for: bot) {
+                        Text(model)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .accessibilityIdentifier("bots.desk.model")
+                    }
+                    DSPill(vm.permissionLabel(for: bot), tone: .neutral)
+                        .accessibilityIdentifier("bots.desk.permission")
                     attentionBadge(vm.attentionState(for: bot))
                 }
-                Text(bot.title.isEmpty ? "Desk" : bot.title)
+                Text(bot.title.isEmpty ? "No job yet" : bot.title)
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityIdentifier("bots.desk.job")
             }
             Spacer(minLength: DS.Space.lg)
             Button("Studio") { vm.beginEdit(bot) }
@@ -2161,45 +2298,150 @@ public struct BotsRootView: View {
     }
 
     private func deskChat(_ bot: BotDefinition) -> some View {
-        VStack(spacing: 0) {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
-                    if vm.deskMessages.isEmpty {
-                        Text("Message \(bot.name) to give it a first task.")
-                            .font(DS.Font.body)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, DS.Space.xl)
-                    }
-                    ForEach(vm.deskMessages) { message in
-                        deskBubble(message, bot: bot)
-                    }
-                }
-                .padding(.horizontal, DS.Space.xxl)
-                .padding(.vertical, DS.Space.xl)
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                deskTimeline(bot)
+                composerBar(bot)
             }
-            composerBar(bot)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Rectangle()
+                .fill(DS.Palette.line)
+                .frame(width: 1)
+                .accessibilityHidden(true)
+            deskDesktop(bot)
+                .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
         }
     }
 
-    private func deskBubble(_ message: BotDeskMessage, bot: BotDefinition) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
-            Text(message.role == .user ? "You" : bot.name)
-                .font(DS.Font.caption.weight(.semibold))
-                .foregroundColor(DS.Palette.textTertiary)
-            Text(message.text)
-                .font(DS.Font.body)
-                .foregroundColor(DS.Palette.text)
-                .textSelection(.enabled)
-                .padding(DS.Space.lg)
-                .frame(maxWidth: 720, alignment: .leading)
-                .background(message.role == .user ? DS.Palette.surfaceRaised : DS.Palette.surface)
-                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                )
+    private func deskTimeline(_ bot: BotDefinition) -> some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
+                if vm.deskTimeline.isEmpty {
+                    Text("Message \(bot.name) to give it a first task.")
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, DS.Space.xl)
+                }
+                ForEach(vm.deskTimeline) { item in
+                    switch item {
+                    case .message(let message):
+                        deskBubble(message, bot: bot)
+                    case .workLog(let row):
+                        deskWorkLogRow(row)
+                    }
+                }
+            }
+            .padding(.horizontal, DS.Space.xxl)
+            .padding(.vertical, DS.Space.xl)
         }
+        .accessibilityIdentifier("bots.desk.timeline")
+    }
+
+    private func deskBubble(_ message: BotDeskMessage, bot: BotDefinition) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.md) {
+            Text(message.createdAt, style: .time)
+                .font(DS.Font.caption2)
+                .foregroundColor(DS.Palette.textTertiary)
+                .frame(width: 56, alignment: .trailing)
+                .accessibilityIdentifier("bots.desk.timestamp")
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text(message.role == .user ? "You" : bot.name)
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityIdentifier(
+                        message.role == .user ? "bots.desk.role.user" : "bots.desk.role.assistant"
+                    )
+                    .accessibilityLabel(message.role == .user ? "user" : "assistant")
+                Text(message.text)
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                    .textSelection(.enabled)
+                    .padding(DS.Space.lg)
+                    .frame(maxWidth: 720, alignment: .leading)
+                    .background(message.role == .user ? DS.Palette.surfaceRaised : DS.Palette.surface)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                    )
+            }
+        }
+    }
+
+    private func deskWorkLogRow(_ row: BotDeskWorkLogRow) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.md) {
+            Text(row.createdAt, style: .time)
+                .font(DS.Font.caption2)
+                .foregroundColor(DS.Palette.textTertiary)
+                .frame(width: 56, alignment: .trailing)
+            HStack(alignment: .center, spacing: DS.Space.md) {
+                Image(systemName: "list.bullet.rectangle")
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(row.title)
+                        .font(DS.Font.bodyStrong)
+                        .foregroundColor(DS.Palette.text)
+                    if !row.detail.isEmpty {
+                        Text(row.detail)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                    }
+                }
+                Spacer(minLength: 0)
+                DSPill(row.statusLabel, tone: workLogTone(row.statusLabel))
+            }
+            .dsPanel(padding: DS.Space.lg)
+        }
+        .accessibilityIdentifier("bots.desk.workLog")
+        .accessibilityLabel("work log \(row.title) \(row.statusLabel)")
+    }
+
+    private func workLogTone(_ status: String) -> DSPill.Tone {
+        switch status {
+        case "Working", "Done":
+            return .success
+        case "Needs you":
+            return .warning
+        default:
+            return .neutral
+        }
+    }
+
+    private func deskDesktop(_ bot: BotDefinition) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
+                DSSectionHeaderG("Desktop")
+                Spacer(minLength: 0)
+                DSPill("Logical space", tone: .neutral)
+            }
+            VStack(spacing: DS.Space.md) {
+                Image(systemName: "desktopcomputer")
+                    .font(.system(size: 28, weight: .regular))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityHidden(true)
+                Text("Logical execution space")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                    .multilineTextAlignment(.center)
+                Text(vm.desktopHonestyLabel)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.warning)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("bots.desk.desktop.honesty")
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(DS.Space.lg)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        }
+        .padding(DS.Space.lg)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(DS.Palette.surface)
+        .accessibilityIdentifier("bots.desk.desktop")
+        .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
     }
 
     private func composerBar(_ bot: BotDefinition) -> some View {

@@ -58,6 +58,61 @@ enum BotsDeskFollowThrough {
         return persisted[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    static func workLogRows(for run: AgentRun?) -> [BotDeskWorkLogRow] {
+        guard let run else { return [] }
+        return [workLogRow(for: run)]
+    }
+
+    static func workLogRow(for run: AgentRun) -> BotDeskWorkLogRow {
+        BotDeskWorkLogRow(
+            id: run.id.value,
+            title: "Supervised run",
+            detail: workLogDetail(provider: run.provider, model: run.model),
+            statusLabel: workLogStatusLabel(for: run.status),
+            createdAt: run.finishedAt ?? run.startedAt,
+            runID: run.id
+        )
+    }
+
+    static func workLogDetail(provider: AgentProvider, model: String) -> String {
+        let route: String
+        switch provider {
+        case .claude: route = "Claude"
+        case .codex: route = "Codex"
+        case .grok: route = "Grok"
+        }
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return route }
+        return "\(route) · \(trimmed)"
+    }
+
+    static func workLogStatusLabel(for status: AgentRunStatus) -> String {
+        switch status {
+        case .pending, .running:
+            return "Working"
+        case .completed:
+            return "Done"
+        case .failed, .interrupted:
+            return "Needs you"
+        case .cancelled:
+            return "Cancelled"
+        }
+    }
+
+    /// Messages stay the conversation; a work-log row appears only when a
+    /// linked Agent run exists. Same-timestamp work-log sits between You and
+    /// the assistant so it reads as the turn's activity, not a fake Desktop.
+    static func timeline(
+        messages: [BotDeskMessage],
+        workLog: [BotDeskWorkLogRow]
+    ) -> [BotDeskTimelineItem] {
+        let items = messages.map(BotDeskTimelineItem.message) + workLog.map(BotDeskTimelineItem.workLog)
+        return items.sorted { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+            return lhs.stableOrder < rhs.stableOrder
+        }
+    }
+
     static func isTerminal(_ status: AgentRunStatus) -> Bool {
         switch status {
         case .completed, .failed, .cancelled, .interrupted:
