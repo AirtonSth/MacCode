@@ -87,6 +87,41 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// App override may only reduce motion beyond the system preference.
     public var petReduceMotion: Bool
 
+    /// P1a Bot control plane. Default on so a user can create and message a Bot.
+    public var botsControlPlaneEnabled: Bool
+    /// P1a memory CRUD. Runtime also requires the control plane.
+    public var botsMemoryEnabled: Bool
+    /// P1b host-brokered writes. Off until that phase ships.
+    public var botsEffectsEnabled: Bool
+    /// Unattended / app-closed routines. Off until the autonomy phase ships.
+    public var botsAutonomyEnabled: Bool
+    /// Dedicated local VM Desktop. Off until that phase ships.
+    public var botsDesktopVMEnabled: Bool
+    /// Managed remote Mac Desktop. Off until that phase ships.
+    public var botsDesktopRemoteEnabled: Bool
+    /// External channels. Off until that phase ships.
+    public var botsChannelsEnabled: Bool
+
+    public var botControlPlaneFlags: BotControlPlaneFlags {
+        BotControlPlaneFlags(
+            botsControlPlaneEnabled: botsControlPlaneEnabled,
+            botsMemoryEnabled: botsMemoryEnabled,
+            botsEffectsEnabled: botsEffectsEnabled,
+            botsAutonomyEnabled: botsAutonomyEnabled,
+            botsDesktopVMEnabled: botsDesktopVMEnabled,
+            botsDesktopRemoteEnabled: botsDesktopRemoteEnabled,
+            botsChannelsEnabled: botsChannelsEnabled
+        )
+    }
+
+    public var isBotControlPlaneActive: Bool { botControlPlaneFlags.isBotControlPlaneActive }
+    public var isBotMemoryActive: Bool { botControlPlaneFlags.isBotMemoryActive }
+    public var isBotEffectsActive: Bool { botControlPlaneFlags.isBotEffectsActive }
+    public var isBotAutonomyActive: Bool { botControlPlaneFlags.isBotAutonomyActive }
+    public var isBotDesktopVMActive: Bool { botControlPlaneFlags.isBotDesktopVMActive }
+    public var isBotDesktopRemoteActive: Bool { botControlPlaneFlags.isBotDesktopRemoteActive }
+    public var isBotChannelsActive: Bool { botControlPlaneFlags.isBotChannelsActive }
+
     public init(diffWordWrap: Bool = false,
                 diffIgnoreWhitespace: Bool = false,
                 sidebarSort: String = "updated",
@@ -110,7 +145,14 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 petPosition: String = "bottomRight",
                 petSize: Double = 1.5,
                 petAttentionFilter: String = "all",
-                petReduceMotion: Bool = false) {
+                petReduceMotion: Bool = false,
+                botsControlPlaneEnabled: Bool = true,
+                botsMemoryEnabled: Bool = true,
+                botsEffectsEnabled: Bool = false,
+                botsAutonomyEnabled: Bool = false,
+                botsDesktopVMEnabled: Bool = false,
+                botsDesktopRemoteEnabled: Bool = false,
+                botsChannelsEnabled: Bool = false) {
         self.diffWordWrap = diffWordWrap
         self.diffIgnoreWhitespace = diffIgnoreWhitespace
         self.sidebarSort = sidebarSort
@@ -135,6 +177,13 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.petSize = petSize
         self.petAttentionFilter = petAttentionFilter
         self.petReduceMotion = petReduceMotion
+        self.botsControlPlaneEnabled = botsControlPlaneEnabled
+        self.botsMemoryEnabled = botsMemoryEnabled
+        self.botsEffectsEnabled = botsEffectsEnabled
+        self.botsAutonomyEnabled = botsAutonomyEnabled
+        self.botsDesktopVMEnabled = botsDesktopVMEnabled
+        self.botsDesktopRemoteEnabled = botsDesktopRemoteEnabled
+        self.botsChannelsEnabled = botsChannelsEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -162,6 +211,13 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case petSize
         case petAttentionFilter
         case petReduceMotion
+        case botsControlPlaneEnabled
+        case botsMemoryEnabled
+        case botsEffectsEnabled
+        case botsAutonomyEnabled
+        case botsDesktopVMEnabled
+        case botsDesktopRemoteEnabled
+        case botsChannelsEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -190,6 +246,13 @@ public struct AppSettings: Codable, Sendable, Equatable {
         petSize = try c.decodeIfPresent(Double.self, forKey: .petSize) ?? 1.5
         petAttentionFilter = try c.decodeIfPresent(String.self, forKey: .petAttentionFilter) ?? "all"
         petReduceMotion = try c.decodeIfPresent(Bool.self, forKey: .petReduceMotion) ?? false
+        botsControlPlaneEnabled = try c.decodeIfPresent(Bool.self, forKey: .botsControlPlaneEnabled) ?? true
+        botsMemoryEnabled = try c.decodeIfPresent(Bool.self, forKey: .botsMemoryEnabled) ?? true
+        botsEffectsEnabled = try c.decodeIfPresent(Bool.self, forKey: .botsEffectsEnabled) ?? false
+        botsAutonomyEnabled = try c.decodeIfPresent(Bool.self, forKey: .botsAutonomyEnabled) ?? false
+        botsDesktopVMEnabled = try c.decodeIfPresent(Bool.self, forKey: .botsDesktopVMEnabled) ?? false
+        botsDesktopRemoteEnabled = try c.decodeIfPresent(Bool.self, forKey: .botsDesktopRemoteEnabled) ?? false
+        botsChannelsEnabled = try c.decodeIfPresent(Bool.self, forKey: .botsChannelsEnabled) ?? false
     }
 }
 

@@ -48,6 +48,13 @@ public struct AppSettingsKeys {
         "petSize",
         "petAttentionFilter",
         "petReduceMotion",
+        "botsControlPlaneEnabled",
+        "botsMemoryEnabled",
+        "botsEffectsEnabled",
+        "botsAutonomyEnabled",
+        "botsDesktopVMEnabled",
+        "botsDesktopRemoteEnabled",
+        "botsChannelsEnabled",
     ]
 }
 
@@ -804,6 +811,41 @@ public final class SettingsViewModel: ObservableObject {
         postPetSettingsDidChange()
     }
 
+    public func setBotsControlPlaneEnabled(_ on: Bool) {
+        appSettings.botsControlPlaneEnabled = on
+        settingsStore.update { $0.botsControlPlaneEnabled = on }
+    }
+
+    public func setBotsMemoryEnabled(_ on: Bool) {
+        appSettings.botsMemoryEnabled = on
+        settingsStore.update { $0.botsMemoryEnabled = on }
+    }
+
+    public func setBotsEffectsEnabled(_ on: Bool) {
+        appSettings.botsEffectsEnabled = on
+        settingsStore.update { $0.botsEffectsEnabled = on }
+    }
+
+    public func setBotsAutonomyEnabled(_ on: Bool) {
+        appSettings.botsAutonomyEnabled = on
+        settingsStore.update { $0.botsAutonomyEnabled = on }
+    }
+
+    public func setBotsDesktopVMEnabled(_ on: Bool) {
+        appSettings.botsDesktopVMEnabled = on
+        settingsStore.update { $0.botsDesktopVMEnabled = on }
+    }
+
+    public func setBotsDesktopRemoteEnabled(_ on: Bool) {
+        appSettings.botsDesktopRemoteEnabled = on
+        settingsStore.update { $0.botsDesktopRemoteEnabled = on }
+    }
+
+    public func setBotsChannelsEnabled(_ on: Bool) {
+        appSettings.botsChannelsEnabled = on
+        settingsStore.update { $0.botsChannelsEnabled = on }
+    }
+
     /// Latest host file-access probe results (Settings privacy section).
     @Published public var hostFileAccessProbeResults: [HostFileAccessProbeResult] = []
     /// Code signature identity for the running process (TCC durability).
@@ -1328,6 +1370,7 @@ public struct SettingsView: View {
                     petSection
                     insomniaSection
                     tokenSaverSection
+                    botsSection
                     keybindingsSection
                     advancedSection
                     storageSection
@@ -1686,6 +1729,97 @@ public struct SettingsView: View {
             distillInstallStatusRow
         }
         .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var botsSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG("Bots")
+            settingRow("Control plane") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.botsControlPlaneEnabled },
+                    set: { vm.setBotsControlPlaneEnabled($0) }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("settings.bots.controlPlane.toggle")
+            }
+            Text("Create and message durable named teammates. A Bot is not an Agent thread.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            settingRow("Memory") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.botsMemoryEnabled },
+                    set: { vm.setBotsMemoryEnabled($0) }
+                ))
+                .labelsHidden()
+                .disabled(!vm.appSettings.botsControlPlaneEnabled)
+                .accessibilityIdentifier("settings.bots.memory.toggle")
+            }
+            Text("Remember facts and corrections. Corrections write a new revision; they do not rewrite the old one.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            settingRow("Effects (host-brokered writes)") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.botsEffectsEnabled },
+                    set: { vm.setBotsEffectsEnabled($0) }
+                ))
+                .labelsHidden()
+                .disabled(!vm.appSettings.botsControlPlaneEnabled)
+                .accessibilityIdentifier("settings.bots.effects.toggle")
+            }
+            Text("P1b. Host-brokered writes stay off until that phase ships.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            settingRow("Autonomy / unattended routines") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.botsAutonomyEnabled },
+                    set: { vm.setBotsAutonomyEnabled($0) }
+                ))
+                .labelsHidden()
+                .disabled(!vm.appSettings.botsControlPlaneEnabled)
+                .accessibilityIdentifier("settings.bots.autonomy.toggle")
+            }
+            Text(BotRoutineCopy.testRunHonestyCaption)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            settingRow("Dedicated local VM Desktop") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.botsDesktopVMEnabled },
+                    set: { vm.setBotsDesktopVMEnabled($0) }
+                ))
+                .labelsHidden()
+                .disabled(!vm.appSettings.botsControlPlaneEnabled)
+                .accessibilityIdentifier("settings.bots.desktopVM.toggle")
+            }
+            Text("Not shipped. \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            settingRow("Managed remote Mac Desktop") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.botsDesktopRemoteEnabled },
+                    set: { vm.setBotsDesktopRemoteEnabled($0) }
+                ))
+                .labelsHidden()
+                .disabled(!vm.appSettings.botsControlPlaneEnabled)
+                .accessibilityIdentifier("settings.bots.desktopRemote.toggle")
+            }
+            Text("Not shipped. A managed remote Mac is not available while this flag is off.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            settingRow("Channels") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.botsChannelsEnabled },
+                    set: { vm.setBotsChannelsEnabled($0) }
+                ))
+                .labelsHidden()
+                .disabled(!vm.appSettings.botsControlPlaneEnabled)
+                .accessibilityIdentifier("settings.bots.channels.toggle")
+            }
+            Text("Not shipped. External channels stay off until that phase.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+        }
+        .dsPanel(padding: DS.Space.lg)
+        .accessibilityIdentifier("settings.section.bots")
     }
 
     @ViewBuilder

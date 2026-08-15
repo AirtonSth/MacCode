@@ -350,6 +350,8 @@ public final class SidebarViewModel: ObservableObject {
     @Published public var isScheduledTasksSelected: Bool = false
     /// True while the main content pane shows Active Threads (not a workspace).
     @Published public var isActiveThreadsSelected: Bool = false
+    /// True while the main content pane shows Bots (not a workspace).
+    @Published public var isBotsSelected: Bool = false
     /// Host-authoritative active agent thread count for the sidebar badge.
     @Published public private(set) var activeThreadCount: Int = 0
     /// Fired when the user activates a workspace row so the shell can leave
@@ -579,7 +581,7 @@ public final class SidebarViewModel: ObservableObject {
         // selected this tick is correctly treated as "being viewed" (no dot).
         // While a shell destination owns the main content, keep every workspace
         // row deselected so the destination is unambiguous.
-        let shellDestinationSelected = isScheduledTasksSelected || isActiveThreadsSelected
+        let shellDestinationSelected = isScheduledTasksSelected || isActiveThreadsSelected || isBotsSelected
         if shellDestinationSelected {
             if selectedWorkspaceID != nil { selectedWorkspaceID = nil }
             if !selectedWorkspaceIDs.isEmpty { selectedWorkspaceIDs.removeAll() }
@@ -1643,6 +1645,7 @@ public final class SidebarViewModel: ObservableObject {
         selectedWorkspaceID = wid
         isScheduledTasksSelected = false
         isActiveThreadsSelected = false
+        isBotsSelected = false
         // UX-SIDEBAR-COMPLETED-DOT: opening a workspace clears its completed dot.
         completedWorkspaces.remove(wid)
         try? router?.selectWorkspace(wid)
@@ -2560,6 +2563,7 @@ public struct SidebarRootView: View {
     private let onOpenAccount: () -> Void
     private let onOpenScheduledTasks: () -> Void
     private let onOpenActiveThreads: () -> Void
+    private let onOpenBots: () -> Void
     private let keyMapper = SidebarKeyIntentMapper()
 
     public init(
@@ -2567,13 +2571,15 @@ public struct SidebarRootView: View {
         onOpenSettings: @escaping () -> Void = {},
         onOpenAccount: @escaping () -> Void = {},
         onOpenScheduledTasks: @escaping () -> Void = {},
-        onOpenActiveThreads: @escaping () -> Void = {}
+        onOpenActiveThreads: @escaping () -> Void = {},
+        onOpenBots: @escaping () -> Void = {}
     ) {
         self.vm = vm
         self.onOpenSettings = onOpenSettings
         self.onOpenAccount = onOpenAccount
         self.onOpenScheduledTasks = onOpenScheduledTasks
         self.onOpenActiveThreads = onOpenActiveThreads
+        self.onOpenBots = onOpenBots
     }
 
     public var body: some View {
@@ -2656,6 +2662,18 @@ public struct SidebarRootView: View {
                 .help("Create and manage scheduled Agent tasks")
                 .accessibilityIdentifier("sidebar.scheduleTasks")
                 .accessibilityAddTraits(vm.isScheduledTasksSelected ? .isSelected : [])
+
+                Button(action: onOpenBots) {
+                    sidebarActionRow(
+                        symbol: "person.2",
+                        title: "Bots",
+                        isSelected: vm.isBotsSelected
+                    )
+                }
+                .buttonStyle(.plain)
+                .help("Create and message durable named teammates")
+                .accessibilityIdentifier("sidebar.bots")
+                .accessibilityAddTraits(vm.isBotsSelected ? .isSelected : [])
 
                 Button(action: reportBug) {
                     sidebarActionRow(symbol: "ladybug", title: "Report Bug")
@@ -5441,6 +5459,8 @@ public final class SidebarView: NSObject {
     public var onPresentScheduledTasks: (() -> Void)?
     /// Main window mounts Active Threads in the workspace content column.
     public var onPresentActiveThreads: (() -> Void)?
+    /// Main window mounts Bots in the workspace content column.
+    public var onPresentBots: (() -> Void)?
     /// Fired when a workspace is selected so main content leaves shell destinations.
     public var onWorkspaceContentActivated: (() -> Void)? {
         get { viewModel.onWorkspaceContentActivated }
@@ -5482,7 +5502,8 @@ public final class SidebarView: NSObject {
             onOpenSettings: { [weak self] in self?.showSettings() },
             onOpenAccount: { [weak self] in self?.showAccount() },
             onOpenScheduledTasks: { [weak self] in self?.showScheduledTasks() },
-            onOpenActiveThreads: { [weak self] in self?.showActiveThreads() }
+            onOpenActiveThreads: { [weak self] in self?.showActiveThreads() },
+            onOpenBots: { [weak self] in self?.showBots() }
         )
     }
 
@@ -5490,6 +5511,7 @@ public final class SidebarView: NSObject {
         viewModel.isScheduledTasksSelected = selected
         if selected {
             viewModel.isActiveThreadsSelected = false
+            viewModel.isBotsSelected = false
             // Visual deselect of all workspace rows while Schedule Tasks is active.
             viewModel.selectedWorkspaceID = nil
             viewModel.selectedWorkspaceIDs.removeAll()
@@ -5501,6 +5523,18 @@ public final class SidebarView: NSObject {
         viewModel.isActiveThreadsSelected = selected
         if selected {
             viewModel.isScheduledTasksSelected = false
+            viewModel.isBotsSelected = false
+            viewModel.selectedWorkspaceID = nil
+            viewModel.selectedWorkspaceIDs.removeAll()
+            viewModel.clearSelectionAnchorForShellDestination()
+        }
+    }
+
+    public func setBotsSelected(_ selected: Bool) {
+        viewModel.isBotsSelected = selected
+        if selected {
+            viewModel.isScheduledTasksSelected = false
+            viewModel.isActiveThreadsSelected = false
             viewModel.selectedWorkspaceID = nil
             viewModel.selectedWorkspaceIDs.removeAll()
             viewModel.clearSelectionAnchorForShellDestination()
@@ -5555,5 +5589,15 @@ public final class SidebarView: NSObject {
             return
         }
         // No detached fallback: Active Threads is main-content only.
+    }
+
+    @objc private func showBots() {
+        if let onPresentBots {
+            onPresentBots()
+            return
+        }
+        guard let context, let router else { return }
+        let controller = BotsWindowController(context: context, router: router)
+        controller.show()
     }
 }

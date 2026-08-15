@@ -325,6 +325,7 @@ public final class AppContext {
     public let tokenSaverRolloverRepo: TokenSaverRolloverCapsuleRepository
     public let tokenSaverProjectDataRepo: TokenSaverProjectDataRepository
     public let tokenSaverAuditEventsRepo: TokenSaverAuditEventRepository
+    public let botStore: BotStore
     /// Shared orchestration receipt runtime for the coordinator and every
     /// Agent App surface. Subagent activity must read the same SQLite-backed
     /// receipts that provider launches write.
@@ -744,6 +745,7 @@ public final class AppContext {
         self.tokenSaverRolloverRepo = TokenSaverRolloverCapsuleRepository(db: db)
         self.tokenSaverProjectDataRepo = TokenSaverProjectDataRepository(db: db)
         self.tokenSaverAuditEventsRepo = TokenSaverAuditEventRepository(db: db)
+        self.botStore = BotStore(db: db)
         do {
             _ = try self.tokenSaverProjectDataRepo.performLifecycleSweep()
         } catch {

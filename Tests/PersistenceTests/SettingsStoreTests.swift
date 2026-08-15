@@ -32,6 +32,14 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(d.petSize, 1.5, "the pet must start at the existing 150% size")
         XCTAssertEqual(d.petAttentionFilter, "all")
         XCTAssertFalse(d.petReduceMotion)
+        XCTAssertTrue(d.botsControlPlaneEnabled, "P1a ships the Bot control plane on")
+        XCTAssertTrue(d.botsMemoryEnabled, "P1a includes memory CRUD")
+        XCTAssertFalse(d.botsEffectsEnabled)
+        XCTAssertFalse(d.botsAutonomyEnabled)
+        XCTAssertFalse(d.botsDesktopVMEnabled)
+        XCTAssertFalse(d.botsDesktopRemoteEnabled)
+        XCTAssertFalse(d.botsChannelsEnabled)
+        XCTAssertFalse(d.isBotEffectsActive, "later Bot phases stay fail-closed")
     }
 
     func test_saveThenLoadRoundTrips() throws {
@@ -102,6 +110,10 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(r.petSize, 1.5, "older blobs without a pet size must receive the current 150% default")
         XCTAssertEqual(r.petAttentionFilter, "all")
         XCTAssertFalse(r.petReduceMotion)
+        XCTAssertTrue(r.botsControlPlaneEnabled, "older blobs must receive the shipped P1a control-plane default")
+        XCTAssertTrue(r.botsMemoryEnabled)
+        XCTAssertFalse(r.botsEffectsEnabled)
+        XCTAssertFalse(r.botsAutonomyEnabled)
     }
 
     func test_corruptBlobDegradesToDefaults() throws {

@@ -48,6 +48,13 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
             "petSize",
             "petAttentionFilter",
             "petReduceMotion",
+            "botsControlPlaneEnabled",
+            "botsMemoryEnabled",
+            "botsEffectsEnabled",
+            "botsAutonomyEnabled",
+            "botsDesktopVMEnabled",
+            "botsDesktopRemoteEnabled",
+            "botsChannelsEnabled",
         ]
         let actual = Set(AppSettingsKeys.userTunableKeys)
         XCTAssertEqual(
@@ -150,6 +157,13 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
         XCTAssertEqual(pet.petSize, 1.5)
         XCTAssertEqual(pet.petAttentionFilter, "needsYou")
         XCTAssertTrue(pet.petReduceMotion)
+
+        // Control plane defaults on; persist the off flip so Settings reload matches store.
+        vm.setBotsControlPlaneEnabled(false)
+        XCTAssertFalse(vm.appSettings.botsControlPlaneEnabled,
+                       "setBotsControlPlaneEnabled(false) must update appSettings immediately")
+        XCTAssertFalse(SettingsStore(db: ctx.db).load().botsControlPlaneEnabled,
+                       "setBotsControlPlaneEnabled must persist so a Bot cannot be created after the user turns the plane off")
     }
 
     /// reload() must reflect the last-persisted value, not a stale in-memory value.

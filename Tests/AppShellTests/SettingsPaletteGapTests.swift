@@ -250,6 +250,9 @@ final class SettingsPaletteGapTests: XCTestCase {
             "graphifyWriteInRepo",
             "petEnabled", "petAnimationsEnabled", "petReadyCounterEnabled",
             "petPosition", "petSize", "petAttentionFilter", "petReduceMotion",
+            "botsControlPlaneEnabled", "botsMemoryEnabled", "botsEffectsEnabled",
+            "botsAutonomyEnabled", "botsDesktopVMEnabled", "botsDesktopRemoteEnabled",
+            "botsChannelsEnabled",
         ]
         XCTAssertEqual(
             Set(AppSettingsKeys.userTunableKeys), expected,

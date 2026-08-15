@@ -23,9 +23,10 @@ public enum Schema {
 
     /// Must equal the highest SchemaStep version. Versions 63-66 were used by
     /// pre-release builds and must never be reused; v67 owns durable RCW1
-    /// requests, v68 owns durable RCW1 assistant responses, and v69 owns
-    /// per-message Human/RCW1 display preferences.
-    public static let currentVersion: Int = 69
+    /// requests, v68 owns durable RCW1 assistant responses, v69 owns
+    /// per-message Human/RCW1 display preferences, v70 owns the Bot
+    /// control-plane identity tables, and v71 owns per-Bot skill enablement.
+    public static let currentVersion: Int = 71
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1170,6 +1171,168 @@ public enum Schema {
             updated_at TEXT NOT NULL,
             FOREIGN KEY(message_id) REFERENCES agent_messages(id) ON DELETE CASCADE
         );
+        """),
+        // Durable named teammate identity. A Bot is not an AgentThread.
+        // Versions 63-66 are retired and must never be reused.
+        SchemaStep(70, """
+        CREATE TABLE IF NOT EXISTS bots (
+            id TEXT PRIMARY KEY NOT NULL,
+            handle TEXT NOT NULL,
+            name TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            avatar_symbol TEXT NOT NULL,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            hidden INTEGER NOT NULL DEFAULT 0,
+            current_revision_id TEXT,
+            directory_epoch INTEGER NOT NULL DEFAULT 1,
+            notifications_enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            deleted_at TEXT,
+            workspace_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_bots_updated
+            ON bots(updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_bots_live
+            ON bots(deleted_at, hidden, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS bot_revisions (
+            id TEXT PRIMARY KEY NOT NULL,
+            bot_id TEXT NOT NULL,
+            revision_number INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            soul TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL,
+            provider_instance_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            reasoning_effort TEXT NOT NULL,
+            compatible_route_set_json TEXT NOT NULL,
+            permission_mode TEXT NOT NULL,
+            desktop_kind TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            supersedes_revision_id TEXT,
+            FOREIGN KEY(bot_id) REFERENCES bots(id),
+            UNIQUE(bot_id, revision_number)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_revisions_bot
+            ON bot_revisions(bot_id, revision_number);
+
+        CREATE TABLE IF NOT EXISTS bot_handles (
+            handle TEXT PRIMARY KEY NOT NULL,
+            bot_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS bot_handle_tombstones (
+            handle TEXT PRIMARY KEY NOT NULL,
+            bot_id TEXT NOT NULL,
+            deleted_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS bot_conversations (
+            id TEXT PRIMARY KEY NOT NULL,
+            bot_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            hidden INTEGER NOT NULL DEFAULT 0,
+            unread INTEGER NOT NULL DEFAULT 0,
+            attention_state TEXT NOT NULL DEFAULT 'none',
+            linked_agent_thread_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_conversations_bot
+            ON bot_conversations(bot_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS bot_memory_items (
+            id TEXT PRIMARY KEY NOT NULL,
+            bot_id TEXT NOT NULL,
+            current_revision_id TEXT,
+            forgotten_at TEXT,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_memory_bot
+            ON bot_memory_items(bot_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS bot_memory_item_revisions (
+            id TEXT PRIMARY KEY NOT NULL,
+            item_id TEXT NOT NULL,
+            bot_id TEXT NOT NULL,
+            revision_number INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            provenance TEXT NOT NULL DEFAULT '',
+            trusted INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            supersedes_revision_id TEXT,
+            FOREIGN KEY(item_id) REFERENCES bot_memory_items(id),
+            UNIQUE(item_id, revision_number)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_memory_revisions_item
+            ON bot_memory_item_revisions(item_id, revision_number);
+
+        CREATE TABLE IF NOT EXISTS bot_attention_items (
+            id TEXT PRIMARY KEY NOT NULL,
+            bot_id TEXT NOT NULL,
+            conversation_id TEXT,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            acknowledged_at TEXT,
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_attention_created
+            ON bot_attention_items(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_bot_attention_open
+            ON bot_attention_items(acknowledged_at, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS bot_routine_definitions (
+            id TEXT PRIMARY KEY NOT NULL,
+            bot_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            schedule_note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_routines_bot
+            ON bot_routine_definitions(bot_id);
+
+        CREATE TABLE IF NOT EXISTS bot_routine_activations (
+            routine_id TEXT PRIMARY KEY NOT NULL,
+            bot_id TEXT NOT NULL,
+            is_enabled INTEGER NOT NULL DEFAULT 0,
+            last_test_run_requested_at TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(routine_id) REFERENCES bot_routine_definitions(id),
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+        """),
+        // Per-Bot skill enablement. Duplicate must copy these; they are not
+        // conversation memory and they are not filesystem paths.
+        SchemaStep(71, """
+        CREATE TABLE IF NOT EXISTS bot_skill_bindings (
+            bot_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            digest TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(bot_id, skill_id),
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_skill_bindings_bot
+            ON bot_skill_bindings(bot_id, enabled);
         """),
     ]
 

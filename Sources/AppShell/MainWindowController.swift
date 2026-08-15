@@ -263,18 +263,21 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// rebuild regressions that os.log alone cannot surface.
     var rebuildCount: Int = 0
 
-    /// Shell main-content destination. Scheduled Tasks and Active Threads open
-    /// here (same place as workspaces), not in a separate NSWindow.
+    /// Shell main-content destination. Scheduled Tasks, Active Threads, and
+    /// Bots open here (same place as workspaces), not in a separate NSWindow.
     private enum ShellContentMode: Equatable {
         case workspace
         case scheduledTasks
         case activeThreads
+        case bots
     }
     private var shellContentMode: ShellContentMode = .workspace
     private var scheduledTasksViewModel: ScheduledTasksViewModel?
     private var scheduledTasksHostingView: NSView?
     private var activeThreadsViewModel: ActiveThreadsViewModel?
     private var activeThreadsHostingView: NSView?
+    private var botsViewModel: BotsViewModel?
+    private var botsHostingView: NSView?
 
     public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
@@ -313,6 +316,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         }
         sidebar.onPresentActiveThreads = { [weak self] in
             self?.presentActiveThreadsInMainContent()
+        }
+        sidebar.onPresentBots = { [weak self] in
+            self?.presentBotsInMainContent()
         }
         sidebar.onWorkspaceContentActivated = { [weak self] in
             self?.presentWorkspaceContent()
@@ -598,6 +604,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
                 collapsedWorkspaceLabel.stringValue = "Active Threads"
                 visibleWorkspaceLabel.stringValue = "Active Threads"
                 window.title = "Active Threads"
+                visibleFinderButton.isHidden = true
+                visibleNewWindowButton.isHidden = true
+                return
+            }
+            if shellContentMode == .bots {
+                collapsedWorkspaceLabel.stringValue = "Bots"
+                visibleWorkspaceLabel.stringValue = "Bots"
+                window.title = "Bots"
                 visibleFinderButton.isHidden = true
                 visibleNewWindowButton.isHidden = true
                 return
@@ -941,7 +955,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         shellContentMode = .scheduledTasks
         sidebar.setScheduledTasksSelected(true)
         sidebar.setActiveThreadsSelected(false)
+        sidebar.setBotsSelected(false)
         activeThreadsHostingView = nil
+        botsHostingView = nil
         lastWorkspaceContainerSignature = nil
         installScheduledTasksContent()
         updateCollapsedWorkspaceHeader()
@@ -953,11 +969,27 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         shellContentMode = .activeThreads
         sidebar.setActiveThreadsSelected(true)
         sidebar.setScheduledTasksSelected(false)
+        sidebar.setBotsSelected(false)
         scheduledTasksHostingView = nil
+        botsHostingView = nil
         lastWorkspaceContainerSignature = nil
         installActiveThreadsContent()
         updateCollapsedWorkspaceHeader()
         shellLog.debug("shellContentMode=activeThreads")
+    }
+
+    /// Bots shell destination: Fleet / Studio / Desk / Attention.
+    func presentBotsInMainContent() {
+        shellContentMode = .bots
+        sidebar.setBotsSelected(true)
+        sidebar.setScheduledTasksSelected(false)
+        sidebar.setActiveThreadsSelected(false)
+        scheduledTasksHostingView = nil
+        activeThreadsHostingView = nil
+        lastWorkspaceContainerSignature = nil
+        installBotsContent()
+        updateCollapsedWorkspaceHeader()
+        shellLog.debug("shellContentMode=bots")
     }
 
     /// Return the main content column to the selected workspace layout.
@@ -966,8 +998,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         shellContentMode = .workspace
         sidebar.setScheduledTasksSelected(false)
         sidebar.setActiveThreadsSelected(false)
+        sidebar.setBotsSelected(false)
         scheduledTasksHostingView = nil
         activeThreadsHostingView = nil
+        botsHostingView = nil
         lastWorkspaceContainerSignature = nil
         rebuildWorkspaceContainer()
         updateCollapsedWorkspaceHeader()
@@ -1022,8 +1056,32 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         rebuildCount += 1
     }
 
+    private func installBotsContent() {
+        for sub in workspaceContent.subviews { sub.removeFromSuperview() }
+        paneControllers.removeAll()
+        guard let context, let router else {
+            let empty = makeEmptyState()
+            workspaceContent.addSubview(empty)
+            pin(empty, to: workspaceContent)
+            return
+        }
+        let vm = botsViewModel ?? BotsViewModel(context: context, router: router)
+        botsViewModel = vm
+        vm.reload()
+        let host = NSHostingView(rootView: BotsRootView(vm: vm))
+        host.translatesAutoresizingMaskIntoConstraints = false
+        host.wantsLayer = true
+        host.layer?.backgroundColor = DS.NS.bg.cgColor
+        RemoteCodeAppearance.apply(to: host)
+        workspaceContent.addSubview(host)
+        pin(host, to: workspaceContent)
+        botsHostingView = host
+        lastWorkspaceContainerSignature = "bots"
+        rebuildCount += 1
+    }
+
     private func rebuildWorkspaceContainer() {
-        // Keep Schedule Tasks / Active Threads mounted across refreshFromState
+        // Keep Schedule Tasks / Active Threads / Bots mounted across refreshFromState
         // bursts while the user is on that shell destination.
         if shellContentMode == .scheduledTasks {
             if scheduledTasksHostingView?.superview === workspaceContent {
@@ -1039,6 +1097,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
                 return
             }
             installActiveThreadsContent()
+            return
+        }
+        if shellContentMode == .bots {
+            if botsHostingView?.superview === workspaceContent {
+                botsViewModel?.reload()
+                return
+            }
+            installBotsContent()
             return
         }
 

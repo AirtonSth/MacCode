@@ -59,3 +59,46 @@ public struct ProjectID: Hashable, Codable, Sendable, CustomStringConvertible {
     public init(_ value: UUID = UUID()) { self.value = value }
     public var description: String { value.uuidString }
 }
+
+public struct BotID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
+public struct BotRevisionID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
+public struct BotConversationID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
+public struct BotMemoryItemID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
+public struct BotRoutineID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
+public struct BotAttentionItemID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
+/// Normalized unique handle (`piper`). Leading `@` is never stored.
+public struct BotHandle: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: String
+    public init(_ value: String) { self.value = value }
+    public var description: String { value }
+}
