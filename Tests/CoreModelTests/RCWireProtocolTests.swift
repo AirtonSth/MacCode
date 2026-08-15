@@ -244,4 +244,14 @@ final class RCWireProtocolTests: XCTestCase {
             ])
         ]))
     }
+
+    /// WHY: request-side `C Human repeated G...` is reconstructive, but RCW1 v1
+    /// never assigned response-side semantics to C. Silently accepting the same
+    /// spelling for A frames would invent an unversioned codec that existing
+    /// consumers cannot reconstruct losslessly.
+    func test_responseExactRepeatContextRequiresAVersionedCodec() {
+        let candidate = "RCW1\tA\t1\nO\tOK\nC\tHuman repeated O verbatim 100 times.\n.\n"
+
+        XCTAssertThrowsError(try RCWireProtocol.parse(candidate))
+    }
 }

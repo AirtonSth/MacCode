@@ -151,6 +151,7 @@ final class BackgroundAwaitContinuationCoordinatorTests: XCTestCase {
                 finalMessage: "\(BackgroundAwaitContinuation.awaitingMarker)\n\(wire)"
             )
             let (coordinator, thread, tmp) = try makeCoordinator(runner: runner)
+            coordinator.finalResponseWireAdmissionCheck = { _, _ in true }
             coordinator.finalResponseTranslator = { response, translatedProvider, _, _ in
                 XCTAssertEqual(translatedProvider, provider)
                 XCTAssertEqual(response, wire.trimmingCharacters(in: .whitespacesAndNewlines),

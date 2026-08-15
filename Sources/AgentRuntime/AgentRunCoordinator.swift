@@ -1123,6 +1123,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// unchanged on any error.
     public var finalResponseTranslator: (@Sendable (_ response: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID) async -> String)?
 
+    /// Host-owned proof gate for RCW1 assistant responses. The complete wire
+    /// payload and its deterministic Human projection are supplied together so
+    /// a host with an exact provider tokenizer can enforce the paid-token
+    /// threshold before RemoteCode persists an optimized disclosure. RCW1 A v1
+    /// has framing but no reconstructive compression primitive, so the safe
+    /// default is Human fail-open with no RCW1 response toggle.
+    public var finalResponseWireAdmissionCheck: @Sendable (
+        _ wire: String,
+        _ deterministicHuman: String
+    ) -> Bool = { _, _ in false }
+
     /// Token Saver hook for RECOVERED sessions. The coordinator rebuilds the run request for a
     /// resumed session itself (`recoverAdapterSessionIfNeeded`), bypassing the app shell's
     /// `providerEnvironment`. Without this the recovered run loses `RC_TOKEN_SAVER_DISTILL_HINT`
@@ -5246,7 +5257,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func sanitizeFinalAssistantEvent(_ ev: AssistantEvent) -> AssistantEvent {
         switch ev {
         case .turnCompleted(let turnId, let finalMessage):
-            return .turnCompleted(turnId: turnId, finalMessage: sanitizeFinalAssistantText(finalMessage))
+            return .turnCompleted(turnId: turnId, finalMessage: finalMessage.map(finalResponseDisplayText))
         case .itemDelta(let itemId, let bodyAppend, let outputAppend, let summary):
             // Defense in depth for live stream: drop leaked control tokens from
             // body deltas without trimming (preserves inter-chunk whitespace).
@@ -5522,7 +5533,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 rememberCompletedTurn(turnId, runId: runId)
                 return
             }
-            if let decision = interceptProviderTextEvent(ev, runId: runId, threadId: threadId) {
+            if allowFinalResponseTranslation,
+               let decision = interceptProviderTextEvent(ev, runId: runId, threadId: threadId) {
                 switch decision {
                 case .hold:
                     return
@@ -6001,13 +6013,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             lock.unlock()
 
-            let finalMessage = sanitizeFinalAssistantText(rawFinalMessage)
+            let finalMessage = rawFinalMessage.map(finalResponseDisplayText)
             if allowFinalResponseTranslation,
                reportedStatus == .completed,
                let rawProviderText = rawFinalMessage,
                let displayedText = finalMessage,
                !displayedText.isEmpty,
                !shouldTranslateFinalResponse(rawProviderText),
+               RCWireProtocol.transportEnvelope(in: rawProviderText) == nil,
                let admittedWireRequest = wireRequestText(runId: runId) {
                 // The request was admitted as wire, but the provider returned
                 // ordinary prose. Keep that readable prose instead of routing it
@@ -6845,8 +6858,47 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return pending
     }
 
+    private struct WireResponseProjection {
+        let wire: String
+        let human: String
+    }
+
+    private func wireResponseProjection(_ text: String) -> WireResponseProjection? {
+        guard let wire = RCWireProtocol.transportEnvelope(in: text)?.payload,
+              let frames = try? RCWireProtocol.parse(wire),
+              !frames.isEmpty,
+              frames.allSatisfy({ $0.direction == .response }) else {
+            return nil
+        }
+        let human = RCWireProtocol.renderEnglish(frames)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !human.isEmpty else { return nil }
+        return WireResponseProjection(wire: wire, human: human)
+    }
+
+    private func admitsWireResponse(_ projection: WireResponseProjection) -> Bool {
+        finalResponseWireAdmissionCheck(projection.wire, projection.human)
+    }
+
+    private func finalResponseDisplayText(_ text: String) -> String {
+        guard finalResponseTranslator != nil,
+              let projection = wireResponseProjection(text),
+              !admitsWireResponse(projection) else {
+            return sanitizeFinalAssistantText(text)
+        }
+        return sanitizeFinalAssistantText(projection.human)
+    }
+
     private func shouldTranslateFinalResponse(_ text: String) -> Bool {
-        finalResponseTranslator != nil && RCWireProtocol.transportEnvelope(in: text) != nil
+        guard finalResponseTranslator != nil,
+              RCWireProtocol.transportEnvelope(in: text) != nil else {
+            return false
+        }
+        // Malformed/truncated transport still enters the existing safety renderer
+        // so raw protocol bytes never leak into the Human transcript. The
+        // economic gate applies only to complete, semantically renderable frames.
+        guard let projection = wireResponseProjection(text) else { return true }
+        return admitsWireResponse(projection)
     }
 
     private func completeProviderTextTranslation(runId: AgentRunID) -> DeferredProviderTerminalEvent? {
@@ -6936,7 +6988,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 items[item.id] = item.type
                 activeProviderTextItemTypes[runId] = items
                 lock.unlock()
-                if isFirstObservation, let request = wireRequestText(runId: runId) {
+                if item.type == .reasoning,
+                   isFirstObservation,
+                   let request = wireRequestText(runId: runId) {
                     // The outbound half already used RCW1 even if the provider
                     // later falls back to streaming ordinary prose. Persist the
                     // admission at item start so Work-so-far can expose the
@@ -7050,15 +7104,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         case .output:
                             deltaEvent = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: separator + rendered, summary: nil)
                         }
-                        return .emit([
-                            .wireTranslation(AssistantWireTranslation(
-                                itemId: itemId,
-                                originalText: updated.rawText,
-                                rewrittenText: updated.renderedText,
-                                wireRequestText: wireRequestText(runId: runId)
-                            )),
-                            deltaEvent
-                        ])
+                        // Render complete records as they arrive, but wait for
+                        // item completion before exposing raw RCW1 metadata. The
+                        // host can only prove profitability against the complete
+                        // response, not a temporarily favorable prefix.
+                        return .emit([deltaEvent])
                     }
                 }
                 lock.unlock()
@@ -7093,15 +7143,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         case .output:
                             deltaEvent = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: rendered, summary: nil)
                         }
-                        return .emit([
-                            .wireTranslation(AssistantWireTranslation(
-                                itemId: itemId,
-                                originalText: newBuffer.rawText,
-                                rewrittenText: rendered,
-                                wireRequestText: wireRequestText(runId: runId)
-                            )),
-                            deltaEvent
-                        ])
+                        return .emit([deltaEvent])
                     }
                 }
                 runBuffers[itemId] = newBuffer
@@ -7140,15 +7182,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         ? error
                         : buffered.renderedText + "\n\n" + error
                 }
-                var events: [AssistantEvent] = [
-                    .wireTranslation(AssistantWireTranslation(
+                var events: [AssistantEvent] = []
+                let projection = wireResponseProjection(buffered.rawText)
+                if projection.map(admitsWireResponse) ?? true {
+                    events.append(.wireTranslation(AssistantWireTranslation(
                         itemId: itemId,
                         originalText: buffered.rawText,
                         rewrittenText: completeRendered,
                         fallbackReason: completeRendered == buffered.renderedText ? nil : "deterministic_render",
                         wireRequestText: wireRequestText(runId: runId)
-                    ))
-                ]
+                    )))
+                }
                 if completeRendered != buffered.renderedText {
                     let append: String
                     if completeRendered.hasPrefix(buffered.renderedText) {

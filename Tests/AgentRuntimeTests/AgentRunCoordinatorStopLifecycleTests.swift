@@ -750,6 +750,7 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         // Short deadline so the test proves fail-open without a long sleep.
         coordinator.providerTerminalTranslationDeadline = 0.2
         let hangGate = DispatchSemaphore(value: 0)
+        coordinator.finalResponseWireAdmissionCheck = { _, _ in true }
         coordinator.finalResponseTranslator = { response, _, _, _ in
             hangGate.wait()
             return "Rendered: \(response)"
@@ -926,6 +927,7 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         )
         let hangGate = DispatchSemaphore(value: 0)
         var translatorEntered = false
+        coordinator.finalResponseWireAdmissionCheck = { _, _ in true }
         coordinator.finalResponseTranslator = { response, _, _, _ in
             translatorEntered = true
             hangGate.wait()

@@ -691,6 +691,7 @@ final class TokenSaverCompressionTests: XCTestCase {
         )
 
         let rendered = "Tests passed and the saved-token counter was updated."
+        coordinator.finalResponseWireAdmissionCheck = { _, _ in true }
         coordinator.finalResponseTranslator = { response, provider, threadId, _ in
             XCTAssertEqual(provider, .claude)
             XCTAssertEqual(threadId, thread.id)
@@ -728,6 +729,57 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertEqual(durable.messageId, assistant.id)
     }
 
+    /// WHY: RCW1 framing is not a saving when the complete provider frame costs
+    /// more than its deterministic Human projection. Such a response must remain
+    /// readable without being persisted or advertised as an optimized translation.
+    func test_unadmittedWireFinalFailsOpenToHumanWithoutRCW1Disclosure() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-ts-response-profitability-gate-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let wire = "RCW1\tA\t1\nO\tOK\n.\n"
+        let runner = ScriptedFinalRunner(provider: .codex, finalMessage: wire)
+        let thread = AgentThread(title: "wire admission", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let wireRequest = "RCW1\tQ\t1\nG\tReturn one terse result.\n.\n"
+        coordinator.promptCompressor = { _, _, _, _ in wireRequest }
+        coordinator.finalResponseTranslator = { _, _, _, _ in
+            XCTFail("an unadmitted RCW1 response must not enter the translation lane")
+            return "wrong"
+        }
+
+        _ = try await coordinator.startRun(.init(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Return one terse result."
+        ))
+        let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
+
+        XCTAssertEqual(assistant.content, "OK")
+        XCTAssertTrue(
+            try messageRepo.rcw1ResponseTranslations(
+                threadId: thread.id,
+                messageIds: [assistant.id]
+            ).isEmpty,
+            "a fail-open Human response must not gain an RCW1 toggle"
+        )
+        var timeline = AssistantTimelineState()
+        for event in coordinator.latestStreamEvents(threadId: thread.id) {
+            timeline.apply(event)
+        }
+        XCTAssertNil(timeline.tokenSaverTranslationsByMessageId[assistant.id.value.uuidString])
+    }
+
     func test_identicalReadableResponsesKeepDistinctRunOwnedRCW1Associations() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-ts-identical-response-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }
@@ -746,6 +798,7 @@ final class TokenSaverCompressionTests: XCTestCase {
             threadRepo: threadRepo,
             providers: [.claude: runner]
         )
+        coordinator.finalResponseWireAdmissionCheck = { _, _ in true }
         coordinator.finalResponseTranslator = { _, _, _, _ in readable }
 
         let firstRun = AgentRunID()
@@ -819,6 +872,7 @@ final class TokenSaverCompressionTests: XCTestCase {
         )
 
         let rendered = "The provider matrix passed. Claude exited 0."
+        coordinator.finalResponseWireAdmissionCheck = { _, _ in true }
         coordinator.finalResponseTranslator = { response, _, _, _ in
             XCTAssertEqual(response, wire.trimmingCharacters(in: .whitespacesAndNewlines),
                            "the local renderer must receive only the strict frame payload")
@@ -896,6 +950,7 @@ final class TokenSaverCompressionTests: XCTestCase {
             providers: [.claude: runner]
         )
 
+        coordinator.finalResponseWireAdmissionCheck = { _, _ in true }
         coordinator.finalResponseTranslator = { _, _, _, _ in
             "Build passed. Raw log retained.\n[[rc:cafebabe]]"
         }
@@ -930,6 +985,7 @@ final class TokenSaverCompressionTests: XCTestCase {
         )
         let observer = RecordingObserver()
         coordinator.addObserver(observer)
+        coordinator.finalResponseWireAdmissionCheck = { _, _ in true }
         coordinator.finalResponseTranslator = { _, _, _, _ in
             XCTFail("complete streamed frames use the deterministic renderer without an MLX wait")
             return "wrong"
@@ -965,6 +1021,62 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertTrue(metadata.rewrittenText.contains("Focused tests passed"))
     }
 
+    /// WHY: streamed providers expose complete RCW1 prefixes before the item is
+    /// terminal. Disclosure must wait for the complete-frame host gate so a
+    /// temporarily small prefix cannot create a misleading optimized toggle.
+    func test_unadmittedWireStreamRendersHumanWithoutRCW1Disclosure() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-wire-stream-profitability-gate-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let wire = "RCW1\tA\t1\nO\tOK\n.\n"
+        let runner = ScriptedStreamRunner(provider: .grok, body: wire)
+        let thread = AgentThread(title: "wire stream admission", provider: .grok, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.grok: runner]
+        )
+        let observer = RecordingObserver()
+        coordinator.addObserver(observer)
+        let wireRequest = "RCW1\tQ\t1\nG\tReturn one terse result.\n.\n"
+        coordinator.promptCompressor = { _, _, _, _ in wireRequest }
+        coordinator.finalResponseTranslator = { _, _, _, _ in
+            XCTFail("complete unadmitted streamed frames use deterministic Human fail-open")
+            return "wrong"
+        }
+
+        _ = try await coordinator.startRun(.init(
+            threadId: thread.id,
+            provider: .grok,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Return one terse result."
+        ))
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline,
+              !observer.recordedEvents.contains(where: {
+                  if case .itemCompleted(let itemId, _) = $0 { return itemId == "stream-item" }
+                  return false
+              }) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(), "OK")
+        var timeline = AssistantTimelineState()
+        for event in coordinator.latestStreamEvents(threadId: thread.id) {
+            timeline.apply(event)
+        }
+        XCTAssertNil(
+            timeline.tokenSaverTranslationsByItemId["stream-item"],
+            "Human fail-open stream items must not gain an RCW1 response toggle"
+        )
+    }
+
     func test_splitWireSentinelNeverLeaksPartialTransportText() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-wire-split-sentinel-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -984,6 +1096,7 @@ final class TokenSaverCompressionTests: XCTestCase {
         )
         let observer = RecordingObserver()
         coordinator.addObserver(observer)
+        coordinator.finalResponseWireAdmissionCheck = { _, _ in true }
         coordinator.finalResponseTranslator = { response, _, _, _ in response }
 
         _ = try await coordinator.startRun(.init(
@@ -1243,7 +1356,7 @@ final class TokenSaverCompressionTests: XCTestCase {
                        "the disclosure must retain what RemoteCode actually sent")
     }
 
-    func test_plainStreamOnAdmittedWirePublishesInspectableRequestWithoutBufferingProse() async throws {
+    func test_plainStreamOnAdmittedWireKeepsRequestDisclosureOnUserMessageWithoutBufferingProse() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-wire-plain-stream-disclosure-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -1267,7 +1380,9 @@ final class TokenSaverCompressionTests: XCTestCase {
         coordinator.promptCompressor = { _, _, _, _ in requestWire }
         coordinator.finalResponseTranslator = { response, _, _, _ in response }
 
+        let runId = AgentRunID()
         _ = try await coordinator.startRun(.init(
+            runId: runId,
             threadId: thread.id,
             provider: .codex,
             model: "fake-model",
@@ -1282,21 +1397,19 @@ final class TokenSaverCompressionTests: XCTestCase {
         }
         XCTAssertEqual(observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(), plain,
                        "provider plaintext must keep streaming immediately instead of waiting for translation")
-        let disclosureDeadline = Date().addingTimeInterval(3)
-        var pendingMetadata: AssistantSR1Translation?
-        while Date() < disclosureDeadline, pendingMetadata == nil {
-            var timeline = AssistantTimelineState()
-            for event in coordinator.latestStreamEvents(threadId: thread.id) { timeline.apply(event) }
-            pendingMetadata = timeline.tokenSaverTranslationsByItemId["stream-item"]
-            if pendingMetadata == nil {
-                try? await Task.sleep(nanoseconds: 10_000_000)
-            }
+        var timeline = AssistantTimelineState()
+        for event in coordinator.latestStreamEvents(threadId: thread.id) {
+            timeline.apply(event)
         }
-        let metadata = try XCTUnwrap(pendingMetadata)
-        XCTAssertEqual(metadata.wireRequestText, requestWire,
-                       "the progress item must expose the exact admitted RCW1 request before the final reply")
-        XCTAssertEqual(metadata.originalText, "",
-                       "plaintext remains canonical in the item body; the placeholder must not duplicate it in memory")
+        XCTAssertNil(
+            timeline.tokenSaverTranslationsByItemId["stream-item"],
+            "a Human provider response must not inherit the user message's RCW1 toggle"
+        )
+        XCTAssertEqual(
+            timeline.tokenSaverTranslationsByMessageId[runId.value.uuidString]?.wireRequestText,
+            requestWire,
+            "the exact admitted request remains inspectable on its owning user message"
+        )
     }
 
     private func waitForAssistantMessage(

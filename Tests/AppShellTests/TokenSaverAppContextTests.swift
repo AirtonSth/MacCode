@@ -2409,6 +2409,18 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
     }
 
+    func test_appHostFailsOpenRCW1ResponsesWithoutExactTokenProof() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2WireResponseAdmission-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let wire = "RCW1\tA\t1\nO\tOK\n.\n"
+
+        XCTAssertFalse(
+            context.coordinator.finalResponseWireAdmissionCheck(wire, "OK"),
+            "the shipped host must not create an RCW1 response toggle without exact provider-token proof at or below 45%"
+        )
+    }
+
     func test_providerUsageDoesNotRecordSavingsWithoutAttributableTransform() throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverDistillSkillSavings-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
