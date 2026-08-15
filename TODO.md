@@ -7,6 +7,10 @@ Product intent this loop: ship remaining P1a-honest work **including Dedicated l
 
 ## Open
 
+## Critic
+
+- [x] Phase C visual critic 2026-08-15T20:50-03:00 — Fleet Home + Studio Profile/Desktop/Brain + Desk ≥ honest P1a of plan-bots assets (`bots-home.png`, `bot-studio.png`, `bot-desk.png`). Structure matches (roster, routing, Current Goal / Activity / Next Routine, Desktop honesty, Memory/Skills/Routines/Approvals; 2-col Studio + summary; Desk chat + desktop + inspector). Concept-only chrome correctly absent: Take over / Pause / Screenshot / Full screen, Isolated network, Encrypted disk, Last checkpoint, “Active now in macOS VM”, P1b Allow once/Deny, P3 handoff. Smoke clean on worktree pid 27524 window 39486. Expire.
+
 ## Done
 
 - [x] dedicated-local-vm-guest Restore.ipsw Start loads VZMacOSRestoreImage and runs VZMacOSInstaller; dummy IPSW fails as invalid-restore-image (not a virtual-disk / EFI boot). Honesty: “Stopped. Restore image is not a valid macOS IPSW: … not isolated.” No isolated-network / takeover. A host-supplied valid IPSW that finishes install remains a later leftover. — seen: 2026-08-15 — done: this fire
