@@ -16,6 +16,7 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.studioTab")
         UserDefaults.standard.removeObject(forKey: "bots.queuedFollowUps")
         UserDefaults.standard.removeObject(forKey: "bots.composerDrafts")
+        UserDefaults.standard.removeObject(forKey: "bots.inspectorDrafts")
     }
 
     override func tearDown() {
@@ -1352,6 +1353,92 @@ final class BotsWindowTests: XCTestCase {
         reopened.openDesk(bot)
         XCTAssertEqual(reopened.composerText, "", "a sent line must not come back as a draft")
         XCTAssertTrue(reopened.deskMessages.contains { $0.text == "send then forget" })
+    }
+
+    func test_inspectorDraftsStayOnOwningBot_becauseMemorySkillsRoutinesMustNotLeak() throws {
+        // WHY: memory/skill/routine fields were process-wide. A fact typed
+        // for New Agent appeared on Batatilson's Memory inspector.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.beginEdit(piper)
+        vm.memoryDraft = "only-piper-memory-draft"
+        vm.skillDraft = "only-piper-skill"
+        vm.routineName = "Piper scan"
+        vm.routinePrompt = "Scan Piper"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.beginEdit(quinn)
+        XCTAssertEqual(vm.memoryDraft, "", "Quinn Studio must not inherit Piper's memory draft")
+        XCTAssertEqual(vm.skillDraft, "", "Quinn Studio must not inherit Piper's skill draft")
+        XCTAssertEqual(vm.routineName, "")
+        XCTAssertEqual(vm.routinePrompt, "")
+        XCTAssertEqual(vm.routineScheduleNote, "")
+        vm.memoryDraft = "only-quinn-memory-draft"
+        vm.skillDraft = "only-quinn-skill"
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.memoryDraft, "only-piper-memory-draft")
+        XCTAssertEqual(vm.skillDraft, "only-piper-skill")
+        XCTAssertEqual(vm.routineName, "Piper scan")
+        XCTAssertEqual(vm.routinePrompt, "Scan Piper")
+        XCTAssertEqual(vm.routineScheduleNote, "Weekdays 9:00")
+        vm.openDesk(quinn)
+        XCTAssertEqual(vm.memoryDraft, "only-quinn-memory-draft")
+        XCTAssertEqual(vm.skillDraft, "only-quinn-skill")
+        XCTAssertEqual(vm.routineName, "")
+    }
+
+    func test_inspectorDraftSurvivesRelaunch_becauseUnsentFactsMustNotVanish() throws {
+        // WHY: an unsent Memory/Skills/Routines field is user work, same
+        // class of loss as an unsent Desk composer line.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        vm.memoryDraft = "keep inspector after relaunch"
+        vm.skillDraft = "weekly-account-health"
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.selectedBotID, bot.id)
+        XCTAssertEqual(reopened.memoryDraft, "keep inspector after relaunch")
+        XCTAssertEqual(reopened.skillDraft, "weekly-account-health")
+        XCTAssertEqual(reopened.routineName, "Morning scan")
+        XCTAssertEqual(reopened.routinePrompt, "Scan overnight")
+        XCTAssertEqual(reopened.routineScheduleNote, "Weekdays 9:00")
+        XCTAssertTrue(reopened.memoryItems.isEmpty, "relaunch must restore the draft, not save it")
+    }
+
+    func test_savingInspectorFieldsClearsOnlyThatBotDraft_becauseSentFactsAreNotDrafts() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.beginEdit(piper)
+        vm.memoryDraft = "Prefers dark mode"
+        vm.addMemory()
+        XCTAssertTrue(vm.memoryDraft.isEmpty)
+        vm.beginEdit(quinn)
+        vm.memoryDraft = "Quinn-only fact"
+        vm.beginEdit(piper)
+        XCTAssertEqual(vm.memoryDraft, "", "saved memory must not return as a draft")
+        XCTAssertEqual(vm.memoryItems.map(\.content), ["Prefers dark mode"])
+        vm.beginEdit(quinn)
+        XCTAssertEqual(vm.memoryDraft, "Quinn-only fact")
+    }
+
+    func test_deletedBotDropsItsInspectorDraft_becauseTheTeammateIsGone() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.beginEdit(piper)
+        vm.memoryDraft = "orphan this inspector draft"
+        vm.delete(id: piper.id)
+        let reopened = BotsViewModel(context: context)
+        reopened.beginEdit(quinn)
+        XCTAssertEqual(reopened.memoryDraft, "")
     }
 
     func test_deletedBotDropsItsComposerDraft_becauseTheTeammateIsGone() throws {

@@ -38,6 +38,33 @@ public struct BotComposerDraft: Equatable, Codable {
     }
 }
 
+public struct BotInspectorDraft: Equatable, Codable {
+    public var memoryDraft: String
+    public var skillDraft: String
+    public var routineName: String
+    public var routinePrompt: String
+    public var routineScheduleNote: String
+
+    public init(
+        memoryDraft: String = "",
+        skillDraft: String = "",
+        routineName: String = "",
+        routinePrompt: String = "",
+        routineScheduleNote: String = ""
+    ) {
+        self.memoryDraft = memoryDraft
+        self.skillDraft = skillDraft
+        self.routineName = routineName
+        self.routinePrompt = routinePrompt
+        self.routineScheduleNote = routineScheduleNote
+    }
+
+    public var isEmpty: Bool {
+        [memoryDraft, skillDraft, routineName, routinePrompt, routineScheduleNote]
+            .allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+}
+
 public struct BotStudioDraft: Equatable {
     public var botID: BotID?
     public var name: String
@@ -299,11 +326,21 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var lastContextReceipt: ContextAssemblyReceipt?
     @Published public var brainPane: BotBrainInspectorPane = .source
     @Published public private(set) var routines: [BotRoutine] = []
-    @Published public var memoryDraft: String = ""
-    @Published public var skillDraft: String = ""
-    @Published public var routineName: String = ""
-    @Published public var routinePrompt: String = ""
-    @Published public var routineScheduleNote: String = ""
+    @Published public var memoryDraft: String = "" {
+        didSet { persistInspectorIfHydrated() }
+    }
+    @Published public var skillDraft: String = "" {
+        didSet { persistInspectorIfHydrated() }
+    }
+    @Published public var routineName: String = "" {
+        didSet { persistInspectorIfHydrated() }
+    }
+    @Published public var routinePrompt: String = "" {
+        didSet { persistInspectorIfHydrated() }
+    }
+    @Published public var routineScheduleNote: String = "" {
+        didSet { persistInspectorIfHydrated() }
+    }
     @Published public var errorMessage: String?
     @Published public private(set) var providers: [AgentProviderSnapshot] = []
     @Published public private(set) var isControlPlaneActive = true
@@ -332,6 +369,9 @@ public final class BotsViewModel: ObservableObject {
     private var composerDraftsByBot: [BotID: BotComposerDraft] = [:]
     private var composerHydrated = false
     private var isApplyingComposerDraft = false
+    private var inspectorDraftsByBot: [BotID: BotInspectorDraft] = [:]
+    private var inspectorHydrated = false
+    private var isApplyingInspectorDraft = false
     private var deskLiveTurnWatch: Task<Void, Never>?
 
     public init(context: AppContext, router: AppCommandRouter? = nil) {
@@ -341,12 +381,16 @@ public final class BotsViewModel: ObservableObject {
         self.settingsStore = SettingsStore(db: context.db)
         restoreQueuedFollowUpsIfNeeded()
         restoreComposerDraftsIfNeeded()
+        restoreInspectorDraftsIfNeeded()
         restoreInspectorTabIfNeeded()
         restoreStudioTabIfNeeded()
         reload()
         restoreScreenIfNeeded()
         if !composerHydrated {
             applyComposerDraft(for: selectedBotID)
+        }
+        if !inspectorHydrated {
+            applyInspectorDraft(for: selectedBotID)
         }
         context.coordinator.addObserver(self)
     }
@@ -739,8 +783,10 @@ public final class BotsViewModel: ObservableObject {
             }
             queuedFollowUpsByBot[id] = nil
             composerDraftsByBot[id] = nil
+            inspectorDraftsByBot[id] = nil
             persistQueuedFollowUps()
             persistComposerDrafts()
+            persistInspectorDrafts()
             syncQueuedFollowUps()
             reloadFleet()
             reloadAttention()
@@ -1154,6 +1200,7 @@ public final class BotsViewModel: ObservableObject {
             rebuildAttentionStates()
             pruneQueuedFollowUpsToFleet()
             pruneComposerDraftsToFleet()
+            pruneInspectorDraftsToFleet()
         } catch {
             errorMessage = String(describing: error)
         }
@@ -1246,6 +1293,7 @@ public final class BotsViewModel: ObservableObject {
     private static let studioTabDefaultsKey = "bots.studioTab"
     private static let queuedFollowUpsDefaultsKey = "bots.queuedFollowUps"
     private static let composerDraftsDefaultsKey = "bots.composerDrafts"
+    private static let inspectorDraftsDefaultsKey = "bots.inspectorDrafts"
 
     private func persistSelection() {
         UserDefaults.standard.set(selectedBotID?.value.uuidString.lowercased(), forKey: Self.selectedBotDefaultsKey)
@@ -1315,13 +1363,22 @@ public final class BotsViewModel: ObservableObject {
             } else {
                 applyComposerDraft(for: id)
             }
+            if inspectorHydrated {
+                captureInspectorDraft()
+            } else {
+                applyInspectorDraft(for: id)
+            }
             return
         }
         if composerHydrated {
             captureComposerDraft()
         }
+        if inspectorHydrated {
+            captureInspectorDraft()
+        }
         selectedBotID = id
         applyComposerDraft(for: id)
+        applyInspectorDraft(for: id)
     }
 
     private func captureComposerDraft(for botID: BotID? = nil) {
@@ -1377,6 +1434,73 @@ public final class BotsViewModel: ObservableObject {
         persistComposerDrafts()
     }
 
+    private func persistInspectorIfHydrated() {
+        guard inspectorHydrated, !isApplyingInspectorDraft else { return }
+        captureInspectorDraft()
+    }
+
+    private func captureInspectorDraft(for botID: BotID? = nil) {
+        guard let botID = botID ?? selectedBotID else { return }
+        let draft = BotInspectorDraft(
+            memoryDraft: memoryDraft,
+            skillDraft: skillDraft,
+            routineName: routineName,
+            routinePrompt: routinePrompt,
+            routineScheduleNote: routineScheduleNote
+        )
+        if draft.isEmpty {
+            inspectorDraftsByBot[botID] = nil
+        } else {
+            inspectorDraftsByBot[botID] = draft
+        }
+        persistInspectorDrafts()
+    }
+
+    private func applyInspectorDraft(for botID: BotID?) {
+        let draft = botID.flatMap { inspectorDraftsByBot[$0] } ?? BotInspectorDraft()
+        isApplyingInspectorDraft = true
+        memoryDraft = draft.memoryDraft
+        skillDraft = draft.skillDraft
+        routineName = draft.routineName
+        routinePrompt = draft.routinePrompt
+        routineScheduleNote = draft.routineScheduleNote
+        isApplyingInspectorDraft = false
+        inspectorHydrated = true
+    }
+
+    private func persistInspectorDrafts() {
+        let payload = Dictionary(uniqueKeysWithValues: inspectorDraftsByBot.compactMap { id, draft -> (String, BotInspectorDraft)? in
+            draft.isEmpty ? nil : (id.value.uuidString.lowercased(), draft)
+        })
+        if payload.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.inspectorDraftsDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.inspectorDraftsDefaultsKey)
+        }
+    }
+
+    private func restoreInspectorDraftsIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.inspectorDraftsDefaultsKey),
+              let payload = try? JSONDecoder().decode([String: BotInspectorDraft].self, from: data)
+        else { return }
+        var restored: [BotID: BotInspectorDraft] = [:]
+        for (raw, draft) in payload {
+            guard let uuid = UUID(uuidString: raw), !draft.isEmpty else { continue }
+            restored[BotID(uuid)] = draft
+        }
+        inspectorDraftsByBot = restored
+    }
+
+    private func pruneInspectorDraftsToFleet() {
+        let live = Set(bots.map(\.id))
+        let next = inspectorDraftsByBot.filter { live.contains($0.key) }
+        guard next.count != inspectorDraftsByBot.count else { return }
+        inspectorDraftsByBot = next
+        persistInspectorDrafts()
+    }
+
     private func restoreInspectorTabIfNeeded() {
         guard let raw = UserDefaults.standard.string(forKey: Self.inspectorTabDefaultsKey),
               let tab = BotDeskInspectorTab(rawValue: raw) else { return }
@@ -1414,6 +1538,9 @@ public final class BotsViewModel: ObservableObject {
         if let selectedBotID, fleet.contains(where: { $0.id == selectedBotID }) {
             if !composerHydrated {
                 applyComposerDraft(for: selectedBotID)
+            }
+            if !inspectorHydrated {
+                applyInspectorDraft(for: selectedBotID)
             }
             return
         }
