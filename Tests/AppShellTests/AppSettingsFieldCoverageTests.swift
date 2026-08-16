@@ -52,7 +52,6 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
             "botsMemoryEnabled",
             "botsEffectsEnabled",
             "botsAutonomyEnabled",
-            "botsDesktopVMEnabled",
             "botsChannelsEnabled",
         ]
         let actual = Set(AppSettingsKeys.userTunableKeys)

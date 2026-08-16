@@ -346,10 +346,8 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var isControlPlaneActive = true
     @Published public private(set) var isMemoryActive = true
     @Published public private(set) var isAutonomyActive = false
-    @Published public private(set) var isDesktopVMActive = false
     @Published public private(set) var lastSendStartedProviderRun = false
     @Published public var pendingDeleteID: BotID?
-    @Published public private(set) var desktopVM: BotDesktopVMIdentity?
     public var onLeaveBots: (() -> Void)?
 
     public var displayedDesktopKind: BotDesktopKind {
@@ -360,24 +358,17 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public var desktopHonestyLabel: String {
-        if displayedDesktopKind == .dedicatedLocalVM, let desktopVM {
-            return desktopVM.honestyLabel
-        }
-        return displayedDesktopKind.honestyLabel
+        displayedDesktopKind.honestyLabel
     }
 
     public var desktopStatusPill: String {
-        if displayedDesktopKind == .dedicatedLocalVM, let desktopVM {
-            return desktopVM.statusPill
-        }
-        return displayedDesktopKind.statusPill
+        displayedDesktopKind.statusPill
     }
 
     private let context: AppContext
     private let router: AppCommandRouter?
     private let botStore: BotStore
     private let settingsStore: SettingsStore
-    private let desktopVMRuntime: BotDesktopVMRuntime
     private var messagesByBot: [BotID: [BotDeskMessage]] = [:]
     private var attentionStateByBot: [BotID: BotAttentionState] = [:]
     private var lastPreviewByBot: [BotID: String] = [:]
@@ -399,8 +390,6 @@ public final class BotsViewModel: ObservableObject {
         self.router = router
         self.botStore = context.botStore
         self.settingsStore = SettingsStore(db: context.db)
-        let desktopRoot = context.appSupportDirectory.appendingPathComponent("bot-desktops", isDirectory: true)
-        self.desktopVMRuntime = BotDesktopVMRuntime(store: BotDesktopVMStore(root: desktopRoot))
         restoreQueuedFollowUpsIfNeeded()
         restoreComposerDraftsIfNeeded()
         restoreInspectorDraftsIfNeeded()
@@ -761,28 +750,6 @@ public final class BotsViewModel: ObservableObject {
         )
         beginEdit(created)
         return created
-    }
-
-    public func startDesktopVM() {
-        guard let botID = selectedBotID ?? studioDraft.botID else { return }
-        do {
-            desktopVM = try desktopVMRuntime.start(botID: botID)
-        } catch {
-            errorMessage = String(describing: error)
-        }
-    }
-
-    public func stopDesktopVM() {
-        guard let botID = selectedBotID ?? studioDraft.botID else { return }
-        do {
-            desktopVM = try desktopVMRuntime.stop(botID: botID)
-        } catch {
-            errorMessage = String(describing: error)
-        }
-    }
-
-    private func reloadDesktopVM(botID: BotID) {
-        desktopVM = try? desktopVMRuntime.identity(botID: botID)
     }
 
     @discardableResult
@@ -1220,7 +1187,6 @@ public final class BotsViewModel: ObservableObject {
         isControlPlaneActive = settings.isBotControlPlaneActive
         isMemoryActive = settings.isBotMemoryActive
         isAutonomyActive = settings.isBotAutonomyActive
-        isDesktopVMActive = settings.isBotDesktopVMActive
     }
 
     private func reloadFleet() {
@@ -1304,7 +1270,6 @@ public final class BotsViewModel: ObservableObject {
                 selectedRevision = nil
             }
             skillBindings = try botStore.listSkillBindings(botID: id)
-            reloadDesktopVM(botID: id)
             reloadMemory(botID: id)
             reloadRoutines(botID: id)
             reloadContextReceipt(botID: id)
@@ -2884,9 +2849,6 @@ public struct BotsRootView: View {
                 .padding(DS.Space.lg)
             }
             .frame(maxWidth: .infinity, minHeight: 188)
-            if kind == .dedicatedLocalVM {
-                desktopVMControls
-            }
             if let model = vm.selectedRevision?.model, !model.isEmpty {
                 Text(model)
                     .font(DS.Font.caption)
@@ -3255,23 +3217,11 @@ public struct BotsRootView: View {
                 enabled: true,
                 identifier: "bots.studio.desktop.logical"
             )
-            desktopOption(
-                kind: .dedicatedLocalVM,
-                title: "Dedicated local VM Desktop",
-                enabled: true,
-                status: vm.displayedDesktopKind == .dedicatedLocalVM
-                    ? vm.desktopStatusPill
-                    : "Guest not running",
-                identifier: "bots.studio.desktop.vm"
-            )
             Text(vm.desktopHonestyLabel)
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.warning)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("bots.studio.desktop.honesty")
-            if vm.displayedDesktopKind == .dedicatedLocalVM {
-                desktopVMControls
-            }
         }
         .dsPanel(padding: DS.Space.lg)
         .accessibilityIdentifier("bots.studio.desktop")
@@ -3289,7 +3239,7 @@ public struct BotsRootView: View {
             vm.studioDraft.desktopKind = kind
         } label: {
             HStack(alignment: .top, spacing: DS.Space.md) {
-                Image(systemName: vm.studioDraft.desktopKind == kind ? "largecircle.fill.circle" : "circle")
+                Image(systemName: vm.displayedDesktopKind == kind ? "largecircle.fill.circle" : "circle")
                     .foregroundColor(enabled ? DS.Palette.accent : DS.Palette.textTertiary)
                     .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 2) {
@@ -3513,9 +3463,6 @@ public struct BotsRootView: View {
                 .padding(DS.Space.lg)
             }
             .frame(maxWidth: .infinity, minHeight: 160)
-            if kind == .dedicatedLocalVM {
-                desktopVMControls
-            }
         }
         .padding(DS.Space.lg)
         .dsBar(edge: .bottom)
@@ -3523,41 +3470,16 @@ public struct BotsRootView: View {
         .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
     }
 
-    private var desktopVMControls: some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            if let identity = vm.desktopVM {
-                Text("Identity \(identity.shortID) · gen \(identity.generation)")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .accessibilityIdentifier("bots.desktop.vm.identity")
-            }
-            HStack(spacing: DS.Space.sm) {
-                Button("Start") { vm.startDesktopVM() }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .disabled(vm.selectedBotID == nil && vm.studioDraft.botID == nil)
-                    .accessibilityIdentifier("bots.desktop.vm.start")
-                Button("Stop") { vm.stopDesktopVM() }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .disabled(vm.selectedBotID == nil && vm.studioDraft.botID == nil)
-                    .accessibilityIdentifier("bots.desktop.vm.stop")
-            }
-        }
-    }
-
     private func desktopPreviewColors(_ kind: BotDesktopKind) -> [Color] {
         switch kind {
-        case .dedicatedLocalVM:
-            return [Color(hex: 0x102028), Color(hex: 0x2563EB).opacity(0.42), Color(hex: 0x171D24)]
-        case .logicalExecutionSpace, .managedRemoteMac:
+        case .logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac:
             return [Color(hex: 0x2A1848), Color(hex: 0x7B5CFF).opacity(0.55), Color(hex: 0x171D24)]
         }
     }
 
     private func desktopPreviewSymbol(_ kind: BotDesktopKind) -> String {
         switch kind {
-        case .dedicatedLocalVM:
-            return "internaldrive"
-        case .logicalExecutionSpace, .managedRemoteMac:
+        case .logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac:
             return "desktopcomputer"
         }
     }

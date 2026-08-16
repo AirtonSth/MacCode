@@ -66,7 +66,7 @@ final class BotTypesTests: XCTestCase {
         XCTAssertNotEqual(first, changedSoul, "soul is published identity; a change must produce a new digest")
     }
 
-    func test_desktopLabel_statesSharedAccount_becauseUsersMustNotThinkP1aIsAnIsolatedVM() {
+    func test_desktopLabel_statesSharedAccount_becauseUsersMustNotThinkP1aIsAnIsolatedVM() throws {
         XCTAssertEqual(
             BotDesktopKind.logicalExecutionSpace.honestyLabel,
             "Same macOS account; not isolated. Not a dedicated Desktop."
@@ -75,37 +75,21 @@ final class BotTypesTests: XCTestCase {
             BotDesktopKind.logicalExecutionSpace.honestyLabel.localizedCaseInsensitiveContains("virtual machine")
         )
         XCTAssertEqual(
-            BotDesktopKind.dedicatedLocalVM.honestyLabel,
-            BotDesktopKind.dedicatedLocalVMHonestyLabel
+            BotDesktopKind.dedicatedLocalVM.advertisedOrLogical,
+            .logicalExecutionSpace,
+            "leftover Dedicated local VM must display and publish as Logical execution space"
         )
-        XCTAssertTrue(
-            BotDesktopKind.dedicatedLocalVM.honestyLabel.localizedCaseInsensitiveContains("not running")
-        )
-        XCTAssertTrue(
-            BotDesktopKind.dedicatedLocalVM.honestyLabel.localizedCaseInsensitiveContains("not isolated")
-        )
-        XCTAssertFalse(
-            BotDesktopKind.dedicatedLocalVM.honestyLabel.localizedCaseInsensitiveContains("active now")
-        )
-        XCTAssertEqual(BotDesktopKind.dedicatedLocalVM.displayTitle, "Dedicated local VM")
-        XCTAssertEqual(BotDesktopKind.dedicatedLocalVM.statusPill, "Local VM · not running")
         XCTAssertFalse(
             BotDesktopKind.logicalExecutionSpace.isSelectable(
                 flags: BotControlPlaneFlags(botsControlPlaneEnabled: false)
             ),
             "even the shared-account desktop is unavailable when the control plane is off"
         )
-        XCTAssertTrue(
-            BotDesktopKind.dedicatedLocalVM.isSelectable(
-                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true, botsDesktopVMEnabled: false)
-            ),
-            "select/persist the VM kind without requiring a guest runtime flag"
-        )
         XCTAssertFalse(
             BotDesktopKind.dedicatedLocalVM.isSelectable(
-                flags: BotControlPlaneFlags(botsControlPlaneEnabled: false, botsDesktopVMEnabled: true)
+                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true, botsDesktopVMEnabled: true)
             ),
-            "a later-phase flag cannot enable VM desktop when the control plane is off"
+            "Dedicated local VM must not be selectable even if a leftover persist flag is on"
         )
         XCTAssertFalse(
             BotDesktopKind.managedRemoteMac.isSelectable(
@@ -118,8 +102,15 @@ final class BotTypesTests: XCTestCase {
             ),
             "Managed remote Mac must not be selectable even if a leftover persist flag is on"
         )
-        XCTAssertEqual(BotDesktopKind.advertisedKinds, [.logicalExecutionSpace, .dedicatedLocalVM])
+        XCTAssertEqual(BotDesktopKind.advertisedKinds, [.logicalExecutionSpace])
+        XCTAssertFalse(BotDesktopKind.dedicatedLocalVM.isAdvertised)
         XCTAssertFalse(BotDesktopKind.managedRemoteMac.isAdvertised)
+        let leftover = try JSONDecoder().decode(
+            BotDesktopKind.self,
+            from: Data(#""dedicatedLocalVM""#.utf8)
+        )
+        XCTAssertEqual(leftover, .dedicatedLocalVM, "stored leftover kinds must still decode")
+        XCTAssertEqual(leftover.advertisedOrLogical, .logicalExecutionSpace)
     }
 
     func test_controlPlaneFlags_failClosed_becauseLaterPhasesMustNotRunWithoutTheShippedSlice() {
@@ -148,77 +139,6 @@ final class BotTypesTests: XCTestCase {
         XCTAssertFalse(planeOff.isBotDesktopVMActive)
         XCTAssertFalse(planeOff.isBotDesktopRemoteActive)
         XCTAssertFalse(planeOff.isBotChannelsActive)
-    }
-
-    func test_desktopVMHonesty_neverClaimsARunningGuestWithoutAnImage() {
-        let identity = BotDesktopVMIdentity(
-            botID: BotID(),
-            bundlePath: "/tmp/bot-desktop",
-            state: .stopped,
-            lastError: BotDesktopVMIdentity.noGuestImageCode,
-            virtualizationSupported: true
-        )
-        XCTAssertTrue(identity.honestyLabel.localizedCaseInsensitiveContains("no guest image"))
-        XCTAssertTrue(identity.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
-        XCTAssertFalse(identity.honestyLabel.localizedCaseInsensitiveContains("active now"))
-        XCTAssertEqual(identity.statusPill, "Local VM · stopped")
-
-        let failed = BotDesktopVMIdentity(
-            botID: BotID(),
-            bundlePath: "/tmp/bot-desktop",
-            state: .failed,
-            lastError: BotDesktopVMIdentity.bootFailedCode,
-            lastErrorDetail: "The disk image is not a valid virtual disk.",
-            virtualizationSupported: true
-        )
-        XCTAssertTrue(failed.honestyLabel.localizedCaseInsensitiveContains("boot failed"))
-        XCTAssertTrue(failed.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
-        XCTAssertFalse(failed.honestyLabel.localizedCaseInsensitiveContains("active now"))
-        XCTAssertFalse(
-            failed.honestyLabel.localizedCaseInsensitiveContains("not a valid virtual disk"),
-            "honesty must not dump Virtualization.framework's raw failure"
-        )
-        XCTAssertEqual(failed.statusPill, "Local VM · failed")
-
-        let starting = BotDesktopVMIdentity(
-            botID: BotID(),
-            bundlePath: "/tmp/bot-desktop",
-            state: .starting,
-            virtualizationSupported: true
-        )
-        XCTAssertTrue(starting.honestyLabel.localizedCaseInsensitiveContains("starting"))
-        XCTAssertTrue(starting.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
-        XCTAssertFalse(starting.honestyLabel.localizedCaseInsensitiveContains("boot failed"))
-        XCTAssertEqual(starting.statusPill, "Local VM · starting")
-
-        let installing = BotDesktopVMIdentity(
-            botID: BotID(),
-            bundlePath: "/tmp/bot-desktop",
-            state: .installing,
-            virtualizationSupported: true
-        )
-        XCTAssertTrue(installing.honestyLabel.localizedCaseInsensitiveContains("installing"))
-        XCTAssertTrue(installing.honestyLabel.localizedCaseInsensitiveContains("restore image"))
-        XCTAssertTrue(installing.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
-        XCTAssertFalse(installing.honestyLabel.localizedCaseInsensitiveContains("active now"))
-        XCTAssertEqual(installing.statusPill, "Local VM · installing")
-
-        let invalidRestore = BotDesktopVMIdentity(
-            botID: BotID(),
-            bundlePath: "/tmp/bot-desktop",
-            state: .failed,
-            lastError: BotDesktopVMIdentity.invalidRestoreImageCode,
-            lastErrorDetail: "The file is not a valid restore image.",
-            virtualizationSupported: true
-        )
-        XCTAssertTrue(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("not a valid macOS"))
-        XCTAssertTrue(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
-        XCTAssertFalse(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("virtual disk"))
-        XCTAssertFalse(
-            invalidRestore.honestyLabel.localizedCaseInsensitiveContains("failed to load"),
-            "Studio/Desk must not paint the raw restore-image dump"
-        )
-        XCTAssertFalse(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("unable to load"))
     }
 
     func test_routineCopy_doesNotClaimAppClosedExecution() {

@@ -66,7 +66,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertTrue(script.contains("codesign --verify --deep --strict --verbose=2 \"$STAGING_APP\""),
                       "local packaging must verify the staged signature before replacing the final app")
         XCTAssertTrue(script.contains("Sources/AppShell/RemoteCode.entitlements"),
-                      "Dedicated local VM needs the virtualization entitlement on the signed app")
+                      "local packaging must attach the signed entitlements file")
         XCTAssertTrue(script.contains("--entitlements \"$ENTITLEMENTS\""),
                       "local packaging must attach RemoteCode.entitlements to the outer app signature")
         let entitlements = try String(
@@ -76,9 +76,9 @@ final class AppIdentityNotificationTests: XCTestCase {
                 .appendingPathComponent("Sources/AppShell/RemoteCode.entitlements"),
             encoding: .utf8
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             entitlements.contains("com.apple.security.virtualization"),
-            "the signed entitlement must admit Virtualization.framework"
+            "bots no longer ship a Virtualization.framework guest"
         )
         XCTAssertTrue(script.contains("refusing to replace running $APP_PATH"),
                       "local packaging must fail loud instead of overwriting a live bundle and letting macOS kill the mapped executable with Code Signature Invalid")

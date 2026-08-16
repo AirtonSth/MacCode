@@ -72,5 +72,31 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "Prefers dark mode" })?.included, true)
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "off-skill" })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .user })?.text, "Summarize overnight")
+        XCTAssertEqual(receipt.desktopKind, .logicalExecutionSpace)
+    }
+
+    func test_leftoverDedicatedLocalVMReceiptResolvesToLogicalSpace() {
+        // WHY: A stored leftover kind must not appear as the live desktop on
+        // Brain receipts after Dedicated local VM was removed from Studio.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let leftover = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .dedicatedLocalVM,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: leftover, userText: "Hi")
+        XCTAssertEqual(receipt.desktopKind, .logicalExecutionSpace)
+        XCTAssertEqual(receipt.desktopKind.honestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
     }
 }

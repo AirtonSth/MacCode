@@ -281,7 +281,7 @@ fi
 CODESIGN_IDENTITY="$("$CODESIGN_RESOLVER")"
 ENTITLEMENTS="$(cd "$(dirname "$0")/.." && pwd)/Sources/AppShell/RemoteCode.entitlements"
 if [ ! -f "$ENTITLEMENTS" ]; then
-  echo "[package] missing $ENTITLEMENTS (Dedicated local VM needs com.apple.security.virtualization)" >&2
+  echo "[package] missing $ENTITLEMENTS" >&2
   exit 1
 fi
 if [ "$CODESIGN_IDENTITY" = "-" ]; then
@@ -294,7 +294,7 @@ else
   codesign --force --sign "$CODESIGN_IDENTITY" --timestamp=none "$STAGING_APP/Contents/Resources/RemoteCodeScheduledTaskAgent"
   codesign --force --deep --sign "$CODESIGN_IDENTITY" --timestamp=none "$STAGING_APP"
 fi
-# Re-sign the outer app (no --deep) so Virtualization.framework is entitled
+# Re-sign the outer app (no --deep) so entitlements attach
 # without rewriting Sparkle/helper signatures.
 codesign --force --sign "$CODESIGN_IDENTITY" --entitlements "$ENTITLEMENTS" --timestamp=none "$STAGING_APP"
 codesign --verify --deep --strict --verbose=2 "$STAGING_APP"

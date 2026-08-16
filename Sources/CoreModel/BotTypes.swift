@@ -73,7 +73,7 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
     public static let logicalExecutionSpaceHonestyLabel =
         "Same macOS account; not isolated. Not a dedicated Desktop."
 
-    /// Kind is selectable. A guest OS is not running; leftover hypervisor work stays open.
+    /// Decode-only leftover. Display and publish resolve to Logical execution space.
     public static let dedicatedLocalVMHonestyLabel =
         "Guest is not running yet. Work still uses this Mac account; not isolated."
 
@@ -110,19 +110,23 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
         }
     }
 
-    /// Kinds Studio may offer. Managed remote Mac is persist-only and must not appear in UI.
+    /// Kinds Studio may offer. Dedicated local VM and Managed remote Mac stay persist-only leftovers.
     public static let advertisedKinds: [BotDesktopKind] = [
         .logicalExecutionSpace,
-        .dedicatedLocalVM,
     ]
 
     public var isAdvertised: Bool { Self.advertisedKinds.contains(self) }
 
+    /// Leftover Dedicated local VM / Managed remote Mac still decode; display and publish use Logical execution space.
+    public var advertisedOrLogical: BotDesktopKind {
+        isAdvertised ? self : .logicalExecutionSpace
+    }
+
     public func isSelectable(flags: BotControlPlaneFlags) -> Bool {
         switch self {
-        case .logicalExecutionSpace, .dedicatedLocalVM:
+        case .logicalExecutionSpace:
             return flags.isBotControlPlaneActive
-        case .managedRemoteMac:
+        case .dedicatedLocalVM, .managedRemoteMac:
             return false
         }
     }

@@ -127,7 +127,7 @@ public enum BotBrainCompiler {
             provider: revision.provider,
             model: revision.model,
             permissionMode: revision.permissionMode,
-            desktopKind: revision.desktopKind,
+            desktopKind: revision.desktopKind.advertisedOrLogical,
             compiledPayload: payload,
             payloadDigest: BotDigest.sha256Hex(payload),
             layers: sourceLayers(
