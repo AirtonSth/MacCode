@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import Persistence
 
 public enum GrokACPError: Error, CustomStringConvertible {
     case missingBinary(String)
@@ -602,12 +603,18 @@ public final class GrokACPClient: @unchecked Sendable {
 
     public static func sessionMCPServers(
         existing: [Any] = [],
-        command: String? = nil
+        command: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [Any] {
         let resolved = command
             ?? AgentSkillInstaller.resolveServiceBinary()?.path
             ?? ComputerUseMCPAdmit.fallbackCommand
-        return ComputerUseMCPAdmit.admitGrokACP(existing: existing, command: resolved)
+        let withComputerUse = ComputerUseMCPAdmit.admitGrokACP(existing: existing, command: resolved)
+        return BotSelfConfigMCPAdmit.admitGrokACP(
+            existing: withComputerUse,
+            command: resolved,
+            environment: environment
+        )
     }
 
     func newSession(cwd: String) async throws -> GrokACPSessionOpenResult {

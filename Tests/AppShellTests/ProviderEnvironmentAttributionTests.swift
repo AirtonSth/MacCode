@@ -640,4 +640,28 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             )
         }
     }
+
+    @MainActor
+    func test_providerEnvironmentStampsCallerBotIdOnLinkedDeskThread() throws {
+        // WHY: self-config MCP must inherit the calling bot, not a baked home-MCP id.
+        let appSupport = NSTemporaryDirectory() + "RC2BotSelfConfigEnv-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: ctx)
+        let bot = try ctx.botStore.create(name: "Piper", title: "", description: "", provider: .claude)
+        let thread = try admittedThread(in: ctx, provider: .claude)
+        try ctx.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Desk", linkedAgentThreadID: thread.id)
+        )
+
+        let env = router.providerEnvironment(provider: .claude, instanceId: nil, threadId: thread.id)
+        XCTAssertEqual(
+            env[BotSelfConfigCatalog.callerEnvironmentKey],
+            bot.id.value.uuidString.lowercased()
+        )
+
+        let other = try admittedThread(in: ctx, provider: .grok)
+        let unbound = router.providerEnvironment(provider: .grok, instanceId: nil, threadId: other.id)
+        XCTAssertNil(unbound[BotSelfConfigCatalog.callerEnvironmentKey])
+    }
 }

@@ -1935,6 +1935,13 @@ public final class AppContext {
                     "RemoteCode: installComputerUseMCP before agent turn failed: \(error.localizedDescription)"
                 )
             }
+            do {
+                try installer.installBotSelfConfigMCP()
+            } catch {
+                NSLog(
+                    "RemoteCode: installBotSelfConfigMCP before agent turn failed: \(error.localizedDescription)"
+                )
+            }
             let managedBin = installer.managedCLIBinURL.path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
@@ -2018,6 +2025,10 @@ public final class AppContext {
             "REMOTE_CODE_AGENT_MODEL": thread?.model ?? "unknown",
             "REMOTE_CODE_PROVIDER_INSTANCE_ID": thread?.providerInstanceId ?? provider.rawValue,
         ]) { _, new in new }
+        if let conversation = try? botStore.conversationLinked(to: threadId) {
+            environment[BotSelfConfigCatalog.callerEnvironmentKey] =
+                conversation.botID.value.uuidString.lowercased()
+        }
         let installer = makeAgentSkillInstaller()
         // Nested launches inherit managed bin; keep distill healthy whenever Token
         // Saver is admitted so child shells and PostToolUse hooks never see a gap.
@@ -2035,6 +2046,13 @@ public final class AppContext {
         } catch {
             NSLog(
                 "RemoteCode: installComputerUseMCP before subagent env failed: \(error.localizedDescription)"
+            )
+        }
+        do {
+            try installer.installBotSelfConfigMCP()
+        } catch {
+            NSLog(
+                "RemoteCode: installBotSelfConfigMCP before subagent env failed: \(error.localizedDescription)"
             )
         }
         let managedBin = installer.managedCLIBinURL.path
@@ -2510,6 +2528,11 @@ public final class AppContext {
             try installer.installComputerUseMCP()
         } catch {
             NSLog("RemoteCode: installComputerUseMCP failed: \(error.localizedDescription)")
+        }
+        do {
+            try installer.installBotSelfConfigMCP()
+        } catch {
+            NSLog("RemoteCode: installBotSelfConfigMCP failed: \(error.localizedDescription)")
         }
     }
 
