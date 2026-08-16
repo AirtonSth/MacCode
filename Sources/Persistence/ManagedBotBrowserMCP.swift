@@ -52,23 +52,6 @@ public struct ManagedBotBrowserMCP: Sendable {
                     env["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"] = store.rootDirectory.deletingLastPathComponent().path
                 }
                 let service = try BotBrowserService.make(environment: env, store: store)
-                if name == BotBrowserCatalog.waitLogin {
-                    let timeout = (arguments["timeout_ms"] as? Double) ?? (arguments["timeout_ms"] as? NSNumber)?.doubleValue ?? 50
-                    let deadline = Date().addingTimeInterval(max(0, timeout) / 1000)
-                    var result = try service.waitLogin()
-                    while !result.isComplete, Date() < deadline {
-                        Thread.sleep(forTimeInterval: 0.01)
-                        result = try service.waitLogin()
-                    }
-                    return reply(id: id, result: [
-                        "content": [["type": "text", "text": encodeJSON([
-                            "complete": result.isComplete,
-                            "user_message": result.userMessage ?? "",
-                            "url": result.url,
-                        ]) ?? "{}"]],
-                        "isError": false,
-                    ])
-                }
                 let object = try service.call(name: name, arguments: arguments)
                 return reply(id: id, result: [
                     "content": [["type": "text", "text": encodeJSON(object) ?? "{}"]],

@@ -52,6 +52,15 @@ public struct BotBrowserPageState: Codable, Equatable, Sendable {
         self.title = title
         self.cookies = cookies
     }
+
+    /// Live login wait reads WKHTTPCookieStore through this helper.
+    public static func fromHTTPCookies(_ cookies: [HTTPCookie], url: String, title: String) -> BotBrowserPageState {
+        var map: [String: String] = [:]
+        for cookie in cookies {
+            map[cookie.name] = cookie.value
+        }
+        return BotBrowserPageState(url: url, title: title, cookies: map)
+    }
 }
 
 public struct BotBrowserLoginPredicate: Equatable, Sendable {
@@ -104,6 +113,28 @@ public enum BotBrowserLoginWait: Sendable {
         predicate: BotBrowserLoginPredicate = .standard
     ) -> [Result] {
         pages.map { evaluate(url: url, page: $0, predicate: predicate) }
+    }
+
+    public static let defaultTimeoutMS: Double = 1_800_000
+    public static let defaultPollIntervalMS: Double = 100
+
+    /// Blocks until `loadPage` looks logged in. Product default is 30 minutes.
+    public static func pollUntilLoggedIn(
+        url: String,
+        timeoutMS: Double = defaultTimeoutMS,
+        pollIntervalMS: Double = defaultPollIntervalMS,
+        predicate: BotBrowserLoginPredicate = .standard,
+        loadPage: () throws -> BotBrowserPageState,
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        now: () -> Date = Date.init
+    ) throws -> Result {
+        let deadline = now().addingTimeInterval(max(0, timeoutMS) / 1_000)
+        var last = try evaluate(url: url, page: loadPage(), predicate: predicate)
+        while !last.isComplete, now() < deadline {
+            sleep(max(0, pollIntervalMS) / 1_000)
+            last = try evaluate(url: url, page: loadPage(), predicate: predicate)
+        }
+        return last
     }
 }
 

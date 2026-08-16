@@ -128,6 +128,29 @@ public struct BotBrowserStore: Sendable {
         try writeWebsiteData(cookies, botID: botID)
     }
 
+    public func enqueuePendingOpen(_ target: BotBrowserTarget, botID: BotID) throws {
+        var pending = try loadPendingOpens()
+        pending.removeAll { $0.botID == botID.value.uuidString.lowercased() }
+        pending.append(
+            BotBrowserPendingOpen(
+                botID: botID.value.uuidString.lowercased(),
+                url: target.url,
+                title: target.title
+            )
+        )
+        try writeJSON(pending, to: pendingOpensURL)
+    }
+
+    public func loadPendingOpens() throws -> [BotBrowserPendingOpen] {
+        try readJSON([BotBrowserPendingOpen].self, from: pendingOpensURL) ?? []
+    }
+
+    public func takePendingOpens() throws -> [BotBrowserPendingOpen] {
+        let pending = try loadPendingOpens()
+        try writeJSON([BotBrowserPendingOpen](), to: pendingOpensURL)
+        return pending
+    }
+
     public func loadPageState(botID: BotID) throws -> BotBrowserPageState? {
         if let stored = try readJSON(BotBrowserPageState.self, from: pageStateURL(for: botID)) {
             return stored
@@ -148,6 +171,10 @@ public struct BotBrowserStore: Sendable {
         directory(for: botID).appendingPathComponent("page-state.json")
     }
 
+    private var pendingOpensURL: URL {
+        rootDirectory.appendingPathComponent("pending-opens.json")
+    }
+
     private func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let encoder = JSONEncoder()
@@ -158,6 +185,43 @@ public struct BotBrowserStore: Sendable {
     private func readJSON<T: Decodable>(_ type: T.Type, from url: URL) throws -> T? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         return try JSONDecoder().decode(type, from: Data(contentsOf: url))
+    }
+}
+
+public struct BotBrowserPendingOpen: Codable, Equatable, Sendable {
+    public var botID: String
+    public var url: String
+    public var title: String
+}
+
+/// MCP writes a pending open; the app applies it through `openBotBrowser`.
+public enum BotBrowserHost: Sendable {
+    public static let pendingOpenNotification = Notification.Name("io.remotecode.bot-browser.pending-open")
+
+    public static func requestOpen(
+        store: BotBrowserStore,
+        botID: BotID,
+        url: String,
+        title: String?,
+        notify: (Notification.Name) -> Void = { name in
+            DistributedNotificationCenter.default().post(name: name, object: nil)
+        }
+    ) throws -> BotBrowserTarget {
+        let service = BotBrowserService(callerBotID: botID, store: store)
+        let target = try service.persistNavigation(url: url, title: title)
+        try store.enqueuePendingOpen(target, botID: botID)
+        notify(pendingOpenNotification)
+        return target
+    }
+
+    public static func applyPendingOpens(
+        store: BotBrowserStore,
+        open: (BotID, String, String?) throws -> BotBrowserTarget
+    ) throws -> [BotBrowserTarget] {
+        try store.takePendingOpens().compactMap { item in
+            guard let uuid = UUID(uuidString: item.botID) else { return nil }
+            return try open(BotID(uuid), item.url, item.title.isEmpty ? nil : item.title)
+        }
     }
 }
 
@@ -185,18 +249,18 @@ public struct BotBrowserService: Sendable {
         }
     }
 
-    public func open(url: String, title: String?) throws -> BotBrowserTarget {
+    public func persistNavigation(url: String, title: String?) throws -> BotBrowserTarget {
         let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, URL(string: trimmed) != nil else {
             throw BotBrowserError.invalid("A valid URL is required.")
         }
         let target = BotBrowserTarget(url: trimmed, title: title ?? "")
         try store.persistTarget(target, botID: callerBotID)
-        try store.persistPageState(
-            BotBrowserPageState(url: trimmed, title: title ?? "", cookies: try store.readWebsiteData(botID: callerBotID)),
-            botID: callerBotID
-        )
         return target
+    }
+
+    public func open(url: String, title: String?) throws -> BotBrowserTarget {
+        try BotBrowserHost.requestOpen(store: store, botID: callerBotID, url: url, title: title)
     }
 
     public func current() throws -> BotBrowserTarget? {
@@ -228,7 +292,17 @@ public struct BotBrowserService: Sendable {
                 "website_data_keys": Array(data.keys).sorted(),
             ]
         case BotBrowserCatalog.waitLogin:
-            let result = try waitLogin()
+            let timeout = (arguments["timeout_ms"] as? Double)
+                ?? (arguments["timeout_ms"] as? NSNumber)?.doubleValue
+                ?? BotBrowserLoginWait.defaultTimeoutMS
+            let url = try current()?.url ?? ""
+            let result = try BotBrowserLoginWait.pollUntilLoggedIn(
+                url: url,
+                timeoutMS: timeout,
+                loadPage: {
+                    try self.store.loadPageState(botID: self.callerBotID) ?? BotBrowserPageState(url: url)
+                }
+            )
             return [
                 "complete": result.isComplete,
                 "user_message": result.userMessage ?? "",

@@ -357,8 +357,11 @@ public final class AppContext {
         didSet {
             drainRecoveredForkPrunedThreadIDsIfPossible()
             refreshActiveAgentWorkspaceProjection()
+            startBotBrowserPendingOpenObserver()
+            try? router?.reconcileBotBrowserOpens()
         }
     }
+    private var botBrowserOpenObserver: NSObjectProtocol?
     private struct ActiveAgentThreadContext {
         let workspaceID: WorkspaceID
         let title: String
@@ -2534,6 +2537,17 @@ public final class AppContext {
             NSLog("RemoteCode managed Distill reconcile incomplete: \(failure)")
         }
         return failure
+    }
+
+    func startBotBrowserPendingOpenObserver() {
+        guard botBrowserOpenObserver == nil else { return }
+        botBrowserOpenObserver = DistributedNotificationCenter.default().addObserver(
+            forName: BotBrowserHost.pendingOpenNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            try? self?.router?.reconcileBotBrowserOpens()
+        }
     }
 
     func reconcileComputerUseMCP() {

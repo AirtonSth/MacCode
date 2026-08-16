@@ -5762,6 +5762,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             EventBus.shared.publish(kind: BotBrowserHostState.eventKind, payload: .object(payload))
         }
+        browser.onHTTPCookiesCaptured = { [weak self] surfaceID, cookies, url, title in
+            self?.persistBotBrowserCookies(surfaceID: surfaceID, cookies: cookies, url: url, title: title)
+        }
         return browser
     }
 
@@ -5824,12 +5827,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             if let botID {
                 let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
                 try? store.persistTarget(BotBrowserTarget(url: url, title: title ?? ""), botID: botID)
-                try? store.persistPageState(
-                    BotBrowserPageState(url: url, title: title ?? "", cookies: (try? store.readWebsiteData(botID: botID)) ?? [:]),
-                    botID: botID
-                )
             }
             return
+        }
+    }
+
+    func persistBotBrowserCookies(surfaceID: SurfaceID, cookies: [HTTPCookie], url: String, title: String?) {
+        guard let ctx = context else { return }
+        for (_, ws) in ctx.state.workspaces {
+            var botID: BotID?
+            forEachSurface(in: ws.layout) { descriptor in
+                guard descriptor.id == surfaceID,
+                      let raw = descriptor.metadata["bot_id"],
+                      let uuid = UUID(uuidString: raw) else { return }
+                botID = BotID(uuid)
+            }
+            if let botID {
+                let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
+                let state = BotBrowserPageState.fromHTTPCookies(cookies, url: url, title: title ?? "")
+                try? store.persistPageState(state, botID: botID)
+                return
+            }
         }
     }
 
@@ -5839,7 +5857,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
         let service = BotBrowserService(callerBotID: botID, store: store)
-        let target = try service.open(url: url, title: title)
+        let target = try service.persistNavigation(url: url, title: title)
         guard let parsed = URL(string: target.url) else { throw LayoutError.invalidLayout }
         let bot = try ctx.botStore.get(id: botID)
         let workspace = bot?.workspaceID ?? ctx.state.workspaces.keys.sorted { $0.value.uuidString < $1.value.uuidString }.first
@@ -5888,6 +5906,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             found = descriptor
         }
         return found
+    }
+
+    /// Drain MCP pending opens through the same `openBotBrowser` path tests drive.
+    @discardableResult
+    public func reconcileBotBrowserOpens() throws -> [BotBrowserTarget] {
+        guard let ctx = context else { return [] }
+        let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
+        return try BotBrowserHost.applyPendingOpens(store: store) { botID, url, title in
+            try self.openBotBrowser(botID: botID, url: url, title: title)
+        }
     }
 
     /// Persist a per-surface agent thread binding into the surface descriptor

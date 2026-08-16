@@ -56,6 +56,36 @@ final class BotBrowserStoreTests: XCTestCase {
         XCTAssertEqual(try BotBrowserService(callerBotID: bot, store: again).current()?.url, opened.url)
     }
 
+    func test_requestOpenEnqueuesPendingAndApplyCallsOpener() throws {
+        // WHY: MCP cannot touch WKWebView; it must enqueue so the app calls openBotBrowser.
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-bot-browser-pending-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bot = BotID()
+        let store = BotBrowserStore(appSupportDirectory: root)
+        var notifyCount = 0
+        let target = try BotBrowserHost.requestOpen(
+            store: store,
+            botID: bot,
+            url: "https://login.example.test/in",
+            title: "Sign in",
+            notify: { _ in notifyCount += 1 }
+        )
+        XCTAssertEqual(notifyCount, 1)
+        XCTAssertEqual(try store.loadPendingOpens().map(\.url), [target.url])
+
+        var opened: [(String, String)] = []
+        let applied = try BotBrowserHost.applyPendingOpens(store: store) { botID, url, title in
+            XCTAssertEqual(botID, bot)
+            opened.append((url, title ?? ""))
+            return BotBrowserTarget(url: url, title: title ?? "")
+        }
+        XCTAssertEqual(applied.map(\.url), [target.url])
+        XCTAssertEqual(opened.first?.0, target.url)
+        XCTAssertEqual(opened.first?.1, "Sign in")
+        XCTAssertTrue(try store.loadPendingOpens().isEmpty)
+    }
+
     func test_waitLoginUsesStoredPageState() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc-bot-browser-wait-\(UUID().uuidString)", isDirectory: true)
