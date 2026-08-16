@@ -347,6 +347,8 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var deskStreamEventCount = 0
     @Published public private(set) var deskSendInFlight = false
     @Published public private(set) var deskSendInFlightStartedAt: Date?
+    /// Owner of the in-flight send so roster switch does not paint Loading on the wrong desk.
+    private var deskSendInFlightBotID: BotID?
     @Published public private(set) var conversations: [BotConversation] = []
     @Published public private(set) var selectedConversation: BotConversation?
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
@@ -574,7 +576,14 @@ public final class BotsViewModel: ObservableObject {
         }
         do {
             // Match the bar: create opens a teammate immediately; profile is optional.
-            let bot = try create(name: "New Agent", title: "", description: "")
+            // Hermes seeds SOUL.md on first run — do not start a soulless New Agent.
+            let name = "New Agent"
+            let bot = try create(
+                name: name,
+                title: "",
+                description: "",
+                soul: BotStandingInstructions.fallback(name: name, title: "", description: "")
+            )
             openDesk(bot)
         } catch {
             errorMessage = String(describing: error)
@@ -606,6 +615,16 @@ public final class BotsViewModel: ObservableObject {
         screen = .studio
         persistSelection()
         reloadSelectedBot(id: bot.id)
+    }
+
+    /// Keep the starter soul aligned with Role & Identity until the user writes their own.
+    public func refreshGeneratedStandingInstructions() {
+        guard BotStandingInstructions.looksGenerated(studioDraft.soul) else { return }
+        studioDraft.soul = BotStandingInstructions.fallback(
+            name: studioDraft.name,
+            title: studioDraft.title,
+            description: studioDraft.description
+        )
     }
 
     public func openFleet() {
@@ -742,6 +761,13 @@ public final class BotsViewModel: ObservableObject {
         }
         let handle = studioDraft.handle.trimmingCharacters(in: .whitespacesAndNewlines)
         let desktop = resolvedDesktopKind(studioDraft.desktopKind)
+        let soul = BotStandingInstructions.resolved(
+            name: name,
+            title: studioDraft.title,
+            description: studioDraft.description,
+            soul: studioDraft.soul
+        )
+        studioDraft.soul = soul
         if let botID = studioDraft.botID {
             guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
                 throw BotStoreError.notFound
@@ -750,7 +776,7 @@ public final class BotsViewModel: ObservableObject {
                 name: name,
                 title: studioDraft.title,
                 description: studioDraft.description,
-                soul: studioDraft.soul,
+                soul: soul,
                 provider: studioDraft.provider,
                 providerInstanceID: studioDraft.providerInstanceID.isEmpty
                     ? studioDraft.provider.rawValue
@@ -778,7 +804,7 @@ public final class BotsViewModel: ObservableObject {
             title: studioDraft.title,
             description: studioDraft.description,
             handle: handle.isEmpty ? nil : handle,
-            soul: studioDraft.soul,
+            soul: soul,
             provider: studioDraft.provider,
             providerInstanceID: studioDraft.providerInstanceID.isEmpty ? nil : studioDraft.providerInstanceID,
             model: studioDraft.model,
@@ -849,6 +875,7 @@ public final class BotsViewModel: ObservableObject {
             queuedFollowUpsByBot[id] = nil
             composerDraftsByBot[id] = nil
             inspectorDraftsByBot[id] = nil
+            clearDeskSendInFlight(for: id)
             persistQueuedFollowUps()
             persistComposerDrafts()
             persistInspectorDrafts()
@@ -865,7 +892,8 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public var deskShowsLoading: Bool {
-        deskSendInFlight && !deskRunIsLive
+        guard deskSendInFlight, !deskRunIsLive else { return false }
+        return deskSendInFlightBotID == nil || deskSendInFlightBotID == selectedBotID
     }
 
     public var deskSendEnabled: Bool {
@@ -959,10 +987,10 @@ public final class BotsViewModel: ObservableObject {
             appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: bot.id)
             if let router = resolvedRouter(),
                let revision = try currentRevision(for: bot) {
-                deskSendInFlight = true
-                deskSendInFlightStartedAt = Date()
+                beginDeskSendInFlight(for: bot.id)
                 Task { [weak self] in
                     guard let self else { return }
+                    await Task.yield()
                     let started = await self.startSupervisedRun(
                         bot: bot,
                         revision: revision,
@@ -971,7 +999,7 @@ public final class BotsViewModel: ObservableObject {
                         attachments: attached,
                         router: router
                     )
-                    self.deskSendInFlight = false
+                    self.clearDeskSendInFlight(for: bot.id)
                     if let runId = started {
                         self.lastSendStartedProviderRun = true
                         self.lastLinkedRunIDByBot[bot.id] = runId
@@ -1295,7 +1323,6 @@ public final class BotsViewModel: ObservableObject {
     private func reloadSelectedBot(id: BotID) {
         deskLiveTurnWatch?.cancel()
         deskLiveTurnWatch = nil
-        deskSendInFlight = false
         deskLiveTimeline = liveTimelineByBot[id] ?? AssistantTimelineState()
         deskStreamEventCount = liveStreamCountByBot[id] ?? 0
         deskMessages = messagesByBot[id] ?? []
@@ -2122,13 +2149,25 @@ public final class BotsViewModel: ObservableObject {
             errorMessage = String(describing: error)
         }
         isStopping = false
-        deskSendInFlight = false
+        clearDeskSendInFlight(for: bot.id)
         if BotsDeskFollowThrough.isTerminal(status) {
             deskSendInFlightStartedAt = nil
             if isViewing(bot.id) {
                 drainQueuedFollowUp()
             }
         }
+    }
+
+    private func beginDeskSendInFlight(for botID: BotID) {
+        deskSendInFlightBotID = botID
+        deskSendInFlight = true
+        deskSendInFlightStartedAt = Date()
+    }
+
+    private func clearDeskSendInFlight(for botID: BotID) {
+        guard deskSendInFlightBotID == nil || deskSendInFlightBotID == botID else { return }
+        deskSendInFlight = false
+        deskSendInFlightBotID = nil
     }
 
     private func resolvedDesktopKind(_ requested: BotDesktopKind) -> BotDesktopKind {
@@ -2794,14 +2833,21 @@ public struct BotsRootView: View {
                         if vm.studioDraft.isNew, vm.studioDraft.handle.isEmpty || handleMatchesDerivedName {
                             vm.studioDraft.handle = BotHandle.derive(from: name) ?? vm.studioDraft.handle
                         }
+                        vm.refreshGeneratedStandingInstructions()
                     }
             }
             studioFormRow("Role") {
                 studioField(placeholder: "What this teammate does", text: $vm.studioDraft.title)
+                    .onChange(of: vm.studioDraft.title) { _ in
+                        vm.refreshGeneratedStandingInstructions()
+                    }
             }
             studioFormRow("Description") {
                 studioMultiline(text: $vm.studioDraft.description, minHeight: 72)
                     .accessibilityIdentifier("bots.studio.description")
+                    .onChange(of: vm.studioDraft.description) { _ in
+                        vm.refreshGeneratedStandingInstructions()
+                    }
             }
             studioFormRow("Handle") {
                 studioField(placeholder: "piper", text: $vm.studioDraft.handle)
@@ -2849,7 +2895,7 @@ public struct BotsRootView: View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
             DSSectionHeaderG(BotsChrome.Label.instructions)
             studioMultiline(text: $vm.studioDraft.soul, minHeight: 140)
-            Text("Published with the Bot. This is not an Agent thread.")
+            Text("Empty uses the built-in teammate default. Write your own to replace it. Published with the Bot.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
         }
@@ -3042,13 +3088,6 @@ public struct BotsRootView: View {
 
     private func deskHeader(_ bot: BotDefinition) -> some View {
         HStack(spacing: DS.Space.lg) {
-            if !showsRosterRail {
-                backButton {
-                    if let bot = vm.selectedBot {
-                        vm.openDesk(bot)
-                    }
-                }
-            }
             Image(systemName: bot.avatarSymbol)
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(DS.Palette.accent)

@@ -74,6 +74,36 @@ final class BotsWindowTests: XCTestCase {
         router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
     }
 
+    func test_deskSendLoadingSurvivesRosterReopen_becauseSendMustStayAcknowledged() throws {
+        // WHY: openDesk reloads the selected bot. That used to clear
+        // deskSendInFlight, so Loading… vanished while sendAgentMessage was
+        // still starting — dead time on the same click that should keep status.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("keep loading visible"))
+        XCTAssertTrue(vm.deskShowsLoading, "send must acknowledge before the provider run exists")
+        vm.openDesk(piper)
+        XCTAssertTrue(
+            vm.deskShowsLoading,
+            "re-opening the sending Desk must not drop Loading… mid-start"
+        )
+        vm.openDesk(quinn)
+        XCTAssertFalse(
+            vm.deskShowsLoading,
+            "Quinn's Desk must not inherit Piper's in-flight Loading…"
+        )
+        vm.openDesk(piper)
+        XCTAssertTrue(
+            vm.deskShowsLoading,
+            "returning to Piper must restore Loading… until that send settles"
+        )
+    }
+
     func test_deskWorkingLabelFollowsALiveWorkLog_becauseDeskMustShowWorking() throws {
         // WHY: a supervised run in Working must surface the Agent App thinking
         // label on Desk, not only the work-log status pill.
@@ -399,6 +429,38 @@ final class BotsWindowTests: XCTestCase {
             slice.contains("botManagementButtons"),
             "roster menu must share Fleet's Pin/Hide/Duplicate/Edit/Delete, not a one-off Delete"
         )
+    }
+
+    func test_deskHeaderHasNoBack_becauseHomeIsGoneAndRosterIsTheSwitcher() throws {
+        // WHY: Chat Back used to return to Fleet Home. Home is gone, so the
+        // chevron called openDesk on the same bot — a visible no-op next to
+        // the sidebar roster. Studio Back still returns to Chat.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let deskStart = source.range(of: "private func deskHeader") else {
+            return XCTFail("desk header must exist")
+        }
+        let deskRest = source[deskStart.upperBound...]
+        let deskEnd = deskRest.range(of: "\n    private func ")?.lowerBound ?? deskRest.endIndex
+        let desk = String(source[deskStart.lowerBound..<deskEnd])
+        XCTAssertFalse(
+            desk.contains("backButton"),
+            "Chat must not paint a Back chevron that re-opens the same desk"
+        )
+        XCTAssertFalse(
+            desk.contains("openDesk(bot)"),
+            "desk header must not treat Back as a dest after Home was removed"
+        )
+        guard let studioStart = source.range(of: "private var studioHeader") else {
+            return XCTFail("studio header must exist")
+        }
+        let studioRest = source[studioStart.upperBound...]
+        let studioEnd = studioRest.range(of: "\n    private var studioTabs")?.lowerBound ?? studioRest.endIndex
+        let studio = String(source[studioStart.lowerBound..<studioEnd])
+        XCTAssertTrue(
+            studio.contains("backButton"),
+            "Studio Back is the real dest back to Chat"
+        )
+        XCTAssertTrue(studio.contains("vm.openDesk(bot)"))
     }
 
     func test_rosterDeleteUsesPendingConfirmation_becauseDeleteRemovesTheTeammate() throws {
@@ -803,6 +865,30 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.botStore.list().count, 1)
         XCTAssertEqual(try context.botStore.list().first?.name, "New Agent")
         XCTAssertTrue(try context.threadRepo.list().isEmpty)
+    }
+
+    func test_beginCreateSeedsStandingInstructions_becauseHermesDoesNotStartSoulless() throws {
+        // WHY: Live Studio/Desk New Agent compiled with "No standing
+        // instructions." Hermes seeds SOUL.md; we persist the starter so
+        // first chat and Studio both show a replaceable default.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.beginCreate()
+        let bot = try XCTUnwrap(try context.botStore.list().first)
+        let revision = try XCTUnwrap(
+            bot.currentRevisionID.flatMap { try context.botStore.getRevision(id: $0) }
+        )
+        XCTAssertTrue(BotStandingInstructions.looksGenerated(revision.soul))
+        XCTAssertTrue(revision.soul.contains(BotStandingInstructions.generatedSignature))
+        vm.beginEdit(bot)
+        XCTAssertEqual(vm.studioDraft.soul, revision.soul)
+        vm.studioDraft.title = "Reviews PRs"
+        vm.refreshGeneratedStandingInstructions()
+        XCTAssertTrue(vm.studioDraft.soul.contains("Your job is: Reviews PRs."))
+        vm.studioDraft.soul = "Speak plainly."
+        vm.studioDraft.title = "Other job"
+        vm.refreshGeneratedStandingInstructions()
+        XCTAssertEqual(vm.studioDraft.soul, "Speak plainly.", "custom soul is the expert escape hatch")
     }
 
     func test_beginCreateTwiceAllocatesDistinctHandles_becauseNewAgentIsAPlaceholder() throws {
@@ -2272,6 +2358,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.studio.identity"))
         XCTAssertTrue(bots.contains("bots.studio.routing"))
         XCTAssertTrue(bots.contains("bots.studio.soul"))
+        XCTAssertTrue(bots.contains("Empty uses the built-in teammate default"))
+        XCTAssertTrue(bots.contains("refreshGeneratedStandingInstructions"))
         XCTAssertTrue(bots.contains("bots.studio.summary"))
         XCTAssertTrue(bots.contains("bots.studio.desktop.honesty"))
         XCTAssertTrue(bots.contains("Role & Identity"))

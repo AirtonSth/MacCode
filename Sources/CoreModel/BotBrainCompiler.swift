@@ -158,7 +158,12 @@ public enum BotBrainCompiler {
         if !description.isEmpty {
             lines.append(description)
         }
-        let soul = revision.soul.trimmingCharacters(in: .whitespacesAndNewlines)
+        let soul = BotStandingInstructions.resolved(
+            name: bot.name,
+            title: revision.title,
+            description: revision.description,
+            soul: revision.soul
+        )
         if !soul.isEmpty {
             lines.append("Standing instructions:")
             lines.append(soul)
@@ -235,16 +240,22 @@ public enum BotBrainCompiler {
             )
         }
 
-        let soul = revision.soul.trimmingCharacters(in: .whitespacesAndNewlines)
-        if soul.isEmpty {
+        let publishedSoul = revision.soul.trimmingCharacters(in: .whitespacesAndNewlines)
+        let soul = BotStandingInstructions.resolved(
+            name: bot.name,
+            title: revision.title,
+            description: revision.description,
+            soul: revision.soul
+        )
+        if BotStandingInstructions.looksGenerated(publishedSoul) {
             layers.append(
                 BotContextLayer(
                     id: "soul",
                     kind: .soul,
                     title: "Standing instructions",
-                    text: "",
-                    included: false,
-                    reason: "No standing instructions."
+                    text: soul,
+                    included: true,
+                    reason: "Built-in teammate default. Write standing instructions to replace it."
                 )
             )
         } else {
