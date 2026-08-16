@@ -395,6 +395,10 @@ public final class BotsViewModel: ObservableObject {
     /// Test seam: inbox rereads already done when dest dests Chat.
     /// First paint dest must dest Chat before dest dests inbox.
     public private(set) var lastDeskRestoreAttentionListCountForTesting = 0
+    /// Test seam: roster-preview conversation lists already done when
+    /// dest dests Chat. First paint dest must dest Chat before dest
+    /// dests dest preview.
+    public private(set) var lastDeskRestoreConversationListCountForTesting = 0
     /// Test seam: dest dests Chat restore. First paint dest must dest
     /// this bubble even when dest dests Chat from dest title.
     public private(set) var deskRestoreInvokedCountForTesting = 0
@@ -1538,6 +1542,11 @@ public final class BotsViewModel: ObservableObject {
             if selectedBotID == nil || !bots.contains(where: { $0.id == selectedBotID }) {
                 restoreSelectedBotIfNeeded()
             }
+            // Dest first. First paint dest used to dest dest preview
+            // (listConversations + listRecent) before dest dested Chat.
+            // Dest dests this bubble first; dest dests dest preview
+            // from dest Chat.
+            destSelectedChatIfNeeded()
             var previews: [BotID: String] = lastPreviewByBot
             var updated: [BotID: Date] = lastUpdatedByBot
             let live = Set(bots.map(\.id))
@@ -1794,6 +1803,17 @@ public final class BotsViewModel: ObservableObject {
         routine.activation.updatedAt = Date()
         routines[index] = routine
         rememberStudioSupport(for: routine.definition.botID)
+    }
+
+    /// Dest first. First paint dest used to dest dest preview before
+    /// dest dested Chat. Dest dests this bubble from dest cache or
+    /// dest title/thread; dest dests dest preview from that dest.
+    private func destSelectedChatIfNeeded() {
+        guard let id = selectedBotID, bots.contains(where: { $0.id == id }) else { return }
+        deskMessages = messagesByBot[id] ?? []
+        if messagesByBot[id]?.isEmpty != false {
+            restoreDeskMessages(botID: id)
+        }
     }
 
     private func reloadSelectedBot(id: BotID) {
@@ -2363,6 +2383,7 @@ public final class BotsViewModel: ObservableObject {
         deskRestoreInvokedCountForTesting += 1
         lastDeskRestoreStudioSupportCountForTesting = studioSupportReloadCountForTesting
         lastDeskRestoreAttentionListCountForTesting = attentionListCountForTesting
+        lastDeskRestoreConversationListCountForTesting = conversationListCountForTesting
         let cached = messagesByBot[botID] ?? []
         let conversation = conversationForBot(botID)
         var persisted: [BotDeskMessage] = []

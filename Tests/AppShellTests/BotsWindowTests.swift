@@ -2047,6 +2047,39 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(dest.attentionState(for: piper), .needsAttention)
     }
 
+    func test_openingBotsRestoresChatBeforeRosterPreview_becauseFirstPaintDestMustDestChat() throws {
+        // WHY: first paint dest used to dest dest preview
+        // (listConversations + listRecent) before dest dested Chat.
+        // Dest dests this bubble first; dest dests dest preview
+        // from dest Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        XCTAssertGreaterThan(dest.deskRestoreInvokedCountForTesting, 0)
+        XCTAssertEqual(
+            dest.lastDeskRestoreConversationListCountForTesting,
+            0,
+            "dest dests Chat before dest dests dest preview"
+        )
+        XCTAssertGreaterThan(
+            dest.conversationListCountForTesting,
+            dest.lastDeskRestoreConversationListCountForTesting,
+            "dest dests dest preview after dest dested Chat"
+        )
+        XCTAssertTrue(
+            dest.rosterPreview(for: piper).contains("From Piper")
+                || dest.deskMessages.contains(where: { $0.text == "From Piper" }),
+            "dest dests dest preview from dest Chat"
+        )
+    }
+
     func test_unpublishedStudioDraftSurvivesRelaunch_becauseDraftIsUserWorkflowState() throws {
         // WHY: composer and inspector drafts persist. Studio title/soul used
         // to vanish on remount because loadStudioDraft always reloaded the
