@@ -624,6 +624,12 @@ public final class BotsViewModel: ObservableObject {
 
     public func reload() {
         refreshFlags()
+        // Dest first. Remount dest used to scan every teammate's
+        // conversations + recent messages before dest dested Chat.
+        // Dest already has this teammate's thread and dest cache.
+        if !bots.isEmpty, let selectedBotID {
+            reloadSelectedBot(id: selectedBotID)
+        }
         reloadFleet()
         reloadAttention()
         restoreSelectedBotIfNeeded()
@@ -1515,15 +1521,25 @@ public final class BotsViewModel: ObservableObject {
     private func reloadFleet() {
         fleetReloadCountForTesting += 1
         do {
+            let destIDs = Set(bots.map(\.id))
             bots = try botStore.list(includeHidden: showHidden)
-            var previews: [BotID: String] = [:]
-            var updated: [BotID: Date] = [:]
+            var previews: [BotID: String] = lastPreviewByBot
+            var updated: [BotID: Date] = lastUpdatedByBot
+            let live = Set(bots.map(\.id))
+            previews = previews.filter { live.contains($0.key) }
+            updated = updated.filter { live.contains($0.key) }
             for bot in bots {
                 if let last = messagesByBot[bot.id]?.last, !last.text.isEmpty {
                     previews[bot.id] = last.text
                     updated[bot.id] = last.createdAt
                     continue
                 }
+                if destIDs.contains(bot.id) {
+                    // Dest first. Remount dest used to list this teammate's
+                    // conversations + recent messages before dest dested Chat.
+                    continue
+                }
+                conversationListCountForTesting += 1
                 guard let conversation = try botStore.listConversations(botID: bot.id).first else { continue }
                 if let threadID = conversation.linkedAgentThreadID,
                    let stored = try? context.messageRepo.listRecent(threadId: threadID, limit: 8),
@@ -1566,6 +1582,19 @@ public final class BotsViewModel: ObservableObject {
         }
         for bot in bots {
             if states[bot.id] == .needsAttention { continue }
+            let dest = destConversations(botID: bot.id)
+            if !dest.isEmpty {
+                states[bot.id] = Self.attentionState(from: dest, hasOpenAttention: false)
+                continue
+            }
+            if let existing = attentionStateByBot[bot.id] {
+                // Dest first. Remount dest used to list every teammate's
+                // conversations before dest dested Chat. Dest inbox already
+                // applied needs-you above; keep dest chips dest already dested.
+                states[bot.id] = existing == .needsAttention ? .none : existing
+                continue
+            }
+            conversationListCountForTesting += 1
             let conversations = (try? botStore.listConversations(botID: bot.id)) ?? []
             states[bot.id] = Self.attentionState(from: conversations, hasOpenAttention: false)
         }

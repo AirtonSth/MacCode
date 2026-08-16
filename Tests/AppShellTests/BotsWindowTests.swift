@@ -1774,6 +1774,77 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
     }
 
+    func test_reloadingDeskDoesNotListFleetConversations_becauseRemountDestMustNotScanEveryTeammate() throws {
+        // WHY: leaving Bots and coming back calls reload() on the same dest.
+        // Remount dest used to list every teammate's conversations before
+        // dest dested Chat. Dest already has dest cache and dest inbox.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Summarize overnight"))
+        let afterDest = vm.conversationListCountForTesting
+        XCTAssertGreaterThan(afterDest, 0)
+        vm.reload()
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+        XCTAssertEqual(
+            vm.conversationListCountForTesting,
+            afterDest,
+            "remount dest must not scan every teammate"
+        )
+    }
+
+    func test_reloadingDeskKeepsChatAndRoster_becauseStaleEmptyMustNotLookCurrent() throws {
+        // WHY: dest-first remount is honest only when dest still dests this
+        // teammate's bubble and the roster dest already dested.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Summarize overnight"))
+        let destPreview = vm.rosterPreview(for: piper)
+        XCTAssertFalse(destPreview.isEmpty)
+        vm.reload()
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+        XCTAssertEqual(
+            vm.rosterPreview(for: piper),
+            destPreview,
+            "remount dest must keep dest roster preview dest already dested"
+        )
+        XCTAssertEqual(Set(vm.fleet.map(\.id)), [piper.id, quinn.id])
+        XCTAssertEqual(vm.fleet.map(\.name).sorted(), ["Piper", "Quinn"])
+    }
+
+    func test_reloadingDeskStillListsInbox_becauseStaleBellMustNotLookCurrent() throws {
+        // WHY: remount dest skips the fleet conversation scan, but dest
+        // inbox must still refresh so a new needs-you cannot look empty.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Summarize overnight"))
+        try context.botStore.upsertAttention(
+            BotAttentionItem(botID: piper.id, kind: .approval, title: "Approve vendor brief")
+        )
+        XCTAssertFalse(vm.attentionItems.contains(where: { $0.title == "Approve vendor brief" }))
+        vm.reload()
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+        XCTAssertTrue(
+            vm.attentionItems.contains(where: { $0.title == "Approve vendor brief" }),
+            "remount dest must still dest dest inbox"
+        )
+        XCTAssertEqual(vm.attentionState(for: piper), .needsAttention)
+    }
+
     func test_deskScreenSurvivesRelaunch_becauseLeavingBotsMustNotDropTheChat() throws {
         // WHY: installBotsContent remounts after Agentic/workspace. Forcing
         // Fleet Home there (or on a new VM) throws away the open Desk turn.
