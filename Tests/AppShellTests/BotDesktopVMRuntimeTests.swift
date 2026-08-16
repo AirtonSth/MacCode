@@ -94,6 +94,10 @@ final class BotDesktopVMRuntimeTests: XCTestCase {
         XCTAssertEqual(started.lastErrorDetail, "The disk image is not a valid virtual disk.")
         XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("boot failed"))
         XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
+        XCTAssertFalse(
+            started.honestyLabel.localizedCaseInsensitiveContains("not a valid virtual disk"),
+            "user-facing honesty must not echo the probe dump"
+        )
         XCTAssertFalse(started.honestyLabel.localizedCaseInsensitiveContains("active now"))
 
         let stopped = try runtime.stop(botID: botID)
@@ -202,11 +206,46 @@ final class BotDesktopVMRuntimeTests: XCTestCase {
         XCTAssertEqual(probe.bootCount, 0, "Restore.ipsw must win over Disk.img")
         XCTAssertEqual(started.state, .failed)
         XCTAssertEqual(started.lastError, BotDesktopVMIdentity.invalidRestoreImageCode)
-        XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("not a valid macOS IPSW"))
+        XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("not a valid macOS"))
         XCTAssertTrue(started.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
         XCTAssertFalse(started.honestyLabel.localizedCaseInsensitiveContains("virtual disk"))
         XCTAssertFalse(started.honestyLabel.localizedCaseInsensitiveContains("active now"))
         XCTAssertFalse(started.honestyLabel.localizedCaseInsensitiveContains("isolated network"))
+        XCTAssertFalse(
+            started.honestyLabel.localizedCaseInsensitiveContains("the file is not a valid restore image"),
+            "honesty stays a short sentence; lastErrorDetail is for logs"
+        )
+    }
+
+    func test_stopClearsAFailedRestoreSoHonestyIsNotStuck() throws {
+        // WHY: a dummy Restore.ipsw left Studio/Desk painted with a failed
+        // IPSW wall of text. Stop must dismiss that state.
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bot-desktops-rt-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = FixedVirtualizationProbe(
+            isSupported: true,
+            installResult: BotDesktopVMBootAttempt(
+                didStart: false,
+                invalidRestoreImage: true,
+                failure: "The restore image failed to load. Unable to load restore image."
+            )
+        )
+        let store = BotDesktopVMStore(root: root)
+        let runtime = BotDesktopVMRuntime(store: store, probe: probe)
+        let botID = BotID()
+        let identity = try store.ensure(botID: botID)
+        try Data("not-an-ipsw".utf8).write(
+            to: URL(fileURLWithPath: identity.bundlePath).appendingPathComponent("Restore.ipsw")
+        )
+        let failed = try runtime.start(botID: botID)
+        XCTAssertEqual(failed.state, .failed)
+        let stopped = try runtime.stop(botID: botID)
+        XCTAssertEqual(stopped.state, .stopped)
+        XCTAssertNil(stopped.lastError)
+        XCTAssertNil(stopped.lastErrorDetail)
+        XCTAssertFalse(stopped.honestyLabel.localizedCaseInsensitiveContains("ipsw"))
+        XCTAssertFalse(stopped.honestyLabel.localizedCaseInsensitiveContains("failed to load"))
     }
 
     func test_startPersistsInstalling_whenRestoreInstallerIsRunning() throws {

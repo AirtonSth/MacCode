@@ -820,6 +820,19 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    public func duplicateFromRoster(_ bot: BotDefinition) {
+        do {
+            let copy = try duplicate(id: bot.id)
+            if screen == .studio {
+                beginEdit(copy)
+            } else {
+                openDesk(copy)
+            }
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
     public func delete(id: BotID) {
         do {
             try botStore.delete(id: id)
@@ -2265,9 +2278,13 @@ public struct BotsModeSwitcher: View {
 /// Roster body shared by the shell sidebar and the detached Bots window.
 public struct BotsRosterList: View {
     @ObservedObject private var vm: BotsViewModel
+    /// Sidebar hosts the roster in a sibling NSHostingView from BotsRootView.
+    /// Attach the delete confirm here so right-click Delete is not a silent latch.
+    private let attachDeleteConfirmation: Bool
 
-    public init(vm: BotsViewModel) {
+    public init(vm: BotsViewModel, attachDeleteConfirmation: Bool = false) {
         self.vm = vm
+        self.attachDeleteConfirmation = attachDeleteConfirmation
     }
 
     public var body: some View {
@@ -2308,6 +2325,11 @@ public struct BotsRosterList: View {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
                 Spacer(minLength: 0)
+                Toggle("Show hidden", isOn: $vm.showHidden)
+                    .toggleStyle(.checkbox)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityIdentifier("bots.roster.showHidden")
             }
             .padding(.horizontal, DS.Space.lg)
             .padding(.bottom, DS.Space.sm)
@@ -2355,6 +2377,7 @@ public struct BotsRosterList: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityIdentifier("bots.roster")
+        .modifier(BotsDeleteConfirmation(vm: vm, enabled: attachDeleteConfirmation))
     }
 
     private func actionRow(symbol: String, title: String) -> some View {
@@ -2433,6 +2456,87 @@ public struct BotsRosterList: View {
         .accessibilityLabel(bot.name)
         .accessibilityValue("\(BotsChrome.statusTitle(for: state)). \(preview)")
         .accessibilityIdentifier("bots.roster.row.\(bot.handle)")
+        .contextMenu {
+            botManagementButtons(bot: bot, vm: vm, fromRoster: true)
+        }
+    }
+}
+
+@MainActor
+@ViewBuilder
+private func botManagementButtons(
+    bot: BotDefinition,
+    vm: BotsViewModel,
+    fromRoster: Bool
+) -> some View {
+    let locked = !vm.isControlPlaneActive
+    Button(bot.pinned ? "Unpin" : "Pin") {
+        vm.setPinned(id: bot.id, pinned: !bot.pinned)
+    }
+    .disabled(locked)
+    .accessibilityIdentifier("bots.menu.pin")
+    Button(bot.hidden ? "Unhide" : "Hide") {
+        vm.setHidden(id: bot.id, hidden: !bot.hidden)
+    }
+    .disabled(locked)
+    .accessibilityIdentifier("bots.menu.hide")
+    Button("Duplicate") {
+        if fromRoster {
+            vm.duplicateFromRoster(bot)
+        } else {
+            _ = try? vm.duplicate(id: bot.id)
+        }
+    }
+    .disabled(locked)
+    .accessibilityIdentifier("bots.menu.duplicate")
+    Button("Edit") {
+        vm.beginEdit(bot)
+    }
+    .disabled(locked)
+    .accessibilityIdentifier("bots.menu.edit")
+    Divider()
+    Button("Delete", role: .destructive) {
+        vm.pendingDeleteID = bot.id
+    }
+    .disabled(locked)
+    .accessibilityIdentifier("bots.menu.delete")
+}
+
+private struct BotsDeleteConfirmation: ViewModifier {
+    @ObservedObject var vm: BotsViewModel
+    let enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.confirmationDialog(
+                title,
+                isPresented: Binding(
+                    get: { vm.pendingDeleteID != nil },
+                    set: { if !$0 { vm.pendingDeleteID = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Delete", role: .destructive) {
+                    if let id = vm.pendingDeleteID {
+                        vm.delete(id: id)
+                    }
+                    vm.pendingDeleteID = nil
+                }
+                .accessibilityIdentifier("bots.menu.delete.confirm")
+                Button("Cancel", role: .cancel) { vm.pendingDeleteID = nil }
+            } message: {
+                Text("This teammate is removed from the fleet. Conversations and routines are deleted.")
+            }
+        } else {
+            content
+        }
+    }
+
+    private var title: String {
+        if let id = vm.pendingDeleteID, let bot = vm.bots.first(where: { $0.id == id }) {
+            return "Delete \(bot.name)?"
+        }
+        return "Delete this Bot?"
     }
 }
 
@@ -2482,32 +2586,8 @@ public struct BotsRootView: View {
         } message: {
             Text(vm.errorMessage ?? "")
         }
-        .confirmationDialog(
-            deleteTitle,
-            isPresented: Binding(
-                get: { vm.pendingDeleteID != nil },
-                set: { if !$0 { vm.pendingDeleteID = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("Delete", role: .destructive) {
-                if let id = vm.pendingDeleteID {
-                    vm.delete(id: id)
-                }
-                vm.pendingDeleteID = nil
-            }
-            Button("Cancel", role: .cancel) { vm.pendingDeleteID = nil }
-        } message: {
-            Text("This teammate is removed from the fleet. Conversations and routines are deleted.")
-        }
+        .modifier(BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail))
         .onAppear { vm.reload() }
-    }
-
-    private var deleteTitle: String {
-        if let id = vm.pendingDeleteID, let bot = vm.bots.first(where: { $0.id == id }) {
-            return "Delete \(bot.name)?"
-        }
-        return "Delete this Bot?"
     }
 
     private var showsRosterRail: Bool {
@@ -2927,22 +3007,7 @@ public struct BotsRootView: View {
                 attentionBadge(vm.attentionState(for: bot))
 
                 Menu {
-                    Button(bot.pinned ? "Unpin" : "Pin") {
-                        vm.setPinned(id: bot.id, pinned: !bot.pinned)
-                    }
-                    Button(bot.hidden ? "Unhide" : "Hide") {
-                        vm.setHidden(id: bot.id, hidden: !bot.hidden)
-                    }
-                    Button("Duplicate") {
-                        _ = try? vm.duplicate(id: bot.id)
-                    }
-                    Button("Edit") {
-                        vm.beginEdit(bot)
-                    }
-                    Divider()
-                    Button("Delete", role: .destructive) {
-                        vm.pendingDeleteID = bot.id
-                    }
+                    botManagementButtons(bot: bot, vm: vm, fromRoster: false)
                 } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 13, weight: .semibold))
@@ -3194,7 +3259,9 @@ public struct BotsRootView: View {
                 kind: .dedicatedLocalVM,
                 title: "Dedicated local VM Desktop",
                 enabled: true,
-                status: "Guest not running",
+                status: vm.displayedDesktopKind == .dedicatedLocalVM
+                    ? vm.desktopStatusPill
+                    : "Guest not running",
                 identifier: "bots.studio.desktop.vm"
             )
             Text(vm.desktopHonestyLabel)
@@ -3292,10 +3359,6 @@ public struct BotsRootView: View {
             studioSummaryRow("Skills", "\(vm.enabledSkillCount) enabled")
             studioSummaryRow("Routines", "\(vm.enabledRoutineCount) · no app-closed runs")
             studioSummaryRow("Notifications", vm.studioDraft.notificationsEnabled ? "On" : "Off")
-            Text(vm.desktopHonestyLabel)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.warning)
-                .fixedSize(horizontal: false, vertical: true)
         }
         .dsPanel(padding: DS.Space.lg)
         .accessibilityIdentifier("bots.studio.summary")

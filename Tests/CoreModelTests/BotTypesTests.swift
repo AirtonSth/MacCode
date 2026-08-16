@@ -174,6 +174,10 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(failed.honestyLabel.localizedCaseInsensitiveContains("boot failed"))
         XCTAssertTrue(failed.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
         XCTAssertFalse(failed.honestyLabel.localizedCaseInsensitiveContains("active now"))
+        XCTAssertFalse(
+            failed.honestyLabel.localizedCaseInsensitiveContains("not a valid virtual disk"),
+            "honesty must not dump Virtualization.framework's raw failure"
+        )
         XCTAssertEqual(failed.statusPill, "Local VM · failed")
 
         let starting = BotDesktopVMIdentity(
@@ -207,9 +211,14 @@ final class BotTypesTests: XCTestCase {
             lastErrorDetail: "The file is not a valid restore image.",
             virtualizationSupported: true
         )
-        XCTAssertTrue(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("not a valid macOS IPSW"))
+        XCTAssertTrue(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("not a valid macOS"))
         XCTAssertTrue(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("not isolated"))
         XCTAssertFalse(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("virtual disk"))
+        XCTAssertFalse(
+            invalidRestore.honestyLabel.localizedCaseInsensitiveContains("failed to load"),
+            "Studio/Desk must not paint the raw restore-image dump"
+        )
+        XCTAssertFalse(invalidRestore.honestyLabel.localizedCaseInsensitiveContains("unable to load"))
     }
 
     func test_routineCopy_doesNotClaimAppClosedExecution() {

@@ -390,6 +390,70 @@ final class BotsWindowTests: XCTestCase {
             slice.contains("vm.openHome(bot)"),
             "roster tap must not land on Home"
         )
+        XCTAssertTrue(
+            slice.contains(".contextMenu"),
+            "right-click must expose teammate actions on the roster row"
+        )
+        XCTAssertTrue(
+            slice.contains("botManagementButtons"),
+            "roster menu must share Fleet's Pin/Hide/Duplicate/Edit/Delete, not a one-off Delete"
+        )
+    }
+
+    func test_rosterDeleteUsesPendingConfirmation_becauseDeleteRemovesTheTeammate() throws {
+        // WHY: right-click Delete is irreversible. It must go through the same
+        // pendingDeleteID dialog as the Fleet overflow, not call delete(id:) now.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("bots.menu.delete"))
+        XCTAssertTrue(source.contains("attachDeleteConfirmation"))
+        XCTAssertTrue(
+            source.contains("BotsRosterList(vm: vm)"),
+            "the rail inside BotsRootView must not attach a second confirm dialog"
+        )
+        XCTAssertTrue(
+            source.contains("BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail)"),
+            "main-shell BotsRootView must not stack a second delete dialog beside the sidebar roster"
+        )
+    }
+
+    func test_hidingFromRosterStaysRecoverable_becauseShowHiddenLivesOnTheList() throws {
+        // WHY: Hide from the sidebar would vanish the row while Show hidden
+        // only lived on the empty Fleet header. The roster toggle is the exit.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        vm.setHidden(id: quinn.id, hidden: true)
+        XCTAssertEqual(vm.fleet.map(\.id), [piper.id])
+        XCTAssertFalse(vm.showHidden)
+        vm.showHidden = true
+        XCTAssertEqual(Set(vm.fleet.map(\.id)), Set([piper.id, quinn.id]))
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(
+            source.contains("bots.roster.showHidden"),
+            "Hide on the roster is only safe if Show hidden is on the same list"
+        )
+    }
+
+    func test_duplicateFromRosterOpensTheCopy_becauseStudioMustNotSaveTheSource() throws {
+        // WHY: Fleet Duplicate runs on the no-selection list. Roster Duplicate
+        // from Studio would leave studioDraft on the source; Save would publish
+        // the original teammate.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(piper)
+        XCTAssertEqual(vm.screen, .studio)
+        vm.duplicateFromRoster(piper)
+        let copy = try XCTUnwrap(vm.selectedBot)
+        XCTAssertNotEqual(copy.id, piper.id)
+        XCTAssertEqual(vm.screen, .studio)
+        XCTAssertEqual(vm.studioDraft.botID, copy.id)
+        vm.openDesk(piper)
+        vm.duplicateFromRoster(piper)
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertNotEqual(vm.selectedBotID, piper.id)
     }
 
     func test_providerChipFollowsThePublishedRevision_becauseHomeMustNotHardcodeClaude() throws {
@@ -825,6 +889,17 @@ final class BotsWindowTests: XCTestCase {
 
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("desktopHonestyLabel"))
+        if let start = source.range(of: "private var studioSummary") {
+            let rest = source[start.upperBound...]
+            let end = rest.range(of: "\n    private func studioSummaryRow")?.lowerBound ?? rest.endIndex
+            let slice = String(source[start.lowerBound..<end])
+            XCTAssertFalse(
+                slice.contains("desktopHonestyLabel"),
+                "Configuration summary must not repeat the Desktop honesty block"
+            )
+        } else {
+            XCTFail("studio summary must exist")
+        }
         XCTAssertTrue(source.contains("not shipped in P1a"))
         XCTAssertTrue(source.contains("Guest not running"))
         XCTAssertFalse(

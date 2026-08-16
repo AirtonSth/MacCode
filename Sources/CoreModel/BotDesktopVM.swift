@@ -67,11 +67,6 @@ public struct BotDesktopVMIdentity: Codable, Sendable, Equatable {
         }
     }
 
-    private var trimmedDetail: String? {
-        (lastErrorDetail?.trimmingCharacters(in: CharacterSet(charactersIn: ". \n\t")))
-            .flatMap { $0.isEmpty ? nil : $0 }
-    }
-
     public var honestyLabel: String {
         if state == .installing {
             return "Installing from restore image. Virtualization.framework is restoring a guest OS. Same Mac host; not isolated."
@@ -89,16 +84,13 @@ public struct BotDesktopVMIdentity: Codable, Sendable, Equatable {
             return "Stopped. No guest image. Work still uses this Mac account; not isolated."
         }
         if lastError == Self.invalidRestoreImageCode {
-            let detail = trimmedDetail ?? "file is not a valid macOS IPSW"
-            return "Stopped. Restore image is not a valid macOS IPSW: \(detail). Work still uses this Mac account; not isolated."
+            return "Stopped. That Restore.ipsw is not a valid macOS image. Work still uses this Mac account; not isolated."
         }
         if lastError == Self.installFailedCode {
-            let detail = trimmedDetail ?? "Virtualization.framework rejected the restore image"
-            return "Stopped. Install failed: \(detail). Work still uses this Mac account; not isolated."
+            return "Stopped. Install failed. Work still uses this Mac account; not isolated."
         }
         if lastError == Self.bootFailedCode {
-            let detail = trimmedDetail ?? "Virtualization.framework rejected the guest image"
-            return "Stopped. Boot failed: \(detail). Work still uses this Mac account; not isolated."
+            return "Stopped. Boot failed. Work still uses this Mac account; not isolated."
         }
         if lastError == Self.bootNotShippedCode {
             return "Stopped. Guest image present; boot is not shipped. Work still uses this Mac account; not isolated."

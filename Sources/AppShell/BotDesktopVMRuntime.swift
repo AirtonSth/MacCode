@@ -519,6 +519,8 @@ public struct BotDesktopVMRuntime {
         probe.halt()
         var identity = try store.ensure(botID: botID, now: now)
         identity.state = .stopped
+        identity.lastError = nil
+        identity.lastErrorDetail = nil
         identity.virtualizationSupported = probe.isSupported
         identity.updatedAt = now
         try store.save(identity)
