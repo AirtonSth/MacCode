@@ -439,8 +439,9 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         // Token Saver per-thread totals (59), reserved no-op (60), lifecycle
         // support (61), bounded maintenance lookup support (62), the
         // durable RCW1 request/response/display rows (67-69), Bot
-        // control-plane identity (70-71), and content-free request
-        // selection receipts (72). Versions 63-66 are retired.
+        // control-plane identity (70-71), content-free request
+        // selection receipts (72-74), and Bot context receipts (75).
+        // Versions 63-66 are retired.
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
@@ -458,9 +459,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             71,
             72,
             73,
-            74
+            74,
+            75
         ])
-        XCTAssertEqual(Schema.currentVersion, 74)
+        XCTAssertEqual(Schema.currentVersion, 75)
         XCTAssertFalse(
             Schema.steps.contains { (63...66).contains($0.version) },
             "schema versions 63-66 are retired and must never be reused"
@@ -487,7 +489,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
 
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(Schema.currentVersion, 74)
+        XCTAssertEqual(Schema.currentVersion, 75)
 
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 0,
                        "v72 must not backfill historical winners")
@@ -554,7 +556,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             """), "billing_claim must stay forced 0")
 
         try Schema.migrate(db)
-        XCTAssertEqual(try maxVersion(db), 74, "head re-migrate must be a no-op at v74")
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion, "head re-migrate must be a no-op at currentVersion")
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 1)
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_arm_receipts"), 1)
     }
@@ -568,10 +570,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.steps.filter { $0.version == 71 }.count, 1,
             "HEAD/origin production last published step is 71"
         )
-        XCTAssertEqual(Schema.currentVersion, 74)
+        XCTAssertEqual(Schema.currentVersion, 75)
         XCTAssertEqual(
-            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74],
-            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts"
+            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75],
+            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts"
         )
         let v72 = try XCTUnwrap(Schema.steps.first { $0.version == 72 })
         XCTAssertTrue(v72.sql.contains("CHECK(format IN ('human', 'rcw1', 'rcs1'))"))
@@ -692,7 +694,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             """)
 
         try Schema.migrateSteps(db, Schema.steps)
-        XCTAssertEqual(try maxVersion(db), 74)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 2)
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_arm_receipts"), 2)
 
@@ -729,7 +731,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             """), "billing_claim must stay forced 0")
 
         try Schema.migrate(db)
-        XCTAssertEqual(try maxVersion(db), 74, "head re-migrate must be a no-op at v74")
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion, "head re-migrate must be a no-op at currentVersion")
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 3)
     }
 
@@ -755,7 +757,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             );
             """)
         try Schema.migrateSteps(db, Schema.steps)
-        XCTAssertEqual(try maxVersion(db), 74)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 1)
         XCTAssertEqual(try rowCount(db, table: "token_saver_context_slot_receipts"), 0)
         XCTAssertEqual(try rowCount(db, table: "token_saver_context_slot_arm_receipts"), 0)
@@ -773,7 +775,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             );
             """), "context slot rows require an agent_runs parent")
         try Schema.migrate(db)
-        XCTAssertEqual(try maxVersion(db), 74, "head re-migrate must be a no-op at v74")
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion, "head re-migrate must be a no-op at currentVersion")
     }
 
     // MARK: - v25 → head

@@ -26,10 +26,12 @@ public enum Schema {
     /// requests, v68 owns durable RCW1 assistant responses, v69 owns
     /// per-message Human/RCW1 display preferences, v70 owns the Bot
     /// control-plane identity tables, v71 owns per-Bot skill enablement,
-    /// and v72 owns content-free request-selection receipts, and v73 admits
-    /// winner selected_format rcs1, and v74 owns content-free context-slot
-    /// selection receipts for fresh-fallback seeds.
-    public static let currentVersion: Int = 74
+    /// v72 owns content-free request-selection receipts, v73 admits
+    /// winner selected_format rcs1, v74 owns content-free context-slot
+    /// selection receipts for fresh-fallback seeds, and v75 owns Bot
+    /// context-assembly receipts (bots branch used 72 before production
+    /// shipped Token Saver receipts at that number).
+    public static let currentVersion: Int = 75
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1666,6 +1668,26 @@ public enum Schema {
                 ordinal
             ) ON DELETE CASCADE
         );
+        """),
+        // Last compiled Brain payload per model-call attempt. Source/Effective
+        // preview reads the same JSON the send path persisted. Numbered 75
+        // because production already shipped Token Saver receipts as 72-74.
+        SchemaStep(75, """
+        CREATE TABLE IF NOT EXISTS bot_context_receipts (
+            id TEXT PRIMARY KEY NOT NULL,
+            bot_id TEXT NOT NULL,
+            conversation_id TEXT,
+            run_id TEXT,
+            revision_id TEXT NOT NULL,
+            payload_digest TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            assembled_at TEXT NOT NULL,
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_context_receipts_bot
+            ON bot_context_receipts(bot_id, assembled_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_bot_context_receipts_conversation
+            ON bot_context_receipts(conversation_id, assembled_at DESC);
         """),
     ]
 

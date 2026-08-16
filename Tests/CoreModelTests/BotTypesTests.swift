@@ -66,13 +66,18 @@ final class BotTypesTests: XCTestCase {
         XCTAssertNotEqual(first, changedSoul, "soul is published identity; a change must produce a new digest")
     }
 
-    func test_desktopLabel_statesSharedAccount_becauseUsersMustNotThinkP1aIsAnIsolatedVM() {
+    func test_desktopLabel_statesSharedAccount_becauseUsersMustNotThinkP1aIsAnIsolatedVM() throws {
         XCTAssertEqual(
             BotDesktopKind.logicalExecutionSpace.honestyLabel,
             "Same macOS account; not isolated. Not a dedicated Desktop."
         )
         XCTAssertFalse(
             BotDesktopKind.logicalExecutionSpace.honestyLabel.localizedCaseInsensitiveContains("virtual machine")
+        )
+        XCTAssertEqual(
+            BotDesktopKind.dedicatedLocalVM.advertisedOrLogical,
+            .logicalExecutionSpace,
+            "leftover Dedicated local VM must display and publish as Logical execution space"
         )
         XCTAssertFalse(
             BotDesktopKind.logicalExecutionSpace.isSelectable(
@@ -82,21 +87,30 @@ final class BotTypesTests: XCTestCase {
         )
         XCTAssertFalse(
             BotDesktopKind.dedicatedLocalVM.isSelectable(
-                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true, botsDesktopVMEnabled: false)
+                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true, botsDesktopVMEnabled: true)
             ),
-            "VM desktop must stay unselectable while its flag is off"
-        )
-        XCTAssertFalse(
-            BotDesktopKind.dedicatedLocalVM.isSelectable(
-                flags: BotControlPlaneFlags(botsControlPlaneEnabled: false, botsDesktopVMEnabled: true)
-            ),
-            "a later-phase flag cannot enable VM desktop when the control plane is off"
+            "Dedicated local VM must not be selectable even if a leftover persist flag is on"
         )
         XCTAssertFalse(
             BotDesktopKind.managedRemoteMac.isSelectable(
                 flags: BotControlPlaneFlags(botsControlPlaneEnabled: true, botsDesktopRemoteEnabled: false)
             )
         )
+        XCTAssertFalse(
+            BotDesktopKind.managedRemoteMac.isSelectable(
+                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true, botsDesktopRemoteEnabled: true)
+            ),
+            "Managed remote Mac must not be selectable even if a leftover persist flag is on"
+        )
+        XCTAssertEqual(BotDesktopKind.advertisedKinds, [.logicalExecutionSpace])
+        XCTAssertFalse(BotDesktopKind.dedicatedLocalVM.isAdvertised)
+        XCTAssertFalse(BotDesktopKind.managedRemoteMac.isAdvertised)
+        let leftover = try JSONDecoder().decode(
+            BotDesktopKind.self,
+            from: Data(#""dedicatedLocalVM""#.utf8)
+        )
+        XCTAssertEqual(leftover, .dedicatedLocalVM, "stored leftover kinds must still decode")
+        XCTAssertEqual(leftover.advertisedOrLogical, .logicalExecutionSpace)
     }
 
     func test_controlPlaneFlags_failClosed_becauseLaterPhasesMustNotRunWithoutTheShippedSlice() {

@@ -2645,7 +2645,7 @@ public struct SidebarRootView: View {
             .accessibilityIdentifier("sidebar.bots")
 
             if vm.isBotsSelected, let botsVM {
-                BotsRosterList(vm: botsVM)
+                BotsRosterList(vm: botsVM, attachDeleteConfirmation: true)
                     .transition(.opacity)
             } else {
             VStack(alignment: .leading, spacing: DS.Space.xxs) {

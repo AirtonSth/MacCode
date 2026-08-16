@@ -52,8 +52,6 @@ public struct AppSettingsKeys {
         "botsMemoryEnabled",
         "botsEffectsEnabled",
         "botsAutonomyEnabled",
-        "botsDesktopVMEnabled",
-        "botsDesktopRemoteEnabled",
         "botsChannelsEnabled",
     ]
 }
@@ -829,11 +827,6 @@ public final class SettingsViewModel: ObservableObject {
     public func setBotsAutonomyEnabled(_ on: Bool) {
         appSettings.botsAutonomyEnabled = on
         settingsStore.update { $0.botsAutonomyEnabled = on }
-    }
-
-    public func setBotsDesktopVMEnabled(_ on: Bool) {
-        appSettings.botsDesktopVMEnabled = on
-        settingsStore.update { $0.botsDesktopVMEnabled = on }
     }
 
     public func setBotsDesktopRemoteEnabled(_ on: Bool) {
@@ -1779,30 +1772,6 @@ public struct SettingsView: View {
                 .accessibilityIdentifier("settings.bots.autonomy.toggle")
             }
             Text(BotRoutineCopy.testRunHonestyCaption)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-            settingRow("Dedicated local VM Desktop") {
-                Toggle("", isOn: Binding(
-                    get: { vm.appSettings.botsDesktopVMEnabled },
-                    set: { vm.setBotsDesktopVMEnabled($0) }
-                ))
-                .labelsHidden()
-                .disabled(!vm.appSettings.botsControlPlaneEnabled)
-                .accessibilityIdentifier("settings.bots.desktopVM.toggle")
-            }
-            Text("Not shipped. \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-            settingRow("Managed remote Mac Desktop") {
-                Toggle("", isOn: Binding(
-                    get: { vm.appSettings.botsDesktopRemoteEnabled },
-                    set: { vm.setBotsDesktopRemoteEnabled($0) }
-                ))
-                .labelsHidden()
-                .disabled(!vm.appSettings.botsControlPlaneEnabled)
-                .accessibilityIdentifier("settings.bots.desktopRemote.toggle")
-            }
-            Text("Not shipped. A managed remote Mac is not available while this flag is off.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
             settingRow("Channels") {

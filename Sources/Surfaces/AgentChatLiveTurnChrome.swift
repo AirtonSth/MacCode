@@ -12,17 +12,22 @@ public enum AgentChatLiveTurnChrome {
     public static func timelineByReplaying(_ events: [AssistantEvent]) -> AssistantTimelineState {
         var next = AssistantTimelineState()
         for event in events {
-            next.apply(event)
+            next.apply(event, nowMs: nil)
         }
         next.enforceAggregateHotTextBudget()
         return next
     }
 
     public static func turnDurationLabel(_ turn: AssistantTurnSnapshot) -> String? {
-        guard let start = turn.items.map(\.startedAtMs).min() else { return nil }
-        let finishes = turn.items.compactMap(\.finishedAtMs)
-        guard finishes.count == turn.items.count, let end = finishes.max(), end >= start else { return nil }
-        let seconds = Int((end - start) / 1000)
+        // Sum each item's own span. Min-start to max-finish counted idle
+        // hours between tools as work ("Worked for 258m" on a greeting).
+        guard !turn.items.isEmpty else { return nil }
+        var totalMs: Int64 = 0
+        for item in turn.items {
+            guard let end = item.finishedAtMs, end >= item.startedAtMs else { return nil }
+            totalMs += end - item.startedAtMs
+        }
+        let seconds = Int(totalMs / 1000)
         guard seconds > 0 else { return nil }
         return seconds < 60 ? "\(seconds)s" : "\(seconds / 60)m \(seconds % 60)s"
     }
@@ -96,7 +101,32 @@ public enum AgentChatLiveTurnChrome {
                 work.append(item)
             }
         }
-        return (reasoning, work, split.outside)
+        return (reasoning, work, deduplicatedAssistantItems(split.outside))
+    }
+
+    /// Claude often emits a streaming assistantMessage and then a snapshot
+    /// item with the same body in one turn. Paint that answer once.
+    static func deduplicatedAssistantItems(_ items: [AssistantItem]) -> [AssistantItem] {
+        var result: [AssistantItem] = []
+        result.reserveCapacity(items.count)
+        for item in items {
+            guard item.type == .assistantMessage else {
+                result.append(item)
+                continue
+            }
+            let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let index = result.firstIndex(where: {
+                $0.type == .assistantMessage && assistantTextsMatch($0.body, body)
+            }) {
+                let existing = result[index].body.trimmingCharacters(in: .whitespacesAndNewlines)
+                if body.count > existing.count {
+                    result[index] = item
+                }
+                continue
+            }
+            result.append(item)
+        }
+        return result
     }
 
     public static func workItems(in turn: AssistantTurnSnapshot) -> [AssistantItem] {

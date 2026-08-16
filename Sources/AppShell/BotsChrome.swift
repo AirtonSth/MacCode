@@ -27,6 +27,11 @@ public enum BotsChrome {
         public static let configurationSummary = "Configuration summary"
         public static let security = "Security"
         public static let desktop = "Desktop"
+        public static let brain = "Brain"
+        public static let source = "Source"
+        public static let effective = "Effective"
+        public static let brainPreviewHonesty = "Local compile. This is not a model call."
+        public static let brainReceiptHonesty = "Receipt from the last compiled send."
         public static let honesty = BotDesktopKind.logicalExecutionSpaceHonestyLabel
     }
 
@@ -58,6 +63,9 @@ public enum BotsChrome {
         Label.instructions,
         Label.configurationSummary,
         Label.security,
+        Label.brain,
+        Label.brainPreviewHonesty,
+        Label.brainReceiptHonesty,
         Label.honesty,
     ]
 

@@ -224,6 +224,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     static let defaultSidebarWidth: CGFloat = 444
     static let sidebarWidthSettingsKey = "sidebar.width"
     private static let sidebarCollapsedSettingsKey = "sidebar.collapsed"
+    static let botsShellSettingsKey = "shell.botsSelected"
     /// IMP-MAC_SHELL_WINDOW-005: AppKit frame-autosave key for the main
     /// window so its size/position survive relaunch.
     private static let mainWindowFrameAutosaveName = "io.remotecode.mainWindow"
@@ -332,6 +333,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             applyStoredCollapsedLayout()
         }
         refreshFromState()
+        restoreBotsShellDestinationIfNeeded()
         // IMP-MAC_SHELL_WINDOW-005: persist and restore the main window
         // frame across launches (matching the sidebar width/collapse state
         // that already persist). AppKit returns false when no saved frame
@@ -962,6 +964,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         activeThreadsHostingView = nil
         botsHostingView = nil
         lastWorkspaceContainerSignature = nil
+        persistBotsShellDestination()
         installScheduledTasksContent()
         updateCollapsedWorkspaceHeader()
         shellLog.debug("shellContentMode=scheduledTasks")
@@ -976,6 +979,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         scheduledTasksHostingView = nil
         botsHostingView = nil
         lastWorkspaceContainerSignature = nil
+        persistBotsShellDestination()
         installActiveThreadsContent()
         updateCollapsedWorkspaceHeader()
         shellLog.debug("shellContentMode=activeThreads")
@@ -991,6 +995,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         scheduledTasksHostingView = nil
         activeThreadsHostingView = nil
         lastWorkspaceContainerSignature = nil
+        persistBotsShellDestination()
         installBotsContent()
         updateCollapsedWorkspaceHeader()
         shellLog.debug("shellContentMode=bots")
@@ -1007,6 +1012,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         activeThreadsHostingView = nil
         botsHostingView = nil
         lastWorkspaceContainerSignature = nil
+        persistBotsShellDestination()
         rebuildWorkspaceContainer()
         updateCollapsedWorkspaceHeader()
         shellLog.debug("shellContentMode=workspace")
@@ -1075,7 +1081,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             self?.presentWorkspaceContent()
         }
         vm.reload()
-        vm.openFleet()
+        // Keep Desk / Studio / Attention. openFleet() here kicked users
+        // home every time they left Bots and came back.
         let host = NSHostingView(rootView: BotsRootView(vm: vm, embedsRosterRail: false))
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
@@ -1505,6 +1512,31 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 
     private static func storedSidebarCollapsed(context: AppContext) -> Bool {
         ((try? context.settingsRepo.get(sidebarCollapsedSettingsKey)) ?? nil) == "1"
+    }
+
+    private func persistBotsShellDestination() {
+        let value: String
+        switch shellContentMode {
+        case .bots: value = "bots"
+        case .scheduledTasks: value = "scheduledTasks"
+        case .activeThreads: value = "activeThreads"
+        case .workspace: value = "workspace"
+        }
+        try? context?.settingsRepo.set(Self.botsShellSettingsKey, value)
+    }
+
+    private func restoreBotsShellDestinationIfNeeded() {
+        let raw = (try? context?.settingsRepo.get(Self.botsShellSettingsKey)) ?? nil
+        switch raw {
+        case "1", "bots":
+            presentBotsInMainContent()
+        case "scheduledTasks":
+            presentScheduledTasksInMainContent()
+        case "activeThreads":
+            presentActiveThreadsInMainContent()
+        default:
+            break
+        }
     }
 }
 

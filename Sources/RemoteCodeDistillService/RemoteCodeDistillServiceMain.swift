@@ -211,6 +211,21 @@ struct RemoteCodeDistillServiceMain {
             await runMCP()
             return
         }
+        if programName == "rc-computer-use-mcp"
+            || rawArgs.dropFirst().first == ComputerUseHostQueue.cliArgument {
+            await runComputerUseMCP()
+            return
+        }
+        if programName == "rc-bot-self-config"
+            || rawArgs.dropFirst().first == BotSelfConfigCatalog.cliArgument {
+            runBotSelfConfigMCP()
+            return
+        }
+        if programName == "rc-bot-browser"
+            || rawArgs.dropFirst().first == BotBrowserCatalog.cliArgument {
+            runBotBrowserMCP()
+            return
+        }
         // Nested provider PATH controller: invoked via managed symlinks
         // (~/.remote-code/bin/{grok,claude,codex}) or explicit `provider-proxy <name> …`.
         // Records content-free Subagents receipts and execs the real CLI outside managed bin.
@@ -685,6 +700,35 @@ struct RemoteCodeDistillServiceMain {
         )
         while let line = readLine(strippingNewline: true) {
             if let response = await server.handle(line) {
+                FileHandle.standardOutput.write(Data((response + "\n").utf8))
+            }
+        }
+    }
+
+    /// RemoteCode-owned computer-use MCP (stdio). HID calls share ComputerUseHostQueue.
+    private static func runComputerUseMCP() async {
+        let server = ManagedComputerUseMCP()
+        while let line = readLine(strippingNewline: true) {
+            if let response = await server.handle(line) {
+                FileHandle.standardOutput.write(Data((response + "\n").utf8))
+            }
+        }
+    }
+
+    /// Bot-owned Studio settings. Bound to RC_REMOTE_CODE_BOT_ID on the calling run.
+    private static func runBotSelfConfigMCP() {
+        let server = ManagedBotSelfConfigMCP()
+        while let line = readLine(strippingNewline: true) {
+            if let response = server.handle(line) {
+                FileHandle.standardOutput.write(Data((response + "\n").utf8))
+            }
+        }
+    }
+
+    private static func runBotBrowserMCP() {
+        let server = ManagedBotBrowserMCP()
+        while let line = readLine(strippingNewline: true) {
+            if let response = server.handle(line) {
                 FileHandle.standardOutput.write(Data((response + "\n").utf8))
             }
         }

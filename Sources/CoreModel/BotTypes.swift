@@ -73,25 +73,61 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
     public static let logicalExecutionSpaceHonestyLabel =
         "Same macOS account; not isolated. Not a dedicated Desktop."
 
+    /// Decode-only leftover. Display and publish resolve to Logical execution space.
+    public static let dedicatedLocalVMHonestyLabel =
+        "Guest is not running yet. Work still uses this Mac account; not isolated."
+
     public var honestyLabel: String {
         switch self {
         case .logicalExecutionSpace:
             return Self.logicalExecutionSpaceHonestyLabel
         case .dedicatedLocalVM:
-            return "Dedicated local VM Desktop. Off until the VM flag is on."
+            return Self.dedicatedLocalVMHonestyLabel
         case .managedRemoteMac:
             return "Managed remote Mac Desktop. Off until the remote flag is on."
         }
+    }
+
+    public var displayTitle: String {
+        switch self {
+        case .logicalExecutionSpace:
+            return "Logical execution space"
+        case .dedicatedLocalVM:
+            return "Dedicated local VM"
+        case .managedRemoteMac:
+            return "Managed remote Mac"
+        }
+    }
+
+    public var statusPill: String {
+        switch self {
+        case .logicalExecutionSpace:
+            return "Logical space"
+        case .dedicatedLocalVM:
+            return "Local VM · not running"
+        case .managedRemoteMac:
+            return "Remote Mac · not shipped"
+        }
+    }
+
+    /// Kinds Studio may offer. Dedicated local VM and Managed remote Mac stay persist-only leftovers.
+    public static let advertisedKinds: [BotDesktopKind] = [
+        .logicalExecutionSpace,
+    ]
+
+    public var isAdvertised: Bool { Self.advertisedKinds.contains(self) }
+
+    /// Leftover Dedicated local VM / Managed remote Mac still decode; display and publish use Logical execution space.
+    public var advertisedOrLogical: BotDesktopKind {
+        isAdvertised ? self : .logicalExecutionSpace
     }
 
     public func isSelectable(flags: BotControlPlaneFlags) -> Bool {
         switch self {
         case .logicalExecutionSpace:
             return flags.isBotControlPlaneActive
-        case .dedicatedLocalVM:
-            return flags.isBotDesktopVMActive
-        case .managedRemoteMac:
-            return flags.isBotDesktopRemoteActive
+        case .dedicatedLocalVM, .managedRemoteMac:
+            return false
         }
     }
 }

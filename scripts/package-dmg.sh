@@ -63,7 +63,9 @@ sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/mlx.metallib"
 sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/RemoteCode"
 
 # Outer bundle last (no --deep: nested code already signed with correct options).
-codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp "$APP_BUNDLE"
+ENTITLEMENTS="$(cd "$(dirname "$0")/.." && pwd)/Sources/AppShell/RemoteCode.entitlements"
+codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp \
+  --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
 codesign --verify --deep --strict --verbose=4 "$APP_BUNDLE"
 
 # Fail closed before DMG creation: nested Mach-Os + outer app must have hardened
