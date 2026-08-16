@@ -409,6 +409,86 @@ private func assertUnboundHumanFallback(
     XCTAssertFalse(receipt.billingClaim)
 }
 
+private func validRCS1Decision(
+    human: String,
+    item: String,
+    request: TokenSaverOutboundSelectionRequest
+) async -> TokenSaverBestOfThreeSelector.Decision {
+    let rcwPayload = "RCW1\tQ\t1\nG\tRuntime request\nX\t[[rc:rcv1.runtime]]\n.\n"
+    let rcwABI = "RCW1 ABI"
+    let rcs1Env = request.environment(for: .rcs1)
+    let rcs1ABI = AgentSkillInstaller.tokenSaverProviderPrompt("", environment: rcs1Env)
+    let humanEnv = "BASE ABI\n\(human)"
+    let rcwEnv = "\(rcwABI)\n\(rcwPayload)"
+    let rcs1Envelope = "\(rcs1ABI)\n\(item)"
+    let source = SHA256.hash(data: Data(human.utf8)).map { String(format: "%02x", $0) }.joined()
+    let rcw1 = TokenSaverBestOfThreeSelector.Candidate(
+        format: .rcw1,
+        sourceSHA256: source,
+        payload: rcwPayload,
+        abi: rcwABI,
+        effectiveEnvelope: rcwEnv,
+        handle: "rcv1.runtime",
+        producerID: "remotecode-rcw1",
+        producerRevision: "1",
+        abiRevision: "1",
+        generation: .passed,
+        structural: .passed,
+        semantic: .passed,
+        recovery: .passed
+    )
+    let rcs1 = TokenSaverBestOfThreeSelector.Candidate(
+        format: .rcs1,
+        sourceSHA256: source,
+        payload: item,
+        abi: rcs1ABI,
+        effectiveEnvelope: rcs1Envelope,
+        handle: nil,
+        producerID: TokenSaverRequestSelectionReceipt.rcs1ProducerID,
+        producerRevision: "1",
+        abiRevision: "1",
+        generation: .passed,
+        structural: .passed,
+        semantic: .passed,
+        recovery: .passed
+    )
+    let counts = [
+        human: 40,
+        humanEnv: 110,
+        rcwPayload: 20,
+        "rcv1.runtime": 4,
+        rcwABI: 5,
+        rcwEnv: 90,
+        item: 8,
+        rcs1ABI: 6,
+        rcs1Envelope: 20,
+    ]
+    return await TokenSaverBestOfThreeSelector.select(
+        canonicalHuman: human,
+        humanOutboundPrompt: human,
+        humanEffectiveEnvelope: humanEnv,
+        target: .init(
+            provider: "codex",
+            resolvedModel: "fake-model",
+            counterID: "runtime-counter",
+            counterRevision: "1",
+            encoding: "fixture"
+        ),
+        candidates: [rcw1, rcs1],
+        counter: .init(counter: .init(
+            id: "runtime-counter",
+            revision: "1",
+            encoding: "fixture",
+            provider: "codex",
+            resolvedModel: "fake-model",
+            quality: .exactLocalTokenizer
+        )) { text in
+            guard let count = counts[text] else { throw NSError(domain: "counter", code: 1) }
+            return count
+        }
+    )
+}
+
 private enum Best3Winner { case rcw1, rcs1, human }
 
 private struct Best3Arms {
@@ -1266,6 +1346,81 @@ final class TokenSaverCompressionTests: XCTestCase {
                              "\(format.rawValue) must not persist RCW1 session metadata")
             }
         }
+    }
+
+    /// WHY: a structurally valid RCS1 winner must reach the provider with the
+    /// exclusive compact-span environment, never as RCW1 disclosure.
+    func test_validRCS1WinnerSendsExactPayloadAndEnvironmentWithoutRCW1Disclosure() async throws {
+        let harness = try Best3Harness.make(title: "valid rcs1 send")
+        let human = String(repeating: "ABCDEFGH", count: 16)
+        let item = try XCTUnwrap(RemoteCodeCompactSpan.encode(human))
+        harness.injectScopedRCW1()
+        harness.select { request in
+            XCTAssertNil(request.environment(for: .rcs1)[rcw1Cap])
+            XCTAssertNil(request.environment(for: .rcs1)[rcw1Ver])
+            XCTAssertEqual(
+                request.environment(for: .rcs1)[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey],
+                "1"
+            )
+            XCTAssertEqual(
+                request.environment(for: .rcs1)[TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey],
+                "1"
+            )
+            XCTAssertNil(request.environment(for: .human)[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey])
+            XCTAssertNil(request.environment(for: .rcw1)[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey])
+            return await validRCS1Decision(human: human, item: item, request: request)
+        }
+        let runID = try await harness.start(human)
+        let env = harness.adapter.request?.environment ?? [:]
+        XCTAssertEqual(harness.adapter.request?.prompt, item)
+        XCTAssertEqual(
+            try harness.messageRepo.get(id: AgentMessageID(runID.value))?.content,
+            human
+        )
+        XCTAssertEqual(env[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey], "1")
+        XCTAssertEqual(env[TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey], "1")
+        XCTAssertNil(env[rcw1Cap])
+        XCTAssertNil(env[rcw1Ver])
+        XCTAssertTrue(
+            try harness.messageRepo.rcw1RequestTranslations(
+                threadId: harness.thread.id, messageIds: [AgentMessageID(runID.value)]
+            ).isEmpty
+        )
+        XCTAssertFalse(harness.observer.recordedEvents.contains {
+            if case .wireTranslation = $0 { return true }
+            return false
+        })
+        XCTAssertNil(try harness.sessionWireVersion())
+        XCTAssertEqual(harness.recorder.events.count, 1)
+        XCTAssertEqual(harness.recorder.events.first?.receipt.selectedFormat, .rcs1)
+        XCTAssertEqual(harness.recorder.events.first?.receipt.reason, .uniqueStrictMinimum)
+        XCTAssertFalse(harness.recorder.events.first?.receipt.billingClaim ?? true)
+    }
+
+    /// WHY: a synthetic or malformed RCS1 winner is not a transport item.
+    func test_malformedRCS1WinnerFallsBackToHumanWithoutRCW1Disclosure() async throws {
+        let harness = try Best3Harness.make(title: "malformed rcs1 fallback")
+        let arms = Best3Arms()
+        harness.injectScopedRCW1()
+        harness.select { _ in await arms.decision(.rcs1) }
+        let runID = try await harness.start(arms.human)
+        let env = harness.adapter.request?.environment ?? [:]
+        XCTAssertEqual(harness.adapter.request?.prompt, arms.human)
+        XCTAssertEqual(
+            try harness.messageRepo.get(id: AgentMessageID(runID.value))?.content,
+            arms.human
+        )
+        XCTAssertNil(env[rcw1Cap])
+        XCTAssertNil(env[rcw1Ver])
+        XCTAssertNil(env[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey])
+        XCTAssertTrue(
+            try harness.messageRepo.rcw1RequestTranslations(
+                threadId: harness.thread.id, messageIds: [AgentMessageID(runID.value)]
+            ).isEmpty
+        )
+        XCTAssertNil(try harness.sessionWireVersion())
+        XCTAssertEqual(harness.recorder.events.first?.receipt.selectedFormat, .human)
+        XCTAssertEqual(harness.recorder.events.first?.receipt.reason, .candidateError)
     }
 
     /// WHY: one local-write observation per decision; never billing.

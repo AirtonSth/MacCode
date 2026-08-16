@@ -5,11 +5,13 @@ import Foundation
 public enum TokenSaverRequestSelectionReceipt {
     public static let humanProducerID = "remotecode-human"
     public static let rcw1ProducerID = "remotecode-rcw1"
+    public static let rcs1ProducerID = "remotecode-rcs1"
     public static let rcs1UnavailableProducerID = "remotecode-rcs1-unavailable"
 
     public enum SelectedFormat: String, Sendable, Codable, Equatable {
         case human
         case rcw1
+        case rcs1
     }
 
     public enum Lifecycle: String, Sendable, Codable, Equatable {
@@ -55,10 +57,10 @@ public enum TokenSaverRequestSelectionReceipt {
         public var rcw1: HostArmDecision
         public var rcs1: HostArmDecision
 
-        public static let productionC10 = HostDecisions(
+        public static let productionC11 = HostDecisions(
             human: HostArmDecision(projection: .projected, availability: .available),
             rcw1: HostArmDecision(projection: .projected, availability: .available),
-            rcs1: HostArmDecision(projection: .notProjected, availability: .unavailable)
+            rcs1: HostArmDecision(projection: .projected, availability: .available)
         )
 
         public init(human: HostArmDecision, rcw1: HostArmDecision, rcs1: HostArmDecision) {
@@ -219,24 +221,24 @@ public enum TokenSaverRequestSelectionReceipt {
         }
     }
 
-    /// Project the live Decision after binding and host availability. RCS1 is
-    /// never a C10 selected format and never carries a proven count.
+    /// Project the live Decision after binding and host availability. RCS1 is a
+    /// first-class selected format when the Decision chose it.
     public static func project(
         decision: TokenSaverBestOfThreeSelector.Decision,
         runId: String,
         threadId: String,
         provider: String,
         resolvedModel: String,
-        host: HostDecisions = .productionC10
+        host: HostDecisions = .productionC11
     ) -> Record {
-        let coercedRCS1 = decision.selectedFormat == .rcs1
-        let selectedFormat: SelectedFormat = decision.selectedFormat == .rcw1 ? .rcw1 : .human
-        let reason: TokenSaverBestOfThreeSelector.Reason = coercedRCS1
-            ? .candidateError
-            : decision.reason
-        let delta = (selectedFormat == .rcw1 && !coercedRCS1)
-            ? max(0, decision.modeledContextDelta)
-            : 0
+        let selectedFormat: SelectedFormat
+        switch decision.selectedFormat {
+        case .human: selectedFormat = .human
+        case .rcw1: selectedFormat = .rcw1
+        case .rcs1: selectedFormat = .rcs1
+        }
+        let reason = decision.reason
+        let delta = selectedFormat == .human ? 0 : max(0, decision.modeledContextDelta)
         let counterStatus = counterStatus(for: decision)
         let exact = counterStatus == .exactLocalTokenizer
             || counterStatus == .exactResolvedModelTokenizer
@@ -346,24 +348,6 @@ public enum TokenSaverRequestSelectionReceipt {
         host: HostArmDecision,
         exact: Bool
     ) -> Arm {
-        if format == .rcs1 {
-            return Arm(
-                runId: runId,
-                format: .rcs1,
-                sourceBound: false,
-                producerId: rcs1UnavailableProducerID,
-                producerRevision: "unavailable",
-                abiRevision: "unavailable",
-                generation: .failed,
-                structural: .failed,
-                semantic: .failed,
-                recovery: .failed,
-                projection: .notProjected,
-                availability: .unavailable,
-                eligible: false,
-                provenEffectiveCount: nil
-            )
-        }
         if format == .human {
             let projected = host.projection == .projected && host.availability == .available
             let count = (exact && projected)
@@ -386,16 +370,16 @@ public enum TokenSaverRequestSelectionReceipt {
                 provenEffectiveCount: count
             )
         }
-        if let existing = decision.arm(.rcw1) {
+        if let existing = decision.arm(format) {
             let projected = existing.eligible
                 && host.projection == .projected
                 && host.availability == .available
             let count = (exact && projected)
-                ? decision.cost(.rcw1)?.effectiveEnvelopeTokens
+                ? decision.cost(format)?.effectiveEnvelopeTokens
                 : nil
             return Arm(
                 runId: runId,
-                format: .rcw1,
+                format: format,
                 sourceBound: existing.sourceBound,
                 producerId: existing.producerID,
                 producerRevision: existing.producerRevision,
@@ -412,9 +396,9 @@ public enum TokenSaverRequestSelectionReceipt {
         }
         return Arm(
             runId: runId,
-            format: .rcw1,
+            format: format,
             sourceBound: false,
-            producerId: rcw1ProducerID,
+            producerId: format == .rcs1 ? rcs1UnavailableProducerID : rcw1ProducerID,
             producerRevision: "unavailable",
             abiRevision: "unavailable",
             generation: .failed,

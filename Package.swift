@@ -184,6 +184,7 @@ let package = Package(
             dependencies: [
                 "DistillCore",
                 "AgentRuntime",
+                "Persistence",
                 .product(name: "MLXLLM", package: "mlx-swift-lm")
             ],
             path: "Tests/DistillCoreTests"

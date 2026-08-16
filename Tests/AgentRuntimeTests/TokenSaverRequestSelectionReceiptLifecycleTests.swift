@@ -21,8 +21,8 @@ final class TokenSaverRequestSelectionReceiptLifecycleTests: XCTestCase {
         XCTAssertEqual(stored.winner.lifecycle, .delivered)
         XCTAssertEqual(stored.winner.selectedFormat, .rcw1)
         XCTAssertEqual(stored.arms.count, 3)
-        XCTAssertEqual(try XCTUnwrap(stored.arm(.rcs1)).availability, .unavailable)
-        XCTAssertNil(try XCTUnwrap(stored.arm(.rcs1)).provenEffectiveCount)
+        XCTAssertEqual(try XCTUnwrap(stored.arm(.rcs1)).availability, .available)
+        XCTAssertEqual(try XCTUnwrap(stored.arm(.rcs1)).producerId, "remotecode-rcs1")
         XCTAssertEqual(try harness.savingsCount(), 0)
     }
 
@@ -99,9 +99,25 @@ final class TokenSaverRequestSelectionReceiptLifecycleTests: XCTestCase {
         let stored = try XCTUnwrap(harness.receipts.load(runId: runID))
         XCTAssertEqual(stored.winner.selectedFormat, .human)
         XCTAssertEqual(stored.winner.reason, .candidateError)
-        XCTAssertEqual(try XCTUnwrap(stored.arm(.rcs1)).producerId,
-                       TokenSaverRequestSelectionReceipt.rcs1UnavailableProducerID)
-        XCTAssertNil(try XCTUnwrap(stored.arm(.rcs1)).provenEffectiveCount)
+        XCTAssertNotEqual(stored.winner.selectedFormat, .rcs1)
+        XCTAssertEqual(try XCTUnwrap(stored.arm(.rcs1)).producerId, "remotecode-rcs1")
+    }
+
+    func test_validRCS1WinnerReceiptRoundtripsDeliveredLifecycle() async throws {
+        let harness = try C10ReceiptHarness.make(title: "rcs1-delivered", acceptance: .accepted)
+        let human = String(repeating: "ABCDEFGH", count: 16)
+        let item = try XCTUnwrap(RemoteCodeCompactSpan.encode(human))
+        let decision = await C10ReceiptArms().validRCS1(human: human, item: item)
+        XCTAssertEqual(decision.selectedFormat, .rcs1)
+        harness.select { _ in decision }
+        let runID = try await harness.start(human)
+        let stored = try XCTUnwrap(harness.receipts.load(runId: runID))
+        XCTAssertEqual(stored.winner.selectedFormat, .rcs1)
+        XCTAssertEqual(stored.winner.lifecycle, .delivered)
+        XCTAssertEqual(stored.winner.reason, .uniqueStrictMinimum)
+        XCTAssertFalse(stored.winner.billingClaim)
+        XCTAssertEqual(try XCTUnwrap(stored.arm(.rcs1)).producerId, TokenSaverRequestSelectionReceipt.rcs1ProducerID)
+        XCTAssertEqual(harness.adapter.request?.prompt, item)
     }
 
     func test_relaunchSweepMarksLeftoverProvisionalUnknownAndLeavesDelivered() async throws {
@@ -313,6 +329,79 @@ private struct C10ReceiptArms {
     let rcs1Outbound = "RCS1 Runtime request [[rc:rcs1.runtime]]"
 
     enum Winner { case human, rcw1, rcs1 }
+
+    func validRCS1(human: String, item: String) async -> TokenSaverBestOfThreeSelector.Decision {
+        let rcwOutbound = self.rcwOutbound
+        let rcwABI = "RCW1 ABI"
+        let rcs1ABI = AgentSkillInstaller.tokenSaverProviderPrompt(
+            "",
+            environment: TokenSaverOutboundSelectionRequest.environment([:], for: .rcs1)
+        )
+        let humanEnv = "BASE ABI\n\(human)"
+        let rcwEnv = "\(rcwABI)\n\(rcwOutbound)"
+        let rcs1Env = "\(rcs1ABI)\n\(item)"
+        let source = SHA256.hash(data: Data(human.utf8)).map { String(format: "%02x", $0) }.joined()
+        let counts = [
+            human: 40, humanEnv: 110,
+            rcwOutbound: 20, "rcv1.runtime": 4, rcwABI: 5, rcwEnv: 90,
+            item: 8, rcs1ABI: 6, rcs1Env: 18,
+        ]
+        return await TokenSaverBestOfThreeSelector.select(
+            canonicalHuman: human,
+            humanOutboundPrompt: human,
+            humanEffectiveEnvelope: humanEnv,
+            target: .init(
+                provider: "codex",
+                resolvedModel: "fake-model",
+                counterID: "runtime-counter",
+                counterRevision: "1",
+                encoding: "fixture"
+            ),
+            candidates: [
+                .init(
+                    format: .rcw1,
+                    sourceSHA256: source,
+                    payload: rcwOutbound,
+                    abi: rcwABI,
+                    effectiveEnvelope: rcwEnv,
+                    handle: "rcv1.runtime",
+                    producerID: "remotecode-rcw1",
+                    producerRevision: "1",
+                    abiRevision: "1",
+                    generation: .passed,
+                    structural: .passed,
+                    semantic: .passed,
+                    recovery: .passed
+                ),
+                .init(
+                    format: .rcs1,
+                    sourceSHA256: source,
+                    payload: item,
+                    abi: rcs1ABI,
+                    effectiveEnvelope: rcs1Env,
+                    handle: nil,
+                    producerID: TokenSaverRequestSelectionReceipt.rcs1ProducerID,
+                    producerRevision: "1",
+                    abiRevision: "1",
+                    generation: .passed,
+                    structural: .passed,
+                    semantic: .passed,
+                    recovery: .passed
+                ),
+            ],
+            counter: .init(counter: .init(
+                id: "runtime-counter",
+                revision: "1",
+                encoding: "fixture",
+                provider: "codex",
+                resolvedModel: "fake-model",
+                quality: .exactLocalTokenizer
+            )) { text in
+                guard let count = counts[text] else { throw NSError(domain: "counter", code: 1) }
+                return count
+            }
+        )
+    }
 
     func decision(_ winner: Winner) async -> TokenSaverBestOfThreeSelector.Decision {
         let human = Self.human

@@ -25,11 +25,28 @@ public enum TokenSaverProviderVisibleEnvelopeProjector {
         payload: String,
         request: TokenSaverOutboundSelectionRequest
     ) -> TokenSaverProviderVisibleEnvelope? {
-        guard format != .rcs1 else { return nil }
+        project(
+            format: format,
+            payload: payload,
+            environment: request.environment(for: format)
+        )
+    }
+
+    public static func project(
+        format: TokenSaverBestOfThreeSelector.Format,
+        payload: String,
+        environment: [String: String]
+    ) -> TokenSaverProviderVisibleEnvelope? {
+        if format == .rcs1 {
+            guard environment[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey] == "1",
+                  environment[TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey] == "1" else {
+                return nil
+            }
+        }
         guard !payload.isEmpty else { return nil }
         let abi = AgentSkillInstaller.tokenSaverProviderPrompt(
             "",
-            environment: request.environment(for: format)
+            environment: environment
         )
         if abi.isEmpty {
             guard format == .human else { return nil }

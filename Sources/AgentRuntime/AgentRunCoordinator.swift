@@ -34,7 +34,8 @@ public struct TokenSaverOutboundSelectionRequest: Sendable {
 
     /// Per-format ABI environment counted and sent for one arm. Never invents
     /// `RC_TOKEN_SAVER_WIRE_CAPABILITY`; version is `1` only when that
-    /// capability is already exactly `1`.
+    /// capability is already exactly `1`. Compact-span keys are exclusive to
+    /// RCS1 and are set exactly to `1` for that arm.
     public func environment(
         for format: TokenSaverBestOfThreeSelector.Format
     ) -> [String: String] {
@@ -47,15 +48,24 @@ public struct TokenSaverOutboundSelectionRequest: Sendable {
     ) -> [String: String] {
         var env = base
         switch format {
-        case .human, .rcs1:
+        case .human:
             env.removeValue(forKey: TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey)
             env.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
+            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey)
+            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey)
         case .rcw1:
             if env[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1" {
                 env["RC_TOKEN_SAVER_WIRE_VERSION"] = "1"
             } else {
                 env.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
             }
+            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey)
+            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey)
+        case .rcs1:
+            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey)
+            env.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
+            env[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey] = "1"
+            env[TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey] = "1"
         }
         return env
     }
@@ -489,6 +499,8 @@ public enum TokenSaverExecutionReceiptSeam {
     public static let disabledLanesEnvKey = "RC_TOKEN_SAVER_DISABLED_LANES"
     public static let enabledLanesEnvKey = "RC_TOKEN_SAVER_ENABLED_LANES"
     public static let wireCapabilityEnvKey = "RC_TOKEN_SAVER_WIRE_CAPABILITY"
+    public static let compactSpanCapabilityEnvKey = "RC_TOKEN_SAVER_COMPACT_SPAN_CAPABILITY"
+    public static let compactSpanVersionEnvKey = "RC_TOKEN_SAVER_COMPACT_SPAN_VERSION"
     public static let maximumEncodedBytes = 4_096
 
     public static func admit(
@@ -912,6 +924,27 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return frames.allSatisfy { $0.direction == .request }
     }
 
+    private func captureCanonicalContextSnapshot(
+        threadId: AgentThreadID,
+        excludingCurrentUserText: String
+    ) throws -> TokenSaverCanonicalConversationSnapshot? {
+        let messages = try messageRepo.list(threadId: threadId)
+        let assistantIds = messages.filter { $0.role == .assistant }.map(\.id)
+        let persisted = (try? messageRepo.rcw1ResponseTranslations(
+            threadId: threadId,
+            messageIds: assistantIds
+        )) ?? [:]
+        var wires: [String: String] = [:]
+        for (messageId, response) in persisted {
+            wires[messageId.value.uuidString] = response.wireResponseText
+        }
+        return TokenSaverCanonicalConversationSnapshot.capture(
+            messages: messages,
+            persistedRCW1ByMessageId: wires,
+            excludingCurrentUserText: excludingCurrentUserText
+        )
+    }
+
     static func normalizedProviderReasoningEffort(
         provider: AgentProvider,
         model: String,
@@ -1215,6 +1248,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var onTokenSaverOutboundDelivery: (@Sendable (
         _ delivery: TokenSaverOutboundDelivery
     ) -> Void)?
+    /// Prepares an RCSEED1 document for a confirmed fresh-fallback destination.
+    public var tokenSaverContextSeedPreparer: TokenSaverContextSeedPreparing?
     /// Token Saver hook for free-form follow-up answers. Defaults to
     /// `promptCompressor` when nil, but app shells can provide a separate hook
     /// to tag telemetry as `prompt_followup`.
@@ -1774,11 +1809,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 }
             }
             if decision.selectedFormat == .rcs1 {
-                decision = decision.fallingBackToHuman(
-                    payload: request.prompt,
-                    reason: .candidateError,
-                    canonicalHuman: preservedUserContent
-                )
+                let projected = selectionRequest.environment(for: .rcs1)
+                let capable = projected[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey] == "1"
+                    && projected[TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey] == "1"
+                if !capable || RemoteCodeCompactSpan.decode(decision.selectedPayload) == nil {
+                    decision = decision.fallingBackToHuman(
+                        payload: request.prompt,
+                        reason: .candidateError,
+                        canonicalHuman: preservedUserContent
+                    )
+                }
             }
             outboundPrompt = decision.selectedPayload
             selectedTransportFormat = decision.selectedFormat
@@ -1870,7 +1910,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             model: request.model,
             requested: request.reasoningEffort
         )
-        let effectiveRequest = AgentRunRequest(
+        var effectiveRequest = AgentRunRequest(
             runId: request.runId,
             threadId: request.threadId,
             provider: request.provider,
@@ -1898,6 +1938,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let adapterKey = providerAdapterKey(runner)
         let binaryIdentity = providerBinaryIdentity(effectiveRequest.provider, adapter: runner)
         try refreshProviderProcessIfScopeChanged(runner, request: effectiveRequest)
+        let priorSnapshot = try captureCanonicalContextSnapshot(
+            threadId: effectiveRequest.threadId,
+            excludingCurrentUserText: preservedUserContent
+        )
         // persist user message
         if recordUserMessage {
             let userMsg = AgentMessage(
@@ -1910,6 +1954,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if try messageRepo.get(id: userMsg.id) == nil {
                 try messageRepo.append(userMsg)
                 onMessageAppended?(userMsg)
+            }
+        }
+        if let priorSnapshot {
+            let verified = try captureCanonicalContextSnapshot(
+                threadId: effectiveRequest.threadId,
+                excludingCurrentUserText: preservedUserContent
+            )
+            if verified?.digest == priorSnapshot.digest {
+                effectiveRequest.contextSnapshot = priorSnapshot
             }
         }
         // persist run

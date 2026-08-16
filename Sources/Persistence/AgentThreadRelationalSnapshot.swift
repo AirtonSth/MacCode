@@ -185,6 +185,8 @@ private extension AgentThreadRepository {
         TableSpec(name: "agent_runs", predicate: "thread_id IN (%@)"),
         TableSpec(name: "token_saver_run_winner_receipts", predicate: "run_id IN (SELECT id FROM agent_runs WHERE thread_id IN (%@))"),
         TableSpec(name: "token_saver_run_arm_receipts", predicate: "run_id IN (SELECT run_id FROM token_saver_run_winner_receipts WHERE thread_id IN (%@))"),
+        TableSpec(name: "token_saver_context_slot_receipts", predicate: "run_id IN (SELECT id FROM agent_runs WHERE thread_id IN (%@))"),
+        TableSpec(name: "token_saver_context_slot_arm_receipts", predicate: "run_id IN (SELECT run_id FROM token_saver_context_slot_receipts WHERE run_id IN (SELECT id FROM agent_runs WHERE thread_id IN (%@)))"),
         TableSpec(name: "agent_stream_events", predicate: "run_id IN (SELECT id FROM agent_runs WHERE thread_id IN (%@))"),
         TableSpec(name: "agent_turn_snapshots", predicate: "thread_id IN (%@)"),
         TableSpec(name: "provider_session_runtime", predicate: "thread_id IN (%@)"),

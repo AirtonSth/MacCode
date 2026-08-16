@@ -726,6 +726,10 @@ public final class CodexAppServerClient: @unchecked Sendable {
 
     public static func turnStartParams(providerThreadId: String, for request: AgentRunRequest) -> JSONObject {
         var input: [JSONObject] = []
+        if let seed = request.preparedContextSeed?.encoded.trimmingCharacters(in: .whitespacesAndNewlines),
+           !seed.isEmpty {
+            input.append(["type": "text", "text": seed, "text_elements": [Any]()])
+        }
         let prompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !prompt.isEmpty {
             // Codex 0.146 UserInput text requires text_elements (empty when unused).

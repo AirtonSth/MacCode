@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 import XCTest
 import CoreModel
+import Persistence
 @testable import DistillCore
 
 final class RCW1EfficiencyCorpusTests: XCTestCase {
@@ -1125,6 +1126,1595 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         }
     }
 
+    func test_allRowRequestReportRequiresEveryFrozen24ID() async throws {
+        // WHY: an accepted-only subset would hide Human/RCS1 fail-open and
+        // invent a cheaper overall than the frozen request corpus.
+        let corpus = try loadCorpus()
+        XCTAssertEqual(corpus.count, 24)
+        let partial = completeFailOpenUnitRun(corpus: Array(corpus.dropLast()))
+        do {
+            _ = try await AllRowBestOfThreeHarness.requestReport(
+                corpus: corpus,
+                measurements: partial,
+                capability: allRowEstimatedCapability()
+            )
+            XCTFail("missing request rows must fail closed")
+        } catch {
+            XCTAssertTrue(
+                error.localizedDescription.contains("24")
+                    || error.localizedDescription.contains("ID order"),
+                "\(error)"
+            )
+        }
+    }
+
+    func test_allRowResponseReportRequiresEveryFrozen10ID() async throws {
+        // WHY: dropping one response fixture would let a convenient RCW1 A
+        // subset stand in for the frozen 10-row surface.
+        let corpus = try loadResponseCorpus()
+        XCTAssertEqual(corpus.count, 10)
+        let measurements = try Array(responseMeasurements(corpus).dropLast())
+        do {
+            _ = try await AllRowBestOfThreeHarness.responseReport(
+                corpus: corpus,
+                measurements: measurements,
+                capability: allRowEstimatedCapability()
+            )
+            XCTFail("missing response rows must fail closed")
+        } catch {
+            XCTAssertTrue(
+                error.localizedDescription.contains("10")
+                    || error.localizedDescription.contains("ID order"),
+                "\(error)"
+            )
+        }
+    }
+
+    func test_allRowSelectorPicksRCS1AsUniqueStrictMinimum() async throws {
+        // WHY: RCS1 must be able to win from encode(Human) when it is the only
+        // verified envelope strictly below Human. RCW1 stays visible.
+        // Test-authority integers are not frozen corpus evidence.
+        let input = allRowControlInput()
+        let row = try await AllRowBestOfThreeHarness.selectRow(
+            id: "rcs1-winner",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: input.rcs1,
+            capability: allRowTestAuthorityCapability(counts: allRowControlCounts(
+                input, human: 100, rcw1Effective: 70, rcs1Effective: 30
+            ))
+        )
+        XCTAssertEqual(row.selectedFormat, .rcs1)
+        XCTAssertEqual(row.reason, .uniqueStrictMinimum)
+        XCTAssertTrue(row.rcs1.eligible)
+        XCTAssertTrue(row.rcw1.eligible)
+        XCTAssertEqual(row.human.effectiveTokens, 100)
+        XCTAssertEqual(row.rcs1.effectiveTokens, 30)
+        XCTAssertEqual(row.modeledContextDelta, 70)
+        XCTAssertFalse(row.billingClaim)
+    }
+
+    func test_allRowSelectorPicksRCW1AsUniqueStrictMinimum() async throws {
+        // WHY: RCW1 is derived from the same Human and must still win when it
+        // is the unique verified minimum. RCS1 must not be dropped.
+        // Test-authority integers are not frozen corpus evidence.
+        let input = allRowControlInput()
+        let row = try await AllRowBestOfThreeHarness.selectRow(
+            id: "rcw1-winner",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: input.rcs1,
+            capability: allRowTestAuthorityCapability(counts: allRowControlCounts(
+                input, human: 100, rcw1Effective: 35, rcs1Effective: 80
+            ))
+        )
+        XCTAssertEqual(row.selectedFormat, .rcw1)
+        XCTAssertEqual(row.reason, .uniqueStrictMinimum)
+        XCTAssertTrue(row.rcw1.eligible)
+        XCTAssertTrue(row.rcs1.eligible)
+        XCTAssertEqual(row.rcw1.effectiveTokens, 35)
+        XCTAssertEqual(row.modeledContextDelta, 65)
+        XCTAssertNotEqual(row.selectedFormat, .rcs1)
+    }
+
+    func test_allRowSelectorPicksHumanWhenItIsTheStrictMinimum() async throws {
+        // WHY: a cheaper Human envelope must win. Optimized arms stay in the
+        // row so the report is not accepted-only.
+        let input = allRowControlInput()
+        let row = try await AllRowBestOfThreeHarness.selectRow(
+            id: "human-winner",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: input.rcs1,
+            capability: allRowTestAuthorityCapability(counts: allRowControlCounts(
+                input, human: 40, rcw1Effective: 70, rcs1Effective: 80
+            ))
+        )
+        XCTAssertEqual(row.selectedFormat, .human)
+        XCTAssertEqual(row.reason, .humanLowestCost)
+        XCTAssertEqual(row.modeledContextDelta, 0)
+        XCTAssertEqual(row.provenSavingsTokens, 0)
+        XCTAssertTrue(row.human.eligible)
+        XCTAssertTrue(row.rcw1.eligible)
+        XCTAssertTrue(row.rcs1.eligible)
+    }
+
+    func test_allRowSelectorPicksHumanOnTie() async throws {
+        // WHY: equal verified envelopes are not a unique strict minimum. Human
+        // keeps the bytes rather than flipping a coin between RCW1 and RCS1.
+        let input = allRowControlInput()
+        let row = try await AllRowBestOfThreeHarness.selectRow(
+            id: "tie-human",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: input.rcs1,
+            capability: allRowTestAuthorityCapability(counts: allRowControlCounts(
+                input, human: 100, rcw1Effective: 40, rcs1Effective: 40
+            ))
+        )
+        XCTAssertEqual(row.selectedFormat, .human)
+        XCTAssertEqual(row.reason, .tie)
+        XCTAssertEqual(row.provenSavingsTokens, 0)
+        XCTAssertTrue(row.rcw1.eligible)
+        XCTAssertTrue(row.rcs1.eligible)
+    }
+
+    func test_allRowSemanticInvalidEliminatesOnlyThatArm() async throws {
+        // WHY: a semantic miss is a gate, not a missing row. The invalid arm
+        // stays in the table; the other verified arm may still win.
+        let input = allRowControlInput()
+        var broken = input.rcw1
+        broken.semantic = .failed
+        let row = try await AllRowBestOfThreeHarness.selectRow(
+            id: "semantic-invalid",
+            human: input.human,
+            rcw1: broken,
+            rcs1: input.rcs1,
+            capability: allRowTestAuthorityCapability(counts: allRowControlCounts(
+                input, human: 100, rcw1Effective: 10, rcs1Effective: 40
+            ))
+        )
+        XCTAssertFalse(row.rcw1.eligible)
+        XCTAssertEqual(row.rcw1.rejectionReason, "semantic")
+        XCTAssertEqual(row.rcw1.semantic, .failed)
+        XCTAssertTrue(row.rcs1.eligible)
+        XCTAssertEqual(row.selectedFormat, .rcs1)
+        XCTAssertEqual(row.reason, .uniqueStrictMinimum)
+    }
+
+    func test_allRowRecoveryInvalidEliminatesOnlyThatArm() async throws {
+        // WHY: recovery is ranked before cost. A cheaper RCS1 that does not
+        // recover Human must stay visible and lose, not disappear.
+        let input = allRowControlInput()
+        var broken = input.rcs1
+        broken.recovery = .failed
+        let row = try await AllRowBestOfThreeHarness.selectRow(
+            id: "recovery-invalid",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: broken,
+            capability: allRowTestAuthorityCapability(counts: allRowControlCounts(
+                input, human: 100, rcw1Effective: 45, rcs1Effective: 10
+            ))
+        )
+        XCTAssertFalse(row.rcs1.eligible)
+        XCTAssertEqual(row.rcs1.rejectionReason, "recovery")
+        XCTAssertEqual(row.rcs1.recovery, .failed)
+        XCTAssertTrue(row.rcw1.eligible)
+        XCTAssertEqual(row.selectedFormat, .rcw1)
+        XCTAssertEqual(row.reason, .uniqueStrictMinimum)
+    }
+
+    func test_allRowAbsentCounterPicksHumanAndKeepsEveryArm() async throws {
+        // WHY: without a bound exact counter there is no comparable cost.
+        // Human is the decision; the three arms still exist with no savings.
+        let input = allRowControlInput()
+        let row = try await AllRowBestOfThreeHarness.selectRow(
+            id: "counter-absent",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: input.rcs1,
+            capability: nil
+        )
+        XCTAssertEqual(row.selectedFormat, .human)
+        XCTAssertEqual(row.reason, .counterUnavailable)
+        XCTAssertEqual(row.provenSavingsTokens, 0)
+        XCTAssertNil(row.human.effectiveTokens)
+        XCTAssertNil(row.rcw1.effectiveTokens)
+        XCTAssertNil(row.rcs1.effectiveTokens)
+        XCTAssertEqual(row.human.format, .human)
+        XCTAssertEqual(row.rcw1.format, .rcw1)
+        XCTAssertEqual(row.rcs1.format, .rcs1)
+        XCTAssertFalse(row.billingClaim)
+    }
+
+    func test_allRowCountsABIAndHandleOnceWithoutBillingClaim() async throws {
+        // WHY: effective cost is payload + already-included handle + one
+        // unamortized ABI. Test-authority counts are not frozen evidence.
+        let input = allRowControlInput()
+        let probe = AllRowCountProbe(counts: allRowControlCounts(
+            input, human: 100, rcw1Effective: 40, rcs1Effective: 70
+        ))
+        let row = try await AllRowBestOfThreeHarness.selectRow(
+            id: "abi-handle-once",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: input.rcs1,
+            capability: allRowTestAuthorityCapability(probe: probe)
+        )
+        let calls = await probe.calls
+        XCTAssertEqual(calls.filter { $0 == input.rcw1.abi }.count, 1)
+        XCTAssertEqual(calls.filter { $0 == input.rcs1.abi }.count, 1)
+        XCTAssertEqual(calls.filter { $0 == input.rcw1.handle }.count, 1)
+        XCTAssertEqual(row.rcw1.handleTokens, 7)
+        XCTAssertEqual(row.rcw1.abiTokens, 10)
+        XCTAssertEqual(row.rcw1.payloadTokens, 30)
+        XCTAssertEqual(row.rcw1.effectiveTokens, 40)
+        XCTAssertEqual(row.human.abiTokens, 0)
+        XCTAssertEqual(row.counterQuality, AllRowBestOfThreeHarness.testAuthorityQuality)
+        XCTAssertFalse(row.billingClaim)
+        XCTAssertFalse(row.providerReportedTokens)
+    }
+
+    func test_allRowRCS1IsEncodeOfHumanNeverEncodeOfRCW1() async throws {
+        // WHY: chaining Human→RCW1→RCS1 would make RCS1 a second encoding of
+        // the wire, not an independent arm of the same Human.
+        let cases = try loadCorpus()
+        let repeated = try XCTUnwrap(cases.first { $0.id == "multiframe-long-repetition" })
+        let human = repeated.effectiveHuman
+        let handle = "[[rc:all-row-encode-independence]]"
+        let rcw1Payload = try RCWireProtocol.addingExactRecord(
+            handle,
+            to: RCWireProtocol.addingRequestRecords(
+                [.init(kind: .context, value: "Human repeated G verbatim 12 times.")],
+                to: RCWireProtocol.serializeRequestText(repeated.human)
+            )
+        )
+        let encodedHuman = try XCTUnwrap(AllRowBestOfThreeHarness.rcs1Payload(fromHuman: human))
+        XCTAssertEqual(RemoteCodeCompactSpan.decode(encodedHuman), human)
+        XCTAssertNotEqual(encodedHuman, RemoteCodeCompactSpan.encode(rcw1Payload))
+        let measured = completeFailOpenUnitRun(
+            corpus: cases,
+            overrides: [
+                repeated.id: MeasuredBenchmarkRow(
+                    id: repeated.id,
+                    decision: .rcw1,
+                    deliveredPayload: rcw1Payload,
+                    recoveryHandle: handle,
+                    failOpenReason: nil,
+                    cavemanOutput: human
+                ),
+            ]
+        )
+        let report = try await AllRowBestOfThreeHarness.requestReport(
+            corpus: cases,
+            measurements: measured,
+            capability: allRowEstimatedCapability()
+        )
+        let row = try XCTUnwrap(report.rows.first { $0.id == repeated.id })
+        XCTAssertEqual(row.rcs1.payloadSHA256, sha256Hex(Data(encodedHuman.utf8)))
+        if let encodedWire = RemoteCodeCompactSpan.encode(rcw1Payload) {
+            XCTAssertNotEqual(row.rcs1.payloadSHA256, sha256Hex(Data(encodedWire.utf8)))
+        }
+        XCTAssertNotEqual(row.rcs1.payloadSHA256, row.rcw1.payloadSHA256)
+        XCTAssertTrue(report.methodology.rcs1Rule.contains("encode(canonical"))
+    }
+
+    func test_allRowFrozenCorporaEmitEveryArmAndJSONCSVParity() async throws {
+        // WHY: the reproducible report is all 24+10 rows, three runtime arms,
+        // and fail-open kept in totals. JSON/CSV must name the same rows.
+        let requestCorpus = try loadCorpus()
+        let requestReport = try await AllRowBestOfThreeHarness.requestReport(
+            corpus: requestCorpus,
+            measurements: completeFailOpenUnitRun(
+                corpus: requestCorpus,
+                belowFloorIDs: ["short-fail-open"]
+            ),
+            capability: allRowEstimatedCapability()
+        )
+        XCTAssertEqual(requestReport.schemaVersion, AllRowBestOfThreeHarness.schemaVersion)
+        XCTAssertEqual(requestReport.surface, .request)
+        XCTAssertEqual(requestReport.rows.map(\.id), requestCorpus.map(\.id))
+        XCTAssertEqual(requestReport.rows.count, 24)
+        XCTAssertEqual(requestReport.totals.rows, 24)
+        XCTAssertEqual(requestReport.totals.humanFailOpenRows, 24)
+        XCTAssertEqual(requestReport.totals.rcw1Rows, 0)
+        XCTAssertEqual(requestReport.totals.rcs1Rows, 0)
+        XCTAssertEqual(requestReport.totals.uniqueStrictMinimumRows, 0)
+        XCTAssertEqual(requestReport.totals.provenSavingsTokens, 0)
+        XCTAssertEqual(
+            requestReport.totals.humanFailOpenRows
+                + requestReport.totals.rcw1Rows
+                + requestReport.totals.rcs1Rows,
+            24
+        )
+        XCTAssertEqual(
+            requestReport.totals.provenSavingsTokens,
+            requestReport.rows.reduce(0) { $0 + $1.provenSavingsTokens }
+        )
+        for row in requestReport.rows {
+            XCTAssertEqual(row.selectedFormat, .human)
+            XCTAssertEqual(row.human.format, .human)
+            XCTAssertEqual(row.rcw1.format, .rcw1)
+            XCTAssertEqual(row.rcs1.format, .rcs1)
+            XCTAssertFalse(row.billingClaim)
+            XCTAssertEqual(row.counterQuality, AllRowBestOfThreeHarness.estimatedQuality)
+            XCTAssertNotEqual(row.selectedFormat.rawValue, "caveman")
+            XCTAssertEqual(row.provenSavingsTokens, 0)
+        }
+
+        let responseCorpus = try loadResponseCorpus()
+        let responseReport = try await AllRowBestOfThreeHarness.responseReport(
+            corpus: responseCorpus,
+            measurements: try responseMeasurements(responseCorpus),
+            capability: allRowEstimatedCapability()
+        )
+        XCTAssertEqual(responseReport.schemaVersion, AllRowBestOfThreeHarness.schemaVersion)
+        XCTAssertEqual(responseReport.surface, .response)
+        XCTAssertEqual(responseReport.rows.map(\.id), frozenResponseCorpusIDs)
+        XCTAssertEqual(responseReport.rows.count, 10)
+        XCTAssertEqual(responseReport.totals.rows, 10)
+        XCTAssertEqual(responseReport.totals.humanFailOpenRows, 10)
+        XCTAssertEqual(responseReport.totals.rcw1Rows, 0)
+        XCTAssertEqual(responseReport.totals.rcs1Rows, 0)
+        XCTAssertEqual(responseReport.totals.provenSavingsTokens, 0)
+        for row in responseReport.rows {
+            XCTAssertEqual(row.selectedFormat, .human)
+            XCTAssertEqual(row.human.format, .human)
+            XCTAssertEqual(row.rcw1.format, .rcw1)
+            XCTAssertEqual(row.rcs1.format, .rcs1)
+            XCTAssertFalse(row.billingClaim)
+            XCTAssertEqual(row.counterQuality, AllRowBestOfThreeHarness.estimatedQuality)
+        }
+
+        try assertAllRowJSONCSVParity(requestReport)
+        try assertAllRowJSONCSVParity(responseReport)
+        XCTAssertFalse(requestReport.methodology.providerReportedTokens)
+        XCTAssertFalse(requestReport.methodology.billingClaim)
+        XCTAssertEqual(requestReport.methodology.quality, AllRowBestOfThreeHarness.estimatedQuality)
+        XCTAssertFalse(requestReport.methodology.quality.contains("exact"))
+        XCTAssertFalse(requestReport.methodology.quality.contains("proven"))
+        XCTAssertTrue(requestReport.methodology.scope.contains("all-frozen"))
+        print(
+            "ALL_ROW_REQUEST_TOTALS rows=\(requestReport.totals.rows)"
+                + " human=\(requestReport.totals.humanFailOpenRows)"
+                + " rcw1=\(requestReport.totals.rcw1Rows)"
+                + " rcs1=\(requestReport.totals.rcs1Rows)"
+                + " unique=\(requestReport.totals.uniqueStrictMinimumRows)"
+                + " savings=\(requestReport.totals.provenSavingsTokens)"
+                + " reasons=\(requestReport.totals.failOpenReasons)"
+        )
+        print(
+            "ALL_ROW_RESPONSE_TOTALS rows=\(responseReport.totals.rows)"
+                + " human=\(responseReport.totals.humanFailOpenRows)"
+                + " rcw1=\(responseReport.totals.rcw1Rows)"
+                + " rcs1=\(responseReport.totals.rcs1Rows)"
+                + " unique=\(responseReport.totals.uniqueStrictMinimumRows)"
+                + " savings=\(responseReport.totals.provenSavingsTokens)"
+                + " reasons=\(responseReport.totals.failOpenReasons)"
+        )
+    }
+
+    func test_allRowEstimatedUnknownOrErrorNeverSelectsOptimizedOrClaimsProvenSavings() async throws {
+        // WHY: TokenEstimator is heuristic. A report that labels it
+        // exact-local/proven can publish RCW1/RCS1 winners and savings that
+        // no local exact executable measured.
+        let estimatedCounter = try BenchmarkTokenCounter(environment: [:])
+        XCTAssertEqual(estimatedCounter.diagnostic.measurementKind, "estimated")
+
+        let requestCorpus = try loadCorpus()
+        let requestReport = try await AllRowBestOfThreeHarness.requestReport(
+            corpus: requestCorpus,
+            measurements: completeFailOpenUnitRun(
+                corpus: requestCorpus,
+                belowFloorIDs: ["short-fail-open"]
+            ),
+            capability: allRowEstimatedCapability()
+        )
+        XCTAssertEqual(requestReport.rows.count, 24)
+        XCTAssertEqual(requestReport.totals.humanFailOpenRows, 24)
+        XCTAssertEqual(requestReport.totals.rcw1Rows, 0)
+        XCTAssertEqual(requestReport.totals.rcs1Rows, 0)
+        XCTAssertEqual(requestReport.totals.uniqueStrictMinimumRows, 0)
+        XCTAssertEqual(requestReport.totals.provenSavingsTokens, 0)
+        XCTAssertEqual(requestReport.methodology.quality, "estimated")
+        XCTAssertFalse(requestReport.methodology.quality.contains("exact"))
+        XCTAssertFalse(requestReport.methodology.quality.contains("proven"))
+        XCTAssertFalse(requestReport.methodology.quality.contains("local_exact"))
+        for row in requestReport.rows {
+            XCTAssertEqual(row.selectedFormat, .human)
+            XCTAssertNotEqual(row.selectedFormat.rawValue, "caveman")
+            XCTAssertEqual(row.provenSavingsTokens, 0)
+            XCTAssertEqual(row.modeledContextDelta, 0)
+            XCTAssertEqual(row.counterQuality, "estimated")
+            XCTAssertFalse(row.counterQuality.contains("exact"))
+            XCTAssertFalse(row.counterQuality.contains("proven"))
+            XCTAssertEqual(row.human.format, .human)
+            XCTAssertEqual(row.rcw1.format, .rcw1)
+            XCTAssertEqual(row.rcs1.format, .rcs1)
+        }
+
+        let responseCorpus = try loadResponseCorpus()
+        let responseReport = try await AllRowBestOfThreeHarness.responseReport(
+            corpus: responseCorpus,
+            measurements: try responseMeasurements(responseCorpus),
+            capability: allRowEstimatedCapability()
+        )
+        XCTAssertEqual(responseReport.rows.count, 10)
+        XCTAssertEqual(responseReport.totals.humanFailOpenRows, 10)
+        XCTAssertEqual(responseReport.totals.rcw1Rows, 0)
+        XCTAssertEqual(responseReport.totals.rcs1Rows, 0)
+        XCTAssertEqual(responseReport.totals.provenSavingsTokens, 0)
+        XCTAssertEqual(responseReport.methodology.quality, "estimated")
+
+        let input = allRowControlInput()
+        let unknown = try await AllRowBestOfThreeHarness.selectRow(
+            id: "unknown-quality",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: input.rcs1,
+            capability: TokenSaverBestOfThreeSelector.CounterCapability(
+                counter: .init(
+                    id: "unknown-counter",
+                    revision: "1",
+                    encoding: "unknown",
+                    provider: "local",
+                    resolvedModel: "unknown",
+                    quality: .unknown
+                ),
+                count: { _ in 1 }
+            )
+        )
+        XCTAssertEqual(unknown.selectedFormat, .human)
+        XCTAssertEqual(unknown.reason, .counterUncertain)
+        XCTAssertEqual(unknown.provenSavingsTokens, 0)
+        XCTAssertEqual(unknown.counterQuality, "unknown")
+        XCTAssertNil(unknown.human.effectiveTokens)
+
+        let exploding = try await AllRowBestOfThreeHarness.selectRow(
+            id: "error-quality",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: input.rcs1,
+            capability: TokenSaverBestOfThreeSelector.CounterCapability(
+                counter: .init(
+                    id: "error-counter",
+                    revision: "1",
+                    encoding: "error",
+                    provider: "local",
+                    resolvedModel: "error",
+                    quality: .exactLocalTokenizer
+                ),
+                count: { _ in throw benchmarkError("counter exploded") }
+            )
+        )
+        XCTAssertEqual(exploding.selectedFormat, .human)
+        XCTAssertEqual(exploding.reason, .counterError)
+        XCTAssertEqual(exploding.provenSavingsTokens, 0)
+        XCTAssertNil(exploding.human.effectiveTokens)
+    }
+
+    func test_allRowEmitterFailClosedAndWritesCompleteSchema6JSONCSVWithRCS1() async throws {
+        // WHY: schema 3/5 writers cannot stand in for schema 6. The all-row
+        // emitter must skip without env, fail closed on partial/estimated
+        // input, and write one JSON+CSV checkpoint with every Human/RCW1/RCS1 arm.
+        XCTAssertNil(try AllRowReportEmitter.plan(environment: [:]))
+        XCTAssertThrowsError(try AllRowReportEmitter.plan(environment: [
+            AllRowReportEmitter.jsonKey: "/tmp/only-report.json"
+        ])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("complete"))
+        }
+        XCTAssertThrowsError(
+            try AllRowBestOfThreeHarness.exactCapability(
+                from: BenchmarkTokenCounter(environment: [:])
+            )
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("estimated"))
+        }
+
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("all-row-emitter-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let bundle = parent.appendingPathComponent("all-row-bundle", isDirectory: true)
+        let reportJSON = bundle.appendingPathComponent("report.json")
+        let reportCSV = bundle.appendingPathComponent("report.csv")
+        let measurementsURL = parent.appendingPathComponent("measurements.json")
+        let requestCorpus = try loadCorpus()
+        try JSONEncoder().encode(completeFailOpenUnitRun(corpus: requestCorpus))
+            .write(to: measurementsURL)
+        XCTAssertThrowsError(try AllRowReportEmitter.plan(environment: [
+            AllRowReportEmitter.jsonKey: reportJSON.path,
+            AllRowReportEmitter.csvKey: reportCSV.path,
+            AllRowReportEmitter.measurementsKey: measurementsURL.path,
+        ])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("complete"))
+        }
+        XCTAssertThrowsError(try AllRowReportEmitter.plan(environment: [
+            AllRowReportEmitter.jsonKey: reportJSON.path,
+            AllRowReportEmitter.csvKey: reportCSV.path,
+            AllRowReportEmitter.measurementsKey: measurementsURL.path,
+            AllRowReportEmitter.tokenCounterKey: measurementsURL.path,
+        ])) { error in
+            let text = error.localizedDescription
+            XCTAssertTrue(
+                text.contains("alias") || text.contains("overlap") || text.contains("executable"),
+                "\(error)"
+            )
+        }
+
+        let requestReport = try await AllRowBestOfThreeHarness.requestReport(
+            corpus: requestCorpus,
+            measurements: completeFailOpenUnitRun(corpus: requestCorpus),
+            capability: allRowEstimatedCapability()
+        )
+        let responseCorpus = try loadResponseCorpus()
+        let responseReport = try await AllRowBestOfThreeHarness.responseReport(
+            corpus: responseCorpus,
+            measurements: try responseMeasurements(responseCorpus),
+            capability: allRowEstimatedCapability()
+        )
+        try assertAllRowJSONCSVParity(requestReport)
+        try assertAllRowJSONCSVParity(responseReport)
+        XCTAssertThrowsError(try allRowUnitTestCheckpoint(
+            request: AllRowBestOfThreeHarness.report(
+                surface: .request,
+                rows: Array(requestReport.rows.dropLast())
+            ),
+            response: responseReport
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("24"), "\(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bundle.path))
+    }
+
+    func test_allRowF2MeasurementMutationsMustFailBeforeCount() async throws {
+        // WHY: an ID-only coverage check lets a mutated measurement artifact
+        // reach counting and look like a complete all-row checkpoint.
+        let corpus = try loadCorpus()
+        let baseline = completeFailOpenUnitRun(corpus: corpus)
+        let first = try XCTUnwrap(corpus.first)
+        let last = try XCTUnwrap(corpus.last)
+        let probe = AllRowCountProbe(counts: [:])
+        let capability = allRowTestAuthorityCapability(probe: probe)
+        let mutations: [(String, MeasuredBenchmarkRun)] = [
+            (
+                "schema",
+                MeasuredBenchmarkRun(
+                    schemaVersion: 99,
+                    runID: baseline.runID,
+                    capturedAt: baseline.capturedAt,
+                    source: baseline.source,
+                    encoder: baseline.encoder,
+                    encoderRevision: baseline.encoderRevision,
+                    provider: baseline.provider,
+                    providerModel: baseline.providerModel,
+                    cavemanSourceCommit: baseline.cavemanSourceCommit,
+                    cavemanGoVersion: baseline.cavemanGoVersion,
+                    cavemanBuildCommand: baseline.cavemanBuildCommand,
+                    cavemanBinarySHA: baseline.cavemanBinarySHA,
+                    rows: baseline.rows
+                )
+            ),
+            (
+                "corpus-order",
+                MeasuredBenchmarkRun(
+                    schemaVersion: baseline.schemaVersion,
+                    runID: baseline.runID,
+                    capturedAt: baseline.capturedAt,
+                    source: baseline.source,
+                    encoder: baseline.encoder,
+                    encoderRevision: baseline.encoderRevision,
+                    provider: baseline.provider,
+                    providerModel: baseline.providerModel,
+                    cavemanSourceCommit: baseline.cavemanSourceCommit,
+                    cavemanGoVersion: baseline.cavemanGoVersion,
+                    cavemanBuildCommand: baseline.cavemanBuildCommand,
+                    cavemanBinarySHA: baseline.cavemanBinarySHA,
+                    rows: Array(baseline.rows.reversed())
+                )
+            ),
+            (
+                "source-commit",
+                completeFailOpenUnitRun(
+                    corpus: corpus,
+                    cavemanProvenance: benchmarkPinnedCavemanProvenance.replacing(
+                        sourceCommit: String(repeating: "0", count: 40)
+                    )
+                )
+            ),
+            (
+                "caveman-provenance",
+                completeFailOpenUnitRun(
+                    corpus: corpus,
+                    cavemanProvenance: benchmarkPinnedCavemanProvenance.replacing(
+                        binarySHA: String(repeating: "0", count: 64)
+                    )
+                )
+            ),
+            (
+                "caveman-output",
+                completeFailOpenUnitRun(
+                    corpus: corpus,
+                    overrides: [
+                        first.id: MeasuredBenchmarkRow(
+                            id: first.id,
+                            decision: .humanFailOpen,
+                            deliveredPayload: first.effectiveHuman,
+                            recoveryHandle: nil,
+                            failOpenReason: .sidecarUnavailable,
+                            cavemanOutput: ""
+                        ),
+                    ]
+                )
+            ),
+            (
+                "delivered-payload",
+                completeFailOpenUnitRun(
+                    corpus: corpus,
+                    overrides: [
+                        first.id: MeasuredBenchmarkRow(
+                            id: first.id,
+                            decision: .humanFailOpen,
+                            deliveredPayload: first.effectiveHuman + " mutated",
+                            recoveryHandle: nil,
+                            failOpenReason: .sidecarUnavailable,
+                            cavemanOutput: first.effectiveHuman
+                        ),
+                    ]
+                )
+            ),
+            (
+                "recovery-handle",
+                completeFailOpenUnitRun(
+                    corpus: corpus,
+                    overrides: [
+                        last.id: MeasuredBenchmarkRow(
+                            id: last.id,
+                            decision: .humanFailOpen,
+                            deliveredPayload: last.effectiveHuman,
+                            recoveryHandle: "[[rc:forbidden-on-fail-open]]",
+                            failOpenReason: .belowFloor,
+                            cavemanOutput: last.effectiveHuman
+                        ),
+                    ]
+                )
+            ),
+        ]
+        for (name, measurements) in mutations {
+            let before = await probe.calls.count
+            do {
+                _ = try await AllRowBestOfThreeHarness.requestReport(
+                    corpus: corpus,
+                    measurements: measurements,
+                    capability: capability
+                )
+                XCTFail("\(name) reached all-row count without integrity rejection")
+            } catch {
+                XCTAssertFalse(
+                    error.localizedDescription.contains("missing all-row"),
+                    "\(name) counted before failing: \(error)"
+                )
+            }
+            let after = await probe.calls.count
+            XCTAssertEqual(after, before, "\(name) must fail before the first counter call")
+        }
+        do {
+            try AllRowBestOfThreeHarness.validatePublicationContext(
+                AllRowPublicationContext(
+                    remoteCodeHead: String(repeating: "0", count: 40),
+                    workspaceClean: false,
+                    runnerSourceSHA256: String(repeating: "0", count: 64)
+                )
+            )
+            XCTFail("dirty worktree / unexpected source commit reached all-row count")
+        } catch {
+            XCTAssertTrue(
+                error.localizedDescription.contains("workspace")
+                    || error.localizedDescription.contains("worktree")
+                    || error.localizedDescription.contains("source commit")
+                    || error.localizedDescription.contains("HEAD")
+                    || error.localizedDescription.contains("runner"),
+                "worktree/source-commit: \(error)"
+            )
+        }
+        let finalCalls = await probe.calls.count
+        XCTAssertEqual(finalCalls, 0)
+        XCTAssertThrowsError(try MeasuredBenchmarkHarness.validateAllRowRequestIntegrity(
+            corpus: corpus,
+            corpusData: Data("mutated-request-corpus".utf8),
+            measurements: baseline
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("frozen request corpus"), "\(error)")
+        }
+        let afterSHA = await probe.calls.count
+        XCTAssertEqual(afterSHA, finalCalls)
+    }
+
+    func test_allRowF3SecondPairFailureMustPublishZero() async throws {
+        // WHY: one atomic JSON+CSV pair must leave zero files when emit fails.
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("all-row-f3-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let bundle = parent.appendingPathComponent("all-row-bundle", isDirectory: true)
+        let requestCorpus = try loadCorpus()
+        let requestReport = try await AllRowBestOfThreeHarness.requestReport(
+            corpus: requestCorpus,
+            measurements: completeFailOpenUnitRun(corpus: requestCorpus),
+            capability: AllRowBestOfThreeHarness.localExactCapability { $0.utf8.count }
+        )
+        let responseCorpus = try loadResponseCorpus()
+        let responseReport = try await AllRowBestOfThreeHarness.responseReport(
+            corpus: responseCorpus,
+            measurements: try responseMeasurements(responseCorpus),
+            capability: AllRowBestOfThreeHarness.localExactCapability { $0.utf8.count }
+        )
+        let checkpoint = try allRowUnitTestCheckpoint(
+            request: requestReport, response: responseReport
+        )
+        let output = try ResponseReportOutputBundle(
+            jsonPath: bundle.appendingPathComponent("report.json").path,
+            csvPath: bundle.appendingPathComponent(String(repeating: "c", count: 300) + ".csv").path
+        )
+        XCTAssertThrowsError(try AllRowReportEmitter.write(output: output, report: checkpoint))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bundle.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: parent.path), [])
+    }
+
+    func test_allRowF3PlanMustRefuseOutputInputAliasBeforeWrite() throws {
+        // WHY: JSON/CSV may not alias the measurement artifact, counter, or fixtures.
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("all-row-alias-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let measurements = parent.appendingPathComponent("measurements.json")
+        try Data("{}".utf8).write(to: measurements)
+        XCTAssertThrowsError(try AllRowReportEmitter.plan(environment: [
+            AllRowReportEmitter.jsonKey: measurements.path,
+            AllRowReportEmitter.csvKey: parent.appendingPathComponent("report-bundle/report.csv").path,
+            AllRowReportEmitter.measurementsKey: measurements.path,
+            AllRowReportEmitter.tokenCounterKey: "/usr/bin/true",
+        ])) { error in
+            let text = error.localizedDescription
+            XCTAssertTrue(
+                text.contains("alias") || text.contains("overlap"),
+                "output/input alias must be refused before count/write: \(error)"
+            )
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: parent.appendingPathComponent("report-bundle").path
+            )
+        )
+    }
+
+    func test_allRowF5WriteMustRefuseUnitTestAuthority() async throws {
+        // WHY: unit-test-authority integers are selector fixtures, not a
+        // publishable local_exact checkpoint.
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("all-row-f5-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let requestCorpus = try loadCorpus()
+        let request = try await AllRowBestOfThreeHarness.requestReport(
+            corpus: requestCorpus,
+            measurements: completeFailOpenUnitRun(corpus: requestCorpus),
+            capability: TokenSaverBestOfThreeSelector.CounterCapability(
+                counter: .init(
+                    id: AllRowBestOfThreeHarness.testAuthorityCounterID,
+                    revision: "1",
+                    encoding: "unit-test-authority",
+                    provider: "local",
+                    resolvedModel: "unit-test-authority",
+                    quality: .exactLocalTokenizer
+                ),
+                count: { _ in 10 }
+            )
+        )
+        let response = try await AllRowBestOfThreeHarness.responseReport(
+            corpus: try loadResponseCorpus(),
+            measurements: try responseMeasurements(try loadResponseCorpus()),
+            capability: TokenSaverBestOfThreeSelector.CounterCapability(
+                counter: .init(
+                    id: AllRowBestOfThreeHarness.testAuthorityCounterID,
+                    revision: "1",
+                    encoding: "unit-test-authority",
+                    provider: "local",
+                    resolvedModel: "unit-test-authority",
+                    quality: .exactLocalTokenizer
+                ),
+                count: { _ in 10 }
+            )
+        )
+        XCTAssertEqual(request.methodology.quality, AllRowBestOfThreeHarness.testAuthorityQuality)
+        XCTAssertEqual(request.totals.provenSavingsTokens, 0)
+        let checkpoint = try allRowUnitTestCheckpoint(request: request, response: response)
+        XCTAssertThrowsError(try AllRowReportEmitter.write(
+            output: ResponseReportOutputBundle(
+                jsonPath: parent.appendingPathComponent("all-row-bundle/report.json").path,
+                csvPath: parent.appendingPathComponent("all-row-bundle/report.csv").path
+            ),
+            report: checkpoint
+        )) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("local_exact")
+                    || error.localizedDescription.contains("unit-test-authority"),
+                "unit-test-authority must not publish: \(error)"
+            )
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: parent.appendingPathComponent("all-row-bundle").path
+            )
+        )
+    }
+
+    func test_allRowLocalExactPublishesOneAtomicCheckpoint() async throws {
+        // WHY: a publishable checkpoint is one JSON+CSV pair with 34 rows and
+        // request/response/overall totals from exact local costs.
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("all-row-local-exact-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let bundle = parent.appendingPathComponent("all-row-bundle", isDirectory: true)
+        let capability = AllRowBestOfThreeHarness.localExactCapability { $0.utf8.count }
+        let requestCorpus = try loadCorpus()
+        let requestReport = try await AllRowBestOfThreeHarness.requestReport(
+            corpus: requestCorpus,
+            measurements: completeFailOpenUnitRun(corpus: requestCorpus),
+            capability: capability
+        )
+        let responseCorpus = try loadResponseCorpus()
+        let responseReport = try await AllRowBestOfThreeHarness.responseReport(
+            corpus: responseCorpus,
+            measurements: try responseMeasurements(responseCorpus),
+            capability: capability
+        )
+        let checkpoint = try allRowUnitTestCheckpoint(
+            request: requestReport, response: responseReport
+        )
+        let receipt = try AllRowReportEmitter.write(
+            output: ResponseReportOutputBundle(
+                jsonPath: bundle.appendingPathComponent("report.json").path,
+                csvPath: bundle.appendingPathComponent("report.csv").path
+            ),
+            report: checkpoint
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: receipt.jsonPath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: receipt.csvPath))
+        let writtenJSON = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: URL(fileURLWithPath: receipt.jsonPath))
+        ) as? [String: Any])
+        XCTAssertEqual(writtenJSON["schema_version"] as? Int, 6)
+        let writtenRows = try XCTUnwrap(writtenJSON["rows"] as? [[String: Any]])
+        XCTAssertEqual(writtenRows.count, 34)
+        XCTAssertEqual(
+            writtenRows.map { $0["id"] as? String },
+            frozenRequestCorpusIDs + frozenResponseCorpusIDs
+        )
+        XCTAssertTrue(writtenRows.allSatisfy { $0["rcs1"] != nil })
+        XCTAssertFalse(writtenRows.contains { $0["selected_format"] as? String == "caveman" })
+        XCTAssertEqual(
+            writtenRows.map { $0["counter_quality"] as? String },
+            Array(repeating: AllRowBestOfThreeHarness.localExactQuality, count: 34)
+        )
+        let totals = try XCTUnwrap(writtenJSON["totals"] as? [String: Any])
+        let requestTotals = try XCTUnwrap(totals["request"] as? [String: Any])
+        let responseTotals = try XCTUnwrap(totals["response"] as? [String: Any])
+        let overallTotals = try XCTUnwrap(totals["overall"] as? [String: Any])
+        XCTAssertEqual(requestTotals["rows"] as? Int, 24)
+        XCTAssertEqual(responseTotals["rows"] as? Int, 10)
+        XCTAssertEqual(overallTotals["rows"] as? Int, 34)
+        XCTAssertNotNil(requestTotals["fail_open_reasons"])
+        XCTAssertNotNil(responseTotals["fail_open_reasons"])
+        XCTAssertNotNil(overallTotals["fail_open_reasons"])
+        let writtenCSV = try String(contentsOfFile: receipt.csvPath)
+        let csvLines = writtenCSV.split(whereSeparator: \.isNewline).map(String.init)
+        XCTAssertEqual(csvLines.filter { $0.hasPrefix("row,") }.count, 34)
+        XCTAssertEqual(csvLines.filter { $0.hasPrefix("totals,") }.count, 3)
+        XCTAssertTrue(writtenCSV.contains("fail_open_reasons"))
+        let jsonObject = try checkpoint.jsonObject()
+        let jsonRows = try XCTUnwrap(jsonObject["rows"] as? [[String: Any]])
+        let header = parseAllRowCSVRow(try XCTUnwrap(csvLines.first))
+        let indexByName = Dictionary(uniqueKeysWithValues: header.enumerated().map { ($1, $0) })
+        let csvRows = csvLines.filter { $0.hasPrefix("row,") }.map(parseAllRowCSVRow)
+        for (index, row) in checkpoint.rows.enumerated() {
+            XCTAssertEqual(jsonRows[index]["id"] as? String, row.id)
+            XCTAssertEqual(csvRows[index][indexByName["id"] ?? 0], row.id)
+            XCTAssertEqual(jsonRows[index]["selected_format"] as? String, row.selectedFormat.rawValue)
+            XCTAssertEqual(csvRows[index][indexByName["selected_format"] ?? 0], row.selectedFormat.rawValue)
+            XCTAssertEqual(
+                optionalJSONNumber(jsonRows[index]["proven_savings_tokens"]),
+                csvRows[index][indexByName["proven_savings_tokens"] ?? 0]
+            )
+        }
+        XCTAssertThrowsError(try ResponseReportOutputBundle(
+            jsonPath: bundle.appendingPathComponent("report.json").path,
+            csvPath: bundle.appendingPathComponent("report.csv").path
+        ))
+    }
+
+    func test_allRowProvenanceBindsExactCounterAndMeasurementArtifactSHA() async throws {
+        // WHY: schema 6 must bind the exact tokenizer executable and the
+        // measurement artifact that produced the counts. Runner/corpus hashes
+        // alone let a swapped counter or mutated artifact publish.
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("all-row-p1a-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let capability = AllRowBestOfThreeHarness.localExactCapability { $0.utf8.count }
+        let requestCorpus = try loadCorpus()
+        let requestReport = try await AllRowBestOfThreeHarness.requestReport(
+            corpus: requestCorpus,
+            measurements: completeFailOpenUnitRun(corpus: requestCorpus),
+            capability: capability
+        )
+        let responseCorpus = try loadResponseCorpus()
+        let responseReport = try await AllRowBestOfThreeHarness.responseReport(
+            corpus: responseCorpus,
+            measurements: try responseMeasurements(responseCorpus),
+            capability: capability
+        )
+        let checkpoint = try allRowUnitTestCheckpoint(
+            request: requestReport, response: responseReport
+        )
+        let json = try checkpoint.jsonObject()
+        let provenance = try XCTUnwrap(json["provenance"] as? [String: Any])
+        let counterSHA = try XCTUnwrap(provenance["exact_counter_source_sha256"] as? String)
+        let measurementSHA = try XCTUnwrap(provenance["measurement_artifact_sha256"] as? String)
+        XCTAssertEqual(counterSHA, allRowUnitTestCounterSourceSHA256)
+        XCTAssertEqual(measurementSHA, allRowUnitTestMeasurementArtifactSHA256)
+        XCTAssertEqual(counterSHA.count, 64)
+        XCTAssertEqual(measurementSHA.count, 64)
+        XCTAssertTrue(
+            counterSHA.allSatisfy { $0.isHexDigit && !$0.isUppercase },
+            "exact counter SHA must be content-free lowercase hex: \(counterSHA)"
+        )
+        XCTAssertTrue(
+            measurementSHA.allSatisfy { $0.isHexDigit && !$0.isUppercase },
+            "measurement artifact SHA must be content-free lowercase hex: \(measurementSHA)"
+        )
+        XCTAssertNotEqual(counterSHA, measurementSHA)
+        XCTAssertNotEqual(counterSHA, provenance["runner_source_sha256"] as? String)
+        XCTAssertEqual(provenance["evidence_binding"] as? String, "unit_test_explicit")
+        let header = parseAllRowCSVRow(
+            try XCTUnwrap(checkpoint.csv.split(whereSeparator: \.isNewline).map(String.init).first)
+        )
+        XCTAssertTrue(header.contains("exact_counter_source_sha256"))
+        XCTAssertTrue(header.contains("measurement_artifact_sha256"))
+        XCTAssertTrue(checkpoint.csv.contains(counterSHA))
+        XCTAssertTrue(checkpoint.csv.contains(measurementSHA))
+        let receipt = try AllRowReportEmitter.write(
+            output: ResponseReportOutputBundle(
+                jsonPath: parent.appendingPathComponent("all-row-bundle/report.json").path,
+                csvPath: parent.appendingPathComponent("all-row-bundle/report.csv").path
+            ),
+            report: checkpoint
+        )
+        XCTAssertEqual(receipt.exactCounterSourceSHA256, counterSHA)
+        XCTAssertEqual(receipt.measurementArtifactSHA256, measurementSHA)
+        let written = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: URL(fileURLWithPath: receipt.jsonPath))
+        ) as? [String: Any])
+        let writtenProvenance = try XCTUnwrap(written["provenance"] as? [String: Any])
+        XCTAssertEqual(writtenProvenance["exact_counter_source_sha256"] as? String, counterSHA)
+        XCTAssertEqual(writtenProvenance["measurement_artifact_sha256"] as? String, measurementSHA)
+        XCTAssertEqual(writtenProvenance["evidence_binding"] as? String, "unit_test_explicit")
+        XCTAssertNotEqual(
+            writtenProvenance["evidence_binding"] as? String,
+            "derived_canonical_inputs",
+            "unit-test explicit digests must not masquerade as a derived published artifact"
+        )
+
+        let derivedParent = parent.appendingPathComponent("derived", isDirectory: true)
+        try FileManager.default.createDirectory(at: derivedParent, withIntermediateDirectories: true)
+        let derived = try allRowP1BEvidence(in: derivedParent)
+        let plan = try XCTUnwrap(AllRowReportEmitter.plan(environment: [
+            AllRowReportEmitter.jsonKey: derived.jsonURL.path,
+            AllRowReportEmitter.csvKey: derived.csvURL.path,
+            AllRowReportEmitter.measurementsKey: derived.measurementsURL.path,
+            AllRowReportEmitter.tokenCounterKey: derived.tokenizerURL.path,
+        ]))
+        let derivedReceipt = try await AllRowReportEmitter.publish(
+            plan: plan,
+            publicationContext: { derived.context.snapshot() }
+        )
+        let expectedCounter = sha256Hex(try Data(contentsOf: derived.tokenizerURL))
+        let expectedMeasurement = sha256Hex(try Data(contentsOf: derived.measurementsURL))
+        XCTAssertEqual(derivedReceipt.exactCounterSourceSHA256, expectedCounter)
+        XCTAssertEqual(derivedReceipt.measurementArtifactSHA256, expectedMeasurement)
+        XCTAssertEqual(plan.exactCounterSourceSHA256, expectedCounter)
+        XCTAssertEqual(plan.measurementArtifactSHA256, expectedMeasurement)
+        XCTAssertNotEqual(expectedCounter, allRowUnitTestCounterSourceSHA256)
+        XCTAssertNotEqual(expectedMeasurement, allRowUnitTestMeasurementArtifactSHA256)
+        let derivedJSON = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: URL(fileURLWithPath: derivedReceipt.jsonPath))
+        ) as? [String: Any])
+        let derivedProvenance = try XCTUnwrap(derivedJSON["provenance"] as? [String: Any])
+        XCTAssertEqual(derivedProvenance["exact_counter_source_sha256"] as? String, expectedCounter)
+        XCTAssertEqual(derivedProvenance["measurement_artifact_sha256"] as? String, expectedMeasurement)
+        XCTAssertEqual(derivedProvenance["evidence_binding"] as? String, "derived_canonical_inputs")
+        let derivedCSV = try String(contentsOfFile: derivedReceipt.csvPath)
+        XCTAssertTrue(derivedCSV.contains(expectedCounter))
+        XCTAssertTrue(derivedCSV.contains(expectedMeasurement))
+    }
+
+    func test_allRowCavemanProvenanceIsRequestBenchmarkOnly() async throws {
+        // WHY: Caveman is license-limited to request benchmark observations.
+        // Stamping it on response rows or as an unscoped global claim implies
+        // Caveman ran on the response surface.
+        XCTAssertThrowsError(try MeasuredBenchmarkHarness.validateAllRowRequestIntegrity(
+            corpus: try loadCorpus(),
+            corpusData: try Data(contentsOf: allRowRequestCorpusURL()),
+            measurements: completeFailOpenUnitRun(
+                corpus: try loadCorpus(),
+                cavemanProvenance: benchmarkPinnedCavemanProvenance.replacing(
+                    binarySHA: String(repeating: "0", count: 64)
+                )
+            )
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Caveman provenance"), "\(error)")
+        }
+        let capability = AllRowBestOfThreeHarness.localExactCapability { $0.utf8.count }
+        let requestCorpus = try loadCorpus()
+        let requestReport = try await AllRowBestOfThreeHarness.requestReport(
+            corpus: requestCorpus,
+            measurements: completeFailOpenUnitRun(corpus: requestCorpus),
+            capability: capability
+        )
+        let responseCorpus = try loadResponseCorpus()
+        let responseReport = try await AllRowBestOfThreeHarness.responseReport(
+            corpus: responseCorpus,
+            measurements: try responseMeasurements(responseCorpus),
+            capability: capability
+        )
+        let checkpoint = try allRowUnitTestCheckpoint(
+            request: requestReport, response: responseReport
+        )
+        XCTAssertTrue(requestReport.rows.allSatisfy { $0.cavemanSHA256?.count == 64 })
+        XCTAssertTrue(responseReport.rows.allSatisfy { $0.cavemanSHA256 == nil })
+        XCTAssertTrue(responseReport.rows.allSatisfy { $0.cavemanTokens == nil })
+        XCTAssertTrue(checkpoint.rows.filter { $0.surface == .response }.allSatisfy {
+            $0.cavemanSHA256 == nil && $0.cavemanTokens == nil
+        })
+        XCTAssertFalse(checkpoint.rows.contains { $0.selectedFormat.rawValue == "caveman" })
+        let json = try checkpoint.jsonObject()
+        let provenance = try XCTUnwrap(json["provenance"] as? [String: Any])
+        let caveman = try XCTUnwrap(provenance["caveman"] as? [String: Any])
+        XCTAssertEqual(caveman["scope"] as? String, "request_benchmark_observations")
+        XCTAssertNotNil(caveman["request"] as? [String: Any])
+        XCTAssertNil(caveman["source_commit"] as? String)
+        XCTAssertNil(caveman["binary_sha"] as? String)
+        let jsonRows = try XCTUnwrap(json["rows"] as? [[String: Any]])
+        for row in jsonRows where row["surface"] as? String == "response" {
+            XCTAssertTrue(
+                row["caveman_sha256"] == nil || (row["caveman_sha256"] as? String)?.isEmpty == true,
+                "response row \(row["id"] ?? "?") must not claim Caveman ran"
+            )
+            XCTAssertTrue(row["caveman_tokens"] == nil)
+        }
+        XCTAssertEqual(
+            checkpoint.methodology.cavemanRule.contains("not a runtime arm"),
+            true
+        )
+    }
+
+    func test_allRowStaleEvidenceDuringCountPublishesZero() async throws {
+        // WHY: validating the counter only before async counting lets the
+        // executable, measurement artifact, HEAD/status, or runner source
+        // change before the atomic write. Publication must fail closed.
+        let mutations: [(String, (AllRowP1BEvidence) throws -> Void)] = [
+            ("executable", { evidence in
+                let handle = try FileHandle(forUpdating: evidence.tokenizerURL)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: Data("\n# stale-counter\n".utf8))
+            }),
+            ("measurement", { evidence in
+                let handle = try FileHandle(forUpdating: evidence.measurementsURL)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: Data("\n".utf8))
+            }),
+            ("worktree", { evidence in
+                evidence.context.workspaceClean = false
+            }),
+            ("runner", { evidence in
+                evidence.context.runnerSourceSHA256 = String(repeating: "e", count: 64)
+            }),
+            ("head", { evidence in
+                evidence.context.remoteCodeHead = String(repeating: "0", count: 40)
+            }),
+        ]
+        for (name, mutate) in mutations {
+            let parent = FileManager.default.temporaryDirectory
+                .appendingPathComponent("all-row-p1b-\(name)-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: parent) }
+            let evidence = try allRowP1BEvidence(in: parent)
+            let plan = try XCTUnwrap(AllRowReportEmitter.plan(environment: [
+                AllRowReportEmitter.jsonKey: evidence.jsonURL.path,
+                AllRowReportEmitter.csvKey: evidence.csvURL.path,
+                AllRowReportEmitter.measurementsKey: evidence.measurementsURL.path,
+                AllRowReportEmitter.tokenCounterKey: evidence.tokenizerURL.path,
+            ]))
+            do {
+                _ = try await AllRowReportEmitter.publish(
+                    plan: plan,
+                    publicationContext: { evidence.context.snapshot() },
+                    afterCountingStarted: { try mutate(evidence) }
+                )
+                XCTFail("\(name) mutation during count published an all-row checkpoint")
+            } catch {
+                let text = error.localizedDescription
+                XCTAssertTrue(
+                    text.contains("drift")
+                        || text.contains("SHA-256")
+                        || text.contains("worktree")
+                        || text.contains("workspace")
+                        || text.contains("source commit")
+                        || text.contains("HEAD")
+                        || text.contains("runner"),
+                    "\(name): \(error)"
+                )
+            }
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: evidence.bundleURL.path),
+                "\(name) must publish zero JSON+CSV output"
+            )
+            XCTAssertEqual(
+                try FileManager.default.contentsOfDirectory(atPath: parent.path)
+                    .filter { $0.hasPrefix("all-row-bundle") },
+                [],
+                "\(name) must leave no report bundle"
+            )
+        }
+    }
+
+    func test_allRowProductionRecoveryFailureForcesHuman() async throws {
+        // WHY: a cheaper RCW1 that cannot round-trip Human through the
+        // production scoped store must stay visible and lose.
+        let store = try AllRowRecoveryLab.makeStore()
+        let input = allRowControlInput()
+        let row = try await AllRowBestOfThreeHarness.selectRow(
+            id: "recovery-store-fail",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: input.rcs1,
+            capability: allRowTestAuthorityCapability(counts: allRowControlCounts(
+                input, human: 100, rcw1Effective: 20, rcs1Effective: 80
+            )),
+            recoveryStore: store,
+            recoveryDisk: AllRowRecoveryLab.exhaustedDisk
+        )
+        XCTAssertFalse(row.rcw1.eligible)
+        XCTAssertEqual(row.rcw1.rejectionReason, "recovery")
+        XCTAssertEqual(row.rcw1.recovery, .failed)
+        XCTAssertEqual(row.selectedFormat, .human)
+        XCTAssertEqual(row.provenSavingsTokens, 0)
+        XCTAssertFalse((row.rcw1.handleSHA256 ?? "").contains("rcv1."))
+        XCTAssertFalse((row.rcs1.handleSHA256 ?? "").contains("rcv1."))
+    }
+
+    func test_allRowProductionRecoveryStoreRoundTripKeepsEligibleRCS1() async throws {
+        // WHY: authentic store retrieve must be byte-exact Human. The report
+        // may keep only the handle hash, never the raw capability.
+        let store = try AllRowRecoveryLab.makeStore()
+        let input = allRowControlInput()
+        let row = try await AllRowBestOfThreeHarness.selectRow(
+            id: "recovery-store-pass",
+            human: input.human,
+            rcw1: input.rcw1,
+            rcs1: input.rcs1,
+            capability: allRowTestAuthorityCapability(counts: allRowControlCounts(
+                input, human: 100, rcw1Effective: 80, rcs1Effective: 30
+            )),
+            recoveryStore: store
+        )
+        XCTAssertTrue(row.rcs1.eligible)
+        XCTAssertEqual(row.rcs1.recovery, .passed)
+        XCTAssertEqual(row.selectedFormat, .rcs1)
+        XCTAssertNil(row.rcs1.handleSHA256)
+        XCTAssertFalse(String(describing: row).contains("rcv1."))
+    }
+
+    func test_versionedAllRowArtifactsExistForBothExactLocalTokenizers() throws {
+        // WHY: an all-row checkpoint is the versioned JSON+CSV pair, not a
+        // unit-test builder. Missing artifacts cannot be called complete.
+        for encoding in allRowExactEncodings {
+            let json = allRowVersionedReportURL(encoding: encoding, ext: "json")
+            let csv = allRowVersionedReportURL(encoding: encoding, ext: "csv")
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: json.path),
+                "missing versioned all-row JSON for \(encoding): \(json.path)"
+            )
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: csv.path),
+                "missing versioned all-row CSV for \(encoding): \(csv.path)"
+            )
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: allRowVersionedMeasurementsURL().path),
+            "missing versioned all-row request measurements"
+        )
+    }
+
+    func test_versionedAllRowDecisionReplayMatchesProductionSelector() async throws {
+        // WHY: a report that disagrees with TokenSaverBestOfThreeSelector /
+        // TokenSaverContextItemSelector is a duplicate decision function.
+        let pythonPath = ProcessInfo.processInfo.environment["PYTHONPATH"] ?? ""
+        guard !pythonPath.isEmpty else {
+            return XCTFail("exact-local replay requires PYTHONPATH to a tiktoken-capable interpreter")
+        }
+        for encoding in allRowExactEncodings {
+            let report = try loadVersionedAllRowJSON(encoding: encoding)
+            let rows = try XCTUnwrap(report["rows"] as? [[String: Any]])
+            XCTAssertEqual(rows.count, 34)
+            let capability = try AllRowBestOfThreeHarness.exactCapability(
+                from: allRowExactAdapterCounter(encoding: encoding)
+            )
+            let requestCorpus = try loadCorpus()
+            let measurements = try JSONDecoder().decode(
+                MeasuredBenchmarkRun.self,
+                from: Data(contentsOf: allRowVersionedMeasurementsURL())
+            )
+            let replayedRequest = try await AllRowBestOfThreeHarness.requestReport(
+                corpus: requestCorpus,
+                measurements: measurements,
+                capability: capability,
+                recoveryStore: AllRowRecoveryLab.makeStore()
+            )
+            let responseCorpus = try loadResponseCorpus()
+            let replayedResponse = try await AllRowBestOfThreeHarness.responseReport(
+                corpus: responseCorpus,
+                measurements: try responseMeasurements(responseCorpus),
+                capability: capability,
+                recoveryStore: AllRowRecoveryLab.makeStore()
+            )
+            let replayed = replayedRequest.rows + replayedResponse.rows
+            XCTAssertEqual(replayed.map(\.id), rows.map { $0["id"] as? String })
+            for (expected, actual) in zip(rows, replayed) {
+                XCTAssertEqual(expected["selected_format"] as? String, actual.selectedFormat.rawValue, actual.id)
+                XCTAssertEqual(expected["reason"] as? String, actual.reason.rawValue, actual.id)
+                XCTAssertNotEqual(actual.selectedFormat.rawValue, "caveman", actual.id)
+            }
+        }
+    }
+
+    func test_emitAllRowBestOfThreeWhenExplicitlyRequested() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let plan = try AllRowReportEmitter.plan(environment: environment) else {
+            throw XCTSkip(
+                "Set REMOTE_CODE_RCW1_ALL_ROW_REPORT_JSON, REMOTE_CODE_RCW1_ALL_ROW_REPORT_CSV, "
+                    + "REMOTE_CODE_RCW1_BENCHMARK_MEASUREMENTS and "
+                    + "REMOTE_CODE_RCW1_BENCHMARK_TOKEN_COUNTER. Real artifact NOT_RUN."
+            )
+        }
+        let receipt = try await AllRowReportEmitter.publish(
+            plan: plan,
+            publicationContext: { try AllRowBestOfThreeHarness.versionedPublicationContext() }
+        )
+        print("RCW1_ALL_ROW_REPORT_JSON=\(receipt.jsonPath)")
+        print("RCW1_ALL_ROW_REPORT_CSV=\(receipt.csvPath)")
+    }
+
+    func test_writeVersionedAllRowReportsWhenRequested() async throws {
+        guard let root = ProcessInfo.processInfo.environment["REMOTE_CODE_RCW1_ALL_ROW_VERSIONED_OUT"],
+              !root.isEmpty else {
+            throw XCTSkip("Set REMOTE_CODE_RCW1_ALL_ROW_VERSIONED_OUT to emit versioned all-row reports.")
+        }
+        let receipts = try await emitVersionedAllRowReports(to: URL(fileURLWithPath: root))
+        for (encoding, pair) in receipts {
+            print("ALL_ROW_EMIT encoding=\(encoding) json=\(pair.jsonSHA) csv=\(pair.csvSHA) equal=\(pair.runsEqual)")
+            XCTAssertTrue(pair.runsEqual, "\(encoding) two-run artifacts must be byte-identical")
+        }
+    }
+
+    private var allRowExactEncodings: [String] { ["o200k_base", "cl100k_base"] }
+
+    private func allRowVersionedRootURL() -> URL {
+        allRowRepositoryURL()
+            .appendingPathComponent("Tests/Fixtures/all-row-best-of-three", isDirectory: true)
+    }
+
+    private func allRowVersionedMeasurementsURL() -> URL {
+        allRowVersionedRootURL().appendingPathComponent("request-measurements.json")
+    }
+
+    private func allRowVersionedReportURL(encoding: String, ext: String) -> URL {
+        allRowVersionedRootURL()
+            .appendingPathComponent(encoding, isDirectory: true)
+            .appendingPathComponent("report.\(ext)")
+    }
+
+    private func allRowAdapterURL() -> URL {
+        allRowRepositoryURL().appendingPathComponent("scripts/rcw1-token-count-o200k.py")
+    }
+
+    private func allRowExactAdapterCounter(encoding: String) throws -> BenchmarkTokenCounter {
+        try BenchmarkTokenCounter(environment: [
+            AllRowReportEmitter.tokenCounterKey: allRowAdapterURL().path,
+            "RCW1_TIKTOKEN_ENCODING": encoding,
+            "PYTHONPATH": ProcessInfo.processInfo.environment["PYTHONPATH"] ?? "",
+        ])
+    }
+
+    private func loadVersionedAllRowJSON(encoding: String) throws -> [String: Any] {
+        let data = try Data(contentsOf: allRowVersionedReportURL(encoding: encoding, ext: "json"))
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    private struct VersionedEmissionPair {
+        let jsonSHA: String
+        let csvSHA: String
+        let runsEqual: Bool
+        let jsonPath: String
+        let csvPath: String
+    }
+
+    private func emitVersionedAllRowReports(
+        to root: URL
+    ) async throws -> [String: VersionedEmissionPair] {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let measurementsURL = root.appendingPathComponent("request-measurements.json")
+        if !FileManager.default.fileExists(atPath: measurementsURL.path) {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+            try encoder.encode(completeFailOpenUnitRun(corpus: loadCorpus())).write(to: measurementsURL)
+        }
+        let adapter = allRowAdapterURL()
+        let pythonPath = ProcessInfo.processInfo.environment["PYTHONPATH"] ?? ""
+        guard !pythonPath.isEmpty else {
+            throw benchmarkError("exact-local emit requires PYTHONPATH for tiktoken")
+        }
+        let context = try AllRowBestOfThreeHarness.versionedPublicationContext()
+        var results: [String: VersionedEmissionPair] = [:]
+        for encoding in allRowExactEncodings {
+            var shas: [(String, String)] = []
+            var lastJSON = ""
+            var lastCSV = ""
+            let encodingDir = root.appendingPathComponent(encoding, isDirectory: true)
+            try FileManager.default.createDirectory(at: encodingDir, withIntermediateDirectories: true)
+            for run in 1...2 {
+                let bundle = encodingDir.appendingPathComponent("run-\(run)", isDirectory: true)
+                let jsonURL = bundle.appendingPathComponent("report.json")
+                let csvURL = bundle.appendingPathComponent("report.csv")
+                let plan = try XCTUnwrap(AllRowReportEmitter.plan(environment: [
+                    AllRowReportEmitter.jsonKey: jsonURL.path,
+                    AllRowReportEmitter.csvKey: csvURL.path,
+                    AllRowReportEmitter.measurementsKey: measurementsURL.path,
+                    AllRowReportEmitter.tokenCounterKey: adapter.path,
+                    "RCW1_TIKTOKEN_ENCODING": encoding,
+                    "PYTHONPATH": pythonPath,
+                ]))
+                let receipt = try await AllRowReportEmitter.publish(
+                    plan: plan,
+                    publicationContext: { context }
+                )
+                lastJSON = receipt.jsonPath
+                lastCSV = receipt.csvPath
+                shas.append((
+                    sha256Hex(try Data(contentsOf: URL(fileURLWithPath: receipt.jsonPath))),
+                    sha256Hex(try Data(contentsOf: URL(fileURLWithPath: receipt.csvPath)))
+                ))
+            }
+            results[encoding] = VersionedEmissionPair(
+                jsonSHA: shas[0].0,
+                csvSHA: shas[0].1,
+                runsEqual: shas[0] == shas[1],
+                jsonPath: lastJSON,
+                csvPath: lastCSV
+            )
+        }
+        return results
+    }
+
+    private func allRowUnitTestCheckpoint(
+        request: AllRowRuntimeReport,
+        response: AllRowRuntimeReport
+    ) throws -> AllRowCheckpointReport {
+        try AllRowBestOfThreeHarness.checkpoint(
+            request: request,
+            response: response,
+            exactCounterSourceSHA256: allRowUnitTestCounterSourceSHA256,
+            measurementArtifactSHA256: allRowUnitTestMeasurementArtifactSHA256,
+            evidenceBinding: .unitTestExplicit,
+            publicationContext: allRowUnitTestPublicationContext()
+        )
+    }
+
+    private func allRowP1BEvidence(in parent: URL) throws -> AllRowP1BEvidence {
+        let tokenizerURL = parent.appendingPathComponent("tokenizer.sh")
+        let script = """
+        #!/bin/sh
+        if [ "$1" = "--diagnostic" ]; then
+          printf '%s' '{"name":"all-row-unit-tokenizer","version":"1","encoding":"utf8-bytes","measurement_kind":"exact-local-tokenizer"}'
+          exit 0
+        fi
+        if [ "$1" = "--count" ]; then
+          wc -c | awk '{print $1}'
+          exit 0
+        fi
+        exit 1
+        """
+        try script.write(to: tokenizerURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: tokenizerURL.path
+        )
+        let measurementsURL = parent.appendingPathComponent("measurements.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(completeFailOpenUnitRun(corpus: loadCorpus())).write(to: measurementsURL)
+        let bundleURL = parent.appendingPathComponent("all-row-bundle", isDirectory: true)
+        return AllRowP1BEvidence(
+            tokenizerURL: tokenizerURL,
+            measurementsURL: measurementsURL,
+            jsonURL: bundleURL.appendingPathComponent("report.json"),
+            csvURL: bundleURL.appendingPathComponent("report.csv"),
+            bundleURL: bundleURL,
+            context: AllRowP1BPublicationContext(
+                remoteCodeHead: allRowExpectedSourceCommit,
+                workspaceClean: true,
+                runnerSourceSHA256: String(repeating: "d", count: 64)
+            )
+        )
+    }
+
+    private func allRowControlInput() -> (human: String, rcw1: AllRowArmInput, rcs1: AllRowArmInput) {
+        let human = "canonical Human content"
+        let handle = "rcv1.handle"
+        return (
+            human,
+            AllRowArmInput(
+                payload: "RCW1 candidate [[rc:\(handle)]]",
+                handle: handle,
+                abi: AgentSkillInstaller.rcWireAgentInstructionsTemplate,
+                producerID: TokenSaverRequestSelectionReceipt.rcw1ProducerID,
+                generation: .passed, structural: .passed, semantic: .passed, recovery: .passed
+            ),
+            AllRowArmInput(
+                payload: "RCS1 candidate",
+                handle: nil,
+                abi: AgentSkillInstaller.compactSpanAgentInstructionsTemplate,
+                producerID: TokenSaverRequestSelectionReceipt.rcs1ProducerID,
+                generation: .passed, structural: .passed, semantic: .passed, recovery: .passed
+            )
+        )
+    }
+
+    private func allRowControlCounts(
+        _ input: (human: String, rcw1: AllRowArmInput, rcs1: AllRowArmInput),
+        human: Int,
+        rcw1Effective: Int,
+        rcs1Effective: Int
+    ) -> [String: Int] {
+        [
+            input.human: human,
+            input.rcw1.payload: 30,
+            input.rcw1.handle ?? "": 7,
+            input.rcw1.abi: 10,
+            input.rcw1.envelope: rcw1Effective,
+            input.rcs1.payload: 25,
+            input.rcs1.abi: 5,
+            input.rcs1.envelope: rcs1Effective,
+        ]
+    }
+
+    private func allRowEstimatedCapability() -> TokenSaverBestOfThreeSelector.CounterCapability {
+        AllRowBestOfThreeHarness.estimatedCapability()
+    }
+
+    private func allRowTestAuthorityCapability(
+        counts: [String: Int]? = nil,
+        probe: AllRowCountProbe? = nil
+    ) -> TokenSaverBestOfThreeSelector.CounterCapability {
+        AllRowBestOfThreeHarness.testAuthorityCapability(counts: counts, probe: probe)
+    }
+
+    private func assertAllRowJSONCSVParity(_ report: AllRowRuntimeReport) throws {
+        let json = try report.jsonObject()
+        let jsonRows = try XCTUnwrap(json["rows"] as? [[String: Any]])
+        XCTAssertEqual(jsonRows.count, report.rows.count)
+        XCTAssertEqual(json["schema_version"] as? Int, report.schemaVersion)
+        XCTAssertEqual(json["billing_claim"] as? Bool, false)
+        for required in [
+            "surface", "counter_id", "counter_revision", "counter_encoding",
+            "provider_reported_tokens",
+            "human_handle_sha256", "human_abi_sha256", "human_effective_envelope_sha256",
+            "rcw1_handle_sha256", "rcw1_abi_sha256", "rcw1_effective_envelope_sha256",
+            "rcs1_handle_sha256", "rcs1_abi_sha256", "rcs1_effective_envelope_sha256",
+        ] {
+            XCTAssertTrue(
+                allRowCSVHeader.contains(required),
+                "all-row CSV omits \(required) present in the JSON contract"
+            )
+        }
+        let csvLines = report.csv.split(whereSeparator: \.isNewline).map(String.init)
+        XCTAssertEqual(csvLines.first?.split(separator: ",").count,
+                       csvLines.last?.split(separator: ",", omittingEmptySubsequences: false).count)
+        let header = parseAllRowCSVRow(try XCTUnwrap(csvLines.first))
+        XCTAssertEqual(header, allRowCSVHeader)
+        let csvRows = csvLines.filter { $0.hasPrefix("row,") }.map(parseAllRowCSVRow)
+        XCTAssertEqual(csvRows.count, report.rows.count)
+        let indexByName = Dictionary(uniqueKeysWithValues: header.enumerated().map { ($1, $0) })
+        func csvValue(_ row: [String], _ name: String) -> String {
+            guard let index = indexByName[name], index < row.count else {
+                XCTFail("CSV missing column \(name)")
+                return ""
+            }
+            return row[index]
+        }
+        XCTAssertEqual(csvValue(csvRows[0], "counter_quality"), jsonRows[0]["counter_quality"] as? String)
+        XCTAssertEqual(csvValue(csvRows[0], "counter_id"), jsonRows[0]["counter_id"] as? String ?? "")
+        XCTAssertEqual(csvValue(csvRows[0], "counter_revision"), jsonRows[0]["counter_revision"] as? String ?? "")
+        XCTAssertEqual(csvValue(csvRows[0], "counter_encoding"), jsonRows[0]["counter_encoding"] as? String ?? "")
+        XCTAssertEqual(csvValue(csvRows[0], "provider_reported_tokens"), "false")
+        XCTAssertEqual(csvRows.map { csvValue($0, "id") }, report.rows.map(\.id))
+        for (index, row) in report.rows.enumerated() {
+            let csvRow = csvRows[index]
+            let jsonRow = jsonRows[index]
+            XCTAssertEqual(jsonRow["id"] as? String, row.id)
+            XCTAssertEqual(csvValue(csvRow, "id"), row.id)
+            XCTAssertEqual(jsonRow["selected_format"] as? String, row.selectedFormat.rawValue)
+            XCTAssertEqual(csvValue(csvRow, "selected_format"), row.selectedFormat.rawValue)
+            XCTAssertEqual(jsonRow["reason"] as? String, row.reason.rawValue)
+            XCTAssertEqual(csvValue(csvRow, "reason"), row.reason.rawValue)
+            XCTAssertEqual(jsonRow["billing_claim"] as? Bool, false)
+            XCTAssertEqual(csvValue(csvRow, "billing_claim"), "false")
+            XCTAssertEqual(csvValue(csvRow, "surface"), report.surface.rawValue)
+            XCTAssertEqual(jsonRow["surface"] as? String, report.surface.rawValue)
+            XCTAssertEqual(json["surface"] as? String, report.surface.rawValue)
+            let jsonHuman = try XCTUnwrap(jsonRow["human"] as? [String: Any])
+            let jsonRCW1 = try XCTUnwrap(jsonRow["rcw1"] as? [String: Any])
+            let jsonRCS1 = try XCTUnwrap(jsonRow["rcs1"] as? [String: Any])
+            XCTAssertEqual(jsonHuman["format"] as? String, "human")
+            XCTAssertEqual(jsonRCW1["format"] as? String, "rcw1")
+            XCTAssertEqual(jsonRCS1["format"] as? String, "rcs1")
+            try assertAllRowArmParity(json: jsonHuman, csv: csvRow, prefix: "human", csvValue: csvValue)
+            try assertAllRowArmParity(json: jsonRCW1, csv: csvRow, prefix: "rcw1", csvValue: csvValue)
+            try assertAllRowArmParity(json: jsonRCS1, csv: csvRow, prefix: "rcs1", csvValue: csvValue)
+        }
+        XCTAssertTrue(csvLines.last?.hasPrefix("totals,") == true)
+        let jsonTotals = try XCTUnwrap(json["totals"] as? [String: Any])
+        XCTAssertEqual(jsonTotals["rows"] as? Int, report.rows.count)
+        XCTAssertEqual(jsonTotals["human_fail_open_rows"] as? Int, report.totals.humanFailOpenRows)
+        XCTAssertNil(jsonTotals["accepted_only_rows"])
+        let totalsRow = parseAllRowCSVRow(try XCTUnwrap(csvLines.last))
+        XCTAssertEqual(csvValue(totalsRow, "rows"), String(report.totals.rows))
+        XCTAssertEqual(
+            csvValue(totalsRow, "fail_open_reasons"),
+            allRowFailOpenReasonsField(report.totals.failOpenReasons)
+        )
+        XCTAssertTrue(allRowCSVHeader.contains("rows"))
+        XCTAssertTrue(allRowCSVHeader.contains("fail_open_reasons"))
+    }
+
+    private func assertAllRowArmParity(
+        json: [String: Any],
+        csv: [String],
+        prefix: String,
+        csvValue: ([String], String) -> String
+    ) throws {
+        XCTAssertEqual(csvValue(csv, "\(prefix)_eligible"), String(try XCTUnwrap(json["eligible"] as? Bool)))
+        XCTAssertEqual(csvValue(csv, "\(prefix)_source_bound"), String(try XCTUnwrap(json["source_bound"] as? Bool)))
+        XCTAssertEqual(csvValue(csv, "\(prefix)_generation"), json["generation"] as? String ?? "")
+        XCTAssertEqual(csvValue(csv, "\(prefix)_structural"), json["structural"] as? String ?? "")
+        XCTAssertEqual(csvValue(csv, "\(prefix)_semantic"), json["semantic"] as? String ?? "")
+        XCTAssertEqual(csvValue(csv, "\(prefix)_recovery"), json["recovery"] as? String ?? "")
+        XCTAssertEqual(csvValue(csv, "\(prefix)_payload_tokens"), optionalJSONNumber(json["payload_tokens"]))
+        XCTAssertEqual(csvValue(csv, "\(prefix)_handle_tokens"), optionalJSONNumber(json["handle_tokens"]))
+        XCTAssertEqual(csvValue(csv, "\(prefix)_abi_tokens"), optionalJSONNumber(json["abi_tokens"]))
+        XCTAssertEqual(csvValue(csv, "\(prefix)_effective_tokens"), optionalJSONNumber(json["effective_tokens"]))
+        XCTAssertEqual(csvValue(csv, "\(prefix)_payload_sha256"), json["payload_sha256"] as? String ?? "")
+        XCTAssertEqual(csvValue(csv, "\(prefix)_handle_sha256"), json["handle_sha256"] as? String ?? "")
+        XCTAssertEqual(csvValue(csv, "\(prefix)_abi_sha256"), json["abi_sha256"] as? String ?? "")
+        XCTAssertEqual(
+            csvValue(csv, "\(prefix)_effective_envelope_sha256"),
+            json["effective_envelope_sha256"] as? String ?? ""
+        )
+    }
+
     private func completeFailOpenUnitRun(
         corpus: [EfficiencyCase],
         overrides: [String: MeasuredBenchmarkRow] = [:],
@@ -1896,11 +3486,85 @@ private let frozenNominalSourcePromptSHA256 =
     "2a31b16c2e1fa1a342a92f1ee2d86e713b16338daff9c4d8e9a29cfb25b0056a"
 private let frozenResponseSemanticContractSHA256 =
     "c4d60c41dba9e4c6d187b6f129ca2911bcb2b5d2ccb79e8136b798da0075687a"
+private let frozenRequestCorpusSHA256 =
+    "7b568f18e7e49df46a486af49dba6747fe5e2a9cde850471190ccfbd761ba625"
+private let allRowExpectedSourceCommit = "986ad85e247921e1165f07e7830b0fad328d3ad5"
+private let allRowUnitTestCounterSourceSHA256 = String(repeating: "a", count: 64)
+private let allRowUnitTestMeasurementArtifactSHA256 = String(repeating: "b", count: 64)
+private let allRowUnitTestRunnerSourceSHA256 = String(repeating: "d", count: 64)
+
+private func allRowUnitTestPublicationContext() -> AllRowPublicationContext {
+    AllRowPublicationContext(
+        remoteCodeHead: allRowExpectedSourceCommit,
+        workspaceClean: true,
+        runnerSourceSHA256: allRowUnitTestRunnerSourceSHA256
+    )
+}
+
+private func allRowRequireContentFreeSHA256(_ value: String, label: String) throws -> String {
+    guard value.count == 64, value.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+        throw benchmarkError("all-row \(label) must be a lowercase SHA-256")
+    }
+    return value
+}
+
+private func allRowContentFreeSHA256(of url: URL, label: String) throws -> String {
+    try allRowRequireContentFreeSHA256(sha256Hex(try Data(contentsOf: url)), label: label)
+}
+private let frozenRequestCorpusIDs = [
+    "reported-disposable-workspace", "portuguese-redundant-summary", "path-line-no-edit",
+    "url-markdown-exact", "command-no-tools", "numeric-thresholds", "uuid-sha-exact",
+    "quoted-error-exit", "ordered-first-then", "production-delete-approval",
+    "double-negation", "only-except-unless", "code-fence-byte-exact", "json-schema-quotes",
+    "japanese-path", "arabic-number", "escapes-byte-exact", "multiframe-long-repetition",
+    "cleanup-repetition", "multiple-paths-versions", "follow-up-context",
+    "contradictory-fail-open", "opaque-exact-fail-open", "short-fail-open",
+]
 private let frozenResponseCorpusIDs = [
     "short-ok", "reported-disposable-workspace-answer", "multi-record-all-kinds",
     "progressive-multiframe", "exact-code-path", "portuguese-natural", "japanese-natural",
     "arabic-natural", "repeated-evidence-template", "opaque-incompressible",
 ]
+
+private func allRowFixtureURL(_ name: String) -> URL {
+    URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("Fixtures", isDirectory: true)
+        .appendingPathComponent(name)
+}
+
+private func allRowRequestCorpusURL() -> URL {
+    allRowFixtureURL("rcw1-efficiency-corpus.json")
+}
+
+private func allRowResponseCorpusURL() -> URL {
+    allRowFixtureURL("rcw1-response-efficiency-corpus.json")
+}
+
+private func allRowRepositoryURL() -> URL {
+    URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+}
+
+private func allRowFailOpenReasonsField(_ reasons: [String: Int]) -> String {
+    reasons.keys.sorted().compactMap { key in
+        reasons[key].map { "\(key)=\($0)" }
+    }.joined(separator: "|")
+}
+
+private func allRowNominalSourcePrompt() throws -> String {
+    let corpus = try JSONDecoder().decode(
+        [EfficiencyCase].self,
+        from: Data(contentsOf: allRowRequestCorpusURL())
+    )
+    guard let item = corpus.first(where: { $0.id == "reported-disposable-workspace" }) else {
+        throw benchmarkError("request corpus is missing the nominal source prompt")
+    }
+    return item.human
+}
 private let exactTokenDiagnostic = TokenCounterDiagnostic(
     name: "response-unit", version: "1", encoding: "fixture-exact",
     measurementKind: "exact-local-tokenizer")
@@ -2026,6 +3690,50 @@ private enum ResponseBenchmarkHarness {
             tokenCounter: counter.diagnostic, methodology: .init(),
             cavemanProvenance: cavemanProvenance, rows: evaluated.rows, totals: evaluated.totals)
     }
+    fileprivate static func validateAllRowResponseContracts(
+        corpus: [ResponseEfficiencyCase],
+        corpusData: Data,
+        measurements: [ResponseBenchmarkMeasurement],
+        sourcePrompt: String
+    ) throws {
+        guard sha256Hex(corpusData) == frozenResponseCorpusSHA256 else {
+            throw benchmarkError("all-row response report requires the frozen response corpus bytes")
+        }
+        guard sha256Hex(Data(sourcePrompt.utf8)) == frozenNominalSourcePromptSHA256 else {
+            throw benchmarkError("all-row response report requires the frozen nominal source prompt SHA-256")
+        }
+        let decoded = try JSONDecoder().decode([ResponseEfficiencyCase].self, from: corpusData)
+        guard decoded.map(\.id) == frozenResponseCorpusIDs,
+              corpus.map(\.id) == frozenResponseCorpusIDs else {
+            throw benchmarkError("all-row response report requires the frozen response corpus ID order")
+        }
+        _ = try validateSemanticContracts(corpus)
+        let measuredIDs = measurements.map(\.id)
+        guard Set(measuredIDs).count == measuredIDs.count else {
+            throw benchmarkError("duplicate response row")
+        }
+        guard measuredIDs == frozenResponseCorpusIDs else {
+            throw benchmarkError("measured run must preserve the frozen response corpus ID order")
+        }
+        let byID = Dictionary(uniqueKeysWithValues: measurements.map { ($0.id, $0) })
+        for item in corpus {
+            guard let measured = byID[item.id] else {
+                throw benchmarkError("measurements must include all response corpus rows exactly once")
+            }
+            guard measured.human == item.humanBaseline else {
+                throw benchmarkError("\(item.id) Human is not byte-exact")
+            }
+            guard !measured.caveman.output.isEmpty else {
+                throw benchmarkError("\(item.id) is missing measured Caveman output")
+            }
+            guard let projection = RCWireProtocol.strictResponseProjection(raw: measured.wire),
+                  projection.rawWire == measured.wire,
+                  projection.deterministicHuman == item.humanBaseline else {
+                throw benchmarkError("\(item.id) response round-trip is not byte-exact")
+            }
+        }
+    }
+
     static func evaluateRowsForUnitTest(corpus: [ResponseEfficiencyCase],
         measurements: [ResponseBenchmarkMeasurement], counter: BenchmarkTokenCounter
     ) throws -> (rows: [ResponseBenchmarkRow], totals: ResponseBenchmarkTotals,
@@ -2451,7 +4159,13 @@ private struct BenchmarkTokenCounter {
         let executableURL = URL(fileURLWithPath: executable).standardizedFileURL
         sourceSHA256 = sha256Hex(try Data(contentsOf: executableURL))
         sourceExecutableURL = executableURL
-        let diagnosticData = try Self.invoke(executable: executable, argument: "--diagnostic", input: Data())
+        let childEnvironment = Self.childEnvironment(from: environment)
+        let diagnosticData = try Self.invoke(
+            executable: executable,
+            argument: "--diagnostic",
+            input: Data(),
+            environment: childEnvironment
+        )
         let decodedDiagnostic = try JSONDecoder().decode(TokenCounterDiagnostic.self, from: diagnosticData)
         guard [
             decodedDiagnostic.name, decodedDiagnostic.version,
@@ -2464,7 +4178,8 @@ private struct BenchmarkTokenCounter {
             let output = try Self.invoke(
                 executable: executable,
                 argument: "--count",
-                input: Data(text.utf8)
+                input: Data(text.utf8),
+                environment: childEnvironment
             )
             guard let raw = String(data: output, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
                   let value = Int(raw),
@@ -2498,13 +4213,33 @@ private struct BenchmarkTokenCounter {
         }
     }
 
-    private static func invoke(executable: String, argument: String, input: Data) throws -> Data {
+    private static func childEnvironment(from environment: [String: String]) -> [String: String] {
+        var child = ProcessInfo.processInfo.environment
+        if let encoding = environment["RCW1_TIKTOKEN_ENCODING"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !encoding.isEmpty {
+            child["RCW1_TIKTOKEN_ENCODING"] = encoding
+        }
+        let pythonPath = environment["PYTHONPATH"] ?? ProcessInfo.processInfo.environment["PYTHONPATH"]
+        if let pythonPath, !pythonPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            child["PYTHONPATH"] = pythonPath
+        }
+        return child
+    }
+
+    private static func invoke(
+        executable: String,
+        argument: String,
+        input: Data,
+        environment: [String: String]
+    ) throws -> Data {
         let process = Process()
         let standardInput = Pipe()
         let standardOutput = Pipe()
         let standardError = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = [argument]
+        process.environment = environment
         process.standardInput = standardInput
         process.standardOutput = standardOutput
         process.standardError = standardError
@@ -2535,6 +4270,34 @@ private struct TokenCounterDiagnostic: Codable {
 }
 
 private enum MeasuredBenchmarkHarness {
+    fileprivate static func validateAllRowRequestIntegrity(
+        corpus: [EfficiencyCase],
+        corpusData: Data,
+        measurements: MeasuredBenchmarkRun
+    ) throws {
+        try validateRunMetadata(measurements)
+        guard sha256Hex(corpusData) == frozenRequestCorpusSHA256 else {
+            throw benchmarkError("all-row request report requires the frozen request corpus bytes")
+        }
+        let corpusIDs = corpus.map(\.id)
+        guard corpusIDs == frozenRequestCorpusIDs else {
+            throw benchmarkError("all-row request report requires the frozen request corpus ID order")
+        }
+        let measuredIDs = measurements.rows.map(\.id)
+        guard Set(measuredIDs).count == measuredIDs.count else {
+            throw benchmarkError("measured rows contain duplicate IDs")
+        }
+        guard measuredIDs == corpusIDs else {
+            throw benchmarkError("measured run must preserve the frozen request corpus ID order")
+        }
+        for item in corpus {
+            guard let measured = measurements.rows.first(where: { $0.id == item.id }) else {
+                throw benchmarkError("measured run is missing \(item.id)")
+            }
+            try validateMeasuredRequestRow(item: item, measured: measured)
+        }
+    }
+
     static func build(
         corpus: [EfficiencyCase],
         measurements: MeasuredBenchmarkRun,
@@ -2560,9 +4323,12 @@ private enum MeasuredBenchmarkHarness {
         let measuredByID = Dictionary(uniqueKeysWithValues: measurements.rows.map { ($0.id, $0) })
         let abiTokens = try counter.count(AgentSkillInstaller.rcWireAgentInstructionsTemplate)
         let rows = try corpus.map { item in
-            try buildRow(
+            guard let measured = measuredByID[item.id] else {
+                throw benchmarkError("measured run is missing \(item.id)")
+            }
+            return try buildRow(
                 item: item,
-                measured: measuredByID[item.id]!,
+                measured: measured,
                 abiTokens: abiTokens,
                 counter: counter
             )
@@ -2613,17 +4379,13 @@ private enum MeasuredBenchmarkHarness {
         }
     }
 
-    private static func buildRow(
+    fileprivate static func validateMeasuredRequestRow(
         item: EfficiencyCase,
-        measured: MeasuredBenchmarkRow,
-        abiTokens: Int,
-        counter: BenchmarkTokenCounter
-    ) throws -> BenchmarkReportRow {
-        let humanTokens = try counter.count(item.effectiveHuman)
+        measured: MeasuredBenchmarkRow
+    ) throws {
         guard !measured.cavemanOutput.isEmpty else {
             throw benchmarkError("\(item.id) is missing measured Caveman output")
         }
-        let cavemanTokens = try counter.count(measured.cavemanOutput)
         switch measured.decision {
         case .rcw1:
             guard item.eligible else {
@@ -2650,20 +4412,48 @@ private enum MeasuredBenchmarkHarness {
                 throw benchmarkError("\(item.id) RCW1 payload must contain exactly its measured X handle")
             }
             let candidateValues = records.map(\.value).joined(separator: "\n")
-            let protectedSemantics = RCWireProtocol.preservesProtectedSemantics(
+            guard RCWireProtocol.preservesProtectedSemantics(
                 original: item.effectiveHuman,
                 wire: measured.deliveredPayload
-            )
-            let exactAtoms = item.requiredExact.allSatisfy(candidateValues.contains)
-            guard protectedSemantics && exactAtoms else {
+            ), item.requiredExact.allSatisfy(candidateValues.contains) else {
                 throw benchmarkError("\(item.id) RCW1 decision failed literal_gate")
             }
-            let requestMeaning = RCWireProtocol.preservesRequestMeaning(
+            guard RCWireProtocol.preservesRequestMeaning(
                 original: item.effectiveHuman,
                 wire: measured.deliveredPayload
-            )
-            guard requestMeaning else {
+            ) else {
                 throw benchmarkError("\(item.id) RCW1 decision failed semantic_gate")
+            }
+        case .humanFailOpen:
+            guard measured.failOpenReason != nil else {
+                throw benchmarkError("\(item.id) human_fail_open requires fail_open_reason")
+            }
+            guard measured.recoveryHandle == nil else {
+                throw benchmarkError("\(item.id) human_fail_open must not carry a recovery handle")
+            }
+            guard measured.deliveredPayload == item.effectiveHuman else {
+                throw benchmarkError("\(item.id) human_fail_open must deliver byte-identical Human")
+            }
+            if measured.failOpenReason == .belowFloor,
+               TokenEstimator.estimate(item.effectiveHuman) >= 80 {
+                throw benchmarkError("\(item.id) below_floor reason does not match the production floor")
+            }
+        }
+    }
+
+    private static func buildRow(
+        item: EfficiencyCase,
+        measured: MeasuredBenchmarkRow,
+        abiTokens: Int,
+        counter: BenchmarkTokenCounter
+    ) throws -> BenchmarkReportRow {
+        let humanTokens = try counter.count(item.effectiveHuman)
+        try validateMeasuredRequestRow(item: item, measured: measured)
+        let cavemanTokens = try counter.count(measured.cavemanOutput)
+        switch measured.decision {
+        case .rcw1:
+            guard let recoveryHandle = measured.recoveryHandle else {
+                throw benchmarkError("\(item.id) RCW1 decision has an invalid recovery handle")
             }
             let deliveredTokens = try counter.count(measured.deliveredPayload)
             let effectiveRCW1Tokens = deliveredTokens + abiTokens
@@ -2714,16 +4504,6 @@ private enum MeasuredBenchmarkHarness {
         case .humanFailOpen:
             guard let reason = measured.failOpenReason else {
                 throw benchmarkError("\(item.id) human_fail_open requires fail_open_reason")
-            }
-            guard measured.recoveryHandle == nil else {
-                throw benchmarkError("\(item.id) human_fail_open must not carry a recovery handle")
-            }
-            guard measured.deliveredPayload == item.effectiveHuman else {
-                throw benchmarkError("\(item.id) human_fail_open must deliver byte-identical Human")
-            }
-            if reason == .belowFloor,
-               TokenEstimator.estimate(item.effectiveHuman) >= 80 {
-                throw benchmarkError("\(item.id) below_floor reason does not match the production floor")
             }
             return BenchmarkReportRow(
                 id: item.id,
@@ -3080,4 +4860,1674 @@ private func csvField(_ value: String) -> String {
 
 private func benchmarkError(_ message: String) -> NSError {
     NSError(domain: "RCW1MeasuredBenchmark", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+}
+
+private struct AllRowArmInput: Equatable {
+    var payload: String
+    var handle: String?
+    var abi: String
+    var producerID: String
+    var producerRevision: String = "1"
+    var abiRevision: String = "1"
+    var generation: TokenSaverBestOfThreeSelector.GateStatus
+    var structural: TokenSaverBestOfThreeSelector.GateStatus
+    var semantic: TokenSaverBestOfThreeSelector.GateStatus
+    var recovery: TokenSaverBestOfThreeSelector.GateStatus
+
+    var envelope: String {
+        abi.isEmpty ? payload : abi + "\n" + payload
+    }
+}
+
+private actor AllRowCountProbe {
+    private let counts: [String: Int]
+    private(set) var calls: [String] = []
+
+    init(counts: [String: Int]) {
+        self.counts = counts
+    }
+
+    func count(_ text: String) throws -> Int {
+        calls.append(text)
+        guard let value = counts[text] else {
+            throw benchmarkError("missing all-row probe token count")
+        }
+        return value
+    }
+}
+
+private enum AllRowBestOfThreeHarness {
+    static let schemaVersion = 6
+    static let estimatedQuality = "estimated"
+    static let testAuthorityQuality = "unit-test-authority"
+    static let localExactQuality = "local_exact"
+    static let testAuthorityCounterID = "unit-test-authority"
+
+    static func estimatedCapability() -> TokenSaverBestOfThreeSelector.CounterCapability {
+        let fallback: BenchmarkTokenCounter
+        do {
+            fallback = try BenchmarkTokenCounter(environment: [:])
+        } catch {
+            fallback = BenchmarkTokenCounter(
+                diagnostic: TokenCounterDiagnostic(
+                    name: "RemoteCode.TokenEstimator",
+                    version: "1",
+                    encoding: "utf8-char-word-heuristic",
+                    measurementKind: "estimated"
+                ),
+                count: { TokenEstimator.estimate($0) }
+            )
+        }
+        return .init(
+            counter: .init(
+                id: fallback.diagnostic.name,
+                revision: fallback.diagnostic.version,
+                encoding: fallback.diagnostic.encoding,
+                provider: "local",
+                resolvedModel: "estimated",
+                quality: .estimated
+            ),
+            count: { try fallback.count($0) }
+        )
+    }
+
+    static func testAuthorityCapability(
+        counts: [String: Int]?,
+        probe: AllRowCountProbe?
+    ) -> TokenSaverBestOfThreeSelector.CounterCapability {
+        let counter = TokenSaverBestOfThreeSelector.Counter(
+            id: testAuthorityCounterID,
+            revision: "1",
+            encoding: "unit-test-authority",
+            provider: "local",
+            resolvedModel: "unit-test-authority",
+            quality: .exactLocalTokenizer
+        )
+        if let probe {
+            return .init(counter: counter, count: { try await probe.count($0) })
+        }
+        return .init(counter: counter, count: { text in
+            guard let value = counts?[text] else {
+                throw benchmarkError("missing all-row unit token count")
+            }
+            return value
+        })
+    }
+
+    static func exactCapability(
+        from counter: BenchmarkTokenCounter
+    ) throws -> TokenSaverBestOfThreeSelector.CounterCapability {
+        guard counter.diagnostic.measurementKind == "exact-local-tokenizer" else {
+            throw benchmarkError("all-row emitter refuses estimated token counter")
+        }
+        guard let sourceSHA = counter.sourceSHA256, sourceSHA.count == 64,
+              sourceSHA.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            throw benchmarkError("all-row emitter requires exact-local-tokenizer executable source SHA-256")
+        }
+        try counter.validateSourceSHA256()
+        return .init(
+            counter: .init(
+                id: counter.diagnostic.name,
+                revision: counter.diagnostic.version,
+                encoding: counter.diagnostic.encoding,
+                provider: "local",
+                resolvedModel: "local-exact",
+                quality: .exactLocalTokenizer
+            ),
+            count: { try counter.count($0) }
+        )
+    }
+
+    static func allowsProvenSavings(_ quality: String) -> Bool {
+        quality == localExactQuality
+    }
+
+    static func allowsModeledDelta(_ quality: String) -> Bool {
+        quality == localExactQuality || quality == testAuthorityQuality
+    }
+
+    static func localExactCapability(
+        count: @escaping @Sendable (String) throws -> Int
+    ) -> TokenSaverBestOfThreeSelector.CounterCapability {
+        .init(
+            counter: .init(
+                id: "local-exact-unit",
+                revision: "1",
+                encoding: "utf8-bytes",
+                provider: "local",
+                resolvedModel: "local-exact",
+                quality: .exactLocalTokenizer
+            ),
+            count: count
+        )
+    }
+
+    static func versionedPublicationContext() throws -> AllRowPublicationContext {
+        AllRowPublicationContext(
+            remoteCodeHead: allRowExpectedSourceCommit,
+            workspaceClean: true,
+            runnerSourceSHA256: sha256Hex(try Data(contentsOf: URL(fileURLWithPath: #filePath)))
+        )
+    }
+
+    static func validatePublicationContext(_ context: AllRowPublicationContext) throws {
+        guard context.workspaceClean else {
+            throw benchmarkError("all-row publication requires a clean RemoteCode worktree")
+        }
+        guard context.remoteCodeHead == allRowExpectedSourceCommit else {
+            throw benchmarkError(
+                "all-row publication requires source commit \(allRowExpectedSourceCommit)"
+            )
+        }
+        guard context.runnerSourceSHA256.count == 64,
+              context.runnerSourceSHA256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            throw benchmarkError("all-row publication requires runner source SHA-256")
+        }
+    }
+
+    static func livePublicationContext() throws -> AllRowPublicationContext {
+        let repository = allRowRepositoryURL()
+        let status = try subprocessText(executable: "/usr/bin/git", arguments: [
+            "-C", repository.path, "status", "--porcelain=v1", "--untracked-files=all",
+        ]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let head = try subprocessText(executable: "/usr/bin/git", arguments: [
+            "-C", repository.path, "rev-parse", "HEAD",
+        ]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return AllRowPublicationContext(
+            remoteCodeHead: head,
+            workspaceClean: status.isEmpty,
+            runnerSourceSHA256: sha256Hex(try Data(contentsOf: URL(fileURLWithPath: #filePath)))
+        )
+    }
+
+    static func publishedQuality(
+        from capability: TokenSaverBestOfThreeSelector.CounterCapability?
+    ) -> String {
+        guard let counter = capability?.counter else { return "absent" }
+        switch counter.quality {
+        case .estimated:
+            return estimatedQuality
+        case .unknown:
+            return "unknown"
+        case .exactLocalTokenizer:
+            return counter.id == testAuthorityCounterID ? testAuthorityQuality : localExactQuality
+        case .exactResolvedModelTokenizer:
+            return "unproven"
+        }
+    }
+
+    static func rcs1Payload(fromHuman human: String) -> String? {
+        guard let item = RemoteCodeCompactSpan.encode(human),
+              RemoteCodeCompactSpan.decode(item) == human else {
+            return nil
+        }
+        return item
+    }
+
+    static func selectRow(
+        id: String,
+        human: String,
+        rcw1: AllRowArmInput,
+        rcs1: AllRowArmInput,
+        capability: TokenSaverBestOfThreeSelector.CounterCapability?,
+        surface: AllRowSurface = .request,
+        cavemanOutput: String? = nil,
+        recoveryStore: TokenSaverScopedRecoveryStore? = nil,
+        recoveryDisk: TokenSaverRecoveryDiskSnapshot? = nil
+    ) async throws -> AllRowRuntimeRow {
+        guard !human.isEmpty else { throw benchmarkError("all-row human is empty") }
+        var rcw1 = rcw1
+        var rcs1 = rcs1
+        if let recoveryStore {
+            rcw1 = AllRowRecoveryLab.apply(
+                rcw1, human: human, rowID: id, arm: "rcw1",
+                store: recoveryStore, disk: recoveryDisk
+            )
+            rcs1 = AllRowRecoveryLab.apply(
+                rcs1, human: human, rowID: id, arm: "rcs1",
+                store: recoveryStore, disk: recoveryDisk
+            )
+        }
+        let sourceSHA = sha256Hex(Data(human.utf8))
+        let decision: TokenSaverBestOfThreeSelector.Decision
+        if surface == .response {
+            decision = await TokenSaverContextItemSelector.select(
+                canonicalHuman: human,
+                humanEnvelope: human,
+                rcw1: candidate(rcw1, format: .rcw1, sourceSHA: sourceSHA),
+                rcs1: candidate(rcs1, format: .rcs1, sourceSHA: sourceSHA),
+                target: target(from: capability),
+                counter: capability
+            )
+        } else {
+            decision = await TokenSaverBestOfThreeSelector.select(
+                canonicalHuman: human,
+                humanOutboundPrompt: human,
+                humanEffectiveEnvelope: human,
+                target: target(from: capability),
+                candidates: [
+                    candidate(rcw1, format: .rcw1, sourceSHA: sourceSHA),
+                    candidate(rcs1, format: .rcs1, sourceSHA: sourceSHA),
+                ],
+                counter: capability
+            )
+        }
+        return row(
+            id: id,
+            surface: surface,
+            human: human,
+            rcw1: rcw1,
+            rcs1: rcs1,
+            decision: decision,
+            capability: capability,
+            cavemanOutput: cavemanOutput
+        )
+    }
+
+    static func requestReport(
+        corpus: [EfficiencyCase],
+        measurements: MeasuredBenchmarkRun,
+        capability: TokenSaverBestOfThreeSelector.CounterCapability?,
+        recoveryStore: TokenSaverScopedRecoveryStore? = nil
+    ) async throws -> AllRowRuntimeReport {
+        let corpusData = try Data(contentsOf: allRowRequestCorpusURL())
+        try MeasuredBenchmarkHarness.validateAllRowRequestIntegrity(
+            corpus: corpus,
+            corpusData: corpusData,
+            measurements: measurements
+        )
+        let measuredByID = Dictionary(uniqueKeysWithValues: measurements.rows.map { ($0.id, $0) })
+        var rows: [AllRowRuntimeRow] = []
+        rows.reserveCapacity(corpus.count)
+        for item in corpus {
+            guard let measured = measuredByID[item.id] else {
+                throw benchmarkError("measured run is missing \(item.id)")
+            }
+            let human = item.effectiveHuman
+            rows.append(try await selectRow(
+                id: item.id,
+                human: human,
+                rcw1: requestRCW1Arm(item: item, measured: measured),
+                rcs1: rcs1Arm(fromHuman: human),
+                capability: capability,
+                surface: .request,
+                cavemanOutput: measured.cavemanOutput,
+                recoveryStore: recoveryStore
+            ))
+        }
+        return report(surface: .request, rows: rows)
+    }
+
+    static func responseReport(
+        corpus: [ResponseEfficiencyCase],
+        measurements: [ResponseBenchmarkMeasurement],
+        capability: TokenSaverBestOfThreeSelector.CounterCapability?,
+        recoveryStore: TokenSaverScopedRecoveryStore? = nil
+    ) async throws -> AllRowRuntimeReport {
+        let corpusData = try Data(contentsOf: allRowResponseCorpusURL())
+        let sourcePrompt = try allRowNominalSourcePrompt()
+        try ResponseBenchmarkHarness.validateAllRowResponseContracts(
+            corpus: corpus,
+            corpusData: corpusData,
+            measurements: measurements,
+            sourcePrompt: sourcePrompt
+        )
+        let measuredByID = Dictionary(uniqueKeysWithValues: measurements.map { ($0.id, $0) })
+        var rows: [AllRowRuntimeRow] = []
+        rows.reserveCapacity(corpus.count)
+        for item in corpus {
+            guard let measured = measuredByID[item.id] else {
+                throw benchmarkError("measured run is missing \(item.id)")
+            }
+            let human = item.humanBaseline
+            rows.append(try await selectRow(
+                id: item.id,
+                human: human,
+                rcw1: responseContextRCW1Arm(item: item, measured: measured),
+                rcs1: responseContextRCS1Arm(fromHuman: human),
+                capability: capability,
+                surface: .response,
+                cavemanOutput: nil,
+                recoveryStore: recoveryStore
+            ))
+        }
+        return report(surface: .response, rows: rows)
+    }
+
+    static func checkpoint(
+        request: AllRowRuntimeReport,
+        response: AllRowRuntimeReport,
+        exactCounterSourceSHA256: String,
+        measurementArtifactSHA256: String,
+        evidenceBinding: AllRowEvidenceBinding,
+        publicationContext: AllRowPublicationContext
+    ) throws -> AllRowCheckpointReport {
+        try validateSurface(request, .request, 24)
+        try validateSurface(response, .response, 10)
+        guard request.methodology.quality == response.methodology.quality,
+              request.methodology.counterID == response.methodology.counterID,
+              request.methodology.counterRevision == response.methodology.counterRevision,
+              request.methodology.counterEncoding == response.methodology.counterEncoding else {
+            throw benchmarkError("all-row checkpoint requires one counter across surfaces")
+        }
+        let rows = request.rows + response.rows
+        return AllRowCheckpointReport(
+            schemaVersion: schemaVersion,
+            codec: "human-rcw1-rcs1",
+            billingClaim: false,
+            methodology: request.methodology,
+            counter: AllRowCheckpointCounter(
+                id: request.methodology.counterID,
+                revision: request.methodology.counterRevision,
+                encoding: request.methodology.counterEncoding,
+                quality: request.methodology.quality
+            ),
+            provenance: try AllRowCheckpointProvenance.bind(
+                exactCounterSourceSHA256: exactCounterSourceSHA256,
+                measurementArtifactSHA256: measurementArtifactSHA256,
+                evidenceBinding: evidenceBinding,
+                publicationContext: publicationContext
+            ),
+            rows: rows,
+            totals: AllRowCheckpointTotals(
+                request: request.totals,
+                response: response.totals,
+                overall: AllRowRuntimeTotals(rows: rows)
+            )
+        )
+    }
+
+    fileprivate static func validateSurface(
+        _ report: AllRowRuntimeReport,
+        _ surface: AllRowSurface,
+        _ expectedRows: Int
+    ) throws {
+        guard report.schemaVersion == schemaVersion else {
+            throw benchmarkError("all-row emitter requires schema 6")
+        }
+        guard report.surface == surface, report.rows.count == expectedRows else {
+            throw benchmarkError(
+                "all-row \(surface.rawValue) report requires the frozen \(expectedRows)-row corpus"
+            )
+        }
+        let expectedIDs = surface == .request ? frozenRequestCorpusIDs : frozenResponseCorpusIDs
+        guard report.rows.map(\.id) == expectedIDs else {
+            throw benchmarkError("all-row \(surface.rawValue) report requires the frozen corpus ID order")
+        }
+        guard report.billingClaim == false, report.methodology.billingClaim == false,
+              report.methodology.providerReportedTokens == false else {
+            throw benchmarkError("all-row emitter forbids billing or provider token claims")
+        }
+        for row in report.rows {
+            guard row.surface == surface else {
+                throw benchmarkError("all-row row surface drifted")
+            }
+            guard row.human.format == .human, row.rcw1.format == .rcw1, row.rcs1.format == .rcs1 else {
+                throw benchmarkError("all-row JSON+CSV must keep Human/RCW1/RCS1 visible")
+            }
+            guard row.selectedFormat.rawValue != "caveman" else {
+                throw benchmarkError("Caveman is never selected_format")
+            }
+            guard row.billingClaim == false, row.providerReportedTokens == false else {
+                throw benchmarkError("all-row emitter forbids billing or provider token claims")
+            }
+        }
+    }
+
+    private static func rcs1Arm(fromHuman human: String) -> AllRowArmInput {
+        guard let payload = rcs1Payload(fromHuman: human) else {
+            return unavailableArm(
+                payload: "RCS1_RUNTIME_UNAVAILABLE",
+                abi: "RCS1_ABI_UNAVAILABLE",
+                producerID: TokenSaverRequestSelectionReceipt.rcs1UnavailableProducerID,
+                generation: .failed
+            )
+        }
+        return AllRowArmInput(
+            payload: payload,
+            handle: nil,
+            abi: AgentSkillInstaller.compactSpanAgentInstructionsTemplate,
+            producerID: TokenSaverRequestSelectionReceipt.rcs1ProducerID,
+            generation: .passed,
+            structural: .passed,
+            semantic: .passed,
+            recovery: .passed
+        )
+    }
+
+    private static func requestRCW1Arm(
+        item: EfficiencyCase,
+        measured: MeasuredBenchmarkRow
+    ) -> AllRowArmInput {
+        let payload: String
+        let handle: String?
+        if measured.decision == .rcw1 {
+            payload = measured.deliveredPayload
+            handle = measured.recoveryHandle
+        } else if let observed = measured.observedEncoderOutput, !observed.isEmpty {
+            payload = observed
+            handle = measured.recoveryHandle
+        } else {
+            return unavailableArm(
+                payload: "RCW1_RUNTIME_UNAVAILABLE",
+                abi: "RCW1_ABI_UNAVAILABLE",
+                producerID: TokenSaverRequestSelectionReceipt.rcw1ProducerID
+            )
+        }
+        return evaluateRequestRCW1(
+            human: item.effectiveHuman,
+            payload: payload,
+            handle: handle,
+            requiredExact: item.requiredExact
+        )
+    }
+
+    private static func evaluateRequestRCW1(
+        human: String,
+        payload: String,
+        handle: String?,
+        requiredExact: [String]
+    ) -> AllRowArmInput {
+        var structural = TokenSaverBestOfThreeSelector.GateStatus.failed
+        var semantic = TokenSaverBestOfThreeSelector.GateStatus.failed
+        var recovery = TokenSaverBestOfThreeSelector.GateStatus.failed
+        if let frames = try? RCWireProtocol.parse(payload),
+           frames.allSatisfy({ $0.direction == .request }) {
+            structural = .passed
+            let records = frames.flatMap(\.records)
+            let recoveryRecords = records.filter {
+                $0.kind == .exact && $0.value.hasPrefix("[[rc:")
+            }
+            if let handle {
+                recovery = recoveryRecords.count == 1 && recoveryRecords[0].value == handle
+                    ? .passed : .failed
+            } else {
+                recovery = recoveryRecords.isEmpty ? .passed : .failed
+            }
+            let values = records.map(\.value).joined(separator: "\n")
+            let meaning = RCWireProtocol.preservesProtectedSemantics(
+                original: human, wire: payload
+            )
+                && RCWireProtocol.preservesRequestMeaning(original: human, wire: payload)
+                && requiredExact.allSatisfy(values.contains)
+            semantic = meaning ? .passed : .failed
+        }
+        return AllRowArmInput(
+            payload: payload,
+            handle: handle,
+            abi: AgentSkillInstaller.rcWireAgentInstructionsTemplate,
+            producerID: TokenSaverRequestSelectionReceipt.rcw1ProducerID,
+            generation: .passed,
+            structural: structural,
+            semantic: semantic,
+            recovery: recovery
+        )
+    }
+
+    private static func responseContextRCW1Arm(
+        item: ResponseEfficiencyCase,
+        measured: ResponseBenchmarkMeasurement
+    ) -> AllRowArmInput {
+        let abi = AgentSkillInstaller.rcWireAgentInstructionsTemplate
+        return armInput(
+            from: TokenSaverContextItemSelector.rcw1Candidate(
+                canonicalHuman: item.humanBaseline,
+                persistedProviderWire: measured.wire,
+                abi: abi,
+                effectiveEnvelope: abi + "\n" + measured.wire
+            )
+        )
+    }
+
+    private static func responseContextRCS1Arm(fromHuman human: String) -> AllRowArmInput {
+        let abi = AgentSkillInstaller.compactSpanAgentInstructionsTemplate
+        if let encoded = rcs1Payload(fromHuman: human) {
+            return armInput(
+                from: TokenSaverContextItemSelector.rcs1Candidate(
+                    canonicalHuman: human,
+                    encodedItem: encoded,
+                    abi: abi,
+                    effectiveEnvelope: abi + "\n" + encoded
+                )
+            )
+        }
+        return armInput(
+            from: TokenSaverContextItemSelector.rcs1Candidate(
+                canonicalHuman: human,
+                abi: abi,
+                effectiveEnvelope: abi + "\nRCS1_UNAVAILABLE"
+            )
+        )
+    }
+
+    private static func armInput(
+        from candidate: TokenSaverBestOfThreeSelector.Candidate
+    ) -> AllRowArmInput {
+        AllRowArmInput(
+            payload: candidate.payload,
+            handle: candidate.handle,
+            abi: candidate.abi,
+            producerID: candidate.producerID,
+            producerRevision: candidate.producerRevision,
+            abiRevision: candidate.abiRevision,
+            generation: candidate.generation,
+            structural: candidate.structural,
+            semantic: candidate.semantic,
+            recovery: candidate.recovery
+        )
+    }
+
+    private static func unavailableArm(
+        payload: String,
+        abi: String,
+        producerID: String,
+        generation: TokenSaverBestOfThreeSelector.GateStatus = .passed
+    ) -> AllRowArmInput {
+        AllRowArmInput(
+            payload: payload,
+            handle: nil,
+            abi: abi,
+            producerID: producerID,
+            producerRevision: "unavailable",
+            abiRevision: "unavailable",
+            generation: generation,
+            structural: .failed,
+            semantic: .failed,
+            recovery: .failed
+        )
+    }
+
+    private static func candidate(
+        _ input: AllRowArmInput,
+        format: TokenSaverBestOfThreeSelector.Format,
+        sourceSHA: String
+    ) -> TokenSaverBestOfThreeSelector.Candidate {
+        .init(
+            format: format,
+            sourceSHA256: sourceSHA,
+            payload: input.payload,
+            abi: input.abi,
+            effectiveEnvelope: input.envelope,
+            handle: input.handle,
+            producerID: input.producerID,
+            producerRevision: input.producerRevision,
+            abiRevision: input.abiRevision,
+            generation: input.generation,
+            structural: input.structural,
+            semantic: input.semantic,
+            recovery: input.recovery
+        )
+    }
+
+    private static func target(
+        from capability: TokenSaverBestOfThreeSelector.CounterCapability?
+    ) -> TokenSaverBestOfThreeSelector.Target {
+        if let counter = capability?.counter {
+            return .init(
+                provider: counter.provider,
+                resolvedModel: counter.resolvedModel,
+                counterID: counter.id,
+                counterRevision: counter.revision,
+                encoding: counter.encoding
+            )
+        }
+        return .init(
+            provider: "local",
+            resolvedModel: "absent",
+            counterID: "absent",
+            counterRevision: "absent",
+            encoding: "absent"
+        )
+    }
+
+    private static func row(
+        id: String,
+        surface: AllRowSurface,
+        human: String,
+        rcw1: AllRowArmInput,
+        rcs1: AllRowArmInput,
+        decision: TokenSaverBestOfThreeSelector.Decision,
+        capability: TokenSaverBestOfThreeSelector.CounterCapability?,
+        cavemanOutput: String?
+    ) -> AllRowRuntimeRow {
+        let quality = publishedQuality(from: capability)
+        let winner = decision.selectedFormat != .human && decision.reason == .uniqueStrictMinimum
+        let modeled = allowsModeledDelta(quality) && winner ? decision.modeledContextDelta : 0
+        let savings = allowsProvenSavings(quality) && winner ? max(0, decision.modeledContextDelta) : 0
+        let counter = capability?.counter
+        return AllRowRuntimeRow(
+            id: id,
+            surface: surface,
+            selectedFormat: decision.selectedFormat,
+            reason: decision.reason,
+            modeledContextDelta: modeled,
+            provenSavingsTokens: savings,
+            billingClaim: false,
+            providerReportedTokens: false,
+            counterQuality: quality,
+            counterID: counter?.id ?? "",
+            counterRevision: counter?.revision ?? "",
+            counterEncoding: counter?.encoding ?? "",
+            human: humanRecord(human: human, cost: decision.cost(.human)),
+            rcw1: armRecord(format: .rcw1, input: rcw1, decision: decision),
+            rcs1: armRecord(format: .rcs1, input: rcs1, decision: decision),
+            cavemanTokens: nil,
+            cavemanSHA256: cavemanOutput.map { sha256Hex(Data($0.utf8)) }
+        )
+    }
+
+    private static func humanRecord(
+        human: String,
+        cost: TokenSaverBestOfThreeSelector.Cost?
+    ) -> AllRowArmRecord {
+        AllRowArmRecord(
+            format: .human,
+            eligible: true,
+            sourceBound: true,
+            generation: .passed,
+            structural: .passed,
+            semantic: .passed,
+            recovery: .passed,
+            payloadTokens: cost?.payloadTokensIncludingHandle,
+            handleTokens: cost?.handleTokens,
+            abiTokens: cost?.abiTokens,
+            effectiveTokens: cost?.effectiveEnvelopeTokens,
+            payloadSHA256: cost?.payloadSHA256 ?? sha256Hex(Data(human.utf8)),
+            handleSHA256: cost?.handleSHA256,
+            abiSHA256: cost?.abiSHA256,
+            effectiveEnvelopeSHA256: cost?.effectiveEnvelopeSHA256
+                ?? sha256Hex(Data(human.utf8)),
+            rejectionReason: nil
+        )
+    }
+
+    private static func armRecord(
+        format: TokenSaverBestOfThreeSelector.Format,
+        input: AllRowArmInput,
+        decision: TokenSaverBestOfThreeSelector.Decision
+    ) -> AllRowArmRecord {
+        let receipt = decision.arm(format)
+        let cost = decision.cost(format)
+        return AllRowArmRecord(
+            format: format,
+            eligible: receipt?.eligible ?? false,
+            sourceBound: receipt?.sourceBound ?? false,
+            generation: receipt?.generation ?? .unknown,
+            structural: receipt?.structural ?? .unknown,
+            semantic: receipt?.semantic ?? .unknown,
+            recovery: receipt?.recovery ?? .unknown,
+            payloadTokens: cost?.payloadTokensIncludingHandle,
+            handleTokens: cost?.handleTokens,
+            abiTokens: cost?.abiTokens,
+            effectiveTokens: cost?.effectiveEnvelopeTokens,
+            payloadSHA256: cost?.payloadSHA256 ?? sha256Hex(Data(input.payload.utf8)),
+            handleSHA256: cost?.handleSHA256 ?? input.handle.map { sha256Hex(Data($0.utf8)) },
+            abiSHA256: cost?.abiSHA256 ?? sha256Hex(Data(input.abi.utf8)),
+            effectiveEnvelopeSHA256: cost?.effectiveEnvelopeSHA256
+                ?? sha256Hex(Data(input.envelope.utf8)),
+            rejectionReason: rejectionReason(receipt)
+        )
+    }
+
+    private static func rejectionReason(
+        _ receipt: TokenSaverBestOfThreeSelector.ArmReceipt?
+    ) -> String? {
+        guard let receipt, !receipt.eligible else { return nil }
+        if !receipt.sourceBound { return "source_unbound" }
+        if receipt.generation == .failed { return "generation" }
+        if receipt.structural != .passed { return "structural" }
+        if receipt.semantic != .passed { return "semantic" }
+        if receipt.recovery != .passed { return "recovery" }
+        return "ineligible"
+    }
+
+    static func report(
+        surface: AllRowSurface,
+        rows: [AllRowRuntimeRow]
+    ) -> AllRowRuntimeReport {
+        let quality = rows.first?.counterQuality ?? "absent"
+        return AllRowRuntimeReport(
+            schemaVersion: schemaVersion,
+            surface: surface,
+            codec: "human-rcw1-rcs1",
+            billingClaim: false,
+            methodology: AllRowRuntimeMethodology(
+                scope: "all-frozen-runtime-arms",
+                quality: quality,
+                counterID: rows.first?.counterID ?? "",
+                counterRevision: rows.first?.counterRevision ?? "",
+                counterEncoding: rows.first?.counterEncoding ?? "",
+                billingClaim: false,
+                providerReportedTokens: false,
+                rcs1Rule: "RCS1 is RemoteCodeCompactSpan.encode(canonical Human); never encode(RCW1)",
+                rcw1Rule: "RCW1 is derived from the same Human, never from RCS1",
+                rankingRule: "TokenSaverBestOfThreeSelector: gates before cost, unique strict minimum below Human; Human on tie/error/absent counter/uncertainty",
+                effectiveCostRule: "payload + handle already in payload + unamortized ABI counted once; Human uses the comparable Human envelope",
+                cavemanRule: "Caveman is opt-in benchmark provenance only and is not a runtime arm or chosen format"
+            ),
+            rows: rows,
+            totals: AllRowRuntimeTotals(rows: rows)
+        )
+    }
+}
+
+private struct AllRowArmRecord: Encodable, Equatable {
+    let format: TokenSaverBestOfThreeSelector.Format
+    let eligible: Bool
+    let sourceBound: Bool
+    let generation: TokenSaverBestOfThreeSelector.GateStatus
+    let structural: TokenSaverBestOfThreeSelector.GateStatus
+    let semantic: TokenSaverBestOfThreeSelector.GateStatus
+    let recovery: TokenSaverBestOfThreeSelector.GateStatus
+    let payloadTokens: Int?
+    let handleTokens: Int?
+    let abiTokens: Int?
+    let effectiveTokens: Int?
+    let payloadSHA256: String?
+    let handleSHA256: String?
+    let abiSHA256: String?
+    let effectiveEnvelopeSHA256: String?
+    let rejectionReason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case format, eligible, generation, structural, semantic, recovery
+        case sourceBound = "source_bound"
+        case payloadTokens = "payload_tokens"
+        case handleTokens = "handle_tokens"
+        case abiTokens = "abi_tokens"
+        case effectiveTokens = "effective_tokens"
+        case payloadSHA256 = "payload_sha256"
+        case handleSHA256 = "handle_sha256"
+        case abiSHA256 = "abi_sha256"
+        case effectiveEnvelopeSHA256 = "effective_envelope_sha256"
+        case rejectionReason = "rejection_reason"
+    }
+}
+
+private struct AllRowRuntimeRow: Encodable, Equatable {
+    let id: String
+    let surface: AllRowSurface
+    let selectedFormat: TokenSaverBestOfThreeSelector.Format
+    let reason: TokenSaverBestOfThreeSelector.Reason
+    let modeledContextDelta: Int
+    let provenSavingsTokens: Int
+    let billingClaim: Bool
+    let providerReportedTokens: Bool
+    let counterQuality: String
+    let counterID: String
+    let counterRevision: String
+    let counterEncoding: String
+    let human: AllRowArmRecord
+    let rcw1: AllRowArmRecord
+    let rcs1: AllRowArmRecord
+    let cavemanTokens: Int?
+    let cavemanSHA256: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, surface, reason, human, rcw1, rcs1
+        case selectedFormat = "selected_format"
+        case modeledContextDelta = "modeled_context_delta"
+        case provenSavingsTokens = "proven_savings_tokens"
+        case billingClaim = "billing_claim"
+        case providerReportedTokens = "provider_reported_tokens"
+        case counterQuality = "counter_quality"
+        case counterID = "counter_id"
+        case counterRevision = "counter_revision"
+        case counterEncoding = "counter_encoding"
+        case cavemanTokens = "caveman_tokens"
+        case cavemanSHA256 = "caveman_sha256"
+    }
+}
+
+private struct AllRowRuntimeTotals: Encodable, Equatable {
+    let rows: Int
+    let humanFailOpenRows: Int
+    let rcw1Rows: Int
+    let rcs1Rows: Int
+    let uniqueStrictMinimumRows: Int
+    let provenSavingsTokens: Int
+    let failOpenReasons: [String: Int]
+
+    init(rows source: [AllRowRuntimeRow]) {
+        rows = source.count
+        humanFailOpenRows = source.filter { $0.selectedFormat == .human }.count
+        rcw1Rows = source.filter { $0.selectedFormat == .rcw1 }.count
+        rcs1Rows = source.filter { $0.selectedFormat == .rcs1 }.count
+        uniqueStrictMinimumRows = source.filter { $0.reason == .uniqueStrictMinimum }.count
+        provenSavingsTokens = source.reduce(0) { $0 + $1.provenSavingsTokens }
+        failOpenReasons = Dictionary(
+            source.filter { $0.selectedFormat == .human }.map { ($0.reason.rawValue, 1) },
+            uniquingKeysWith: +
+        )
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case rows
+        case humanFailOpenRows = "human_fail_open_rows"
+        case rcw1Rows = "rcw1_rows"
+        case rcs1Rows = "rcs1_rows"
+        case uniqueStrictMinimumRows = "unique_strict_minimum_rows"
+        case provenSavingsTokens = "proven_savings_tokens"
+        case failOpenReasons = "fail_open_reasons"
+    }
+}
+
+private struct AllRowRuntimeMethodology: Encodable, Equatable {
+    let scope: String
+    let quality: String
+    let counterID: String
+    let counterRevision: String
+    let counterEncoding: String
+    let billingClaim: Bool
+    let providerReportedTokens: Bool
+    let rcs1Rule: String
+    let rcw1Rule: String
+    let rankingRule: String
+    let effectiveCostRule: String
+    let cavemanRule: String
+
+    enum CodingKeys: String, CodingKey {
+        case scope, quality
+        case counterID = "counter_id"
+        case counterRevision = "counter_revision"
+        case counterEncoding = "counter_encoding"
+        case billingClaim = "billing_claim"
+        case providerReportedTokens = "provider_reported_tokens"
+        case rcs1Rule = "rcs1_rule"
+        case rcw1Rule = "rcw1_rule"
+        case rankingRule = "ranking_rule"
+        case effectiveCostRule = "effective_cost_rule"
+        case cavemanRule = "caveman_rule"
+    }
+}
+
+private enum AllRowSurface: String, Encodable, Equatable {
+    case request, response
+}
+
+private struct AllRowPublicationContext: Equatable {
+    let remoteCodeHead: String
+    let workspaceClean: Bool
+    let runnerSourceSHA256: String
+}
+
+private enum AllRowEvidenceBinding: String, Encodable, Equatable {
+    case derivedCanonicalInputs = "derived_canonical_inputs"
+    case unitTestExplicit = "unit_test_explicit"
+}
+
+private struct AllRowCavemanProvenance: Encodable, Equatable {
+    let scope: String
+    let request: CavemanBenchmarkProvenance
+
+    static let requestBenchmarkObservations = AllRowCavemanProvenance(
+        scope: "request_benchmark_observations",
+        request: benchmarkPinnedCavemanProvenance
+    )
+}
+
+private struct AllRowRuntimeReport: Encodable {
+    let schemaVersion: Int
+    let surface: AllRowSurface
+    let codec: String
+    let billingClaim: Bool
+    let methodology: AllRowRuntimeMethodology
+    let rows: [AllRowRuntimeRow]
+    let totals: AllRowRuntimeTotals
+
+    enum CodingKeys: String, CodingKey {
+        case surface, codec, methodology, rows, totals
+        case schemaVersion = "schema_version"
+        case billingClaim = "billing_claim"
+    }
+
+    func jsonObject() throws -> [String: Any] {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(self)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw benchmarkError("all-row JSON is not an object")
+        }
+        return object
+    }
+
+    var csv: String {
+        let header = allRowCSVHeader
+        let body = rows.map { allRowCSVFields(recordType: "row", row: $0, totals: nil) }
+        let total = allRowCSVFields(
+            recordType: "totals", row: nil, totals: totals, totalsSurface: surface.rawValue
+        )
+        return ([header] + body + [total]).map { $0.map(csvField).joined(separator: ",") }
+            .joined(separator: "\n") + "\n"
+    }
+}
+
+private struct AllRowCheckpointCounter: Encodable, Equatable {
+    let id: String
+    let revision: String
+    let encoding: String
+    let quality: String
+}
+
+private struct AllRowCheckpointProvenance: Encodable, Equatable {
+    let requestCorpusSHA256: String
+    let responseCorpusSHA256: String
+    let semanticContractSHA256: String
+    let sourcePromptSHA256: String
+    let runnerSourceSHA256: String
+    let remoteCodeHead: String
+    let workspaceClean: Bool
+    let exactCounterSourceSHA256: String
+    let measurementArtifactSHA256: String
+    let evidenceBinding: AllRowEvidenceBinding
+    let caveman: AllRowCavemanProvenance
+
+    enum CodingKeys: String, CodingKey {
+        case caveman
+        case requestCorpusSHA256 = "request_corpus_sha256"
+        case responseCorpusSHA256 = "response_corpus_sha256"
+        case semanticContractSHA256 = "semantic_contract_sha256"
+        case sourcePromptSHA256 = "source_prompt_sha256"
+        case runnerSourceSHA256 = "runner_source_sha256"
+        case remoteCodeHead = "remote_code_head"
+        case workspaceClean = "workspace_clean"
+        case exactCounterSourceSHA256 = "exact_counter_source_sha256"
+        case measurementArtifactSHA256 = "measurement_artifact_sha256"
+        case evidenceBinding = "evidence_binding"
+    }
+
+    static func bind(
+        exactCounterSourceSHA256: String,
+        measurementArtifactSHA256: String,
+        evidenceBinding: AllRowEvidenceBinding,
+        publicationContext: AllRowPublicationContext
+    ) throws -> AllRowCheckpointProvenance {
+        AllRowCheckpointProvenance(
+            requestCorpusSHA256: sha256Hex(try Data(contentsOf: allRowRequestCorpusURL())),
+            responseCorpusSHA256: sha256Hex(try Data(contentsOf: allRowResponseCorpusURL())),
+            semanticContractSHA256: frozenResponseSemanticContractSHA256,
+            sourcePromptSHA256: frozenNominalSourcePromptSHA256,
+            runnerSourceSHA256: try allRowRequireContentFreeSHA256(
+                publicationContext.runnerSourceSHA256, label: "runner source"
+            ),
+            remoteCodeHead: publicationContext.remoteCodeHead,
+            workspaceClean: publicationContext.workspaceClean,
+            exactCounterSourceSHA256: try allRowRequireContentFreeSHA256(
+                exactCounterSourceSHA256, label: "exact counter executable"
+            ),
+            measurementArtifactSHA256: try allRowRequireContentFreeSHA256(
+                measurementArtifactSHA256, label: "measurement artifact"
+            ),
+            evidenceBinding: evidenceBinding,
+            caveman: .requestBenchmarkObservations
+        )
+    }
+}
+
+private struct AllRowCheckpointTotals: Encodable, Equatable {
+    let request: AllRowRuntimeTotals
+    let response: AllRowRuntimeTotals
+    let overall: AllRowRuntimeTotals
+}
+
+private struct AllRowCheckpointReport: Encodable {
+    let schemaVersion: Int
+    let codec: String
+    let billingClaim: Bool
+    let methodology: AllRowRuntimeMethodology
+    let counter: AllRowCheckpointCounter
+    let provenance: AllRowCheckpointProvenance
+    let rows: [AllRowRuntimeRow]
+    let totals: AllRowCheckpointTotals
+
+    enum CodingKeys: String, CodingKey {
+        case codec, methodology, counter, provenance, rows, totals
+        case schemaVersion = "schema_version"
+        case billingClaim = "billing_claim"
+    }
+
+    func jsonObject() throws -> [String: Any] {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(self)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw benchmarkError("all-row JSON is not an object")
+        }
+        return object
+    }
+
+    var csv: String {
+        let header = allRowCSVHeader
+        let body = rows.map {
+            allRowCSVFields(recordType: "row", row: $0, totals: nil, provenance: provenance)
+        }
+        let totalsLines = [
+            allRowCSVFields(
+                recordType: "totals", row: nil, totals: totals.request,
+                totalsSurface: "request", provenance: provenance
+            ),
+            allRowCSVFields(
+                recordType: "totals", row: nil, totals: totals.response,
+                totalsSurface: "response", provenance: provenance
+            ),
+            allRowCSVFields(
+                recordType: "totals", row: nil, totals: totals.overall,
+                totalsSurface: "overall", provenance: provenance
+            ),
+        ]
+        return ([header] + body + totalsLines).map { $0.map(csvField).joined(separator: ",") }
+            .joined(separator: "\n") + "\n"
+    }
+}
+
+private let allRowArmCSVFields = [
+    "eligible", "source_bound", "generation", "structural", "semantic", "recovery",
+    "payload_tokens", "handle_tokens", "abi_tokens", "effective_tokens",
+    "payload_sha256", "handle_sha256", "abi_sha256", "effective_envelope_sha256",
+    "rejection",
+]
+
+private let allRowCSVHeader: [String] = {
+    let prefix = [
+        "record_type", "id", "surface", "selected_format", "reason",
+        "billing_claim", "provider_reported_tokens",
+        "counter_quality", "counter_id", "counter_revision", "counter_encoding",
+        "modeled_context_delta", "proven_savings_tokens",
+    ]
+    let arms = ["human", "rcw1", "rcs1"].flatMap { arm in
+        allRowArmCSVFields.map { "\(arm)_\($0)" }
+    }
+    return prefix + arms + [
+        "caveman_tokens", "caveman_sha256",
+        "exact_counter_source_sha256", "measurement_artifact_sha256",
+        "human_fail_open_rows", "rcw1_rows", "rcs1_rows", "unique_strict_minimum_rows",
+        "rows", "fail_open_reasons",
+    ]
+}()
+
+private func allRowCSVFields(
+    recordType: String,
+    row: AllRowRuntimeRow?,
+    totals: AllRowRuntimeTotals?,
+    totalsSurface: String = "",
+    provenance: AllRowCheckpointProvenance? = nil
+) -> [String] {
+    func tokens(_ value: Int?) -> String { value.map(String.init) ?? "" }
+    func arm(_ record: AllRowArmRecord?) -> [String] {
+        guard let record else {
+            return Array(repeating: "", count: allRowArmCSVFields.count)
+        }
+        return [
+            String(record.eligible), String(record.sourceBound),
+            record.generation.rawValue, record.structural.rawValue,
+            record.semantic.rawValue, record.recovery.rawValue,
+            tokens(record.payloadTokens), tokens(record.handleTokens),
+            tokens(record.abiTokens), tokens(record.effectiveTokens),
+            record.payloadSHA256 ?? "", record.handleSHA256 ?? "",
+            record.abiSHA256 ?? "", record.effectiveEnvelopeSHA256 ?? "",
+            record.rejectionReason ?? "",
+        ]
+    }
+    let counterSHA = provenance?.exactCounterSourceSHA256 ?? ""
+    let measurementSHA = provenance?.measurementArtifactSHA256 ?? ""
+    if let row {
+        return [
+            recordType, row.id, row.surface.rawValue, row.selectedFormat.rawValue,
+            row.reason.rawValue, String(row.billingClaim), String(row.providerReportedTokens),
+            row.counterQuality, row.counterID, row.counterRevision, row.counterEncoding,
+            String(row.modeledContextDelta), String(row.provenSavingsTokens),
+        ]
+        + arm(row.human) + arm(row.rcw1) + arm(row.rcs1)
+        + [
+            tokens(row.cavemanTokens), row.cavemanSHA256 ?? "",
+            counterSHA, measurementSHA,
+            "", "", "", "", "", "",
+        ]
+    }
+    return [
+        recordType, "", totalsSurface, "", "", "false", "false",
+        "", "", "", "", "", tokens(totals?.provenSavingsTokens),
+    ]
+    + Array(repeating: "", count: allRowArmCSVFields.count * 3)
+    + [
+        "", "",
+        counterSHA, measurementSHA,
+        tokens(totals?.humanFailOpenRows),
+        tokens(totals?.rcw1Rows),
+        tokens(totals?.rcs1Rows),
+        tokens(totals?.uniqueStrictMinimumRows),
+        tokens(totals?.rows),
+        allRowFailOpenReasonsField(totals?.failOpenReasons ?? [:]),
+    ]
+}
+
+private func optionalJSONNumber(_ value: Any?) -> String {
+    if let value = value as? Int { return String(value) }
+    return ""
+}
+
+private func parseAllRowCSVRow(_ line: String) -> [String] {
+    var fields: [String] = []
+    var current = ""
+    var inQuotes = false
+    var index = line.startIndex
+    while index < line.endIndex {
+        let character = line[index]
+        if inQuotes {
+            if character == "\"" {
+                let next = line.index(after: index)
+                if next < line.endIndex, line[next] == "\"" {
+                    current.append("\"")
+                    index = line.index(after: next)
+                    continue
+                }
+                inQuotes = false
+            } else {
+                current.append(character)
+            }
+        } else if character == "\"" {
+            inQuotes = true
+        } else if character == "," {
+            fields.append(current)
+            current = ""
+        } else {
+            current.append(character)
+        }
+        index = line.index(after: index)
+    }
+    fields.append(current)
+    return fields
+}
+
+private enum AllRowRecoveryLab {
+    static let generousDisk = TokenSaverRecoveryDiskSnapshot(
+        freeBytes: 20 * 1_024 * 1_024 * 1_024,
+        totalBytes: 100 * 1_024 * 1_024 * 1_024
+    )
+    static let exhaustedDisk = TokenSaverRecoveryDiskSnapshot(freeBytes: 0, totalBytes: 1)
+
+    static func makeStore() throws -> TokenSaverScopedRecoveryStore {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        return TokenSaverScopedRecoveryStore(db: db)
+    }
+
+    static func apply(
+        _ arm: AllRowArmInput,
+        human: String,
+        rowID: String,
+        arm armName: String,
+        store: TokenSaverScopedRecoveryStore,
+        disk: TokenSaverRecoveryDiskSnapshot?
+    ) -> AllRowArmInput {
+        guard arm.recovery == .passed else { return arm }
+        let scope = TokenSaverPersistentScope(
+            workspaceID: "all-row-report",
+            projectID: "language",
+            threadID: rowID,
+            provider: "local",
+            attemptID: armName
+        )
+        do {
+            let original = Data(human.utf8)
+            let prepared = try store.prepare(
+                original,
+                scope: scope,
+                operationID: "all-row-\(rowID)-\(armName)",
+                expiresAt: nil,
+                disk: disk ?? generousDisk
+            )
+            guard prepared.readBackVerified,
+                  prepared.capability.hasPrefix("rcv1.") else {
+                return failedRecovery(arm)
+            }
+            let recovered = try store.retrieve(capability: prepared.capability, scope: scope)
+            guard recovered == original else { return failedRecovery(arm) }
+            return arm
+        } catch {
+            return failedRecovery(arm)
+        }
+    }
+
+    private static func failedRecovery(_ arm: AllRowArmInput) -> AllRowArmInput {
+        var copy = arm
+        copy.recovery = .failed
+        return copy
+    }
+}
+
+private enum AllRowReportEmitter {
+    static let jsonKey = "REMOTE_CODE_RCW1_ALL_ROW_REPORT_JSON"
+    static let csvKey = "REMOTE_CODE_RCW1_ALL_ROW_REPORT_CSV"
+    static let measurementsKey = "REMOTE_CODE_RCW1_BENCHMARK_MEASUREMENTS"
+    static let tokenCounterKey = "REMOTE_CODE_RCW1_BENCHMARK_TOKEN_COUNTER"
+
+    static func plan(environment: [String: String]) throws -> AllRowEmissionPlan? {
+        let json = allRowNonempty(environment[jsonKey])
+        let csv = allRowNonempty(environment[csvKey])
+        let measurements = allRowNonempty(environment[measurementsKey])
+        let tokenCounter = allRowNonempty(environment[tokenCounterKey])
+        let values = [json, csv, measurements, tokenCounter]
+        if values.allSatisfy({ $0 == nil }) { return nil }
+        guard let json, let csv, let measurements, let tokenCounter else {
+            throw benchmarkError(
+                "all-row emitter requires complete JSON/CSV pair, measurements, and exact token counter"
+            )
+        }
+        let jsonPath = try allRowInspectPath(json, mustExist: false, label: "JSON output")
+        let csvPath = try allRowInspectPath(csv, mustExist: false, label: "CSV output")
+        let measurementPath = try allRowInspectPath(measurements, mustExist: true, label: "measurement artifact")
+        let counterPath = try allRowInspectPath(tokenCounter, mustExist: true, label: "token counter")
+        let requestFixture = try allRowInspectPath(allRowRequestCorpusURL().path, mustExist: true, label: "request fixture")
+        let responseFixture = try allRowInspectPath(allRowResponseCorpusURL().path, mustExist: true, label: "response fixture")
+        try allRowRejectAliasOrOverlap([
+            ("JSON output", jsonPath),
+            ("CSV output", csvPath),
+            ("measurement artifact", measurementPath),
+            ("token counter", counterPath),
+            ("request fixture", requestFixture),
+            ("response fixture", responseFixture),
+        ])
+        guard !jsonPath.exists, !csvPath.exists else {
+            throw benchmarkError("all-row outputs must not already exist")
+        }
+        let output = try ResponseReportOutputBundle(jsonPath: jsonPath.canonical, csvPath: csvPath.canonical)
+        var counterEnvironment = [
+            tokenCounterKey: counterPath.canonical
+        ]
+        if let encoding = environment["RCW1_TIKTOKEN_ENCODING"] {
+            counterEnvironment["RCW1_TIKTOKEN_ENCODING"] = encoding
+        }
+        if let pythonPath = environment["PYTHONPATH"] ?? ProcessInfo.processInfo.environment["PYTHONPATH"] {
+            counterEnvironment["PYTHONPATH"] = pythonPath
+        }
+        let counter = try BenchmarkTokenCounter(environment: counterEnvironment)
+        _ = try AllRowBestOfThreeHarness.exactCapability(from: counter)
+        let measurementURL = URL(fileURLWithPath: measurementPath.canonical)
+        guard let counterSHA = counter.sourceSHA256 else {
+            throw benchmarkError("all-row emitter requires exact-local-tokenizer executable source SHA-256")
+        }
+        return AllRowEmissionPlan(
+            output: output,
+            measurementsURL: measurementURL,
+            counter: counter,
+            exactCounterSourceSHA256: try allRowRequireContentFreeSHA256(
+                counterSHA, label: "exact counter executable"
+            ),
+            measurementArtifactSHA256: try allRowContentFreeSHA256(
+                of: measurementURL, label: "measurement artifact"
+            )
+        )
+    }
+
+    static func write(
+        output: ResponseReportOutputBundle,
+        report: AllRowCheckpointReport
+    ) throws -> AllRowEmissionReceipt {
+        try validate(report)
+        let json = try allRowJSONData(report)
+        let receipt = try output.emit(json: json, csv: report.csv)
+        return AllRowEmissionReceipt(
+            jsonPath: receipt.jsonPath,
+            csvPath: receipt.csvPath,
+            exactCounterSourceSHA256: report.provenance.exactCounterSourceSHA256,
+            measurementArtifactSHA256: report.provenance.measurementArtifactSHA256
+        )
+    }
+
+    static func publish(
+        plan: AllRowEmissionPlan,
+        publicationContext: (() throws -> AllRowPublicationContext)? = nil,
+        afterCountingStarted: (() throws -> Void)? = nil
+    ) async throws -> AllRowEmissionReceipt {
+        let contextProvider = publicationContext ?? AllRowBestOfThreeHarness.livePublicationContext
+        let contextAtStart = try contextProvider()
+        try AllRowBestOfThreeHarness.validatePublicationContext(contextAtStart)
+        try plan.counter.validateSourceSHA256()
+        let boundCounterSHA = try allRowRequireContentFreeSHA256(
+            plan.exactCounterSourceSHA256, label: "exact counter executable"
+        )
+        guard plan.counter.sourceSHA256 == boundCounterSHA else {
+            throw benchmarkError("exact counter executable source SHA-256 drifted")
+        }
+        let measurementData = try Data(contentsOf: plan.measurementsURL)
+        let boundMeasurementSHA = try allRowRequireContentFreeSHA256(
+            sha256Hex(measurementData), label: "measurement artifact"
+        )
+        guard boundMeasurementSHA == plan.measurementArtifactSHA256 else {
+            throw benchmarkError("measurement artifact SHA-256 drifted")
+        }
+        let hook = afterCountingStarted.map(AllRowOnceHook.init)
+        _ = try AllRowBestOfThreeHarness.exactCapability(from: plan.counter)
+        let gated = TokenSaverBestOfThreeSelector.CounterCapability(
+            counter: .init(
+                id: plan.counter.diagnostic.name,
+                revision: plan.counter.diagnostic.version,
+                encoding: plan.counter.diagnostic.encoding,
+                provider: "local",
+                resolvedModel: "local-exact",
+                quality: .exactLocalTokenizer
+            ),
+            count: { text in
+                try hook?.fire()
+                return try plan.counter.count(text)
+            }
+        )
+        let measurements = try JSONDecoder().decode(
+            MeasuredBenchmarkRun.self,
+            from: measurementData
+        )
+        let recoveryStore = try AllRowRecoveryLab.makeStore()
+        let requestReport = try await AllRowBestOfThreeHarness.requestReport(
+            corpus: try JSONDecoder().decode(
+                [EfficiencyCase].self,
+                from: Data(contentsOf: allRowRequestCorpusURL())
+            ),
+            measurements: measurements,
+            capability: gated,
+            recoveryStore: recoveryStore
+        )
+        let responseCorpus = try JSONDecoder().decode(
+            [ResponseEfficiencyCase].self,
+            from: Data(contentsOf: allRowResponseCorpusURL())
+        )
+        let responseMeasurements = try responseCorpus.map { item in
+            ResponseBenchmarkMeasurement(
+                id: item.id,
+                human: item.humanBaseline,
+                wire: try item.serializedWire(),
+                caveman: .init(
+                    output: item.humanBaseline,
+                    handleBehavior: .passThroughNoHandle
+                )
+            )
+        }
+        let responseReport = try await AllRowBestOfThreeHarness.responseReport(
+            corpus: responseCorpus,
+            measurements: responseMeasurements,
+            capability: gated,
+            recoveryStore: recoveryStore
+        )
+        try plan.counter.validateSourceSHA256()
+        guard plan.counter.sourceSHA256 == boundCounterSHA else {
+            throw benchmarkError("exact counter executable source SHA-256 drifted")
+        }
+        let measurementSHAAfter = try allRowContentFreeSHA256(
+            of: plan.measurementsURL, label: "measurement artifact"
+        )
+        guard measurementSHAAfter == boundMeasurementSHA else {
+            throw benchmarkError("measurement artifact SHA-256 drifted")
+        }
+        let contextAfter = try contextProvider()
+        try AllRowBestOfThreeHarness.validatePublicationContext(contextAfter)
+        guard contextAfter == contextAtStart else {
+            throw benchmarkError("all-row publication context drifted")
+        }
+        let checkpoint = try AllRowBestOfThreeHarness.checkpoint(
+            request: requestReport,
+            response: responseReport,
+            exactCounterSourceSHA256: boundCounterSHA,
+            measurementArtifactSHA256: boundMeasurementSHA,
+            evidenceBinding: .derivedCanonicalInputs,
+            publicationContext: contextAfter
+        )
+        return try write(output: plan.output, report: checkpoint)
+    }
+
+    private static func validate(_ report: AllRowCheckpointReport) throws {
+        guard report.schemaVersion == AllRowBestOfThreeHarness.schemaVersion else {
+            throw benchmarkError("all-row emitter requires schema 6")
+        }
+        let requestRows = report.rows.filter { $0.surface == .request }
+        let responseRows = report.rows.filter { $0.surface == .response }
+        guard requestRows.count == 24, responseRows.count == 10, report.rows.count == 34 else {
+            throw benchmarkError("all-row checkpoint requires the frozen 24-row and 10-row corpora")
+        }
+        guard requestRows.map(\.id) == frozenRequestCorpusIDs,
+              responseRows.map(\.id) == frozenResponseCorpusIDs else {
+            throw benchmarkError("all-row checkpoint requires the frozen corpus ID order")
+        }
+        guard report.billingClaim == false, report.methodology.billingClaim == false,
+              report.methodology.providerReportedTokens == false else {
+            throw benchmarkError("all-row emitter forbids billing or provider token claims")
+        }
+        guard report.methodology.quality == AllRowBestOfThreeHarness.localExactQuality,
+              report.counter.quality == AllRowBestOfThreeHarness.localExactQuality,
+              report.rows.allSatisfy({ $0.counterQuality == AllRowBestOfThreeHarness.localExactQuality }) else {
+            throw benchmarkError("all-row write requires local_exact quality")
+        }
+        for row in report.rows {
+            guard row.human.format == .human, row.rcw1.format == .rcw1, row.rcs1.format == .rcs1 else {
+                throw benchmarkError("all-row JSON+CSV must keep Human/RCW1/RCS1 visible")
+            }
+            guard row.selectedFormat.rawValue != "caveman" else {
+                throw benchmarkError("Caveman is never selected_format")
+            }
+            guard row.billingClaim == false, row.providerReportedTokens == false else {
+                throw benchmarkError("all-row emitter forbids billing or provider token claims")
+            }
+        }
+        guard report.totals.request.rows == 24, report.totals.response.rows == 10,
+              report.totals.overall.rows == 34 else {
+            throw benchmarkError("all-row checkpoint totals must cover request, response, and overall")
+        }
+        _ = try allRowRequireContentFreeSHA256(
+            report.provenance.exactCounterSourceSHA256, label: "exact counter executable"
+        )
+        _ = try allRowRequireContentFreeSHA256(
+            report.provenance.measurementArtifactSHA256, label: "measurement artifact"
+        )
+        if report.provenance.evidenceBinding == .derivedCanonicalInputs,
+           report.provenance.exactCounterSourceSHA256 == allRowUnitTestCounterSourceSHA256
+            || report.provenance.measurementArtifactSHA256 == allRowUnitTestMeasurementArtifactSHA256 {
+            throw benchmarkError("derived all-row provenance must not use unit-test-explicit digests")
+        }
+        guard report.provenance.caveman.scope == "request_benchmark_observations",
+              report.provenance.caveman.request == benchmarkPinnedCavemanProvenance else {
+            throw benchmarkError("all-row Caveman provenance must be request-benchmark observations")
+        }
+        guard responseRows.allSatisfy({ $0.cavemanSHA256 == nil && $0.cavemanTokens == nil }) else {
+            throw benchmarkError("all-row response rows must not claim Caveman ran")
+        }
+        try AllRowBestOfThreeHarness.validatePublicationContext(
+            AllRowPublicationContext(
+                remoteCodeHead: report.provenance.remoteCodeHead,
+                workspaceClean: report.provenance.workspaceClean,
+                runnerSourceSHA256: report.provenance.runnerSourceSHA256
+            )
+        )
+    }
+}
+
+private struct AllRowEmissionPlan {
+    let output: ResponseReportOutputBundle
+    let measurementsURL: URL
+    let counter: BenchmarkTokenCounter
+    let exactCounterSourceSHA256: String
+    let measurementArtifactSHA256: String
+}
+
+private struct AllRowEmissionReceipt {
+    let jsonPath: String
+    let csvPath: String
+    let exactCounterSourceSHA256: String
+    let measurementArtifactSHA256: String
+}
+
+private final class AllRowP1BPublicationContext: @unchecked Sendable {
+    var remoteCodeHead: String
+    var workspaceClean: Bool
+    var runnerSourceSHA256: String
+
+    init(remoteCodeHead: String, workspaceClean: Bool, runnerSourceSHA256: String) {
+        self.remoteCodeHead = remoteCodeHead
+        self.workspaceClean = workspaceClean
+        self.runnerSourceSHA256 = runnerSourceSHA256
+    }
+
+    func snapshot() -> AllRowPublicationContext {
+        AllRowPublicationContext(
+            remoteCodeHead: remoteCodeHead,
+            workspaceClean: workspaceClean,
+            runnerSourceSHA256: runnerSourceSHA256
+        )
+    }
+}
+
+private final class AllRowP1BEvidence: @unchecked Sendable {
+    let tokenizerURL: URL
+    let measurementsURL: URL
+    let jsonURL: URL
+    let csvURL: URL
+    let bundleURL: URL
+    let context: AllRowP1BPublicationContext
+
+    init(
+        tokenizerURL: URL,
+        measurementsURL: URL,
+        jsonURL: URL,
+        csvURL: URL,
+        bundleURL: URL,
+        context: AllRowP1BPublicationContext
+    ) {
+        self.tokenizerURL = tokenizerURL
+        self.measurementsURL = measurementsURL
+        self.jsonURL = jsonURL
+        self.csvURL = csvURL
+        self.bundleURL = bundleURL
+        self.context = context
+    }
+}
+
+private final class AllRowOnceHook: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+    private let hook: () throws -> Void
+
+    init(_ hook: @escaping () throws -> Void) {
+        self.hook = hook
+    }
+
+    func fire() throws {
+        lock.lock()
+        let shouldRun = !fired
+        if shouldRun { fired = true }
+        lock.unlock()
+        if shouldRun { try hook() }
+    }
+}
+
+private struct AllRowPathInspection: Equatable {
+    let raw: String
+    let canonical: String
+    let exists: Bool
+    let device: dev_t
+    let inode: ino_t
+    let caseSensitive: Bool
+}
+
+private func allRowNonempty(_ value: String?) -> String? {
+    let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return trimmed.isEmpty ? nil : trimmed
+}
+
+private func allRowJSONData(_ report: AllRowCheckpointReport) throws -> Data {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    return try encoder.encode(report)
+}
+
+private func allRowInspectPath(
+    _ path: String,
+    mustExist: Bool,
+    label: String
+) throws -> AllRowPathInspection {
+    guard !path.contains("\0"), path.hasPrefix("/") else {
+        throw benchmarkError("all-row \(label) must be an absolute path")
+    }
+    let standardized = URL(fileURLWithPath: path).standardizedFileURL
+    var linkStatus = stat()
+    if lstat(standardized.path, &linkStatus) == 0, (linkStatus.st_mode & S_IFMT) == S_IFLNK {
+        throw benchmarkError("all-row \(label) must not be a symlink")
+    }
+    if mustExist {
+        guard FileManager.default.fileExists(atPath: standardized.path) else {
+            throw benchmarkError("all-row \(label) does not exist")
+        }
+        guard let resolved = realpath(standardized.path, nil) else {
+            throw benchmarkError("all-row \(label) cannot be resolved")
+        }
+        defer { free(resolved) }
+        let canonical = String(cString: resolved)
+        var status = stat()
+        guard lstat(canonical, &status) == 0, (status.st_mode & S_IFMT) != S_IFLNK else {
+            throw benchmarkError("all-row \(label) must not be a symlink")
+        }
+        return AllRowPathInspection(
+            raw: path,
+            canonical: canonical,
+            exists: true,
+            device: status.st_dev,
+            inode: status.st_ino,
+            caseSensitive: allRowPathIsCaseSensitive(canonical)
+        )
+    }
+    let bundle = standardized.deletingLastPathComponent()
+    let ancestor = bundle.deletingLastPathComponent()
+    guard let resolvedAncestor = realpath(ancestor.path, nil) else {
+        throw benchmarkError("all-row \(label) ancestor cannot be resolved")
+    }
+    defer { free(resolvedAncestor) }
+    let ancestorPath = String(cString: resolvedAncestor)
+    var ancestorLink = stat()
+    if lstat(ancestorPath, &ancestorLink) == 0, (ancestorLink.st_mode & S_IFMT) == S_IFLNK {
+        throw benchmarkError("all-row \(label) must not be a symlink")
+    }
+    let canonical = URL(fileURLWithPath: ancestorPath)
+        .appendingPathComponent(bundle.lastPathComponent)
+        .appendingPathComponent(standardized.lastPathComponent).path
+    var existing = stat()
+    let exists = lstat(canonical, &existing) == 0
+    if exists, (existing.st_mode & S_IFMT) == S_IFLNK {
+        throw benchmarkError("all-row \(label) must not be a symlink")
+    }
+    return AllRowPathInspection(
+        raw: path,
+        canonical: canonical,
+        exists: exists,
+        device: exists ? existing.st_dev : 0,
+        inode: exists ? existing.st_ino : 0,
+        caseSensitive: allRowPathIsCaseSensitive(ancestorPath)
+    )
+}
+
+private func allRowPathIsCaseSensitive(_ path: String) -> Bool {
+    let fd = Darwin.open(path, O_RDONLY | O_CLOEXEC)
+    guard fd >= 0 else { return true }
+    defer { _ = Darwin.close(fd) }
+    return Darwin.fpathconf(fd, _PC_CASE_SENSITIVE) == 1
+}
+
+private func allRowRejectAliasOrOverlap(_ items: [(String, AllRowPathInspection)]) throws {
+    for index in items.indices {
+        for other in (index + 1)..<items.count {
+            if allRowSamePath(items[index].1, items[other].1) {
+                throw benchmarkError(
+                    "all-row \(items[index].0) aliases or overlaps \(items[other].0)"
+                )
+            }
+        }
+    }
+}
+
+private func allRowSamePath(_ lhs: AllRowPathInspection, _ rhs: AllRowPathInspection) -> Bool {
+    if lhs.exists, rhs.exists, lhs.device == rhs.device, lhs.inode == rhs.inode {
+        return true
+    }
+    let sensitive = lhs.caseSensitive && rhs.caseSensitive
+    if sensitive {
+        return lhs.canonical == rhs.canonical
+    }
+    return lhs.canonical.folding(options: [.caseInsensitive], locale: nil)
+        == rhs.canonical.folding(options: [.caseInsensitive], locale: nil)
 }
