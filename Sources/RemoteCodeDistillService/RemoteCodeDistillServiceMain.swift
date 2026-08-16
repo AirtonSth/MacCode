@@ -211,6 +211,11 @@ struct RemoteCodeDistillServiceMain {
             await runMCP()
             return
         }
+        if programName == "rc-computer-use-mcp"
+            || rawArgs.dropFirst().first == ComputerUseHostQueue.cliArgument {
+            await runComputerUseMCP()
+            return
+        }
         // Nested provider PATH controller: invoked via managed symlinks
         // (~/.remote-code/bin/{grok,claude,codex}) or explicit `provider-proxy <name> …`.
         // Records content-free Subagents receipts and execs the real CLI outside managed bin.
@@ -683,6 +688,16 @@ struct RemoteCodeDistillServiceMain {
             },
             scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment)
         )
+        while let line = readLine(strippingNewline: true) {
+            if let response = await server.handle(line) {
+                FileHandle.standardOutput.write(Data((response + "\n").utf8))
+            }
+        }
+    }
+
+    /// RemoteCode-owned computer-use MCP (stdio). HID calls share ComputerUseHostQueue.
+    private static func runComputerUseMCP() async {
+        let server = ManagedComputerUseMCP()
         while let line = readLine(strippingNewline: true) {
             if let response = await server.handle(line) {
                 FileHandle.standardOutput.write(Data((response + "\n").utf8))

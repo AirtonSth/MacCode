@@ -1006,6 +1006,7 @@ public final class AppContext {
         // XCTest isolated unless a sandboxed skills home was injected explicitly.
         if !AppContext.isRunningUnitTests || agentSkillsHomeOverrideForTesting != nil {
             reconcileRemoteCodeOrchestrate()
+            reconcileComputerUseMCP()
         }
         // Managed Distill is app-private (Application Support/AgentSkills/distill) and
         // injected at runtime — never written into ~/.claude/skills or ~/.codex/skills.
@@ -1927,6 +1928,13 @@ public final class AppContext {
                     "RemoteCode: ensureDistillCLI before agent turn failed: \(error.localizedDescription)"
                 )
             }
+            do {
+                try installer.installComputerUseMCP()
+            } catch {
+                NSLog(
+                    "RemoteCode: installComputerUseMCP before agent turn failed: \(error.localizedDescription)"
+                )
+            }
             let managedBin = installer.managedCLIBinURL.path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
@@ -2021,6 +2029,13 @@ public final class AppContext {
                     "RemoteCode: ensureDistillCLI before subagent env failed: \(error.localizedDescription)"
                 )
             }
+        }
+        do {
+            try installer.installComputerUseMCP()
+        } catch {
+            NSLog(
+                "RemoteCode: installComputerUseMCP before subagent env failed: \(error.localizedDescription)"
+            )
         }
         let managedBin = installer.managedCLIBinURL.path
         let basePath = environment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
@@ -2487,6 +2502,15 @@ public final class AppContext {
             NSLog("RemoteCode managed Distill reconcile incomplete: \(failure)")
         }
         return failure
+    }
+
+    func reconcileComputerUseMCP() {
+        let installer = makeAgentSkillInstaller()
+        do {
+            try installer.installComputerUseMCP()
+        } catch {
+            NSLog("RemoteCode: installComputerUseMCP failed: \(error.localizedDescription)")
+        }
     }
 
     private func makeAgentSkillInstaller() -> AgentSkillInstaller {

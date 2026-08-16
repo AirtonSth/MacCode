@@ -600,8 +600,22 @@ public final class GrokACPClient: @unchecked Sendable {
         return try GrokACPInitializeResult.parse(result)
     }
 
+    public static func sessionMCPServers(
+        existing: [Any] = [],
+        command: String? = nil
+    ) -> [Any] {
+        let resolved = command
+            ?? AgentSkillInstaller.resolveServiceBinary()?.path
+            ?? ComputerUseMCPAdmit.fallbackCommand
+        return ComputerUseMCPAdmit.admitGrokACP(existing: existing, command: resolved)
+    }
+
     func newSession(cwd: String) async throws -> GrokACPSessionOpenResult {
-        let result = try await requestJSONObject(method: "session/new", params: ["cwd": cwd, "mcpServers": []], timeout: 20)
+        let result = try await requestJSONObject(
+            method: "session/new",
+            params: ["cwd": cwd, "mcpServers": Self.sessionMCPServers()],
+            timeout: 20
+        )
         return try Self.openResult(result, fallbackSessionId: nil)
     }
 
@@ -613,7 +627,11 @@ public final class GrokACPClient: @unchecked Sendable {
         cwd: String,
         noReplay: Bool = false
     ) async throws -> GrokACPSessionOpenResult {
-        var params: JSONObject = ["sessionId": sessionId, "cwd": cwd, "mcpServers": []]
+        var params: JSONObject = [
+            "sessionId": sessionId,
+            "cwd": cwd,
+            "mcpServers": Self.sessionMCPServers(),
+        ]
         if noReplay {
             params["_meta"] = ["noReplay": true]
         }

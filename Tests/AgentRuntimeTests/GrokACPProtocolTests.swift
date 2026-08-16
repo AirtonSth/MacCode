@@ -1295,6 +1295,7 @@ final class GrokACPProtocolTests: XCTestCase {
             contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPClient.swift"),
             encoding: .utf8
         )
+        XCTAssertTrue(clientSource.contains("sessionMCPServers"), "Grok session/new and session/load must admit computer-use MCP")
         XCTAssertTrue(clientSource.contains("noReplay"), "loadSession must accept noReplay")
         XCTAssertTrue(
             clientSource.contains("\"noReplay\": true") || clientSource.contains("[\"noReplay\": true]"),
