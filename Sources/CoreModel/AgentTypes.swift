@@ -588,6 +588,10 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     /// Runtime-only queue dispatch gate. Intentionally excluded from Codable and
     /// value equality; it has no meaning outside the current host process.
     public var acceptancePermit: AgentRunAcceptancePermit?
+    /// Canonical prior conversation captured before provider start. Runtime-only.
+    public var contextSnapshot: TokenSaverCanonicalConversationSnapshot?
+    /// Prepared RCSEED1 document for a confirmed fresh-fallback destination.
+    public var preparedContextSeed: TokenSaverPreparedContextSeed?
 
     public init(
         runId: AgentRunID = AgentRunID(),
@@ -608,7 +612,9 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         environment: [String: String] = [:],
         extraArgs: [String] = [],
         runAsUser: AgentRunAsUser? = nil,
-        acceptancePermit: AgentRunAcceptancePermit? = nil
+        acceptancePermit: AgentRunAcceptancePermit? = nil,
+        contextSnapshot: TokenSaverCanonicalConversationSnapshot? = nil,
+        preparedContextSeed: TokenSaverPreparedContextSeed? = nil
     ) {
         self.runId = runId
         self.threadId = threadId
@@ -629,6 +635,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         self.extraArgs = extraArgs
         self.runAsUser = runAsUser
         self.acceptancePermit = acceptancePermit
+        self.contextSnapshot = contextSnapshot
+        self.preparedContextSeed = preparedContextSeed
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -681,6 +689,20 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
 
     public var providerPrompt: String {
         AgentProviderInstructionText.providerPrompt(for: interactionMode, prompt: prompt)
+    }
+
+    public func attachingContext(
+        snapshot: TokenSaverCanonicalConversationSnapshot? = nil,
+        seed: TokenSaverPreparedContextSeed? = nil
+    ) -> AgentRunRequest {
+        var copy = self
+        if let snapshot {
+            copy.contextSnapshot = snapshot
+        }
+        if let seed {
+            copy.preparedContextSeed = seed
+        }
+        return copy
     }
 }
 

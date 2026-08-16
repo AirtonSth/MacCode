@@ -26,8 +26,10 @@ public enum Schema {
     /// requests, v68 owns durable RCW1 assistant responses, v69 owns
     /// per-message Human/RCW1 display preferences, v70 owns the Bot
     /// control-plane identity tables, v71 owns per-Bot skill enablement,
-    /// and v72 owns content-free request-selection receipts.
-    public static let currentVersion: Int = 72
+    /// and v72 owns content-free request-selection receipts, and v73 admits
+    /// winner selected_format rcs1, and v74 owns content-free context-slot
+    /// selection receipts for fresh-fallback seeds.
+    public static let currentVersion: Int = 74
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1427,6 +1429,242 @@ public enum Schema {
             PRIMARY KEY(run_id, format),
             FOREIGN KEY(run_id) REFERENCES token_saver_run_winner_receipts(run_id)
                 ON DELETE CASCADE
+        );
+        """),
+        // Admit winner selected_format rcs1. SQLite cannot alter a CHECK, so
+        // rebuild both receipt tables inside the migrator transaction and copy
+        // every existing row first.
+        SchemaStep(73, """
+        CREATE TABLE token_saver_run_winner_receipts_v73 (
+            run_id TEXT PRIMARY KEY NOT NULL,
+            thread_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            resolved_model TEXT NOT NULL,
+            selected_format TEXT NOT NULL CHECK(selected_format IN ('human', 'rcw1', 'rcs1')),
+            reason TEXT NOT NULL CHECK(reason IN (
+                'unique_strict_minimum',
+                'human_lowest_cost',
+                'tie',
+                'no_eligible_optimized_candidate',
+                'counter_unavailable',
+                'counter_uncertain',
+                'counter_error',
+                'counter_binding_mismatch',
+                'candidate_error',
+                'candidate_unknown',
+                'invalid_measurement'
+            )),
+            modeled_context_delta INTEGER NOT NULL CHECK(modeled_context_delta >= 0),
+            counter_id TEXT,
+            counter_revision TEXT,
+            encoding TEXT,
+            counter_status TEXT NOT NULL CHECK(counter_status IN (
+                'exact_local_tokenizer',
+                'exact_resolved_model_tokenizer',
+                'unavailable',
+                'uncertain',
+                'error',
+                'binding_mismatch'
+            )),
+            lifecycle TEXT NOT NULL CHECK(lifecycle IN (
+                'provisional',
+                'delivered',
+                'not_delivered',
+                'delivery_unknown'
+            )),
+            billing_claim INTEGER NOT NULL CHECK(billing_claim = 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE,
+            CHECK(
+                (
+                    counter_status IN (
+                        'exact_local_tokenizer',
+                        'exact_resolved_model_tokenizer'
+                    )
+                    AND counter_id IS NOT NULL
+                    AND counter_revision IS NOT NULL
+                    AND encoding IS NOT NULL
+                )
+                OR
+                (
+                    counter_status NOT IN (
+                        'exact_local_tokenizer',
+                        'exact_resolved_model_tokenizer'
+                    )
+                    AND counter_id IS NULL
+                    AND counter_revision IS NULL
+                    AND encoding IS NULL
+                )
+            )
+        );
+        INSERT INTO token_saver_run_winner_receipts_v73
+        SELECT
+            run_id, thread_id, provider, resolved_model, selected_format, reason,
+            modeled_context_delta, counter_id, counter_revision, encoding,
+            counter_status, lifecycle, billing_claim, created_at, updated_at
+        FROM token_saver_run_winner_receipts;
+        CREATE TABLE token_saver_run_arm_receipts_v73 (
+            run_id TEXT NOT NULL,
+            format TEXT NOT NULL CHECK(format IN ('human', 'rcw1', 'rcs1')),
+            source_bound INTEGER NOT NULL CHECK(source_bound IN (0, 1)),
+            producer_id TEXT NOT NULL,
+            producer_revision TEXT NOT NULL,
+            abi_revision TEXT NOT NULL,
+            generation TEXT NOT NULL CHECK(generation IN ('passed', 'failed', 'unknown', 'not_required')),
+            structural TEXT NOT NULL CHECK(structural IN ('passed', 'failed', 'unknown', 'not_required')),
+            semantic TEXT NOT NULL CHECK(semantic IN ('passed', 'failed', 'unknown', 'not_required')),
+            recovery TEXT NOT NULL CHECK(recovery IN ('passed', 'failed', 'unknown', 'not_required')),
+            projection TEXT NOT NULL CHECK(projection IN ('projected', 'not_projected', 'unknown')),
+            availability TEXT NOT NULL CHECK(availability IN ('available', 'unavailable', 'unknown')),
+            eligible INTEGER NOT NULL CHECK(eligible IN (0, 1)),
+            proven_effective_count INTEGER
+                CHECK(proven_effective_count IS NULL OR proven_effective_count >= 0),
+            PRIMARY KEY(run_id, format),
+            FOREIGN KEY(run_id) REFERENCES token_saver_run_winner_receipts_v73(run_id)
+                ON DELETE CASCADE
+        );
+        INSERT INTO token_saver_run_arm_receipts_v73
+        SELECT
+            run_id, format, source_bound, producer_id, producer_revision,
+            abi_revision, generation, structural, semantic, recovery,
+            projection, availability, eligible, proven_effective_count
+        FROM token_saver_run_arm_receipts;
+        DROP TABLE token_saver_run_arm_receipts;
+        DROP TABLE token_saver_run_winner_receipts;
+        ALTER TABLE token_saver_run_winner_receipts_v73 RENAME TO token_saver_run_winner_receipts;
+        ALTER TABLE token_saver_run_arm_receipts_v73 RENAME TO token_saver_run_arm_receipts;
+        CREATE INDEX IF NOT EXISTS idx_token_saver_run_winner_receipts_thread
+            ON token_saver_run_winner_receipts(thread_id);
+        CREATE INDEX IF NOT EXISTS idx_token_saver_run_winner_receipts_provisional
+            ON token_saver_run_winner_receipts(lifecycle)
+            WHERE lifecycle = 'provisional';
+        """),
+        // Content-free context-slot receipts for one fresh-fallback seed.
+        // Identity is (run, destination provider thread, snapshot digest,
+        // source message, ordinal). Rows never store payload/handle/ABI.
+        SchemaStep(74, """
+        CREATE TABLE IF NOT EXISTS token_saver_context_slot_receipts (
+            run_id TEXT NOT NULL,
+            destination_provider_thread_id TEXT NOT NULL,
+            snapshot_digest TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            provider TEXT NOT NULL,
+            resolved_model TEXT NOT NULL,
+            selected_format TEXT NOT NULL CHECK(selected_format IN ('human', 'rcw1', 'rcs1')),
+            reason TEXT NOT NULL CHECK(reason IN (
+                'unique_strict_minimum',
+                'human_lowest_cost',
+                'tie',
+                'no_eligible_optimized_candidate',
+                'counter_unavailable',
+                'counter_uncertain',
+                'counter_error',
+                'counter_binding_mismatch',
+                'candidate_error',
+                'candidate_unknown',
+                'invalid_measurement'
+            )),
+            modeled_context_delta INTEGER NOT NULL CHECK(modeled_context_delta >= 0),
+            counter_id TEXT,
+            counter_revision TEXT,
+            encoding TEXT,
+            counter_status TEXT NOT NULL CHECK(counter_status IN (
+                'exact_local_tokenizer',
+                'exact_resolved_model_tokenizer',
+                'unavailable',
+                'uncertain',
+                'error',
+                'binding_mismatch'
+            )),
+            lifecycle TEXT NOT NULL CHECK(lifecycle IN (
+                'provisional',
+                'delivered',
+                'not_delivered',
+                'delivery_unknown'
+            )),
+            billing_claim INTEGER NOT NULL CHECK(billing_claim = 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(
+                run_id,
+                destination_provider_thread_id,
+                snapshot_digest,
+                source_message_id,
+                ordinal
+            ),
+            FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE,
+            CHECK(
+                (
+                    counter_status IN (
+                        'exact_local_tokenizer',
+                        'exact_resolved_model_tokenizer'
+                    )
+                    AND counter_id IS NOT NULL
+                    AND counter_revision IS NOT NULL
+                    AND encoding IS NOT NULL
+                )
+                OR
+                (
+                    counter_status NOT IN (
+                        'exact_local_tokenizer',
+                        'exact_resolved_model_tokenizer'
+                    )
+                    AND counter_id IS NULL
+                    AND counter_revision IS NULL
+                    AND encoding IS NULL
+                )
+            )
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_context_slot_receipts_run
+            ON token_saver_context_slot_receipts(run_id);
+        CREATE INDEX IF NOT EXISTS idx_token_saver_context_slot_receipts_provisional
+            ON token_saver_context_slot_receipts(lifecycle)
+            WHERE lifecycle = 'provisional';
+        CREATE TABLE IF NOT EXISTS token_saver_context_slot_arm_receipts (
+            run_id TEXT NOT NULL,
+            destination_provider_thread_id TEXT NOT NULL,
+            snapshot_digest TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            format TEXT NOT NULL CHECK(format IN ('human', 'rcw1', 'rcs1')),
+            source_bound INTEGER NOT NULL CHECK(source_bound IN (0, 1)),
+            producer_id TEXT NOT NULL,
+            producer_revision TEXT NOT NULL,
+            abi_revision TEXT NOT NULL,
+            generation TEXT NOT NULL CHECK(generation IN ('passed', 'failed', 'unknown', 'not_required')),
+            structural TEXT NOT NULL CHECK(structural IN ('passed', 'failed', 'unknown', 'not_required')),
+            semantic TEXT NOT NULL CHECK(semantic IN ('passed', 'failed', 'unknown', 'not_required')),
+            recovery TEXT NOT NULL CHECK(recovery IN ('passed', 'failed', 'unknown', 'not_required')),
+            projection TEXT NOT NULL CHECK(projection IN ('projected', 'not_projected', 'unknown')),
+            availability TEXT NOT NULL CHECK(availability IN ('available', 'unavailable', 'unknown')),
+            eligible INTEGER NOT NULL CHECK(eligible IN (0, 1)),
+            proven_effective_count INTEGER
+                CHECK(proven_effective_count IS NULL OR proven_effective_count >= 0),
+            PRIMARY KEY(
+                run_id,
+                destination_provider_thread_id,
+                snapshot_digest,
+                source_message_id,
+                ordinal,
+                format
+            ),
+            FOREIGN KEY(
+                run_id,
+                destination_provider_thread_id,
+                snapshot_digest,
+                source_message_id,
+                ordinal
+            ) REFERENCES token_saver_context_slot_receipts(
+                run_id,
+                destination_provider_thread_id,
+                snapshot_digest,
+                source_message_id,
+                ordinal
+            ) ON DELETE CASCADE
         );
         """),
     ]

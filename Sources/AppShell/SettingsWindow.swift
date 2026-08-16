@@ -1162,7 +1162,7 @@ public final class SettingsViewModel: ObservableObject {
         }
         switch provider {
         case .codex:
-            context.coordinator.replaceProviderAdapter(.codex, adapter: CodexAppServerAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
+            context.replaceCodexProviderAdapter(CodexAppServerAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
         case .claude:
             let engine = ClaudeEnginePolicy.resolve(
                 setting: (try? settingsRepo.get(ClaudeEnginePolicy.settingsKey)).flatMap { $0 },

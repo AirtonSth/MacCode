@@ -3052,6 +3052,22 @@ final class TokenSaverAppContextTests: XCTestCase {
             ),
             "experimental lanes default DISABLED"
         )
+        XCTAssertFalse(TokenSaverLaneKillSwitch.knownStableLanes.contains("compact-span"))
+        XCTAssertTrue(
+            TokenSaverLaneKillSwitch.isDisabled(
+                "compact-span",
+                environment: [:],
+                cliState: .empty
+            ),
+            "compact-span stays experimental and disabled by default"
+        )
+        XCTAssertFalse(
+            TokenSaverLaneKillSwitch.isDisabled(
+                "compact-span",
+                environment: [TokenSaverLaneKillSwitch.enabledEnvKey: "compact-span"],
+                cliState: .empty
+            )
+        )
         XCTAssertFalse(
             TokenSaverLaneKillSwitch.isDisabled(
                 "deterministic_wrapper",

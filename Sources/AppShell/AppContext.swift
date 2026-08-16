@@ -353,6 +353,7 @@ public final class AppContext {
     public var state = LayoutState()
 
     public let coordinator: AgentRunCoordinator
+    private var tokenSaverCodexAdapter: CodexAppServerAdapter
     public var router: AppCommandRouter! {
         didSet {
             drainRecoveredForkPrunedThreadIDsIfPossible()
@@ -856,6 +857,7 @@ public final class AppContext {
             appSupportDirectory: self.appSupportDirectory
         )
         let codex = CodexAppServerAdapter(binaryNameOverride: try? settingsRepo.get("cli.codex.path"))
+        self.tokenSaverCodexAdapter = codex
         let configuredClaudeBinary = try? settingsRepo.get("cli.claude.path")
         let claudeEngine = ClaudeEnginePolicy.resolve(
             setting: (try? settingsRepo.get(ClaudeEnginePolicy.settingsKey)).flatMap { $0 },
@@ -886,6 +888,9 @@ public final class AppContext {
         // plan-final W0: durable terminal ledger write-before-UI (diagnostics dir).
         let diagnosticsDir = self.appSupportDirectory.appendingPathComponent("diagnostics", isDirectory: true)
         self.coordinator.terminalTransitionLedger = TerminalTransitionLedger(directory: diagnosticsDir)
+        self.coordinator.tokenSaverContextSeedPreparer = TokenSaverHumanContextSeedPreparer()
+        self.tokenSaverCodexAdapter.contextSeedPreparer = self.coordinator.tokenSaverContextSeedPreparer
+        self.tokenSaverCodexAdapter.contextSeedReceipts = self.runRepo.contextSelectionReceipts()
         contextReference.value = self
         let liveActivitySyncCoordinator = self.liveActivitySyncCoordinator
         coordinator.onActiveRunProjectionChanged = { [weak contextReference] projection, cause in
@@ -1529,6 +1534,18 @@ public final class AppContext {
         if let snap = try snapshotRepo.latest() {
             self.state = snap.layout
         }
+    }
+
+    /// Settings CLI-path commits replace the live Codex adapter through this owner.
+    func replaceCodexProviderAdapter(_ adapter: CodexAppServerAdapter) {
+        applyContextSeedHooks(to: adapter)
+        tokenSaverCodexAdapter = adapter
+        coordinator.replaceProviderAdapter(.codex, adapter: adapter)
+    }
+
+    private func applyContextSeedHooks(to adapter: CodexAppServerAdapter) {
+        adapter.contextSeedPreparer = coordinator.tokenSaverContextSeedPreparer
+        adapter.contextSeedReceipts = runRepo.contextSelectionReceipts()
     }
 
     deinit {
@@ -3094,10 +3111,61 @@ public final class AppContext {
                 }
                 return await self.selectTokenSaverOutbound(request)
             }
+            coordinator.tokenSaverContextSeedPreparer = self.makeContextSeedPreparer()
+            applyContextSeedHooks(to: tokenSaverCodexAdapter)
             return true
         }
         coordinator.tokenSaverOutboundSelector = nil
+        coordinator.tokenSaverContextSeedPreparer = TokenSaverHumanContextSeedPreparer()
+        applyContextSeedHooks(to: tokenSaverCodexAdapter)
         return false
+    }
+
+    private func makeContextSeedPreparer() -> TokenSaverContextSeedPreparing {
+        guard let capability = snapshotTokenSaverExactRuntimeCapability() else {
+            return TokenSaverHumanContextSeedPreparer()
+        }
+        let compactSpanLaneURL = tokenSaverDistillCLIStateURL
+        return TokenSaverExactContextSeedPreparer(
+            target: capability.target,
+            counter: capability.counterCapability,
+            project: { format, payload in
+                if format == .rcs1,
+                   TokenSaverLaneKillSwitch.isDisabled(
+                    "compact-span",
+                    environment: ProcessInfo.processInfo.environment,
+                    cliState: TokenSaverLaneKillSwitch.loadCLIStateOverlay(from: compactSpanLaneURL)
+                   ) {
+                    return nil
+                }
+                guard let envelope = capability.projectEnvelope(
+                    format,
+                    payload,
+                    TokenSaverOutboundSelectionRequest(
+                        canonicalHuman: payload,
+                        admittedRequest: AgentRunRequest(
+                            threadId: AgentThreadID(),
+                            provider: .codex,
+                            model: capability.target.resolvedModel,
+                            cwd: "/",
+                            prompt: payload
+                        ),
+                        autoRoute: nil,
+                        admittedEnvironment: TokenSaverOutboundSelectionRequest.environment(
+                            [:],
+                            for: format
+                        )
+                    )
+                ) else {
+                    return nil
+                }
+                return TokenSaverContextSeedBuilder.ProjectedEnvelope(
+                    payload: envelope.payload,
+                    abi: envelope.abi,
+                    effectiveEnvelope: envelope.effectiveEnvelope
+                )
+            }
+        )
     }
 
     private func snapshotTokenSaverExactRuntimeCapability() -> TokenSaverExactRuntimeCapability? {
@@ -3115,6 +3183,9 @@ public final class AppContext {
             target: TokenSaverBestOfThreeSelector.Target,
             humanEnvelope: String,
             rcw1: TokenSaverBestOfThreeSelector.Candidate,
+            rcs1: TokenSaverBestOfThreeSelector.Candidate = TokenSaverExactRuntimeSupport.disabledRCS1Candidate(
+                sourceSHA256: sourceSHA256
+            ),
             counter: TokenSaverBestOfThreeSelector.CounterCapability?
         ) async -> TokenSaverBestOfThreeSelector.Decision {
             await TokenSaverBestOfThreeSelector.select(
@@ -3122,10 +3193,7 @@ public final class AppContext {
                 humanOutboundPrompt: humanOutbound,
                 humanEffectiveEnvelope: humanEnvelope,
                 target: target,
-                candidates: [
-                    rcw1,
-                    TokenSaverExactRuntimeSupport.disabledRCS1Candidate(sourceSHA256: sourceSHA256),
-                ],
+                candidates: [rcw1, rcs1],
                 counter: counter
             )
         }
@@ -3191,6 +3259,7 @@ public final class AppContext {
             return await contentFreeHuman()
         }
 
+        let compactSpanEnabled = !tokenSaverLaneIsDisabled("compact-span")
         var provisional: TokenSaverProvisionalRCW1Recovery?
         var rcw1 = TokenSaverExactRuntimeSupport.disabledRCW1Candidate(sourceSHA256: sourceSHA256)
         let rcw1Environment = request.environment(for: .rcw1)
@@ -3236,10 +3305,36 @@ public final class AppContext {
             }
         }
 
+        var rcs1 = TokenSaverExactRuntimeSupport.disabledRCS1Candidate(sourceSHA256: sourceSHA256)
+        if compactSpanEnabled,
+           canonical == humanOutbound,
+           let item = RemoteCodeCompactSpan.encode(canonical),
+           let recovered = RemoteCodeCompactSpan.decode(item),
+           recovered == canonical,
+           let projected = capability.projectEnvelope(.rcs1, item, request),
+           RemoteCodeCompactSpan.decode(projected.payload) == canonical {
+            rcs1 = TokenSaverBestOfThreeSelector.Candidate(
+                format: .rcs1,
+                sourceSHA256: sourceSHA256,
+                payload: projected.payload,
+                abi: projected.abi,
+                effectiveEnvelope: projected.effectiveEnvelope,
+                handle: nil,
+                producerID: TokenSaverRequestSelectionReceipt.rcs1ProducerID,
+                producerRevision: "1",
+                abiRevision: "1",
+                generation: .passed,
+                structural: .passed,
+                semantic: .passed,
+                recovery: .passed
+            )
+        }
+
         let decision = await decide(
             target: requestTarget,
             humanEnvelope: humanProjection.effectiveEnvelope,
             rcw1: rcw1,
+            rcs1: rcs1,
             counter: capability.counterCapability
         )
         if decision.selectedFormat == .rcw1, let provisional {

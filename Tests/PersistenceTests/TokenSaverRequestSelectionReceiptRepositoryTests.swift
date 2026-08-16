@@ -39,14 +39,21 @@ final class TokenSaverRequestSelectionReceiptRepositoryTests: XCTestCase {
             XCTAssertEqual(record.arms.map(\.format), TokenSaverBestOfThreeSelector.Format.allCases)
             XCTAssertEqual(record.arms.count, 3)
             XCTAssertTrue(
-                record.winner.selectedFormat == .human || record.winner.selectedFormat == .rcw1
+                record.winner.selectedFormat == .human
+                    || record.winner.selectedFormat == .rcw1
+                    || record.winner.selectedFormat == .rcs1
             )
             XCTAssertFalse(record.winner.billingClaim)
             let rcs1 = try XCTUnwrap(record.arm(.rcs1))
-            XCTAssertEqual(rcs1.producerId, TokenSaverRequestSelectionReceipt.rcs1UnavailableProducerID)
-            XCTAssertEqual(rcs1.availability, .unavailable)
-            XCTAssertFalse(rcs1.eligible)
-            XCTAssertNil(rcs1.provenEffectiveCount)
+            XCTAssertEqual(rcs1.producerId, TokenSaverRequestSelectionReceipt.rcs1ProducerID)
+            XCTAssertEqual(rcs1.availability, .available)
+            XCTAssertTrue(rcs1.sourceBound)
+            XCTAssertEqual(rcs1.generation, .passed)
+            XCTAssertEqual(rcs1.structural, .passed)
+            XCTAssertEqual(rcs1.semantic, .passed)
+            XCTAssertEqual(rcs1.recovery, .passed)
+            XCTAssertTrue(rcs1.eligible)
+            XCTAssertNotNil(rcs1.provenEffectiveCount)
         }
 
         XCTAssertEqual(rcw1.record.winner.selectedFormat, .rcw1)
@@ -89,19 +96,69 @@ final class TokenSaverRequestSelectionReceiptRepositoryTests: XCTestCase {
         XCTAssertEqual(try scalar(db, "SELECT COUNT(*) FROM token_saver_savings;"), 0)
     }
 
-    func test_rcs1SelectorWinnerIsPersistedAsUnavailableNonselectableArm() async throws {
+    func test_rcs1SelectorWinnerIsPersistedAsSelectedFormatWithoutCoercion() async throws {
         let db = try makeDB()
         let repo = TokenSaverRequestSelectionReceiptRepository(db: db)
         let persisted = try await persistRealDecision(db: db, repo: repo, winner: .rcs1)
         XCTAssertEqual(persisted.decision.selectedFormat, .rcs1)
-        XCTAssertEqual(persisted.record.winner.selectedFormat, .human)
-        XCTAssertEqual(persisted.record.winner.reason, .candidateError)
-        XCTAssertEqual(persisted.record.winner.modeledContextDelta, 0)
+        XCTAssertEqual(persisted.record.winner.selectedFormat, .rcs1)
+        XCTAssertEqual(persisted.record.winner.reason, .uniqueStrictMinimum)
+        XCTAssertEqual(persisted.record.winner.modeledContextDelta, 70)
+        XCTAssertFalse(persisted.record.winner.billingClaim)
         let rcs1 = try XCTUnwrap(persisted.record.arm(.rcs1))
-        XCTAssertEqual(rcs1.producerId, TokenSaverRequestSelectionReceipt.rcs1UnavailableProducerID)
-        XCTAssertEqual(rcs1.availability, .unavailable)
-        XCTAssertFalse(rcs1.eligible)
-        XCTAssertNil(rcs1.provenEffectiveCount)
+        XCTAssertEqual(rcs1.producerId, TokenSaverRequestSelectionReceipt.rcs1ProducerID)
+        XCTAssertEqual(rcs1.availability, .available)
+        XCTAssertTrue(rcs1.eligible)
+        XCTAssertEqual(rcs1.provenEffectiveCount, 30)
+        XCTAssertEqual(rcs1.generation, .passed)
+        XCTAssertEqual(rcs1.structural, .passed)
+        XCTAssertEqual(rcs1.semantic, .passed)
+        XCTAssertEqual(rcs1.recovery, .passed)
+    }
+
+    func test_rcs1WinnerLifecycleAndContentFreeJSON() async throws {
+        let db = try makeDB()
+        let repo = TokenSaverRequestSelectionReceiptRepository(db: db)
+        let persisted = try await persistRealDecision(db: db, repo: repo, winner: .rcs1)
+        XCTAssertEqual(persisted.record.winner.lifecycle, .provisional)
+        try repo.acknowledgeBatch([
+            TokenSaverRequestSelectionLifecycleAck(
+                runId: persisted.run.id.value.uuidString,
+                lifecycle: .delivered
+            )
+        ])
+        XCTAssertEqual(try repo.load(runId: persisted.run.id)?.winner.lifecycle, .delivered)
+
+        let notDelivered = try await persistRealDecision(db: db, repo: repo, winner: .rcs1)
+        try repo.acknowledgeBatch([
+            TokenSaverRequestSelectionLifecycleAck(
+                runId: notDelivered.run.id.value.uuidString,
+                lifecycle: .notDelivered
+            )
+        ])
+        XCTAssertEqual(try repo.load(runId: notDelivered.run.id)?.winner.lifecycle, .notDelivered)
+
+        let unknown = try await persistRealDecision(db: db, repo: repo, winner: .rcs1)
+        try repo.acknowledgeBatch([
+            TokenSaverRequestSelectionLifecycleAck(
+                runId: unknown.run.id.value.uuidString,
+                lifecycle: .deliveryUnknown
+            )
+        ])
+        XCTAssertEqual(try repo.load(runId: unknown.run.id)?.winner.lifecycle, .deliveryUnknown)
+
+        let report = try repo.report()
+        let encoded = String(
+            data: try TokenSaverRequestSelectionReceipt.encodeReport(report),
+            encoding: .utf8
+        )
+        let json = try XCTUnwrap(encoded)
+        XCTAssertTrue(json.contains("\"rcs1\""))
+        XCTAssertFalse(json.contains(human))
+        XCTAssertFalse(json.contains(rcs1Payload))
+        XCTAssertFalse(json.contains("RCS1 ABI"))
+        XCTAssertFalse(json.contains("selectedPayload"))
+        XCTAssertTrue(report.records.allSatisfy { !$0.winner.billingClaim })
     }
 
     func test_billingClaimIsForcedZeroRegardlessOfCallerInput() async throws {
@@ -313,7 +370,17 @@ final class TokenSaverRequestSelectionReceiptRepositoryTests: XCTestCase {
         XCTAssertEqual(restored.winner.selectedFormat, .rcw1)
         XCTAssertEqual(restored.arms.count, 3)
 
-        try threads.deleteWithRelationalSnapshot(ids: [persisted.thread.id])
+        let rcs1Persisted = try await persistRealDecision(db: db, repo: repo, winner: .rcs1)
+        let rcs1Snapshot = try threads.deleteWithRelationalSnapshot(ids: [rcs1Persisted.thread.id])
+        XCTAssertNil(try repo.load(runId: rcs1Persisted.run.id))
+        try threads.restore(rcs1Snapshot)
+        let restoredRCS1 = try XCTUnwrap(repo.load(runId: rcs1Persisted.run.id))
+        XCTAssertEqual(restoredRCS1.winner.selectedFormat, .rcs1)
+        XCTAssertEqual(restoredRCS1.winner.reason, .uniqueStrictMinimum)
+        XCTAssertFalse(restoredRCS1.winner.billingClaim)
+        XCTAssertEqual(restoredRCS1.arms.count, 3)
+
+        try threads.deleteWithRelationalSnapshot(ids: [persisted.thread.id, rcs1Persisted.thread.id])
         XCTAssertEqual(try rowCount(db, "token_saver_run_winner_receipts"), 0)
         XCTAssertEqual(try rowCount(db, "token_saver_run_arm_receipts"), 0)
     }

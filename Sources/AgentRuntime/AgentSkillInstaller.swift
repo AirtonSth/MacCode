@@ -267,6 +267,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Current RCW1 Q:G/C/K=task,X=handle;RCW1 A:O/A/E/R/Q+"." iff full tokens<=45% of semantically identical terse text;else same text. Keep literals/negation/order/approval;tools native
     """
 
+    public static let compactSpanAgentInstructionsTemplate = """
+    REMOTE_CODE_COMPACT_SPAN_V1
+    Item RCS1/1 then H decoded_utf8_len dict_utf8_len record_count ref_count; one D escaped span; record_count L or R lines; END. Escapes only \\\\ \\n \\r \\t. Decode the complete item before acting. Concatenate L literals and D for each R in order. Preserve decoded literals/negation/order. Tools remain native
+    """
+
     /// The distill agent instructions with the begin/end HTML markers stripped. The markers
     /// only matter for the in-place upsert/removal inside CLAUDE.md/AGENTS.md; this marker-free
     /// body is what gets injected as an authoritative system prompt (Claude SDK bridge), where
@@ -294,6 +299,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         if environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1",
            !withDistill.contains(rcWireAgentInstructionsTemplate) {
             withDistill += "\n\n" + rcWireAgentInstructionsTemplate
+        }
+        if environment[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey] == "1",
+           environment[TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey] == "1",
+           !withDistill.contains(compactSpanAgentInstructionsTemplate) {
+            withDistill += "\n\n" + compactSpanAgentInstructionsTemplate
         }
         return graphifyProviderPrompt(withDistill, environment: environment)
     }

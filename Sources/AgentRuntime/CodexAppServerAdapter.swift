@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import Persistence
 
 public protocol CodexAppServerControlling: AnyObject, Sendable {
     var terminationHandler: (@Sendable (Error) -> Void)? { get set }
@@ -120,6 +121,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         /// a detached process already exited before turn end, or when the UI
         /// shows awaiting during an active-thread PendingFinish deferral.
         var sawDetachedShellSpawn: Bool
+        /// Fresh destination created by recoverSession fallback; first sendTurn may seed.
+        var pendingFreshFallbackSeed: Bool
+        /// Fresh-fallback dest is not a durable resume identity until seeded startTurn is accepted.
+        var awaitingSeedPublish: Bool
     }
 
     private struct OpenedClient {
@@ -202,6 +207,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     /// with continuous app-server activity can run long, while wedged deferrals
     /// still release (and unblock follow-up sends).
     private let pendingFinishInactivityTimeout: TimeInterval
+    public var contextSeedPreparer: TokenSaverContextSeedPreparing?
+    public var contextSeedReceipts: TokenSaverContextSelectionReceiptRepository?
+    private var appliedContextSeeds: Set<String> = []
 
     // Model-list cache (guarded by `lock`).
     private var cachedModels: [AgentModelDescriptor]? = nil
@@ -405,22 +413,68 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             client = opened.client
             providerThreadId = opened.result.providerThreadId
             resumeFellBackToStart = opened.resumeFellBackToStart
-            recordSession(threadId: request.threadId, client: client, providerThreadId: providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
+            recordSession(
+                threadId: request.threadId,
+                client: client,
+                providerThreadId: providerThreadId,
+                interactionMode: request.interactionMode,
+                onEvent: onEvent,
+                permissionMode: request.permissionMode,
+                awaitingSeedPublish: opened.resumeFellBackToStart
+                    && request.contextSnapshot?.items.isEmpty == false
+            )
         }
         installTerminationHandler(for: client, threadId: request.threadId)
+        let pendingRecoverSeed = sessionSnapshot(threadId: request.threadId)?.pendingFreshFallbackSeed == true
+        let shouldSeed = resumeFellBackToStart || pendingRecoverSeed
+        let hasPriorContext = request.contextSnapshot?.items.isEmpty == false
+        let delayDestinationPublish = shouldSeed && hasPriorContext
         onEvent(.status(.running))
-        onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
-        if resumeFellBackToStart {
-            onEvent(.event(.error(message: "Previous session could not be resumed; starting a new session.", recoverable: true)))
+        if !delayDestinationPublish {
+            publishProviderDestination(
+                providerThreadId,
+                discloseResumeFallback: resumeFellBackToStart,
+                onEvent: onEvent
+            )
+        }
+        var turnRequest = request
+        if shouldSeed {
+            do {
+                turnRequest = try await applyContextSeedIfEligible(
+                    request: request,
+                    destinationProviderThreadId: providerThreadId
+                )
+            } catch {
+                if let failedSession = removeSession(threadId: request.threadId) {
+                    settlePendingCallbacks(session: failedSession)
+                    failedSession.client.stop()
+                }
+                throw error
+            }
+            clearPendingFreshFallbackSeed(threadId: request.threadId)
         }
 
         do {
-            let turn = try await client.startTurn(providerThreadId: providerThreadId, for: request)
+            let turn = try await client.startTurn(providerThreadId: providerThreadId, for: turnRequest)
+            if shouldSeed {
+                acknowledgeContextSeed(turnRequest, lifecycle: .delivered)
+            }
+            if delayDestinationPublish {
+                clearAwaitingSeedPublish(threadId: request.threadId)
+                publishProviderDestination(
+                    providerThreadId,
+                    discloseResumeFallback: resumeFellBackToStart,
+                    onEvent: onEvent
+                )
+            }
             if let turnId = Self.turnId(from: turn), !turnId.isEmpty {
                 setActiveTurn(threadId: request.threadId, turnId: turnId)
                 onEvent(.event(.turnStarted(turnId: turnId)))
             }
         } catch {
+            if shouldSeed {
+                acknowledgeContextSeed(turnRequest, lifecycle: .notDelivered)
+            }
             if let failedSession = removeSession(threadId: request.threadId) {
                 settlePendingCallbacks(session: failedSession)
                 failedSession.client.stop()
@@ -583,14 +637,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 interactionMode: request.interactionMode,
                 onEvent: onEvent,
                 permissionMode: request.permissionMode,
-                status: activeTurnId == nil ? .completed : .running
+                status: activeTurnId == nil ? .completed : .running,
+                awaitingSeedPublish: opened.resumeFellBackToStart
             )
             if let activeTurnId {
                 setActiveTurn(threadId: request.threadId, turnId: activeTurnId)
             }
-            onEvent(.event(.threadStarted(threadId: opened.result.providerThreadId, providerThreadId: opened.result.providerThreadId)))
             if opened.resumeFellBackToStart {
+                markPendingFreshFallbackSeed(threadId: request.threadId)
                 onEvent(.event(.error(message: "Previous session could not be resumed; starting a new session.", recoverable: true)))
+            } else {
+                onEvent(.event(.threadStarted(threadId: opened.result.providerThreadId, providerThreadId: opened.result.providerThreadId)))
             }
         } catch {
             openedClient?.client.stop()
@@ -601,7 +658,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     public func listSessions() -> [AgentProviderSessionSummary] {
         lock.lock(); defer { lock.unlock() }
         return sessions.map { threadId, session in
-            AgentProviderSessionSummary(threadId: threadId, provider: .codex, status: session.status, providerThreadId: session.providerThreadId)
+            AgentProviderSessionSummary(
+                threadId: threadId,
+                provider: .codex,
+                status: session.status,
+                providerThreadId: session.awaitingSeedPublish ? nil : session.providerThreadId
+            )
         }
     }
 
@@ -958,7 +1020,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     private static func requestStartingFreshThread(from request: AgentRunRequest) -> AgentRunRequest {
-        AgentRunRequest(
+        var fresh = AgentRunRequest(
             runId: request.runId,
             threadId: request.threadId,
             provider: request.provider,
@@ -978,6 +1040,132 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             extraArgs: request.extraArgs,
             runAsUser: request.runAsUser
         )
+        fresh.acceptancePermit = request.acceptancePermit
+        fresh.contextSnapshot = request.contextSnapshot
+        fresh.preparedContextSeed = request.preparedContextSeed
+        return fresh
+    }
+
+    private func applyContextSeedIfEligible(
+        request: AgentRunRequest,
+        destinationProviderThreadId: String
+    ) async throws -> AgentRunRequest {
+        guard let snapshot = request.contextSnapshot, !snapshot.items.isEmpty else {
+            return request
+        }
+        let key = TokenSaverContextSeedApplication.applicationKey(
+            runId: request.runId.value.uuidString,
+            destinationProviderThreadId: destinationProviderThreadId,
+            snapshotDigest: snapshot.digest
+        )
+        lock.lock()
+        let alreadyApplied = appliedContextSeeds.contains(key)
+        lock.unlock()
+        if alreadyApplied { return request }
+        if (try? contextSeedReceipts?.hasDelivered(
+            runId: request.runId.value.uuidString,
+            destinationProviderThreadId: destinationProviderThreadId,
+            snapshotDigest: snapshot.digest
+        )) == true {
+            return request
+        }
+        let preparer = contextSeedPreparer ?? TokenSaverHumanContextSeedPreparer()
+        guard let prepared = await preparer.prepare(
+            snapshot: snapshot,
+            request: request,
+            destinationProviderThreadId: destinationProviderThreadId
+        ) else {
+            throw AgentProviderAdapterError.unsupported(
+                "Unable to prepare a context seed for the fresh Codex session."
+            )
+        }
+        do {
+            try contextSeedReceipts?.persistPending(prepared.receipts)
+        } catch {
+            throw error
+        }
+        lock.lock()
+        appliedContextSeeds.insert(key)
+        lock.unlock()
+        var next = request
+        next.preparedContextSeed = prepared
+        return next
+    }
+
+    private func acknowledgeContextSeed(
+        _ request: AgentRunRequest,
+        lifecycle: TokenSaverRequestSelectionReceipt.Lifecycle
+    ) {
+        guard let seed = request.preparedContextSeed else { return }
+        let acks = seed.receipts.map {
+            TokenSaverContextSelectionLifecycleAck(
+                runId: $0.winner.runId,
+                destinationProviderThreadId: $0.winner.destinationProviderThreadId,
+                snapshotDigest: $0.winner.snapshotDigest,
+                sourceMessageId: $0.winner.sourceMessageId,
+                ordinal: $0.winner.ordinal,
+                lifecycle: lifecycle
+            )
+        }
+        try? contextSeedReceipts?.acknowledge(acks)
+        if lifecycle != .delivered, let dest = seed.receipts.first?.winner.destinationProviderThreadId {
+            let key = TokenSaverContextSeedApplication.applicationKey(
+                runId: request.runId.value.uuidString,
+                destinationProviderThreadId: dest,
+                snapshotDigest: seed.document.snapshotDigest
+            )
+            lock.lock()
+            appliedContextSeeds.remove(key)
+            lock.unlock()
+        }
+    }
+
+    private func markPendingFreshFallbackSeed(threadId: AgentThreadID) {
+        lock.lock()
+        sessions[threadId]?.pendingFreshFallbackSeed = true
+        lock.unlock()
+    }
+
+    private func clearPendingFreshFallbackSeed(threadId: AgentThreadID) {
+        lock.lock()
+        sessions[threadId]?.pendingFreshFallbackSeed = false
+        lock.unlock()
+    }
+
+    private func clearAwaitingSeedPublish(threadId: AgentThreadID) {
+        lock.lock()
+        sessions[threadId]?.awaitingSeedPublish = false
+        lock.unlock()
+    }
+
+    private func isAwaitingSeedPublish(threadId: AgentThreadID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return sessions[threadId]?.awaitingSeedPublish == true
+    }
+
+    private func publishedDestination(_ session: Session) -> String? {
+        session.awaitingSeedPublish ? nil : session.providerThreadId
+    }
+
+    private func publishedDestination(threadId: AgentThreadID) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard let session = sessions[threadId] else { return nil }
+        return publishedDestination(session)
+    }
+
+    private func publishedDestination(_ providerThreadId: String?, threadId: AgentThreadID) -> String? {
+        isAwaitingSeedPublish(threadId: threadId) ? nil : providerThreadId
+    }
+
+    private func publishProviderDestination(
+        _ providerThreadId: String,
+        discloseResumeFallback: Bool,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) {
+        onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+        if discloseResumeFallback {
+            onEvent(.event(.error(message: "Previous session could not be resumed; starting a new session.", recoverable: true)))
+        }
     }
 
     private func handleServerRequest(method: String, params: Any?, threadId: AgentThreadID) async throws -> Any? {
@@ -1176,7 +1364,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
         switch method {
         case "thread/started":
-            if let providerThreadId = string(payload, "threadId") ?? (payload["thread"] as? [String: Any]).flatMap({ string($0, "id") }) {
+            if let providerThreadId = string(payload, "threadId") ?? (payload["thread"] as? [String: Any]).flatMap({ string($0, "id") }),
+               !isAwaitingSeedPublish(threadId: threadId) {
                 events.append(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId))
             }
         case "error":
@@ -1187,7 +1376,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let willRetry = (payload["willRetry"] as? Bool) == true
             events.append(.error(message: full.nilIfEmpty ?? "Codex error", recoverable: willRetry))
             if let outcome = Self.classifyFatalOutcome(eventKind: "error", willRetry: willRetry, errorCode: Self.errorCode(from: payload, error: error)) {
-                finished = Self.failedEvent(for: outcome, message: full.nilIfEmpty ?? "Codex error", providerThreadId: providerThreadId(threadId: threadId))
+                finished = Self.failedEvent(for: outcome, message: full.nilIfEmpty ?? "Codex error", providerThreadId: publishedDestination(threadId: threadId))
                 markFinished(threadId: threadId, status: .failed, turnId: activeTurnId(threadId: threadId))
             }
         case "thread/status/changed", "thread.status.changed":
@@ -1206,7 +1395,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 finishedAtMs: now
             )))
             if let pending {
-                finished = .finished(pending.status, finalMessage: pending.finalMessage, providerThreadId: pending.providerThreadId)
+                finished = .finished(pending.status, finalMessage: pending.finalMessage, providerThreadId: publishedDestination(pending.providerThreadId, threadId: threadId))
                 markFinished(threadId: threadId, status: pending.status, turnId: pending.turnId)
             }
         case "turn/started":
@@ -1635,7 +1824,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 finished = .finished(
                     .cancelled,
                     finalMessage: nil,
-                    providerThreadId: providerThreadId(threadId: threadId)
+                    providerThreadId: publishedDestination(threadId: threadId)
                 )
                 markFinished(threadId: threadId, status: .cancelled, turnId: turnId.isEmpty ? nil : turnId)
             } else {
@@ -1671,7 +1860,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 let pending = PendingFinish(
                     status: .completed,
                     finalMessage: final.isEmpty ? nil : final,
-                    providerThreadId: providerThreadId(threadId: threadId),
+                    providerThreadId: publishedDestination(threadId: threadId),
                     turnId: turnId,
                     deferredAt: Date()
                 )
@@ -1811,12 +2000,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 try? await session.client.interruptTurn(providerThreadId: session.providerThreadId, turnId: turnId)
                 session.client.stop()
                 session.onEvent?(.status(.cancelled))
-                session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
+                session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: publishedDestination(session)))
             }
         } else {
             session.client.stop()
             session.onEvent?(.status(.cancelled))
-            session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
+            session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: publishedDestination(session)))
         }
     }
 
@@ -1849,7 +2038,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         ])))
         session.onEvent?(.error(message))
         session.onEvent?(.status(.failed))
-        session.onEvent?(.finished(.failed, finalMessage: nil, providerThreadId: session.providerThreadId))
+        session.onEvent?(.finished(.failed, finalMessage: nil, providerThreadId: publishedDestination(session)))
     }
 
     private func recordSession(
@@ -1859,7 +2048,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         interactionMode: AgentInteractionMode,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void,
         permissionMode: AgentPermissionMode,
-        status: AgentRunStatus = .running
+        status: AgentRunStatus = .running,
+        awaitingSeedPublish: Bool = false
     ) {
         lock.lock()
         sessions[threadId] = Session(
@@ -1883,7 +2073,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             streamedItemIds: [],
             permissionMode: permissionMode,
             turnReconcileGeneration: 0,
-            sawDetachedShellSpawn: false
+            sawDetachedShellSpawn: false,
+            pendingFreshFallbackSeed: false,
+            awaitingSeedPublish: awaitingSeedPublish
         )
         lock.unlock()
     }
@@ -2012,7 +2204,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 .finished(
                     pending.status,
                     finalMessage: pending.finalMessage,
-                    providerThreadId: pending.providerThreadId
+                    providerThreadId: publishedDestination(pending.providerThreadId, threadId: threadId)
                 )
             )
         if let onEvent {
@@ -2195,7 +2387,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 .finished(
                     .completed,
                     finalMessage: final,
-                    providerThreadId: snapshot.providerThreadId
+                    providerThreadId: publishedDestination(snapshot.providerThreadId, threadId: threadId)
                 )
             )
         return true
@@ -2227,7 +2419,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return Self.failedEvent(
             for: outcome,
             message: message,
-            providerThreadId: providerThreadId(threadId: threadId)
+            providerThreadId: publishedDestination(threadId: threadId)
         )
     }
 
