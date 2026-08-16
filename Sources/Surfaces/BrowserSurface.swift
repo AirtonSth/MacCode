@@ -224,16 +224,22 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     /// Called when the user chooses "Copy Link" from the context menu.
     public var onCopyLink: ((URL) -> Void)?
 
-    public init(workspaceID: WorkspaceID, initialURL: URL? = nil, title: String = "browser") {
+    public init(workspaceID: WorkspaceID, initialURL: URL? = nil, title: String = "browser", botID: BotID? = nil) {
+        var metadata = ["workspace": workspaceID.value.uuidString]
+        if let botID {
+            metadata["bot_id"] = botID.value.uuidString.lowercased()
+        }
         self.descriptor = SurfaceDescriptor(
             type: .browser,
             title: title,
             iconName: "browser",
-            metadata: ["workspace": workspaceID.value.uuidString]
+            metadata: metadata
         )
 
         let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = WKWebsiteDataStore(forIdentifier: Self.dataStoreIdentifier(for: workspaceID))
+        let storeID = botID.map { BotBrowserIdentity.dataStoreIdentifier(for: $0) }
+            ?? Self.dataStoreIdentifier(for: workspaceID)
+        cfg.websiteDataStore = WKWebsiteDataStore(forIdentifier: storeID)
         cfg.userContentController.addUserScript(WKUserScript(
             source: Self.navigationStateObserverScript,
             injectionTime: .atDocumentStart,
@@ -609,6 +615,11 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     /// Marked `nonisolated` so tests can call it without a MainActor context.
     nonisolated static func dataStoreIdentifier(for workspaceID: WorkspaceID) -> UUID {
         workspaceID.value
+    }
+
+    /// Bot-owned browsers use the shipped bot mapping, not the workspace UUID.
+    nonisolated static func dataStoreIdentifier(forBot botID: BotID) -> UUID {
+        BotBrowserIdentity.dataStoreIdentifier(for: botID)
     }
 
     public static var defaultInitialURL: URL {

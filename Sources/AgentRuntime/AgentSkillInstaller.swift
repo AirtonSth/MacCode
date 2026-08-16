@@ -1683,6 +1683,14 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try installCodexBotSelfConfigMCP(binary: binary)
     }
 
+    public func installBotBrowserMCP(serviceBinaryURL: URL? = nil) throws {
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+            throw AgentSkillCLIError.serviceBinaryUnavailable
+        }
+        try installClaudeBotBrowserMCP(binary: binary)
+        try installCodexBotBrowserMCP(binary: binary)
+    }
+
     public func uninstallComputerUseMCP() throws {
         let claude = claudeSettingsURL()
         if let data = try? Data(contentsOf: claude),
@@ -1746,6 +1754,28 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
         let next = BotSelfConfigMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
+        try Data(next.utf8).write(to: url, options: .atomic)
+    }
+
+    private func installClaudeBotBrowserMCP(binary: URL) throws {
+        let url = claudeSettingsURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            root = obj
+        }
+        let existing = root["mcpServers"] as? [String: Any] ?? [:]
+        root["mcpServers"] = BotBrowserMCPAdmit.admitClaude(existing: existing, command: binary.path)
+        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try out.write(to: url, options: .atomic)
+    }
+
+    private func installCodexBotBrowserMCP(binary: URL) throws {
+        let url = codexConfigURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let next = BotBrowserMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
         try Data(next.utf8).write(to: url, options: .atomic)
     }
 

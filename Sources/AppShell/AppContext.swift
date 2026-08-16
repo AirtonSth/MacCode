@@ -1942,6 +1942,13 @@ public final class AppContext {
                     "RemoteCode: installBotSelfConfigMCP before agent turn failed: \(error.localizedDescription)"
                 )
             }
+            do {
+                try installer.installBotBrowserMCP()
+            } catch {
+                NSLog(
+                    "RemoteCode: installBotBrowserMCP before agent turn failed: \(error.localizedDescription)"
+                )
+            }
             let managedBin = installer.managedCLIBinURL.path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
@@ -2053,6 +2060,13 @@ public final class AppContext {
         } catch {
             NSLog(
                 "RemoteCode: installBotSelfConfigMCP before subagent env failed: \(error.localizedDescription)"
+            )
+        }
+        do {
+            try installer.installBotBrowserMCP()
+        } catch {
+            NSLog(
+                "RemoteCode: installBotBrowserMCP before subagent env failed: \(error.localizedDescription)"
             )
         }
         let managedBin = installer.managedCLIBinURL.path
@@ -2533,6 +2547,11 @@ public final class AppContext {
             try installer.installBotSelfConfigMCP()
         } catch {
             NSLog("RemoteCode: installBotSelfConfigMCP failed: \(error.localizedDescription)")
+        }
+        do {
+            try installer.installBotBrowserMCP()
+        } catch {
+            NSLog("RemoteCode: installBotBrowserMCP failed: \(error.localizedDescription)")
         }
     }
 

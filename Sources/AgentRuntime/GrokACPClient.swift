@@ -610,8 +610,13 @@ public final class GrokACPClient: @unchecked Sendable {
             ?? AgentSkillInstaller.resolveServiceBinary()?.path
             ?? ComputerUseMCPAdmit.fallbackCommand
         let withComputerUse = ComputerUseMCPAdmit.admitGrokACP(existing: existing, command: resolved)
-        return BotSelfConfigMCPAdmit.admitGrokACP(
+        let withSelfConfig = BotSelfConfigMCPAdmit.admitGrokACP(
             existing: withComputerUse,
+            command: resolved,
+            environment: environment
+        )
+        return BotBrowserMCPAdmit.admitGrokACP(
+            existing: withSelfConfig,
             command: resolved,
             environment: environment
         )

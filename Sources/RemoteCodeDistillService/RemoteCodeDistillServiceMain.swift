@@ -221,6 +221,11 @@ struct RemoteCodeDistillServiceMain {
             runBotSelfConfigMCP()
             return
         }
+        if programName == "rc-bot-browser"
+            || rawArgs.dropFirst().first == BotBrowserCatalog.cliArgument {
+            runBotBrowserMCP()
+            return
+        }
         // Nested provider PATH controller: invoked via managed symlinks
         // (~/.remote-code/bin/{grok,claude,codex}) or explicit `provider-proxy <name> …`.
         // Records content-free Subagents receipts and execs the real CLI outside managed bin.
@@ -713,6 +718,15 @@ struct RemoteCodeDistillServiceMain {
     /// Bot-owned Studio settings. Bound to RC_REMOTE_CODE_BOT_ID on the calling run.
     private static func runBotSelfConfigMCP() {
         let server = ManagedBotSelfConfigMCP()
+        while let line = readLine(strippingNewline: true) {
+            if let response = server.handle(line) {
+                FileHandle.standardOutput.write(Data((response + "\n").utf8))
+            }
+        }
+    }
+
+    private static func runBotBrowserMCP() {
+        let server = ManagedBotBrowserMCP()
         while let line = readLine(strippingNewline: true) {
             if let response = server.handle(line) {
                 FileHandle.standardOutput.write(Data((response + "\n").utf8))
