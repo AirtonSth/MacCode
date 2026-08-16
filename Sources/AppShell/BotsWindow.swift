@@ -1523,6 +1523,9 @@ public final class BotsViewModel: ObservableObject {
         do {
             let destIDs = Set(bots.map(\.id))
             bots = try botStore.list(includeHidden: showHidden)
+            if selectedBotID == nil || !bots.contains(where: { $0.id == selectedBotID }) {
+                restoreSelectedBotIfNeeded()
+            }
             var previews: [BotID: String] = lastPreviewByBot
             var updated: [BotID: Date] = lastUpdatedByBot
             let live = Set(bots.map(\.id))
@@ -1537,6 +1540,12 @@ public final class BotsViewModel: ObservableObject {
                 if destIDs.contains(bot.id) {
                     // Dest first. Remount dest used to list this teammate's
                     // conversations + recent messages before dest dested Chat.
+                    continue
+                }
+                if bot.id != selectedBotID {
+                    // Dest first. First paint dest used to list every
+                    // teammate before dest dested Chat. Dest dests this
+                    // preview when dest dests this row.
                     continue
                 }
                 conversationListCountForTesting += 1
@@ -1587,11 +1596,22 @@ public final class BotsViewModel: ObservableObject {
                 states[bot.id] = Self.attentionState(from: dest, hasOpenAttention: false)
                 continue
             }
-            if let existing = attentionStateByBot[bot.id] {
-                // Dest first. Remount dest used to list every teammate's
-                // conversations before dest dested Chat. Dest inbox already
-                // applied needs-you above; keep dest chips dest already dested.
-                states[bot.id] = existing == .needsAttention ? .none : existing
+            if bot.id != selectedBotID {
+                // Dest first. First paint dest used to list every
+                // teammate before dest dested Chat. Dest dests this
+                // chip when dest dests this row.
+                if let existing = attentionStateByBot[bot.id] {
+                    states[bot.id] = existing == .needsAttention ? BotAttentionState.none : existing
+                } else {
+                    states[bot.id] = BotAttentionState.none
+                }
+                continue
+            }
+            if let existing = attentionStateByBot[bot.id], existing != BotAttentionState.none {
+                // Dest first. Remount dest already dested this chip
+                // from dest cache. Keep it unless dest inbox already
+                // dested needs-you above.
+                states[bot.id] = existing == .needsAttention ? BotAttentionState.none : existing
                 continue
             }
             conversationListCountForTesting += 1

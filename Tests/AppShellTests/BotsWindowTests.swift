@@ -1861,6 +1861,83 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(reopened.deskMessages.first?.text, "Summarize overnight")
     }
 
+    func test_openingBotsDoesNotListOtherTeammateConversations_becauseFirstPaintDestMustDestChat() throws {
+        // WHY: first paint of Bots is a new dest. Dest used to list every
+        // teammate's conversations before dest dested the open Chat.
+        // Dest dests this teammate; dest dests the others when dest dests them.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("From Quinn"))
+        vm.openDesk(piper)
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        let afterDest = dest.conversationListCountForTesting
+        XCTAssertGreaterThan(afterDest, 0)
+        dest.openDesk(quinn)
+        XCTAssertEqual(dest.selectedBotID, quinn.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Quinn")
+        XCTAssertGreaterThan(
+            dest.conversationListCountForTesting,
+            afterDest,
+            "dest dests Quinn when dest dests that row"
+        )
+    }
+
+    func test_openingBotsKeepsSelectedChat_becauseStaleEmptyMustNotLookCurrent() throws {
+        // WHY: dest-first first paint is honest only when dest dests this
+        // teammate's bubble and dest dests the roster dest already dested.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("From Quinn"))
+        vm.openDesk(piper)
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        XCTAssertEqual(Set(dest.fleet.map(\.id)), [piper.id, quinn.id])
+        XCTAssertEqual(dest.fleet.map(\.name).sorted(), ["Piper", "Quinn"])
+        XCTAssertFalse(dest.rosterPreview(for: piper).isEmpty)
+        XCTAssertNotEqual(dest.rosterPreview(for: piper), "No job yet")
+        XCTAssertTrue(
+            dest.rosterPreview(for: piper).contains("From Piper")
+                || dest.deskMessages.contains(where: { $0.text == "From Piper" })
+        )
+    }
+
+    func test_openingBotsStillDestsTheOtherTeammate_becauseStaleEmptyMustNotLookCurrent() throws {
+        // WHY: first paint dest skips Quinn's conversation scan, but dest
+        // dests Quinn's thread when dest dests that row so dest cannot
+        // look empty after dest dested Quinn.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("From Quinn"))
+        vm.openDesk(piper)
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        dest.openDesk(quinn)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, quinn.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Quinn")
+        XCTAssertTrue(dest.deskMessages.contains(where: { $0.text == "From Quinn" }))
+    }
+
     func test_unpublishedStudioDraftSurvivesRelaunch_becauseDraftIsUserWorkflowState() throws {
         // WHY: composer and inspector drafts persist. Studio title/soul used
         // to vanish on remount because loadStudioDraft always reloaded the
