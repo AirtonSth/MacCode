@@ -251,7 +251,7 @@ final class SettingsPaletteGapTests: XCTestCase {
             "petEnabled", "petAnimationsEnabled", "petReadyCounterEnabled",
             "petPosition", "petSize", "petAttentionFilter", "petReduceMotion",
             "botsControlPlaneEnabled", "botsMemoryEnabled", "botsEffectsEnabled",
-            "botsAutonomyEnabled", "botsDesktopVMEnabled", "botsDesktopRemoteEnabled",
+            "botsAutonomyEnabled",
             "botsChannelsEnabled",
         ]
         XCTAssertEqual(

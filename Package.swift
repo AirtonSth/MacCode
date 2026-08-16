@@ -144,6 +144,7 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "Sources/AppShell",
+            exclude: ["RemoteCode.entitlements"],
             resources: [
                 .copy("Resources/Pet")
             ],

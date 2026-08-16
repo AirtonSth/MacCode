@@ -231,31 +231,12 @@ enum BotsDeskFollowThrough {
         memory: [BotMemoryItem] = [],
         skills: [BotSkillBinding] = []
     ) -> String {
-        var lines: [String] = []
-        let job = [bot.name, revision.title].filter { !$0.isEmpty }.joined(separator: " — ")
-        if !job.isEmpty {
-            lines.append("You are \(job).")
-        }
-        let description = revision.description.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !description.isEmpty {
-            lines.append(description)
-        }
-        let soul = revision.soul.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !soul.isEmpty {
-            lines.append("Standing instructions:")
-            lines.append(soul)
-        }
-        let liveMemory = memory.filter { $0.forgottenAt == nil && $0.trusted }
-        if !liveMemory.isEmpty {
-            lines.append("Trusted memory:")
-            lines.append(contentsOf: liveMemory.map { "- \($0.content)" })
-        }
-        let enabled = skills.filter(\.enabled).map(\.skillID).sorted()
-        if !enabled.isEmpty {
-            lines.append("Enabled skills: \(enabled.joined(separator: ", "))")
-        }
-        lines.append("User request:")
-        lines.append(userText)
-        return lines.joined(separator: "\n\n")
+        BotBrainCompiler.composeRunPrompt(
+            bot: bot,
+            revision: revision,
+            userText: userText,
+            memory: memory,
+            skills: skills
+        )
     }
 }

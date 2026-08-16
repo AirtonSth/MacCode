@@ -2693,7 +2693,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     nonisolated static func timelineByReplaying(_ events: [AssistantEvent]) -> AssistantTimelineState {
         var next = AssistantTimelineState()
         for event in events {
-            next.apply(event)
+            next.apply(event, nowMs: nil)
         }
         next.enforceAggregateHotTextBudget()
         return next

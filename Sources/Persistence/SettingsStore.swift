@@ -95,9 +95,9 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var botsEffectsEnabled: Bool
     /// Unattended / app-closed routines. Off until the autonomy phase ships.
     public var botsAutonomyEnabled: Bool
-    /// Dedicated local VM Desktop. Off until that phase ships.
+    /// Persist-only leftover. Dedicated local VM is not advertised in Studio or Settings.
     public var botsDesktopVMEnabled: Bool
-    /// Managed remote Mac Desktop. Off until that phase ships.
+    /// Persist-only. Managed remote Mac is not advertised in Studio or Settings.
     public var botsDesktopRemoteEnabled: Bool
     /// External channels. Off until that phase ships.
     public var botsChannelsEnabled: Bool

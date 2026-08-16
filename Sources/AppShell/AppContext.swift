@@ -358,8 +358,11 @@ public final class AppContext {
         didSet {
             drainRecoveredForkPrunedThreadIDsIfPossible()
             refreshActiveAgentWorkspaceProjection()
+            startBotBrowserPendingOpenObserver()
+            try? router?.reconcileBotBrowserOpens()
         }
     }
+    private var botBrowserOpenObserver: NSObjectProtocol?
     private struct ActiveAgentThreadContext {
         let workspaceID: WorkspaceID
         let title: String
@@ -1026,6 +1029,7 @@ public final class AppContext {
         // XCTest isolated unless a sandboxed skills home was injected explicitly.
         if !AppContext.isRunningUnitTests || agentSkillsHomeOverrideForTesting != nil {
             reconcileRemoteCodeOrchestrate()
+            reconcileComputerUseMCP()
         }
         // Managed Distill is app-private (Application Support/AgentSkills/distill) and
         // injected at runtime — never written into ~/.claude/skills or ~/.codex/skills.
@@ -1959,6 +1963,27 @@ public final class AppContext {
                     "RemoteCode: ensureDistillCLI before agent turn failed: \(error.localizedDescription)"
                 )
             }
+            do {
+                try installer.installComputerUseMCP()
+            } catch {
+                NSLog(
+                    "RemoteCode: installComputerUseMCP before agent turn failed: \(error.localizedDescription)"
+                )
+            }
+            do {
+                try installer.installBotSelfConfigMCP()
+            } catch {
+                NSLog(
+                    "RemoteCode: installBotSelfConfigMCP before agent turn failed: \(error.localizedDescription)"
+                )
+            }
+            do {
+                try installer.installBotBrowserMCP()
+            } catch {
+                NSLog(
+                    "RemoteCode: installBotBrowserMCP before agent turn failed: \(error.localizedDescription)"
+                )
+            }
             let managedBin = installer.managedCLIBinURL.path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
@@ -2042,6 +2067,10 @@ public final class AppContext {
             "REMOTE_CODE_AGENT_MODEL": thread?.model ?? "unknown",
             "REMOTE_CODE_PROVIDER_INSTANCE_ID": thread?.providerInstanceId ?? provider.rawValue,
         ]) { _, new in new }
+        if let conversation = try? botStore.conversationLinked(to: threadId) {
+            environment[BotSelfConfigCatalog.callerEnvironmentKey] =
+                conversation.botID.value.uuidString.lowercased()
+        }
         let installer = makeAgentSkillInstaller()
         // Nested launches inherit managed bin; keep distill healthy whenever Token
         // Saver is admitted so child shells and PostToolUse hooks never see a gap.
@@ -2053,6 +2082,27 @@ public final class AppContext {
                     "RemoteCode: ensureDistillCLI before subagent env failed: \(error.localizedDescription)"
                 )
             }
+        }
+        do {
+            try installer.installComputerUseMCP()
+        } catch {
+            NSLog(
+                "RemoteCode: installComputerUseMCP before subagent env failed: \(error.localizedDescription)"
+            )
+        }
+        do {
+            try installer.installBotSelfConfigMCP()
+        } catch {
+            NSLog(
+                "RemoteCode: installBotSelfConfigMCP before subagent env failed: \(error.localizedDescription)"
+            )
+        }
+        do {
+            try installer.installBotBrowserMCP()
+        } catch {
+            NSLog(
+                "RemoteCode: installBotBrowserMCP before subagent env failed: \(error.localizedDescription)"
+            )
         }
         let managedBin = installer.managedCLIBinURL.path
         let basePath = environment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
@@ -2519,6 +2569,36 @@ public final class AppContext {
             NSLog("RemoteCode managed Distill reconcile incomplete: \(failure)")
         }
         return failure
+    }
+
+    func startBotBrowserPendingOpenObserver() {
+        guard botBrowserOpenObserver == nil else { return }
+        botBrowserOpenObserver = DistributedNotificationCenter.default().addObserver(
+            forName: BotBrowserHost.pendingOpenNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            try? self?.router?.reconcileBotBrowserOpens()
+        }
+    }
+
+    func reconcileComputerUseMCP() {
+        let installer = makeAgentSkillInstaller()
+        do {
+            try installer.installComputerUseMCP()
+        } catch {
+            NSLog("RemoteCode: installComputerUseMCP failed: \(error.localizedDescription)")
+        }
+        do {
+            try installer.installBotSelfConfigMCP()
+        } catch {
+            NSLog("RemoteCode: installBotSelfConfigMCP failed: \(error.localizedDescription)")
+        }
+        do {
+            try installer.installBotBrowserMCP()
+        } catch {
+            NSLog("RemoteCode: installBotBrowserMCP failed: \(error.localizedDescription)")
+        }
     }
 
     private func makeAgentSkillInstaller() -> AgentSkillInstaller {

@@ -1353,12 +1353,15 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         }
     }
 
-    public mutating func apply(_ ev: AssistantEvent) {
+    public mutating func apply(
+        _ ev: AssistantEvent,
+        nowMs: Int64? = Int64(Date().timeIntervalSince1970 * 1000)
+    ) {
         switch ev {
         case .threadStarted(let tid, let ptid):
             self.threadId = tid; self.providerThreadId = ptid
         case .turnStarted(let tid):
-            ensureTurn(tid, startedAtMs: Int64(Date().timeIntervalSince1970 * 1000))
+            ensureTurn(tid, startedAtMs: nowMs)
         case .itemStarted(let item):
             ensureTurn(item.turnId)
             if let idx = turns.firstIndex(where: { $0.turnId == item.turnId }) {
@@ -1420,8 +1423,11 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         case .itemCompleted(let iid, let state):
             mutateItem(iid) { item in
                 item.state = state
-                if item.finishedAtMs == nil {
-                    item.finishedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                // Replay must not invent wall-clock now. Desk/Agent App
+                // rebuild timelines from persisted events; Date() here made
+                // "Worked for 12s" grow into hundreds of minutes.
+                if item.finishedAtMs == nil, let nowMs {
+                    item.finishedAtMs = nowMs
                 }
             }
             if let item = item(withId: iid) {

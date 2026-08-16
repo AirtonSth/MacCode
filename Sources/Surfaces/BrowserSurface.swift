@@ -218,22 +218,30 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     private var waitForToken = 0
     private var isClosed = false
     public var onNavigationChange: ((SurfaceID, String, String?) -> Void)?
+    /// WKHTTPCookieStore snapshot for bot login-wait. Names and values only.
+    public var onHTTPCookiesCaptured: ((SurfaceID, [HTTPCookie], String, String?) -> Void)?
     public var externalURLOpener: ((URL) -> Void)?
     /// Called when the user chooses "Open Link in New Surface" from the context menu.
     public var onOpenLinkInNewSurface: ((URL) -> Void)?
     /// Called when the user chooses "Copy Link" from the context menu.
     public var onCopyLink: ((URL) -> Void)?
 
-    public init(workspaceID: WorkspaceID, initialURL: URL? = nil, title: String = "browser") {
+    public init(workspaceID: WorkspaceID, initialURL: URL? = nil, title: String = "browser", botID: BotID? = nil) {
+        var metadata = ["workspace": workspaceID.value.uuidString]
+        if let botID {
+            metadata["bot_id"] = botID.value.uuidString.lowercased()
+        }
         self.descriptor = SurfaceDescriptor(
             type: .browser,
             title: title,
             iconName: "browser",
-            metadata: ["workspace": workspaceID.value.uuidString]
+            metadata: metadata
         )
 
         let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = WKWebsiteDataStore(forIdentifier: Self.dataStoreIdentifier(for: workspaceID))
+        let storeID = botID.map { BotBrowserIdentity.dataStoreIdentifier(for: $0) }
+            ?? Self.dataStoreIdentifier(for: workspaceID)
+        cfg.websiteDataStore = WKWebsiteDataStore(forIdentifier: storeID)
         cfg.userContentController.addUserScript(WKUserScript(
             source: Self.navigationStateObserverScript,
             injectionTime: .atDocumentStart,
@@ -611,6 +619,11 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         workspaceID.value
     }
 
+    /// Bot-owned browsers use the shipped bot mapping, not the workspace UUID.
+    nonisolated static func dataStoreIdentifier(forBot botID: BotID) -> UUID {
+        BotBrowserIdentity.dataStoreIdentifier(for: botID)
+    }
+
     public static var defaultInitialURL: URL {
         URL(string: defaultInitialURLString)!
     }
@@ -975,7 +988,17 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         Self.log.debug("nav finish host=\(webView.url?.host ?? "?", privacy: .public)")
         syncNavigationChrome(url: webView.url, title: webView.title, publish: true)
         hideError()
+        captureHTTPCookies()
         reloadGoogleOnceAfterClearingLegacyLayoutCookie()
+    }
+
+    public func captureHTTPCookies() {
+        let url = webView.url?.absoluteString ?? retainedURL?.absoluteString ?? ""
+        let title = webView.title
+        let surfaceID = descriptor.id
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+            self?.onHTTPCookiesCaptured?(surfaceID, cookies, url, title)
+        }
     }
 
     public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {

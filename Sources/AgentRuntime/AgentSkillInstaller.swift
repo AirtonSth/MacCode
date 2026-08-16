@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import CoreModel
+import Persistence
 
 public struct AgentSkillManifest: Codable, Sendable, Equatable {
     public let provider: AgentProvider
@@ -184,6 +185,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static let mcpBeginMarker = "# RemoteCode managed MCP: begin"
     public static let mcpEndMarker = "# RemoteCode managed MCP: end"
     public static let retrieveMCPName = "remotecode-distill-retrieve"
+    public static let computerUseMCPName = ComputerUseMCPAdmit.serverName
+    public static let botSelfConfigMCPName = BotSelfConfigMCPAdmit.serverName
     public static let agentAppMiddlewareCommand = "remote-code"
     public static let remoteCodeOrchestrateManifestName = ".remote-code-install.json"
     public static let remoteCodeOrchestrateRuntimeManifestName = "manifest.json"
@@ -1668,6 +1671,122 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         }
         try installClaudeRetrieveMCP(binary: binary)
         try installCodexRetrieveMCP(binary: binary)
+    }
+
+    /// Admit the host-queued computer-use MCP into Claude and Codex configs.
+    /// Idempotent; leftover / user-authored servers stay. Not Token Saver gated.
+    public func installComputerUseMCP(serviceBinaryURL: URL? = nil) throws {
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+            throw AgentSkillCLIError.serviceBinaryUnavailable
+        }
+        try installClaudeComputerUseMCP(binary: binary)
+        try installCodexComputerUseMCP(binary: binary)
+    }
+
+    /// Admit the bot self-config MCP into Claude and Codex configs.
+    /// Idempotent; leftover / user-authored servers stay. Bot id is not baked here.
+    public func installBotSelfConfigMCP(serviceBinaryURL: URL? = nil) throws {
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+            throw AgentSkillCLIError.serviceBinaryUnavailable
+        }
+        try installClaudeBotSelfConfigMCP(binary: binary)
+        try installCodexBotSelfConfigMCP(binary: binary)
+    }
+
+    public func installBotBrowserMCP(serviceBinaryURL: URL? = nil) throws {
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+            throw AgentSkillCLIError.serviceBinaryUnavailable
+        }
+        try installClaudeBotBrowserMCP(binary: binary)
+        try installCodexBotBrowserMCP(binary: binary)
+    }
+
+    public func uninstallComputerUseMCP() throws {
+        let claude = claudeSettingsURL()
+        if let data = try? Data(contentsOf: claude),
+           var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           var servers = root["mcpServers"] as? [String: Any] {
+            servers.removeValue(forKey: ComputerUseMCPAdmit.serverName)
+            root["mcpServers"] = servers
+            if let out = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) {
+                try? out.write(to: claude, options: .atomic)
+            }
+        }
+        let codex = codexConfigURL()
+        if let text = try? String(contentsOf: codex, encoding: .utf8) {
+            let stripped = Self.removingMarkerBlock(
+                text,
+                begin: ComputerUseMCPAdmit.tomlBeginMarker,
+                end: ComputerUseMCPAdmit.tomlEndMarker
+            )
+            try? Data(stripped.utf8).write(to: codex, options: .atomic)
+        }
+    }
+
+    private func installClaudeComputerUseMCP(binary: URL) throws {
+        let url = claudeSettingsURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            root = obj
+        }
+        let existing = root["mcpServers"] as? [String: Any] ?? [:]
+        root["mcpServers"] = ComputerUseMCPAdmit.admitClaude(existing: existing, command: binary.path)
+        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try out.write(to: url, options: .atomic)
+    }
+
+    private func installCodexComputerUseMCP(binary: URL) throws {
+        let url = codexConfigURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let next = ComputerUseMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
+        try Data(next.utf8).write(to: url, options: .atomic)
+    }
+
+    private func installClaudeBotSelfConfigMCP(binary: URL) throws {
+        let url = claudeSettingsURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            root = obj
+        }
+        let existing = root["mcpServers"] as? [String: Any] ?? [:]
+        root["mcpServers"] = BotSelfConfigMCPAdmit.admitClaude(existing: existing, command: binary.path)
+        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try out.write(to: url, options: .atomic)
+    }
+
+    private func installCodexBotSelfConfigMCP(binary: URL) throws {
+        let url = codexConfigURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let next = BotSelfConfigMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
+        try Data(next.utf8).write(to: url, options: .atomic)
+    }
+
+    private func installClaudeBotBrowserMCP(binary: URL) throws {
+        let url = claudeSettingsURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            root = obj
+        }
+        let existing = root["mcpServers"] as? [String: Any] ?? [:]
+        root["mcpServers"] = BotBrowserMCPAdmit.admitClaude(existing: existing, command: binary.path)
+        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try out.write(to: url, options: .atomic)
+    }
+
+    private func installCodexBotBrowserMCP(binary: URL) throws {
+        let url = codexConfigURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let next = BotBrowserMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
+        try Data(next.utf8).write(to: url, options: .atomic)
     }
 
     public func uninstallRetrieveMCP() throws {

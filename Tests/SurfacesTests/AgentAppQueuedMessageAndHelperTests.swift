@@ -932,6 +932,27 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         XCTAssertNil(AgentAppView.turnDurationLabel(turn),
                      "a zero-duration turn must return nil — '0s' is not informative and matches the guard: seconds > 0")
     }
+
+    func test_turnDurationLabel_sumsItemWork_becauseIdleGapsAreNotWork() {
+        // WHY: min-start/max-finish turned a 5s greeting with hours of idle
+        // between tools into "Worked for 258m". Sum each item's own span.
+        let hour: Int64 = 3_600_000
+        let turn = AssistantTurnSnapshot(
+            turnId: "t",
+            items: [
+                AssistantItem(id: "i1", turnId: "t", type: .tool,
+                              state: .completed, startedAtMs: 0, finishedAtMs: 2_000),
+                AssistantItem(id: "i2", turnId: "t", type: .tool,
+                              state: .completed, startedAtMs: hour, finishedAtMs: hour + 3_000),
+            ]
+        )
+        XCTAssertEqual(AgentAppView.turnDurationLabel(turn), "5s",
+                       "idle between tools must not count as worked time")
+        XCTAssertEqual(
+            AgentChatLiveTurnChrome.completedWorkLabel(turn, live: false, workBlockCount: 2),
+            "Worked for 5s"
+        )
+    }
 }
 
 private final class ActiveQueueRunner: AgentProviderRunner, @unchecked Sendable {

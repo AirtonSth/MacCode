@@ -8,17 +8,64 @@ import SwiftUI
 
 // MARK: - Drafts & rows
 
-public struct BotQueuedFollowUp: Equatable {
+public struct BotQueuedFollowUp: Equatable, Identifiable, Codable {
+    public let id: UUID
     public var text: String
     public var attachments: [AgentAttachment]
 
-    public init(text: String, attachments: [AgentAttachment] = []) {
+    public init(id: UUID = UUID(), text: String, attachments: [AgentAttachment] = []) {
+        self.id = id
         self.text = text
         self.attachments = attachments
     }
 }
 
-public struct BotStudioDraft: Equatable {
+public struct BotComposerDraft: Equatable, Codable {
+    public var text: String
+    public var attachments: [AgentAttachment]
+
+    public init(text: String = "", attachments: [AgentAttachment] = []) {
+        self.text = text
+        self.attachments = attachments
+    }
+
+    public var isEmpty: Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty
+    }
+
+    public var liveAttachments: [AgentAttachment] {
+        attachments.filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+}
+
+public struct BotInspectorDraft: Equatable, Codable {
+    public var memoryDraft: String
+    public var skillDraft: String
+    public var routineName: String
+    public var routinePrompt: String
+    public var routineScheduleNote: String
+
+    public init(
+        memoryDraft: String = "",
+        skillDraft: String = "",
+        routineName: String = "",
+        routinePrompt: String = "",
+        routineScheduleNote: String = ""
+    ) {
+        self.memoryDraft = memoryDraft
+        self.skillDraft = skillDraft
+        self.routineName = routineName
+        self.routinePrompt = routinePrompt
+        self.routineScheduleNote = routineScheduleNote
+    }
+
+    public var isEmpty: Bool {
+        [memoryDraft, skillDraft, routineName, routinePrompt, routineScheduleNote]
+            .allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+}
+
+public struct BotStudioDraft: Equatable, Codable {
     public var botID: BotID?
     public var name: String
     public var title: String
@@ -64,6 +111,16 @@ public struct BotStudioDraft: Equatable {
     }
 
     public var isNew: Bool { botID == nil }
+}
+
+private struct BotStudioSupportSnapshot {
+    var conversations: [BotConversation]
+    var selectedConversation: BotConversation?
+    var selectedRevision: BotRevision?
+    var skillBindings: [BotSkillBinding]
+    var memoryItems: [BotMemoryItem]
+    var lastContextReceipt: ContextAssemblyReceipt?
+    var routines: [BotRoutine]
 }
 
 public struct BotDeskMessage: Identifiable, Equatable, Sendable {
@@ -153,9 +210,21 @@ public enum BotsScreen: String, Equatable {
     case studio
     case desk
     case attention
+
+    /// Home/fleet and the old Attention full-screen are not destinations.
+    /// Leftover persist remaps them to Chat.
+    public var resolvedDestination: BotsScreen {
+        switch self {
+        case .studio:
+            return .studio
+        case .desk, .fleet, .attention:
+            return .desk
+        }
+    }
 }
 
 public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
+    case brain
     case memory
     case routines
 
@@ -163,6 +232,7 @@ public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
 
     public var title: String {
         switch self {
+        case .brain: return BotsChrome.Label.brain
         case .memory: return "Memory"
         case .routines: return "Routines"
         }
@@ -170,6 +240,7 @@ public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
 
     public var accessibilityIdentifier: String {
         switch self {
+        case .brain: return "bots.desk.inspector.tab.brain"
         case .memory: return "bots.desk.inspector.tab.memory"
         case .routines: return "bots.desk.inspector.tab.routines"
         }
@@ -178,6 +249,7 @@ public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
 
 public enum BotStudioTab: String, CaseIterable, Identifiable {
     case profile
+    case brain
     case memory
     case skills
     case routines
@@ -189,6 +261,7 @@ public enum BotStudioTab: String, CaseIterable, Identifiable {
     public var title: String {
         switch self {
         case .profile: return "Profile"
+        case .brain: return BotsChrome.Label.brain
         case .memory: return "Memory"
         case .skills: return "Skills"
         case .routines: return "Routines"
@@ -200,11 +273,45 @@ public enum BotStudioTab: String, CaseIterable, Identifiable {
     public var accessibilityIdentifier: String {
         switch self {
         case .profile: return "bots.studio.tab.profile"
+        case .brain: return "bots.studio.tab.brain"
         case .memory: return "bots.studio.tab.memory"
         case .skills: return "bots.studio.tab.skills"
         case .routines: return "bots.studio.tab.routines"
         case .security: return "bots.studio.tab.security"
         case .desktop: return "bots.studio.tab.desktop"
+        }
+    }
+
+    public var symbol: String {
+        switch self {
+        case .profile: return "person.crop.circle"
+        case .brain: return "brain.head.profile"
+        case .memory: return "archivebox"
+        case .skills: return "puzzlepiece.extension"
+        case .routines: return "clock.arrow.2.circlepath"
+        case .security: return "lock.shield"
+        case .desktop: return "desktopcomputer"
+        }
+    }
+}
+
+public enum BotBrainInspectorPane: String, CaseIterable, Identifiable {
+    case source
+    case effective
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .source: return BotsChrome.Label.source
+        case .effective: return BotsChrome.Label.effective
+        }
+    }
+
+    public var accessibilityIdentifier: String {
+        switch self {
+        case .source: return "bots.brain.pane.source"
+        case .effective: return "bots.brain.pane.effective"
         }
     }
 }
@@ -216,17 +323,45 @@ public final class BotsViewModel: ObservableObject {
     public static let assistantPlaceholder = BotsDeskFollowThrough.noRouterPlaceholder
 
     @Published public private(set) var bots: [BotDefinition] = []
-    @Published public var searchText: String = ""
-    @Published public var showHidden: Bool = false { didSet { reloadFleet() } }
+    @Published public var searchText: String = "" {
+        didSet { persistSearchText() }
+    }
+    @Published public var showHidden: Bool = false {
+        didSet {
+            persistShowHidden()
+            if showHidden == oldValue { return }
+            // Dest first. Show hidden used to reloadFleet (every teammate's
+            // conversations + recent messages) before the roster could
+            // paint. Off filters locally; on lists hidden rows only.
+            applyShowHiddenLocally()
+        }
+    }
     @Published public var selectedBotID: BotID?
-    @Published public var screen: BotsScreen = .fleet
+    @Published public var screen: BotsScreen = .desk {
+        didSet {
+            let resolved = screen.resolvedDestination
+            if screen != resolved {
+                screen = resolved
+                return
+            }
+            persistScreen()
+        }
+    }
     @Published public var inspectorTab: BotDeskInspectorTab = .memory {
         didSet { persistInspectorTab() }
     }
-    @Published public var studioTab: BotStudioTab = .profile
-    @Published public var studioDraft = BotStudioDraft()
-    @Published public var composerText: String = ""
-    @Published public var attachments: [AgentAttachment] = []
+    @Published public var studioTab: BotStudioTab = .profile {
+        didSet { persistStudioTab() }
+    }
+    @Published public var studioDraft = BotStudioDraft() {
+        didSet { persistStudioDraftIfHydrated() }
+    }
+    @Published public var composerText: String = "" {
+        didSet { persistComposerIfHydrated() }
+    }
+    @Published public var attachments: [AgentAttachment] = [] {
+        didSet { persistComposerIfHydrated() }
+    }
     @Published public var isStopping = false
     @Published public private(set) var queuedFollowUps: [BotQueuedFollowUp] = []
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
@@ -235,30 +370,94 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var deskStreamEventCount = 0
     @Published public private(set) var deskSendInFlight = false
     @Published public private(set) var deskSendInFlightStartedAt: Date?
+    /// Owner of the in-flight send so roster switch does not paint Loading on the wrong desk.
+    private var deskSendInFlightBotID: BotID?
+    /// Test seam: how many times Desk actually decoded stream events.
+    public private(set) var deskLiveReplayFetchCountForTesting = 0
+    /// Test seam: dest at the moment send first acknowledged the click.
+    public private(set) var lastSendAcknowledgedOnScreenForTesting: BotsScreen?
+    /// Test seam: dest at the moment Attention acknowledge ran. Dest-first
+    /// must already be Chat so the row click does not wait on the store.
+    public private(set) var lastAttentionAcknowledgedOnScreenForTesting: BotsScreen?
+    /// Test seam: full-fleet reloads. Roster dest must not increment this.
+    public private(set) var fleetReloadCountForTesting = 0
+    /// Test seam: thread message rereads. Warm-cache dest must not increment this.
+    public private(set) var deskMessageRestoreCountForTesting = 0
+    /// Test seam: listRecentFinished scans. Dest after first lookup must not increment this.
+    public private(set) var deskFinishedRunScanCountForTesting = 0
+    /// Test seam: Brain assemble calls. Unchanged dest must not increment this.
+    public private(set) var previewBrainAssembleCountForTesting = 0
+    /// Test seam: inspector store rereads. Warm-cache dest must not increment this.
+    public private(set) var studioSupportReloadCountForTesting = 0
+    /// Test seam: mark-read store rereads. Already-read dest must not increment this.
+    public private(set) var deskMarkReadStoreCountForTesting = 0
+    /// Test seam: revision store rereads. Warm dest chips must not increment this.
+    public private(set) var rosterRevisionFetchCountForTesting = 0
+    /// Test seam: listMemory rereads. Add/send dest must not increment this.
+    public private(set) var memoryListCountForTesting = 0
+    /// Test seam: listRoutines rereads. Save/enable/test dest must not increment this.
+    public private(set) var routineListCountForTesting = 0
+    /// Test seam: listSkillBindings rereads. Add/enable/send dest must not increment this.
+    public private(set) var skillListCountForTesting = 0
+    /// Test seam: send dest used dest brain cache instead of listing.
+    public private(set) var lastSendUsedDestBrainForTesting = false
+    /// Test seam: listConversations rereads. Persist dest must not increment this.
+    public private(set) var conversationListCountForTesting = 0
+    /// Test seam: listAttention rereads. Acknowledge dest must not increment this.
+    public private(set) var attentionListCountForTesting = 0
+    private var cachedPreviewBrain: ContextAssemblyReceipt?
+    private var cachedPreviewBrainKey: String?
+    private var studioSupportByBot: [BotID: BotStudioSupportSnapshot] = [:]
+    private var revisionByID: [BotRevisionID: BotRevision] = [:]
     @Published public private(set) var conversations: [BotConversation] = []
     @Published public private(set) var selectedConversation: BotConversation?
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
     @Published public private(set) var memoryItems: [BotMemoryItem] = []
     @Published public private(set) var skillBindings: [BotSkillBinding] = []
     @Published public private(set) var selectedRevision: BotRevision?
+    @Published public private(set) var lastContextReceipt: ContextAssemblyReceipt?
+    @Published public var brainPane: BotBrainInspectorPane = .source {
+        didSet { persistBrainPane() }
+    }
     @Published public private(set) var routines: [BotRoutine] = []
-    @Published public var memoryDraft: String = ""
-    @Published public var skillDraft: String = ""
-    @Published public var routineName: String = ""
-    @Published public var routinePrompt: String = ""
-    @Published public var routineScheduleNote: String = ""
+    @Published public var memoryDraft: String = "" {
+        didSet { persistInspectorIfHydrated() }
+    }
+    @Published public var skillDraft: String = "" {
+        didSet { persistInspectorIfHydrated() }
+    }
+    @Published public var routineName: String = "" {
+        didSet { persistInspectorIfHydrated() }
+    }
+    @Published public var routinePrompt: String = "" {
+        didSet { persistInspectorIfHydrated() }
+    }
+    @Published public var routineScheduleNote: String = "" {
+        didSet { persistInspectorIfHydrated() }
+    }
     @Published public var errorMessage: String?
     @Published public private(set) var providers: [AgentProviderSnapshot] = []
     @Published public private(set) var isControlPlaneActive = true
     @Published public private(set) var isMemoryActive = true
     @Published public private(set) var isAutonomyActive = false
-    @Published public private(set) var isDesktopVMActive = false
-    @Published public private(set) var isDesktopRemoteActive = false
     @Published public private(set) var lastSendStartedProviderRun = false
     @Published public var pendingDeleteID: BotID?
     public var onLeaveBots: (() -> Void)?
 
-    public let desktopHonestyLabel = BotDesktopKind.logicalExecutionSpaceHonestyLabel
+    public var displayedDesktopKind: BotDesktopKind {
+        if screen == .studio {
+            return resolvedDesktopKind(studioDraft.desktopKind)
+        }
+        return resolvedDesktopKind(selectedRevision?.desktopKind ?? .logicalExecutionSpace)
+    }
+
+    public var desktopHonestyLabel: String {
+        displayedDesktopKind.honestyLabel
+    }
+
+    public var desktopStatusPill: String {
+        displayedDesktopKind.statusPill
+    }
 
     private let context: AppContext
     private let router: AppCommandRouter?
@@ -271,6 +470,16 @@ public final class BotsViewModel: ObservableObject {
     private var lastLinkedRunIDByBot: [BotID: AgentRunID] = [:]
     private var liveTimelineByBot: [BotID: AssistantTimelineState] = [:]
     private var liveStreamCountByBot: [BotID: Int] = [:]
+    private var queuedFollowUpsByBot: [BotID: [BotQueuedFollowUp]] = [:]
+    private var composerDraftsByBot: [BotID: BotComposerDraft] = [:]
+    private var composerHydrated = false
+    private var isApplyingComposerDraft = false
+    private var inspectorDraftsByBot: [BotID: BotInspectorDraft] = [:]
+    private var inspectorHydrated = false
+    private var isApplyingInspectorDraft = false
+    private var studioDraftsByBot: [BotID: BotStudioDraft] = [:]
+    private var studioDraftHydrated = false
+    private var isApplyingStudioDraft = false
     private var deskLiveTurnWatch: Task<Void, Never>?
 
     public init(context: AppContext, router: AppCommandRouter? = nil) {
@@ -278,8 +487,24 @@ public final class BotsViewModel: ObservableObject {
         self.router = router
         self.botStore = context.botStore
         self.settingsStore = SettingsStore(db: context.db)
+        restoreQueuedFollowUpsIfNeeded()
+        restoreComposerDraftsIfNeeded()
+        restoreInspectorDraftsIfNeeded()
+        restoreStudioDraftIfNeeded()
         restoreInspectorTabIfNeeded()
+        restoreStudioTabIfNeeded()
+        restoreShowHiddenIfNeeded()
+        restoreBrainPaneIfNeeded()
+        restoreSearchTextIfNeeded()
         reload()
+        restoreScreenIfNeeded()
+        studioDraftHydrated = true
+        if !composerHydrated {
+            applyComposerDraft(for: selectedBotID)
+        }
+        if !inspectorHydrated {
+            applyInspectorDraft(for: selectedBotID)
+        }
         context.coordinator.addObserver(self)
     }
 
@@ -305,10 +530,17 @@ public final class BotsViewModel: ObservableObject {
                     || bot.description.lowercased().contains(query)
             }
         }
-        return filtered.sorted { lhs, rhs in
+        var result = filtered.sorted { lhs, rhs in
             if lhs.pinned != rhs.pinned { return lhs.pinned && !rhs.pinned }
             return lhs.updatedAt > rhs.updatedAt
         }
+        // Search must not hide the open teammate while Chat still shows them.
+        if let id = selectedBotID,
+           let selected = bots.first(where: { $0.id == id }),
+           !result.contains(where: { $0.id == id }) {
+            result.insert(selected, at: 0)
+        }
+        return result
     }
 
     public var openAttentionCount: Int { attentionItems.count }
@@ -377,15 +609,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func modelLabel(for bot: BotDefinition) -> String? {
-        if selectedBotID == bot.id,
-           let model = trimmedNonEmpty(selectedRevision?.model) {
-            return model
-        }
-        if let revisionID = bot.currentRevisionID,
-           let revision = try? botStore.getRevision(id: revisionID) {
-            return trimmedNonEmpty(revision.model)
-        }
-        return nil
+        trimmedNonEmpty(cachedRevision(for: bot)?.model)
     }
 
     public func permissionLabel(for bot: BotDefinition) -> String {
@@ -429,7 +653,28 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func beginEdit(_ bot: BotDefinition) {
-        let revision = bot.currentRevisionID.flatMap { try? botStore.getRevision(id: $0) }
+        loadStudioDraft(bot)
+        studioTab = .profile
+        screen = .studio
+        persistSelection()
+        leaveDeskLiveWatch()
+        reloadStudioSupport(id: bot.id)
+    }
+
+    /// Studio is a dest. Keep the last selected tab; Edit still opens Profile.
+    public func openStudio(_ bot: BotDefinition) {
+        loadStudioDraft(bot)
+        screen = .studio
+        persistSelection()
+        leaveDeskLiveWatch()
+        reloadStudioSupport(id: bot.id)
+    }
+
+    private func loadStudioDraft(_ bot: BotDefinition) {
+        // Studio dest used to getRevision on every dest even when the
+        // published revision was already in revisionByID from Desk chips.
+        let revision = cachedRevision(for: bot)
+        isApplyingStudioDraft = true
         studioDraft = BotStudioDraft(
             botID: bot.id,
             name: bot.name,
@@ -442,89 +687,164 @@ public final class BotsViewModel: ObservableObject {
             providerInstanceID: revision?.providerInstanceID ?? (revision?.provider.rawValue ?? "claude"),
             model: revision?.model ?? "",
             notificationsEnabled: bot.notificationsEnabled,
-            desktopKind: revision?.desktopKind ?? .logicalExecutionSpace,
+            desktopKind: resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace),
             expectedRevisionID: bot.currentRevisionID
         )
         if studioDraft.model.isEmpty {
             applyDefaultModel(for: studioDraft.provider)
         }
-        selectedBotID = bot.id
-        studioTab = .profile
-        screen = .studio
-        persistSelection()
-        reloadSelectedBot(id: bot.id)
+        applyPersistedStudioDraftIfMatching(bot.id)
+        isApplyingStudioDraft = false
+        adoptSelectedBot(bot.id)
     }
 
     public func openFleet() {
-        screen = .fleet
         reloadFleet()
         reloadAttention()
         restoreSelectedBotIfNeeded()
-        if let selectedBotID {
-            reloadSelectedBot(id: selectedBotID)
+        if selectedBotID == nil, let first = fleet.first {
+            adoptSelectedBot(first.id)
         }
-        persistSelection()
+        if let bot = selectedBot {
+            openDesk(bot)
+        } else {
+            screen = .desk
+            persistSelection()
+        }
     }
 
     public func openHome(_ bot: BotDefinition) {
-        selectedBotID = bot.id
-        screen = .fleet
-        persistSelection()
-        reloadAttention()
-        reloadSelectedBot(id: bot.id)
+        openDesk(bot)
     }
 
     public func openDesk(_ bot: BotDefinition) {
-        selectedBotID = bot.id
+        adoptSelectedBot(bot.id)
         screen = .desk
         persistSelection()
         markOpenedConversationRead(botID: bot.id)
         reloadSelectedBot(id: bot.id)
+        syncQueuedFollowUps()
+        drainQueuedFollowUp()
     }
 
     private func markOpenedConversationRead(botID: BotID) {
+        if let snapshot = studioSupportByBot[botID],
+           !Self.conversationsNeedMarkRead(snapshot.conversations),
+           !attentionItems.contains(where: {
+               $0.botID == botID && $0.acknowledgedAt == nil && $0.kind == .unread
+           }) {
+            applyAttentionState(for: botID, conversations: snapshot.conversations)
+            return
+        }
+        deskMarkReadStoreCountForTesting += 1
         do {
-            let items = try botStore.listConversations(botID: botID)
-            for var conversation in items where conversation.unread || conversation.attentionState == .unreadActivity {
-                conversation.unread = false
-                if conversation.attentionState == .unreadActivity {
-                    conversation.attentionState = .none
+            // Dest first. Mark-read dest used to listConversations and
+            // listAttention after dest already dested Chat. Dest cache
+            // already has this teammate's threads and dest inbox.
+            var items = destConversations(botID: botID)
+            if items.isEmpty {
+                conversationListCountForTesting += 1
+                items = try botStore.listConversations(botID: botID)
+            }
+            for index in items.indices where items[index].unread || items[index].attentionState == .unreadActivity {
+                items[index].unread = false
+                if items[index].attentionState == .unreadActivity {
+                    items[index].attentionState = .none
                 }
-                try botStore.upsertConversation(conversation)
+                try botStore.upsertConversation(items[index])
             }
-            for item in try botStore.listAttention() where item.botID == botID && item.acknowledgedAt == nil && item.kind == .unread {
+            let destUnread = attentionItems.filter {
+                $0.botID == botID && $0.acknowledgedAt == nil && $0.kind == .unread
+            }
+            for item in destUnread {
                 try botStore.acknowledgeAttention(id: item.id)
+                dropAcknowledgedAttention(item.id)
             }
-            reloadAttention()
-            reloadFleet()
+            applyAttentionState(for: botID, conversations: items)
+            rememberStudioSupportConversations(botID: botID, conversations: items)
         } catch {
             errorMessage = String(describing: error)
         }
+    }
+
+    private static func conversationsNeedMarkRead(_ conversations: [BotConversation]) -> Bool {
+        conversations.contains { $0.unread || $0.attentionState == .unreadActivity }
+    }
+
+    private func rememberStudioSupportConversations(botID: BotID, conversations: [BotConversation]) {
+        guard var snapshot = studioSupportByBot[botID] else { return }
+        snapshot.conversations = conversations
+        if let selected = snapshot.selectedConversation,
+           let updated = conversations.first(where: { $0.id == selected.id }) {
+            snapshot.selectedConversation = updated
+        } else {
+            snapshot.selectedConversation = conversations.first
+        }
+        studioSupportByBot[botID] = snapshot
+    }
+
+    private func patchStudioSupportConversation(_ conversation: BotConversation, botID: BotID) {
+        guard var snapshot = studioSupportByBot[botID] else { return }
+        if let index = snapshot.conversations.firstIndex(where: { $0.id == conversation.id }) {
+            snapshot.conversations[index] = conversation
+        } else {
+            snapshot.conversations.insert(conversation, at: 0)
+        }
+        if snapshot.selectedConversation?.id == conversation.id {
+            snapshot.selectedConversation = conversation
+        }
+        studioSupportByBot[botID] = snapshot
     }
 
     public func openAttention() {
+        // Dest first. Bell dest used to listAttention (and then list
+        // every teammate's conversations) before dest dested Chat.
+        // Dest already has dest inbox from send/settle dest.
+        if let item = destOpenAttentionItem() {
+            openAttention(item)
+            return
+        }
         reloadAttention()
-        screen = .attention
+        guard let item = attentionItems.first else {
+            // Home/Attention is not a dest. An empty bell must not
+            // yank Studio back to Chat.
+            return
+        }
+        openAttention(item)
+    }
+
+    /// Bell dest dests dest inbox. Cold dest still lists.
+    private func destOpenAttentionItem() -> BotAttentionItem? {
+        attentionItems.first(where: { $0.acknowledgedAt == nil })
     }
 
     public func openAttention(_ item: BotAttentionItem) {
-        do {
-            try botStore.acknowledgeAttention(id: item.id)
-        } catch {
-            errorMessage = String(describing: error)
-        }
-        reloadAttention()
-        if let bot = (try? botStore.get(id: item.botID)) ?? bots.first(where: { $0.id == item.botID }) {
+        // Dest first. Attention used to acknowledge and list the queue
+        // before Chat could paint, so first feedback waited on store writes.
+        if let bot = bots.first(where: { $0.id == item.botID }) {
+            openDesk(bot)
+        } else if let bot = try? botStore.get(id: item.botID) {
             openDesk(bot)
         } else {
-            screen = .fleet
+            screen = .desk
+        }
+        lastAttentionAcknowledgedOnScreenForTesting = screen
+        do {
+            // Dest first. Acknowledge used to listAttention after dest
+            // painted Chat. The store already marked this row read.
+            try botStore.acknowledgeAttention(id: item.id)
+            dropAcknowledgedAttention(item.id)
+        } catch {
+            errorMessage = String(describing: error)
         }
     }
 
     public func acknowledge(_ item: BotAttentionItem) {
         do {
+            // Dest first. Acknowledge used to listAttention after the
+            // store marked this row read. Drop it locally.
             try botStore.acknowledgeAttention(id: item.id)
-            reloadAttention()
+            dropAcknowledgedAttention(item.id)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -541,7 +861,8 @@ public final class BotsViewModel: ObservableObject {
         providerInstanceID: String? = nil,
         model: String = "",
         avatarSymbol: String = "person.crop.circle",
-        notificationsEnabled: Bool = true
+        notificationsEnabled: Bool = true,
+        desktopKind: BotDesktopKind = .logicalExecutionSpace
     ) throws -> BotDefinition {
         guard isControlPlaneActive else {
             errorMessage = "Turn on Bot control plane in Settings"
@@ -560,11 +881,13 @@ public final class BotsViewModel: ObservableObject {
             provider: provider,
             providerInstanceID: providerInstanceID ?? provider.rawValue,
             model: resolvedModel,
+            desktopKind: resolvedDesktopKind(desktopKind),
             workspaceID: context.state.window.selectedWorkspaceID,
             notificationsEnabled: notificationsEnabled
         )
-        selectedBotID = bot.id
-        reloadFleet()
+        // Dest first. Create used to reloadFleet (every teammate's
+        // conversations + recent messages) before Chat could paint.
+        adoptCreatedBot(bot)
         return bot
     }
 
@@ -602,11 +925,22 @@ public final class BotsViewModel: ObservableObject {
                 notificationsEnabled: studioDraft.notificationsEnabled
             )
             studioDraft.expectedRevisionID = published.id
-            selectedBotID = botID
-            reloadFleet()
-            reloadSelectedBot(id: botID)
+            studioDraft.desktopKind = desktop
+            // Dest first. Save used to force-reload studio support
+            // (conversations, skills, memory, routines, receipt) after
+            // publish already returned this revision. Patch the row
+            // and the revision locally so dest does not reread inspector.
+            var saved = bot
+            saved.name = published.name
+            saved.title = published.title
+            saved.description = published.description
+            saved.avatarSymbol = studioDraft.avatarSymbol
+            saved.notificationsEnabled = studioDraft.notificationsEnabled
+            saved.currentRevisionID = published.id
+            saved.updatedAt = Date()
+            adoptPublishedRevision(published, bot: saved)
             screen = .studio
-            return try botStore.get(id: botID) ?? bot
+            return saved
         }
         let created = try create(
             name: name,
@@ -618,7 +952,8 @@ public final class BotsViewModel: ObservableObject {
             providerInstanceID: studioDraft.providerInstanceID.isEmpty ? nil : studioDraft.providerInstanceID,
             model: studioDraft.model,
             avatarSymbol: studioDraft.avatarSymbol,
-            notificationsEnabled: studioDraft.notificationsEnabled
+            notificationsEnabled: studioDraft.notificationsEnabled,
+            desktopKind: desktop
         )
         beginEdit(created)
         return created
@@ -631,15 +966,24 @@ public final class BotsViewModel: ObservableObject {
             throw BotPublishError.controlPlaneDisabled
         }
         let copy = try botStore.duplicate(id: id)
-        selectedBotID = copy.id
-        reloadFleet()
+        // Dest first. Copy used to reloadFleet before Chat/Studio could
+        // paint. The store already returned the new row.
+        adoptCreatedBot(copy)
         return copy
     }
 
     public func setPinned(id: BotID, pinned: Bool) {
         do {
             try botStore.setPinned(id: id, pinned: pinned)
-            reloadFleet()
+            // Dest first. Pin used to reloadFleet (every teammate's
+            // conversations + recent messages) before the roster could
+            // resort. The store already wrote this row.
+            if var bot = bots.first(where: { $0.id == id }) {
+                bot.pinned = pinned
+                rememberFleetBot(bot)
+            } else {
+                reloadFleet()
+            }
         } catch {
             errorMessage = String(describing: error)
         }
@@ -648,11 +992,52 @@ public final class BotsViewModel: ObservableObject {
     public func setHidden(id: BotID, hidden: Bool) {
         do {
             try botStore.setHidden(id: id, hidden: hidden)
-            if hidden, selectedBotID == id {
-                selectedBotID = nil
-                screen = .fleet
+            let leaving = hidden && selectedBotID == id
+            // Dest first. Hide used to reloadFleet (every teammate's
+            // conversations + recent messages) before the roster could
+            // drop the row. The store already wrote this row.
+            applyHiddenLocally(id: id, hidden: hidden)
+            if leaving {
+                adoptRemainingTeammate(afterRemoving: id)
             }
-            reloadFleet()
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    private func applyShowHiddenLocally() {
+        if !showHidden {
+            bots.removeAll { $0.hidden }
+            return
+        }
+        do {
+            bots = try botStore.list(includeHidden: true)
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    private func applyHiddenLocally(id: BotID, hidden: Bool) {
+        if hidden, !showHidden {
+            bots.removeAll { $0.id == id }
+            return
+        }
+        if var bot = bots.first(where: { $0.id == id }) {
+            bot.hidden = hidden
+            rememberFleetBot(bot)
+            return
+        }
+        reloadFleet()
+    }
+
+    public func duplicateFromRoster(_ bot: BotDefinition) {
+        do {
+            let copy = try duplicate(id: bot.id)
+            if screen == .studio {
+                beginEdit(copy)
+            } else {
+                openDesk(copy)
+            }
         } catch {
             errorMessage = String(describing: error)
         }
@@ -661,15 +1046,48 @@ public final class BotsViewModel: ObservableObject {
     public func delete(id: BotID) {
         do {
             try botStore.delete(id: id)
-            if selectedBotID == id {
-                selectedBotID = nil
-                screen = .fleet
+            let leaving = selectedBotID == id
+            queuedFollowUpsByBot[id] = nil
+            composerDraftsByBot[id] = nil
+            inspectorDraftsByBot[id] = nil
+            clearPersistedStudioDraft(for: id)
+            clearDeskSendInFlight(for: id)
+            persistQueuedFollowUps()
+            persistComposerDrafts()
+            persistInspectorDrafts()
+            syncQueuedFollowUps()
+            // Dest first. Delete used to reloadFleet (every teammate's
+            // conversations + recent messages) before Chat could dest the
+            // next row, then listAttention after dest already dested.
+            // The store already removed this teammate; dest inbox is
+            // already dropped locally.
+            bots.removeAll { $0.id == id }
+            attentionItems.removeAll { $0.botID == id }
+            if leaving {
+                adoptRemainingTeammate(afterRemoving: id)
             }
-            reloadFleet()
-            reloadAttention()
         } catch {
             errorMessage = String(describing: error)
         }
+    }
+
+    /// Hide/Delete of the open teammate must not dump Chat on empty desk
+    /// while the roster still has rows. Home is gone; pick the next visible
+    /// teammate. Stay put only when Show hidden still lists the same row.
+    private func adoptRemainingTeammate(afterRemoving removedID: BotID) {
+        if fleet.contains(where: { $0.id == removedID }) {
+            if let bot = fleet.first(where: { $0.id == removedID }) {
+                openDesk(bot)
+            }
+            return
+        }
+        if let next = fleet.first {
+            openDesk(next)
+            return
+        }
+        adoptSelectedBot(nil)
+        screen = .desk
+        persistSelection()
     }
 
     public var deskRunIsLive: Bool {
@@ -677,7 +1095,8 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public var deskShowsLoading: Bool {
-        deskSendInFlight && !deskRunIsLive
+        guard deskSendInFlight, !deskRunIsLive else { return false }
+        return deskSendInFlightBotID == nil || deskSendInFlightBotID == selectedBotID
     }
 
     public var deskSendEnabled: Bool {
@@ -728,6 +1147,16 @@ public final class BotsViewModel: ObservableObject {
         attachments.removeAll { $0 == attachment }
     }
 
+    public func removeQueuedFollowUp(_ item: BotQueuedFollowUp) {
+        guard let botID = selectedBotID else { return }
+        queuedFollowUpsByBot[botID]?.removeAll { $0.id == item.id }
+        if queuedFollowUpsByBot[botID]?.isEmpty == true {
+            queuedFollowUpsByBot[botID] = nil
+        }
+        persistQueuedFollowUps()
+        syncQueuedFollowUps()
+    }
+
     public func stopDeskRun() {
         guard let threadID = selectedConversation?.linkedAgentThreadID else { return }
         isStopping = true
@@ -739,37 +1168,49 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    public func send(_ text: String? = nil) {
+    @discardableResult
+    public func send(_ text: String? = nil) -> Bool {
         let attached = attachments
         let message = (text ?? composerText).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard AgentChatTranscriptChrome.admitsSend(text: message, attachmentCount: attached.count) else { return }
-        guard let bot = selectedBot else { return }
+        guard AgentChatTranscriptChrome.admitsSend(text: message, attachmentCount: attached.count) else { return false }
+        guard let bot = selectedBot else { return false }
+        lastSendAcknowledgedOnScreenForTesting = screen
         composerText = ""
         attachments = []
         lastSendStartedProviderRun = false
         if deskRunIsLive, text == nil {
-            queuedFollowUps.append(BotQueuedFollowUp(text: message, attachments: attached))
-            return
+            enqueueFollowUp(
+                BotQueuedFollowUp(text: message, attachments: attached),
+                botID: bot.id
+            )
+            return true
         }
         do {
             let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attached)
             let conversation = try persistUserMessage(bot: bot, text: display)
             appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: bot.id)
+            // Dest first. Send used to listMemory/listSkillBindings
+            // after dest painted the bubble. Snapshot dest cache here
+            // so dest does not reread the brain.
+            let brain = destBrainInputs(for: bot)
+            lastSendUsedDestBrainForTesting = selectedBotID == bot.id
             if let router = resolvedRouter(),
                let revision = try currentRevision(for: bot) {
-                deskSendInFlight = true
-                deskSendInFlightStartedAt = Date()
+                beginDeskSendInFlight(for: bot.id)
                 Task { [weak self] in
                     guard let self else { return }
+                    await Task.yield()
                     let started = await self.startSupervisedRun(
                         bot: bot,
                         revision: revision,
                         conversation: conversation,
                         userText: message,
                         attachments: attached,
+                        memory: brain.memory,
+                        skills: brain.skills,
                         router: router
                     )
-                    self.deskSendInFlight = false
+                    self.clearDeskSendInFlight(for: bot.id)
                     if let runId = started {
                         self.lastSendStartedProviderRun = true
                         self.lastLinkedRunIDByBot[bot.id] = runId
@@ -788,20 +1229,31 @@ public final class BotsViewModel: ObservableObject {
             } else {
                 recordNeedsAttention(bot: bot, conversation: conversation, userText: message)
             }
+            return true
         } catch {
             errorMessage = String(describing: error)
+            return false
         }
     }
 
     public func addSkill() {
         let skillID = skillDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !skillID.isEmpty, let bot = selectedBot else { return }
+        guard !skillID.contains("/") else {
+            errorMessage = "Catalog ids only. A skill id is not a filesystem path."
+            return
+        }
         do {
-            try botStore.setSkillBinding(
-                BotSkillBinding(botID: bot.id, skillID: skillID, enabled: true)
+            // Dest first. Add used to listSkillBindings after the store
+            // wrote this binding. The binding is already the row.
+            let binding = BotSkillBinding(
+                botID: bot.id,
+                skillID: skillID,
+                enabled: true
             )
+            try botStore.setSkillBinding(binding)
             skillDraft = ""
-            skillBindings = try botStore.listSkillBindings(botID: bot.id)
+            adoptWrittenSkill(binding)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -810,10 +1262,16 @@ public final class BotsViewModel: ObservableObject {
     public func setSkillEnabled(skillID: String, enabled: Bool) {
         guard let bot = selectedBot else { return }
         do {
-            try botStore.setSkillBinding(
-                BotSkillBinding(botID: bot.id, skillID: skillID, enabled: enabled)
+            // Dest first. Enable used to listSkillBindings after the
+            // store wrote this binding. Patch it locally so dest does
+            // not reread every skill.
+            let binding = BotSkillBinding(
+                botID: bot.id,
+                skillID: skillID,
+                enabled: enabled
             )
-            skillBindings = try botStore.listSkillBindings(botID: bot.id)
+            try botStore.setSkillBinding(binding)
+            adoptEnabledSkill(binding)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -836,17 +1294,58 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public var studioDesktopSummary: String {
-        switch resolvedDesktopKind(studioDraft.desktopKind) {
-        case .logicalExecutionSpace:
-            return "Logical execution space"
-        case .dedicatedLocalVM:
-            return "Dedicated local VM"
-        case .managedRemoteMac:
-            return "Managed remote Mac"
-        }
+        resolvedDesktopKind(studioDraft.desktopKind).displayTitle
     }
 
     public var studioApprovalLabel: String { "Supervised" }
+
+    public var inspectedBrain: ContextAssemblyReceipt? {
+        if screen == .studio {
+            return previewBrain()
+        }
+        return lastContextReceipt ?? previewBrain()
+    }
+
+    public var inspectedBrainIsPreview: Bool {
+        screen == .studio || lastContextReceipt == nil
+    }
+
+    public var inspectedBrainIsLastCall: Bool {
+        screen != .studio && lastContextReceipt?.runID != nil
+    }
+
+    public func previewBrain(userText: String? = nil) -> ContextAssemblyReceipt? {
+        let text = (userText ?? composerText)
+        let request = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let bot = selectedBot ?? studioPreviewBot() else { return nil }
+        guard let revision = studioPreviewRevision(for: bot) ?? selectedRevision else { return nil }
+        let memory = selectedBotID == bot.id
+            ? memoryItems
+            : ((try? botStore.listMemory(botID: bot.id, includeForgotten: true)) ?? memoryItems)
+        let key = [
+            bot.id.value.uuidString,
+            revision.digest,
+            request,
+            memory.map(\.content).joined(separator: "\u{1e}"),
+            skillBindings.map(\.skillID).joined(separator: ","),
+            selectedConversation?.id.value.uuidString ?? "",
+        ].joined(separator: "\u{1f}")
+        if cachedPreviewBrainKey == key, let cached = cachedPreviewBrain {
+            return cached
+        }
+        previewBrainAssembleCountForTesting += 1
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: request,
+            memory: memory,
+            skills: skillBindings,
+            conversationID: selectedConversation?.id
+        )
+        cachedPreviewBrainKey = key
+        cachedPreviewBrain = receipt
+        return receipt
+    }
 
     public var studioHasUnpublishedChanges: Bool {
         guard let revision = selectedRevision else { return studioDraft.isNew }
@@ -857,7 +1356,7 @@ public final class BotsViewModel: ObservableObject {
             || studioDraft.soul != revision.soul
             || studioDraft.provider != revision.provider
             || studioDraft.model != revision.model
-            || studioDraft.desktopKind != revision.desktopKind
+            || resolvedDesktopKind(studioDraft.desktopKind) != resolvedDesktopKind(revision.desktopKind)
             || studioDraft.notificationsEnabled != (bot?.notificationsEnabled ?? true)
             || studioDraft.avatarSymbol != (bot?.avatarSymbol ?? "person.crop.circle")
     }
@@ -867,7 +1366,9 @@ public final class BotsViewModel: ObservableObject {
         let content = memoryDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty, let bot = selectedBot else { return }
         do {
-            _ = try botStore.putMemory(
+            // Dest first. Add used to listMemory after putMemory before
+            // the new fact could paint. The store already returned the row.
+            let item = try botStore.putMemory(
                 botID: bot.id,
                 content: content,
                 provenance: "user",
@@ -875,7 +1376,7 @@ public final class BotsViewModel: ObservableObject {
                 source: "studio"
             )
             memoryDraft = ""
-            reloadMemory(botID: bot.id)
+            adoptWrittenMemory(item)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -886,8 +1387,10 @@ public final class BotsViewModel: ObservableObject {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         do {
-            _ = try botStore.correctMemory(id: id, content: trimmed)
-            if let botID = selectedBotID { reloadMemory(botID: botID) }
+            // Dest first. Correct used to listMemory after the store
+            // returned the revised row. Insert it locally.
+            let item = try botStore.correctMemory(id: id, content: trimmed)
+            adoptWrittenMemory(item)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -896,8 +1399,10 @@ public final class BotsViewModel: ObservableObject {
     public func forgetMemory(id: BotMemoryItemID) {
         guard isMemoryActive else { return }
         do {
+            // Dest first. Forget used to listMemory after the store
+            // marked the row forgotten. Drop it locally.
             try botStore.forgetMemory(id: id)
-            if let botID = selectedBotID { reloadMemory(botID: botID) }
+            dropForgottenMemory(id)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -912,18 +1417,19 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         do {
-            try botStore.saveRoutine(
-                BotRoutineDefinition(
-                    botID: bot.id,
-                    name: name,
-                    prompt: prompt,
-                    scheduleNote: routineScheduleNote
-                )
+            // Dest first. Save used to listRoutines after the store
+            // wrote this schedule. The definition is already the row.
+            let definition = BotRoutineDefinition(
+                botID: bot.id,
+                name: name,
+                prompt: prompt,
+                scheduleNote: routineScheduleNote
             )
+            try botStore.saveRoutine(definition)
             routineName = ""
             routinePrompt = ""
             routineScheduleNote = ""
-            reloadRoutines(botID: bot.id)
+            adoptWrittenRoutine(definition)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -931,8 +1437,11 @@ public final class BotsViewModel: ObservableObject {
 
     public func setRoutineEnabled(id: BotRoutineID, enabled: Bool) {
         do {
+            // Dest first. Enable used to listRoutines after the store
+            // wrote this activation. Patch it locally so dest does not
+            // reread every schedule.
             try botStore.setRoutineEnabled(id: id, enabled: enabled)
-            if let botID = selectedBotID { reloadRoutines(botID: botID) }
+            adoptEnabledRoutine(id: id, enabled: enabled)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -946,14 +1455,18 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         do {
+            // Dest first. Test run used to listRoutines after the store
+            // stamped last_test_run_requested_at. Patch it locally so
+            // dest does not reread every schedule.
             try botStore.requestRoutineTestRun(id: id)
-            if let botID = selectedBotID { reloadRoutines(botID: botID) }
-            if let bot = selectedBot, screen != .desk {
+            adoptTestRunRequested(id: id)
+            // Acknowledge the click (user bubble / Loading…) before dest
+            // reload. Studio Test run used to openDesk first, so first
+            // feedback waited on mark-read and transcript restore.
+            let sent = send(instruction)
+            if sent, let bot = selectedBot, screen != .desk {
                 openDesk(bot)
             }
-            // Test run is a live supervised turn. Enabling a schedule still
-            // does not execute while RemoteCode is closed.
-            send(instruction)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -997,11 +1510,10 @@ public final class BotsViewModel: ObservableObject {
         isControlPlaneActive = settings.isBotControlPlaneActive
         isMemoryActive = settings.isBotMemoryActive
         isAutonomyActive = settings.isBotAutonomyActive
-        isDesktopVMActive = settings.isBotDesktopVMActive
-        isDesktopRemoteActive = settings.isBotDesktopRemoteActive
     }
 
     private func reloadFleet() {
+        fleetReloadCountForTesting += 1
         do {
             bots = try botStore.list(includeHidden: showHidden)
             var previews: [BotID: String] = [:]
@@ -1028,6 +1540,10 @@ public final class BotsViewModel: ObservableObject {
             lastPreviewByBot = previews
             lastUpdatedByBot = updated
             rebuildAttentionStates()
+            pruneQueuedFollowUpsToFleet()
+            pruneComposerDraftsToFleet()
+            pruneInspectorDraftsToFleet()
+            pruneStudioDraftsToFleet()
         } catch {
             errorMessage = String(describing: error)
         }
@@ -1035,6 +1551,7 @@ public final class BotsViewModel: ObservableObject {
 
     private func reloadAttention() {
         do {
+            attentionListCountForTesting += 1
             attentionItems = try botStore.listAttention()
             rebuildAttentionStates()
         } catch {
@@ -1050,27 +1567,56 @@ public final class BotsViewModel: ObservableObject {
         for bot in bots {
             if states[bot.id] == .needsAttention { continue }
             let conversations = (try? botStore.listConversations(botID: bot.id)) ?? []
-            if conversations.contains(where: { $0.attentionState == .needsAttention }) {
-                states[bot.id] = .needsAttention
-            } else if conversations.contains(where: { $0.attentionState == .working }) {
-                states[bot.id] = .working
-            } else if conversations.contains(where: { $0.unread || $0.attentionState == .unreadActivity }) {
-                states[bot.id] = .unreadActivity
-            } else {
-                states[bot.id] = BotAttentionState.none
-            }
+            states[bot.id] = Self.attentionState(from: conversations, hasOpenAttention: false)
         }
         attentionStateByBot = states
     }
 
-    private func reloadSelectedBot(id: BotID) {
+    private func applyAttentionState(for botID: BotID, conversations: [BotConversation]) {
+        var states = attentionStateByBot
+        let hasOpenAttention = attentionItems.contains {
+            $0.botID == botID && $0.acknowledgedAt == nil
+        }
+        states[botID] = Self.attentionState(from: conversations, hasOpenAttention: hasOpenAttention)
+        attentionStateByBot = states
+    }
+
+    private static func attentionState(
+        from conversations: [BotConversation],
+        hasOpenAttention: Bool
+    ) -> BotAttentionState {
+        if hasOpenAttention { return .needsAttention }
+        if conversations.contains(where: { $0.attentionState == .needsAttention }) {
+            return .needsAttention
+        }
+        if conversations.contains(where: { $0.attentionState == .working }) {
+            return .working
+        }
+        if conversations.contains(where: { $0.unread || $0.attentionState == .unreadActivity }) {
+            return .unreadActivity
+        }
+        return .none
+    }
+
+    private func leaveDeskLiveWatch() {
         deskLiveTurnWatch?.cancel()
         deskLiveTurnWatch = nil
-        deskSendInFlight = false
-        deskLiveTimeline = liveTimelineByBot[id] ?? AssistantTimelineState()
-        deskStreamEventCount = liveStreamCountByBot[id] ?? 0
-        deskMessages = messagesByBot[id] ?? []
+    }
+
+    /// Studio dest needs revision, memory, skills, routines, and the last
+    /// brain receipt. It does not show Chat, so it must not replay the desk
+    /// stream before the dest can paint. Desk dest used to pay the same
+    /// six store reads on every roster click even when that inspector
+    /// snapshot was already warm.
+    private func reloadStudioSupport(id: BotID, force: Bool = false) {
+        if !force, let cached = studioSupportByBot[id] {
+            applyStudioSupport(cached)
+            syncQueuedFollowUps()
+            return
+        }
+        studioSupportReloadCountForTesting += 1
         do {
+            conversationListCountForTesting += 1
             conversations = try botStore.listConversations(botID: id)
             selectedConversation = conversations.first
             if let bot = try botStore.get(id: id) {
@@ -1078,15 +1624,128 @@ public final class BotsViewModel: ObservableObject {
             } else {
                 selectedRevision = nil
             }
+            skillListCountForTesting += 1
             skillBindings = try botStore.listSkillBindings(botID: id)
             reloadMemory(botID: id)
             reloadRoutines(botID: id)
-            restoreDeskMessages(botID: id)
-            restoreDeskWorkLog(botID: id)
-            restoreDeskLiveTurn(botID: id)
+            reloadContextReceipt(botID: id)
+            rememberStudioSupport(for: id)
+            syncQueuedFollowUps()
         } catch {
             errorMessage = String(describing: error)
         }
+    }
+
+    private func applyStudioSupport(_ snapshot: BotStudioSupportSnapshot) {
+        conversations = snapshot.conversations
+        selectedConversation = snapshot.selectedConversation
+        selectedRevision = snapshot.selectedRevision
+        skillBindings = snapshot.skillBindings
+        memoryItems = snapshot.memoryItems
+        lastContextReceipt = snapshot.lastContextReceipt
+        routines = snapshot.routines
+    }
+
+    private func rememberStudioSupport(for id: BotID) {
+        studioSupportByBot[id] = BotStudioSupportSnapshot(
+            conversations: conversations,
+            selectedConversation: selectedConversation,
+            selectedRevision: selectedRevision,
+            skillBindings: skillBindings,
+            memoryItems: memoryItems,
+            lastContextReceipt: lastContextReceipt,
+            routines: routines
+        )
+    }
+
+    /// Add dest used to listMemory after putMemory. The store already
+    /// returned the row; insert it locally so dest does not reread facts.
+    private func adoptWrittenMemory(_ item: BotMemoryItem) {
+        memoryItems.removeAll { $0.id == item.id }
+        memoryItems.insert(item, at: 0)
+        rememberStudioSupport(for: item.botID)
+    }
+
+    /// Forget dest used to listMemory after the store marked the row.
+    /// Drop it locally so dest does not reread facts.
+    private func dropForgottenMemory(_ id: BotMemoryItemID) {
+        memoryItems.removeAll { $0.id == id }
+        if let botID = selectedBotID {
+            rememberStudioSupport(for: botID)
+        }
+    }
+
+    /// Save dest used to listRoutines after the store wrote this
+    /// schedule. Insert it locally so dest does not reread routines.
+    private func adoptWrittenRoutine(_ definition: BotRoutineDefinition) {
+        let routine = BotRoutine(
+            definition: definition,
+            activation: BotRoutineActivation(
+                routineID: definition.id,
+                botID: definition.botID,
+                isEnabled: false
+            )
+        )
+        routines.removeAll { $0.definition.id == definition.id }
+        routines.insert(routine, at: 0)
+        rememberStudioSupport(for: definition.botID)
+    }
+
+    /// Enable dest used to listRoutines after the store wrote this
+    /// activation. Patch it locally so dest does not reread schedules.
+    private func adoptEnabledRoutine(id: BotRoutineID, enabled: Bool) {
+        guard let index = routines.firstIndex(where: { $0.definition.id == id }) else {
+            return
+        }
+        var routine = routines[index]
+        routine.activation.isEnabled = enabled
+        routine.activation.updatedAt = Date()
+        routines[index] = routine
+        rememberStudioSupport(for: routine.definition.botID)
+    }
+
+    /// Add dest used to listSkillBindings after the store wrote this
+    /// binding. Insert it locally so dest does not reread skills.
+    private func adoptWrittenSkill(_ binding: BotSkillBinding) {
+        skillBindings.removeAll { $0.skillID == binding.skillID }
+        skillBindings.insert(binding, at: 0)
+        rememberStudioSupport(for: binding.botID)
+    }
+
+    /// Enable dest used to listSkillBindings after the store wrote this
+    /// binding. Patch it locally so dest does not reread skills.
+    private func adoptEnabledSkill(_ binding: BotSkillBinding) {
+        guard let index = skillBindings.firstIndex(where: { $0.skillID == binding.skillID }) else {
+            return
+        }
+        skillBindings[index] = binding
+        rememberStudioSupport(for: binding.botID)
+    }
+
+    /// Test run dest used to listRoutines after the store stamped this
+    /// request. Patch it locally so dest does not reread schedules.
+    private func adoptTestRunRequested(id: BotRoutineID) {
+        guard let index = routines.firstIndex(where: { $0.definition.id == id }) else {
+            return
+        }
+        var routine = routines[index]
+        routine.activation.lastTestRunRequestedAt = Date()
+        routine.activation.updatedAt = Date()
+        routines[index] = routine
+        rememberStudioSupport(for: routine.definition.botID)
+    }
+
+    private func reloadSelectedBot(id: BotID) {
+        leaveDeskLiveWatch()
+        deskLiveTimeline = liveTimelineByBot[id] ?? AssistantTimelineState()
+        deskStreamEventCount = liveStreamCountByBot[id] ?? 0
+        deskMessages = messagesByBot[id] ?? []
+        reloadStudioSupport(id: id)
+        if messagesByBot[id]?.isEmpty != false {
+            restoreDeskMessages(botID: id)
+        }
+        restoreDeskWorkLog(botID: id)
+        restoreDeskLiveTurn(botID: id)
     }
 
     public func providerChipTitle(_ provider: AgentProvider) -> String {
@@ -1102,18 +1761,20 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func resolvedProvider(for bot: BotDefinition) -> AgentProvider? {
-        if selectedBotID == bot.id, let provider = selectedRevision?.provider {
-            return provider
-        }
-        if let revisionID = bot.currentRevisionID,
-           let revision = try? botStore.getRevision(id: revisionID) {
-            return revision.provider
-        }
-        return nil
+        cachedRevision(for: bot)?.provider
     }
 
     private static let selectedBotDefaultsKey = "bots.selectedBotID"
     private static let inspectorTabDefaultsKey = "bots.inspectorTab"
+    private static let screenDefaultsKey = "bots.screen"
+    private static let studioTabDefaultsKey = "bots.studioTab"
+    private static let showHiddenDefaultsKey = "bots.showHidden"
+    private static let brainPaneDefaultsKey = "bots.brainPane"
+    private static let queuedFollowUpsDefaultsKey = "bots.queuedFollowUps"
+    private static let composerDraftsDefaultsKey = "bots.composerDrafts"
+    private static let inspectorDraftsDefaultsKey = "bots.inspectorDrafts"
+    private static let studioDraftDefaultsKey = "bots.studioDraft"
+    private static let searchTextDefaultsKey = "bots.searchText"
 
     private func persistSelection() {
         UserDefaults.standard.set(selectedBotID?.value.uuidString.lowercased(), forKey: Self.selectedBotDefaultsKey)
@@ -1123,23 +1784,380 @@ public final class BotsViewModel: ObservableObject {
         UserDefaults.standard.set(inspectorTab.rawValue, forKey: Self.inspectorTabDefaultsKey)
     }
 
+    private func persistScreen() {
+        UserDefaults.standard.set(screen.rawValue, forKey: Self.screenDefaultsKey)
+    }
+
+    private func persistStudioTab() {
+        UserDefaults.standard.set(studioTab.rawValue, forKey: Self.studioTabDefaultsKey)
+    }
+
+    private func persistStudioDraftIfHydrated() {
+        guard studioDraftHydrated, !isApplyingStudioDraft else { return }
+        persistStudioDraft()
+    }
+
+    private func persistStudioDraft() {
+        guard let botID = studioDraft.botID else { return }
+        var draft = studioDraft
+        draft.desktopKind = resolvedDesktopKind(draft.desktopKind)
+        studioDraftsByBot[botID] = draft
+        persistStudioDrafts()
+    }
+
+    private func persistStudioDrafts() {
+        let payload = Dictionary(uniqueKeysWithValues: studioDraftsByBot.map {
+            ($0.key.value.uuidString.lowercased(), $0.value)
+        })
+        if payload.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.studioDraftDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.studioDraftDefaultsKey)
+        }
+    }
+
+    private func restoreStudioDraftIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.studioDraftDefaultsKey) else { return }
+        if let payload = try? JSONDecoder().decode([String: BotStudioDraft].self, from: data) {
+            var restored: [BotID: BotStudioDraft] = [:]
+            for (raw, draft) in payload {
+                guard let uuid = UUID(uuidString: raw) else { continue }
+                restored[BotID(uuid)] = draft
+            }
+            studioDraftsByBot = restored
+            return
+        }
+        if let draft = try? JSONDecoder().decode(BotStudioDraft.self, from: data),
+           let botID = draft.botID {
+            studioDraftsByBot = [botID: draft]
+        }
+    }
+
+    private func applyPersistedStudioDraftIfMatching(_ botID: BotID) {
+        guard var saved = studioDraftsByBot[botID] else { return }
+        saved.desktopKind = resolvedDesktopKind(saved.desktopKind)
+        studioDraft = saved
+    }
+
+    private func clearPersistedStudioDraft(for botID: BotID) {
+        guard studioDraftsByBot[botID] != nil else { return }
+        studioDraftsByBot[botID] = nil
+        persistStudioDrafts()
+    }
+
+    private func pruneStudioDraftsToFleet() {
+        let live = Set(bots.map(\.id))
+        let next = studioDraftsByBot.filter { live.contains($0.key) }
+        guard next.count != studioDraftsByBot.count else { return }
+        studioDraftsByBot = next
+        persistStudioDrafts()
+    }
+
+    private func persistSearchText() {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.searchTextDefaultsKey)
+        } else {
+            UserDefaults.standard.set(searchText, forKey: Self.searchTextDefaultsKey)
+        }
+    }
+
+    private func restoreSearchTextIfNeeded() {
+        searchText = UserDefaults.standard.string(forKey: Self.searchTextDefaultsKey) ?? ""
+    }
+
+    private func persistShowHidden() {
+        UserDefaults.standard.set(showHidden, forKey: Self.showHiddenDefaultsKey)
+    }
+
+    private func restoreShowHiddenIfNeeded() {
+        showHidden = UserDefaults.standard.bool(forKey: Self.showHiddenDefaultsKey)
+    }
+
+    private func persistBrainPane() {
+        UserDefaults.standard.set(brainPane.rawValue, forKey: Self.brainPaneDefaultsKey)
+    }
+
+    private func restoreBrainPaneIfNeeded() {
+        guard let raw = UserDefaults.standard.string(forKey: Self.brainPaneDefaultsKey),
+              let pane = BotBrainInspectorPane(rawValue: raw) else { return }
+        brainPane = pane
+    }
+
+    private func persistQueuedFollowUps() {
+        let payload = Dictionary(uniqueKeysWithValues: queuedFollowUpsByBot.map {
+            ($0.key.value.uuidString.lowercased(), $0.value)
+        })
+        if payload.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.queuedFollowUpsDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.queuedFollowUpsDefaultsKey)
+        }
+    }
+
+    private func restoreQueuedFollowUpsIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.queuedFollowUpsDefaultsKey),
+              let payload = try? JSONDecoder().decode([String: [BotQueuedFollowUp]].self, from: data)
+        else { return }
+        var restored: [BotID: [BotQueuedFollowUp]] = [:]
+        for (raw, items) in payload {
+            guard let uuid = UUID(uuidString: raw) else { continue }
+            let kept = items.filter {
+                !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !$0.attachments.isEmpty
+            }
+            if !kept.isEmpty {
+                restored[BotID(uuid)] = kept
+            }
+        }
+        queuedFollowUpsByBot = restored
+    }
+
+    private func pruneQueuedFollowUpsToFleet() {
+        let live = Set(bots.map(\.id))
+        let next = queuedFollowUpsByBot.filter { live.contains($0.key) }
+        guard next.count != queuedFollowUpsByBot.count else { return }
+        queuedFollowUpsByBot = next
+        persistQueuedFollowUps()
+        syncQueuedFollowUps()
+    }
+
+    private func persistComposerIfHydrated() {
+        guard composerHydrated, !isApplyingComposerDraft else { return }
+        captureComposerDraft()
+    }
+
+    /// Create/copy dest used to reloadFleet before Chat/Studio painted.
+    /// The store already returned the new row; insert it locally so dest
+    /// does not list every teammate. Hide/pin/delete/reload still list.
+    private func rememberFleetBot(_ bot: BotDefinition) {
+        if let index = bots.firstIndex(where: { $0.id == bot.id }) {
+            bots[index] = bot
+        } else {
+            bots.append(bot)
+        }
+    }
+
+    /// Save dest used to force-reload studio support after publish.
+    /// The revision is already the row; dest must not reread inspector.
+    private func adoptPublishedRevision(_ revision: BotRevision, bot: BotDefinition) {
+        rememberFleetBot(bot)
+        revisionByID[revision.id] = revision
+        selectedRevision = revision
+        rememberStudioSupport(for: bot.id)
+        adoptSelectedBot(bot.id)
+    }
+
+    private func adoptCreatedBot(_ bot: BotDefinition) {
+        rememberFleetBot(bot)
+        attentionStateByBot[bot.id] = BotAttentionState.none
+        adoptSelectedBot(bot.id)
+    }
+
+    private func adoptSelectedBot(_ id: BotID?) {
+        if selectedBotID == id {
+            if composerHydrated {
+                captureComposerDraft()
+            } else {
+                applyComposerDraft(for: id)
+            }
+            if inspectorHydrated {
+                captureInspectorDraft()
+            } else {
+                applyInspectorDraft(for: id)
+            }
+            return
+        }
+        if composerHydrated {
+            captureComposerDraft()
+        }
+        if inspectorHydrated {
+            captureInspectorDraft()
+        }
+        selectedBotID = id
+        applyComposerDraft(for: id)
+        applyInspectorDraft(for: id)
+    }
+
+    private func captureComposerDraft(for botID: BotID? = nil) {
+        guard let botID = botID ?? selectedBotID else { return }
+        let draft = BotComposerDraft(text: composerText, attachments: attachments)
+        if draft.isEmpty {
+            composerDraftsByBot[botID] = nil
+        } else {
+            composerDraftsByBot[botID] = draft
+        }
+        persistComposerDrafts()
+    }
+
+    private func applyComposerDraft(for botID: BotID?) {
+        let draft = botID.flatMap { composerDraftsByBot[$0] }
+        isApplyingComposerDraft = true
+        composerText = draft?.text ?? ""
+        attachments = draft?.liveAttachments ?? []
+        isApplyingComposerDraft = false
+        composerHydrated = true
+    }
+
+    private func persistComposerDrafts() {
+        let payload = Dictionary(uniqueKeysWithValues: composerDraftsByBot.compactMap { id, draft -> (String, BotComposerDraft)? in
+            draft.isEmpty ? nil : (id.value.uuidString.lowercased(), draft)
+        })
+        if payload.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.composerDraftsDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.composerDraftsDefaultsKey)
+        }
+    }
+
+    private func restoreComposerDraftsIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.composerDraftsDefaultsKey),
+              let payload = try? JSONDecoder().decode([String: BotComposerDraft].self, from: data)
+        else { return }
+        var restored: [BotID: BotComposerDraft] = [:]
+        for (raw, draft) in payload {
+            guard let uuid = UUID(uuidString: raw), !draft.isEmpty else { continue }
+            restored[BotID(uuid)] = draft
+        }
+        composerDraftsByBot = restored
+    }
+
+    private func pruneComposerDraftsToFleet() {
+        let live = Set(bots.map(\.id))
+        let next = composerDraftsByBot.filter { live.contains($0.key) }
+        guard next.count != composerDraftsByBot.count else { return }
+        composerDraftsByBot = next
+        persistComposerDrafts()
+    }
+
+    private func persistInspectorIfHydrated() {
+        guard inspectorHydrated, !isApplyingInspectorDraft else { return }
+        captureInspectorDraft()
+    }
+
+    private func captureInspectorDraft(for botID: BotID? = nil) {
+        guard let botID = botID ?? selectedBotID else { return }
+        let draft = BotInspectorDraft(
+            memoryDraft: memoryDraft,
+            skillDraft: skillDraft,
+            routineName: routineName,
+            routinePrompt: routinePrompt,
+            routineScheduleNote: routineScheduleNote
+        )
+        if draft.isEmpty {
+            inspectorDraftsByBot[botID] = nil
+        } else {
+            inspectorDraftsByBot[botID] = draft
+        }
+        persistInspectorDrafts()
+    }
+
+    private func applyInspectorDraft(for botID: BotID?) {
+        let draft = botID.flatMap { inspectorDraftsByBot[$0] } ?? BotInspectorDraft()
+        isApplyingInspectorDraft = true
+        memoryDraft = draft.memoryDraft
+        skillDraft = draft.skillDraft
+        routineName = draft.routineName
+        routinePrompt = draft.routinePrompt
+        routineScheduleNote = draft.routineScheduleNote
+        isApplyingInspectorDraft = false
+        inspectorHydrated = true
+    }
+
+    private func persistInspectorDrafts() {
+        let payload = Dictionary(uniqueKeysWithValues: inspectorDraftsByBot.compactMap { id, draft -> (String, BotInspectorDraft)? in
+            draft.isEmpty ? nil : (id.value.uuidString.lowercased(), draft)
+        })
+        if payload.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.inspectorDraftsDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.inspectorDraftsDefaultsKey)
+        }
+    }
+
+    private func restoreInspectorDraftsIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.inspectorDraftsDefaultsKey),
+              let payload = try? JSONDecoder().decode([String: BotInspectorDraft].self, from: data)
+        else { return }
+        var restored: [BotID: BotInspectorDraft] = [:]
+        for (raw, draft) in payload {
+            guard let uuid = UUID(uuidString: raw), !draft.isEmpty else { continue }
+            restored[BotID(uuid)] = draft
+        }
+        inspectorDraftsByBot = restored
+    }
+
+    private func pruneInspectorDraftsToFleet() {
+        let live = Set(bots.map(\.id))
+        let next = inspectorDraftsByBot.filter { live.contains($0.key) }
+        guard next.count != inspectorDraftsByBot.count else { return }
+        inspectorDraftsByBot = next
+        persistInspectorDrafts()
+    }
+
     private func restoreInspectorTabIfNeeded() {
         guard let raw = UserDefaults.standard.string(forKey: Self.inspectorTabDefaultsKey),
               let tab = BotDeskInspectorTab(rawValue: raw) else { return }
         inspectorTab = tab
     }
 
+    private func restoreStudioTabIfNeeded() {
+        guard let raw = UserDefaults.standard.string(forKey: Self.studioTabDefaultsKey),
+              let tab = BotStudioTab(rawValue: raw) else { return }
+        studioTab = tab
+    }
+
+    private func restoreScreenIfNeeded() {
+        guard let raw = UserDefaults.standard.string(forKey: Self.screenDefaultsKey),
+              let saved = BotsScreen(rawValue: raw) else { return }
+        let persistedSelection = UserDefaults.standard.string(forKey: Self.selectedBotDefaultsKey)
+        let selectionMatches = selectedBotID?.value.uuidString.lowercased() == persistedSelection
+        switch saved.resolvedDestination {
+        case .studio:
+            guard selectionMatches, let bot = selectedBot else {
+                screen = .desk
+                return
+            }
+            let tab = studioTab
+            beginEdit(bot)
+            studioTab = tab
+        case .desk, .fleet, .attention:
+            if selectionMatches, let bot = selectedBot {
+                openDesk(bot)
+            } else {
+                screen = .desk
+            }
+        }
+    }
+
     private func restoreSelectedBotIfNeeded() {
-        if let selectedBotID, fleet.contains(where: { $0.id == selectedBotID }) {
+        // Persist lookup must use `bots` (hidden filter only), not `fleet`
+        // (search). Otherwise a restored search drops the open teammate
+        // and Chat jumps to the first match.
+        if let selectedBotID, bots.contains(where: { $0.id == selectedBotID }) {
+            if !composerHydrated {
+                applyComposerDraft(for: selectedBotID)
+            }
+            if !inspectorHydrated {
+                applyInspectorDraft(for: selectedBotID)
+            }
             return
         }
         if let raw = UserDefaults.standard.string(forKey: Self.selectedBotDefaultsKey),
            let uuid = UUID(uuidString: raw),
-           fleet.contains(where: { $0.id == BotID(uuid) }) {
-            selectedBotID = BotID(uuid)
+           bots.contains(where: { $0.id == BotID(uuid) }) {
+            adoptSelectedBot(BotID(uuid))
             return
         }
-        selectedBotID = fleet.first?.id
+        adoptSelectedBot(fleet.first?.id)
     }
 
     public var liveMemoryCount: Int {
@@ -1160,25 +2178,115 @@ public final class BotsViewModel: ObservableObject {
 
     private func reloadMemory(botID: BotID) {
         do {
+            memoryListCountForTesting += 1
             memoryItems = try botStore.listMemory(botID: botID)
+            rememberStudioSupport(for: botID)
         } catch {
             errorMessage = String(describing: error)
         }
     }
 
+    private func reloadContextReceipt(botID: BotID) {
+        do {
+            if let conversationID = selectedConversation?.id,
+               let receipt = try botStore.latestContextReceipt(botID: botID, conversationID: conversationID) {
+                lastContextReceipt = receipt
+            } else {
+                lastContextReceipt = try botStore.latestContextReceipt(botID: botID)
+            }
+            rememberStudioSupport(for: botID)
+        } catch {
+            lastContextReceipt = nil
+        }
+    }
+
+    private func studioPreviewBot() -> BotDefinition? {
+        if let selectedBot { return selectedBot }
+        let handle = BotHandle.normalize(studioDraft.handle) ?? "draft"
+        return BotDefinition(
+            handle: handle,
+            name: studioDraft.name,
+            title: studioDraft.title,
+            description: studioDraft.description,
+            avatarSymbol: studioDraft.avatarSymbol
+        )
+    }
+
+    private func studioPreviewRevision(for bot: BotDefinition) -> BotRevision? {
+        let draft = BotRevisionDraft(
+            name: studioDraft.name,
+            title: studioDraft.title,
+            description: studioDraft.description,
+            soul: studioDraft.soul,
+            provider: studioDraft.provider,
+            providerInstanceID: studioDraft.providerInstanceID.isEmpty
+                ? studioDraft.provider.rawValue
+                : studioDraft.providerInstanceID,
+            model: studioDraft.model.isEmpty ? Self.defaultModel(for: studioDraft.provider) : studioDraft.model,
+            permissionMode: .supervised,
+            desktopKind: resolvedDesktopKind(studioDraft.desktopKind)
+        )
+        if screen != .studio, let selectedRevision { return selectedRevision }
+        return BotRevision(
+            id: selectedRevision?.id ?? BotRevisionID(),
+            botID: bot.id,
+            revisionNumber: selectedRevision?.revisionNumber ?? 0,
+            name: draft.name,
+            title: draft.title,
+            description: draft.description,
+            soul: draft.soul,
+            provider: draft.provider,
+            providerInstanceID: draft.providerInstanceID,
+            model: draft.model,
+            reasoningEffort: selectedRevision?.reasoningEffort ?? .medium,
+            compatibleRouteSet: selectedRevision?.compatibleRouteSet ?? ["default"],
+            permissionMode: draft.permissionMode,
+            desktopKind: draft.desktopKind,
+            digest: BotRevision.digest(botID: bot.id, draft: draft),
+            publishedAt: selectedRevision?.publishedAt ?? Date(),
+            supersedesRevisionID: selectedRevision?.id
+        )
+    }
+
     private func reloadRoutines(botID: BotID) {
         do {
+            routineListCountForTesting += 1
             routines = try botStore.listRoutines(botID: botID)
+            rememberStudioSupport(for: botID)
         } catch {
             errorMessage = String(describing: error)
         }
     }
 
     private func conversationForBot(_ botID: BotID) -> BotConversation? {
+        if let dest = destConversation(for: botID) {
+            return dest
+        }
+        // Dest first. Settle dest used to listConversations after dest
+        // dested Chat — including when dest dested another teammate.
+        // Dest cache already has this thread from persist dest.
+        conversationListCountForTesting += 1
+        return (try? botStore.listConversations(botID: botID).first)
+    }
+
+    /// Persist dest already wrote this thread into dest cache. Settle
+    /// dest must dest Chat from that cache instead of listing threads.
+    private func destConversation(for botID: BotID) -> BotConversation? {
         if let selected = selectedConversation, selected.botID == botID {
             return selected
         }
-        return (try? botStore.listConversations(botID: botID).first)
+        if let snapshot = studioSupportByBot[botID] {
+            if let selected = snapshot.selectedConversation, selected.botID == botID {
+                return selected
+            }
+            if let first = snapshot.conversations.first(where: { $0.botID == botID }) {
+                return first
+            }
+        }
+        if selectedBotID == botID {
+            return conversations.first(where: { $0.botID == botID })
+        }
+        return nil
     }
 
     private func threadBelongsToAnotherBot(_ threadID: AgentThreadID, botID: BotID) -> Bool {
@@ -1193,6 +2301,7 @@ public final class BotsViewModel: ObservableObject {
         if let threadID = conversation?.linkedAgentThreadID,
            let stored = try? context.messageRepo.listRecent(threadId: threadID, limit: 80),
            !stored.isEmpty {
+            deskMessageRestoreCountForTesting += 1
             persisted = stored.compactMap { message -> BotDeskMessage? in
                 let role: BotDeskMessage.Role
                 let text: String
@@ -1236,7 +2345,7 @@ public final class BotsViewModel: ObservableObject {
             }
             return
         }
-        applyDeskLiveReplay(botID: botID, threadID: threadID, force: true)
+        applyDeskLiveReplay(botID: botID, threadID: threadID, force: false)
         if selectedBotID == botID, screen == .desk, deskRunIsLive {
             startDeskLiveTurnWatch(botID: botID, threadID: threadID)
         }
@@ -1251,6 +2360,7 @@ public final class BotsViewModel: ObservableObject {
             }
             return
         }
+        deskLiveReplayFetchCountForTesting += 1
         let events = context.coordinator.latestStreamEvents(threadId: threadID)
         let state = AgentChatLiveTurnChrome.timelineByReplaying(events)
         // Only compare against THIS bot's timeline. Using deskLiveTimeline here
@@ -1330,6 +2440,7 @@ public final class BotsViewModel: ObservableObject {
 
     private func linkedRun(for threadID: AgentThreadID, botID: BotID) -> AgentRun? {
         if let active = try? context.runRepo.latestActive(for: threadID) {
+            lastLinkedRunIDByBot[botID] = active.id
             return active
         }
         if let runID = lastLinkedRunIDByBot[botID],
@@ -1337,8 +2448,15 @@ public final class BotsViewModel: ObservableObject {
            stored.threadId == threadID {
             return stored
         }
-        return (try? context.runRepo.listRecentFinished(limit: 80))?
-            .first(where: { $0.threadId == threadID })
+        // Roster dest used to scan 80 finished runs on every click when
+        // lastLinkedRunID was unset. Remember the first hit.
+        deskFinishedRunScanCountForTesting += 1
+        guard let finished = (try? context.runRepo.listRecentFinished(limit: 80))?
+            .first(where: { $0.threadId == threadID }) else {
+            return nil
+        }
+        lastLinkedRunIDByBot[botID] = finished.id
+        return finished
     }
 
     private func appendDeskMessage(_ message: BotDeskMessage, botID: BotID) {
@@ -1355,7 +2473,7 @@ public final class BotsViewModel: ObservableObject {
         var conversation: BotConversation
         if let selected = selectedConversation, selected.botID == bot.id {
             conversation = selected
-        } else if let existing = (try? botStore.listConversations(botID: bot.id))?.first {
+        } else if let existing = conversations.first(where: { $0.botID == bot.id }) {
             conversation = existing
         } else {
             conversation = BotConversation(
@@ -1368,10 +2486,98 @@ public final class BotsViewModel: ObservableObject {
         }
         conversation.updatedAt = Date()
         conversation.unread = false
+        // Dest first. Persist used to listConversations after dest
+        // painted the bubble. The upserted row is already dest state.
         try botStore.upsertConversation(conversation)
-        selectedConversation = conversation
-        conversations = try botStore.listConversations(botID: bot.id)
+        adoptWrittenConversation(conversation)
         return conversation
+    }
+
+    /// Persist dest used to listConversations after the store wrote
+    /// this thread. Patch it locally so dest does not reread threads.
+    private func adoptWrittenConversation(_ conversation: BotConversation) {
+        selectedConversation = conversation
+        conversations.removeAll { $0.id == conversation.id }
+        conversations.insert(conversation, at: 0)
+        rememberStudioSupport(for: conversation.botID)
+    }
+
+    /// Follow-through dest used to listConversations when dest was not
+    /// already on this thread. Dest already has this row from persist
+    /// dest or the last dest snapshot.
+    private func destFollowThroughConversation(
+        for bot: BotDefinition,
+        fallback: BotConversation
+    ) -> BotConversation {
+        if let selected = selectedConversation, selected.id == fallback.id {
+            return selected
+        }
+        if selectedBotID == bot.id,
+           let dest = conversations.first(where: { $0.id == fallback.id }) {
+            return dest
+        }
+        if let cached = studioSupportByBot[bot.id]?.conversations.first(where: { $0.id == fallback.id }) {
+            return cached
+        }
+        return fallback
+    }
+
+    /// Follow-through dest used to reloadFleet after dest already
+    /// painted the completed turn. Patch this dest thread locally.
+    private func adoptFollowThroughConversation(_ conversation: BotConversation) {
+        if selectedConversation?.id == conversation.id {
+            selectedConversation = conversation
+        }
+        if selectedBotID == conversation.botID {
+            conversations.removeAll { $0.id == conversation.id }
+            conversations.insert(conversation, at: 0)
+            rememberStudioSupport(for: conversation.botID)
+        } else {
+            patchStudioSupportConversation(conversation, botID: conversation.botID)
+        }
+    }
+
+    /// Follow-through dest used to listAttention after dest already
+    /// upserted this row. Insert it locally so dest inbox is current.
+    private func adoptWrittenAttention(_ item: BotAttentionItem) {
+        attentionItems.removeAll { $0.id == item.id }
+        attentionItems.insert(item, at: 0)
+    }
+
+    /// Acknowledge dest used to listAttention after dest already
+    /// painted Chat. Drop this row locally so dest does not reread
+    /// the inbox. Cold dest still lists.
+    private func dropAcknowledgedAttention(_ id: BotAttentionItemID) {
+        let botID = attentionItems.first(where: { $0.id == id })?.botID
+        attentionItems.removeAll { $0.id == id }
+        if let botID {
+            applyAttentionState(for: botID, conversations: destConversations(botID: botID))
+        }
+    }
+
+    private func destConversations(botID: BotID) -> [BotConversation] {
+        if let cached = studioSupportByBot[botID]?.conversations, !cached.isEmpty {
+            return cached
+        }
+        if selectedBotID == botID, conversations.contains(where: { $0.botID == botID }) {
+            return conversations
+        }
+        return []
+    }
+
+    private func destConversations(botID: BotID, patched: BotConversation) -> [BotConversation] {
+        if selectedBotID == botID {
+            return conversations
+        }
+        if var items = studioSupportByBot[botID]?.conversations {
+            if let index = items.firstIndex(where: { $0.id == patched.id }) {
+                items[index] = patched
+            } else {
+                items.insert(patched, at: 0)
+            }
+            return items
+        }
+        return [patched]
     }
 
     private func recordNeedsAttention(bot: BotDefinition, conversation: BotConversation, userText: String) {
@@ -1380,31 +2586,65 @@ public final class BotsViewModel: ObservableObject {
             next.attentionState = .needsAttention
             next.updatedAt = Date()
             try botStore.upsertConversation(next)
-            if selectedConversation?.id == next.id {
-                selectedConversation = next
-            }
-            try botStore.upsertAttention(
-                BotAttentionItem(
-                    botID: bot.id,
-                    conversationID: next.id,
-                    kind: .question,
-                    title: "Needs you",
-                    detail: userText
-                )
+            // Dest first. Needs-you dest used to listAttention after dest
+            // painted the bubble. The upserted row is dest inbox state.
+            adoptWrittenConversation(next)
+            let item = BotAttentionItem(
+                botID: bot.id,
+                conversationID: next.id,
+                kind: .question,
+                title: "Needs you",
+                detail: userText
             )
+            try botStore.upsertAttention(item)
             appendDeskMessage(
                 BotDeskMessage(role: .assistant, text: Self.assistantPlaceholder),
                 botID: bot.id
             )
-            reloadAttention()
+            adoptWrittenAttention(item)
+            applyAttentionState(
+                for: bot.id,
+                conversations: destConversations(botID: bot.id, patched: next)
+            )
         } catch {
             errorMessage = String(describing: error)
         }
     }
 
     private func currentRevision(for bot: BotDefinition) throws -> BotRevision? {
+        cachedRevision(for: bot)
+    }
+
+    /// Roster dest used to getRevision for every teammate chip on every
+    /// dest paint. Revisions are immutable by id; a new publish is a new id.
+    private func cachedRevision(for bot: BotDefinition) -> BotRevision? {
+        if selectedBotID == bot.id,
+           let selectedRevision,
+           selectedRevision.id == bot.currentRevisionID {
+            revisionByID[selectedRevision.id] = selectedRevision
+            return selectedRevision
+        }
         guard let revisionID = bot.currentRevisionID else { return nil }
-        return try botStore.getRevision(id: revisionID)
+        if let cached = revisionByID[revisionID] {
+            return cached
+        }
+        rosterRevisionFetchCountForTesting += 1
+        guard let revision = try? botStore.getRevision(id: revisionID) else { return nil }
+        revisionByID[revisionID] = revision
+        return revision
+    }
+
+    /// Send dest used to listMemory/listSkillBindings after dest
+    /// painted the bubble. Use dest cache when this teammate is open.
+    private func destBrainInputs(for bot: BotDefinition) -> (memory: [BotMemoryItem], skills: [BotSkillBinding]) {
+        if selectedBotID == bot.id {
+            return (memoryItems, skillBindings)
+        }
+        memoryListCountForTesting += 1
+        skillListCountForTesting += 1
+        let memory = (try? botStore.listMemory(botID: bot.id, includeForgotten: true)) ?? []
+        let skills = (try? botStore.listSkillBindings(botID: bot.id)) ?? []
+        return (memory, skills)
     }
 
     private func startSupervisedRun(
@@ -1413,6 +2653,8 @@ public final class BotsViewModel: ObservableObject {
         conversation: BotConversation,
         userText: String,
         attachments: [AgentAttachment] = [],
+        memory: [BotMemoryItem],
+        skills: [BotSkillBinding],
         router: AppCommandRouter
     ) async -> AgentRunID? {
         let workspaceID = bot.workspaceID
@@ -1444,22 +2686,27 @@ public final class BotsViewModel: ObservableObject {
                 linked.updatedAt = Date()
                 try botStore.upsertConversation(linked)
                 selectedConversation = linked
+                rememberStudioSupport(for: bot.id)
             }
             if selectedBotID == bot.id, screen == .desk {
                 startDeskLiveTurnWatch(botID: bot.id, threadID: thread.id)
             }
-            let memory = (try? botStore.listMemory(botID: bot.id)) ?? []
-            let skills = (try? botStore.listSkillBindings(botID: bot.id)) ?? []
-            let prompt = BotsDeskFollowThrough.composeRunPrompt(
+            var receipt = BotBrainCompiler.assemble(
                 bot: bot,
                 revision: revision,
                 userText: userText,
                 memory: memory,
-                skills: skills
+                skills: skills,
+                conversationID: conversation.id
             )
+            try botStore.insertContextReceipt(receipt)
+            if selectedBotID == bot.id {
+                lastContextReceipt = receipt
+                rememberStudioSupport(for: bot.id)
+            }
             let result = try await router.sendAgentMessage(
                 thread: thread.id,
-                text: prompt,
+                text: receipt.compiledPayload,
                 provider: revision.provider,
                 model: model,
                 permissionMode: .supervised,
@@ -1467,6 +2714,13 @@ public final class BotsViewModel: ObservableObject {
                 providerInstanceId: revision.providerInstanceID,
                 attachments: attachments
             )
+            if let runId = result.runId {
+                receipt.runID = runId
+                try? botStore.insertContextReceipt(receipt)
+                if selectedBotID == bot.id {
+                    lastContextReceipt = receipt
+                }
+            }
             return result.runId
         } catch {
             errorMessage = String(describing: error)
@@ -1501,12 +2755,32 @@ public final class BotsViewModel: ObservableObject {
         applyFollowThrough(bot: bot, conversation: conversation, run: try? context.runRepo.get(id: runId))
     }
 
+    private func enqueueFollowUp(_ item: BotQueuedFollowUp, botID: BotID) {
+        queuedFollowUpsByBot[botID, default: []].append(item)
+        persistQueuedFollowUps()
+        syncQueuedFollowUps()
+    }
+
+    private func syncQueuedFollowUps() {
+        queuedFollowUps = selectedBotID.flatMap { queuedFollowUpsByBot[$0] } ?? []
+    }
+
     private func drainQueuedFollowUp() {
-        guard !queuedFollowUps.isEmpty else { return }
-        let next = queuedFollowUps.removeFirst()
+        guard let bot = selectedBot else { return }
+        guard !deskRunIsLive else { return }
+        guard let next = queuedFollowUpsByBot[bot.id]?.first else {
+            syncQueuedFollowUps()
+            return
+        }
         composerText = next.text
         attachments = next.attachments
-        send()
+        guard send() else { return }
+        queuedFollowUpsByBot[bot.id]?.removeAll { $0.id == next.id }
+        if queuedFollowUpsByBot[bot.id]?.isEmpty == true {
+            queuedFollowUpsByBot[bot.id] = nil
+        }
+        persistQueuedFollowUps()
+        syncQueuedFollowUps()
     }
 
     private func applyFollowThrough(
@@ -1514,14 +2788,9 @@ public final class BotsViewModel: ObservableObject {
         conversation: BotConversation,
         run: AgentRun?
     ) {
-        var next = conversation
-        if let selected = selectedConversation, selected.id == conversation.id {
-            next = selected
-        } else if let stored = try? botStore.listConversations(botID: bot.id).first(where: { $0.id == conversation.id }) {
-            next = stored
-            if next.linkedAgentThreadID == nil {
-                next.linkedAgentThreadID = conversation.linkedAgentThreadID
-            }
+        var next = destFollowThroughConversation(for: bot, fallback: conversation)
+        if next.linkedAgentThreadID == nil {
+            next.linkedAgentThreadID = conversation.linkedAgentThreadID
         }
         restoreDeskMessages(botID: bot.id)
         if let run {
@@ -1539,32 +2808,51 @@ public final class BotsViewModel: ObservableObject {
         }
         next.updatedAt = Date()
         do {
+            // Dest first. Follow-through used to listConversations,
+            // listAttention, and reloadFleet (every teammate's
+            // conversations + recent messages) after dest already
+            // painted the completed turn. The upserted row is dest
+            // state; dest must not scan the fleet to settle.
             try botStore.upsertConversation(next)
-            if selectedConversation?.id == next.id {
-                selectedConversation = next
-            }
+            adoptFollowThroughConversation(next)
             if let kind = BotsDeskFollowThrough.attentionKind(for: status) {
-                try botStore.upsertAttention(
-                    BotAttentionItem(
-                        botID: bot.id,
-                        conversationID: next.id,
-                        kind: kind,
-                        title: status == .cancelled ? "Run cancelled" : "Run needs you",
-                        detail: run?.errorMessage ?? "The supervised turn ended without a clean completion."
-                    )
+                let item = BotAttentionItem(
+                    botID: bot.id,
+                    conversationID: next.id,
+                    kind: kind,
+                    title: status == .cancelled ? "Run cancelled" : "Run needs you",
+                    detail: run?.errorMessage ?? "The supervised turn ended without a clean completion."
                 )
+                try botStore.upsertAttention(item)
+                adoptWrittenAttention(item)
             }
-            reloadAttention()
-            reloadFleet()
+            applyAttentionState(
+                for: bot.id,
+                conversations: destConversations(botID: bot.id, patched: next)
+            )
         } catch {
             errorMessage = String(describing: error)
         }
         isStopping = false
-        deskSendInFlight = false
+        clearDeskSendInFlight(for: bot.id)
         if BotsDeskFollowThrough.isTerminal(status) {
             deskSendInFlightStartedAt = nil
-            drainQueuedFollowUp()
+            if isViewing(bot.id) {
+                drainQueuedFollowUp()
+            }
         }
+    }
+
+    private func beginDeskSendInFlight(for botID: BotID) {
+        deskSendInFlightBotID = botID
+        deskSendInFlight = true
+        deskSendInFlightStartedAt = Date()
+    }
+
+    private func clearDeskSendInFlight(for botID: BotID) {
+        guard deskSendInFlightBotID == nil || deskSendInFlightBotID == botID else { return }
+        deskSendInFlight = false
+        deskSendInFlightBotID = nil
     }
 
     private func resolvedDesktopKind(_ requested: BotDesktopKind) -> BotDesktopKind {
@@ -1719,9 +3007,13 @@ public struct BotsModeSwitcher: View {
 /// Roster body shared by the shell sidebar and the detached Bots window.
 public struct BotsRosterList: View {
     @ObservedObject private var vm: BotsViewModel
+    /// Sidebar hosts the roster in a sibling NSHostingView from BotsRootView.
+    /// Attach the delete confirm here so right-click Delete is not a silent latch.
+    private let attachDeleteConfirmation: Bool
 
-    public init(vm: BotsViewModel) {
+    public init(vm: BotsViewModel, attachDeleteConfirmation: Bool = false) {
         self.vm = vm
+        self.attachDeleteConfirmation = attachDeleteConfirmation
     }
 
     public var body: some View {
@@ -1762,6 +3054,11 @@ public struct BotsRosterList: View {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
                 Spacer(minLength: 0)
+                Toggle("Show hidden", isOn: $vm.showHidden)
+                    .toggleStyle(.checkbox)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityIdentifier("bots.roster.showHidden")
             }
             .padding(.horizontal, DS.Space.lg)
             .padding(.bottom, DS.Space.sm)
@@ -1809,6 +3106,7 @@ public struct BotsRosterList: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityIdentifier("bots.roster")
+        .modifier(BotsDeleteConfirmation(vm: vm, enabled: attachDeleteConfirmation))
     }
 
     private func actionRow(symbol: String, title: String) -> some View {
@@ -1859,6 +3157,18 @@ public struct BotsRosterList: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
+                if bot.pinned {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityHidden(true)
+                }
+                if bot.hidden {
+                    Image(systemName: "eye.slash")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityHidden(true)
+                }
                 if let provider = vm.providerLabel(for: bot) {
                     Text(provider)
                         .font(DS.Font.caption2)
@@ -1885,8 +3195,89 @@ public struct BotsRosterList: View {
         .buttonStyle(.plain)
         .help("\(bot.name) · \(BotsChrome.statusTitle(for: state))")
         .accessibilityLabel(bot.name)
-        .accessibilityValue("\(BotsChrome.statusTitle(for: state)). \(preview)")
+        .accessibilityValue("\(bot.pinned ? "Pinned. " : "")\(bot.hidden ? "Hidden. " : "")\(BotsChrome.statusTitle(for: state)). \(preview)")
         .accessibilityIdentifier("bots.roster.row.\(bot.handle)")
+        .contextMenu {
+            botManagementButtons(bot: bot, vm: vm, fromRoster: true)
+        }
+    }
+}
+
+@MainActor
+@ViewBuilder
+private func botManagementButtons(
+    bot: BotDefinition,
+    vm: BotsViewModel,
+    fromRoster: Bool
+) -> some View {
+    let locked = !vm.isControlPlaneActive
+    Button(bot.pinned ? "Unpin" : "Pin") {
+        vm.setPinned(id: bot.id, pinned: !bot.pinned)
+    }
+    .disabled(locked)
+    .accessibilityIdentifier("bots.menu.pin")
+    Button(bot.hidden ? "Unhide" : "Hide") {
+        vm.setHidden(id: bot.id, hidden: !bot.hidden)
+    }
+    .disabled(locked)
+    .accessibilityIdentifier("bots.menu.hide")
+    Button("Duplicate") {
+        if fromRoster {
+            vm.duplicateFromRoster(bot)
+        } else {
+            _ = try? vm.duplicate(id: bot.id)
+        }
+    }
+    .disabled(locked)
+    .accessibilityIdentifier("bots.menu.duplicate")
+    Button("Edit") {
+        vm.beginEdit(bot)
+    }
+    .disabled(locked)
+    .accessibilityIdentifier("bots.menu.edit")
+    Divider()
+    Button("Delete", role: .destructive) {
+        vm.pendingDeleteID = bot.id
+    }
+    .disabled(locked)
+    .accessibilityIdentifier("bots.menu.delete")
+}
+
+private struct BotsDeleteConfirmation: ViewModifier {
+    @ObservedObject var vm: BotsViewModel
+    let enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.confirmationDialog(
+                title,
+                isPresented: Binding(
+                    get: { vm.pendingDeleteID != nil },
+                    set: { if !$0 { vm.pendingDeleteID = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Delete", role: .destructive) {
+                    if let id = vm.pendingDeleteID {
+                        vm.delete(id: id)
+                    }
+                    vm.pendingDeleteID = nil
+                }
+                .accessibilityIdentifier("bots.menu.delete.confirm")
+                Button("Cancel", role: .cancel) { vm.pendingDeleteID = nil }
+            } message: {
+                Text("This teammate is removed from the fleet. Conversations and routines are deleted.")
+            }
+        } else {
+            content
+        }
+    }
+
+    private var title: String {
+        if let id = vm.pendingDeleteID, let bot = vm.bots.first(where: { $0.id == id }) {
+            return "Delete \(bot.name)?"
+        }
+        return "Delete this Bot?"
     }
 }
 
@@ -1913,15 +3304,11 @@ public struct BotsRootView: View {
                     .accessibilityHidden(true)
             }
             Group {
-                switch vm.screen {
-                case .fleet:
-                    fleetScreen
+                switch vm.screen.resolvedDestination {
                 case .studio:
                     studioScreen
-                case .desk:
+                case .desk, .fleet, .attention:
                     deskScreen
-                case .attention:
-                    attentionScreen
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1936,32 +3323,8 @@ public struct BotsRootView: View {
         } message: {
             Text(vm.errorMessage ?? "")
         }
-        .confirmationDialog(
-            deleteTitle,
-            isPresented: Binding(
-                get: { vm.pendingDeleteID != nil },
-                set: { if !$0 { vm.pendingDeleteID = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("Delete", role: .destructive) {
-                if let id = vm.pendingDeleteID {
-                    vm.delete(id: id)
-                }
-                vm.pendingDeleteID = nil
-            }
-            Button("Cancel", role: .cancel) { vm.pendingDeleteID = nil }
-        } message: {
-            Text("This teammate is removed from the fleet. Conversations and routines are deleted.")
-        }
+        .modifier(BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail))
         .onAppear { vm.reload() }
-    }
-
-    private var deleteTitle: String {
-        if let id = vm.pendingDeleteID, let bot = vm.bots.first(where: { $0.id == id }) {
-            return "Delete \(bot.name)?"
-        }
-        return "Delete this Bot?"
     }
 
     private var showsRosterRail: Bool {
@@ -1983,438 +3346,28 @@ public struct BotsRootView: View {
         .background(DS.Palette.surface)
     }
 
-    // MARK: Fleet
+    // MARK: Empty desk
 
-    private var fleetScreen: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if !vm.isControlPlaneActive {
-                fleetHeader
-                DSEmptyState(
-                    icon: "person.2",
-                    title: "Turn on Bot control plane in Settings",
-                    subtitle: "Bots stay off until the control plane is enabled."
-                )
-            } else if vm.fleet.isEmpty {
-                fleetHeader
-                DSEmptyState(
-                    icon: "person.2",
-                    title: vm.searchText.isEmpty ? "No bots yet" : "No matching bots",
-                    subtitle: vm.searchText.isEmpty
-                        ? "Create a Bot, give it a job, send a first task."
-                        : "Try another search or show hidden teammates."
-                )
-            } else if let bot = vm.selectedBot {
-                fleetHome(bot)
-            } else {
-                fleetHeader
-                ScrollView {
-                    LazyVStack(spacing: DS.Space.md) {
-                        ForEach(vm.fleet, id: \.id) { bot in
-                            fleetRow(bot)
-                        }
-                    }
-                    .padding(.horizontal, DS.Space.xxl)
-                    .padding(.bottom, DS.Space.xxl)
-                }
-            }
-        }
-    }
-
-    private func fleetHome(_ bot: BotDefinition) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: DS.Space.xl) {
-                fleetHomeHeader(bot)
-                fleetHomeRouting(bot)
-                HStack(alignment: .top, spacing: DS.Space.xl) {
-                    VStack(alignment: .leading, spacing: DS.Space.lg) {
-                        fleetHomeGoal(bot)
-                        fleetHomeActivity(bot)
-                        fleetHomeRoutine(bot)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    fleetHomeDesktop(bot)
-                        .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
-                }
-                fleetHomeStats()
-            }
-            .padding(DS.Space.xxl)
-        }
-        .accessibilityIdentifier("bots.home")
-    }
-
-    private func fleetHomeHeader(_ bot: BotDefinition) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.lg) {
-            BotsAvatarView(name: bot.name, handle: bot.handle, size: 52)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: DS.Space.sm) {
-                    Text(bot.name)
-                        .font(DS.Font.title2.weight(.semibold))
-                        .foregroundColor(DS.Palette.text)
-                        .accessibilityIdentifier("bots.home.name")
-                    Circle()
-                        .fill(DS.Palette.success)
-                        .frame(width: 8, height: 8)
-                    Text(BotsChrome.statusTitle(for: vm.attentionState(for: bot)))
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textSecondary)
-                    attentionBadge(vm.attentionState(for: bot))
-                }
-                Text(bot.title.isEmpty ? "No job yet" : bot.title)
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .accessibilityIdentifier("bots.home.title")
-            }
-            Spacer(minLength: DS.Space.lg)
-            Button(action: { vm.openDesk(bot) }) {
-                HStack(spacing: DS.Space.sm) {
-                    Image(systemName: "bubble.left")
-                    Text(BotsChrome.Label.openChat)
-                }
-            }
-            .buttonStyle(BotsPrimaryButtonStyle())
-            .accessibilityIdentifier("bots.home.chat")
-        }
-    }
-
-    private func fleetHomeRouting(_ bot: BotDefinition) -> some View {
-        HStack(spacing: DS.Space.md) {
-            Text("Routing")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-            ForEach([AgentProvider.claude, .codex, .grok], id: \.self) { provider in
-                let selected = vm.resolvedProvider(for: bot) == provider
-                Text(vm.providerChipTitle(provider))
-                    .font(DS.Font.caption.weight(.semibold))
-                    .foregroundColor(selected ? BotsChrome.onPrimary : DS.Palette.textSecondary)
-                    .padding(.horizontal, DS.Space.lg)
-                    .frame(minHeight: 32)
-                    .background(selected ? BotsChrome.primary : DS.Palette.surfaceRaised)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .accessibilityIdentifier(selected ? "bots.home.provider" : "bots.home.route.\(provider.rawValue)")
-            }
-            Spacer(minLength: 0)
-            Button("Studio") { vm.beginEdit(bot) }
-                .buttonStyle(DSSecondaryButtonStyle())
-                .accessibilityIdentifier("bots.home.studio")
-        }
-    }
-
-    private func fleetHomeGoal(_ bot: BotDefinition) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            Label(BotsChrome.Label.currentGoal, systemImage: "target")
-                .font(DS.Font.bodyStrong)
-                .foregroundColor(DS.Palette.text)
-            Text(vm.currentGoal(for: bot))
-                .font(DS.Font.body)
-                .foregroundColor(DS.Palette.text)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .dsPanel(padding: DS.Space.lg)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityIdentifier("bots.home.goal")
-    }
-
-    private func fleetHomeActivity(_ bot: BotDefinition) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            Label(BotsChrome.Label.todaysActivity, systemImage: "waveform.path.ecg")
-                .font(DS.Font.bodyStrong)
-                .foregroundColor(DS.Palette.text)
-            let rows = vm.activityRows(for: bot)
-            if rows.isEmpty {
-                Text("No activity yet")
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textTertiary)
-            } else {
-                ForEach(rows) { row in
-                    HStack(alignment: .firstTextBaseline, spacing: DS.Space.md) {
-                        Circle()
-                            .fill(BotsChrome.primary)
-                            .frame(width: 6, height: 6)
-                        Text(row.text)
-                            .font(DS.Font.body)
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(2)
-                        Spacer(minLength: DS.Space.sm)
-                        Text(row.createdAt, style: .time)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textTertiary)
-                    }
-                }
-            }
-        }
-        .dsPanel(padding: DS.Space.lg)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityIdentifier("bots.home.activity")
-    }
-
-    private func fleetHomeRoutine(_ bot: BotDefinition) -> some View {
-        let routine = vm.routines.first(where: { $0.activation.isEnabled })
-        return VStack(alignment: .leading, spacing: DS.Space.md) {
-            Label(BotsChrome.Label.nextRoutine, systemImage: "calendar")
-                .font(DS.Font.bodyStrong)
-                .foregroundColor(DS.Palette.text)
-            if let routine {
-                Text(routine.definition.name)
-                    .font(DS.Font.bodyStrong)
-                    .foregroundColor(DS.Palette.text)
-                Text(routine.definition.scheduleNote.isEmpty ? "No schedule yet" : routine.definition.scheduleNote)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-            } else {
-                Text("No active routine for \(bot.name)")
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textTertiary)
-            }
-            Text(BotRoutineCopy.testRunHonestyCaption)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.warning)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .dsPanel(padding: DS.Space.lg)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityIdentifier("bots.home.routine")
-    }
-
-    private func fleetHomeStats() -> some View {
-        HStack(alignment: .top, spacing: DS.Space.md) {
-            fleetStatCard(
-                title: "Memory",
-                value: "\(vm.liveMemoryCount)",
-                detail: vm.isMemoryActive ? "facts" : "off",
-                identifier: "bots.home.memory"
+    private var emptyDesk: some View {
+        VStack(spacing: DS.Space.xl) {
+            DSEmptyState(
+                icon: "bubble.left.and.bubble.right",
+                title: vm.isControlPlaneActive ? "Select a teammate" : "Turn on Bot control plane in Settings",
+                subtitle: vm.isControlPlaneActive
+                    ? "Chat opens here. Studio is the other destination."
+                    : "Bots stay off until the control plane is enabled."
             )
-            fleetStatCard(
-                title: "Skills",
-                value: "\(vm.enabledSkillCount)",
-                detail: "enabled",
-                identifier: "bots.home.skills"
-            )
-            fleetStatCard(
-                title: "Routines",
-                value: "\(vm.enabledRoutineCount)",
-                detail: "no app-closed runs",
-                identifier: "bots.home.routines"
-            )
-            fleetStatCard(
-                title: "Approvals",
-                value: "\(vm.pendingApprovalCount)",
-                detail: "pending",
-                identifier: "bots.home.approvals"
-            )
-        }
-    }
-
-    private func fleetStatCard(title: String, value: String, detail: String, identifier: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-            Text(value)
-                .font(DS.Font.title2.weight(.semibold))
-                .foregroundColor(DS.Palette.text)
-            Text(detail)
-                .font(DS.Font.caption2)
-                .foregroundColor(DS.Palette.textSecondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .dsPanel(padding: DS.Space.lg)
-        .accessibilityIdentifier(identifier)
-    }
-
-    private func fleetHomeDesktop(_ bot: BotDefinition) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            HStack(spacing: DS.Space.sm) {
-                Label(BotsChrome.Label.desktop, systemImage: "desktopcomputer")
-                    .font(DS.Font.bodyStrong)
-                    .foregroundColor(DS.Palette.text)
-                Spacer(minLength: 0)
-                DSPill("Logical space", tone: .neutral)
-            }
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [Color(hex: 0x2A1848), Color(hex: 0x7B5CFF).opacity(0.55), Color(hex: 0x171D24)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                VStack(spacing: DS.Space.md) {
-                    Image(systemName: "desktopcomputer")
-                        .font(.system(size: 28, weight: .regular))
-                        .foregroundColor(.white.opacity(0.9))
-                        .accessibilityHidden(true)
-                    Text("Logical execution space")
-                        .font(DS.Font.bodyStrong)
-                        .foregroundColor(.white)
-                    Text(vm.desktopHonestyLabel)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.warning)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityIdentifier("bots.home.desktop.honesty")
+            if vm.isControlPlaneActive {
+                Button(action: vm.beginCreate) {
+                    Text(BotsChrome.Label.newBot)
+                        .frame(minHeight: BotsChrome.hitTarget)
                 }
-                .padding(DS.Space.lg)
-            }
-            .frame(maxWidth: .infinity, minHeight: 188)
-            if let model = vm.selectedRevision?.model, !model.isEmpty {
-                Text(model)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
+                .buttonStyle(BotsPrimaryButtonStyle())
+                .accessibilityIdentifier("bots.desk.empty.new")
             }
         }
-        .dsPanel(padding: DS.Space.lg)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityIdentifier("bots.home.desktop")
-        .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
-    }
-
-    private var fleetHeader: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xl) {
-            HStack(alignment: .center, spacing: DS.Space.lg) {
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    Text("Bots")
-                        .font(DS.Font.title.weight(.semibold))
-                        .foregroundColor(DS.Palette.text)
-                    Text("Named teammates with their own job, memory, and desk")
-                        .font(DS.Font.body)
-                        .foregroundColor(DS.Palette.textSecondary)
-                }
-                Spacer(minLength: DS.Space.lg)
-                HStack(spacing: DS.Space.md) {
-                    Button(action: vm.openAttention) {
-                        Label(
-                            vm.openAttentionCount == 0
-                                ? "Attention"
-                                : "Attention \(vm.openAttentionCount)",
-                            systemImage: "bell"
-                        )
-                    }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .accessibilityIdentifier("bots.attention")
-
-                    Button(action: vm.beginCreate) {
-                        Label("New Bot", systemImage: "plus")
-                    }
-                    .buttonStyle(DSPrimaryButtonStyle())
-                    .disabled(!vm.isControlPlaneActive)
-                    .accessibilityIdentifier("bots.new")
-                }
-            }
-
-            HStack(spacing: DS.Space.md) {
-                HStack(spacing: DS.Space.sm) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .accessibilityHidden(true)
-                    TextField("Search bots", text: $vm.searchText)
-                        .textFieldStyle(.plain)
-                        .foregroundColor(DS.Palette.text)
-                }
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.vertical, DS.Space.md)
-                .background(DS.Palette.surfaceRaised)
-                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                )
-                .frame(maxWidth: 320)
-
-                Spacer(minLength: DS.Space.lg)
-                Toggle("Show hidden", isOn: $vm.showHidden)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .accessibilityIdentifier("bots.showHidden")
-            }
-        }
-        .padding(.horizontal, DS.Space.xxl)
-        .padding(.top, DS.Space.xxl)
-        .padding(.bottom, DS.Space.xl)
-    }
-
-    private func fleetRow(_ bot: BotDefinition) -> some View {
-        Button {
-            vm.openDesk(bot)
-        } label: {
-            HStack(spacing: DS.Space.lg) {
-                Image(systemName: bot.avatarSymbol)
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(DS.Palette.accent)
-                    .frame(width: 40, height: 40)
-                    .background(DS.Palette.accent.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .accessibilityHidden(true)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: DS.Space.sm) {
-                        Text(bot.name)
-                            .font(DS.Font.bodyStrong)
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(1)
-                        Text("@\(bot.handle)")
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textTertiary)
-                        if bot.pinned {
-                            Image(systemName: "pin.fill")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundColor(DS.Palette.textTertiary)
-                                .accessibilityLabel("Pinned")
-                        }
-                        if bot.hidden {
-                            DSPill("Hidden", tone: .neutral)
-                        }
-                    }
-                    Text(vm.rosterPreview(for: bot))
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                attentionBadge(vm.attentionState(for: bot))
-
-                Menu {
-                    Button(bot.pinned ? "Unpin" : "Pin") {
-                        vm.setPinned(id: bot.id, pinned: !bot.pinned)
-                    }
-                    Button(bot.hidden ? "Unhide" : "Hide") {
-                        vm.setHidden(id: bot.id, hidden: !bot.hidden)
-                    }
-                    Button("Duplicate") {
-                        _ = try? vm.duplicate(id: bot.id)
-                    }
-                    Button("Edit") {
-                        vm.beginEdit(bot)
-                    }
-                    Divider()
-                    Button("Delete", role: .destructive) {
-                        vm.pendingDeleteID = bot.id
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .menuStyle(.borderlessButton)
-                .accessibilityLabel("Bot actions")
-            }
-            .padding(.horizontal, DS.Space.xl)
-            .padding(.vertical, DS.Space.lg)
-            .background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("bots.fleet.row.\(bot.handle)")
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityIdentifier("bots.desk.empty")
     }
 
     @ViewBuilder
@@ -2431,8 +3384,6 @@ public struct BotsRootView: View {
         }
     }
 
-    // MARK: Studio
-
     private var studioScreen: some View {
         VStack(spacing: 0) {
             studioHeader
@@ -2441,6 +3392,8 @@ public struct BotsRootView: View {
                 switch vm.studioTab {
                 case .profile:
                     studioProfile
+                case .brain:
+                    studioBrain
                 case .memory:
                     memoryTab
                 case .skills:
@@ -2464,7 +3417,11 @@ public struct BotsRootView: View {
     private var studioHeader: some View {
         HStack(alignment: .top, spacing: DS.Space.lg) {
             if !showsRosterRail {
-                backButton { vm.openFleet() }
+                backButton {
+                    if let bot = vm.selectedBot {
+                        vm.openDesk(bot)
+                    }
+                }
             }
             Image(systemName: vm.studioDraft.avatarSymbol)
                 .font(.system(size: 18, weight: .semibold))
@@ -2505,7 +3462,7 @@ public struct BotsRootView: View {
     }
 
     private var studioTabs: some View {
-        HStack(spacing: DS.Space.xl) {
+        HStack(spacing: DS.Space.md) {
             ForEach(BotStudioTab.allCases) { tab in
                 if tab == .memory && !vm.isMemoryActive {
                     EmptyView()
@@ -2514,17 +3471,24 @@ public struct BotsRootView: View {
                     Button {
                         vm.studioTab = tab
                     } label: {
-                        VStack(spacing: 6) {
-                            Text(tab.title)
-                                .font(DS.Font.body.weight(selected ? .semibold : .regular))
-                                .foregroundColor(selected ? BotsChrome.primary : DS.Palette.textSecondary)
+                        VStack(spacing: DS.Space.xs) {
+                            HStack(spacing: DS.Space.xs) {
+                                Image(systemName: tab.symbol)
+                                    .font(.system(size: 12, weight: selected ? .semibold : .regular))
+                                    .accessibilityHidden(true)
+                                Text(tab.title)
+                                    .font(DS.Font.body.weight(selected ? .semibold : .regular))
+                            }
+                            .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
                             Rectangle()
                                 .fill(selected ? BotsChrome.primary : Color.clear)
                                 .frame(height: 2)
                         }
                         .frame(minHeight: BotsChrome.hitTarget, alignment: .bottom)
+                        .padding(.horizontal, DS.Space.sm)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(tab.title)
                     .accessibilityAddTraits(selected ? .isSelected : [])
                     .accessibilityIdentifier(tab.accessibilityIdentifier)
                 }
@@ -2621,6 +3585,7 @@ public struct BotsRootView: View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
             DSSectionHeaderG(BotsChrome.Label.instructions)
             studioMultiline(text: $vm.studioDraft.soul, minHeight: 140)
+                .accessibilityLabel(BotsChrome.Label.instructions)
             Text("Published with the Bot. This is not an Agent thread.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
@@ -2638,20 +3603,6 @@ public struct BotsRootView: View {
                 enabled: true,
                 identifier: "bots.studio.desktop.logical"
             )
-            desktopOption(
-                kind: .dedicatedLocalVM,
-                title: "Dedicated local VM Desktop",
-                enabled: vm.isDesktopVMActive,
-                notShipped: !vm.isDesktopVMActive,
-                identifier: "bots.studio.desktop.vm"
-            )
-            desktopOption(
-                kind: .managedRemoteMac,
-                title: "Managed remote Mac Desktop",
-                enabled: vm.isDesktopRemoteActive,
-                notShipped: !vm.isDesktopRemoteActive,
-                identifier: "bots.studio.desktop.remote"
-            )
             Text(vm.desktopHonestyLabel)
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.warning)
@@ -2666,7 +3617,7 @@ public struct BotsRootView: View {
         kind: BotDesktopKind,
         title: String,
         enabled: Bool,
-        notShipped: Bool = false,
+        status: String? = nil,
         identifier: String
     ) -> some View {
         Button {
@@ -2674,7 +3625,7 @@ public struct BotsRootView: View {
             vm.studioDraft.desktopKind = kind
         } label: {
             HStack(alignment: .top, spacing: DS.Space.md) {
-                Image(systemName: vm.studioDraft.desktopKind == kind ? "largecircle.fill.circle" : "circle")
+                Image(systemName: vm.displayedDesktopKind == kind ? "largecircle.fill.circle" : "circle")
                     .foregroundColor(enabled ? DS.Palette.accent : DS.Palette.textTertiary)
                     .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 2) {
@@ -2682,8 +3633,8 @@ public struct BotsRootView: View {
                         Text(title)
                             .font(DS.Font.bodyStrong)
                             .foregroundColor(enabled ? DS.Palette.text : DS.Palette.textTertiary)
-                        if notShipped {
-                            DSPill("Not shipped", tone: .neutral)
+                        if let status, !status.isEmpty {
+                            DSPill(status, tone: .neutral)
                         }
                     }
                     Text(kind.honestyLabel)
@@ -2698,17 +3649,26 @@ public struct BotsRootView: View {
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
         }
         .buttonStyle(.plain)
+        .frame(minHeight: BotsChrome.hitTarget)
         .disabled(!enabled)
         .accessibilityIdentifier(identifier)
+        .accessibilityAddTraits(vm.displayedDesktopKind == kind ? .isSelected : [])
     }
 
     private var studioSecurity: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: DS.Space.lg) {
                 DSSectionHeaderG(BotsChrome.Label.security)
-                Text("Approval policy and effect grants stay off until P1b. This tab is readable only.")
+                Label("Readable only. No grants run from this tab.", systemImage: "lock.shield")
                     .font(DS.Font.body)
                     .foregroundColor(DS.Palette.textSecondary)
+                    .labelStyle(.titleAndIcon)
+                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    securityRow(symbol: "hand.raised", title: "Approvals", detail: "Allow once / Deny stay off until P1b.")
+                    securityRow(symbol: "pencil.and.outline", title: "Host-brokered writes", detail: "Effects stay off until that phase ships.")
+                    securityRow(symbol: "desktopcomputer", title: "Desktop", detail: "Logical space is not a security boundary.")
+                }
                 Text("No Allow once / Deny actions are live. Desktop isolation is not a security boundary.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.warning)
@@ -2721,12 +3681,38 @@ public struct BotsRootView: View {
         .accessibilityIdentifier("bots.studio.security")
     }
 
+    private func securityRow(symbol: String, title: String, detail: String) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.md) {
+            Image(systemName: symbol)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(width: 28, height: BotsChrome.hitTarget, alignment: .center)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                Text(detail)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(minHeight: BotsChrome.hitTarget, alignment: .top)
+    }
+
     private var studioNotifications: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             DSSectionHeaderG("Notifications")
             Toggle("Notify when this Bot needs you", isOn: $vm.studioDraft.notificationsEnabled)
                 .toggleStyle(.switch)
                 .foregroundColor(DS.Palette.text)
+                .frame(minHeight: BotsChrome.hitTarget)
+                .accessibilityLabel("Notify when this Bot needs you")
+            Text("Alerts stay on this Mac. They are not an isolated Desktop.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
         }
         .dsPanel(padding: DS.Space.lg)
     }
@@ -2744,10 +3730,6 @@ public struct BotsRootView: View {
             studioSummaryRow("Skills", "\(vm.enabledSkillCount) enabled")
             studioSummaryRow("Routines", "\(vm.enabledRoutineCount) · no app-closed runs")
             studioSummaryRow("Notifications", vm.studioDraft.notificationsEnabled ? "On" : "Off")
-            Text(vm.desktopHonestyLabel)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.warning)
-                .fixedSize(horizontal: false, vertical: true)
         }
         .dsPanel(padding: DS.Space.lg)
         .accessibilityIdentifier("bots.studio.summary")
@@ -2767,14 +3749,16 @@ public struct BotsRootView: View {
     }
 
     private func studioFormRow<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.lg) {
+        HStack(alignment: .center, spacing: DS.Space.lg) {
             Text(label)
                 .font(DS.Font.caption.weight(.medium))
                 .foregroundColor(DS.Palette.textSecondary)
                 .frame(width: 112, alignment: .leading)
-                .padding(.top, 10)
+                .accessibilityHidden(true)
             content()
+                .accessibilityLabel(label)
         }
+        .frame(minHeight: BotsChrome.hitTarget)
     }
 
     // MARK: Desk
@@ -2788,16 +3772,13 @@ public struct BotsRootView: View {
                 }
                 .accessibilityIdentifier("bots.desk")
             } else {
-                fleetScreen.onAppear { vm.openFleet() }
+                emptyDesk
             }
         }
     }
 
     private func deskHeader(_ bot: BotDefinition) -> some View {
         HStack(spacing: DS.Space.lg) {
-            if !showsRosterRail {
-                backButton { vm.openFleet() }
-            }
             Image(systemName: bot.avatarSymbol)
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundColor(DS.Palette.accent)
@@ -2835,7 +3816,7 @@ public struct BotsRootView: View {
                     .accessibilityIdentifier("bots.desk.job")
             }
             Spacer(minLength: DS.Space.lg)
-            Button("Studio") { vm.beginEdit(bot) }
+            Button("Studio") { vm.openStudio(bot) }
                 .buttonStyle(DSSecondaryButtonStyle())
                 .accessibilityIdentifier("bots.desk.studio")
         }
@@ -2848,6 +3829,9 @@ public struct BotsRootView: View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
                 deskTimeline(bot)
+                if !vm.queuedFollowUps.isEmpty {
+                    deskQueuedFollowUps
+                }
                 composerBar(bot)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -2864,28 +3848,29 @@ public struct BotsRootView: View {
     }
 
     private func deskDesktopPane(_ bot: BotDefinition) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
+        let kind = vm.displayedDesktopKind
+        return VStack(alignment: .leading, spacing: DS.Space.md) {
             HStack {
                 Label("\(bot.name) Desktop", systemImage: "desktopcomputer")
                     .font(DS.Font.bodyStrong)
                     .foregroundColor(DS.Palette.text)
                 Spacer(minLength: 0)
-                DSPill("Logical space", tone: .neutral)
+                DSPill(vm.desktopStatusPill, tone: .neutral)
             }
             ZStack {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(
                         LinearGradient(
-                            colors: [Color(hex: 0x2A1848), Color(hex: 0x7B5CFF).opacity(0.45), Color(hex: 0x171D24)],
+                            colors: desktopPreviewColors(kind),
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
                     )
                 VStack(spacing: DS.Space.sm) {
-                    Image(systemName: "macwindow")
+                    Image(systemName: desktopPreviewSymbol(kind))
                         .font(.system(size: 26, weight: .regular))
                         .foregroundColor(.white.opacity(0.92))
-                    Text("Logical execution space")
+                    Text(kind.displayTitle)
                         .font(DS.Font.bodyStrong)
                         .foregroundColor(.white)
                     Text(vm.desktopHonestyLabel)
@@ -2901,8 +3886,23 @@ public struct BotsRootView: View {
         }
         .padding(DS.Space.lg)
         .dsBar(edge: .bottom)
+        .accessibilityElement(children: .ignore)
         .accessibilityIdentifier("bots.desk.desktop")
         .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
+    }
+
+    private func desktopPreviewColors(_ kind: BotDesktopKind) -> [Color] {
+        switch kind {
+        case .logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac:
+            return [Color(hex: 0x2A1848), Color(hex: 0x7B5CFF).opacity(0.55), Color(hex: 0x171D24)]
+        }
+    }
+
+    private func desktopPreviewSymbol(_ kind: BotDesktopKind) -> String {
+        switch kind {
+        case .logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac:
+            return "desktopcomputer"
+        }
     }
 
     private func deskInspector(_ bot: BotDefinition) -> some View {
@@ -2937,6 +3937,8 @@ public struct BotsRootView: View {
 
             Group {
                 switch resolvedInspectorTab {
+                case .brain:
+                    inspectorBrain
                 case .memory:
                     inspectorMemory
                 case .routines:
@@ -2952,9 +3954,190 @@ public struct BotsRootView: View {
 
     private var resolvedInspectorTab: BotDeskInspectorTab {
         if vm.inspectorTab == .memory && !vm.isMemoryActive {
-            return .routines
+            return .brain
         }
         return vm.inspectorTab
+    }
+
+    private var studioBrain: some View {
+        ScrollView {
+            brainInspector(compact: false)
+                .padding(DS.Space.xxl)
+        }
+        .accessibilityIdentifier("bots.studio.brain")
+    }
+
+    private var inspectorBrain: some View {
+        ScrollView {
+            brainInspector(compact: true)
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.bottom, DS.Space.md)
+        }
+        .accessibilityIdentifier("bots.desk.inspector.brain")
+    }
+
+    private func brainInspector(compact: Bool) -> some View {
+        let receipt = vm.inspectedBrain
+        return VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
+                Text("What this Bot sees")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                Spacer(minLength: 0)
+                if vm.inspectedBrainIsLastCall {
+                    DSPill("Last call", tone: .accent)
+                } else if vm.inspectedBrainIsPreview {
+                    DSPill("Preview", tone: .neutral)
+                } else {
+                    DSPill("Compiled", tone: .neutral)
+                }
+            }
+            Text(vm.inspectedBrainIsLastCall ? BotsChrome.Label.brainReceiptHonesty : BotsChrome.Label.brainPreviewHonesty)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.warning)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("bots.brain.honesty")
+            HStack(spacing: DS.Space.sm) {
+                ForEach(BotBrainInspectorPane.allCases) { pane in
+                    let selected = vm.brainPane == pane
+                    Button {
+                        vm.brainPane = pane
+                    } label: {
+                        Text(pane.title)
+                            .font(DS.Font.caption.weight(selected ? .semibold : .regular))
+                            .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
+                            .padding(.horizontal, DS.Space.md)
+                            .padding(.vertical, DS.Space.sm)
+                            .background(selected ? DS.Palette.accent : DS.Palette.surfaceRaised)
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .frame(minHeight: BotsChrome.hitTarget)
+                    .accessibilityAddTraits(selected ? .isSelected : [])
+                    .accessibilityIdentifier(pane.accessibilityIdentifier)
+                }
+                Spacer(minLength: 0)
+            }
+            if let receipt {
+                brainReceiptMeta(receipt, compact: compact)
+                if vm.brainPane == .source {
+                    brainSource(receipt)
+                } else {
+                    brainEffective(receipt)
+                }
+                brainWhyMemory(receipt)
+                brainCapabilities(receipt)
+            } else {
+                Text("Save or select a Bot to compile Source and Effective Brain.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+        }
+    }
+
+    private func brainReceiptMeta(_ receipt: ContextAssemblyReceipt, compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Revision \(receipt.revisionNumber) · \(vm.providerChipTitle(receipt.provider)) · \(receipt.model.isEmpty ? "model unset" : receipt.model) · \(receipt.permissionMode.rawValue)")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+            Text("payload \(receipt.payloadDigest)")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(DS.Palette.textTertiary)
+                .textSelection(.enabled)
+                .accessibilityIdentifier("bots.brain.digest")
+            if !compact {
+                Text("compiler \(receipt.compilerVersion) · no opaque RemoteCode layer")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+        }
+        .accessibilityIdentifier("bots.brain.receipt")
+    }
+
+    private func brainSource(_ receipt: ContextAssemblyReceipt) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            ForEach(receipt.layers) { layer in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: DS.Space.sm) {
+                        DSPill(layer.included ? "Included" : "Excluded", tone: layer.included ? .success : .neutral)
+                        Text(layer.title)
+                            .font(DS.Font.caption.weight(.semibold))
+                            .foregroundColor(DS.Palette.text)
+                    }
+                    if !layer.text.isEmpty {
+                        Text(layer.text)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(layer.reason)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .accessibilityIdentifier("bots.brain.source")
+    }
+
+    private func brainEffective(_ receipt: ContextAssemblyReceipt) -> some View {
+        Text(receipt.compiledPayload.isEmpty ? "(empty payload)" : receipt.compiledPayload)
+            .font(.system(.caption, design: .monospaced))
+            .foregroundColor(DS.Palette.text)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(DS.Space.md)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .accessibilityIdentifier("bots.brain.effective")
+    }
+
+    private func brainWhyMemory(_ receipt: ContextAssemblyReceipt) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            Text("Why this memory?")
+                .font(DS.Font.bodyStrong)
+                .foregroundColor(DS.Palette.text)
+            if receipt.memoryLayers.isEmpty {
+                Text("No memory items were considered.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            } else {
+                ForEach(receipt.memoryLayers) { layer in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(layer.text.isEmpty ? "(empty fact)" : layer.text)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .textSelection(.enabled)
+                        Text(layer.reason)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
+                }
+            }
+        }
+        .accessibilityIdentifier("bots.brain.whyMemory")
+    }
+
+    private func brainCapabilities(_ receipt: ContextAssemblyReceipt) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            Text("What this Bot can do")
+                .font(DS.Font.bodyStrong)
+                .foregroundColor(DS.Palette.text)
+            Text("Supervised route only. Host-brokered writes stay off.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+            Text(receipt.desktopKind.honestyLabel)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.warning)
+                .fixedSize(horizontal: false, vertical: true)
+            let skills = receipt.layers.filter { $0.kind == .skill && $0.included }.map(\.text)
+            Text(skills.isEmpty ? "No enabled skills." : "Skills: \(skills.joined(separator: ", "))")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+        }
+        .accessibilityIdentifier("bots.brain.capabilities")
     }
 
     private var inspectorMemory: some View {
@@ -2962,6 +4145,7 @@ public struct BotsRootView: View {
             if vm.isMemoryActive {
                 HStack(spacing: DS.Space.sm) {
                     studioField(placeholder: "Remember a fact", text: $vm.memoryDraft)
+                        .accessibilityLabel("Remember a fact")
                         .accessibilityIdentifier("bots.memory.field")
                     Button("Add") { vm.addMemory() }
                         .buttonStyle(DSPrimaryButtonStyle())
@@ -3134,14 +4318,53 @@ public struct BotsRootView: View {
         }
     }
 
+    private var deskQueuedFollowUps: some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "text.line.first.and.arrowtriangle.forward")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(DS.Palette.accent)
+                    .accessibilityHidden(true)
+                Text("Queued")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.accent)
+                Text("\(vm.queuedFollowUps.count)")
+                    .font(DS.Font.caption.monospacedDigit())
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer(minLength: 0)
+            }
+            .accessibilityIdentifier("bots.desk.queued.header")
+            ForEach(vm.queuedFollowUps) { item in
+                HStack(alignment: .top, spacing: DS.Space.md) {
+                    Text(AgentChatTranscriptChrome.displayUserLine(
+                        text: item.text,
+                        attachments: item.attachments
+                    ))
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(3)
+                    Spacer(minLength: DS.Space.sm)
+                    Button("Remove") { vm.removeQueuedFollowUp(item) }
+                        .buttonStyle(.plain)
+                        .font(DS.Font.caption.weight(.medium))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .accessibilityIdentifier("bots.desk.queued.remove")
+                }
+            }
+        }
+        .padding(.horizontal, DS.Space.xxl)
+        .padding(.vertical, DS.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.bg)
+        .accessibilityIdentifier("bots.desk.queued")
+    }
+
     private func composerBar(_ bot: BotDefinition) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             AgentChatComposerBar(
                 text: $vm.composerText,
                 attachments: vm.attachments,
-                placeholder: AgentChatTranscriptChrome.composerPlaceholder(
-                    providerDisplayName: vm.providerLabel(for: bot) ?? bot.name
-                ),
+                placeholder: "Message \(bot.name)…",
                 sendEnabled: vm.deskSendEnabled,
                 runActive: vm.deskRunIsLive,
                 isStopping: vm.isStopping,
@@ -3165,6 +4388,8 @@ public struct BotsRootView: View {
             if vm.isMemoryActive {
                 HStack(alignment: .top, spacing: DS.Space.md) {
                     studioMultiline(text: $vm.memoryDraft, minHeight: 56, maxHeight: 72)
+                        .accessibilityLabel("Remember a fact")
+                        .accessibilityIdentifier("bots.memory.field")
                     Button("Add") { vm.addMemory() }
                         .buttonStyle(DSPrimaryButtonStyle())
                         .disabled(vm.memoryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -3176,9 +4401,12 @@ public struct BotsRootView: View {
                     .foregroundColor(DS.Palette.textTertiary)
             }
             if vm.memoryItems.isEmpty {
-                Text("No remembered facts yet.")
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textTertiary)
+                DSEmptyState(
+                    icon: "archivebox",
+                    title: "No remembered facts yet",
+                    subtitle: "Add a fact this teammate should keep."
+                )
+                .frame(maxWidth: .infinity)
             } else {
                 ForEach(vm.memoryItems, id: \.id) { item in
                     memoryRow(item)
@@ -3198,15 +4426,20 @@ public struct BotsRootView: View {
                 .foregroundColor(DS.Palette.textTertiary)
             HStack(alignment: .center, spacing: DS.Space.md) {
                 studioField(placeholder: "weekly-account-health", text: $vm.skillDraft)
+                    .accessibilityLabel("Skill catalog id")
+                    .accessibilityIdentifier("bots.studio.skills.field")
                 Button("Add") { vm.addSkill() }
                     .buttonStyle(DSPrimaryButtonStyle())
                     .disabled(vm.skillDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.selectedBot == nil)
                     .accessibilityIdentifier("bots.studio.skills.add")
             }
             if vm.skillBindings.isEmpty {
-                Text("No skills bound yet.")
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textTertiary)
+                DSEmptyState(
+                    icon: "puzzlepiece.extension",
+                    title: "No skills bound yet",
+                    subtitle: "Add a catalog id. Paths are not allowed."
+                )
+                .frame(maxWidth: .infinity)
             } else {
                 ForEach(vm.skillBindings, id: \.skillID) { binding in
                     HStack {
@@ -3225,6 +4458,7 @@ public struct BotsRootView: View {
                         ))
                         .toggleStyle(.switch)
                         .controlSize(.small)
+                        .accessibilityLabel(binding.skillID)
                     }
                     .dsPanel(padding: DS.Space.lg)
                 }
@@ -3272,6 +4506,7 @@ public struct BotsRootView: View {
         alert.addButton(withTitle: "Cancel")
         let field = NSTextField(string: current)
         field.frame = NSRect(x: 0, y: 0, width: 360, height: 24)
+        field.setAccessibilityLabel("Remember a fact")
         alert.accessoryView = field
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         return field.stringValue
@@ -3335,6 +4570,7 @@ public struct BotsRootView: View {
                 ))
                 .toggleStyle(.switch)
                 .controlSize(.small)
+                .accessibilityLabel(routine.definition.name)
                 .accessibilityIdentifier("bots.routines.active")
             }
             Text(routine.definition.prompt)
@@ -3362,7 +4598,11 @@ public struct BotsRootView: View {
     private var attentionScreen: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: DS.Space.lg) {
-                backButton { vm.openFleet() }
+                backButton {
+                    if let bot = vm.selectedBot {
+                        vm.openDesk(bot)
+                    }
+                }
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     Text("Attention")
                         .font(DS.Font.title2.weight(.semibold))
@@ -3442,7 +4682,9 @@ public struct BotsRootView: View {
             Text(label)
                 .font(DS.Font.caption.weight(.medium))
                 .foregroundColor(DS.Palette.textSecondary)
+                .accessibilityHidden(true)
             content()
+                .accessibilityLabel(label)
         }
     }
 
@@ -3451,6 +4693,7 @@ public struct BotsRootView: View {
             .textFieldStyle(.plain)
             .padding(.horizontal, DS.Space.lg)
             .padding(.vertical, DS.Space.md)
+            .frame(minHeight: BotsChrome.hitTarget)
             .background(DS.Palette.surfaceRaised)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             .overlay(

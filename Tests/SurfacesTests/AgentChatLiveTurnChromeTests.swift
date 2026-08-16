@@ -132,6 +132,53 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         )
     }
 
+    func test_replayDoesNotInventWallClockFinish_becauseDeskMustNotGrowWorkedHours() throws {
+        // WHY: Bots Desk replays persisted itemCompleted events on every open.
+        // apply() used Date() for missing finishedAtMs, so "Worked for 12s"
+        // became "Worked for 1230m" and grew each time the user left Studio.
+        let start: Int64 = 1_700_000_000_000
+        let events: [AssistantEvent] = [
+            .turnStarted(turnId: "t1"),
+            .itemStarted(item: AssistantItem(
+                id: "r1", turnId: "t1", type: .reasoning, state: .streaming,
+                body: "hmm", startedAtMs: start
+            )),
+            .itemCompleted(itemId: "r1", finalState: .completed),
+            .itemStarted(item: AssistantItem(
+                id: "tool1", turnId: "t1", type: .tool, state: .completed,
+                summary: "Bash", startedAtMs: start + 2_000, finishedAtMs: start + 4_000
+            )),
+            .turnCompleted(turnId: "t1", finalMessage: "done"),
+        ]
+        let first = AgentChatLiveTurnChrome.timelineByReplaying(events)
+        let second = AgentChatLiveTurnChrome.timelineByReplaying(events)
+        let firstTurn = try XCTUnwrap(first.turns.first)
+        let secondTurn = try XCTUnwrap(second.turns.first)
+        let firstReasoning = try XCTUnwrap(firstTurn.items.first { $0.id == "r1" })
+        XCTAssertNil(
+            firstReasoning.finishedAtMs,
+            "replay must not stamp wall-clock now onto a completed item that never recorded a finish"
+        )
+        XCTAssertNil(
+            AgentChatLiveTurnChrome.turnDurationLabel(firstTurn),
+            "unknown finish must omit duration instead of now-minus-start"
+        )
+        XCTAssertEqual(
+            AgentChatLiveTurnChrome.completedWorkLabel(firstTurn, live: false, workBlockCount: 1),
+            "Worked"
+        )
+        XCTAssertEqual(
+            AgentChatLiveTurnChrome.completedWorkLabel(firstTurn, live: false, workBlockCount: 1),
+            AgentChatLiveTurnChrome.completedWorkLabel(secondTurn, live: false, workBlockCount: 1),
+            "two replays hours apart must not change the Worked label"
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.timelineByReplaying(events).turns.first?.items.first { $0.id == "r1" }?.finishedAtMs,
+            firstReasoning.finishedAtMs,
+            "Agent App replay must share the same no-Date() finish rule"
+        )
+    }
+
     func test_messageDuplicatesTurnHidesPersistedAnswer_becauseDeskMustNotPaintTheReplyTwice() {
         // WHY: messageRepo stores the assistant row and the live turn stores
         // the same final. Painting both is the duplicate the user reported.
@@ -231,5 +278,43 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         )))
         XCTAssertTrue(AgentChatLiveTurnChrome.isRicher(live, than: persisted))
         XCTAssertFalse(AgentChatLiveTurnChrome.isRicher(persisted, than: live))
+    }
+
+    func test_composeKeepsOneAssistantWhenClaudeEmitsStreamAndSnapshot() {
+        // WHY: a real Claude Desk turn writes a streaming assistantMessage
+        // and then a snapshot item with the same body. Two replies is a lie.
+        let answer = "Sou Batatilson da Silva, Gerente de Marketing, e não alterei nenhum arquivo."
+        let turn = AssistantTurnSnapshot(
+            turnId: "F18B4835-C8AC-4C5B-8D0D-FD8A915CA0EF",
+            items: [
+                AssistantItem(
+                    id: "483520EA-C4E5-471D-A409-1B8501E14F90",
+                    turnId: "F18B4835-C8AC-4C5B-8D0D-FD8A915CA0EF",
+                    type: .assistantMessage,
+                    state: .completed,
+                    body: answer,
+                    startedAtMs: 1,
+                    finishedAtMs: 2
+                ),
+                AssistantItem(
+                    id: "793AAE89-A3B1-4F24-962E-A5D76186A18E",
+                    turnId: "F18B4835-C8AC-4C5B-8D0D-FD8A915CA0EF",
+                    type: .assistantMessage,
+                    state: .completed,
+                    body: answer,
+                    startedAtMs: 2,
+                    finishedAtMs: 3
+                ),
+            ],
+            finalAssistantMessage: answer,
+            finished: true
+        )
+        let composition = AgentChatLiveTurnChrome.compose(turn)
+        XCTAssertEqual(composition.outside.map(\.id), ["483520EA-C4E5-471D-A409-1B8501E14F90"])
+        XCTAssertEqual(composition.outside.map(\.body), [answer])
+        XCTAssertFalse(
+            AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn),
+            "the item is the answer; the turn final must not paint a third copy"
+        )
     }
 }

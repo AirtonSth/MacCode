@@ -711,6 +711,65 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func insertContextReceipt(_ receipt: ContextAssemblyReceipt) throws {
+        try db.performSync { database in
+            let data = try encoder.encode(receipt)
+            guard let json = String(data: data, encoding: .utf8) else {
+                throw BotStoreError.invalidRow("context receipt is not UTF-8")
+            }
+            let statement = try database.prepare("""
+                INSERT INTO bot_context_receipts(
+                    id, bot_id, conversation_id, run_id, revision_id, payload_digest,
+                    receipt_json, assembled_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    receipt_json=excluded.receipt_json;
+                """)
+            defer { statement.reset() }
+            try statement.bind(1, receipt.id.uuidString.lowercased())
+            try statement.bind(2, receipt.botID.value.uuidString.lowercased())
+            try statement.bind(3, receipt.conversationID?.value.uuidString.lowercased())
+            try statement.bind(4, receipt.runID?.value.uuidString.lowercased())
+            try statement.bind(5, receipt.revisionID.value.uuidString.lowercased())
+            try statement.bind(6, receipt.payloadDigest)
+            try statement.bind(7, json)
+            try statement.bind(8, string(receipt.assembledAt))
+            _ = try statement.step()
+        }
+    }
+
+    public func latestContextReceipt(
+        botID: BotID,
+        conversationID: BotConversationID? = nil
+    ) throws -> ContextAssemblyReceipt? {
+        try db.performSync { database in
+            let sql: String
+            if conversationID != nil {
+                sql = """
+                    SELECT receipt_json FROM bot_context_receipts
+                    WHERE bot_id = ? AND conversation_id = ?
+                    ORDER BY assembled_at DESC LIMIT 1;
+                    """
+            } else {
+                sql = """
+                    SELECT receipt_json FROM bot_context_receipts
+                    WHERE bot_id = ?
+                    ORDER BY assembled_at DESC LIMIT 1;
+                    """
+            }
+            let statement = try database.prepare(sql)
+            defer { statement.reset() }
+            try statement.bind(1, botID.value.uuidString.lowercased())
+            if let conversationID {
+                try statement.bind(2, conversationID.value.uuidString.lowercased())
+            }
+            guard try statement.step(), let json = statement.columnText(0),
+                  let data = json.data(using: .utf8) else { return nil }
+            return try decoder.decode(ContextAssemblyReceipt.self, from: data)
+        }
+    }
+
     public func setSkillBinding(_ binding: BotSkillBinding) throws {
         let skillID = binding.skillID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !skillID.isEmpty, !skillID.contains("/") else {

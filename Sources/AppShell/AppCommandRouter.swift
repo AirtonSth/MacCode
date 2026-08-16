@@ -633,7 +633,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             )
                         }
                     case .browser:
-                        surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
+                        let botID = desc.metadata["bot_id"].flatMap { UUID(uuidString: $0) }.map(BotID.init)
+                        var restored = restoredBrowserURL(from: desc)
+                        if restored == nil, let botID, let ctx = context {
+                            if let target = try? BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory).loadTarget(botID: botID) {
+                                restored = URL(string: target.url)
+                            }
+                        }
+                        surface = configureBrowserSurface(
+                            BrowserSurface(workspaceID: wid, initialURL: restored, title: title, botID: botID)
+                        )
                     case .agentApp:
                         // Per-surface thread binding restore: prefer the persisted
                         // `selected_thread`. Legacy surfaces (saved before binding
@@ -5746,12 +5755,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func configureBrowserSurface(_ browser: BrowserSurface) -> BrowserSurface {
         browser.onNavigationChange = { [weak self] surfaceID, url, title in
             self?.persistBrowserNavigation(surfaceID: surfaceID, url: url, title: title)
-            var payload: [String: JSONValue] = [
-                "surface_id": .string(surfaceID.value.uuidString),
-                "url": .string(url)
-            ]
-            if let title { payload["title"] = .string(title) }
-            EventBus.shared.publish(kind: "surface.browser", payload: .object(payload))
+            let fields = BotBrowserHostState.makePayload(surfaceID: surfaceID, url: url, title: title)
+            var payload: [String: JSONValue] = [:]
+            for (key, value) in fields {
+                payload[key] = .string(value)
+            }
+            EventBus.shared.publish(kind: BotBrowserHostState.eventKind, payload: .object(payload))
+        }
+        browser.onHTTPCookiesCaptured = { [weak self] surfaceID, cookies, url, title in
+            self?.persistBotBrowserCookies(surfaceID: surfaceID, cookies: cookies, url: url, title: title)
         }
         return browser
     }
@@ -5797,10 +5809,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func persistBrowserNavigation(surfaceID: SurfaceID, url: String, title: String?) {
         guard let ctx = context else { return }
         for (wid, var ws) in ctx.state.workspaces {
+            var botID: BotID?
             let result = updateSurface(in: ws.layout, surfaceID: surfaceID) { descriptor in
                 descriptor.metadata["url"] = url
                 if let title, !title.isEmpty {
                     descriptor.title = title
+                }
+                if let raw = descriptor.metadata["bot_id"], let uuid = UUID(uuidString: raw) {
+                    botID = BotID(uuid)
                 }
             }
             guard result.changed else { continue }
@@ -5808,7 +5824,97 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ws.updatedAt = Date()
             ctx.state.workspaces[wid] = ws
             ctx.scheduleSnapshotSave()
+            if let botID {
+                let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
+                try? store.persistTarget(BotBrowserTarget(url: url, title: title ?? ""), botID: botID)
+            }
             return
+        }
+    }
+
+    func persistBotBrowserCookies(surfaceID: SurfaceID, cookies: [HTTPCookie], url: String, title: String?) {
+        guard let ctx = context else { return }
+        for (_, ws) in ctx.state.workspaces {
+            var botID: BotID?
+            forEachSurface(in: ws.layout) { descriptor in
+                guard descriptor.id == surfaceID,
+                      let raw = descriptor.metadata["bot_id"],
+                      let uuid = UUID(uuidString: raw) else { return }
+                botID = BotID(uuid)
+            }
+            if let botID {
+                let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
+                let state = BotBrowserPageState.fromHTTPCookies(cookies, url: url, title: title ?? "")
+                try? store.persistPageState(state, botID: botID)
+                return
+            }
+        }
+    }
+
+    /// Open or retarget this bot's dedicated browser. Last URL/title persist by bot id.
+    @discardableResult
+    public func openBotBrowser(botID: BotID, url: String, title: String? = nil) throws -> BotBrowserTarget {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
+        let service = BotBrowserService(callerBotID: botID, store: store)
+        let target = try service.persistNavigation(url: url, title: title)
+        guard let parsed = URL(string: target.url) else { throw LayoutError.invalidLayout }
+        let bot = try ctx.botStore.get(id: botID)
+        let workspace = bot?.workspaceID ?? ctx.state.workspaces.keys.sorted { $0.value.uuidString < $1.value.uuidString }.first
+        guard let workspace, ctx.state.workspaces[workspace] != nil else {
+            return target
+        }
+        if let existing = botBrowserSurface(botID: botID, workspace: workspace),
+           let browser = SurfaceRegistry.shared.surface(existing.id) as? BrowserSurface {
+            browser.navigate(to: parsed)
+            persistBrowserNavigation(surfaceID: existing.id, url: target.url, title: target.title)
+            let fields = BotBrowserHostState.makePayload(surfaceID: existing.id, url: target.url, title: target.title)
+            var payload: [String: JSONValue] = [:]
+            for (key, value) in fields { payload[key] = .string(value) }
+            EventBus.shared.publish(kind: BotBrowserHostState.eventKind, payload: .object(payload))
+            try? ctx.apply(.focusSurface(workspace, existing.id))
+            windowController?.refreshFromState()
+            return target
+        }
+        let tabTitle = title?.isEmpty == false ? title! : (parsed.host ?? "browser")
+        let browser = configureBrowserSurface(
+            BrowserSurface(workspaceID: workspace, initialURL: parsed, title: tabTitle, botID: botID)
+        )
+        SurfaceRegistry.shared.register(browser)
+        var desc = browser.descriptor
+        desc.metadata["url"] = target.url
+        desc.metadata["bot_id"] = botID.value.uuidString.lowercased()
+        try ctx.apply(.addSurface(workspace, paneID: nil, descriptor: desc))
+        persistBrowserNavigation(surfaceID: desc.id, url: target.url, title: target.title)
+        let fields = BotBrowserHostState.makePayload(surfaceID: desc.id, url: target.url, title: target.title)
+        var payload: [String: JSONValue] = [:]
+        for (key, value) in fields { payload[key] = .string(value) }
+        EventBus.shared.publish(kind: BotBrowserHostState.eventKind, payload: .object(payload))
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        return target
+    }
+
+    private func botBrowserSurface(botID: BotID, workspace: WorkspaceID) -> SurfaceDescriptor? {
+        guard let ws = context?.state.workspaces[workspace] else { return nil }
+        var found: SurfaceDescriptor?
+        let expected = botID.value.uuidString.lowercased()
+        forEachSurface(in: ws.layout) { descriptor in
+            guard found == nil,
+                  descriptor.type == .browser,
+                  descriptor.metadata["bot_id"]?.lowercased() == expected else { return }
+            found = descriptor
+        }
+        return found
+    }
+
+    /// Drain MCP pending opens through the same `openBotBrowser` path tests drive.
+    @discardableResult
+    public func reconcileBotBrowserOpens() throws -> [BotBrowserTarget] {
+        guard let ctx = context else { return [] }
+        let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
+        return try BotBrowserHost.applyPendingOpens(store: store) { botID, url, title in
+            try self.openBotBrowser(botID: botID, url: url, title: title)
         }
     }
 
