@@ -53,6 +53,53 @@ final class ManagedComputerUseMCPTests: XCTestCase {
         XCTAssertEqual(backend.maxActive, 1, "HID calls must not overlap inside the shipped MCP queue")
         XCTAssertEqual(backend.invocations, 2)
     }
+
+    func test_screenshotToolsCallEmitsImageContentFromShippedBackendResult() async throws {
+        // WHY: zavora screenshot/zoom return type=image. A text-only MCP
+        // envelope would hide the pixels from every bot.
+        let pixels = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1s="
+        let backend = ImageBackend(data: pixels, mimeType: "image/png")
+        let server = makeServer(backend: backend)
+        let obj = try parse(await server.handle(
+            #"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"screenshot","arguments":{"width":64}}}"#
+        ))
+        let result = try XCTUnwrap(obj["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 1)
+        XCTAssertEqual(content[0]["type"] as? String, "image")
+        XCTAssertEqual(content[0]["data"] as? String, pixels)
+        XCTAssertEqual(content[0]["mimeType"] as? String, "image/png")
+        XCTAssertNil(content[0]["text"])
+        XCTAssertEqual(result["isError"] as? Bool, false)
+    }
+
+    func test_parseUpstreamKeepsZavoraImageAndDoesNotInventOkText() {
+        // WHY: the zavora forwarder must use this shipped parser; dropping
+        // type=image or substituting "ok" is how bots lose screenshots.
+        let pixels = "ZmFrZS1qcGVn"
+        let upstream: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": [
+                "content": [
+                    ["type": "text", "text": "1024x640"],
+                    ["type": "image", "data": pixels, "mimeType": "image/jpeg"],
+                ],
+                "isError": false,
+            ],
+        ]
+        let parsed = ComputerUseToolResult.parseUpstream(upstream)
+        XCTAssertEqual(parsed.content.count, 2)
+        XCTAssertEqual(parsed.content[0], .text("1024x640"))
+        XCTAssertEqual(parsed.content[1], .image(data: pixels, mimeType: "image/jpeg"))
+        XCTAssertFalse(parsed.isError)
+        XCTAssertFalse(parsed.content.contains { $0.text == "ok" })
+        XCTAssertEqual(
+            (parsed.jsonContent()[1]["data"] as? String),
+            pixels,
+            "MCP wire content must still carry the image bytes"
+        )
+    }
 }
 
 private final class CountingBackend: ComputerUseToolBackend, @unchecked Sendable {
@@ -72,5 +119,14 @@ private final class CountingBackend: ComputerUseToolBackend, @unchecked Sendable
         active -= 1
         lock.unlock()
         return ComputerUseToolResult(text: "hid \(name)")
+    }
+}
+
+private struct ImageBackend: ComputerUseToolBackend {
+    var data: String
+    var mimeType: String
+
+    func invoke(name: String, arguments: [String: Any]) async -> ComputerUseToolResult {
+        ComputerUseToolResult(content: [.image(data: data, mimeType: mimeType)])
     }
 }

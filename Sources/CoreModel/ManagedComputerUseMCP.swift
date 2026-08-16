@@ -1,12 +1,77 @@
 import Foundation
 
+public struct ComputerUseContentPart: Sendable, Equatable {
+    public var type: String
+    public var text: String?
+    public var data: String?
+    public var mimeType: String?
+
+    public init(type: String, text: String? = nil, data: String? = nil, mimeType: String? = nil) {
+        self.type = type
+        self.text = text
+        self.data = data
+        self.mimeType = mimeType
+    }
+
+    public static func text(_ value: String) -> ComputerUseContentPart {
+        ComputerUseContentPart(type: "text", text: value)
+    }
+
+    public static func image(data: String, mimeType: String) -> ComputerUseContentPart {
+        ComputerUseContentPart(type: "image", data: data, mimeType: mimeType)
+    }
+
+    /// Decode one zavora / MCP content item. Image parts keep data + mimeType.
+    public static func parse(_ object: [String: Any]) -> ComputerUseContentPart? {
+        guard let type = object["type"] as? String, !type.isEmpty else { return nil }
+        return ComputerUseContentPart(
+            type: type,
+            text: object["text"] as? String,
+            data: object["data"] as? String,
+            mimeType: object["mimeType"] as? String
+        )
+    }
+
+    public func jsonObject() -> [String: Any] {
+        var object: [String: Any] = ["type": type]
+        if let text { object["text"] = text }
+        if let data { object["data"] = data }
+        if let mimeType { object["mimeType"] = mimeType }
+        return object
+    }
+}
+
 public struct ComputerUseToolResult: Sendable, Equatable {
-    public var text: String
+    public var content: [ComputerUseContentPart]
     public var isError: Bool
 
-    public init(text: String, isError: Bool = false) {
-        self.text = text
+    public init(content: [ComputerUseContentPart], isError: Bool = false) {
+        self.content = content
         self.isError = isError
+    }
+
+    public init(text: String, isError: Bool = false) {
+        self.content = [.text(text)]
+        self.isError = isError
+    }
+
+    /// Decode a zavora-style tools/call result so screenshot/zoom images survive.
+    public static func parseUpstream(_ object: [String: Any]) -> ComputerUseToolResult {
+        if let error = object["error"] as? [String: Any] {
+            let message = (error["message"] as? String) ?? String(describing: error)
+            return ComputerUseToolResult(text: message, isError: true)
+        }
+        let result = object["result"] as? [String: Any] ?? object
+        let raw = result["content"] as? [[String: Any]] ?? []
+        let parts = raw.compactMap(ComputerUseContentPart.parse)
+        return ComputerUseToolResult(
+            content: parts,
+            isError: result["isError"] as? Bool ?? false
+        )
+    }
+
+    public func jsonContent() -> [[String: Any]] {
+        content.map { $0.jsonObject() }
     }
 }
 
@@ -108,7 +173,7 @@ public struct ManagedComputerUseMCP: Sendable {
                     await backend.invoke(name: name, arguments: arguments)
                 }
                 return reply(id: id, result: [
-                    "content": [["type": "text", "text": result.text]],
+                    "content": result.jsonContent(),
                     "isError": result.isError,
                 ])
             } catch is CancellationError {

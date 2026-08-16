@@ -68,17 +68,7 @@ public final class ComputerUseZavoraForwardBackend: ComputerUseToolBackend, @unc
         lock.lock()
         defer { lock.unlock() }
         try sendLocked(method: "tools/call", params: ["name": name, "arguments": arguments])
-        let object = try readLocked()
-        if let error = object["error"] as? [String: Any] {
-            return ComputerUseToolResult(text: String(describing: error["message"] ?? error), isError: true)
-        }
-        let result = object["result"] as? [String: Any] ?? [:]
-        let content = result["content"] as? [[String: Any]] ?? []
-        let text = content.compactMap { $0["text"] as? String }.joined(separator: "\n")
-        return ComputerUseToolResult(
-            text: text.isEmpty ? "ok" : text,
-            isError: result["isError"] as? Bool ?? false
-        )
+        return ComputerUseToolResult.parseUpstream(try readLocked())
     }
 
     @discardableResult
