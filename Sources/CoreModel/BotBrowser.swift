@@ -66,14 +66,49 @@ public struct BotBrowserPageState: Codable, Equatable, Sendable {
 public struct BotBrowserLoginPredicate: Equatable, Sendable {
     public var cookieNames: Set<String>
 
-    public static let standard = BotBrowserLoginPredicate(cookieNames: ["session", "sid", "auth"])
+    /// Typical completed-login cookies. Includes names used by LinkedIn (`li_at`)
+    /// and servlet stacks (`JSESSIONID`), not only `session`/`sid`/`auth`.
+    public static let standard = BotBrowserLoginPredicate(cookieNames: [
+        "session", "sid", "auth",
+        "sessionid", "session_id", "__session",
+        "auth_token", "access_token", "token", "jwt",
+        "connect.sid",
+        "li_at", "jsessionid",
+    ])
 
     public init(cookieNames: Set<String>) {
         self.cookieNames = Set(cookieNames.map { $0.lowercased() })
     }
 
-    public func isLoggedIn(_ page: BotBrowserPageState) -> Bool {
+    public func hasAuthCookie(_ page: BotBrowserPageState) -> Bool {
         page.cookies.keys.contains { cookieNames.contains($0.lowercased()) }
+    }
+
+    public func leftLoginPage(openedURL: String, currentURL: String) -> Bool {
+        guard looksLikeLoginURL(openedURL) else { return false }
+        let current = currentURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !current.isEmpty, current != openedURL else { return false }
+        return !looksLikeLoginURL(current)
+    }
+
+    public func isLoggedIn(_ page: BotBrowserPageState, openedURL: String? = nil) -> Bool {
+        if hasAuthCookie(page) { return true }
+        if let openedURL { return leftLoginPage(openedURL: openedURL, currentURL: page.url) }
+        return false
+    }
+
+    public func looksLikeLoginURL(_ raw: String) -> Bool {
+        guard let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return raw.lowercased().contains("/login") || raw.lowercased().contains("/signin")
+        }
+        let host = (components.host ?? "").lowercased()
+        let path = components.path.lowercased()
+        if host.hasPrefix("login.") || host.hasPrefix("signin.") || host.hasPrefix("auth.") {
+            return true
+        }
+        let markers = ["/login", "/log-in", "/signin", "/sign-in", "/signup", "/sign-up", "/auth"]
+        return markers.contains { path == $0 || path.hasPrefix($0 + "/") || path.hasSuffix($0) }
     }
 }
 
@@ -100,7 +135,7 @@ public enum BotBrowserLoginWait: Sendable {
         page: BotBrowserPageState,
         predicate: BotBrowserLoginPredicate = .standard
     ) -> Result {
-        if predicate.isLoggedIn(page) {
+        if predicate.isLoggedIn(page, openedURL: url) {
             return Result(isComplete: true, userMessage: nil, url: page.url.isEmpty ? url : page.url)
         }
         return Result(isComplete: false, userMessage: userPrompt(url: url), url: url)

@@ -57,4 +57,56 @@ final class BotBrowserLoginWaitTests: XCTestCase {
         XCTAssertTrue(BotBrowserLoginPredicate.standard.isLoggedIn(loggedIn))
         XCTAssertEqual(loggedIn.cookies["session"], "ok")
     }
+
+    func test_standardPredicateCompletesOnLiAtCookieNotSessionSidOrAuth() throws {
+        // WHY: a real LinkedIn sign-in sets li_at, not session/sid/auth.
+        let loginURL = "https://www.linkedin.com/login"
+        let cookie = HTTPCookie(properties: [
+            .name: "li_at",
+            .value: "AQED",
+            .domain: ".linkedin.com",
+            .path: "/",
+        ])!
+        XCTAssertFalse(["session", "sid", "auth"].contains(cookie.name.lowercased()))
+        let loggedOut = BotBrowserPageState(url: loginURL, title: "Sign in", cookies: [:])
+        let loggedIn = BotBrowserPageState.fromHTTPCookies(
+            [cookie],
+            url: "https://www.linkedin.com/feed/",
+            title: "Feed"
+        )
+        XCTAssertFalse(BotBrowserLoginPredicate.standard.isLoggedIn(loggedOut, openedURL: loginURL))
+        XCTAssertTrue(BotBrowserLoginPredicate.standard.hasAuthCookie(loggedIn))
+        let steps = BotBrowserLoginWait.wait(url: loginURL, pages: [loggedOut, loggedIn])
+        XCTAssertFalse(steps[0].isComplete)
+        XCTAssertEqual(steps[0].userMessage, BotBrowserLoginWait.userPrompt(url: loginURL))
+        XCTAssertTrue(steps[1].isComplete)
+        XCTAssertNil(steps[1].userMessage)
+
+        var index = 0
+        let pages = [loggedOut, loggedIn]
+        let polled = try BotBrowserLoginWait.pollUntilLoggedIn(
+            url: loginURL,
+            timeoutMS: BotBrowserLoginWait.defaultTimeoutMS,
+            pollIntervalMS: 1,
+            loadPage: {
+                let page = pages[min(index, pages.count - 1)]
+                index += 1
+                return page
+            },
+            sleep: { _ in },
+            now: { Date(timeIntervalSince1970: 0) }
+        )
+        XCTAssertTrue(polled.isComplete)
+        XCTAssertEqual(polled.url, loggedIn.url)
+    }
+
+    func test_standardPredicateCompletesWhenURLLeavesLoginPath() {
+        let opened = "https://www.linkedin.com/login"
+        let stillLogin = BotBrowserPageState(url: opened, cookies: [:])
+        let feed = BotBrowserPageState(url: "https://www.linkedin.com/feed/", cookies: [:])
+        XCTAssertFalse(BotBrowserLoginPredicate.standard.isLoggedIn(stillLogin, openedURL: opened))
+        XCTAssertTrue(BotBrowserLoginPredicate.standard.leftLoginPage(openedURL: opened, currentURL: feed.url))
+        let result = BotBrowserLoginWait.evaluate(url: opened, page: feed)
+        XCTAssertTrue(result.isComplete)
+    }
 }
