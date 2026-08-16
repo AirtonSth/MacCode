@@ -349,16 +349,17 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(BotsChrome.Label.openChat, "Open Chat")
     }
 
-    func test_openHomeShowsFleetOverview_becauseThePlanSeparatesRosterFromChat() throws {
-        // WHY: Fleet Home is the selected-bot overview. openHome must stay
-        // on that screen so Studio / Open Chat remain distinct from Desk.
+    func test_openHomeShowsChat_becauseHomeIsNotADestination() throws {
+        // WHY: Home/overview is gone. openHome is leftover API and must
+        // land on Chat so roster/create never park on Goal cards.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.openDesk(bot)
         XCTAssertEqual(vm.screen, .desk)
         vm.openHome(bot)
-        XCTAssertEqual(vm.screen, .fleet)
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.screen, BotsScreen.fleet.resolvedDestination)
         XCTAssertEqual(vm.selectedBotID, bot.id)
         XCTAssertEqual(vm.providerLabel(for: bot), "Claude")
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).title, "Scout")
@@ -371,7 +372,7 @@ final class BotsWindowTests: XCTestCase {
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.openHome(bot)
-        XCTAssertEqual(vm.screen, .fleet)
+        XCTAssertEqual(vm.screen, .desk)
         vm.openDesk(bot)
         XCTAssertEqual(vm.screen, .desk)
         XCTAssertEqual(vm.selectedBotID, bot.id)
@@ -475,12 +476,12 @@ final class BotsWindowTests: XCTestCase {
         vm.selectedBotID = nil
         vm.openFleet()
         XCTAssertEqual(vm.selectedBotID, bot.id)
-        XCTAssertEqual(vm.screen, .fleet)
+        XCTAssertEqual(vm.screen, .desk)
     }
 
-    func test_reloadOnFleetSelectsFirstTeammate_becauseSidebarOpenMustLandOnOverview() throws {
-        // WHY: first paint of Bots is reload(), not openFleet(). A nil
-        // selection would show the empty list instead of the selected overview.
+    func test_reloadOnFleetSelectsFirstTeammate_becauseSidebarOpenMustLandOnChat() throws {
+        // WHY: first paint of Bots is reload(). A leftover Home screen must
+        // not stay Home; Chat is the only default destination.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
@@ -488,7 +489,7 @@ final class BotsWindowTests: XCTestCase {
         vm.screen = .fleet
         vm.reload()
         XCTAssertEqual(vm.selectedBotID, bot.id)
-        XCTAssertEqual(vm.screen, .fleet)
+        XCTAssertEqual(vm.screen, .desk)
     }
 
     func test_openChatFromHomeOpensDesk_becauseConversationLivesOnDeskNotFleet() throws {
@@ -496,7 +497,7 @@ final class BotsWindowTests: XCTestCase {
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.openHome(bot)
-        XCTAssertEqual(vm.screen, .fleet)
+        XCTAssertEqual(vm.screen, .desk)
         vm.openDesk(bot)
         XCTAssertEqual(vm.screen, .desk)
         XCTAssertEqual(vm.inspectorTab, .memory)
@@ -610,18 +611,21 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(reopened.studioDraft.name, "Piper")
     }
 
-    func test_fleetScreenSurvivesRelaunch_becauseHomeIsAlsoAnExplicitChoice() throws {
-        // WHY: restoring Desk after the user pressed Back would fight them.
+    func test_leftoverHomePersistOpensChat_becauseHomeIsNotADestination() throws {
+        // WHY: UserDefaults may still store fleet/Home. Dropping that raw
+        // value without remap would leave Bots stuck on a removed screen.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.openDesk(bot)
         vm.openHome(bot)
-        XCTAssertEqual(vm.screen, .fleet)
+        XCTAssertEqual(vm.screen, .desk)
+        UserDefaults.standard.set(BotsScreen.fleet.rawValue, forKey: "bots.screen")
 
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.selectedBotID, bot.id)
-        XCTAssertEqual(reopened.screen, .fleet)
+        XCTAssertEqual(reopened.screen, .desk)
+        XCTAssertEqual(BotsScreen(rawValue: "fleet")?.resolvedDestination, .desk)
     }
 
     func test_botsShellDestinationSurvivesRelaunch_becauseAgenticBotsIsUserWorkflowState() throws {
@@ -710,7 +714,7 @@ final class BotsWindowTests: XCTestCase {
 
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.selectedBotID, quinn.id)
-        XCTAssertEqual(reopened.screen, .fleet)
+        XCTAssertEqual(reopened.screen, .desk)
     }
 
     func test_memoryCorrectAndForgetStayOnDesk_becauseTheInspectorOwnsBrainEdits() throws {
@@ -934,8 +938,11 @@ final class BotsWindowTests: XCTestCase {
             source.contains("Dedicated Desktop"),
             "P1a has no dedicated Desktop; the concept screenshot is not the contract"
         )
-        XCTAssertTrue(source.contains("bots.home.desktop.honesty"))
-        XCTAssertTrue(source.contains("bots.desk.desktop.honesty"))
+        XCTAssertFalse(
+            source.contains("bots.home.desktop.honesty"),
+            "Home desktop honesty is gone with the Home screen"
+        )
+        XCTAssertTrue(source.contains("bots.studio.desktop.honesty") || source.contains("bots.desk.desktop"))
         XCTAssertTrue(source.contains("BotRoutineCopy.testRunHonestyCaption"))
         XCTAssertTrue(source.contains("no app-closed runs"))
         XCTAssertFalse(
@@ -995,6 +1002,7 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
         try context.botStore.upsertConversation(
             BotConversation(botID: bot.id, title: "Standup", unread: true, attentionState: .unreadActivity)
         )
@@ -2227,27 +2235,31 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.chrome.bots"))
         XCTAssertTrue(sidebar.contains("if vm.isBotsSelected"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.new\")"))
-        XCTAssertTrue(bots.contains("bots.fleet.row."))
+        XCTAssertFalse(bots.contains("bots.fleet.row."), "Fleet Home row is not a destination")
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.roster\")"))
         XCTAssertTrue(bots.contains("bots.roster.row."))
-        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.home\")"))
-        XCTAssertTrue(bots.contains("bots.home.chat"))
-        XCTAssertTrue(bots.contains("bots.home.studio"))
-        XCTAssertTrue(bots.contains("bots.home.desktop"))
-        XCTAssertTrue(bots.contains("bots.home.activity"))
-        XCTAssertTrue(bots.contains("bots.home.memory"))
-        XCTAssertTrue(bots.contains("bots.home.skills"))
-        XCTAssertTrue(bots.contains("bots.home.routines"))
-        XCTAssertTrue(bots.contains("bots.home.approvals"))
+        XCTAssertFalse(bots.contains("accessibilityIdentifier(\"bots.home\")"))
+        XCTAssertFalse(bots.contains("bots.home.chat"))
+        XCTAssertFalse(bots.contains("bots.home.studio"))
+        XCTAssertFalse(bots.contains("bots.home.desktop"))
+        XCTAssertFalse(bots.contains("bots.home.activity"))
+        XCTAssertFalse(bots.contains("bots.home.memory"))
+        XCTAssertFalse(bots.contains("bots.home.skills"))
+        XCTAssertFalse(bots.contains("bots.home.routines"))
+        XCTAssertFalse(bots.contains("bots.home.approvals"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.studio\")"))
         XCTAssertTrue(bots.contains("bots.studio.tab.profile"))
+        XCTAssertTrue(bots.contains("bots.studio.tab.brain"))
         XCTAssertTrue(bots.contains("bots.studio.tab.memory"))
         XCTAssertTrue(bots.contains("bots.studio.tab.skills"))
         XCTAssertTrue(bots.contains("bots.studio.tab.routines"))
         XCTAssertTrue(bots.contains("bots.studio.tab.desktop"))
         XCTAssertTrue(bots.contains("bots.studio.tab.security"))
         XCTAssertTrue(bots.contains("bots.chrome.agentic"))
-        XCTAssertTrue(bots.contains("bots.home.goal"))
+        XCTAssertFalse(bots.contains("bots.home.goal"))
+        XCTAssertTrue(bots.contains("accessibilityAddTraits(selected ? .isSelected : [])"))
+        XCTAssertTrue(bots.contains("BotsChrome.hitTarget"))
+        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "memory", "skills", "routines", "security", "desktop"])
         XCTAssertTrue(chrome.contains(BotsChrome.Label.agentic))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.currentGoal))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.todaysActivity))
