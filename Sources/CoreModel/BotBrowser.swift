@@ -66,22 +66,27 @@ public struct BotBrowserPageState: Codable, Equatable, Sendable {
 public struct BotBrowserLoginPredicate: Equatable, Sendable {
     public var cookieNames: Set<String>
 
-    /// Typical completed-login cookies. Includes names used by LinkedIn (`li_at`)
-    /// and servlet stacks (`JSESSIONID`), not only `session`/`sid`/`auth`.
-    public static let standard = BotBrowserLoginPredicate(cookieNames: [
-        "session", "sid", "auth",
-        "sessionid", "session_id", "__session",
-        "auth_token", "access_token", "token", "jwt",
-        "connect.sid",
-        "li_at", "jsessionid",
-    ])
+    /// Completes even while still on `/login`. Pre-login CSRF cookies are not here.
+    public static let sufficientCookieNames: Set<String> = [
+        "session", "sid", "auth", "li_at",
+    ]
 
-    public init(cookieNames: Set<String>) {
+    /// Present on login pages before sign-in. Never enough to complete wait.
+    public static let neverSufficientCookieNames: Set<String> = [
+        "jsessionid", "csrf", "xsrf", "_csrf", "xsrf-token", "bcookie", "lidc", "lang",
+    ]
+
+    public static let cookieNameSetsAreDisjoint =
+        sufficientCookieNames.isDisjoint(with: neverSufficientCookieNames)
+
+    public static let standard = BotBrowserLoginPredicate(cookieNames: sufficientCookieNames)
+
+    public init(cookieNames: Set<String> = sufficientCookieNames) {
         self.cookieNames = Set(cookieNames.map { $0.lowercased() })
     }
 
     public func hasAuthCookie(_ page: BotBrowserPageState) -> Bool {
-        page.cookies.keys.contains { cookieNames.contains($0.lowercased()) }
+        page.cookies.keys.contains { Self.sufficientCookieNames.contains($0.lowercased()) }
     }
 
     public func leftLoginPage(openedURL: String, currentURL: String) -> Bool {
