@@ -318,7 +318,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(try maxVersion(db), Schema.checkpointListSchemaVersion)
 
         let legacy = try db.prepare("""
-            SELECT list_turn_id, list_metadata_unavailable, files_summary_timestamp
+            SELECT list_turn_id, list_metadata_unavailable, files_summary_truncated
             FROM agent_turn_checkpoints WHERE thread_id = ?;
             """)
         try legacy.bind(1, threadID)
@@ -453,6 +453,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             67,
             68,
             69,
+            70,
             Schema.currentVersion
         ])
         XCTAssertGreaterThanOrEqual(Schema.currentVersion, 70)

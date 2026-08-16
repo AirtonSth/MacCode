@@ -2155,6 +2155,7 @@ final class TokenSaverCompressionTests: XCTestCase {
         }
         XCTAssertEqual(observer.recordedEvents.compactMap(\.bodyAppendForTest).joined(), plain,
                        "provider plaintext must keep streaming immediately instead of waiting for translation")
+        try await waitForRun(runId, in: runRepo)
         var timeline = AssistantTimelineState()
         for event in coordinator.latestStreamEvents(threadId: thread.id) {
             timeline.apply(event)
