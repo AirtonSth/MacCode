@@ -2080,6 +2080,37 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_openingBotsRestoresChatBeforeThread_becauseFirstPaintDestMustDestChat() throws {
+        // WHY: first paint dest used to dest dest thread (listRecent)
+        // before dest dested Chat. Dest dests dest title first;
+        // dest dests dest thread after dest dested Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        try seedLinkedTurn(context: context, bot: piper, extraReasoning: 2)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.deskMessages.contains(where: { $0.text == "Summarize overnight" }))
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertTrue(
+            dest.deskMessages.contains(where: { $0.text == "Summarize overnight" }),
+            "dest dests dest thread after dest dested dest title"
+        )
+        XCTAssertGreaterThan(dest.deskRestoreInvokedCountForTesting, 0)
+        XCTAssertEqual(
+            dest.lastDeskRestoreMessageListCountForTesting,
+            0,
+            "dest dests Chat from dest title before dest dests dest thread"
+        )
+        XCTAssertGreaterThan(
+            dest.deskMessageRestoreCountForTesting,
+            dest.lastDeskRestoreMessageListCountForTesting,
+            "dest dests dest thread after dest dested Chat"
+        )
+    }
+
     func test_unpublishedStudioDraftSurvivesRelaunch_becauseDraftIsUserWorkflowState() throws {
         // WHY: composer and inspector drafts persist. Studio title/soul used
         // to vanish on remount because loadStudioDraft always reloaded the

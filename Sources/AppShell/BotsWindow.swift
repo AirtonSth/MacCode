@@ -399,6 +399,9 @@ public final class BotsViewModel: ObservableObject {
     /// dest dests Chat. First paint dest must dest Chat before dest
     /// dests dest preview.
     public private(set) var lastDeskRestoreConversationListCountForTesting = 0
+    /// Test seam: dest thread rereads already done when dest dests Chat.
+    /// First paint dest must dest Chat from dest title before dest dests dest thread.
+    public private(set) var lastDeskRestoreMessageListCountForTesting = 0
     /// Test seam: dest dests Chat restore. First paint dest must dest
     /// this bubble even when dest dests Chat from dest title.
     public private(set) var deskRestoreInvokedCountForTesting = 0
@@ -2386,6 +2389,10 @@ public final class BotsViewModel: ObservableObject {
         lastDeskRestoreConversationListCountForTesting = conversationListCountForTesting
         let cached = messagesByBot[botID] ?? []
         let conversation = conversationForBot(botID)
+        // Dest first. First paint dest used to dest dest thread
+        // (listRecent) before dest dested Chat. Dest dests dest
+        // title now; dest dests dest thread after dest dested Chat.
+        destDeskChatFromTitleIfNeeded(botID: botID, cached: cached, conversation: conversation)
         var persisted: [BotDeskMessage] = []
         if let threadID = conversation?.linkedAgentThreadID,
            let stored = try? context.messageRepo.listRecent(threadId: threadID, limit: 80),
@@ -2419,6 +2426,29 @@ public final class BotsViewModel: ObservableObject {
             lastPreviewByBot[botID] = last.text
             lastUpdatedByBot[botID] = last.createdAt
         }
+    }
+
+    /// Dest first. First paint dest used to dest dest thread before
+    /// dest dested Chat. Dest dests dest title so dest dests Chat
+    /// before dest dests dest thread.
+    private func destDeskChatFromTitleIfNeeded(
+        botID: BotID,
+        cached: [BotDeskMessage],
+        conversation: BotConversation?
+    ) {
+        guard selectedBotID == botID, deskMessages.isEmpty else { return }
+        lastDeskRestoreMessageListCountForTesting = deskMessageRestoreCountForTesting
+        if !cached.isEmpty {
+            deskMessages = cached
+            messagesByBot[botID] = cached
+            return
+        }
+        guard let conversation, !conversation.title.isEmpty else { return }
+        let dest = [
+            BotDeskMessage(role: .user, text: conversation.title, createdAt: conversation.createdAt)
+        ]
+        deskMessages = dest
+        messagesByBot[botID] = dest
     }
 
     private func restoreDeskLiveTurn(botID: BotID) {
