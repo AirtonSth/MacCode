@@ -2667,6 +2667,52 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "Codex app-server streamed deltas must be returned as final assistant text")
         XCTAssertEqual(streamedBody, "1 2 3",
                        "item/completed must not replay the full assistant text after deltas already streamed it")
+        let deltaRuntime = events.filter {
+            if case .providerRuntime(let runtime) = $0 {
+                return runtime.method == "item/agentMessage/delta"
+            }
+            return false
+        }
+        XCTAssertTrue(deltaRuntime.isEmpty,
+                      "token-rate deltas must not mint providerRuntime; itemDelta is the product event")
+        XCTAssertTrue(events.contains {
+            if case .providerRuntime(let runtime) = $0 { return runtime.method == "item/started" }
+            return false
+        }, "lifecycle item/started must still emit providerRuntime")
+        XCTAssertTrue(events.contains {
+            if case .providerRuntime(let runtime) = $0 { return runtime.method == "turn/completed" }
+            return false
+        }, "lifecycle turn/completed must still emit providerRuntime")
+    }
+
+    func test_highFrequencyStreamingMethodsSkipProviderRuntime() {
+        // WHY: handleNotification used to prepend providerRuntime on every
+        // notification. item/agentMessage/delta (and other outputDelta kinds)
+        // fire at token / PTY rate; each one JSONSerialization.data(.sortedKeys)
+        // then persistStreamBatch + EventBus EventLog on the delivery queue.
+        // itemDelta already carries the bytes. Lifecycle methods stay.
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/agentMessage/delta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item.agentMessage.delta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "command/exec/outputDelta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "command.exec.outputDelta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "process/outputDelta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/commandExecution/outputDelta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/commandExecution/terminalInteraction"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/fileChange/outputDelta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/fileChange/patchUpdated"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/reasoning/textDelta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/plan/delta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/mcpToolCall/progress"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "thread/realtime/transcript/delta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "thread/realtime/outputAudio/delta"))
+        XCTAssertTrue(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/started"),
+                      "item start is lifecycle and still needs the raw provider payload")
+        XCTAssertTrue(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/completed"))
+        XCTAssertTrue(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "turn/started"))
+        XCTAssertTrue(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "turn/completed"))
+        XCTAssertTrue(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "thread/started"))
+        XCTAssertTrue(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "thread/goal/updated"))
+        XCTAssertTrue(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "error"))
     }
 
     func test_adapterFinalMessageIsLastAgentMessageItemNotConcatenationOfPreambles() async throws {
