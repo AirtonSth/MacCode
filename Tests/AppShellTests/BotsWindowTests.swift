@@ -1938,6 +1938,62 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(dest.deskMessages.contains(where: { $0.text == "From Quinn" }))
     }
 
+    func test_openingBotsRestoresChatBeforeInspector_becauseFirstPaintDestMustDestChat() throws {
+        // WHY: first paint dest used to dest inspector (six store
+        // reads) before dest dested Chat. Dest dests this bubble
+        // first; dest dests inspector after dest dested Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("From Quinn"))
+        vm.openDesk(piper)
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        XCTAssertGreaterThan(dest.deskRestoreInvokedCountForTesting, 0)
+        XCTAssertEqual(
+            dest.lastDeskRestoreStudioSupportCountForTesting,
+            0,
+            "dest dests Chat before dest dests inspector"
+        )
+        XCTAssertGreaterThan(
+            dest.studioSupportReloadCountForTesting,
+            dest.lastDeskRestoreStudioSupportCountForTesting,
+            "dest dests inspector after dest dested Chat"
+        )
+    }
+
+    func test_openingBotsStillDestsInspector_becauseStaleEmptyMustNotLookCurrent() throws {
+        // WHY: dest-first Chat is honest only when dest dests Brain
+        // after dest dested this bubble. Dest dests inspector so
+        // Memory/Skills cannot look empty after dest dested Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        _ = try context.botStore.putMemory(
+            botID: piper.id,
+            content: "Prefers dark mode",
+            provenance: "user",
+            trusted: true,
+            source: "studio"
+        )
+        try context.botStore.setSkillBinding(
+            BotSkillBinding(botID: piper.id, skillID: "weekly-account-health", enabled: true)
+        )
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        XCTAssertEqual(dest.liveMemoryCount, 1)
+        XCTAssertEqual(dest.enabledSkillCount, 1)
+    }
+
     func test_unpublishedStudioDraftSurvivesRelaunch_becauseDraftIsUserWorkflowState() throws {
         // WHY: composer and inspector drafts persist. Studio title/soul used
         // to vanish on remount because loadStudioDraft always reloaded the

@@ -389,6 +389,12 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var previewBrainAssembleCountForTesting = 0
     /// Test seam: inspector store rereads. Warm-cache dest must not increment this.
     public private(set) var studioSupportReloadCountForTesting = 0
+    /// Test seam: inspector rereads already done when dest dests Chat.
+    /// First paint dest must dest Chat before dest dests inspector.
+    public private(set) var lastDeskRestoreStudioSupportCountForTesting = 0
+    /// Test seam: dest dests Chat restore. First paint dest must dest
+    /// this bubble even when dest dests Chat from dest title.
+    public private(set) var deskRestoreInvokedCountForTesting = 0
     /// Test seam: mark-read store rereads. Already-read dest must not increment this.
     public private(set) var deskMarkReadStoreCountForTesting = 0
     /// Test seam: revision store rereads. Warm dest chips must not increment this.
@@ -1789,12 +1795,16 @@ public final class BotsViewModel: ObservableObject {
         deskLiveTimeline = liveTimelineByBot[id] ?? AssistantTimelineState()
         deskStreamEventCount = liveStreamCountByBot[id] ?? 0
         deskMessages = messagesByBot[id] ?? []
-        reloadStudioSupport(id: id)
+        // Dest first. First paint dest used to dest inspector
+        // (conversations, revision, skills, memory, routines,
+        // receipt) before dest dested Chat. Dest dests this
+        // bubble first; dest dests inspector after dest dested Chat.
         if messagesByBot[id]?.isEmpty != false {
             restoreDeskMessages(botID: id)
         }
         restoreDeskWorkLog(botID: id)
         restoreDeskLiveTurn(botID: id)
+        reloadStudioSupport(id: id)
     }
 
     public func providerChipTitle(_ provider: AgentProvider) -> String {
@@ -2344,6 +2354,8 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func restoreDeskMessages(botID: BotID) {
+        deskRestoreInvokedCountForTesting += 1
+        lastDeskRestoreStudioSupportCountForTesting = studioSupportReloadCountForTesting
         let cached = messagesByBot[botID] ?? []
         let conversation = conversationForBot(botID)
         var persisted: [BotDeskMessage] = []
