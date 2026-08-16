@@ -392,6 +392,9 @@ public final class BotsViewModel: ObservableObject {
     /// Test seam: inspector rereads already done when dest dests Chat.
     /// First paint dest must dest Chat before dest dests inspector.
     public private(set) var lastDeskRestoreStudioSupportCountForTesting = 0
+    /// Test seam: inbox rereads already done when dest dests Chat.
+    /// First paint dest must dest Chat before dest dests inbox.
+    public private(set) var lastDeskRestoreAttentionListCountForTesting = 0
     /// Test seam: dest dests Chat restore. First paint dest must dest
     /// this bubble even when dest dests Chat from dest title.
     public private(set) var deskRestoreInvokedCountForTesting = 0
@@ -637,11 +640,14 @@ public final class BotsViewModel: ObservableObject {
             reloadSelectedBot(id: selectedBotID)
         }
         reloadFleet()
-        reloadAttention()
         restoreSelectedBotIfNeeded()
         if let selectedBotID {
             reloadSelectedBot(id: selectedBotID)
         }
+        // Dest first. First paint dest used to dest inbox
+        // (listAttention) before dest dested Chat. Dest dests
+        // this bubble first; dest dests inbox after dest dested Chat.
+        reloadAttention()
         Task { [weak self] in
             guard let self else { return }
             if let router = self.resolvedRouter() {
@@ -2356,6 +2362,7 @@ public final class BotsViewModel: ObservableObject {
     private func restoreDeskMessages(botID: BotID) {
         deskRestoreInvokedCountForTesting += 1
         lastDeskRestoreStudioSupportCountForTesting = studioSupportReloadCountForTesting
+        lastDeskRestoreAttentionListCountForTesting = attentionListCountForTesting
         let cached = messagesByBot[botID] ?? []
         let conversation = conversationForBot(botID)
         var persisted: [BotDeskMessage] = []
