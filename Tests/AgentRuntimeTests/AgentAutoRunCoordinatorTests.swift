@@ -278,8 +278,8 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
             XCTAssertEqual(request.environment(for: .rcw1)["RC_TOKEN_SAVER_WIRE_VERSION"], "1")
             XCTAssertNil(request.environment(for: .human)[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey])
             XCTAssertNil(request.environment(for: .human)["RC_TOKEN_SAVER_WIRE_VERSION"])
-            XCTAssertNil(request.environment(for: .caveman)[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey])
-            XCTAssertNil(request.environment(for: .caveman)["RC_TOKEN_SAVER_WIRE_VERSION"])
+            XCTAssertNil(request.environment(for: .rcs1)[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey])
+            XCTAssertNil(request.environment(for: .rcs1)["RC_TOKEN_SAVER_WIRE_VERSION"])
             XCTAssertNotEqual(request.admittedEnvironment, request.admittedRequest.environment)
             return await TokenSaverBestOfThreeSelector.select(
                 canonicalHuman: request.canonicalHuman,
@@ -384,9 +384,9 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
             let humanEnvelope = "BASE ABI\n\(humanOutbound)"
             let rcwABI = "RCW1 ABI"
             let rcwEnvelope = "\(rcwABI)\n\(rcwPayload)"
-            let cavePayload = "CAVE Runtime request [[ccr:cave.runtime]]"
-            let caveABI = "Caveman ABI"
-            let caveEnvelope = "\(caveABI)\n\(cavePayload)"
+            let rcs1Payload = "RCS1 Runtime request [[rc:rcs1.runtime]]"
+            let rcs1ABI = "RCS1 ABI"
+            let rcs1Envelope = "\(rcs1ABI)\n\(rcs1Payload)"
             let source = SHA256.hash(data: Data(request.canonicalHuman.utf8))
                 .map { String(format: "%02x", $0) }.joined()
             func arm(
@@ -399,7 +399,7 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
                 .init(
                     format: format, sourceSHA256: source, payload: payload, abi: abi,
                     effectiveEnvelope: envelope, handle: handle,
-                    producerID: format == .rcw1 ? "remotecode-rcw1" : "caveman",
+                    producerID: format == .rcw1 ? "remotecode-rcw1" : "remotecode-rcs1",
                     producerRevision: "1", abiRevision: "1",
                     generation: .passed, structural: .passed, semantic: .passed, recovery: .passed
                 )
@@ -407,7 +407,7 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
             let counts = [
                 humanOutbound: 100, humanEnvelope: 110,
                 rcwPayload: 20, handle: 4, rcwABI: 5, rcwEnvelope: 30,
-                cavePayload: 20, "cave.runtime": 4, caveABI: 5, caveEnvelope: 60,
+                rcs1Payload: 20, "rcs1.runtime": 4, rcs1ABI: 5, rcs1Envelope: 60,
             ]
             return await TokenSaverBestOfThreeSelector.select(
                 canonicalHuman: request.canonicalHuman,
@@ -422,7 +422,7 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
                 ),
                 candidates: [
                     arm(.rcw1, payload: rcwPayload, abi: rcwABI, envelope: rcwEnvelope, handle: handle),
-                    arm(.caveman, payload: cavePayload, abi: caveABI, envelope: caveEnvelope, handle: "cave.runtime"),
+                    arm(.rcs1, payload: rcs1Payload, abi: rcs1ABI, envelope: rcs1Envelope, handle: "rcs1.runtime"),
                 ],
                 counter: .init(counter: .init(
                     id: "auto-counter", revision: "1", encoding: "fixture",

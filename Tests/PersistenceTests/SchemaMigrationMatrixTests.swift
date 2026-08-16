@@ -438,8 +438,9 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         // The composed head has Message identity, named checkpoint list,
         // Token Saver per-thread totals (59), reserved no-op (60), lifecycle
         // support (61), bounded maintenance lookup support (62), the
-        // durable RCW1 request/response/display rows (67-69), and Bot
-        // control-plane identity (70-71). Versions 63-66 are retired.
+        // durable RCW1 request/response/display rows (67-69), Bot
+        // control-plane identity (70-71), and content-free request
+        // selection receipts (72). Versions 63-66 are retired.
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
@@ -454,13 +455,180 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             68,
             69,
             70,
-            Schema.currentVersion
+            71,
+            72
         ])
-        XCTAssertGreaterThanOrEqual(Schema.currentVersion, 70)
+        XCTAssertEqual(Schema.currentVersion, 72)
         XCTAssertFalse(
             Schema.steps.contains { (63...66).contains($0.version) },
             "schema versions 63-66 are retired and must never be reused"
         )
+    }
+
+    /// WHY: v72 is the first durable, content-free request-selection receipt
+    /// store. A user on v71 must gain empty tables (no historical backfill)
+    /// and parent-first FK order: agent_runs/agent_threads before winner,
+    /// winner before arms. Head re-migrate must stay a no-op.
+    func test_v71ToHeadAddsRequestSelectionReceiptsWithoutBackfillAndEnforcesParentOrder() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 71 })
+        XCTAssertEqual(try maxVersion(db), 71)
+        let thread = AgentThread(title: "v71-receipts", provider: .codex, model: "gpt-test")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-test",
+            status: .pending
+        )
+        try AgentRunRepository(db: db).upsert(run)
+
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+        XCTAssertEqual(Schema.currentVersion, 72)
+
+        XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 0,
+                       "v72 must not backfill historical winners")
+        XCTAssertEqual(try rowCount(db, table: "token_saver_run_arm_receipts"), 0,
+                       "v72 must not backfill historical arms")
+
+        XCTAssertThrowsError(try db.execute("""
+            INSERT INTO token_saver_run_winner_receipts(
+                run_id, thread_id, provider, resolved_model, selected_format, reason,
+                modeled_context_delta, counter_status, lifecycle, billing_claim,
+                created_at, updated_at
+            ) VALUES(
+                'missing-run', '\(thread.id.value.uuidString)', 'codex', 'gpt-test',
+                'human', 'candidate_error', 0, 'unavailable', 'provisional', 0,
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+            );
+            """), "winner rows require an agent_runs parent")
+
+        try db.execute("""
+            INSERT INTO token_saver_run_winner_receipts(
+                run_id, thread_id, provider, resolved_model, selected_format, reason,
+                modeled_context_delta, counter_status, lifecycle, billing_claim,
+                created_at, updated_at
+            ) VALUES(
+                '\(run.id.value.uuidString)', '\(thread.id.value.uuidString)', 'codex',
+                'gpt-test', 'human', 'candidate_error', 0, 'unavailable', 'provisional',
+                0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+            );
+            """)
+
+        XCTAssertThrowsError(try db.execute("""
+            INSERT INTO token_saver_run_arm_receipts(
+                run_id, format, source_bound, producer_id, producer_revision,
+                abi_revision, generation, structural, semantic, recovery,
+                projection, availability, eligible
+            ) VALUES(
+                'missing-winner', 'human', 1, 'remotecode-human', '1', '1',
+                'not_required', 'not_required', 'not_required', 'not_required',
+                'projected', 'available', 1
+            );
+            """), "arm rows require a winner parent")
+
+        try db.execute("""
+            INSERT INTO token_saver_run_arm_receipts(
+                run_id, format, source_bound, producer_id, producer_revision,
+                abi_revision, generation, structural, semantic, recovery,
+                projection, availability, eligible
+            ) VALUES(
+                '\(run.id.value.uuidString)', 'human', 1, 'remotecode-human', '1', '1',
+                'not_required', 'not_required', 'not_required', 'not_required',
+                'projected', 'available', 1
+            );
+            """)
+
+        XCTAssertThrowsError(try db.execute("""
+            UPDATE token_saver_run_winner_receipts
+            SET selected_format = 'caveman'
+            WHERE run_id = '\(run.id.value.uuidString)';
+            """), "C10 selected_format must reject caveman")
+        XCTAssertThrowsError(try db.execute("""
+            UPDATE token_saver_run_winner_receipts
+            SET billing_claim = 1
+            WHERE run_id = '\(run.id.value.uuidString)';
+            """), "billing_claim must stay forced 0")
+
+        try Schema.migrate(db)
+        XCTAssertEqual(try maxVersion(db), 72, "head re-migrate must be a no-op at v72")
+        XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 1)
+        XCTAssertEqual(try rowCount(db, table: "token_saver_run_arm_receipts"), 1)
+    }
+
+    /// WHY: origin/production and HEAD still ship schema 71. The first committed
+    /// C10 step must be v72 with arm format rcs1, never a caveman-only v72 then
+    /// a rename v73. Winner selected_format stays human/rcw1 until RCS1 runtime
+    /// admission exists.
+    func test_headOriginBaselineWas71AndV72RejectsCavemanOnWinnerAndArmWhileAcceptingRCS1Arm() throws {
+        XCTAssertEqual(
+            Schema.steps.filter { $0.version == 71 }.count, 1,
+            "HEAD/origin production last published step is 71"
+        )
+        XCTAssertEqual(Schema.currentVersion, 72)
+        XCTAssertEqual(
+            Schema.steps.filter { $0.version > 71 }.map(\.version), [72],
+            "v72 must be the first unpublished step after HEAD 71"
+        )
+        let v72 = try XCTUnwrap(Schema.steps.first { $0.version == 72 })
+        XCTAssertTrue(v72.sql.contains("CHECK(format IN ('human', 'rcw1', 'rcs1'))"))
+        XCTAssertTrue(v72.sql.contains("CHECK(selected_format IN ('human', 'rcw1'))"))
+        XCTAssertFalse(v72.sql.contains("'caveman'"))
+
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 71 })
+        XCTAssertEqual(try maxVersion(db), 71, "HEAD/origin production baseline must stop at 71")
+        let thread = AgentThread(title: "v72-rcs1-contract", provider: .codex, model: "gpt-test")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
+        try AgentRunRepository(db: db).upsert(run)
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), 72)
+
+        try db.execute("""
+            INSERT INTO token_saver_run_winner_receipts(
+                run_id, thread_id, provider, resolved_model, selected_format, reason,
+                modeled_context_delta, counter_status, lifecycle, billing_claim,
+                created_at, updated_at
+            ) VALUES(
+                '\(run.id.value.uuidString)', '\(thread.id.value.uuidString)', 'codex',
+                'gpt-test', 'human', 'candidate_error', 0, 'unavailable', 'provisional',
+                0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+            );
+            """)
+        XCTAssertThrowsError(try db.execute("""
+            UPDATE token_saver_run_winner_receipts
+            SET selected_format = 'caveman'
+            WHERE run_id = '\(run.id.value.uuidString)';
+            """), "v72 winner selected_format must reject caveman")
+        XCTAssertThrowsError(try db.execute("""
+            UPDATE token_saver_run_winner_receipts
+            SET selected_format = 'rcs1'
+            WHERE run_id = '\(run.id.value.uuidString)';
+            """), "v72 winner selected_format must reject rcs1 until runtime admission")
+        XCTAssertThrowsError(try db.execute("""
+            INSERT INTO token_saver_run_arm_receipts(
+                run_id, format, source_bound, producer_id, producer_revision,
+                abi_revision, generation, structural, semantic, recovery,
+                projection, availability, eligible
+            ) VALUES(
+                '\(run.id.value.uuidString)', 'caveman', 0, 'remotecode-rcs1-unavailable',
+                'unavailable', 'unavailable', 'failed', 'failed', 'failed', 'failed',
+                'not_projected', 'unavailable', 0
+            );
+            """), "v72 arm format must reject caveman")
+        XCTAssertNoThrow(try db.execute("""
+            INSERT INTO token_saver_run_arm_receipts(
+                run_id, format, source_bound, producer_id, producer_revision,
+                abi_revision, generation, structural, semantic, recovery,
+                projection, availability, eligible
+            ) VALUES(
+                '\(run.id.value.uuidString)', 'rcs1', 0, 'remotecode-rcs1-unavailable',
+                'unavailable', 'unavailable', 'failed', 'failed', 'failed', 'failed',
+                'not_projected', 'unavailable', 0
+            );
+            """), "v72 arm format must accept rcs1")
     }
 
     // MARK: - v25 → head

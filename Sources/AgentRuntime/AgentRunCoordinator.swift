@@ -47,7 +47,7 @@ public struct TokenSaverOutboundSelectionRequest: Sendable {
     ) -> [String: String] {
         var env = base
         switch format {
-        case .human, .caveman:
+        case .human, .rcs1:
             env.removeValue(forKey: TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey)
             env.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
         case .rcw1:
@@ -1205,7 +1205,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID?) async -> String)?
     /// Best-of-three request hook. When present it owns final Auto-aware prompt
     /// shaping and returns the exact provider-bound payload selected from Human,
-    /// RCW1, and Caveman. The legacy String compressor remains the fallback for
+    /// RCW1, and RCS1. The legacy String compressor remains the fallback for
     /// hosts that have not installed the typed selector.
     public var tokenSaverOutboundSelector: (@Sendable (
         _ request: TokenSaverOutboundSelectionRequest
@@ -1351,6 +1351,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Snapshot active runs before reconcile so we can stamp ledger rows.
         let preLaunchActive = (try? runRepo.listActive()) ?? []
         _ = try runRepo.reconcileRunningOnLaunch(preservingThreadIDs: preservingThreadIDs)
+        _ = try? runRepo.selectionReceipts().reconcileProvisionalOnRelaunch()
         for run in preLaunchActive {
             if preservingThreadIDs.contains(run.threadId) { continue }
             _ = recordTerminalTransition(
@@ -1544,7 +1545,26 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runId: AgentRunID,
             deliver: (@Sendable (TokenSaverOutboundDelivery) -> Void)?
         )?
+        var pendingSelectionDecision: TokenSaverBestOfThreeSelector.Decision?
+        var receiptCommitted = false
+        var sendTurnEntered = false
         defer {
+            if receiptCommitted {
+                let lifecycle: TokenSaverRequestSelectionReceipt.Lifecycle
+                if !sendTurnEntered {
+                    lifecycle = .notDelivered
+                } else if pendingProviderStart.acceptancePermit.outcome == .accepted {
+                    lifecycle = .delivered
+                } else {
+                    lifecycle = .deliveryUnknown
+                }
+                try? runRepo.selectionReceipts().acknowledgeBatch([
+                    TokenSaverRequestSelectionLifecycleAck(
+                        runId: runId.value.uuidString,
+                        lifecycle: lifecycle
+                    )
+                ])
+            }
             if let outboundDecisionContext {
                 outboundDecisionContext.deliver?(TokenSaverOutboundDelivery(
                     receipt: outboundDecisionContext.receipt,
@@ -1753,9 +1773,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     )
                 }
             }
+            if decision.selectedFormat == .rcs1 {
+                decision = decision.fallingBackToHuman(
+                    payload: request.prompt,
+                    reason: .candidateError,
+                    canonicalHuman: preservedUserContent
+                )
+            }
             outboundPrompt = decision.selectedPayload
             selectedTransportFormat = decision.selectedFormat
             effectiveEnvironment = selectionRequest.environment(for: decision.selectedFormat)
+            pendingSelectionDecision = decision
             outboundDecisionContext = (
                 decision.receipt,
                 request.provider,
@@ -1886,7 +1914,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         // persist run
         let run = AgentRun(id: effectiveRequest.runId, threadId: effectiveRequest.threadId, provider: effectiveRequest.provider, providerInstanceId: effectiveRequest.providerInstanceId, model: effectiveRequest.model, status: .pending)
-        try runRepo.upsert(run)
+        if let pendingSelectionDecision {
+            let record = TokenSaverRequestSelectionReceipt.project(
+                decision: pendingSelectionDecision,
+                runId: run.id.value.uuidString,
+                threadId: run.threadId.value.uuidString,
+                provider: effectiveRequest.provider.rawValue,
+                resolvedModel: effectiveRequest.model
+            )
+            try runRepo.selectionReceipts().persistPendingRun(run, record: record)
+            receiptCommitted = true
+        } else {
+            try runRepo.upsert(run)
+        }
         if var thread = try threadRepo.get(id: effectiveRequest.threadId) {
             thread.status = .pending
             thread.hasUnread = false
@@ -1984,6 +2024,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let coordinator = self
         let handle: AgentRunHandle
         do {
+            sendTurnEntered = true
             handle = try await runner.sendTurn(effectiveRequest) { ev in
                 coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
             }

@@ -11,7 +11,7 @@ public enum TokenSaverBestOfThreeSelector {
     public enum Format: String, Sendable, Codable, CaseIterable {
         case human
         case rcw1
-        case caveman
+        case rcs1
     }
 
     public enum GateStatus: String, Sendable, Codable {
@@ -433,11 +433,13 @@ public enum TokenSaverBestOfThreeSelector {
         guard validHumanIdentity,
               validTarget(target),
               candidates.count == 2,
-              Set(candidates.map(\.format)) == Set([.rcw1, .caveman]),
+              Set(candidates.map(\.format)) == Set([.rcw1, .rcs1]),
               candidates.allSatisfy(validCandidateIdentity) else {
             return human(.candidateError)
         }
-        if candidates.contains(where: { $0.generation == .failed || $0.generation == .notRequired }) {
+        if candidates.contains(where: {
+            $0.format != .rcs1 && ($0.generation == .failed || $0.generation == .notRequired)
+        }) {
             return human(.candidateError)
         }
         if candidates.contains(where: hasUnknownRequiredGate) {

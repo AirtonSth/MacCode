@@ -409,26 +409,26 @@ private func assertUnboundHumanFallback(
     XCTAssertFalse(receipt.billingClaim)
 }
 
-private enum Best3Winner { case rcw1, caveman, human }
+private enum Best3Winner { case rcw1, rcs1, human }
 
 private struct Best3Arms {
     let human = "Canonical Human request stays visible."
     let rcwOutbound: String
-    let cavemanOutbound: String
+    let rcs1Outbound: String
     private let rcwHandle = "rcv1.runtime"
-    private let cavemanHandle = "cave.runtime"
+    private let rcs1Handle = "rcs1.runtime"
 
-    init(cavemanLooksLikeRCW1: Bool = false) {
+    init(rcs1LooksLikeRCW1: Bool = false) {
         rcwOutbound = "RCW1\tQ\t1\nG\tRuntime request\nX\t[[rc:\(rcwHandle)]]\n.\n"
-        cavemanOutbound = cavemanLooksLikeRCW1
-            ? "RCW1\tQ\t1\nG\tCaveman winner must not be RCW1\nX\t[[ccr:\(cavemanHandle)]]\n.\n"
-            : "CAVE Runtime request [[ccr:\(cavemanHandle)]]"
+        rcs1Outbound = rcs1LooksLikeRCW1
+            ? "RCW1\tQ\t1\nG\tRCS1 winner must not be RCW1\nX\t[[rc:\(rcs1Handle)]]\n.\n"
+            : "RCS1 Runtime request [[rc:\(rcs1Handle)]]"
     }
 
     func payload(_ winner: Best3Winner) -> String {
         switch winner {
         case .rcw1: rcwOutbound
-        case .caveman: cavemanOutbound
+        case .rcs1: rcs1Outbound
         case .human: human
         }
     }
@@ -452,12 +452,12 @@ private struct Best3Arms {
         let human = canonicalHuman ?? self.human
         let humanOutbound = humanOutboundPrompt ?? self.human
         let rcwOutbound = rcwPayload ?? self.rcwOutbound
-        let rcwABI = "RCW1 ABI", caveABI = "Caveman ABI"
+        let rcwABI = "RCW1 ABI", rcs1ABI = "RCS1 ABI"
         let humanEnv = "BASE ABI\n\(humanOutbound)"
-        let rcwEnv = "\(rcwABI)\n\(rcwOutbound)", caveEnv = "\(caveABI)\n\(cavemanOutbound)"
+        let rcwEnv = "\(rcwABI)\n\(rcwOutbound)", rcs1Env = "\(rcs1ABI)\n\(rcs1Outbound)"
         let envelopes: (Int, Int, Int) = switch winner {
         case .rcw1: (110, 30, 60)
-        case .caveman: (110, 90, 30)
+        case .rcs1: (110, 90, 30)
         case .human: (25, 50, 55)
         }
         let source = SHA256.hash(data: Data(human.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -465,7 +465,7 @@ private struct Best3Arms {
             .init(
                 format: format, sourceSHA256: source, payload: payload, abi: abi,
                 effectiveEnvelope: envelope, handle: handle,
-                producerID: format == .rcw1 ? "remotecode-rcw1" : "caveman",
+                producerID: format == .rcw1 ? "remotecode-rcw1" : "remotecode-rcs1",
                 producerRevision: "1", abiRevision: "1",
                 generation: .passed, structural: .passed, semantic: .passed, recovery: .passed
             )
@@ -473,7 +473,7 @@ private struct Best3Arms {
         let counts = [
             humanOutbound: envelopes.0 - 10, humanEnv: envelopes.0,
             rcwOutbound: 20, rcwHandle: 4, rcwABI: 5, rcwEnv: envelopes.1,
-            cavemanOutbound: 20, cavemanHandle: 4, caveABI: 5, caveEnv: envelopes.2,
+            rcs1Outbound: 20, rcs1Handle: 4, rcs1ABI: 5, rcs1Env: envelopes.2,
         ]
         return await TokenSaverBestOfThreeSelector.select(
             canonicalHuman: human,
@@ -488,7 +488,7 @@ private struct Best3Arms {
             ),
             candidates: [
                 arm(.rcw1, payload: rcwOutbound, abi: rcwABI, envelope: rcwEnv, handle: rcwHandle),
-                arm(.caveman, payload: cavemanOutbound, abi: caveABI, envelope: caveEnv, handle: cavemanHandle),
+                arm(.rcs1, payload: rcs1Outbound, abi: rcs1ABI, envelope: rcs1Env, handle: rcs1Handle),
             ],
             counter: .init(counter: .init(
                 id: "runtime-counter", revision: "1", encoding: "fixture",
@@ -917,15 +917,15 @@ final class TokenSaverCompressionTests: XCTestCase {
         try assertUnboundHumanFallback(harness: harness, arms: arms, runID: runID)
     }
 
-    /// WHY: a valid Caveman winner whose Human Cost hashes a different Auto
+    /// WHY: a valid RCS1 winner whose Human Cost hashes a different Auto
     /// outbound must fail closed before send and drop the unbound evidence.
-    func test_staleHumanOutboundSHAWithValidCavemanSendsHumanAndDropsEvidence() async throws {
-        let harness = try Best3Harness.make(title: "c7 stale human outbound caveman")
+    func test_staleHumanOutboundSHAWithValidRCS1SendsHumanAndDropsEvidence() async throws {
+        let harness = try Best3Harness.make(title: "c7 stale human outbound rcs1")
         let arms = Best3Arms()
         harness.injectScopedRCW1()
         harness.select { _ in
             await arms.decision(
-                .caveman,
+                .rcs1,
                 humanOutboundPrompt: "AUTO HUMAN: \(arms.human)"
             )
         }
@@ -962,15 +962,15 @@ final class TokenSaverCompressionTests: XCTestCase {
 
     /// WHY: the same candidate bytes ranked on another resolved model are not
     /// evidence for this model's tokenizer. Send current admitted Human.
-    func test_staleCounterResolvedModelWithValidCavemanSendsHumanAndDropsEvidence() async throws {
-        let harness = try Best3Harness.make(title: "c7 stale counter model caveman")
+    func test_staleCounterResolvedModelWithValidRCS1SendsHumanAndDropsEvidence() async throws {
+        let harness = try Best3Harness.make(title: "c7 stale counter model rcs1")
         let arms = Best3Arms()
         harness.injectScopedRCW1()
         harness.select { request in
             XCTAssertEqual(request.admittedRequest.provider, .codex)
             XCTAssertEqual(request.admittedRequest.model, "fake-model")
-            let decision = await arms.decision(.caveman, resolvedModel: "other-model")
-            XCTAssertEqual(decision.selectedFormat, .caveman)
+            let decision = await arms.decision(.rcs1, resolvedModel: "other-model")
+            XCTAssertEqual(decision.selectedFormat, .rcs1)
             XCTAssertEqual(decision.reason, .uniqueStrictMinimum)
             XCTAssertEqual(decision.counter?.provider, "codex")
             XCTAssertEqual(decision.counter?.resolvedModel, "other-model")
@@ -991,7 +991,7 @@ final class TokenSaverCompressionTests: XCTestCase {
     func test_boundCounterProviderAndModelDecisionRemainsOptimized() async throws {
         let cases: [(Best3Winner, TokenSaverBestOfThreeSelector.Format)] = [
             (.rcw1, .rcw1),
-            (.caveman, .caveman),
+            (.rcs1, .rcs1),
         ]
         for (winner, format) in cases {
             let harness = try Best3Harness.make(title: "c7 bound counter \(format.rawValue)")
@@ -1009,14 +1009,23 @@ final class TokenSaverCompressionTests: XCTestCase {
             let runID = try await harness.start(arms.human)
             let env = harness.adapter.request?.environment ?? [:]
             let receipt = try XCTUnwrap(harness.recorder.events.first?.receipt)
-            XCTAssertEqual(harness.adapter.request?.prompt, arms.payload(winner))
+            let sentFormat: TokenSaverBestOfThreeSelector.Format = winner == .rcs1 ? .human : format
+            XCTAssertEqual(
+                harness.adapter.request?.prompt,
+                winner == .rcs1 ? arms.human : arms.payload(winner)
+            )
             XCTAssertEqual(
                 try harness.messageRepo.get(id: AgentMessageID(runID.value))?.content,
                 arms.human
             )
-            XCTAssertEqual(receipt.selectedFormat, format)
-            XCTAssertEqual(receipt.reason, .uniqueStrictMinimum)
-            XCTAssertGreaterThan(receipt.modeledContextDelta, 0)
+            XCTAssertEqual(receipt.selectedFormat, sentFormat)
+            if winner == .rcs1 {
+                XCTAssertEqual(receipt.reason, .candidateError)
+                XCTAssertEqual(receipt.modeledContextDelta, 0)
+            } else {
+                XCTAssertEqual(receipt.reason, .uniqueStrictMinimum)
+                XCTAssertGreaterThan(receipt.modeledContextDelta, 0)
+            }
             XCTAssertEqual(receipt.counter?.provider, "codex")
             XCTAssertEqual(receipt.counter?.resolvedModel, "fake-model")
             XCTAssertFalse(receipt.costs.isEmpty)
@@ -1082,13 +1091,13 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertFalse(receipt.billingClaim)
     }
 
-    /// WHY: stamp-after-projection lets Human/Caveman regain capability and
+    /// WHY: stamp-after-projection lets Human/RCS1 regain capability and
     /// drops RCW1 VERSION. Counted projection must equal the sent environment.
     func test_typedReceiptBearingCountedEnvironmentEqualsSentEnvironment() async throws {
         let cases: [(Best3Winner, TokenSaverBestOfThreeSelector.Format)] = [
             (.human, .human),
             (.rcw1, .rcw1),
-            (.caveman, .caveman),
+            (.rcs1, .rcs1),
         ]
         for (winner, format) in cases {
             let harness = try Best3Harness.make(title: "best3 receipt \(format.rawValue)")
@@ -1103,7 +1112,8 @@ final class TokenSaverCompressionTests: XCTestCase {
             XCTAssertEqual(envCalls.count, 1, "\(format) must call runEnvironmentProvider exactly once")
             let selection = try XCTUnwrap(harness.recorder.requests.first)
             let sent = harness.adapter.request?.environment ?? [:]
-            let projected = selection.environment(for: format)
+            let sentFormat: TokenSaverBestOfThreeSelector.Format = winner == .rcs1 ? .human : format
+            let projected = selection.environment(for: sentFormat)
             let attempt = runID.value.uuidString
             let admittedReceipt = try XCTUnwrap(
                 TokenSaverExecutionReceiptSeam.receipt(from: selection.admittedEnvironment)
@@ -1126,7 +1136,7 @@ final class TokenSaverCompressionTests: XCTestCase {
             XCTAssertEqual(projected["RC_TOKEN_SAVER_ROOT_RUN_ID"], sent["RC_TOKEN_SAVER_ROOT_RUN_ID"])
             XCTAssertEqual(projected["RC_TOKEN_SAVER_ATTEMPT_ID"], sent["RC_TOKEN_SAVER_ATTEMPT_ID"])
             XCTAssertEqual(harness.adapter.request?.provider, .codex)
-            if format == .rcw1 {
+            if sentFormat == .rcw1 {
                 XCTAssertEqual(sent[rcw1Cap], "1")
                 XCTAssertEqual(sent[rcw1Ver], "1")
                 XCTAssertEqual(projected[rcw1Cap], "1")
@@ -1138,7 +1148,7 @@ final class TokenSaverCompressionTests: XCTestCase {
                 XCTAssertNil(projected[rcw1Ver])
             }
             XCTAssertEqual(harness.recorder.events.count, 1)
-            XCTAssertEqual(harness.recorder.events.first?.receipt.selectedFormat, format)
+            XCTAssertEqual(harness.recorder.events.first?.receipt.selectedFormat, sentFormat)
             XCTAssertFalse(harness.recorder.events.first?.receipt.billingClaim ?? true)
         }
     }
@@ -1174,14 +1184,14 @@ final class TokenSaverCompressionTests: XCTestCase {
     func test_bestOfThreeWinnerAppliesFormatSpecificWireAdmission() async throws {
         let cases: [(Best3Winner, TokenSaverBestOfThreeSelector.Format, TokenSaverBestOfThreeSelector.Reason)] = [
             (.rcw1, .rcw1, .uniqueStrictMinimum),
-            (.caveman, .caveman, .uniqueStrictMinimum),
+            (.rcs1, .rcs1, .uniqueStrictMinimum),
             (.human, .human, .humanLowestCost),
         ]
         for (winner, format, reason) in cases {
             let harness = try Best3Harness.make(title: "best3 \(format.rawValue)")
-            let arms = Best3Arms(cavemanLooksLikeRCW1: winner == .caveman)
-            if winner == .caveman {
-                XCTAssertTrue(RCWireProtocol.isWire(arms.cavemanOutbound), "Caveman fixture must look like RCW1")
+            let arms = Best3Arms(rcs1LooksLikeRCW1: winner == .rcs1)
+            if winner == .rcs1 {
+                XCTAssertTrue(RCWireProtocol.isWire(arms.rcs1Outbound), "RCS1 fixture must look like RCW1")
             }
             let compressorCalls = CallLog()
             harness.injectScopedRCW1()
@@ -1202,23 +1212,30 @@ final class TokenSaverCompressionTests: XCTestCase {
                 XCTAssertEqual(request.environment(for: .rcw1)[rcw1Ver], "1")
                 XCTAssertNil(request.environment(for: .human)[rcw1Cap])
                 XCTAssertNil(request.environment(for: .human)[rcw1Ver])
-                XCTAssertNil(request.environment(for: .caveman)[rcw1Cap])
-                XCTAssertNil(request.environment(for: .caveman)[rcw1Ver])
+                XCTAssertNil(request.environment(for: .rcs1)[rcw1Cap])
+                XCTAssertNil(request.environment(for: .rcs1)[rcw1Ver])
                 return await arms.decision(winner)
             }
             let runID = try await harness.start(arms.human)
             let selection = try XCTUnwrap(harness.recorder.requests.first)
             let env = harness.adapter.request?.environment ?? [:]
-            let projected = selection.environment(for: format)
+            let sentFormat: TokenSaverBestOfThreeSelector.Format = winner == .rcs1 ? .human : format
+            let projected = selection.environment(for: sentFormat)
             XCTAssertEqual(env[rcw1Cap], projected[rcw1Cap])
             XCTAssertEqual(env[rcw1Ver], projected[rcw1Ver])
             XCTAssertEqual(compressorCalls.count, 0, "typed selector must replace, not chain, the String compressor")
-            XCTAssertEqual(harness.adapter.request?.prompt, arms.payload(winner))
+            XCTAssertEqual(
+                harness.adapter.request?.prompt,
+                winner == .rcs1 ? arms.human : arms.payload(winner)
+            )
             XCTAssertEqual(try harness.messageRepo.get(id: AgentMessageID(runID.value))?.content, arms.human)
             XCTAssertEqual(harness.recorder.events.count, 1)
             XCTAssertEqual(harness.recorder.events.first?.outcome, .accepted)
-            XCTAssertEqual(harness.recorder.events.first?.receipt.selectedFormat, format)
-            XCTAssertEqual(harness.recorder.events.first?.receipt.reason, reason)
+            XCTAssertEqual(harness.recorder.events.first?.receipt.selectedFormat, sentFormat)
+            XCTAssertEqual(
+                harness.recorder.events.first?.receipt.reason,
+                winner == .rcs1 ? .candidateError : reason
+            )
             XCTAssertFalse(harness.recorder.events.first?.receipt.billingClaim ?? true)
             if winner == .rcw1 {
                 XCTAssertEqual(env[rcw1Cap], "1")

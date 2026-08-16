@@ -94,17 +94,18 @@ enum TokenSaverExactRuntimeSupport {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Disabled Caveman remains ineligible through known failed gates. Generation
-    /// is not marked failed/notRequired because that aborts the whole decision.
-    static func disabledCavemanCandidate(
+    /// Disabled RCS1 is ineligible through known failed gates, including
+    /// generation. The selector must not treat that as a global candidate error.
+    static func disabledRCS1Candidate(
         sourceSHA256: String
     ) -> TokenSaverBestOfThreeSelector.Candidate {
         disabledCandidate(
-            format: .caveman,
+            format: .rcs1,
             sourceSHA256: sourceSHA256,
-            payload: "CAVEMAN_RUNTIME_UNAVAILABLE",
-            abi: "CAVEMAN_ABI_UNAVAILABLE",
-            producerID: "caveman-unavailable"
+            payload: "RCS1_RUNTIME_UNAVAILABLE",
+            abi: "RCS1_ABI_UNAVAILABLE",
+            producerID: TokenSaverRequestSelectionReceipt.rcs1UnavailableProducerID,
+            generation: .failed
         )
     }
 
@@ -125,7 +126,8 @@ enum TokenSaverExactRuntimeSupport {
         sourceSHA256: String,
         payload: String,
         abi: String,
-        producerID: String
+        producerID: String,
+        generation: TokenSaverBestOfThreeSelector.GateStatus = .passed
     ) -> TokenSaverBestOfThreeSelector.Candidate {
         TokenSaverBestOfThreeSelector.Candidate(
             format: format,
@@ -137,7 +139,7 @@ enum TokenSaverExactRuntimeSupport {
             producerID: producerID,
             producerRevision: "unavailable",
             abiRevision: "unavailable",
-            generation: .passed,
+            generation: generation,
             structural: .failed,
             semantic: .failed,
             recovery: .failed

@@ -8,7 +8,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
     private let human = "canonical Human content"
 
     func test_rcw1WinsAsUniqueVerifiedStrictMinimum() async {
-        let decision = await select(rcw1: 30, rcw1ABI: 10, caveman: 70, cavemanABI: 10, human: 100)
+        let decision = await select(rcw1: 30, rcw1ABI: 10, rcs1: 70, rcs1ABI: 10, human: 100)
 
         XCTAssertEqual(decision.selectedFormat, .rcw1)
         XCTAssertEqual(decision.selectedPayload, candidate(.rcw1).payload)
@@ -17,16 +17,56 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         XCTAssertFalse(decision.billingClaim)
     }
 
-    func test_cavemanWinsAsUniqueVerifiedStrictMinimum() async {
-        let decision = await select(rcw1: 70, rcw1ABI: 10, caveman: 25, cavemanABI: 5, human: 100)
+    func test_rcs1WinsAsUniqueVerifiedStrictMinimum() async {
+        let decision = await select(rcw1: 70, rcw1ABI: 10, rcs1: 25, rcs1ABI: 5, human: 100)
 
-        XCTAssertEqual(decision.selectedFormat, .caveman)
-        XCTAssertEqual(decision.selectedPayload, candidate(.caveman).payload)
+        XCTAssertEqual(decision.selectedFormat, .rcs1)
+        XCTAssertEqual(decision.selectedPayload, candidate(.rcs1).payload)
         XCTAssertEqual(decision.modeledContextDelta, 70)
     }
 
+    func test_threeFormatsAreExactlyHumanRCW1RCS1() {
+        XCTAssertEqual(Selector.Format.allCases, [.human, .rcw1, .rcs1])
+    }
+
+    func test_disabledRCS1FailedGatesDoNotPoisonEligibleRCW1() async {
+        // WHY: production RCS1 is present but unavailable. A cheaper ineligible
+        // RCS1 arm with failed generation must not abort the whole decision or
+        // an otherwise valid RCW1 winner is lost.
+        let disabled = Selector.Candidate(
+            format: .rcs1,
+            sourceSHA256: sha256(human),
+            payload: "RCS1_RUNTIME_UNAVAILABLE",
+            abi: "RCS1_ABI_UNAVAILABLE",
+            effectiveEnvelope: "RCS1_ABI_UNAVAILABLE\nRCS1_RUNTIME_UNAVAILABLE",
+            handle: nil,
+            producerID: TokenSaverRequestSelectionReceipt.rcs1UnavailableProducerID,
+            producerRevision: "unavailable",
+            abiRevision: "unavailable",
+            generation: .failed,
+            structural: .failed,
+            semantic: .failed,
+            recovery: .failed
+        )
+        let decision = await select(
+            candidates: [candidate(.rcw1), disabled],
+            rcw1: 30, rcw1ABI: 10, rcs1: 5, rcs1ABI: 1, human: 100
+        )
+
+        XCTAssertEqual(decision.selectedFormat, .rcw1)
+        XCTAssertEqual(decision.reason, .uniqueStrictMinimum)
+        XCTAssertEqual(decision.selectedPayload, candidate(.rcw1).payload)
+        XCTAssertTrue(decision.arm(.rcw1)!.eligible)
+        XCTAssertFalse(decision.arm(.rcs1)!.eligible)
+        XCTAssertEqual(decision.arm(.rcs1)!.generation, .failed)
+        XCTAssertEqual(
+            decision.arm(.rcs1)!.producerID,
+            TokenSaverRequestSelectionReceipt.rcs1UnavailableProducerID
+        )
+    }
+
     func test_humanWinsWhenEveryVerifiedCandidateCostsMore() async {
-        let decision = await select(rcw1: 60, rcw1ABI: 10, caveman: 65, cavemanABI: 10, human: 50)
+        let decision = await select(rcw1: 60, rcw1ABI: 10, rcs1: 65, rcs1ABI: 10, human: 50)
 
         XCTAssertEqual(decision.selectedFormat, .human)
         XCTAssertEqual(decision.selectedPayload, human)
@@ -37,13 +77,13 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         // WHY: Human ranking and the provider-bound payload are the outbound
         // prompt. Canonical Human is only the source identity, never the
         // selected bytes when that outbound identity is valid.
-        let candidates = [candidate(.rcw1), candidate(.caveman)]
+        let candidates = [candidate(.rcw1), candidate(.rcs1)]
         let humanOutbound = "AUTO:\(human)"
         let humanEnvelope = "SYSTEM:baseline\nUSER:\(humanOutbound)"
         var measured = counts(
             candidates: candidates,
             rcw1: 60, rcw1ABI: 10, rcw1Effective: 80,
-            caveman: 65, cavemanABI: 10, cavemanEffective: 85,
+            rcs1: 65, rcs1ABI: 10, rcs1Effective: 85,
             human: 90
         )
         measured[humanOutbound] = 40
@@ -66,10 +106,10 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
 
     func test_anyMinimumTieFallsBackToHuman() async {
         let optimizedTie = await select(
-            rcw1: 30, rcw1ABI: 10, caveman: 35, cavemanABI: 5, human: 100
+            rcw1: 30, rcw1ABI: 10, rcs1: 35, rcs1ABI: 5, human: 100
         )
         let humanTie = await select(
-            rcw1: 40, rcw1ABI: 10, caveman: 80, cavemanABI: 10, human: 50
+            rcw1: 40, rcw1ABI: 10, rcs1: 80, rcs1ABI: 10, human: 50
         )
 
         XCTAssertEqual(optimizedTie.reason, .tie)
@@ -80,29 +120,29 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
 
     func test_knownValidationFailureEliminatesOnlyAffectedCandidate() async {
         let semantic = await select(candidates: [
-            candidate(.rcw1, semantic: .failed), candidate(.caveman),
-        ], rcw1: 10, rcw1ABI: 5, caveman: 25, cavemanABI: 5, human: 100)
+            candidate(.rcw1, semantic: .failed), candidate(.rcs1),
+        ], rcw1: 10, rcw1ABI: 5, rcs1: 25, rcs1ABI: 5, human: 100)
         let structural = await select(candidates: [
-            candidate(.rcw1, structural: .failed), candidate(.caveman),
-        ], rcw1: 10, rcw1ABI: 5, caveman: 25, cavemanABI: 5, human: 100)
+            candidate(.rcw1, structural: .failed), candidate(.rcs1),
+        ], rcw1: 10, rcw1ABI: 5, rcs1: 25, rcs1ABI: 5, human: 100)
         let recovery = await select(candidates: [
-            candidate(.rcw1), candidate(.caveman, recovery: .failed),
-        ], rcw1: 30, rcw1ABI: 5, caveman: 10, cavemanABI: 5, human: 100)
+            candidate(.rcw1), candidate(.rcs1, recovery: .failed),
+        ], rcw1: 30, rcw1ABI: 5, rcs1: 10, rcs1ABI: 5, human: 100)
         let notRequired = await select(candidates: [
-            candidate(.rcw1, recovery: .notRequired), candidate(.caveman),
-        ], rcw1: 10, rcw1ABI: 5, caveman: 25, cavemanABI: 5, human: 100)
+            candidate(.rcw1, recovery: .notRequired), candidate(.rcs1),
+        ], rcw1: 10, rcw1ABI: 5, rcs1: 25, rcs1ABI: 5, human: 100)
 
-        XCTAssertEqual(semantic.selectedFormat, .caveman)
-        XCTAssertEqual(structural.selectedFormat, .caveman)
+        XCTAssertEqual(semantic.selectedFormat, .rcs1)
+        XCTAssertEqual(structural.selectedFormat, .rcs1)
         XCTAssertEqual(recovery.selectedFormat, .rcw1)
-        XCTAssertEqual(notRequired.selectedFormat, .caveman)
+        XCTAssertEqual(notRequired.selectedFormat, .rcs1)
         XCTAssertFalse(semantic.arm(.rcw1)!.eligible)
-        XCTAssertFalse(recovery.arm(.caveman)!.eligible)
+        XCTAssertFalse(recovery.arm(.rcs1)!.eligible)
         XCTAssertFalse(notRequired.arm(.rcw1)!.eligible)
     }
 
     func test_missingOrUncertainCounterFallsBackToHuman() async {
-        let candidates = [candidate(.rcw1), candidate(.caveman)]
+        let candidates = [candidate(.rcw1), candidate(.rcs1)]
         let missing = await Selector.select(
             canonicalHuman: human, humanOutboundPrompt: human, humanEffectiveEnvelope: human,
             target: target, candidates: candidates, counter: nil
@@ -124,10 +164,10 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
 
     func test_generationErrorOrUnknownGateFallsBackToHuman() async {
         let failed = await select(candidates: [
-            candidate(.rcw1, generation: .failed), candidate(.caveman),
+            candidate(.rcw1, generation: .failed), candidate(.rcs1),
         ])
         let unknown = await select(candidates: [
-            candidate(.rcw1), candidate(.caveman, semantic: .unknown),
+            candidate(.rcw1), candidate(.rcs1, semantic: .unknown),
         ])
 
         XCTAssertEqual(failed.reason, .candidateError)
@@ -137,15 +177,15 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
     func test_candidatesMustBindToTheSameCanonicalHuman() async {
         let decision = await select(candidates: [
             candidate(.rcw1, sourceSHA256: String(repeating: "0", count: 64)),
-            candidate(.caveman),
-        ], rcw1: 10, rcw1ABI: 5, caveman: 20, cavemanABI: 5, human: 100)
+            candidate(.rcs1),
+        ], rcw1: 10, rcw1ABI: 5, rcs1: 20, rcs1ABI: 5, human: 100)
 
-        XCTAssertEqual(decision.selectedFormat, .caveman)
+        XCTAssertEqual(decision.selectedFormat, .rcs1)
         XCTAssertFalse(decision.arm(.rcw1)!.sourceBound)
     }
 
     func test_handleIsDiagnosticAndAlreadyIncludedInPayloadAndEnvelope() async {
-        let decision = await select(rcw1: 30, rcw1ABI: 10, caveman: 80, cavemanABI: 10, human: 100)
+        let decision = await select(rcw1: 30, rcw1ABI: 10, rcs1: 80, rcs1ABI: 10, human: 100)
         let rcw1 = decision.cost(.rcw1)!
         let input = candidate(.rcw1)
 
@@ -159,11 +199,11 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
     }
 
     func test_rankingUsesOneMeasuredFinalEnvelopeNotAdditiveComponents() async {
-        let candidates = [candidate(.rcw1), candidate(.caveman)]
+        let candidates = [candidate(.rcw1), candidate(.rcs1)]
         let probe = CountProbe(counts: counts(
             candidates: candidates,
             rcw1: 10, rcw1ABI: 5, rcw1Effective: 90,
-            caveman: 25, cavemanABI: 5, cavemanEffective: 40,
+            rcs1: 25, rcs1ABI: 5, rcs1Effective: 40,
             human: 50
         ))
         let decision = await Selector.select(
@@ -176,21 +216,21 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         )
         let requests = await probe.requests
 
-        XCTAssertEqual(decision.selectedFormat, .caveman)
+        XCTAssertEqual(decision.selectedFormat, .rcs1)
         XCTAssertEqual(decision.cost(.rcw1)?.effectiveEnvelopeTokens, 90)
-        XCTAssertEqual(decision.cost(.caveman)?.effectiveEnvelopeTokens, 40)
+        XCTAssertEqual(decision.cost(.rcs1)?.effectiveEnvelopeTokens, 40)
         XCTAssertTrue(requests.contains(candidates[0].effectiveEnvelope))
         XCTAssertTrue(requests.contains(candidates[1].effectiveEnvelope))
     }
 
     func test_humanRankingUsesItsFinalEnvelopeNotItsCanonicalPayload() async {
-        let candidates = [candidate(.rcw1), candidate(.caveman)]
+        let candidates = [candidate(.rcw1), candidate(.rcs1)]
         let humanOutbound = "AUTO:\(human)"
         let humanEnvelope = "SYSTEM:baseline\nUSER:\(humanOutbound)"
         var measured = counts(
             candidates: candidates,
             rcw1: 10, rcw1ABI: 5, rcw1Effective: 50,
-            caveman: 20, cavemanABI: 5, cavemanEffective: 60,
+            rcs1: 20, rcs1ABI: 5, rcs1Effective: 60,
             human: 10
         )
         measured[humanOutbound] = 12
@@ -215,7 +255,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
     }
 
     func test_counterMustBindEveryIndependentTargetIdentity() async {
-        let candidates = [candidate(.rcw1), candidate(.caveman)]
+        let candidates = [candidate(.rcw1), candidate(.rcs1)]
         let counter = capability(counts: counts(candidates: candidates))
         let mismatches: [Selector.Target] = [
             target(provider: "grok"), target(model: "different-model"),
@@ -240,32 +280,32 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         let whitespace = candidate(.rcw1, payload: "RCW1 [[rc:   ]]", handle: "   ")
 
         for invalid in [missing, repeated, whitespace] {
-            let decision = await select(candidates: [invalid, candidate(.caveman)])
+            let decision = await select(candidates: [invalid, candidate(.rcs1)])
             XCTAssertEqual(decision.reason, .candidateError)
             XCTAssertFalse(decision.arm(.rcw1)!.eligible)
         }
     }
 
     func test_candidateOrderDoesNotChangeDecisionOrReceiptOrder() async {
-        let forward = [candidate(.rcw1), candidate(.caveman)]
+        let forward = [candidate(.rcw1), candidate(.rcs1)]
         let reverse = Array(forward.reversed())
         let first = await select(candidates: forward, rcw1: 30, rcw1ABI: 5,
-                                 caveman: 20, cavemanABI: 5, human: 100)
+                                 rcs1: 20, rcs1ABI: 5, human: 100)
         let second = await select(candidates: reverse, rcw1: 30, rcw1ABI: 5,
-                                  caveman: 20, cavemanABI: 5, human: 100)
+                                  rcs1: 20, rcs1ABI: 5, human: 100)
 
         XCTAssertEqual(first.receipt, second.receipt)
-        XCTAssertEqual(first.arms.map(\.format), [.rcw1, .caveman])
-        XCTAssertEqual(first.costs.map(\.format), [.human, .rcw1, .caveman])
+        XCTAssertEqual(first.arms.map(\.format), [.rcw1, .rcs1])
+        XCTAssertEqual(first.costs.map(\.format), [.human, .rcw1, .rcs1])
     }
 
     func test_receiptIsCodableWithoutCanonicalOrCandidatePayloads() async throws {
-        let decision = await select(rcw1: 30, rcw1ABI: 10, caveman: 80, cavemanABI: 10, human: 100)
+        let decision = await select(rcw1: 30, rcw1ABI: 10, rcs1: 80, rcs1ABI: 10, human: 100)
         let json = String(decoding: try JSONEncoder().encode(decision.receipt), as: UTF8.self)
 
         XCTAssertFalse(json.contains(human))
         XCTAssertFalse(json.contains("RCW1 candidate"))
-        XCTAssertFalse(json.contains("Caveman candidate"))
+        XCTAssertFalse(json.contains("RCS1 candidate"))
         XCTAssertTrue(json.contains("unique_strict_minimum"))
         XCTAssertFalse(decision.receipt.billingClaim)
     }
@@ -274,7 +314,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         // WHY: fail-closed Human must not persist costs measured against a
         // different outbound. A stale Human Cost.payloadSHA256 would record
         // another context's tokens as this turn's evidence.
-        let decision = await select(rcw1: 30, rcw1ABI: 10, caveman: 80, cavemanABI: 10, human: 100)
+        let decision = await select(rcw1: 30, rcw1ABI: 10, rcs1: 80, rcs1ABI: 10, human: 100)
         let payload = "AUTO:\(human)"
         let fallback = decision.fallingBackToHuman(
             payload: payload,
@@ -302,7 +342,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         // WHY: identical bytes ranked by another provider's tokenizer are not
         // evidence for this target. Fail closed to Human with an explicit
         // counter-binding reason, not a generic candidate error.
-        let decision = await select(rcw1: 30, rcw1ABI: 10, caveman: 70, cavemanABI: 10, human: 100)
+        let decision = await select(rcw1: 30, rcw1ABI: 10, rcs1: 70, rcs1ABI: 10, human: 100)
         let rebound = decision.bindingToCurrentHuman(
             canonicalHuman: human,
             admittedPrompt: human,
@@ -323,7 +363,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
     }
 
     func test_bindingToCurrentHumanRejectsOptimizedDecisionForAnotherResolvedModel() async {
-        let decision = await select(rcw1: 70, rcw1ABI: 10, caveman: 25, cavemanABI: 5, human: 100)
+        let decision = await select(rcw1: 70, rcw1ABI: 10, rcs1: 25, rcs1ABI: 5, human: 100)
         let rebound = decision.bindingToCurrentHuman(
             canonicalHuman: human,
             admittedPrompt: human,
@@ -331,7 +371,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
             resolvedModel: "other-model"
         )
 
-        XCTAssertEqual(decision.selectedFormat, .caveman)
+        XCTAssertEqual(decision.selectedFormat, .rcs1)
         XCTAssertEqual(decision.counter?.resolvedModel, "gpt-test")
         XCTAssertEqual(rebound.selectedFormat, .human)
         XCTAssertEqual(rebound.selectedPayload, human)
@@ -343,7 +383,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
     }
 
     func test_bindingToCurrentHumanKeepsOptimizedDecisionForCurrentTarget() async {
-        let decision = await select(rcw1: 30, rcw1ABI: 10, caveman: 70, cavemanABI: 10, human: 100)
+        let decision = await select(rcw1: 30, rcw1ABI: 10, rcs1: 70, rcs1ABI: 10, human: 100)
         let rebound = decision.bindingToCurrentHuman(
             canonicalHuman: human,
             admittedPrompt: human,
@@ -359,7 +399,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
     func test_bindingToCurrentHumanKeepsHumanDecisionsWithNoCounter() async {
         // WHY: tie/unavailable/error already selected Human. Missing counter
         // evidence is not a stale optimized ranking.
-        let candidates = [candidate(.rcw1), candidate(.caveman)]
+        let candidates = [candidate(.rcw1), candidate(.rcs1)]
         let missing = await Selector.select(
             canonicalHuman: human, humanOutboundPrompt: human, humanEffectiveEnvelope: human,
             target: target, candidates: candidates, counter: nil
@@ -379,8 +419,8 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
     }
 
     func test_bindingToCurrentHumanKeepsHumanTieAndCounterErrorForCurrentTarget() async {
-        let tied = await select(rcw1: 40, rcw1ABI: 10, caveman: 80, cavemanABI: 10, human: 50)
-        let candidates = [candidate(.rcw1), candidate(.caveman)]
+        let tied = await select(rcw1: 40, rcw1ABI: 10, rcs1: 80, rcs1ABI: 10, human: 50)
+        let candidates = [candidate(.rcw1), candidate(.rcs1)]
         let error = await Selector.select(
             canonicalHuman: human,
             humanOutboundPrompt: human,
@@ -415,7 +455,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         // human_lowest_cost for this target. Keep the admitted Human bytes and
         // fail closed with the explicit counter-binding reason, not the stale
         // ranking reason, while dropping that other tokenizer's evidence.
-        let decision = await select(rcw1: 60, rcw1ABI: 10, caveman: 65, cavemanABI: 10, human: 50)
+        let decision = await select(rcw1: 60, rcw1ABI: 10, rcs1: 65, rcs1ABI: 10, human: 50)
         let rebound = decision.bindingToCurrentHuman(
             canonicalHuman: human,
             admittedPrompt: human,
@@ -440,7 +480,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         // WHY: stale target evidence is counter_binding_mismatch only when
         // canonical/outbound bytes still match. A different Human stays the
         // content-unbound candidate path.
-        let decision = await select(rcw1: 30, rcw1ABI: 10, caveman: 70, cavemanABI: 10, human: 100)
+        let decision = await select(rcw1: 30, rcw1ABI: 10, rcs1: 70, rcs1ABI: 10, human: 100)
         let other = "different canonical Human"
         let rebound = decision.bindingToCurrentHuman(
             canonicalHuman: other,
@@ -460,7 +500,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
     func test_humanFallbackPreservesBoundEvidenceWhenPayloadMatchesHumanCost() async throws {
         // WHY: capability/malformed fallback may keep measured arms only when
         // Human Cost.payloadSHA256 is the exact bytes that will be sent.
-        let decision = await select(rcw1: 30, rcw1ABI: 10, caveman: 80, cavemanABI: 10, human: 100)
+        let decision = await select(rcw1: 30, rcw1ABI: 10, rcs1: 80, rcs1ABI: 10, human: 100)
         let fallback = decision.fallingBackToHuman(
             payload: human,
             reason: .candidateError,
@@ -484,7 +524,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
     }
 
     func test_counterErrorOrInvalidCountFallsBackToHuman() async {
-        let candidates = [candidate(.rcw1), candidate(.caveman)]
+        let candidates = [candidate(.rcw1), candidate(.rcs1)]
         let error = await Selector.select(
             canonicalHuman: human,
             humanOutboundPrompt: human,
@@ -515,12 +555,12 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         rcw1: Int = 30,
         rcw1ABI: Int = 10,
         rcw1Effective: Int? = nil,
-        caveman: Int = 60,
-        cavemanABI: Int = 10,
-        cavemanEffective: Int? = nil,
+        rcs1: Int = 60,
+        rcs1ABI: Int = 10,
+        rcs1Effective: Int? = nil,
         human: Int = 100
     ) async -> Selector.Decision {
-        let candidates = candidates ?? [candidate(.rcw1), candidate(.caveman)]
+        let candidates = candidates ?? [candidate(.rcw1), candidate(.rcs1)]
         return await Selector.select(
             canonicalHuman: self.human,
             humanOutboundPrompt: self.human,
@@ -530,8 +570,8 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
             counter: capability(counts: counts(
                 candidates: candidates,
                 rcw1: rcw1, rcw1ABI: rcw1ABI, rcw1Effective: rcw1Effective,
-                caveman: caveman, cavemanABI: cavemanABI,
-                cavemanEffective: cavemanEffective, human: human
+                rcs1: rcs1, rcs1ABI: rcs1ABI,
+                rcs1Effective: rcs1Effective, human: human
             ))
         )
     }
@@ -546,11 +586,11 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         semantic: Selector.GateStatus = .passed,
         recovery: Selector.GateStatus = .passed
     ) -> Selector.Candidate {
-        let handle = handle ?? (format == .rcw1 ? "rcv1.handle" : "cave.handle")
+        let handle = handle ?? (format == .rcw1 ? "rcv1.handle" : "rcs1.handle")
         let payload = payload ?? (format == .rcw1
             ? "RCW1 candidate [[rc:\(handle)]]"
-            : "Caveman candidate [[ccr:\(handle)]]")
-        let abi = format == .rcw1 ? "RCW1 ABI" : "Caveman ABI"
+            : "RCS1 candidate [[rc:\(handle)]]")
+        let abi = format == .rcw1 ? "RCW1 ABI" : "RCS1 ABI"
         return .init(
             format: format,
             sourceSHA256: sourceSHA256 ?? sha256(human),
@@ -558,7 +598,7 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
             abi: abi,
             effectiveEnvelope: "SYSTEM:\(abi)\nUSER:\(payload)",
             handle: handle,
-            producerID: format == .rcw1 ? "remotecode-rcw1" : "caveman",
+            producerID: format == .rcw1 ? "remotecode-rcw1" : "remotecode-rcs1",
             producerRevision: "fixture-1",
             abiRevision: "fixture-abi-1",
             generation: generation,
@@ -573,22 +613,24 @@ final class TokenSaverBestOfThreeSelectorTests: XCTestCase {
         rcw1: Int = 30,
         rcw1ABI: Int = 10,
         rcw1Effective: Int? = nil,
-        caveman: Int = 60,
-        cavemanABI: Int = 10,
-        cavemanEffective: Int? = nil,
+        rcs1: Int = 60,
+        rcs1ABI: Int = 10,
+        rcs1Effective: Int? = nil,
         human: Int = 100
     ) -> [String: Int] {
         var result = [self.human: human]
         for candidate in candidates {
             let isRCW1 = candidate.format == .rcw1
-            let payload = isRCW1 ? rcw1 : caveman
-            let abi = isRCW1 ? rcw1ABI : cavemanABI
+            let payload = isRCW1 ? rcw1 : rcs1
+            let abi = isRCW1 ? rcw1ABI : rcs1ABI
             result[candidate.payload] = payload
-            result[candidate.handle!] = isRCW1 ? 7 : 6
+            if let handle = candidate.handle {
+                result[handle] = isRCW1 ? 7 : 6
+            }
             result[candidate.abi] = abi
             result[candidate.effectiveEnvelope] = isRCW1
                 ? (rcw1Effective ?? payload + abi)
-                : (cavemanEffective ?? payload + abi)
+                : (rcs1Effective ?? payload + abi)
         }
         return result
     }

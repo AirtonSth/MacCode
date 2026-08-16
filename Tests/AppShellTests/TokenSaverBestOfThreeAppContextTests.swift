@@ -199,14 +199,35 @@ final class TokenSaverBestOfThreeAppContextTests: XCTestCase {
         XCTAssertGreaterThan(rcw1Cost.handleTokens, 0)
         XCTAssertGreaterThan(rcw1Cost.abiTokens, 0)
         XCTAssertTrue(decision.selectedPayload.contains("[[rc:"))
+        let rcs1Arm = try XCTUnwrap(decision.arm(.rcs1))
+        XCTAssertFalse(rcs1Arm.eligible, "disabled RCS1 must not become a selectable winner")
+        XCTAssertEqual(
+            rcs1Arm.producerID,
+            TokenSaverRequestSelectionReceipt.rcs1UnavailableProducerID
+        )
         XCTAssertNil(
             TokenSaverProviderVisibleEnvelopeProjector.project(
-                format: .caveman,
+                format: .rcs1,
                 payload: "unused",
                 request: request
             ),
-            "Caveman has no proven production envelope"
+            "RCS1 has no proven production envelope"
         )
+    }
+
+    func test_disabledRCS1CandidateIsUnavailableWithFailedGatesAndDoesNotInstallThirdPartyProducer() {
+        let source = String(repeating: "ab", count: 32)
+        let candidate = TokenSaverExactRuntimeSupport.disabledRCS1Candidate(sourceSHA256: source)
+        XCTAssertEqual(candidate.format, .rcs1)
+        XCTAssertEqual(candidate.sourceSHA256, source)
+        XCTAssertNil(candidate.handle)
+        XCTAssertEqual(candidate.generation, .failed)
+        XCTAssertEqual(candidate.structural, .failed)
+        XCTAssertEqual(candidate.semantic, .failed)
+        XCTAssertEqual(candidate.recovery, .failed)
+        XCTAssertEqual(candidate.producerID, "remotecode-rcs1-unavailable")
+        XCTAssertEqual(candidate.payload, "RCS1_RUNTIME_UNAVAILABLE")
+        XCTAssertEqual(candidate.abi, "RCS1_ABI_UNAVAILABLE")
     }
 
     func test_selectedRCW1ProvisionalIsFinalizedExactlyOnce() async throws {
@@ -992,7 +1013,7 @@ private final class C9CountProbe: @unchecked Sendable {
     }
 
     private static func classify(_ text: String, humanEnvelope: Int, rcw1Envelope: Int) -> Int {
-        if text.contains("CAVEMAN_RUNTIME_UNAVAILABLE") || text.contains("CAVEMAN_ABI_UNAVAILABLE") {
+        if text.contains("RCS1_RUNTIME_UNAVAILABLE") || text.contains("RCS1_ABI_UNAVAILABLE") {
             return 90
         }
         if text.contains("RCW1\t") && text.contains("REMOTE_CODE_WIRE_V1") {

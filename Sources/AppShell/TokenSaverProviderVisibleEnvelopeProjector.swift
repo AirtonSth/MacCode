@@ -25,7 +25,7 @@ public enum TokenSaverProviderVisibleEnvelopeProjector {
         payload: String,
         request: TokenSaverOutboundSelectionRequest
     ) -> TokenSaverProviderVisibleEnvelope? {
-        guard format != .caveman else { return nil }
+        guard format != .rcs1 else { return nil }
         guard !payload.isEmpty else { return nil }
         let abi = AgentSkillInstaller.tokenSaverProviderPrompt(
             "",

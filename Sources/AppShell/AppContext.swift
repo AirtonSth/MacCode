@@ -3124,7 +3124,7 @@ public final class AppContext {
                 target: target,
                 candidates: [
                     rcw1,
-                    TokenSaverExactRuntimeSupport.disabledCavemanCandidate(sourceSHA256: sourceSHA256),
+                    TokenSaverExactRuntimeSupport.disabledRCS1Candidate(sourceSHA256: sourceSHA256),
                 ],
                 counter: counter
             )
