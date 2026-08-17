@@ -1494,6 +1494,40 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesAdvertisedWorkspace_becauseDestMustNotOmitTheRepo() throws {
+        // WHY: Studio already shows Workspace. Brain compile never sent
+        // name/cwd, so first-chat "which repo?" invented a folder. Dest
+        // preview and compose must share the advertised workspace.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "macos-app", cwd: "/tmp/macos-app")
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "Which repo is this?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(vm.advertisedWorkspace?.name, "macos-app")
+        XCTAssertEqual(vm.advertisedWorkspace?.cwd, "/tmp/macos-app")
+        XCTAssertEqual(vm.studioWorkspaceLabel, "macos-app")
+        XCTAssertTrue(preview.compiledPayload.contains("Working space: macos-app (/tmp/macos-app)."))
+        XCTAssertTrue(preview.compiledPayload.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Which repo is this?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+        XCTAssertEqual(piper.workspaceID, workspace.id)
+    }
+
     func test_previewBrainIncludesEnabledRoutine_becauseDestMustNotOmitSchedules() throws {
         // WHY: Brain Inspector / Desk send used dest memory+skills and
         // skipped dest routines. Owner-authored Morning scan never reached
@@ -1521,7 +1555,8 @@ final class BotsWindowTests: XCTestCase {
                 userText: "What do you run?",
                 memory: vm.memoryItems,
                 skills: vm.skillBindings,
-                routines: vm.routines
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
             )
         )
         XCTAssertEqual(
@@ -3814,7 +3849,8 @@ final class BotsWindowTests: XCTestCase {
             revision: try XCTUnwrap(vm.selectedRevision),
             userText: "Summarize overnight",
             memory: vm.memoryItems,
-            skills: vm.skillBindings
+            skills: vm.skillBindings,
+            workspace: vm.advertisedWorkspace
         ))
         XCTAssertTrue(preview.compiledPayload.contains("Prefers dark mode"))
         XCTAssertEqual(preview.layers.first(where: { $0.kind == .user })?.text, "Summarize overnight")
@@ -3929,7 +3965,8 @@ final class BotsWindowTests: XCTestCase {
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Summarize overnight",
                 memory: vm.memoryItems,
-                skills: vm.skillBindings
+                skills: vm.skillBindings,
+                workspace: vm.advertisedWorkspace
             ),
             preview.compiledPayload
         )

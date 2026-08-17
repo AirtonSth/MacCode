@@ -103,6 +103,27 @@ public struct ContextAssemblyReceipt: Codable, Sendable, Equatable, Identifiable
     public var memoryLayers: [BotContextLayer] { layers.filter { $0.kind == .memory } }
 }
 
+/// Studio already shows the workspace name. Compile name + cwd so
+/// first-chat "which repo?" cannot invent a folder. Custom soul must
+/// not hide advertised workspace. Blank name/cwd compile as isolation only.
+public struct BotWorkspaceHonesty: Codable, Sendable, Equatable {
+    public var name: String
+    public var cwd: String
+
+    public init(name: String, cwd: String = "") {
+        self.name = name
+        self.cwd = cwd
+    }
+
+    public var placeLabel: String {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty { return cwd }
+        if cwd.isEmpty { return name }
+        return "\(name) (\(cwd))"
+    }
+}
+
 /// Compiles Source Brain layers into the Effective payload sent to a provider.
 public enum BotBrainCompiler {
     public static func assemble(
@@ -112,6 +133,7 @@ public enum BotBrainCompiler {
         memory: [BotMemoryItem] = [],
         skills: [BotSkillBinding] = [],
         routines: [BotRoutine] = [],
+        workspace: BotWorkspaceHonesty? = nil,
         conversationID: BotConversationID? = nil,
         runID: AgentRunID? = nil,
         now: Date = Date()
@@ -122,7 +144,8 @@ public enum BotBrainCompiler {
             userText: userText,
             memory: memory,
             skills: skills,
-            routines: routines
+            routines: routines,
+            workspace: workspace
         )
         return ContextAssemblyReceipt(
             botID: bot.id,
@@ -143,7 +166,8 @@ public enum BotBrainCompiler {
                 userText: userText,
                 memory: memory,
                 skills: skills,
-                routines: routines
+                routines: routines,
+                workspace: workspace
             ),
             assembledAt: now
         )
@@ -156,13 +180,14 @@ public enum BotBrainCompiler {
         userText: String,
         memory: [BotMemoryItem] = [],
         skills: [BotSkillBinding] = [],
-        routines: [BotRoutine] = []
+        routines: [BotRoutine] = [],
+        workspace: BotWorkspaceHonesty? = nil
     ) -> String {
         var lines: [String] = []
         if let identity = identityLine(name: bot.name, handle: bot.handle, title: revision.title) {
             lines.append(identity)
         }
-        lines.append("Working space: \(workingSpaceText(for: revision))")
+        lines.append("Working space: \(workingSpaceText(for: revision, workspace: workspace))")
         lines.append("Permission: \(BotPermission.honestyLabel)")
         lines.append("Route: \(routeLine(provider: revision.provider, model: revision.model))")
         lines.append(BotStandingInstructions.admittedToolsText)
@@ -200,8 +225,13 @@ public enum BotBrainCompiler {
         return lines.joined(separator: "\n\n")
     }
 
-    static func workingSpaceText(for revision: BotRevision) -> String {
-        revision.desktopKind.advertisedOrLogical.honestyLabel
+    static func workingSpaceText(
+        for revision: BotRevision,
+        workspace: BotWorkspaceHonesty? = nil
+    ) -> String {
+        let isolation = revision.desktopKind.advertisedOrLogical.honestyLabel
+        let place = workspace?.placeLabel ?? ""
+        return place.isEmpty ? isolation : "\(place). \(isolation)"
     }
 
     /// Desk already shows provider + model. Compile them so first-chat
@@ -254,7 +284,8 @@ public enum BotBrainCompiler {
         userText: String,
         memory: [BotMemoryItem],
         skills: [BotSkillBinding],
-        routines: [BotRoutine]
+        routines: [BotRoutine],
+        workspace: BotWorkspaceHonesty? = nil
     ) -> [BotContextLayer] {
         var layers: [BotContextLayer] = []
         if let identity = identityLine(name: bot.name, handle: bot.handle, title: revision.title) {
@@ -286,9 +317,9 @@ public enum BotBrainCompiler {
                 id: "desktop",
                 kind: .desktop,
                 title: "Working space",
-                text: workingSpaceText(for: revision),
+                text: workingSpaceText(for: revision, workspace: workspace),
                 included: true,
-                reason: "Advertised execution space. Leftover VM kinds compile as logical space."
+                reason: "Advertised workspace and execution space. Leftover VM kinds compile as logical space."
             )
         )
 

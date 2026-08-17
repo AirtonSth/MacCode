@@ -1339,12 +1339,20 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// Same workspace Desk send binds. Studio already shows the name;
+    /// compile uses name + cwd so first-chat cannot invent a folder.
+    public var advertisedWorkspace: BotWorkspaceHonesty? {
+        let id = selectedBot?.workspaceID
+            ?? context.state.window.selectedWorkspaceID
+            ?? context.state.window.workspaces.first
+        guard let id, let workspace = context.state.workspaces[id] else { return nil }
+        let honesty = BotWorkspaceHonesty(name: workspace.name, cwd: workspace.cwd)
+        return honesty.placeLabel.isEmpty ? nil : honesty
+    }
+
     public var studioWorkspaceLabel: String {
-        let id = selectedBot?.workspaceID ?? context.state.window.selectedWorkspaceID
-        if let id, let name = context.state.workspaces[id]?.name, !name.isEmpty {
-            return name
-        }
-        return "None"
+        let name = advertisedWorkspace?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return name.isEmpty ? "None" : name
     }
 
     public var studioRouteLabel: String {
@@ -1393,6 +1401,7 @@ public final class BotsViewModel: ObservableObject {
             routines.map {
                 "\($0.definition.id.value.uuidString):\($0.activation.isEnabled):\($0.definition.name):\($0.definition.prompt):\($0.definition.scheduleNote)"
             }.joined(separator: ","),
+            advertisedWorkspace?.placeLabel ?? "",
             selectedConversation?.id.value.uuidString ?? "",
         ].joined(separator: "\u{1f}")
         if cachedPreviewBrainKey == key, let cached = cachedPreviewBrain {
@@ -1406,6 +1415,7 @@ public final class BotsViewModel: ObservableObject {
             memory: memory,
             skills: skillBindings,
             routines: routines,
+            workspace: advertisedWorkspace,
             conversationID: selectedConversation?.id
         )
         cachedPreviewBrainKey = key
@@ -2866,6 +2876,7 @@ public final class BotsViewModel: ObservableObject {
                 memory: memory,
                 skills: skills,
                 routines: routines,
+                workspace: advertisedWorkspace,
                 conversationID: conversation.id
             )
             try botStore.insertContextReceipt(receipt)

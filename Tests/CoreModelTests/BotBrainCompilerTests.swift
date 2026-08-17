@@ -134,7 +134,86 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .desktop })?.included, true)
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .desktop })?.reason,
-            "Advertised execution space. Leftover VM kinds compile as logical space."
+            "Advertised workspace and execution space. Leftover VM kinds compile as logical space."
+        )
+    }
+
+    func test_workspaceHonestyCompilesForCustomSoul_becauseStudioWorkspaceIsNotAnEscapeHatch() {
+        // WHY: Studio already shows Workspace. The model never saw name or
+        // cwd, so first-chat "which repo?" invented a folder. A written soul
+        // must not hide the advertised workspace — Hermes agents know their
+        // cwd even when SOUL.md is custom.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let workspace = BotWorkspaceHonesty(name: "macos-app", cwd: "/tmp/macos-app")
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Which repo is this?",
+            workspace: workspace
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("Working space: macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .desktop })?.included, true)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .desktop })?.text,
+            "macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("macos-app"),
+            "workspace honesty is a compiler layer, not starter soul"
+        )
+    }
+
+    func test_emptyWorkspaceDoesNotInventAFolder_becauseCompileMustNotAdvertiseNone() {
+        // WHY: Studio shows "None" when no workspace is bound. Compile must
+        // not invent a folder name or emit "None" as if it were a repo.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let blank = BotWorkspaceHonesty(name: "  ", cwd: "  ")
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Which repo is this?",
+            workspace: blank
+        )
+        XCTAssertEqual(blank.placeLabel, "")
+        XCTAssertTrue(receipt.compiledPayload.contains("Working space: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Working space: None"))
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .desktop })?.text,
+            BotDesktopKind.logicalExecutionSpaceHonestyLabel
         )
     }
 
