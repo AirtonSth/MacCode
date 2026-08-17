@@ -65,6 +65,7 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.payloadDigest, BotDigest.sha256Hex(composed))
         XCTAssertEqual(receipt.compilerVersion, ContextAssemblyReceipt.compilerVersion)
         XCTAssertTrue(receipt.compiledPayload.contains("Prefers dark mode"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Description: Looks around"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(live.id.value)))
         XCTAssertFalse(receipt.compiledPayload.contains("Old secret"))
         XCTAssertFalse(receipt.compiledPayload.contains("Rumor"))
@@ -461,17 +462,17 @@ final class BotBrainCompilerTests: XCTestCase {
         )
     }
 
-    func test_admittedToolsCompileNamesRouteAndNotifications_becauseCustomSoulMustNotHideThem() {
-        // WHY: Compile already injects Route and Notifications. set_settings
-        // is the persist path. A custom soul must still see that those
-        // advertised writes go through the catalog tool.
-        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+    func test_admittedToolsCompileNamesDescription_becauseCustomSoulMustNotHideThem() {
+        // WHY: Compile already injects Route, Notifications, and Description.
+        // set_settings is the persist path. A custom soul must still see that
+        // advertised description writes go through the catalog tool.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "Looks around")
         let revision = BotRevision(
             botID: bot.id,
             revisionNumber: 1,
             name: "Piper",
             title: "Scout",
-            description: "",
+            description: "Looks around",
             soul: "Own the inbox.",
             provider: .claude,
             providerInstanceID: "claude",
@@ -482,14 +483,49 @@ final class BotBrainCompilerTests: XCTestCase {
             desktopKind: .logicalExecutionSpace,
             digest: "x"
         )
-        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Switch to Grok")
-        XCTAssertTrue(receipt.compiledPayload.contains("name, job, standing instructions, route, or notifications"))
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Change your description")
+        XCTAssertTrue(receipt.compiledPayload.contains("name, job, standing instructions, description, route, or notifications"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.changeJobTool))
+        XCTAssertTrue(receipt.compiledPayload.contains("Description: Looks around"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .tools })?.text,
             BotStandingInstructions.admittedToolsText
         )
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .description })?.text,
+            BotBrainCompiler.descriptionLine("Looks around")
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Description:"),
+            "description honesty is a compiler layer, not starter soul"
+        )
+    }
+
+    func test_emptyDescriptionDoesNotCompile_becauseBlankAboutMustNotInventCopy() {
+        // WHY: Studio hides an empty Description. Compile must not invent
+        // about text the owner never advertised.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "  ")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "  ",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's your description?")
+        XCTAssertFalse(receipt.compiledPayload.contains("Description:"))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .description })?.included, false)
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
     }
 
     func test_routeOmitsEmptyModel_becauseDeskHidesAnUnsetModelPill() {

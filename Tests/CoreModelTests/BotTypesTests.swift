@@ -152,17 +152,17 @@ final class BotTypesTests: XCTestCase {
         )
     }
 
-    func test_admittedToolsNameRouteAndNotifications_becauseSetSettingsAlreadyPublishesThem() {
-        // WHY: Desk-admitted bot_set_settings already publishes name, route,
-        // and notifications. The tools line only named job/soul, so first-chat
-        // "switch to Grok" / "stop notifying me" invented a hop or a pretend
-        // change. Hermes agents know which self-config writes are live.
+    func test_admittedToolsNameDescriptionRouteAndNotifications_becauseSetSettingsAlreadyPublishesThem() {
+        // WHY: Desk-admitted bot_set_settings already publishes description.
+        // Tools named name/job/soul/route/notifications, so first-chat
+        // "change your description" invented a hop. Hermes agents know
+        // which self-config writes are live.
         let tools = BotStandingInstructions.admittedToolsText
         XCTAssertTrue(tools.contains(BotStandingInstructions.changeJobTool))
-        XCTAssertTrue(tools.contains("name, job, standing instructions, route, or notifications"))
+        XCTAssertTrue(tools.contains("name, job, standing instructions, description, route, or notifications"))
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")
-                .contains("route, or notifications"),
+                .contains("description, route, or notifications"),
             "tools layer owns the remaining set_settings writes"
         )
         XCTAssertFalse(tools.contains("handle"), "handle is create-only")

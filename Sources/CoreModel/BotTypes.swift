@@ -191,7 +191,7 @@ public enum BotStandingInstructions {
     public static let waitLoginTool = "bot_browser_wait_login"
 
     public static let generatedCapabilityLine =
-        "When asked to remember a fact, call \(rememberFactTool). When asked to change your name, job, standing instructions, route, or notifications, call \(changeJobTool)."
+        "When asked to remember a fact, call \(rememberFactTool). When asked to change your name, job, standing instructions, description, route, or notifications, call \(changeJobTool)."
 
     public static let generatedMutateLine =
         "When asked to forget a fact, call \(forgetFactTool). When asked to enable or disable a skill, call \(setSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to turn a routine on or off, call \(setRoutineEnabledTool)."

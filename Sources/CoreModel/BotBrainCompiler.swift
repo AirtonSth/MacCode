@@ -193,8 +193,7 @@ public enum BotBrainCompiler {
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
         lines.append("Route: \(routeLine(provider: revision.provider, model: revision.model))")
         lines.append(BotStandingInstructions.admittedToolsText)
-        let description = revision.description.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !description.isEmpty {
+        if let description = descriptionLine(revision.description) {
             lines.append(description)
         }
         let soul = BotStandingInstructions.resolved(
@@ -234,6 +233,14 @@ public enum BotBrainCompiler {
         let isolation = revision.desktopKind.advertisedOrLogical.honestyLabel
         let place = workspace?.placeLabel ?? ""
         return place.isEmpty ? isolation : "\(place). \(isolation)"
+    }
+
+    /// Studio already shows Description. Compile it labeled so first-chat
+    /// "what's your description?" cannot treat unlabeled prose as soul.
+    /// Empty stays omitted. Custom soul must not hide advertised about text.
+    static func descriptionLine(_ description: String) -> String? {
+        let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : "Description: \(trimmed)"
     }
 
     /// Studio already shows Notifications On/Off. Compile them so
@@ -390,16 +397,15 @@ public enum BotBrainCompiler {
             )
         )
 
-        let description = revision.description.trimmingCharacters(in: .whitespacesAndNewlines)
-        if description.isEmpty {
+        if let description = descriptionLine(revision.description) {
             layers.append(
                 BotContextLayer(
                     id: "description",
                     kind: .description,
                     title: "Description",
-                    text: "",
-                    included: false,
-                    reason: "No description."
+                    text: description,
+                    included: true,
+                    reason: "Advertised about text. Studio already shows Description."
                 )
             )
         } else {
@@ -408,9 +414,9 @@ public enum BotBrainCompiler {
                     id: "description",
                     kind: .description,
                     title: "Description",
-                    text: description,
-                    included: true,
-                    reason: "Published description is RemoteCode-controlled text."
+                    text: "",
+                    included: false,
+                    reason: "No description."
                 )
             )
         }
