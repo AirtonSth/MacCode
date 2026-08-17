@@ -194,6 +194,19 @@ final class BotTypesTests: XCTestCase {
         XCTAssertEqual(Set(BotAvatar.advertisedSymbols).count, BotAvatar.advertisedSymbols.count)
     }
 
+    func test_avatarParseAcceptsBlobatarToken_becauseStudioComposerPersistsTheToken() {
+        // WHY: Studio Avatar is a blobatar composer. Tools must persist
+        // Cloud / Auto on the same publish path, not invent an SF hop.
+        XCTAssertEqual(BotAvatar.parse("cloud"), "blobatar:v1:cloud:idle:none:auto")
+        XCTAssertEqual(
+            BotAvatar.parse("blobatar:v1:sun:happy:circle:pink"),
+            "blobatar:v1:sun:happy:circle:pink"
+        )
+        XCTAssertEqual(BotAvatar.advertisedName(for: "blobatar:v1:cloud:idle:none:auto"), "Cloud")
+        XCTAssertFalse(BotAvatar.advertisedName(for: "blobatar:v1:auto:idle:none:auto").contains("."))
+        XCTAssertNil(BotAvatar.parse("blobatar:v1:nope:idle:none:auto"))
+    }
+
     func test_admittedToolsNameDescriptionRouteAndNotifications_becauseSetSettingsAlreadyPublishesThem() {
         // WHY: Studio already says Default route and Model. Tools named
         // route only, so first-chat "change your Default route" invented

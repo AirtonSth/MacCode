@@ -731,6 +731,33 @@ final class BotBrainCompilerTests: XCTestCase {
         )
     }
 
+    func test_avatarHonestyCompilesBlobatar_becauseStudioComposerMustNotLeakTheToken() {
+        // WHY: Studio writes blobatar:v1:cloud:…. First-chat "what's my
+        // avatar?" must hear Cloud, never the token.
+        var bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        bot.avatarSymbol = "blobatar:v1:cloud:happy:none:coral"
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's my avatar?")
+        XCTAssertTrue(receipt.compiledPayload.contains("Avatar: Cloud"), "Avatar: Cloud")
+        XCTAssertFalse(receipt.compiledPayload.contains("blobatar:"), "token stays out")
+        XCTAssertFalse(receipt.compiledPayload.contains("star.fill"), "leftover SF")
+    }
+
     func test_leftoverAvatarDoesNotCompileSFSymbol_becauseStudioNeverAdvertisedIt() {
         // WHY: Leftover store symbols are not Studio chips. Compile must not
         // teach the model an SF path the owner never picked.

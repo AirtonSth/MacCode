@@ -218,8 +218,8 @@ public enum BotRoute {
     }
 }
 
-/// Studio Avatar is a chip picker. Tools must persist those names on the
-/// same publish path Studio Save already uses.
+/// Studio Avatar is a blobatar composer. Leftover SF chips still parse
+/// so published bots and tools keep working.
 public enum BotAvatar {
     public static let advertisedSymbols: [String] = [
         "person.crop.circle",
@@ -233,6 +233,9 @@ public enum BotAvatar {
     ]
 
     public static func advertisedName(for symbol: String) -> String {
+        if let spec = BotBlobatarSpec.parse(symbol) {
+            return spec.advertisedName
+        }
         switch symbol {
         case "person.crop.circle": return "Person"
         case "brain.head.profile": return "Brain"
@@ -246,10 +249,13 @@ public enum BotAvatar {
         }
     }
 
-    /// Studio says Star / Person. The SF Symbol stays valid.
+    /// Studio says Cloud / Auto / Star. The stored token or SF Symbol stays valid.
     public static func parse(_ raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        if let spec = BotBlobatarSpec.parse(trimmed) {
+            return spec.token
+        }
         if advertisedSymbols.contains(trimmed) { return trimmed }
         return advertisedSymbols.first {
             advertisedName(for: $0).caseInsensitiveCompare(trimmed) == .orderedSame

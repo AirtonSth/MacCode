@@ -43,7 +43,7 @@ public enum BotsChrome {
     public static let rosterWidth: CGFloat = 272
     public static let desktopPaneWidth: CGFloat = 340
 
-    /// Studio Avatar is a chip picker. Default matches BotDefinition.
+    /// Leftover SF chips. Studio Avatar is the blobatar composer.
     public static let avatarSymbols: [String] = BotAvatar.advertisedSymbols
 
     public static func avatarSymbolName(_ symbol: String) -> String {
@@ -125,6 +125,18 @@ public struct BotsAvatarView: View {
     }
 
     public var body: some View {
+        Group {
+            if let symbol, let spec = BotBlobatarSpec.parse(symbol) {
+                BotBlobatarView(name: name.isEmpty ? handle : name, spec: spec, size: size)
+            } else {
+                symbolFallback
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private var symbolFallback: some View {
         let ink = BotsChrome.avatarColor(for: handle)
         ZStack {
             RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
