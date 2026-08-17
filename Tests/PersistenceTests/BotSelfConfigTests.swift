@@ -688,4 +688,45 @@ final class BotSelfConfigTests: XCTestCase {
         }
         XCTAssertTrue(try service.snapshot().skills.isEmpty)
     }
+
+    func test_encodeSnapshotUsesCatalogMutateKeys_becauseNestedIdCollidedWithTheBot() throws {
+        // WHY: Forget/remove/toggle require memory_id / skill_id / routine_id.
+        // Snapshot used Swift id / skillID / scheduleNote, so same-turn
+        // "forget that" invented a hop or sent the bot id. Hermes agents
+        // reuse the key the last write returned. Canonical Swift fields stay.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dark mode",
+        ])
+        _ = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+            "enabled": true,
+        ])
+        _ = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "prompt": "Summarize overnight",
+            "schedule_note": "Weekdays 9:00",
+        ])
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["id"] as? String, bot.id.value.uuidString.lowercased())
+        let memory = try XCTUnwrap(object["memory"] as? [[String: Any]])
+        XCTAssertEqual(memory.first?["memory_id"] as? String, remembered.memory.first?.id, "memory_id persists")
+        XCTAssertNil(memory.first?["id"], "nested id omitted")
+        XCTAssertEqual(memory.first?["content"] as? String, "Prefers dark mode")
+        let skills = try XCTUnwrap(object["skills"] as? [[String: Any]])
+        XCTAssertEqual(skills.first?["skill_id"] as? String, "weekly-account-health", "skill_id persists")
+        XCTAssertNil(skills.first?["skillID"])
+        let routines = try XCTUnwrap(object["routines"] as? [[String: Any]])
+        XCTAssertEqual(routines.first?["routine_id"] as? String, try service.snapshot().routines.first?.id, "routine_id persists")
+        XCTAssertNil(routines.first?["id"], "nested id omitted")
+        XCTAssertEqual(routines.first?["schedule_note"] as? String, "Weekdays 9:00")
+        XCTAssertNil(routines.first?["scheduleNote"])
+        XCTAssertEqual(remembered.memory.first?.id.isEmpty, false)
+        XCTAssertEqual(try service.snapshot().skills.first?.skillID, "weekly-account-health")
+        XCTAssertEqual(try service.snapshot().routines.first?.scheduleNote, "Weekdays 9:00")
+    }
 }

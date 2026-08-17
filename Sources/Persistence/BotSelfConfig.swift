@@ -182,11 +182,23 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
     public struct Item: Codable, Equatable, Sendable {
         public var id: String
         public var content: String
+
+        // Tools require memory_id. Snapshot used to say id, which collided
+        // with the bot id, so same-turn forget invented a hop.
+        enum CodingKeys: String, CodingKey {
+            case id = "memory_id"
+            case content
+        }
     }
 
     public struct Skill: Codable, Equatable, Sendable {
         public var skillID: String
         public var enabled: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case skillID = "skill_id"
+            case enabled
+        }
     }
 
     public struct Routine: Codable, Equatable, Sendable {
@@ -195,6 +207,14 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
         public var prompt: String
         public var scheduleNote: String
         public var enabled: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case id = "routine_id"
+            case name
+            case prompt
+            case scheduleNote = "schedule_note"
+            case enabled
+        }
     }
 }
 
