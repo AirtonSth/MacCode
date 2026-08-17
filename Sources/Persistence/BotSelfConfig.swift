@@ -63,7 +63,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
-            return "Forget one of this bot's memory facts."
+            return "Forget one of this bot's memory facts. Same path as Studio Forget."
         case correctMemory:
             return "Correct one of this bot's memory facts. Writes a new revision. Same path as Studio Correct."
         case setSkill:
@@ -531,7 +531,14 @@ public struct BotSelfConfigService: Sendable {
             }
             return try putMemory(content: content)
         case BotSelfConfigCatalog.forgetMemory:
-            return try forgetMemory(id: BotMemoryItemID(try Self.parseUUID(arguments["memory_id"], label: "memory_id")))
+            // Tools and Studio say Forget. Schema key stays memory_id.
+            // set_settings leftover forget already rejects and points
+            // here, so first-chat retried forget on forget_memory.
+            // Accept that advertised name on the existing persist path.
+            return try forgetMemory(id: BotMemoryItemID(try Self.parseUUID(
+                arguments["memory_id"] ?? arguments["forget"] ?? arguments["forget_memory"],
+                label: "memory_id"
+            )))
         case BotSelfConfigCatalog.correctMemory:
             // Tools and Studio say Correct. Schema key stays content.
             // set_settings leftover correct already rejects and points

@@ -3711,6 +3711,15 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["correct_fact"], "correct_fact is an advertised alias, not a second schema key")
         let content = properties?["content"] as? [String: Any]
         XCTAssertEqual(content?["description"] as? String, "Fact. Same field as Studio Remember a fact.")
+
+        let forgetSchema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.forgetMemory)
+        let forgetProperties = forgetSchema["properties"] as? [String: Any]
+        XCTAssertNotNil(forgetProperties?["memory_id"])
+        XCTAssertNil(forgetProperties?["forget"], "forget is an advertised forget_memory alias, not a second schema key")
+        XCTAssertNil(forgetProperties?["forget_memory"], "forget_memory is an advertised alias, not a second schema key")
+        XCTAssertEqual(forgetSchema["required"] as? [String], ["memory_id"])
+        let forgetDescription = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.forgetMemory)
+        XCTAssertTrue(forgetDescription.contains("Forget"), "Same path as Studio Forget")
     }
 
     func test_correctMemoryAdvertisedCorrectPersists_becauseHonestySaysStudioCorrect() throws {
@@ -3783,6 +3792,77 @@ final class BotSelfConfigTests: XCTestCase {
                 "Prefers dawn",
                 "Prefers light mode",
             ]
+        )
+    }
+
+    func test_forgetMemoryAdvertisedForgetPersists_becauseHonestySaysStudioForget() throws {
+        // WHY: set_settings leftover forget already rejects and points
+        // at bot_forget_memory ("Same path as Studio Forget"). Forget
+        // only read memory_id, so first-chat retried forget and
+        // invented a hop. Canonical memory_id still wins. Schema does
+        // not grow a forget key. Dest title stays Memory.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let first = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dark mode",
+        ])
+        let firstID = try XCTUnwrap(first.memory.first?.id)
+
+        let fromForget = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "forget": firstID,
+        ])
+        XCTAssertTrue(fromForget.memory.isEmpty, "forget persists")
+        XCTAssertTrue(try store.listMemory(botID: bot.id).isEmpty)
+        XCTAssertEqual(
+            try store.listMemory(botID: bot.id, includeForgotten: true).first?.id.value.uuidString.lowercased(),
+            firstID.lowercased()
+        )
+
+        let second = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dusk",
+        ])
+        let secondID = try XCTUnwrap(second.memory.first?.id)
+        let fromForgetMemory = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "forget_memory": secondID,
+        ])
+        XCTAssertTrue(fromForgetMemory.memory.isEmpty, "forget_memory persists")
+        XCTAssertTrue(try store.listMemory(botID: bot.id).isEmpty)
+
+        let third = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dawn",
+        ])
+        let thirdID = try XCTUnwrap(third.memory.first?.id)
+        let fourth = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers light mode",
+        ])
+        let fourthID = try XCTUnwrap(fourth.memory.first(where: { $0.content == "Prefers light mode" })?.id)
+        let memoryIDWins = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "memory_id": thirdID,
+            "forget": fourthID,
+            "forget_memory": fourthID,
+        ])
+        XCTAssertEqual(memoryIDWins.memory.map(\.id), [fourthID], "memory_id wins")
+        XCTAssertEqual(memoryIDWins.memory.first?.content, "Prefers light mode")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "forget": fourthID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.memory.count, 1)
+        XCTAssertEqual(still.memory.first?.id, fourthID)
+        XCTAssertEqual(
+            still.memory.first?.content,
+            "Prefers light mode",
+            "leftover forget still rejects on set_settings"
+        )
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.forgetMemory)["properties"]
+                .flatMap { $0 as? [String: Any] }?["forget"],
+            "forget is an advertised forget_memory alias, not a second schema key"
         )
     }
 
