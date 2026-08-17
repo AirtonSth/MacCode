@@ -3724,6 +3724,7 @@ public struct BotsRootView: View {
                     Text("Grok").tag(AgentProvider.grok)
                 }
                 .pickerStyle(.segmented)
+                .labelsHidden()
                 .onChange(of: vm.studioDraft.provider) { provider in
                     vm.applyDefaultModel(for: provider)
                 }

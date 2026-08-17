@@ -4381,6 +4381,24 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.displayedDesktopKind, .logicalExecutionSpace)
     }
 
+    func test_studioProviderPickerHidesTitle_becauseDefaultRouteAlreadyLabelsTheRow() throws {
+        // WHY: The Profile row is already "Default route". A visible
+        // Picker title "Provider" looks like leftover chrome beside
+        // Claude/Codex/Grok. Scheduled Tasks already hides the same title.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private var studioProvider") else {
+            return XCTFail("studioProvider must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n    private var studioSoul")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("Picker(\"Provider\""))
+        XCTAssertTrue(
+            slice.contains(".labelsHidden()"),
+            "Default route already names the row; Provider must not paint beside the segments"
+        )
+    }
+
     func test_avatarSymbolNameIsHuman_becauseStudioMustNotAnnounceSFSymbolPaths() {
         XCTAssertEqual(
             BotsChrome.avatarSymbolName("person.crop.circle"),
