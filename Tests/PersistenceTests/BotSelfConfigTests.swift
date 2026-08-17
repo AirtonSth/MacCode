@@ -233,10 +233,14 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["approval_mode"], "approval_mode is host-assigned, not a schema key")
         XCTAssertNil(properties?["permission"], "permission is dest title, not a schema key")
         XCTAssertNil(properties?["desktop"], "desktop is host-assigned, not a schema key")
+        XCTAssertNil(properties?["approvals"], "approvals is not a schema key")
+        XCTAssertNil(properties?["allow_once"], "allow_once is not a schema key")
+        XCTAssertNil(properties?["deny"], "deny is not a schema key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.approvalModeHostAssignedHonesty), "catalog names Approval mode host-assigned honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.approvalsHonesty), "catalog names Approvals honesty")
         XCTAssertTrue(description.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel), "catalog names Desktop isolation honesty")
     }
 
@@ -498,6 +502,69 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedApprovals_becauseStudioSaysTheyStayOff() throws {
+        // WHY: Studio Security already says Approvals. Compile already
+        // labels Allow once / Deny stay off. set_settings still accepted
+        // Approvals / allow_once / deny as an empty success, so first-chat
+        // "Allow once" invented a persist. Reject the advertised name.
+        // Name still persists. Leftover permission_mode still coerces.
+        // Schema does not grow an approvals key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "approvals": "allow_once",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Approvals": "deny",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Allow once": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "deny": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalsHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Approvals reject must not persist a name")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let leftover = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+        ])
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
