@@ -166,6 +166,18 @@ public enum BotPermission {
     }
 }
 
+/// Studio provider picker already binds these models. A provider-only
+/// set_settings write must not keep the leftover model from the old route.
+public enum BotRoute {
+    public static func defaultModel(for provider: AgentProvider) -> String {
+        switch provider {
+        case .claude: return "opus"
+        case .codex: return AgentDefaultModelSelection.codexBuiltInDefault
+        case .grok: return "grok-4.6"
+        }
+    }
+}
+
 /// Hermes seeds `SOUL.md` and falls back when it is empty. OpenClaw seeds
 /// `SOUL.md` / `IDENTITY.md` on first run. An empty Bot soul used to compile
 /// as "No standing instructions." — a New Agent then only saw "You are New Agent."

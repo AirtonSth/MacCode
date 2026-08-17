@@ -168,6 +168,53 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(try service.snapshot().id, bot.id.value.uuidString.lowercased())
     }
 
+    func test_setSettingsCatalogOmitsLeftoverPermissionAndDesktop_becauseThoseWritesAreNotLive() {
+        // WHY: Compile tools already omit leftover permission/desktop.
+        // The MCP schema still invited those writes, so first-chat
+        // "set full access" invented live unsupervised power.
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setSettings)
+        XCTAssertTrue(description.contains("name, job, standing instructions, description, route, or notifications"))
+        XCTAssertFalse(description.contains("permission"))
+        XCTAssertFalse(description.contains("desktop"))
+        let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)
+        let properties = schema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["provider"])
+        XCTAssertNotNil(properties?["model"])
+        XCTAssertNil(properties?["permission_mode"])
+        XCTAssertNil(properties?["desktop_kind"])
+    }
+
+    func test_setSettingsProviderWithoutModelBindsAdvertisedRoute_becauseLeftoverModelIsNotLive() throws {
+        // WHY: Desk-admitted bot_set_settings already publishes route.
+        // A provider-only write kept opus on Grok and the leftover
+        // Claude account id, so first-chat "switch to Grok" invented a hop
+        // or ran the old route. Studio picker already binds the default.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", soul: "Be brief.", provider: .claude, model: "opus")
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let after = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "provider": AgentProvider.grok.rawValue,
+        ])
+        XCTAssertEqual(after.provider, AgentProvider.grok.rawValue)
+        XCTAssertEqual(after.model, BotRoute.defaultModel(for: .grok))
+        XCTAssertEqual(after.providerInstanceID, AgentProvider.grok.rawValue)
+        XCTAssertNotEqual(after.model, "opus")
+        XCTAssertNotEqual(after.providerInstanceID, AgentProvider.claude.rawValue)
+        let explicit = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "provider": AgentProvider.claude.rawValue,
+            "model": "sonnet",
+            "provider_instance_id": "claude-work",
+        ])
+        XCTAssertEqual(explicit.provider, AgentProvider.claude.rawValue)
+        XCTAssertEqual(explicit.model, "sonnet")
+        XCTAssertEqual(explicit.providerInstanceID, "claude-work")
+        let modelOnly = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "model": "opus",
+        ])
+        XCTAssertEqual(modelOnly.provider, AgentProvider.claude.rawValue)
+        XCTAssertEqual(modelOnly.model, "opus")
+        XCTAssertEqual(modelOnly.providerInstanceID, "claude-work")
+    }
+
     func test_leftoverPermissionSnapshotStaysSupervised_becauseFullAccessIsNotLive() throws {
         // WHY: Brain compile already treats leftover full_access as
         // supervised. get_settings still returned the raw leftover, so

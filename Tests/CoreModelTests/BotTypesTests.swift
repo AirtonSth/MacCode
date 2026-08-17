@@ -152,6 +152,16 @@ final class BotTypesTests: XCTestCase {
         )
     }
 
+    func test_routeDefaultModelMatchesStudioPicker_becauseProviderOnlyWritesMustNotKeepLeftover() {
+        // WHY: Studio already binds opus / gpt-5.6-sol / grok-4.6 when the
+        // owner switches provider. A provider-only set_settings write used
+        // to keep the leftover model, so first-chat "switch to Grok" still
+        // ran opus. Hermes agents land on the advertised model for that route.
+        XCTAssertEqual(BotRoute.defaultModel(for: .claude), "opus")
+        XCTAssertEqual(BotRoute.defaultModel(for: .codex), AgentDefaultModelSelection.codexBuiltInDefault)
+        XCTAssertEqual(BotRoute.defaultModel(for: .grok), "grok-4.6")
+    }
+
     func test_admittedToolsNameDescriptionRouteAndNotifications_becauseSetSettingsAlreadyPublishesThem() {
         // WHY: Desk-admitted bot_set_settings already publishes description.
         // Tools named name/job/soul/route/notifications, so first-chat

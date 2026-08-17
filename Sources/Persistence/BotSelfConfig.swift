@@ -57,7 +57,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own identity, soul, provider/model, permission, desktop, or notifications. Same path as Studio Save."
+            return "Publish this bot's own name, job, standing instructions, description, route, or notifications. Same path as Studio Save."
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -89,8 +89,6 @@ public enum BotSelfConfigCatalog: Sendable {
                     "provider": ["type": "string"],
                     "provider_instance_id": ["type": "string"],
                     "model": ["type": "string"],
-                    "permission_mode": ["type": "string"],
-                    "desktop_kind": ["type": "string"],
                     "notifications_enabled": ["type": "boolean"],
                 ]) { _, new in new },
             ]
@@ -314,14 +312,32 @@ public struct BotSelfConfigService: Sendable {
         let permission = BotPermission.advertisedOrSupervised(
             patch.permissionMode ?? current.permissionMode
         )
+        let provider = patch.provider ?? current.provider
+        let providerChanged = patch.provider != nil && patch.provider != current.provider
+        let requestedModel = patch.model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let model = if !requestedModel.isEmpty {
+            requestedModel
+        } else if providerChanged {
+            BotRoute.defaultModel(for: provider)
+        } else {
+            current.model
+        }
+        let requestedInstance = patch.providerInstanceID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let providerInstanceID = if !requestedInstance.isEmpty {
+            requestedInstance
+        } else if providerChanged {
+            provider.rawValue
+        } else {
+            current.providerInstanceID
+        }
         let draft = BotRevisionDraft(
             name: name,
             title: patch.title ?? current.title,
             description: patch.description ?? current.description,
             soul: patch.soul ?? current.soul,
-            provider: patch.provider ?? current.provider,
-            providerInstanceID: patch.providerInstanceID ?? current.providerInstanceID,
-            model: patch.model ?? current.model,
+            provider: provider,
+            providerInstanceID: providerInstanceID,
+            model: model,
             reasoningEffort: current.reasoningEffort,
             compatibleRouteSet: current.compatibleRouteSet,
             permissionMode: permission,
