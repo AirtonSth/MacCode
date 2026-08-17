@@ -613,15 +613,16 @@ public struct BotSelfConfigService: Sendable {
         // write used to coerce to supervised and return success, so
         // first-chat invented a persist. Schema does not grow an
         // approval_mode or permission_mode key. Leftover desktop_kind
-        // still coerces. Dest title stays Permission.
+        // now rejects. Dest title stays Permission.
         if arguments.keys.contains(where: Self.isAdvertisedApprovalModeKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.approvalModeHostAssignedHonesty)
         }
         // Studio already says Desktop. Compile already labels isolation
-        // honesty. A leftover Desktop / desktop write used to return an
-        // empty success, so first-chat invented a persist. Schema does
-        // not grow a desktop key. Leftover desktop_kind still coerces.
-        // Dest title stays Desktop.
+        // honesty. A leftover Desktop / desktop / desktop_kind write
+        // used to coerce to logical and return success, so first-chat
+        // invented a persist. Schema does not grow a desktop or
+        // desktop_kind key. Snapshot camelCase desktopKind still
+        // succeeds empty. Dest title stays Desktop.
         if arguments.keys.contains(where: Self.isAdvertisedDesktopKey) {
             throw BotSelfConfigError.invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel)
         }
@@ -742,12 +743,6 @@ public struct BotSelfConfigService: Sendable {
                 patch.model = model
             }
         }
-        if let raw = arguments["desktop_kind"] as? String {
-            guard let kind = BotDesktopKind(rawValue: raw) else {
-                throw BotSelfConfigError.invalid("Unknown desktop kind: \(raw)")
-            }
-            patch.desktopKind = kind
-        }
         if arguments["notifications_enabled"] != nil || arguments["notifications"] != nil {
             let value = arguments["notifications_enabled"] ?? arguments["notifications"]
             patch.notificationsEnabled = try parseBool(value, label: "notifications_enabled")
@@ -794,10 +789,12 @@ public struct BotSelfConfigService: Sendable {
 
     /// desktop is not a schema key. Studio / compile advertise the name,
     /// so parse must fail loud instead of succeeding empty. Leftover
-    /// desktop_kind stays a coerce path, not this reject.
+    /// desktop_kind is the same host-assigned write. Snapshot camelCase
+    /// desktopKind stays an empty-success leftover, not this reject.
     static func isAdvertisedDesktopKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "desktop"
+            || normalized == "desktop_kind"
     }
 
     /// approvals is not a schema key. Studio / compile advertise the
