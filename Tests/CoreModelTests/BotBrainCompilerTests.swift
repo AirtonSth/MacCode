@@ -76,7 +76,7 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(receipt.compiledPayload.contains("Skills: weekly-account-health"))
         XCTAssertFalse(receipt.compiledPayload.contains("Enabled skills"))
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Working space: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertTrue(receipt.compiledPayload.contains("Permission: \(BotPermission.honestyLabel)"))
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Old secret") })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Rumor") })?.included, false)
@@ -137,7 +137,7 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Are you isolated?")
-        XCTAssertTrue(receipt.compiledPayload.contains("Working space: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .desktop })?.included, true)
@@ -176,7 +176,8 @@ final class BotBrainCompilerTests: XCTestCase {
             userText: "Which repo is this?",
             workspace: workspace
         )
-        XCTAssertTrue(receipt.compiledPayload.contains("Working space: macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Working space:"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .desktop })?.included, true)
@@ -218,8 +219,9 @@ final class BotBrainCompilerTests: XCTestCase {
             workspace: blank
         )
         XCTAssertEqual(blank.placeLabel, "")
-        XCTAssertTrue(receipt.compiledPayload.contains("Working space: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
-        XCTAssertFalse(receipt.compiledPayload.contains("Working space: None"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Workspace: None"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Working space:"))
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .desktop })?.text,
             BotDesktopKind.logicalExecutionSpaceHonestyLabel

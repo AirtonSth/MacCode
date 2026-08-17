@@ -198,7 +198,10 @@ public enum BotBrainCompiler {
         ) {
             lines.append(identity)
         }
-        lines.append("Working space: \(workingSpaceText(for: revision, workspace: workspace))")
+        // Studio already says Workspace. Compile that name so first-chat
+        // "which Workspace?" cannot invent a hop. Isolation honesty stays
+        // on this line. Dest Source title stays Working space.
+        lines.append("Workspace: \(workingSpaceText(for: revision, workspace: workspace))")
         lines.append("Permission: \(BotPermission.honestyLabel)")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
         lines.append("Route: \(routeLine(provider: revision.provider, model: revision.model))")

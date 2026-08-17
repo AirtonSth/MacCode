@@ -1510,7 +1510,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.advertisedWorkspace?.name, "macos-app")
         XCTAssertEqual(vm.advertisedWorkspace?.cwd, "/tmp/macos-app")
         XCTAssertEqual(vm.studioWorkspaceLabel, "macos-app")
-        XCTAssertTrue(preview.compiledPayload.contains("Working space: macos-app (/tmp/macos-app)."))
+        XCTAssertTrue(preview.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app)."))
+        XCTAssertFalse(preview.compiledPayload.contains("Working space:"))
         XCTAssertTrue(preview.compiledPayload.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
         XCTAssertEqual(
