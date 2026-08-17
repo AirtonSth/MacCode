@@ -120,4 +120,26 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
             AgentWorkingStripPresentation.label(phase: .tools, elapsedSeconds: 12)
         )
     }
+
+    func test_assistantCopyMatchesUserCopyChrome_becauseTenPointIconIsInvisibleOnDesk() throws {
+        // WHY: Desk assistant Copy message painted at 10x12.5 while the
+        // user bubble already frames the same glyph at 18x18. Users cannot
+        // find or hit the leftover tiny control.
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: "Sources/Surfaces/AgentChatTranscriptChrome.swift"),
+            encoding: .utf8
+        )
+        guard let start = source.range(of: "public struct AgentChatAssistantReply") else {
+            return XCTFail("AgentChatAssistantReply must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\npublic struct AgentChatComposerBar")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains(".font(.system(size: 11, weight: .regular))"))
+        XCTAssertTrue(slice.contains(".frame(width: 18, height: 18)"))
+        XCTAssertFalse(
+            slice.contains(".font(.system(size: 10))"),
+            "assistant Copy must not stay a 10pt leftover icon"
+        )
+    }
 }

@@ -17,6 +17,42 @@ final class BotSelfConfigTests: XCTestCase {
         db = nil
     }
 
+    func test_standingStarterNamesLiveSelfConfigTools_becauseDeskAlreadyAdmitsThem() {
+        // WHY: Generated soul must name the same tools the MCP catalog
+        // exposes. A drift here means first-chat "remember this" calls a
+        // name the server does not have.
+        XCTAssertEqual(BotStandingInstructions.rememberFactTool, BotSelfConfigCatalog.putMemory)
+        XCTAssertEqual(BotStandingInstructions.changeJobTool, BotSelfConfigCatalog.setSettings)
+        XCTAssertEqual(BotStandingInstructions.forgetFactTool, BotSelfConfigCatalog.forgetMemory)
+        XCTAssertEqual(BotStandingInstructions.correctFactTool, BotSelfConfigCatalog.correctMemory)
+        XCTAssertEqual(BotStandingInstructions.setSkillTool, BotSelfConfigCatalog.setSkill)
+        XCTAssertEqual(BotStandingInstructions.removeSkillTool, BotSelfConfigCatalog.removeSkill)
+        XCTAssertEqual(BotStandingInstructions.saveRoutineTool, BotSelfConfigCatalog.saveRoutine)
+        XCTAssertEqual(BotStandingInstructions.setRoutineEnabledTool, BotSelfConfigCatalog.setRoutineEnabled)
+        let tools = BotStandingInstructions.admittedToolsText
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.putMemory))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSettings))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.forgetMemory))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.correctMemory))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSkill))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.removeSkill))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.saveRoutine))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setRoutineEnabled))
+        XCTAssertFalse(tools.contains(BotSelfConfigCatalog.getSettings))
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.putMemory),
+            "tools layer owns self-config names"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.correctMemory),
+            "tools layer owns correct"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.removeSkill),
+            "tools layer owns remove"
+        )
+    }
+
     func test_callUsesLiveCatalogAndPersistsThroughPublish() throws {
         // WHY: Studio Save and the bot self-config surface must share one persist path.
         let bot = try store.create(
@@ -33,7 +69,9 @@ final class BotSelfConfigTests: XCTestCase {
             BotSelfConfigCatalog.setSettings,
             BotSelfConfigCatalog.putMemory,
             BotSelfConfigCatalog.forgetMemory,
+            BotSelfConfigCatalog.correctMemory,
             BotSelfConfigCatalog.setSkill,
+            BotSelfConfigCatalog.removeSkill,
             BotSelfConfigCatalog.saveRoutine,
             BotSelfConfigCatalog.setRoutineEnabled,
         ])
@@ -50,15 +88,14 @@ final class BotSelfConfigTests: XCTestCase {
             "soul": "Speak plainly.",
             "provider": AgentProvider.grok.rawValue,
             "model": "grok-4",
-            "permission_mode": AgentPermissionMode.fullAccess.rawValue,
-            "desktop_kind": BotDesktopKind.logicalExecutionSpace.rawValue,
             "notifications_enabled": false,
         ])
         XCTAssertEqual(afterSet.name, "Piper Prime")
         XCTAssertEqual(afterSet.soul, "Speak plainly.")
         XCTAssertEqual(afterSet.provider, AgentProvider.grok.rawValue)
         XCTAssertEqual(afterSet.model, "grok-4")
-        XCTAssertEqual(afterSet.permissionMode, AgentPermissionMode.fullAccess.rawValue)
+        // leftover full_access is not live — Desk launches supervised
+        XCTAssertEqual(afterSet.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertEqual(afterSet.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
         XCTAssertFalse(afterSet.notificationsEnabled)
         XCTAssertEqual(try store.get(id: bot.id)?.name, "Piper Prime")
@@ -69,6 +106,13 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(withMemory.memory.map(\.content), ["Prefers dark mode"])
         let memoryID = try XCTUnwrap(withMemory.memory.first?.id)
+
+        let corrected = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "content": "Prefers light mode",
+        ])
+        XCTAssertEqual(corrected.memory.map(\.content), ["Prefers light mode"])
+        XCTAssertEqual(corrected.memory.first?.id, memoryID)
 
         let withSkill = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
             "skill_id": "weekly-account-health",
@@ -141,5 +185,3956 @@ final class BotSelfConfigTests: XCTestCase {
             store: store
         )
         XCTAssertEqual(try service.snapshot().id, bot.id.value.uuidString.lowercased())
+    }
+
+    func test_setSettingsCatalogOmitsLeftoverPermissionAndDesktop_becauseThoseWritesAreNotLive() {
+        // WHY: Compile tools already omit leftover permission/desktop.
+        // The MCP schema still invited those writes, so first-chat
+        // "set full access" invented live unsupervised power.
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setSettings)
+        XCTAssertTrue(description.contains("name, Role, Instructions, description, Default route, Model, notifications, or avatar"))
+        XCTAssertFalse(description.contains("job, standing instructions"), "leftover job is not advertised")
+        XCTAssertFalse(description.contains("permission"))
+        XCTAssertFalse(description.contains("desktop"))
+        let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)
+        let properties = schema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["provider"])
+        XCTAssertNotNil(properties?["model"])
+        XCTAssertNotNil(properties?["avatar_symbol"])
+        XCTAssertNil(properties?["route"], "route is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["default_route"], "default_route is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["avatar"], "avatar is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["permission_mode"])
+        XCTAssertNil(properties?["desktop_kind"])
+        let provider = properties?["provider"] as? [String: Any]
+        XCTAssertEqual(provider?["description"] as? String, "Default route. Claude, Codex, or Grok. Same field as Studio Default route.")
+        let title = properties?["title"] as? [String: Any]
+        let soul = properties?["soul"] as? [String: Any]
+        let model = properties?["model"] as? [String: Any]
+        let notify = properties?["notifications_enabled"] as? [String: Any]
+        let avatar = properties?["avatar_symbol"] as? [String: Any]
+        XCTAssertEqual(title?["description"] as? String, "Role / job. Same field as Studio Role.")
+        XCTAssertEqual(soul?["description"] as? String, "Instructions. Same field as Studio Instructions.")
+        XCTAssertEqual(model?["description"] as? String, "Model. Same field as Studio Model.")
+        XCTAssertEqual(notify?["description"] as? String, "Notifications On/Off.")
+        XCTAssertEqual(avatar?["description"] as? String, "Avatar. Same field as Studio Avatar.")
+        XCTAssertNil(properties?["notifications"], "notifications is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["instructions"], "instructions is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["standing_instructions"], "standing_instructions is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["fallback"], "fallback is not a schema key")
+        XCTAssertNil(properties?["fallback_order"], "fallback_order is not a schema key")
+        XCTAssertNil(properties?["handle"], "handle is create-only, not a schema key")
+        XCTAssertNil(properties?["id"], "id is leftover snapshot identity, not a schema write key")
+        XCTAssertNil(properties?["identity"], "identity is advertised dest title, not a schema write key")
+        XCTAssertNil(properties?["workspace"], "workspace is host-assigned, not a schema key")
+        XCTAssertNil(properties?["working_space"], "working_space is not a schema key")
+        XCTAssertNil(properties?["cwd"], "cwd is not a schema key")
+        XCTAssertNil(properties?["approval"], "approval is not a schema key")
+        XCTAssertNil(properties?["approval_mode"], "approval_mode is host-assigned, not a schema key")
+        XCTAssertNil(properties?["permission"], "permission is dest title, not a schema key")
+        XCTAssertNil(properties?["supervised"], "supervised is advertised Approval mode value, not a schema key")
+        XCTAssertNil(properties?["ask_before_tool_actions"], "ask_before_tool_actions is advertised honesty, not a schema key")
+        XCTAssertNil(properties?["ask_before"], "ask_before is advertised honesty, not a schema key")
+        XCTAssertNil(properties?["tool_actions"], "tool_actions is advertised honesty, not a schema key")
+        XCTAssertNil(properties?["desktop"], "desktop is host-assigned, not a schema key")
+        XCTAssertNil(properties?["approvals"], "approvals is not a schema key")
+        XCTAssertNil(properties?["allow_once"], "allow_once is not a schema key")
+        XCTAssertNil(properties?["deny"], "deny is not a schema key")
+        XCTAssertNil(properties?["host_brokered_writes"], "host_brokered_writes is not a schema key")
+        XCTAssertNil(properties?["host_brokered"], "host_brokered is not a schema key")
+        XCTAssertNil(properties?["effects"], "effects is not a schema key")
+        XCTAssertNil(properties?["test_run"], "test_run is not a schema key")
+        XCTAssertNil(properties?["test_run_requested"], "test_run_requested is not a schema key")
+        XCTAssertNil(properties?["last_test_run_requested_at"], "last_test_run_requested_at is not a schema key")
+        XCTAssertNil(properties?["memory"], "memory is not a schema key")
+        XCTAssertNil(properties?["fact"], "fact is an advertised put_memory alias, not a set_settings key")
+        XCTAssertNil(properties?["remember"], "remember is not a schema key")
+        XCTAssertNil(properties?["remember_a_fact"], "remember_a_fact is not a schema key")
+        XCTAssertNil(properties?["memory_id"], "memory_id is leftover snapshot identity, not a set_settings key")
+        XCTAssertNil(properties?["content"], "content is leftover snapshot fact, not a set_settings key")
+        XCTAssertNil(properties?["forget"], "forget is an advertised forget_memory alias, not a set_settings key")
+        XCTAssertNil(properties?["forget_memory"], "forget_memory is not a set_settings key")
+        XCTAssertNil(properties?["forgotten"], "forgotten is not a set_settings key")
+        XCTAssertNil(properties?["correct"], "correct is an advertised correct_memory alias, not a set_settings key")
+        XCTAssertNil(properties?["correct_memory"], "correct_memory is not a set_settings key")
+        XCTAssertNil(properties?["correct_fact"], "correct_fact is not a set_settings key")
+        XCTAssertNil(properties?["skills"], "skills is not a schema key")
+        XCTAssertNil(properties?["skill"], "skill is an advertised set_skill alias, not a set_settings key")
+        XCTAssertNil(properties?["skill_id"], "skill_id is a set_skill key, not a set_settings key")
+        XCTAssertNil(properties?["add_skill"], "add_skill is not a schema key")
+        XCTAssertNil(properties?["add"], "add is an advertised set_skill alias, not a set_settings key")
+        XCTAssertNil(properties?["set_skill"], "set_skill is not a set_settings key")
+        XCTAssertNil(properties?["remove"], "remove is an advertised remove_skill alias, not a set_settings key")
+        XCTAssertNil(properties?["remove_skill"], "remove_skill is not a set_settings key")
+        XCTAssertNil(properties?["unbind"], "unbind is not a set_settings key")
+        XCTAssertNil(properties?["routines"], "routines is not a schema key")
+        XCTAssertNil(properties?["routine"], "routine is an advertised save_routine alias, not a set_settings key")
+        XCTAssertNil(properties?["routine_id"], "routine_id is a save_routine key, not a set_settings key")
+        XCTAssertNil(properties?["save_routine"], "save_routine is not a schema key")
+        XCTAssertNil(properties?["instruction"], "instruction is an advertised save_routine alias, not a set_settings key")
+        XCTAssertNil(properties?["prompt"], "prompt is leftover snapshot Instruction, not a set_settings key")
+        XCTAssertNil(properties?["when"], "when is an advertised save_routine alias, not a set_settings key")
+        XCTAssertNil(properties?["active"], "active is an advertised set_routine_enabled alias, not a set_settings key")
+        XCTAssertNil(properties?["enabled"], "enabled is a leftover set_routine_enabled key, not a set_settings key")
+        XCTAssertNil(properties?["on"], "on is a leftover Active alias, not a set_settings key")
+        XCTAssertNil(properties?["off"], "off is a leftover Active alias, not a set_settings key")
+        XCTAssertNil(properties?["website"], "website is an advertised bot_browser_open alias, not a set_settings key")
+        XCTAssertNil(properties?["url"], "url is a leftover bot_browser_open key, not a set_settings key")
+        XCTAssertNil(properties?["last_website"], "last_website is an advertised compile name, not a set_settings key")
+        XCTAssertNil(properties?["browser"], "browser is an advertised compile heading, not a set_settings key")
+        XCTAssertNil(properties?["open"], "open is an advertised bot_browser_open verb, not a set_settings key")
+        XCTAssertNil(properties?["open_website"], "open_website is an advertised bot_browser_open alias, not a set_settings key")
+        XCTAssertNil(properties?["bot_browser_open"], "bot_browser_open is the catalog name, not a set_settings key")
+        XCTAssertNil(properties?["logical_execution_space"], "logical_execution_space is an advertised compile title, not a set_settings key")
+        XCTAssertNil(properties?["logical_space"], "logical_space is an advertised Desktop pill, not a set_settings key")
+        XCTAssertNil(properties?["same_macos_account"], "same_macos_account is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["macos_account"], "macos_account is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["same_account"], "same_account is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["isolated"], "isolated is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["not_isolated"], "not_isolated is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["isolated_desktop"], "isolated_desktop is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["dedicated"], "dedicated is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["not_dedicated"], "not_dedicated is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["dedicated_desktop"], "dedicated_desktop is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["admitted_tools"], "admitted_tools is advertised dest title, not a schema write key")
+        XCTAssertNil(properties?["tools"], "tools is leftover dest layer id, not a schema write key")
+        XCTAssertNil(properties?["admitted"], "admitted is leftover dest title first word, not a schema write key")
+        XCTAssertNil(properties?["user_request"], "user_request is advertised dest title, not a schema write key")
+        XCTAssertNil(properties?["user_text"], "user_text is leftover compose name, not a schema write key")
+        XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.approvalModeHostAssignedHonesty), "catalog names Approval mode host-assigned honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.approvalsHonesty), "catalog names Approvals honesty")
+        XCTAssertTrue(description.contains(BotPermission.honestyLabel), "catalog names Host-brokered writes honesty")
+        XCTAssertTrue(description.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel), "catalog names Desktop isolation honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.testRunHonesty), "catalog names Test run honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.memoryHonesty), "catalog names Memory honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.forgetHonesty), "catalog names Forget honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.correctHonesty), "catalog names Correct honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.skillsHonesty), "catalog names Skills honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.removeHonesty), "catalog names Remove honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.routinesHonesty), "catalog names Routines honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.instructionHonesty), "catalog names Instruction honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.whenHonesty), "catalog names When honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.activeHonesty), "catalog names Active honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.websiteHonesty), "catalog names Website honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.userRequestHonesty), "catalog names User request honesty")
+    }
+
+    func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
+        // WHY: Studio already says Fallback order is not shipped. Compile
+        // already labels that honesty. set_settings still accepted
+        // fallback_order as an empty success, so first-chat "if Claude is
+        // down use Grok" invented a persist. Reject the advertised name.
+        // Default route still persists. Schema does not grow a fallback key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "fallback_order": "Grok, Claude",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotRoute.fallbackOrderHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Fallback order": "Grok then Claude",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotRoute.fallbackOrderHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "provider": "Grok",
+                "fallback": "Claude",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotRoute.fallbackOrderHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.provider, AgentProvider.claude.rawValue, "Fallback reject must not persist a route")
+        XCTAssertEqual(still.model, "opus", "Fallback reject must not persist a model")
+
+        let route = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "default_route": "Grok",
+        ])
+        XCTAssertEqual(route.provider, AgentProvider.grok.rawValue)
+        XCTAssertEqual(route.model, BotRoute.defaultModel(for: .grok))
+    }
+
+    func test_setSettingsRejectsAdvertisedHandle_becauseStudioSaysItIsCreateOnly() throws {
+        // WHY: Studio Handle is create-only after first save. Compile
+        // already labels that honesty. set_settings still accepted
+        // handle as an empty success, so first-chat "change your handle"
+        // invented a persist. Reject the advertised name. Name still
+        // persists. Schema does not grow a handle key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        XCTAssertEqual(try store.get(id: bot.id)?.handle, "piper")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "handle": "night-piper",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.handleCreateOnlyHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Handle": "night-piper",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.handleCreateOnlyHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "@handle": "night-piper",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.handleCreateOnlyHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.handle, "piper", "Handle reject must not persist a handle")
+        XCTAssertEqual(still.name, "Piper", "Handle reject must not persist a name")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.handle, "piper", "Name persist must leave handle")
+        XCTAssertEqual(try store.get(id: bot.id)?.handle, "piper")
+    }
+
+    func test_setSettingsRejectsAdvertisedWorkspace_becauseStudioSaysItIsHostAssigned() throws {
+        // WHY: Studio already shows Workspace. Compile already labels
+        // host-assigned honesty. set_settings still accepted workspace /
+        // cwd as an empty success, so first-chat "use this Workspace"
+        // invented a persist. Reject the advertised name. Name still
+        // persists. Schema does not grow a workspace key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "workspace": "macos-app",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Working space": "/tmp/macos-app",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "cwd": "/tmp/macos-app",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Workspace reject must not persist a name")
+        XCTAssertEqual(still.provider, AgentProvider.claude.rawValue)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+    }
+
+    func test_setSettingsRejectsAdvertisedApprovalMode_becauseStudioSaysItIsHostAssigned() throws {
+        // WHY: Studio already says Approval mode. Compile already labels
+        // host-assigned honesty. set_settings still accepted Approval mode
+        // / approval as an empty success, so first-chat "set Approval mode
+        // to full access" invented a persist. Reject the advertised name.
+        // Name still persists. Leftover permission_mode now rejects.
+        // Schema does not grow an approval_mode key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "approval_mode": "full_access",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Approval mode": "full_access",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "permission": "full_access",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Approval mode reject must not persist a name")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedDesktop_becauseStudioSaysItIsNotASelfConfigWrite() throws {
+        // WHY: Studio already says Desktop. Compile already labels
+        // isolation honesty. set_settings still accepted Desktop /
+        // desktop as an empty success, so first-chat "set Desktop to
+        // Dedicated local VM" invented a persist. Reject the advertised
+        // name. Name still persists. Leftover desktop_kind now rejects.
+        // Schema does not grow a desktop key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop": "Dedicated local VM",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Desktop": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "desktop": "logicalExecutionSpace",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Desktop reject must not persist a name")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop_kind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedApprovals_becauseStudioSaysTheyStayOff() throws {
+        // WHY: Studio Security already says Approvals. Compile already
+        // labels Allow once / Deny stay off. set_settings still accepted
+        // Approvals / allow_once / deny as an empty success, so first-chat
+        // "Allow once" invented a persist. Reject the advertised name.
+        // Name still persists. Leftover permission_mode now rejects.
+        // Schema does not grow an approvals key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "approvals": "allow_once",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Approvals": "deny",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Allow once": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "deny": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalsHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Approvals reject must not persist a name")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedHostBrokeredWrites_becauseStudioSaysTheyStayOff() throws {
+        // WHY: Studio Security already says Host-brokered writes. Compile
+        // already labels they stay off. set_settings still accepted
+        // Host-brokered writes / effects as an empty success, so
+        // first-chat "enable Effects" invented a persist. Reject the
+        // advertised name. Name still persists. Leftover permission_mode
+        // now rejects. Schema does not grow a host_brokered_writes key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "host_brokered_writes": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Host-brokered writes": "on",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Effects": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "host_brokered": "full_access",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Host-brokered writes reject must not persist a name")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedTestRun_becauseStudioSaysDoTheInstructionNow() throws {
+        // WHY: Studio Routines already says Test run. Compile already
+        // labels do the Instruction now. set_settings still accepted
+        // Test run / test_run as an empty success, so first-chat
+        // invented a persist. Reject the advertised name. Name still
+        // persists. Leftover permission_mode now rejects. Schema
+        // does not grow a test_run key. Dest title stays Routine.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "test_run": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.testRunHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Test run": "now",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.testRunHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "test_run_requested": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.testRunHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "last_test_run_requested_at": "now",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.testRunHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Test run reject must not persist a name")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedMemory_becauseStudioSaysRememberAFact() throws {
+        // WHY: Studio already says Memory. Compile already labels Fact.
+        // set_settings still accepted Memory / fact as an empty success,
+        // so first-chat invented a persist. Reject the advertised name.
+        // put_memory still persists Fact. Name still persists. Leftover
+        // permission_mode now rejects. Schema does not grow a memory
+        // key. Dest title stays Memory.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "memory": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "fact": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "remember": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Remember a fact": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Memory reject must not persist a name")
+        XCTAssertEqual(still.memory.count, 0, "Memory reject must not persist a fact")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "fact": "Prefers dark mode",
+        ])
+        XCTAssertEqual(remembered.memory.first?.content, "Prefers dark mode")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.memory.first?.content, "Prefers dark mode")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.memory.first?.content, "Prefers dark mode")
+    }
+
+    func test_setSettingsRejectsAdvertisedForget_becauseStudioSaysForgetMemory() throws {
+        // WHY: Studio already says Forget. Compile already names
+        // bot_forget_memory. leftover Memory / fact / memory_id already
+        // reject. leftover forget still succeeded empty, so first-chat
+        // invented a persist. Reject the advertised name with Forget
+        // honesty, not put_memory honesty. forget_memory still persists
+        // Forget. leftover Memory still rejects. Name still persists.
+        // Schema does not grow a forget write key. Dest title stays
+        // Memory.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "fact": "Prefers dark mode",
+        ])
+        let memoryID = try XCTUnwrap(remembered.memory.first?.id)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["forget"],
+            "schema does not grow a forget write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "forget": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Forget": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "forget_memory": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "forgotten": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "fact": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Forget reject must not persist a name")
+        XCTAssertEqual(still.memory.first?.id, memoryID)
+        XCTAssertEqual(still.memory.first?.content, "Prefers dark mode")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.memory.first?.content, "Prefers dark mode")
+
+        let forgotten = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "memory_id": memoryID,
+        ])
+        XCTAssertEqual(forgotten.memory.count, 0, "forget_memory still owns Forget")
+    }
+
+    func test_setSettingsRejectsAdvertisedCorrect_becauseStudioSaysCorrectMemory() throws {
+        // WHY: Studio already says Correct. Compile already names
+        // bot_correct_memory. leftover Memory / fact / memory_id / forget
+        // already reject. leftover correct still succeeded empty, so
+        // first-chat invented a persist. Reject the advertised name with
+        // Correct honesty, not put_memory or forget_memory honesty.
+        // correct_memory still persists Correct. leftover Memory / Forget
+        // still reject. Name still persists. Schema does not grow a
+        // correct write key. Dest title stays Memory.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "fact": "Prefers dark mode",
+        ])
+        let memoryID = try XCTUnwrap(remembered.memory.first?.id)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["correct"],
+            "schema does not grow a correct write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "correct": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.correctHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Correct": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.correctHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "correct_memory": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.correctHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "correct_fact": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.correctHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "forget": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "fact": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Correct reject must not persist a name")
+        XCTAssertEqual(still.memory.first?.id, memoryID)
+        XCTAssertEqual(still.memory.first?.content, "Prefers dark mode")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.memory.first?.content, "Prefers dark mode")
+
+        let corrected = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "content": "Prefers light mode",
+        ])
+        XCTAssertEqual(corrected.memory.first?.id, memoryID, "correct_memory keeps the same id")
+        XCTAssertEqual(corrected.memory.first?.content, "Prefers light mode", "correct_memory still owns Correct")
+    }
+
+    func test_setSettingsRejectsAdvertisedSkills_becauseStudioSaysAdd() throws {
+        // WHY: Studio already says Skills. Compile already labels Skills.
+        // set_settings still accepted Skills / skill as an empty success,
+        // so first-chat invented a persist. Reject the advertised name.
+        // set_skill still persists Add. Name still persists. Leftover
+        // permission_mode now rejects. Schema does not grow a skills
+        // key. Dest title stays Skills.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "skills": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "skill": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "skill_id": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "add_skill": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Skills reject must not persist a name")
+        XCTAssertEqual(still.skills.count, 0, "Skills reject must not persist a binding")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let added = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+        ])
+        XCTAssertEqual(added.skills.first?.skillID, "weekly-account-health")
+        XCTAssertEqual(added.skills.first?.enabled, true)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.skills.first?.skillID, "weekly-account-health")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.skills.first?.skillID, "weekly-account-health")
+    }
+
+    func test_setSettingsRejectsAdvertisedAdd_becauseStudioSaysAddSkill() throws {
+        // WHY: Studio already says Add. Compile already names set_skill
+        // / Studio Add. leftover Skills / skill / skill_id / add_skill
+        // already reject. leftover add still succeeded empty, so
+        // first-chat invented a persist. Reject the advertised name
+        // with Skills honesty pointing at set_skill. set_skill still
+        // persists Add. leftover Skills / Remove still reject. Name
+        // still persists. Schema does not grow an add write key. Dest
+        // title stays Skills.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["add"],
+            "schema does not grow an add write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "add": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Add": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "set_skill": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "add_skill": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "remove": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.removeHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Add reject must not persist a name")
+        XCTAssertEqual(still.skills.count, 0, "Add reject must not persist a binding")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let added = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+        ])
+        XCTAssertEqual(added.skills.first?.skillID, "weekly-account-health", "set_skill still owns Add")
+        XCTAssertEqual(added.skills.first?.enabled, true)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.skills.first?.skillID, "weekly-account-health")
+    }
+
+    func test_setSettingsRejectsAdvertisedRemove_becauseStudioSaysRemoveSkill() throws {
+        // WHY: Studio already says Remove. Compile already names
+        // bot_remove_skill. leftover Skills / skill / skill_id / add_skill
+        // already reject. leftover remove still succeeded empty, so
+        // first-chat invented a persist. Reject the advertised name with
+        // Remove honesty, not set_skill honesty. remove_skill still
+        // persists Remove. leftover Skills still reject. Name still
+        // persists. Schema does not grow a remove write key. Dest title
+        // stays Skills.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let added = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+        ])
+        XCTAssertEqual(added.skills.first?.skillID, "weekly-account-health")
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["remove"],
+            "schema does not grow a remove write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "remove": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.removeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Remove": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.removeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "remove_skill": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.removeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "unbind": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.removeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "skill_id": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Remove reject must not persist a name")
+        XCTAssertEqual(still.skills.first?.skillID, "weekly-account-health")
+        XCTAssertEqual(still.skills.first?.enabled, true)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.skills.first?.skillID, "weekly-account-health")
+
+        let removed = try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
+            "skill_id": "weekly-account-health",
+        ])
+        XCTAssertEqual(removed.skills.count, 0, "remove_skill still owns Remove")
+    }
+
+    func test_setSettingsRejectsAdvertisedRoutines_becauseStudioSaysSaveRoutine() throws {
+        // WHY: Studio already says Routines. Compile already labels
+        // Routines. set_settings still accepted Routines / routine as an
+        // empty success, so first-chat invented a persist. Reject the
+        // advertised name. save_routine still persists Instruction /
+        // When. set_routine_enabled still persists Active. Name still
+        // persists. Leftover permission_mode now rejects. Schema does
+        // not grow a routines key. Dest title stays Routines.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "routines": "Morning",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.routinesHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "routine": "Morning",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.routinesHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "routine_id": "00000000-0000-0000-0000-000000000001",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.routinesHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "save_routine": "Morning",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.routinesHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Routines reject must not persist a name")
+        XCTAssertEqual(still.routines.count, 0, "Routines reject must not persist a schedule")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.name, "Morning")
+        XCTAssertEqual(saved.routines.first?.prompt, "Summarize overnight")
+        XCTAssertEqual(saved.routines.first?.scheduleNote, "Weekdays 9:00")
+        let routineID = try XCTUnwrap(saved.routines.first?.id)
+
+        let activated = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": true,
+        ])
+        XCTAssertEqual(activated.routines.first?.enabled, true)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.routines.first?.name, "Morning")
+        XCTAssertEqual(leftover.routines.first?.enabled, true)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.routines.first?.name, "Morning")
+        XCTAssertEqual(renamed.routines.first?.enabled, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedInstruction_becauseStudioSaysSaveRoutine() throws {
+        // WHY: Studio already says Instruction. Compile already labels
+        // Instruction. set_settings still accepted instruction as an
+        // empty success, so first-chat invented a persist. Reject the
+        // advertised name. Plural Instructions still persist soul.
+        // save_routine still persists Instruction / When.
+        // set_routine_enabled still persists Active. Name still
+        // persists. Leftover permission_mode now rejects. Schema does
+        // not grow an instruction key. Dest title stays Routine.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "instruction": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "instruction": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Instruction reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Instruction reject must not persist soul")
+        XCTAssertEqual(still.routines.count, 0, "Instruction reject must not persist a schedule")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.name, "Morning")
+        XCTAssertEqual(saved.routines.first?.prompt, "Summarize overnight")
+        XCTAssertEqual(saved.routines.first?.scheduleNote, "Weekdays 9:00")
+        let routineID = try XCTUnwrap(saved.routines.first?.id)
+
+        let activated = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": true,
+        ])
+        XCTAssertEqual(activated.routines.first?.enabled, true)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.soul, "Own the inbox.")
+        XCTAssertEqual(leftover.routines.first?.name, "Morning")
+        XCTAssertEqual(leftover.routines.first?.enabled, true)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
+        XCTAssertEqual(renamed.routines.first?.name, "Morning")
+        XCTAssertEqual(renamed.routines.first?.enabled, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedWhen_becauseStudioSaysSaveRoutine() throws {
+        // WHY: Studio already says When. Compile already labels When.
+        // set_settings still accepted when as an empty success, so
+        // first-chat invented a persist. Reject the advertised name.
+        // save_routine still persists Instruction / When.
+        // set_routine_enabled still persists Active. Name still
+        // persists. Leftover permission_mode now rejects. Schema does
+        // not grow a when key. Dest title stays Routine.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "when": "Weekdays 9:00",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.whenHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "when": "Weekdays 9:00",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.whenHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "When reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "When reject must not persist soul")
+        XCTAssertEqual(still.routines.count, 0, "When reject must not persist a schedule")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.name, "Morning")
+        XCTAssertEqual(saved.routines.first?.prompt, "Summarize overnight")
+        XCTAssertEqual(saved.routines.first?.scheduleNote, "Weekdays 9:00")
+        let routineID = try XCTUnwrap(saved.routines.first?.id)
+
+        let activated = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": true,
+        ])
+        XCTAssertEqual(activated.routines.first?.enabled, true)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.soul, "Own the inbox.")
+        XCTAssertEqual(leftover.routines.first?.name, "Morning")
+        XCTAssertEqual(leftover.routines.first?.scheduleNote, "Weekdays 9:00")
+        XCTAssertEqual(leftover.routines.first?.enabled, true)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
+        XCTAssertEqual(renamed.routines.first?.name, "Morning")
+        XCTAssertEqual(renamed.routines.first?.scheduleNote, "Weekdays 9:00")
+        XCTAssertEqual(renamed.routines.first?.enabled, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedActive_becauseStudioSaysSetRoutineEnabled() throws {
+        // WHY: Studio already says Active. Compile already labels Active.
+        // set_settings still accepted active / enabled / on / off as an
+        // empty success, so first-chat invented a persist. Reject the
+        // advertised name and leftover aliases. save_routine still
+        // persists Instruction / When. set_routine_enabled still
+        // persists Active. Name still persists. Leftover
+        // permission_mode now rejects. Schema does not grow an
+        // active key. Dest title stays Routine.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "active": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.activeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "enabled": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.activeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "on": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.activeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "off": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.activeHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Active reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Active reject must not persist soul")
+        XCTAssertEqual(still.routines.count, 0, "Active reject must not persist a schedule")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.name, "Morning")
+        XCTAssertEqual(saved.routines.first?.prompt, "Summarize overnight")
+        XCTAssertEqual(saved.routines.first?.scheduleNote, "Weekdays 9:00")
+        let routineID = try XCTUnwrap(saved.routines.first?.id)
+
+        let activated = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": true,
+        ])
+        XCTAssertEqual(activated.routines.first?.enabled, true)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.soul, "Own the inbox.")
+        XCTAssertEqual(leftover.routines.first?.name, "Morning")
+        XCTAssertEqual(leftover.routines.first?.scheduleNote, "Weekdays 9:00")
+        XCTAssertEqual(leftover.routines.first?.enabled, true)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
+        XCTAssertEqual(renamed.routines.first?.name, "Morning")
+        XCTAssertEqual(renamed.routines.first?.scheduleNote, "Weekdays 9:00")
+        XCTAssertEqual(renamed.routines.first?.enabled, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedWebsite_becauseStudioSaysBotBrowserOpen() throws {
+        // WHY: Studio already says last website. Compile already labels
+        // Browser. set_settings still accepted website / url /
+        // last_website as an empty success, so first-chat invented a
+        // persist. Reject the advertised name and leftover aliases.
+        // bot_browser_open still persists Website. Name still persists.
+        // Leftover permission_mode now rejects. Schema does not grow
+        // a website key. Dest title stays Browser.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "website": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "url": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "last_website": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "website": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Website reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Website reject must not persist soul")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.soul, "Own the inbox.")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
+    }
+
+    func test_setSettingsRejectsAdvertisedBrowser_becauseStudioSaysBotBrowserOpen() throws {
+        // WHY: Studio dest title already says Browser. Compile already
+        // labels Browser. leftover website / url / last_website already
+        // reject. leftover browser still succeeded empty, so first-chat
+        // invented a persist from the compile heading. Reject the
+        // advertised name with website honesty pointing at
+        // bot_browser_open. bot_browser_open still persists Website.
+        // leftover website still rejects. Name still persists. Schema
+        // does not grow a browser write key. Dest title stays Browser.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["browser"],
+            "schema does not grow a browser write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "browser": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Browser": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "website": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Browser reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Browser reject must not persist soul")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedOpen_becauseStudioSaysBotBrowserOpen() throws {
+        // WHY: Admitted tools already say open a website via
+        // bot_browser_open. leftover website / last_website / browser
+        // already reject. leftover open still succeeded empty, so
+        // first-chat invented a persist from the advertised open verb.
+        // Reject the advertised name with website honesty pointing at
+        // bot_browser_open. leftover website still rejects. leftover
+        // browser still rejects. bot_browser_open still persists
+        // Website. Name still persists. Schema does not grow an open
+        // write key. Dest title stays Browser.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["open"],
+            "schema does not grow an open write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "open": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "open website": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "bot_browser_open": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "website": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "browser": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "open reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "open reject must not persist soul")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsLeftoverPermissionMode_becauseStudioSaysItIsHostAssigned() throws {
+        // WHY: Studio already says Approval mode. Compile already labels
+        // host-assigned honesty. set_settings still coerced leftover
+        // permission_mode to supervised and returned success, so
+        // first-chat invented a persist. Reject the leftover key.
+        // Name still persists. Leftover desktop_kind now rejects.
+        // Snapshot camelCase permissionMode now rejects. Schema does
+        // not grow a permission_mode key. Dest title stays Permission.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Permission mode": AgentPermissionMode.autoAcceptEdits.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "permission_mode reject must not persist a name")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop_kind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+    }
+
+    func test_setSettingsRejectsSnapshotPermissionMode_becauseStudioSaysItIsHostAssigned() throws {
+        // WHY: Studio already says Approval mode. Compile already labels
+        // host-assigned honesty. Leftover permission_mode already
+        // rejects. Snapshot still encodes camelCase permissionMode, so
+        // first-chat that reused the last get_settings key invented a
+        // persist. Reject the snapshot key. Name still persists. Schema
+        // does not grow a permissionMode key. Dest title stays
+        // Permission.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertNotNil(object["permissionMode"], "snapshot still encodes leftover camelCase")
+        XCTAssertNil(object["permission_mode"], "schema does not grow a permission_mode key")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permissionMode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "permissionMode": AgentPermissionMode.autoAcceptEdits.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "permissionMode reject must not persist a name")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+    }
+
+    func test_setSettingsRejectsLeftoverDesktopKind_becauseStudioSaysItIsNotASelfConfigWrite() throws {
+        // WHY: Studio already says Desktop. Compile already labels
+        // isolation honesty. set_settings still coerced leftover
+        // desktop_kind to logical and returned success, so first-chat
+        // invented a persist. Reject the leftover key. Name still
+        // persists. Snapshot camelCase desktopKind now rejects. Schema
+        // does not grow a desktop_kind key. Dest title stays Desktop.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop_kind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Desktop kind": BotDesktopKind.managedRemoteMac.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "desktop_kind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "desktop_kind reject must not persist a name")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktopKind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(leftover.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+    }
+
+    func test_setSettingsRejectsSnapshotDesktopKind_becauseStudioSaysItIsNotASelfConfigWrite() throws {
+        // WHY: Studio already says Desktop. Compile already labels
+        // isolation honesty. Leftover desktop_kind already rejects.
+        // Snapshot still encodes camelCase desktopKind, so first-chat
+        // that reused the last get_settings key invented a persist.
+        // Reject the snapshot key. Name still persists. Schema does
+        // not grow a desktopKind key. Dest title stays Desktop.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertNotNil(object["desktopKind"], "snapshot still encodes leftover camelCase")
+        XCTAssertNil(object["desktop_kind"], "schema does not grow a desktop_kind key")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktopKind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "desktopKind": BotDesktopKind.managedRemoteMac.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "desktopKind reject must not persist a name")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop_kind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedLogicalExecutionSpace_becauseStudioSaysItIsNotASelfConfigWrite() throws {
+        // WHY: Studio already says Logical execution space. Compile
+        // already labels Desktop with that title. leftover desktop /
+        // desktop_kind / desktopKind already reject. leftover
+        // logical_execution_space still succeeded empty, so first-chat
+        // invented a persist from the compile title. Reject the
+        // advertised name with desktop honesty. leftover desktop still
+        // rejects. Name still persists. Schema does not grow a
+        // logical_execution_space write key. Dest title stays Desktop.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["logical_execution_space"],
+            "schema does not grow a logical_execution_space write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "logical_execution_space": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Logical execution space": BotDesktopKind.logicalExecutionSpace.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "logical_space": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop": BotDesktopKind.logicalExecutionSpace.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Logical execution space reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Logical execution space reject must not persist soul")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
+        XCTAssertEqual(renamed.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsSnapshotId_becauseStudioSaysIdentityIsHostAssigned() throws {
+        // WHY: Studio Identity is host-assigned. Compile already labels
+        // handle create-only. Snapshot still encodes leftover id, so
+        // first-chat that reused the last get_settings key invented a
+        // persist. Reject the snapshot key. bot_id still owns the
+        // caller check. Name still persists. leftover permissionMode
+        // and desktopKind still reject. Schema does not grow an id
+        // write key. Dest title stays Identity.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["id"] as? String, bot.id.value.uuidString.lowercased())
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["id"],
+            "schema does not grow an id write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "id": bot.id.value.uuidString.lowercased(),
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "id": UUID().uuidString.lowercased(),
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "id reject must not persist a name")
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permissionMode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktopKind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+    }
+
+    func test_setSettingsRejectsAdvertisedIdentity_becauseStudioSaysItIsHostAssigned() throws {
+        // WHY: Studio already dests Identity. Compile dest title is
+        // Identity. get_settings already says live identity. leftover
+        // snapshot id already rejects. leftover identity still succeeded
+        // empty, so first-chat invented a persist from the dest title.
+        // Reject the advertised name with host-assigned honesty. leftover
+        // id still rejects. bot_id still owns the caller check. Name
+        // still persists. Schema does not grow an identity write key.
+        // Dest title stays Identity.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["identity"],
+            "schema does not grow an identity write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "identity": "Piper Prime",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Identity": "Piper Prime",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "id": bot.id.value.uuidString.lowercased(),
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Identity reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Identity reject must not persist soul")
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedAdmittedTools_becauseStudioSaysTheyAreHostAssigned() throws {
+        // WHY: Studio dest title already says Admitted tools. Compile
+        // already labels Admitted tools. leftover identity already
+        // rejects. leftover admitted_tools still succeeded empty, so
+        // first-chat invented a persist from the dest title. Reject
+        // the advertised name with host-assigned honesty. leftover
+        // identity still rejects. bot_id still owns the caller check.
+        // Name still persists. Schema does not grow an admitted_tools
+        // write key. Dest title stays Admitted tools.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["admitted_tools"],
+            "schema does not grow an admitted_tools write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "admitted_tools": "Invent a new tool.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Admitted tools": "Invent a new tool.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "tools": "Invent a new tool.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "identity": "Piper Prime",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Admitted tools reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Admitted tools reject must not persist soul")
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedUserRequest_becauseStudioSaysItIsThisTurn() throws {
+        // WHY: Studio dest title already says User request. Compile
+        // already labels User request. leftover admitted_tools already
+        // rejects. leftover user_request still succeeded empty, so
+        // first-chat invented a persist from the dest title. Reject
+        // the advertised name with this-turn honesty. leftover
+        // admitted_tools still rejects. bot_id still owns the caller
+        // check. Name still persists. Schema does not grow a
+        // user_request write key. Dest title stays User request.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["user_request"],
+            "schema does not grow a user_request write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "user_request": "Remember this turn as a setting.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.userRequestHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "User request": "Remember this turn as a setting.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.userRequestHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "user_text": "Remember this turn as a setting.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.userRequestHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "admitted_tools": "Invent a new tool.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "User request reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "User request reject must not persist soul")
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedSupervised_becauseStudioSaysItIsHostAssigned() throws {
+        // WHY: Studio Desk pill and summary already say Supervised.
+        // Compile already labels Approval mode: Supervised. leftover
+        // approval_mode / permission_mode already reject. leftover
+        // supervised still succeeded empty, so first-chat invented a
+        // persist from the advertised pill. Reject the advertised name
+        // with host-assigned honesty. leftover permission_mode still
+        // rejects. leftover user_request still rejects. bot_id still
+        // owns the caller check. Name still persists. Schema does not
+        // grow a supervised write key. Dest title stays Permission.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["supervised"],
+            "schema does not grow a supervised write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "supervised": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Supervised": AgentPermissionMode.supervised.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "user_request": "Remember this turn as a setting.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.userRequestHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Supervised reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Supervised reject must not persist soul")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedAskBeforeToolActions_becauseStudioSaysAskBefore() throws {
+        // WHY: Studio Desk and compile already say Ask before tool
+        // actions. leftover supervised / host_brokered_writes already
+        // reject. leftover ask_before_tool_actions still succeeded
+        // empty, so first-chat invented a persist from the advertised
+        // honesty phrase. Reject the advertised name with Permission
+        // honesty. leftover supervised still rejects. leftover
+        // host_brokered_writes still rejects. bot_id still owns the
+        // caller check. Name still persists. Schema does not grow an
+        // ask_before_tool_actions write key. Dest title stays Permission.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["ask_before_tool_actions"],
+            "schema does not grow an ask_before_tool_actions write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "ask_before_tool_actions": false,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Ask before tool actions": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "ask_before": false,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "tool_actions": "unsupervised",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "supervised": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "host_brokered_writes": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Ask before reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Ask before reject must not persist soul")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedSameMacOSAccount_becauseStudioSaysSameAccount() throws {
+        // WHY: Studio Desk and compile already say Same macOS account.
+        // leftover desktop / logical_execution_space already reject.
+        // leftover same_macos_account still succeeded empty, so
+        // first-chat invented a persist from the advertised honesty
+        // phrase. Reject the advertised name with Desktop isolation
+        // honesty. leftover desktop still rejects. leftover
+        // logical_execution_space still rejects. bot_id still owns the
+        // caller check. Name still persists. Schema does not grow a
+        // same_macos_account write key. Dest title stays Desktop.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["same_macos_account"],
+            "schema does not grow a same_macos_account write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "same_macos_account": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Same macOS account": false,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "macos_account": "isolated",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "same_account": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop": "logical",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "logical_execution_space": "isolated",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Same macOS account reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Same macOS account reject must not persist soul")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedIsolated_becauseStudioSaysNotIsolated() throws {
+        // WHY: Studio Desk and compile already say not isolated.
+        // leftover desktop / same_macos_account already reject.
+        // leftover isolated still succeeded empty, so first-chat
+        // invented a persist from the advertised honesty phrase.
+        // Reject the advertised name with Desktop isolation honesty.
+        // leftover desktop still rejects. leftover same_macos_account
+        // still rejects. bot_id still owns the caller check. Name
+        // still persists. Schema does not grow an isolated write key.
+        // Dest title stays Desktop.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["isolated"],
+            "schema does not grow an isolated write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "isolated": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "not isolated": false,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "isolated_desktop": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop": "logical",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "same_macos_account": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "isolated reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "isolated reject must not persist soul")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedDedicated_becauseStudioSaysNotDedicated() throws {
+        // WHY: Studio Desk and compile already say Not a dedicated Desktop.
+        // leftover desktop / isolated already reject.
+        // leftover dedicated still succeeded empty, so first-chat
+        // invented a persist from the advertised honesty phrase.
+        // Reject the advertised name with Desktop isolation honesty.
+        // leftover desktop still rejects. leftover isolated still
+        // rejects. bot_id still owns the caller check. Name still
+        // persists. Schema does not grow a dedicated write key.
+        // Dest title stays Desktop.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["dedicated"],
+            "schema does not grow a dedicated write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "dedicated": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "not dedicated": false,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "dedicated_desktop": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop": "logical",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "isolated": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "dedicated reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "dedicated reject must not persist soul")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsSnapshotMemoryId_becauseStudioSaysRememberAFact() throws {
+        // WHY: Studio already says Memory. Compile already labels Fact.
+        // Snapshot still encodes leftover memory_id, so first-chat that
+        // reused the last get_settings key invented a persist. Reject
+        // the snapshot key. forget/correct still own memory_id.
+        // put_memory still persists Fact. leftover Memory / fact still
+        // reject. leftover snapshot id still rejects. Name still
+        // persists. Schema does not grow a memory_id write key. Dest
+        // title stays Memory.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "fact": "Prefers dark mode",
+        ])
+        let memoryID = try XCTUnwrap(remembered.memory.first?.id)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        let memory = try XCTUnwrap(object["memory"] as? [[String: Any]])
+        XCTAssertEqual(memory.first?["memory_id"] as? String, memoryID)
+        XCTAssertNil(memory.first?["id"], "nested id omitted")
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["memory_id"],
+            "schema does not grow a memory_id write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "memory_id": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "memory_id": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "fact": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "id": bot.id.value.uuidString.lowercased(),
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "memory_id reject must not persist a name")
+        XCTAssertEqual(still.memory.first?.id, memoryID)
+        XCTAssertEqual(still.memory.first?.content, "Prefers dark mode")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.memory.first?.content, "Prefers dark mode")
+
+        let corrected = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "fact": "Prefers light mode",
+        ])
+        XCTAssertEqual(corrected.memory.first?.content, "Prefers light mode", "correct still owns memory_id")
+
+        let forgotten = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "memory_id": memoryID,
+        ])
+        XCTAssertEqual(forgotten.memory.count, 0, "forget still owns memory_id")
+    }
+
+    func test_setSettingsRejectsSnapshotContent_becauseStudioSaysRememberAFact() throws {
+        // WHY: Studio already says Memory. Compile already labels Fact.
+        // Snapshot still encodes leftover content, so first-chat that
+        // reused the last get_settings key invented a persist. Reject
+        // the snapshot key. put_memory still persists Fact.
+        // leftover Memory / fact / memory_id still reject. leftover
+        // snapshot id still rejects. Name still persists. Schema does
+        // not grow a content write key. Dest title stays Memory.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "fact": "Prefers dark mode",
+        ])
+        let memoryID = try XCTUnwrap(remembered.memory.first?.id)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        let memory = try XCTUnwrap(object["memory"] as? [[String: Any]])
+        XCTAssertEqual(memory.first?["content"] as? String, "Prefers dark mode")
+        XCTAssertEqual(memory.first?["memory_id"] as? String, memoryID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["content"],
+            "schema does not grow a content write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "content": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "content": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "fact": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "memory_id": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "id": bot.id.value.uuidString.lowercased(),
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "content reject must not persist a name")
+        XCTAssertEqual(still.memory.first?.id, memoryID)
+        XCTAssertEqual(still.memory.first?.content, "Prefers dark mode")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.memory.first?.content, "Prefers dark mode")
+
+        let viaContent = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers light mode",
+        ])
+        XCTAssertEqual(viaContent.memory.last?.content, "Prefers light mode", "put_memory still owns content")
+    }
+
+    func test_setSettingsRejectsSnapshotPrompt_becauseStudioSaysSaveRoutine() throws {
+        // WHY: Studio already says Instruction. Compile already labels
+        // Instruction. leftover instruction already rejects. Snapshot
+        // still encodes leftover prompt, so first-chat that reused the
+        // last get_settings key invented a persist. Reject the snapshot
+        // key. save_routine still persists Instruction. leftover
+        // instruction still rejects. leftover Memory / content still
+        // reject. Name still persists. Schema does not grow a prompt
+        // write key. Dest title stays Routine.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.prompt, "Summarize overnight")
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        let routines = try XCTUnwrap(object["routines"] as? [[String: Any]])
+        XCTAssertEqual(routines.first?["prompt"] as? String, "Summarize overnight")
+        XCTAssertEqual(routines.first?["schedule_note"] as? String, "Weekdays 9:00")
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["prompt"],
+            "schema does not grow a prompt write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "prompt": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "prompt": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "instruction": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "content": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "prompt reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "prompt reject must not persist soul")
+        XCTAssertEqual(still.routines.first?.prompt, "Summarize overnight")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.routines.first?.prompt, "Summarize overnight")
+
+        let viaPrompt = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "routine_id": try XCTUnwrap(saved.routines.first?.id),
+            "name": "Morning",
+            "prompt": "Triage the inbox",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(viaPrompt.routines.first?.prompt, "Triage the inbox", "save_routine still owns prompt")
+    }
+
+    func test_setSettingsRejectsSnapshotScheduleNote_becauseStudioSaysSaveRoutine() throws {
+        // WHY: Studio already says When. Compile already labels When.
+        // leftover when already rejects. Snapshot still encodes leftover
+        // schedule_note, so first-chat that reused the last get_settings
+        // key invented a persist. Reject the snapshot key. save_routine
+        // still persists When. leftover when still rejects. leftover
+        // Instruction / prompt still reject. Name still persists.
+        // Schema does not grow a schedule_note write key. Dest title
+        // stays Routine.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.scheduleNote, "Weekdays 9:00")
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        let routines = try XCTUnwrap(object["routines"] as? [[String: Any]])
+        XCTAssertEqual(routines.first?["prompt"] as? String, "Summarize overnight")
+        XCTAssertEqual(routines.first?["schedule_note"] as? String, "Weekdays 9:00")
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["schedule_note"],
+            "schema does not grow a schedule_note write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "schedule_note": "Weekdays 9:00",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.whenHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "schedule_note": "Weekdays 9:00",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.whenHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "when": "Weekdays 9:00",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.whenHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "prompt": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "schedule_note reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "schedule_note reject must not persist soul")
+        XCTAssertEqual(still.routines.first?.scheduleNote, "Weekdays 9:00")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.routines.first?.scheduleNote, "Weekdays 9:00")
+
+        let viaNote = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "routine_id": try XCTUnwrap(saved.routines.first?.id),
+            "name": "Morning",
+            "prompt": "Summarize overnight",
+            "schedule_note": "Daily 8:00",
+        ])
+        XCTAssertEqual(viaNote.routines.first?.scheduleNote, "Daily 8:00", "save_routine still owns schedule_note")
+    }
+
+    func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
+        // WHY: Studio already picks Avatar and publish already writes
+        // avatar_symbol. Tools never named that path, so first-chat
+        // "change my avatar" invented a hop. Canonical avatar_symbol
+        // still wins. Schema does not grow an avatar key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude
+        )
+        XCTAssertEqual(bot.avatarSymbol, "person.crop.circle")
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromName = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "avatar": "Star",
+        ])
+        XCTAssertEqual(fromName.avatarSymbol, "star.fill", "Star persists")
+        XCTAssertEqual(try store.get(id: bot.id)?.avatarSymbol, "star.fill")
+
+        let fromSymbol = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "avatar": "leaf.fill",
+        ])
+        XCTAssertEqual(fromSymbol.avatarSymbol, "leaf.fill")
+
+        let symbolWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "avatar_symbol": "hammer.fill",
+            "avatar": "Star",
+        ])
+        XCTAssertEqual(symbolWins.avatarSymbol, "hammer.fill", "avatar_symbol wins")
+        XCTAssertEqual(try store.get(id: bot.id)?.avatarSymbol, "hammer.fill")
+
+        let json = try service.encodeSnapshot(symbolWins)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["avatar_symbol"] as? String, "hammer.fill", "avatar_symbol persists")
+        XCTAssertNil(object["avatar"], "avatar is an advertised alias, not a second schema key")
+        XCTAssertNil(object["avatarSymbol"], "Swift avatarSymbol omitted")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "avatar": "Robot",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid("Unknown avatar: Robot"))
+        }
+        XCTAssertEqual(try store.get(id: bot.id)?.avatarSymbol, "hammer.fill")
+    }
+
+    func test_setSettingsAdvertisedNamesPersist_becauseToolsSayJobNotTitle() throws {
+        // WHY: Tools invite Role / Instructions / notifications.
+        // Parse only read title / soul / notifications_enabled, so first-chat
+        // "change your job" invented a hop or left Role untouched.
+        // Studio Role is the same field. Canonical keys still win.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromJob = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "job": "Night scout",
+        ])
+        XCTAssertEqual(fromJob.title, "Night scout", "job maps to title")
+        XCTAssertEqual(try store.get(id: bot.id)?.title, "Night scout")
+
+        let fromRole = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "role": "Reviewer",
+        ])
+        XCTAssertEqual(fromRole.title, "Reviewer")
+
+        let titleWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "title": "Lead",
+            "job": "Ignored job",
+            "role": "Ignored role",
+        ])
+        XCTAssertEqual(titleWins.title, "Lead", "title wins")
+
+        let fromStanding = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "standing_instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromStanding.soul, "Own the inbox.")
+
+        let soulWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "soul": "Speak plainly.",
+            "standing_instructions": "Ignored soul",
+        ])
+        XCTAssertEqual(soulWins.soul, "Speak plainly.", "soul wins")
+
+        let fromNotify = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications": false,
+        ])
+        XCTAssertFalse(fromNotify.notificationsEnabled)
+
+        let notifyWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications_enabled": true,
+            "notifications": false,
+        ])
+        XCTAssertTrue(notifyWins.notificationsEnabled, "notifications_enabled wins")
+        XCTAssertEqual(try store.get(id: bot.id)?.title, "Lead")
+    }
+
+    func test_setSettingsAdvertisedInstructionsPersist_becauseStudioSaysInstructionsNotSoul() throws {
+        // WHY: Studio already says Instructions. Parse only read soul /
+        // standing_instructions, so first-chat "change your instructions"
+        // invented a hop or left the leftover soul. Canonical soul still
+        // wins. Schema does not grow an instructions key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "Instructions persist")
+        XCTAssertEqual(try store.getRevision(id: try XCTUnwrap(store.get(id: bot.id)?.currentRevisionID))?.soul, "Own the inbox.")
+
+        let standingWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "standing_instructions": "Ask when blocked.",
+            "instructions": "Ignored instructions",
+        ])
+        XCTAssertEqual(standingWins.soul, "Ask when blocked.", "standing_instructions wins")
+
+        let soulWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "soul": "Speak plainly.",
+            "standing_instructions": "Ignored standing",
+            "instructions": "Ignored instructions",
+        ])
+        XCTAssertEqual(soulWins.soul, "Speak plainly.", "soul wins")
+    }
+
+    func test_setSettingsAdvertisedOnOffPersist_becauseStudioSaysOnNotTrue() throws {
+        // WHY: Studio summary and the schema already say On/Off.
+        // ParseBool only read true/1/yes, so first-chat "turn notifications
+        // Off" invented a hop or left the leftover switch. Canonical bool
+        // still wins. Schema does not grow a notifications key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromOff = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications": "Off",
+        ])
+        XCTAssertFalse(fromOff.notificationsEnabled, "Off persists")
+        XCTAssertEqual(try store.get(id: bot.id)?.notificationsEnabled, false)
+
+        let fromOn = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications": "On",
+        ])
+        XCTAssertTrue(fromOn.notificationsEnabled, "On persists")
+        XCTAssertEqual(try store.get(id: bot.id)?.notificationsEnabled, true)
+
+        let boolWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications_enabled": false,
+            "notifications": "On",
+        ])
+        XCTAssertFalse(boolWins.notificationsEnabled, "notifications_enabled wins")
+    }
+
+    func test_setSettingsProviderWithoutModelBindsAdvertisedRoute_becauseLeftoverModelIsNotLive() throws {
+        // WHY: Desk-admitted bot_set_settings already publishes route.
+        // A provider-only write kept opus on Grok and the leftover
+        // Claude account id, so first-chat "switch to Grok" invented a hop
+        // or ran the old route. Studio picker already binds the default.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", soul: "Be brief.", provider: .claude, model: "opus")
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let after = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "provider": AgentProvider.grok.rawValue,
+        ])
+        XCTAssertEqual(after.provider, AgentProvider.grok.rawValue)
+        XCTAssertEqual(after.model, BotRoute.defaultModel(for: .grok))
+        XCTAssertEqual(after.providerInstanceID, AgentProvider.grok.rawValue)
+        XCTAssertNotEqual(after.model, "opus")
+        XCTAssertNotEqual(after.providerInstanceID, AgentProvider.claude.rawValue)
+        let explicit = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "provider": AgentProvider.claude.rawValue,
+            "model": "sonnet",
+            "provider_instance_id": "claude-work",
+        ])
+        XCTAssertEqual(explicit.provider, AgentProvider.claude.rawValue)
+        XCTAssertEqual(explicit.model, "sonnet")
+        XCTAssertEqual(explicit.providerInstanceID, "claude-work")
+        let modelOnly = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "model": "opus",
+        ])
+        XCTAssertEqual(modelOnly.provider, AgentProvider.claude.rawValue)
+        XCTAssertEqual(modelOnly.model, "opus")
+        XCTAssertEqual(modelOnly.providerInstanceID, "claude-work")
+    }
+
+    func test_setSettingsAdvertisedRouteNamesPersist_becauseToolsSayGrokNotRawId() throws {
+        // WHY: Studio already says Default route. Tools named route, so
+        // first-chat "change your Default route" invented a hop or left
+        // opus. Canonical provider still wins. Explicit model still wins.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromTitle = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "provider": "Grok",
+        ])
+        XCTAssertEqual(fromTitle.provider, AgentProvider.grok.rawValue)
+        XCTAssertEqual(fromTitle.model, BotRoute.defaultModel(for: .grok))
+
+        let fromRoute = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "route": "Claude",
+        ])
+        XCTAssertEqual(fromRoute.provider, AgentProvider.claude.rawValue)
+        XCTAssertEqual(fromRoute.model, BotRoute.defaultModel(for: .claude))
+
+        let fromDefaultRoute = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "default_route": "Grok",
+        ])
+        XCTAssertEqual(fromDefaultRoute.provider, AgentProvider.grok.rawValue)
+        XCTAssertEqual(fromDefaultRoute.model, BotRoute.defaultModel(for: .grok))
+
+        let providerWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "provider": "codex",
+            "route": "Grok",
+        ])
+        XCTAssertEqual(providerWins.provider, AgentProvider.codex.rawValue, "provider wins")
+        XCTAssertEqual(providerWins.model, BotRoute.defaultModel(for: .codex))
+
+        let fromCompiled = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "route": "Grok · grok-4.6",
+        ])
+        XCTAssertEqual(fromCompiled.provider, AgentProvider.grok.rawValue)
+        XCTAssertEqual(fromCompiled.model, "grok-4.6")
+
+        let modelWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "provider": "Claude",
+            "model": "sonnet",
+        ])
+        XCTAssertEqual(modelWins.provider, AgentProvider.claude.rawValue)
+        XCTAssertEqual(modelWins.model, "sonnet")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "route": "ChatGPT",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid("Unknown provider: ChatGPT"))
+        }
+    }
+
+    func test_saveRoutineAdvertisedNamesPersist_becauseStudioSaysInstructionAndWhen() throws {
+        // WHY: Tools and Studio say Instruction / When. Parse only read
+        // prompt / schedule_note, so first-chat "change the instruction"
+        // invented a hop or left the leftover prompt. Canonical keys
+        // still win. Schema does not grow a second pair of keys.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromAdvertised = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(fromAdvertised.routines.count, 1)
+        XCTAssertEqual(fromAdvertised.routines[0].prompt, "Summarize overnight")
+        XCTAssertEqual(fromAdvertised.routines[0].scheduleNote, "Weekdays 9:00")
+        let stored = try store.listRoutines(botID: bot.id)
+        XCTAssertEqual(stored.first?.definition.prompt, "Summarize overnight")
+        XCTAssertEqual(stored.first?.definition.scheduleNote, "Weekdays 9:00")
+
+        let promptWins = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "routine_id": fromAdvertised.routines[0].id,
+            "name": "Morning",
+            "prompt": "Scan PRs",
+            "instruction": "Ignored instruction",
+            "schedule_note": "Daily",
+            "when": "Ignored when",
+        ])
+        XCTAssertEqual(promptWins.routines[0].prompt, "Scan PRs", "prompt wins")
+        XCTAssertEqual(promptWins.routines[0].scheduleNote, "Daily", "schedule_note wins")
+    }
+
+    func test_saveRoutineCatalogDescribesInstructionAndWhen_becauseThoseAreTheStudioFields() {
+        // WHY: Schema key stays prompt / schedule_note. Description must
+        // name Instruction / When so first-chat does not invent a hop.
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.saveRoutine)
+        XCTAssertTrue(description.contains("instruction"))
+        XCTAssertTrue(description.contains("when"))
+        XCTAssertTrue(description.contains("Studio Save routine"))
+        let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.saveRoutine)
+        let properties = schema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["prompt"])
+        XCTAssertNotNil(properties?["schedule_note"])
+        XCTAssertNil(properties?["instruction"], "instruction is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["when"], "when is an advertised alias, not a second schema key")
+        let prompt = properties?["prompt"] as? [String: Any]
+        let when = properties?["schedule_note"] as? [String: Any]
+        XCTAssertEqual(prompt?["description"] as? String, "Instruction. Same field as Studio Instruction.")
+        XCTAssertEqual(when?["description"] as? String, "When. Same field as Studio When.")
+    }
+
+    func test_setRoutineEnabledAdvertisedActivePersists_becauseStudioSaysActiveNotEnabled() throws {
+        // WHY: Studio already says Active. Parse only read enabled / on,
+        // so first-chat "set this Active" invented a hop or left the leftover
+        // switch. Advertised Active token persists. Canonical enabled still
+        // wins. Schema does not grow a second key.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let created = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "prompt": "Summarize overnight",
+        ])
+        let routineID = try XCTUnwrap(created.routines.first?.id)
+        XCTAssertEqual(created.routines.first?.enabled, false)
+
+        let fromActive = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": true,
+        ])
+        XCTAssertEqual(fromActive.routines.first?.enabled, true, "Active persists")
+        XCTAssertEqual(try store.listRoutines(botID: bot.id).first?.activation.isEnabled, true)
+
+        let fromActiveToken = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": "Active",
+        ])
+        XCTAssertEqual(fromActiveToken.routines.first?.enabled, true, "advertised Active token persists")
+        XCTAssertEqual(try store.listRoutines(botID: bot.id).first?.activation.isEnabled, true)
+
+        let fromOff = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": "Off",
+        ])
+        XCTAssertEqual(fromOff.routines.first?.enabled, false, "Active Off persists")
+
+        let enabledWins = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "enabled": true,
+            "active": false,
+        ])
+        XCTAssertEqual(enabledWins.routines.first?.enabled, true, "enabled wins")
+        XCTAssertEqual(try store.listRoutines(botID: bot.id).first?.activation.isEnabled, true)
+    }
+
+    func test_setRoutineEnabledCatalogDescribesActive_becauseThatIsTheStudioField() {
+        // WHY: Schema key stays enabled. Description must name Active so
+        // first-chat does not invent a hop.
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setRoutineEnabled)
+        XCTAssertEqual(description, "Set a routine Active or Off. Same path as Studio Active.")
+        let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setRoutineEnabled)
+        let properties = schema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["enabled"])
+        XCTAssertNil(properties?["active"], "active is an advertised alias, not a second schema key")
+        let enabled = properties?["enabled"] as? [String: Any]
+        XCTAssertEqual(enabled?["description"] as? String, "Active. Same field as Studio Active.")
+    }
+
+    func test_setSkillAdvertisedAddPersists_becauseStudioAddOnlySendsTheCatalogId() throws {
+        // WHY: Studio Add already binds via setSkillBinding(enabled: true).
+        // Tools required enabled, so first-chat "add this skill" invented a
+        // hop or a fake add tool. Omit enabled to Add it Enabled. Advertised
+        // Enabled token persists. Explicit Off still disables. Canonical
+        // enabled still wins.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromAdd = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+        ])
+        XCTAssertEqual(fromAdd.skills.map(\.skillID), ["weekly-account-health"], "Add persists")
+        XCTAssertEqual(fromAdd.skills.first?.enabled, true, "Add persists")
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, true)
+
+        let fromEnabledToken = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+            "enabled": "Enabled",
+        ])
+        XCTAssertEqual(fromEnabledToken.skills.first?.enabled, true, "advertised Enabled token persists")
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, true)
+
+        let fromOff = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+            "enabled": "Off",
+        ])
+        XCTAssertEqual(fromOff.skills.first?.enabled, false, "Off persists")
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, false)
+
+        let enabledWins = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+            "enabled": true,
+        ])
+        XCTAssertEqual(enabledWins.skills.first?.enabled, true, "enabled wins")
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, true)
+    }
+
+    func test_setSkillCatalogDescribesAdd_becauseThatIsTheStudioPath() {
+        // WHY: Schema does not grow an add tool. Description must name Add
+        // so first-chat does not invent a hop. enabled stays optional.
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setSkill)
+        XCTAssertTrue(description.contains("Add"), "Same path as Studio Add")
+        let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSkill)
+        let properties = schema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["skill_id"])
+        XCTAssertNotNil(properties?["enabled"])
+        XCTAssertNil(properties?["add"], "add is advertised on set_skill, not a second schema key")
+        XCTAssertEqual(schema["required"] as? [String], ["skill_id"])
+        let enabled = properties?["enabled"] as? [String: Any]
+        XCTAssertEqual(enabled?["description"] as? String, "Enabled. Omit to Add. Same field as Studio Skills.")
+        let skillID = properties?["skill_id"] as? [String: Any]
+        XCTAssertEqual(skillID?["description"] as? String, "Catalog id. Same field as Studio Add.")
+    }
+
+    func test_putMemoryAdvertisedFactPersists_becauseStudioSaysRememberAFact() throws {
+        // WHY: Tools and Studio say Remember a fact. Parse only read
+        // content, so first-chat "remember this fact" invented a hop or
+        // dropped the row. Canonical content still wins. Schema does not
+        // grow a second key.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromFact = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "fact": "Prefers dark mode",
+        ])
+        XCTAssertEqual(fromFact.memory.map(\.content), ["Prefers dark mode"])
+        XCTAssertEqual(try store.listMemory(botID: bot.id).map(\.content), ["Prefers dark mode"])
+
+        let contentWins = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers light mode",
+            "fact": "Ignored fact",
+        ])
+        XCTAssertEqual(contentWins.memory.map(\.content), ["Prefers dark mode", "Prefers light mode"])
+        XCTAssertEqual(contentWins.memory.last?.content, "Prefers light mode", "content wins")
+
+        let memoryID = try XCTUnwrap(fromFact.memory.first?.id)
+        let corrected = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "fact": "Prefers dusk",
+        ])
+        XCTAssertEqual(corrected.memory.first(where: { $0.id == memoryID })?.content, "Prefers dusk")
+
+        let correctContentWins = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "content": "Prefers dawn",
+            "fact": "Ignored correction",
+        ])
+        XCTAssertEqual(
+            correctContentWins.memory.first(where: { $0.id == memoryID })?.content,
+            "Prefers dawn",
+            "content wins"
+        )
+    }
+
+    func test_putMemoryCatalogDescribesFact_becauseThatIsTheStudioField() {
+        // WHY: Schema key stays content. Description must name Fact so
+        // first-chat does not invent a hop.
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.putMemory)
+        XCTAssertTrue(description.contains("fact"))
+        let putSchema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.putMemory)
+        let putProperties = putSchema["properties"] as? [String: Any]
+        XCTAssertNotNil(putProperties?["content"])
+        XCTAssertNil(putProperties?["fact"], "fact is an advertised alias, not a second schema key")
+        XCTAssertNil(putProperties?["remember"], "remember is an advertised alias, not a second schema key")
+        XCTAssertNil(putProperties?["remember_a_fact"], "remember_a_fact is an advertised alias, not a second schema key")
+        let putContent = putProperties?["content"] as? [String: Any]
+        XCTAssertEqual(putContent?["description"] as? String, "Fact. Same field as Studio Remember a fact.")
+
+        let correctSchema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.correctMemory)
+        let properties = correctSchema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["content"])
+        XCTAssertNil(properties?["fact"], "fact is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["correct"], "correct is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["correct_fact"], "correct_fact is an advertised alias, not a second schema key")
+        let content = properties?["content"] as? [String: Any]
+        XCTAssertEqual(content?["description"] as? String, "Fact. Same field as Studio Remember a fact.")
+
+        let forgetSchema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.forgetMemory)
+        let forgetProperties = forgetSchema["properties"] as? [String: Any]
+        XCTAssertNotNil(forgetProperties?["memory_id"])
+        XCTAssertNil(forgetProperties?["forget"], "forget is an advertised forget_memory alias, not a second schema key")
+        XCTAssertNil(forgetProperties?["forget_memory"], "forget_memory is an advertised alias, not a second schema key")
+        XCTAssertEqual(forgetSchema["required"] as? [String], ["memory_id"])
+        let forgetDescription = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.forgetMemory)
+        XCTAssertTrue(forgetDescription.contains("Forget"), "Same path as Studio Forget")
+    }
+
+    func test_correctMemoryAdvertisedCorrectPersists_becauseHonestySaysStudioCorrect() throws {
+        // WHY: set_settings leftover correct already rejects and points
+        // at bot_correct_memory ("Same path as Studio Correct"). Correct
+        // only read content / fact, so first-chat retried correct and
+        // invented a hop. Canonical content still wins. Schema does not
+        // grow a correct key. Dest title stays Memory.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let created = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dark mode",
+        ])
+        let memoryID = try XCTUnwrap(created.memory.first?.id)
+
+        let fromCorrect = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "correct": "Prefers dusk",
+        ])
+        XCTAssertEqual(fromCorrect.memory.count, 1)
+        XCTAssertEqual(fromCorrect.memory.first?.id, memoryID, "correct keeps the id")
+        XCTAssertEqual(fromCorrect.memory.first?.content, "Prefers dusk", "correct persists")
+
+        let fromCorrectFact = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "correct_fact": "Prefers twilight",
+        ])
+        XCTAssertEqual(fromCorrectFact.memory.first?.content, "Prefers twilight", "correct_fact persists")
+        XCTAssertEqual(fromCorrectFact.memory.first?.id, memoryID)
+
+        let fromFact = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "fact": "Prefers dawn",
+        ])
+        XCTAssertEqual(fromFact.memory.first?.content, "Prefers dawn", "fact still persists")
+        XCTAssertEqual(fromFact.memory.first?.id, memoryID)
+
+        let contentWins = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "content": "Prefers light mode",
+            "correct": "Ignored correct",
+            "correct_fact": "Ignored correct fact",
+            "fact": "Ignored fact",
+        ])
+        XCTAssertEqual(contentWins.memory.first?.content, "Prefers light mode", "content wins")
+        XCTAssertEqual(contentWins.memory.first?.id, memoryID)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "correct": "Must not persist",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.correctHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.memory.count, 1)
+        XCTAssertEqual(still.memory.first?.id, memoryID)
+        XCTAssertEqual(
+            still.memory.first?.content,
+            "Prefers light mode",
+            "leftover correct still rejects on set_settings"
+        )
+        let itemID = BotMemoryItemID(try XCTUnwrap(UUID(uuidString: memoryID)))
+        XCTAssertEqual(
+            try store.listMemoryRevisions(itemID: itemID).map(\.content),
+            [
+                "Prefers dark mode",
+                "Prefers dusk",
+                "Prefers twilight",
+                "Prefers dawn",
+                "Prefers light mode",
+            ]
+        )
+    }
+
+    func test_forgetMemoryAdvertisedForgetPersists_becauseHonestySaysStudioForget() throws {
+        // WHY: set_settings leftover forget already rejects and points
+        // at bot_forget_memory ("Same path as Studio Forget"). Forget
+        // only read memory_id, so first-chat retried forget and
+        // invented a hop. Canonical memory_id still wins. Schema does
+        // not grow a forget key. Dest title stays Memory.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let first = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dark mode",
+        ])
+        let firstID = try XCTUnwrap(first.memory.first?.id)
+
+        let fromForget = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "forget": firstID,
+        ])
+        XCTAssertTrue(fromForget.memory.isEmpty, "forget persists")
+        XCTAssertTrue(try store.listMemory(botID: bot.id).isEmpty)
+        XCTAssertEqual(
+            try store.listMemory(botID: bot.id, includeForgotten: true).first?.id.value.uuidString.lowercased(),
+            firstID.lowercased()
+        )
+
+        let second = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dusk",
+        ])
+        let secondID = try XCTUnwrap(second.memory.first?.id)
+        let fromForgetMemory = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "forget_memory": secondID,
+        ])
+        XCTAssertTrue(fromForgetMemory.memory.isEmpty, "forget_memory persists")
+        XCTAssertTrue(try store.listMemory(botID: bot.id).isEmpty)
+
+        let third = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dawn",
+        ])
+        let thirdID = try XCTUnwrap(third.memory.first?.id)
+        let fourth = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers light mode",
+        ])
+        let fourthID = try XCTUnwrap(fourth.memory.first(where: { $0.content == "Prefers light mode" })?.id)
+        let memoryIDWins = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "memory_id": thirdID,
+            "forget": fourthID,
+            "forget_memory": fourthID,
+        ])
+        XCTAssertEqual(memoryIDWins.memory.map(\.id), [fourthID], "memory_id wins")
+        XCTAssertEqual(memoryIDWins.memory.first?.content, "Prefers light mode")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "forget": fourthID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.memory.count, 1)
+        XCTAssertEqual(still.memory.first?.id, fourthID)
+        XCTAssertEqual(
+            still.memory.first?.content,
+            "Prefers light mode",
+            "leftover forget still rejects on set_settings"
+        )
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.forgetMemory)["properties"]
+                .flatMap { $0 as? [String: Any] }?["forget"],
+            "forget is an advertised forget_memory alias, not a second schema key"
+        )
+    }
+
+    func test_putMemoryAdvertisedRememberPersists_becauseHonestySaysRememberAFact() throws {
+        // WHY: set_settings leftover remember already rejects and points
+        // at bot_put_memory ("Same path as Studio Remember a fact"). Put
+        // only read content / fact, so first-chat retried remember and
+        // invented a hop. Canonical content still wins. Schema does not
+        // grow a remember key. Dest title stays Memory.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromRemember = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "remember": "Prefers dark mode",
+        ])
+        XCTAssertEqual(fromRemember.memory.map(\.content), ["Prefers dark mode"], "remember persists")
+        XCTAssertEqual(try store.listMemory(botID: bot.id).map(\.content), ["Prefers dark mode"])
+
+        let fromRememberAFact = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "remember_a_fact": "Prefers dusk",
+        ])
+        XCTAssertEqual(fromRememberAFact.memory.last?.content, "Prefers dusk", "remember_a_fact persists")
+
+        let contentWins = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers light mode",
+            "remember": "Ignored remember",
+            "remember_a_fact": "Ignored remember a fact",
+        ])
+        XCTAssertEqual(contentWins.memory.last?.content, "Prefers light mode", "content wins")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "remember": "Must not persist",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.memory.map(\.content), [
+            "Prefers dark mode",
+            "Prefers dusk",
+            "Prefers light mode",
+        ], "leftover remember still rejects on set_settings")
+    }
+
+    func test_leftoverPermissionSnapshotStaysSupervised_becauseFullAccessIsNotLive() throws {
+        // WHY: Brain compile already treats leftover full_access as
+        // supervised. get_settings still returned the raw leftover, so
+        // first-chat "just write the file" via bot_get_settings invented
+        // unsupervised access. Hermes agents see advertised permission.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", soul: "Own the inbox.", provider: .claude)
+        let currentID = try XCTUnwrap(bot.currentRevisionID)
+        _ = try store.publish(
+            botID: bot.id,
+            expectedCurrentRevisionID: currentID,
+            draft: BotRevisionDraft(
+                name: "Piper",
+                title: "Scout",
+                description: "",
+                soul: "Own the inbox.",
+                provider: .claude,
+                providerInstanceID: "claude",
+                model: "opus",
+                permissionMode: .fullAccess
+            )
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let snapshot = try service.snapshot()
+        XCTAssertEqual(snapshot.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertNotEqual(snapshot.permissionMode, AgentPermissionMode.fullAccess.rawValue)
+        let stored = try XCTUnwrap(try store.getRevision(id: try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)))
+        XCTAssertEqual(stored.permissionMode, .fullAccess)
+    }
+
+    func test_setSettingsLeftoverPermissionDoesNotAdvertiseFullAccess() throws {
+        // WHY: Desk-admitted bot_set_settings used to persist leftover
+        // full_access and echo it back. The model then believed it had
+        // unsupervised writes. Leftover permission_mode now rejects.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let stored = try XCTUnwrap(try store.getRevision(id: try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)))
+        XCTAssertEqual(stored.permissionMode, .supervised)
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.autoAcceptEdits.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let after = try service.snapshot()
+        XCTAssertEqual(after.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertFalse(after.permissionMode.contains("full_access"))
+        XCTAssertFalse(after.permissionMode.contains("auto_accept_edits"))
+    }
+
+    func test_correctMemoryKeepsId_becauseStudioCorrectDoesNotMintANewFact() throws {
+        // WHY: Studio Correct writes a revision on the same fact.
+        // Tools never named that path, so first-chat "correct this"
+        // invented forget+put and lost the id. Hermes agents update
+        // memory in place.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let created = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dark mode",
+        ])
+        let memoryID = try XCTUnwrap(created.memory.first?.id)
+        let after = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "content": "Prefers light mode",
+        ])
+        XCTAssertEqual(after.memory.count, 1)
+        XCTAssertEqual(after.memory.first?.id, memoryID)
+        XCTAssertEqual(after.memory.first?.content, "Prefers light mode")
+        let itemID = BotMemoryItemID(try XCTUnwrap(UUID(uuidString: memoryID)))
+        let revisions = try store.listMemoryRevisions(itemID: itemID)
+        XCTAssertEqual(revisions.map(\.content), ["Prefers dark mode", "Prefers light mode"])
+    }
+
+    func test_correctMemoryRejectedWhenForgotten_becauseTombstonesAreNotRewritable() throws {
+        // WHY: Studio Correct cannot rewrite a forgotten fact. The new
+        // tool must fail the same way instead of minting a live row.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let created = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Old secret",
+        ])
+        let memoryID = try XCTUnwrap(created.memory.first?.id)
+        _ = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "memory_id": memoryID,
+        ])
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+                "memory_id": memoryID,
+                "content": "Still secret",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? BotStoreError,
+                .invalidRow("forgotten memory cannot be rewritten")
+            )
+        }
+        XCTAssertTrue(try service.snapshot().memory.isEmpty)
+    }
+
+    func test_removeSkillDropsBinding_becauseDisableIsNotUnbind() throws {
+        // WHY: Studio Remove deletes the catalog row. Tools only named
+        // enable/disable, so first-chat "remove this skill" invented
+        // disable and left the id bound. Disable is not unbind.
+        // Hermes agents unbind in place.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        _ = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "keep-me",
+            "enabled": true,
+        ])
+        _ = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "drop-me",
+            "enabled": true,
+        ])
+        let disabled = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "drop-me",
+            "enabled": false,
+        ])
+        XCTAssertEqual(Set(disabled.skills.map(\.skillID)), ["keep-me", "drop-me"])
+        XCTAssertEqual(disabled.skills.first(where: { $0.skillID == "drop-me" })?.enabled, false)
+        let removed = try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
+            "skill_id": "drop-me",
+        ])
+        XCTAssertEqual(removed.skills.map(\.skillID), ["keep-me"])
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).map(\.skillID), ["keep-me"])
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
+                "skill_id": "drop-me",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .notFound)
+        }
+    }
+
+    func test_removeSkillRejectedWhenPath_becauseCatalogIdsAreNotFilesystemPaths() throws {
+        // WHY: Studio Add already rejects paths. Unbind must fail the same
+        // way instead of pretending a path is a live catalog id.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
+                "skill_id": "/tmp/skill.md",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? BotStoreError,
+                .invalidRow("skill id must be a catalog id, not a path")
+            )
+        }
+        XCTAssertTrue(try service.snapshot().skills.isEmpty)
+    }
+
+    func test_encodeSnapshotUsesCatalogMutateKeys_becauseNestedIdCollidedWithTheBot() throws {
+        // WHY: Forget/remove/toggle require memory_id / skill_id / routine_id.
+        // Snapshot used Swift id / skillID / scheduleNote, so same-turn
+        // "forget that" invented a hop or sent the bot id. Hermes agents
+        // reuse the key the last write returned. Canonical Swift fields stay.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dark mode",
+        ])
+        _ = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+            "enabled": true,
+        ])
+        _ = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "prompt": "Summarize overnight",
+            "schedule_note": "Weekdays 9:00",
+        ])
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["id"] as? String, bot.id.value.uuidString.lowercased())
+        let memory = try XCTUnwrap(object["memory"] as? [[String: Any]])
+        XCTAssertEqual(memory.first?["memory_id"] as? String, remembered.memory.first?.id, "memory_id persists")
+        XCTAssertNil(memory.first?["id"], "nested id omitted")
+        XCTAssertEqual(memory.first?["content"] as? String, "Prefers dark mode")
+        let skills = try XCTUnwrap(object["skills"] as? [[String: Any]])
+        XCTAssertEqual(skills.first?["skill_id"] as? String, "weekly-account-health", "skill_id persists")
+        XCTAssertNil(skills.first?["skillID"])
+        let routines = try XCTUnwrap(object["routines"] as? [[String: Any]])
+        XCTAssertEqual(routines.first?["routine_id"] as? String, try service.snapshot().routines.first?.id, "routine_id persists")
+        XCTAssertNil(routines.first?["id"], "nested id omitted")
+        XCTAssertEqual(routines.first?["schedule_note"] as? String, "Weekdays 9:00")
+        XCTAssertNil(routines.first?["scheduleNote"])
+        XCTAssertEqual(remembered.memory.first?.id.isEmpty, false)
+        XCTAssertEqual(try service.snapshot().skills.first?.skillID, "weekly-account-health")
+        XCTAssertEqual(try service.snapshot().routines.first?.scheduleNote, "Weekdays 9:00")
+    }
+
+    func test_encodeSnapshotUsesCatalogSettingsKeys_becauseSwiftNamesInventedAHop() throws {
+        // WHY: set_settings requires notifications_enabled / provider_instance_id.
+        // Snapshot used Swift notificationsEnabled / providerInstanceID, so
+        // same-turn "turn notifications off" invented a hop. Hermes agents
+        // reuse the key the last write returned. Canonical Swift fields stay.
+        // Leftover permission/desktop stay camelCase — catalog omits those writes.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let after = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications_enabled": false,
+            "provider_instance_id": "claude-work",
+        ])
+        XCTAssertFalse(after.notificationsEnabled)
+        XCTAssertEqual(after.providerInstanceID, "claude-work")
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["notifications_enabled"] as? Bool, false, "notifications_enabled persists")
+        XCTAssertNil(object["notificationsEnabled"], "Swift notificationsEnabled omitted")
+        XCTAssertEqual(object["provider_instance_id"] as? String, "claude-work", "provider_instance_id persists")
+        XCTAssertNil(object["providerInstanceID"], "Swift providerInstanceID omitted")
+        XCTAssertEqual(object["permissionMode"] as? String, AgentPermissionMode.supervised.rawValue)
+        XCTAssertNil(object["permission_mode"], "leftover permission stays unnamed")
+        XCTAssertEqual(object["desktopKind"] as? String, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertNil(object["desktop_kind"], "leftover desktop stays unnamed")
+        XCTAssertEqual(try store.get(id: bot.id)?.notificationsEnabled, false)
+        XCTAssertEqual(try store.getRevision(id: try XCTUnwrap(store.get(id: bot.id)?.currentRevisionID))?.providerInstanceID, "claude-work")
     }
 }

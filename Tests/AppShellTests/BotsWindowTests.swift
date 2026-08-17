@@ -14,6 +14,7 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.selectedBotID")
         UserDefaults.standard.removeObject(forKey: "bots.screen")
         UserDefaults.standard.removeObject(forKey: "bots.studioTab")
+        UserDefaults.standard.removeObject(forKey: "bots.deskSidePane")
         UserDefaults.standard.removeObject(forKey: "bots.showHidden")
         UserDefaults.standard.removeObject(forKey: "bots.brainPane")
         UserDefaults.standard.removeObject(forKey: "bots.queuedFollowUps")
@@ -1494,6 +1495,537 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesAdvertisedWorkspace_becauseDestMustNotOmitTheRepo() throws {
+        // WHY: Studio already shows Workspace. Brain compile never sent
+        // name/cwd, so first-chat "which repo?" invented a folder. Dest
+        // preview and compose must share the advertised workspace.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "macos-app", cwd: "/tmp/macos-app")
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "Which repo is this?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(vm.advertisedWorkspace?.name, "macos-app")
+        XCTAssertEqual(vm.advertisedWorkspace?.cwd, "/tmp/macos-app")
+        XCTAssertEqual(vm.studioWorkspaceLabel, "macos-app")
+        XCTAssertTrue(preview.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app)."))
+        XCTAssertFalse(preview.compiledPayload.contains("Working space:"))
+        XCTAssertTrue(preview.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.workspaceHostAssignedHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Which repo is this?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+        XCTAssertEqual(piper.workspaceID, workspace.id)
+    }
+
+    func test_previewBrainIncludesAdvertisedDesktop_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio already says Desktop. Compile folded isolation into
+        // Workspace, so first-chat "which Desktop?" invented a hop. Dest
+        // preview and compose must share that advertised name.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "Which Desktop?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(vm.studioDesktopSummary, BotDesktopKind.logicalExecutionSpace.displayTitle)
+        XCTAssertTrue(preview.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertFalse(preview.compiledPayload.contains("Working space:"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Which Desktop?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedBrowser_becauseDestMustNotOmitTheLastWebsite() throws {
+        // WHY: Tools already persist last website. Dest preview never sent
+        // URL/title, so first-chat "what's open?" invented a hop. Dest
+        // preview and compose must share the advertised last website.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        let store = BotBrowserStore(appSupportDirectory: context.appSupportDirectory)
+        try store.persistTarget(
+            BotBrowserTarget(url: "https://github.com/remotecode", title: "GitHub"),
+            botID: piper.id
+        )
+        vm.composerText = "What's open?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(vm.advertisedBrowser?.url, "https://github.com/remotecode")
+        XCTAssertEqual(vm.advertisedBrowser?.title, "GitHub")
+        XCTAssertTrue(preview.compiledPayload.contains("Browser: GitHub (https://github.com/remotecode)"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(preview.compiledPayload.contains("secret-token"), "cookies stay out")
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What's open?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace,
+                browser: vm.advertisedBrowser
+            )
+        )
+        XCTAssertEqual(
+            preview.layers.first(where: { $0.kind == .browser })?.text,
+            "Browser: GitHub (https://github.com/remotecode)"
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedNotifications_becauseDestMustNotOmitAlerts() throws {
+        // WHY: Studio already shows Notifications On/Off. Brain compile never
+        // sent that toggle, so first-chat "will you notify me?" invented
+        // alerts. Dest preview and compose must share the advertised state.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "Will you notify me?"
+        let onPreview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(onPreview.compiledPayload.contains("Notifications: On. Alerts stay on this Mac; not an isolated Desktop."))
+        XCTAssertTrue(onPreview.compiledPayload.contains("Own the inbox."))
+        vm.openStudio(piper)
+        vm.studioDraft.notificationsEnabled = false
+        let draftPreview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(draftPreview.compiledPayload.contains("Notifications: Off. This Mac will not alert the owner."))
+        XCTAssertFalse(draftPreview.compiledPayload.contains("Notifications: On."))
+        _ = try vm.saveStudio()
+        vm.openDesk(try XCTUnwrap(vm.selectedBot))
+        vm.composerText = "Will you notify me?"
+        let offPreview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(offPreview.compiledPayload.contains("Notifications: Off. This Mac will not alert the owner."))
+        XCTAssertEqual(
+            offPreview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: try XCTUnwrap(vm.selectedBot),
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Will you notify me?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedMemoryMutateKey_becauseDestMustNotOmitForgetKeys() throws {
+        // WHY: Studio already says Memory. Compile headed facts with
+        // Trusted memory, so first-chat "what's in Memory?" invented a hop.
+        // Dest preview and compose must share the advertised heading.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.memoryDraft = "Prefers dark mode"
+        vm.addMemory()
+        let item = try XCTUnwrap(vm.memoryItems.first)
+        vm.composerText = "Forget the dark-mode fact"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        let key = item.id.value.uuidString.lowercased()
+        XCTAssertTrue(preview.compiledPayload.contains("Memory:"))
+        XCTAssertFalse(preview.compiledPayload.contains("Trusted memory:"))
+        XCTAssertTrue(preview.compiledPayload.contains("Fact: Prefers dark mode"))
+        XCTAssertTrue(preview.compiledPayload.contains(key))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Forget the dark-mode fact",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedApprovalMode_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio already says Approval mode. Compile listed Permission,
+        // so first-chat "what's your Approval mode?" invented a hop. Dest
+        // preview and compose must share that advertised name. Dest Source
+        // title stays Permission.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "What's your Approval mode?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(vm.studioApprovalLabel, "Supervised")
+        XCTAssertTrue(preview.compiledPayload.contains("Approval mode: \(BotPermission.honestyLabel) \(BotBrainCompiler.approvalsHonesty) \(BotBrainCompiler.approvalModeHostAssignedHonesty)"))
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.approvalsHonesty))
+        XCTAssertFalse(preview.compiledPayload.contains("Permission:"))
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .permission })?.title, "Permission")
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What's your Approval mode?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedApprovals_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio Security already says Approvals. Compile listed
+        // Approval mode only, so first-chat "Allow once" invented a grant.
+        // Dest preview and compose must share that advertised name. Dest
+        // Source title stays Permission.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "Allow once"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.approvalsHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains("Allow once / Deny stay off until P1b"))
+        XCTAssertTrue(preview.compiledPayload.contains("Approval mode: \(BotPermission.honestyLabel) \(BotBrainCompiler.approvalsHonesty) \(BotBrainCompiler.approvalModeHostAssignedHonesty)"))
+        XCTAssertFalse(preview.compiledPayload.contains("Permission:"))
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .permission })?.title, "Permission")
+        XCTAssertEqual(
+            preview.layers.first(where: { $0.kind == .permission })?.text,
+            "\(BotPermission.honestyLabel) \(BotBrainCompiler.approvalsHonesty) \(BotBrainCompiler.approvalModeHostAssignedHonesty)"
+        )
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Allow once",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedHandleCreateOnlyHonesty_becauseDestMustNotInviteAWrite() throws {
+        // WHY: Studio Handle is create-only after first save. Compile already
+        // showed @handle next to Role, so first-chat "change your handle"
+        // invented a write. Dest preview and compose must share that honesty.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "Change your handle"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("@\(piper.handle)"))
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.handleCreateOnlyHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Change your handle",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedRole_becauseDestMustNotLeaveTheJobUnlabeled() throws {
+        // WHY: Studio already says Role. Compile put the job unlabeled after
+        // an em-dash, so first-chat "what's your Role?" invented a hop. Dest
+        // preview and compose must share the advertised name. Empty stays out.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "What's your Role?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Role: Scout"))
+        XCTAssertFalse(preview.compiledPayload.contains("You are Piper (@piper) — Scout"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What's your Role?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedInstructions_becauseDestMustNotSayStandingInstructions() throws {
+        // WHY: Studio already says Instructions. Compile headed the soul
+        // with Standing instructions, so first-chat "what are your
+        // Instructions?" invented a hop. Dest preview and compose must
+        // share the advertised name. Custom soul still wins the body.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "What are your Instructions?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Instructions:"))
+        XCTAssertFalse(preview.compiledPayload.contains("Standing instructions:"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What are your Instructions?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedModel_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio already says Model. Compile listed it unlabeled after
+        // · on Default route, so first-chat "what's your Model?" invented a
+        // hop. Dest preview and compose must share the advertised name.
+        // Empty stays out. Dest Source title stays Route.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "What's your Model?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Model: opus"))
+        XCTAssertTrue(preview.compiledPayload.contains("Default route: Claude · opus"))
+        XCTAssertTrue(preview.compiledPayload.contains(BotRoute.fallbackOrderHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .route })?.title, "Route")
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What's your Model?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedFallbackOrder_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio already says Fallback order is not shipped. Compile
+        // listed Default route only, so first-chat "if Claude is down use
+        // Grok" invented a second route. Dest preview and compose must
+        // share that advertised honesty. Dest Source title stays Route.
+        // Schema does not grow a fallback tool.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "If Claude is down use Grok"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains(BotRoute.fallbackOrderHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains("Default route: Claude · opus. \(BotRoute.fallbackOrderHonesty)"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(preview.compiledPayload.contains("bot_set_fallback"))
+        XCTAssertFalse(preview.layers.contains { $0.title == "Fallback" })
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .route })?.title, "Route")
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "If Claude is down use Grok",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedRoutines_becauseDestMustNotSayActiveRoutines() throws {
+        // WHY: Studio already says Routines. Compile listed Active routines,
+        // so first-chat "what are your Routines?" invented a hop. Dest
+        // preview and compose must share the advertised name. Active stays
+        // on each live line. Dest Source title stays Routine.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.saveRoutine()
+        let id = try XCTUnwrap(vm.routines.first?.definition.id)
+        vm.setRoutineEnabled(id: id, enabled: true)
+        vm.composerText = "What are your Routines?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Routines (not while the app is closed):"))
+        XCTAssertTrue(preview.compiledPayload.contains("Morning scan: Instruction: Scan overnight failures. When: Weekdays 9:00. Active."))
+        XCTAssertFalse(preview.compiledPayload.contains("Active routines"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(preview.layers.contains { $0.title == "Routines" })
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .routine })?.title, "Routine")
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What are your Routines?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedTestRun_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio already says Test run. Compile listed Active routines
+        // only, so first-chat "test this routine" invented a hop or a
+        // schedule fire. Dest preview and compose must share the advertised
+        // name. Dest Source title stays Routine. Schema does not grow a
+        // test tool.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.saveRoutine()
+        let id = try XCTUnwrap(vm.routines.first?.definition.id)
+        vm.setRoutineEnabled(id: id, enabled: true)
+        vm.composerText = "Test this routine"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Test run: do the Instruction now. Does not set Active."))
+        XCTAssertTrue(preview.compiledPayload.contains(BotRoutineCopy.testRunHonestyCaption))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(preview.compiledPayload.contains("bot_test_routine"))
+        XCTAssertFalse(preview.layers.contains { $0.title == "Test run" })
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .routine })?.title, "Routine")
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Test this routine",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedSkills_becauseDestMustNotSayEnabledSkills() throws {
+        // WHY: Studio already says Skills. Compile listed Enabled skills, so
+        // first-chat "which Skills?" invented a hop. Dest preview and compose
+        // must share the advertised name. Off stays out.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.skillDraft = "weekly-account-health"
+        vm.addSkill()
+        vm.skillDraft = "off-skill"
+        vm.addSkill()
+        vm.setSkillEnabled(skillID: "off-skill", enabled: false)
+        vm.composerText = "Which Skills?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(preview.compiledPayload.contains("Enabled skills"))
+        XCTAssertFalse(preview.compiledPayload.contains("off-skill"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Which Skills?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesEnabledRoutine_becauseDestMustNotOmitSchedules() throws {
+        // WHY: Brain Inspector / Desk send used dest memory+skills and
+        // skipped dest routines. Owner-authored Morning scan never reached
+        // the model unless it called get_settings.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openDesk(piper)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.saveRoutine()
+        let id = try XCTUnwrap(vm.routines.first?.definition.id)
+        let listsBefore = vm.routineListCountForTesting
+        vm.setRoutineEnabled(id: id, enabled: true)
+        vm.composerText = "What do you run?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Morning scan: Instruction: Scan overnight failures. When: Weekdays 9:00"))
+        XCTAssertTrue(preview.compiledPayload.contains("not while the app is closed"))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What do you run?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+        XCTAssertEqual(
+            vm.routineListCountForTesting,
+            listsBefore,
+            "preview dest must use dest-cached routines"
+        )
+    }
+
     func test_saveRoutineKeepsExistingRoutines_becauseStaleEmptyMustNotLookCurrent() throws {
         // WHY: dest-first save is honest only when older schedules stay
         // visible and the new row paints first.
@@ -1774,6 +2306,77 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
     }
 
+    func test_reloadingDeskDoesNotListFleetConversations_becauseRemountDestMustNotScanEveryTeammate() throws {
+        // WHY: leaving Bots and coming back calls reload() on the same dest.
+        // Remount dest used to list every teammate's conversations before
+        // dest dested Chat. Dest already has dest cache and dest inbox.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Summarize overnight"))
+        let afterDest = vm.conversationListCountForTesting
+        XCTAssertGreaterThan(afterDest, 0)
+        vm.reload()
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+        XCTAssertEqual(
+            vm.conversationListCountForTesting,
+            afterDest,
+            "remount dest must not scan every teammate"
+        )
+    }
+
+    func test_reloadingDeskKeepsChatAndRoster_becauseStaleEmptyMustNotLookCurrent() throws {
+        // WHY: dest-first remount is honest only when dest still dests this
+        // teammate's bubble and the roster dest already dested.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Summarize overnight"))
+        let destPreview = vm.rosterPreview(for: piper)
+        XCTAssertFalse(destPreview.isEmpty)
+        vm.reload()
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+        XCTAssertEqual(
+            vm.rosterPreview(for: piper),
+            destPreview,
+            "remount dest must keep dest roster preview dest already dested"
+        )
+        XCTAssertEqual(Set(vm.fleet.map(\.id)), [piper.id, quinn.id])
+        XCTAssertEqual(vm.fleet.map(\.name).sorted(), ["Piper", "Quinn"])
+    }
+
+    func test_reloadingDeskStillListsInbox_becauseStaleBellMustNotLookCurrent() throws {
+        // WHY: remount dest skips the fleet conversation scan, but dest
+        // inbox must still refresh so a new needs-you cannot look empty.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Summarize overnight"))
+        try context.botStore.upsertAttention(
+            BotAttentionItem(botID: piper.id, kind: .approval, title: "Approve vendor brief")
+        )
+        XCTAssertFalse(vm.attentionItems.contains(where: { $0.title == "Approve vendor brief" }))
+        vm.reload()
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
+        XCTAssertTrue(
+            vm.attentionItems.contains(where: { $0.title == "Approve vendor brief" }),
+            "remount dest must still dest dest inbox"
+        )
+        XCTAssertEqual(vm.attentionState(for: piper), .needsAttention)
+    }
+
     func test_deskScreenSurvivesRelaunch_becauseLeavingBotsMustNotDropTheChat() throws {
         // WHY: installBotsContent remounts after Agentic/workspace. Forcing
         // Fleet Home there (or on a new VM) throws away the open Desk turn.
@@ -1788,6 +2391,256 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(reopened.selectedBotID, bot.id)
         XCTAssertEqual(reopened.screen, .desk)
         XCTAssertEqual(reopened.deskMessages.first?.text, "Summarize overnight")
+    }
+
+    func test_openingBotsDoesNotListOtherTeammateConversations_becauseFirstPaintDestMustDestChat() throws {
+        // WHY: first paint of Bots is a new dest. Dest used to list every
+        // teammate's conversations before dest dested the open Chat.
+        // Dest dests this teammate; dest dests the others when dest dests them.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("From Quinn"))
+        vm.openDesk(piper)
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        let afterDest = dest.conversationListCountForTesting
+        XCTAssertGreaterThan(afterDest, 0)
+        dest.openDesk(quinn)
+        XCTAssertEqual(dest.selectedBotID, quinn.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Quinn")
+        XCTAssertGreaterThan(
+            dest.conversationListCountForTesting,
+            afterDest,
+            "dest dests Quinn when dest dests that row"
+        )
+    }
+
+    func test_openingBotsKeepsSelectedChat_becauseStaleEmptyMustNotLookCurrent() throws {
+        // WHY: dest-first first paint is honest only when dest dests this
+        // teammate's bubble and dest dests the roster dest already dested.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("From Quinn"))
+        vm.openDesk(piper)
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        XCTAssertEqual(Set(dest.fleet.map(\.id)), [piper.id, quinn.id])
+        XCTAssertEqual(dest.fleet.map(\.name).sorted(), ["Piper", "Quinn"])
+        XCTAssertFalse(dest.rosterPreview(for: piper).isEmpty)
+        XCTAssertNotEqual(dest.rosterPreview(for: piper), "No job yet")
+        XCTAssertTrue(
+            dest.rosterPreview(for: piper).contains("From Piper")
+                || dest.deskMessages.contains(where: { $0.text == "From Piper" })
+        )
+    }
+
+    func test_openingBotsStillDestsTheOtherTeammate_becauseStaleEmptyMustNotLookCurrent() throws {
+        // WHY: first paint dest skips Quinn's conversation scan, but dest
+        // dests Quinn's thread when dest dests that row so dest cannot
+        // look empty after dest dested Quinn.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("From Quinn"))
+        vm.openDesk(piper)
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        dest.openDesk(quinn)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, quinn.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Quinn")
+        XCTAssertTrue(dest.deskMessages.contains(where: { $0.text == "From Quinn" }))
+    }
+
+    func test_openingBotsRestoresChatBeforeInspector_becauseFirstPaintDestMustDestChat() throws {
+        // WHY: first paint dest used to dest inspector (six store
+        // reads) before dest dested Chat. Dest dests this bubble
+        // first; dest dests inspector after dest dested Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("From Quinn"))
+        vm.openDesk(piper)
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        XCTAssertGreaterThan(dest.deskRestoreInvokedCountForTesting, 0)
+        XCTAssertEqual(
+            dest.lastDeskRestoreStudioSupportCountForTesting,
+            0,
+            "dest dests Chat before dest dests inspector"
+        )
+        XCTAssertGreaterThan(
+            dest.studioSupportReloadCountForTesting,
+            dest.lastDeskRestoreStudioSupportCountForTesting,
+            "dest dests inspector after dest dested Chat"
+        )
+    }
+
+    func test_openingBotsStillDestsInspector_becauseStaleEmptyMustNotLookCurrent() throws {
+        // WHY: dest-first Chat is honest only when dest dests Brain
+        // after dest dested this bubble. Dest dests inspector so
+        // Memory/Skills cannot look empty after dest dested Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        _ = try context.botStore.putMemory(
+            botID: piper.id,
+            content: "Prefers dark mode",
+            provenance: "user",
+            trusted: true,
+            source: "studio"
+        )
+        try context.botStore.setSkillBinding(
+            BotSkillBinding(botID: piper.id, skillID: "weekly-account-health", enabled: true)
+        )
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        XCTAssertEqual(dest.liveMemoryCount, 1)
+        XCTAssertEqual(dest.enabledSkillCount, 1)
+    }
+
+    func test_openingBotsRestoresChatBeforeInbox_becauseFirstPaintDestMustDestChat() throws {
+        // WHY: first paint dest used to dest inbox (listAttention)
+        // before dest dested Chat. Dest dests this bubble first;
+        // dest dests inbox after dest dested Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        try context.botStore.upsertAttention(
+            BotAttentionItem(botID: piper.id, kind: .approval, title: "Approve vendor brief")
+        )
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        XCTAssertGreaterThan(dest.deskRestoreInvokedCountForTesting, 0)
+        XCTAssertEqual(
+            dest.lastDeskRestoreAttentionListCountForTesting,
+            0,
+            "dest dests Chat before dest dests inbox"
+        )
+        XCTAssertGreaterThan(
+            dest.attentionListCountForTesting,
+            dest.lastDeskRestoreAttentionListCountForTesting,
+            "dest dests inbox after dest dested Chat"
+        )
+    }
+
+    func test_openingBotsStillDestsInbox_becauseStaleBellMustNotLookCurrent() throws {
+        // WHY: dest-first Chat is honest only when dest dests inbox
+        // after dest dested this bubble. Dest dests the bell so a
+        // needs-you cannot look empty after dest dested Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        try context.botStore.upsertAttention(
+            BotAttentionItem(botID: piper.id, kind: .approval, title: "Approve vendor brief")
+        )
+        XCTAssertFalse(vm.attentionItems.contains(where: { $0.title == "Approve vendor brief" }))
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        XCTAssertTrue(
+            dest.attentionItems.contains(where: { $0.title == "Approve vendor brief" }),
+            "first paint dest must still dest dest inbox"
+        )
+        XCTAssertEqual(dest.attentionState(for: piper), .needsAttention)
+    }
+
+    func test_openingBotsRestoresChatBeforeRosterPreview_becauseFirstPaintDestMustDestChat() throws {
+        // WHY: first paint dest used to dest dest preview
+        // (listConversations + listRecent) before dest dested Chat.
+        // Dest dests this bubble first; dest dests dest preview
+        // from dest Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertEqual(dest.deskMessages.first?.text, "From Piper")
+        XCTAssertGreaterThan(dest.deskRestoreInvokedCountForTesting, 0)
+        XCTAssertEqual(
+            dest.lastDeskRestoreConversationListCountForTesting,
+            0,
+            "dest dests Chat before dest dests dest preview"
+        )
+        XCTAssertGreaterThan(
+            dest.conversationListCountForTesting,
+            dest.lastDeskRestoreConversationListCountForTesting,
+            "dest dests dest preview after dest dested Chat"
+        )
+        XCTAssertTrue(
+            dest.rosterPreview(for: piper).contains("From Piper")
+                || dest.deskMessages.contains(where: { $0.text == "From Piper" }),
+            "dest dests dest preview from dest Chat"
+        )
+    }
+
+    func test_openingBotsRestoresChatBeforeThread_becauseFirstPaintDestMustDestChat() throws {
+        // WHY: first paint dest used to dest dest thread (listRecent)
+        // before dest dested Chat. Dest dests dest title first;
+        // dest dests dest thread after dest dested Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        try seedLinkedTurn(context: context, bot: piper, extraReasoning: 2)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.deskMessages.contains(where: { $0.text == "Summarize overnight" }))
+        let dest = BotsViewModel(context: context)
+        XCTAssertEqual(dest.screen, .desk)
+        XCTAssertEqual(dest.selectedBotID, piper.id)
+        XCTAssertTrue(
+            dest.deskMessages.contains(where: { $0.text == "Summarize overnight" }),
+            "dest dests dest thread after dest dested dest title"
+        )
+        XCTAssertGreaterThan(dest.deskRestoreInvokedCountForTesting, 0)
+        XCTAssertEqual(
+            dest.lastDeskRestoreMessageListCountForTesting,
+            0,
+            "dest dests Chat from dest title before dest dests dest thread"
+        )
+        XCTAssertGreaterThan(
+            dest.deskMessageRestoreCountForTesting,
+            dest.lastDeskRestoreMessageListCountForTesting,
+            "dest dests dest thread after dest dested Chat"
+        )
     }
 
     func test_unpublishedStudioDraftSurvivesRelaunch_becauseDraftIsUserWorkflowState() throws {
@@ -2102,6 +2955,37 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.allSatisfy { $0.name == "New Agent" })
     }
 
+    func test_beginCreateSeedsStandingInstructions_becauseHermesDoesNotStartSoulless() throws {
+        // WHY: Live Studio/Desk New Agent compiled with "No standing
+        // instructions." Hermes seeds SOUL.md; we persist the starter so
+        // first chat and Studio both show a replaceable default.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.beginCreate()
+        let bot = try XCTUnwrap(try context.botStore.list().first)
+        let revision = try XCTUnwrap(
+            bot.currentRevisionID.flatMap { try context.botStore.getRevision(id: $0) }
+        )
+        XCTAssertTrue(BotStandingInstructions.looksGenerated(revision.soul))
+        XCTAssertTrue(revision.soul.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertFalse(revision.soul.contains(BotStandingInstructions.rememberFactTool), "tools layer owns remember")
+        XCTAssertFalse(revision.soul.contains(BotStandingInstructions.openBrowserTool), "tools layer owns browser")
+        let preview = try XCTUnwrap(vm.previewBrain(userText: "Remember this"))
+        XCTAssertTrue(preview.compiledPayload.contains(BotStandingInstructions.admittedToolsText))
+        XCTAssertTrue(preview.compiledPayload.contains(BotStandingInstructions.getBrowserTool))
+        vm.beginEdit(bot)
+        XCTAssertEqual(vm.studioDraft.soul, revision.soul)
+        vm.studioDraft.title = "Reviews PRs"
+        vm.refreshGeneratedStandingInstructions()
+        XCTAssertTrue(vm.studioDraft.soul.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertFalse(vm.studioDraft.soul.contains(BotStandingInstructions.changeJobTool), "tools layer owns job tool")
+        XCTAssertFalse(vm.studioDraft.soul.contains("You are"), "Role must not rewrite identity into Instructions")
+        vm.studioDraft.soul = "Speak plainly."
+        vm.studioDraft.title = "Other job"
+        vm.refreshGeneratedStandingInstructions()
+        XCTAssertEqual(vm.studioDraft.soul, "Speak plainly.", "custom soul is the expert escape hatch")
+    }
+
     func test_openDeskMarksUnreadConversationRead_becauseOpeningTheChatClearsFleetAttention() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -2191,7 +3075,10 @@ final class BotsWindowTests: XCTestCase {
         } else {
             XCTFail("studio summary must exist")
         }
-        XCTAssertTrue(source.contains("not shipped in P1a"))
+        XCTAssertTrue(
+            source.contains("BotRoute.fallbackOrderHonesty") || source.contains("not shipped in P1a"),
+            "Studio must keep the P1a fallback-order honesty on the routing panel"
+        )
         XCTAssertFalse(
             source.contains("Guest not running"),
             "Studio must not advertise a Dedicated local VM guest control"
@@ -3398,7 +4285,12 @@ final class BotsWindowTests: XCTestCase {
 
         XCTAssertTrue(prompt.contains("Prefers dark mode"))
         XCTAssertFalse(prompt.contains("Old secret"))
-        XCTAssertTrue(prompt.contains("weekly-account-health"))
+        XCTAssertTrue(prompt.contains("Role: Scout"))
+        XCTAssertFalse(prompt.contains("You are Piper (@piper) — Scout"))
+        XCTAssertTrue(prompt.contains("Instructions:"))
+        XCTAssertFalse(prompt.contains("Standing instructions:"))
+        XCTAssertTrue(prompt.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(prompt.contains("Enabled skills"))
         XCTAssertFalse(prompt.contains("off-skill"))
         XCTAssertTrue(prompt.contains("Summarize overnight"))
     }
@@ -3425,7 +4317,8 @@ final class BotsWindowTests: XCTestCase {
             revision: try XCTUnwrap(vm.selectedRevision),
             userText: "Summarize overnight",
             memory: vm.memoryItems,
-            skills: vm.skillBindings
+            skills: vm.skillBindings,
+            workspace: vm.advertisedWorkspace
         ))
         XCTAssertTrue(preview.compiledPayload.contains("Prefers dark mode"))
         XCTAssertEqual(preview.layers.first(where: { $0.kind == .user })?.text, "Summarize overnight")
@@ -3540,7 +4433,8 @@ final class BotsWindowTests: XCTestCase {
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Summarize overnight",
                 memory: vm.memoryItems,
-                skills: vm.skillBindings
+                skills: vm.skillBindings,
+                workspace: vm.advertisedWorkspace
             ),
             preview.compiledPayload
         )
@@ -3905,6 +4799,69 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.screen, .studio)
     }
 
+    func test_studioSkillToggleHidesTitle_becauseRowCaptionAlreadySaysOff() throws {
+        // WHY: After Remove landed, the Skills row painted Off as a caption
+        // and again as the Toggle title next to the switch. Hide the title;
+        // keep the caption and VoiceOver name.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private var skillsTab") else {
+            return XCTFail("skillsTab must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n    private func memoryRow")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("Toggle(binding.enabled ? \"On\" : \"Off\""))
+        XCTAssertTrue(
+            slice.contains(".labelsHidden()"),
+            "Skills Off/On must not paint twice beside Remove"
+        )
+        XCTAssertTrue(slice.contains("Text(binding.enabled ? \"On\" : \"Off\")"))
+    }
+
+    func test_removeSkillDoesNotListSkills_becauseRemoveDestMustNotRereadBindings() throws {
+        // WHY: Remove dest must drop the row without listing every skill,
+        // or the Skills tab looks current only after a reread.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(piper)
+        vm.skillDraft = "weekly-account-health"
+        vm.addSkill()
+        let afterAdd = vm.skillListCountForTesting
+        vm.removeSkill(skillID: "weekly-account-health")
+        XCTAssertTrue(vm.skillBindings.isEmpty)
+        XCTAssertEqual(vm.enabledSkillCount, 0)
+        XCTAssertEqual(
+            vm.skillListCountForTesting,
+            afterAdd,
+            "remove dest must not reread every skill"
+        )
+        XCTAssertTrue(try context.botStore.listSkillBindings(botID: piper.id).isEmpty)
+    }
+
+    func test_removeSkillKeepsExistingSkills_becauseStaleEmptyMustNotLookCurrent() throws {
+        // WHY: dest-first remove is honest only when the other bindings stay
+        // visible after this catalog id leaves the list.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        try context.botStore.setSkillBinding(
+            BotSkillBinding(botID: piper.id, skillID: "keep-me", enabled: true)
+        )
+        vm.beginEdit(piper)
+        vm.skillDraft = "drop-me"
+        vm.addSkill()
+        let afterAdd = vm.skillListCountForTesting
+        vm.removeSkill(skillID: "drop-me")
+        XCTAssertEqual(vm.skillBindings.map(\.skillID), ["keep-me"])
+        XCTAssertTrue(try XCTUnwrap(vm.skillBindings.first).enabled)
+        XCTAssertEqual(vm.skillListCountForTesting, afterAdd)
+        XCTAssertEqual(
+            try context.botStore.listSkillBindings(botID: piper.id).map(\.skillID),
+            ["keep-me"]
+        )
+    }
+
     func test_studioDoesNotPersistDedicatedLocalVM_becauseItIsNotAdvertised() throws {
         // WHY: Product must not advertise Dedicated local VM. A leftover draft
         // kind must fall back to logical space instead of publishing a hidden mode.
@@ -4016,6 +4973,59 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.displayedDesktopKind, .logicalExecutionSpace)
     }
 
+    func test_memoryTabHeaderSaysMemory_becauseMemoryMustNotNameTheBrainSiblingTab() throws {
+        // WHY: Brain and Memory are sibling Studio tabs and the tab strip
+        // already says Memory. A "Brain / Memory" body header is leftover
+        // from before the split and claims Memory lives under Brain.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertFalse(
+            source.contains("Brain / Memory"),
+            "Memory's header must not name the Brain sibling tab"
+        )
+        guard let start = source.range(of: "private var memoryTab") else {
+            return XCTFail("memory tab must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private var ")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(
+            slice.contains("studioSectionHeader(BotsChrome.Label.memory)"),
+            "Memory keeps a section title like every sibling Studio tab, titled by the shared chrome token"
+        )
+    }
+
+    func test_studioProviderPickerHidesTitle_becauseDefaultRouteAlreadyLabelsTheRow() throws {
+        // WHY: The Profile row is already "Default route". A visible
+        // Picker title "Provider" looks like leftover chrome beside
+        // Claude/Codex/Grok. Scheduled Tasks already hides the same title.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private var studioProvider") else {
+            return XCTFail("studioProvider must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n    private var studioSoul")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("Picker(\"Provider\""))
+        XCTAssertTrue(
+            slice.contains(".labelsHidden()"),
+            "Default route already names the row; Provider must not paint beside the segments"
+        )
+    }
+
+    func test_avatarSymbolNameIsHuman_becauseStudioMustNotAnnounceSFSymbolPaths() {
+        XCTAssertEqual(
+            BotsChrome.avatarSymbolName("person.crop.circle"),
+            "Person",
+            "VoiceOver on an Avatar chip must say Person, not person.crop.circle"
+        )
+        for symbol in BotsChrome.avatarSymbols {
+            XCTAssertFalse(
+                BotsChrome.avatarSymbolName(symbol).contains("."),
+                "\(symbol) must not leak an SF Symbol path into the Avatar name"
+            )
+        }
+    }
+
     func test_botsOpensInMainContent_andSidebarSitsUnderScheduleTasks() throws {
         let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
         let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
@@ -4067,13 +5077,20 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.studio.tab.memory"))
         XCTAssertTrue(bots.contains("bots.studio.tab.skills"))
         XCTAssertTrue(bots.contains("bots.studio.tab.routines"))
-        XCTAssertTrue(bots.contains("bots.studio.tab.desktop"))
+        XCTAssertFalse(
+            bots.contains("bots.studio.tab.desktop"),
+            "Desktop merged into the Security tab; a seventh tab must not come back"
+        )
         XCTAssertTrue(bots.contains("bots.studio.tab.security"))
+        XCTAssertTrue(
+            bots.contains("bots.studio.desktop"),
+            "the read-only Desktop card still ships inside the Security tab"
+        )
         XCTAssertTrue(bots.contains("bots.chrome.agentic"))
         XCTAssertFalse(bots.contains("bots.home.goal"))
         XCTAssertTrue(bots.contains("accessibilityAddTraits(selected ? .isSelected : [])"))
         XCTAssertTrue(bots.contains("BotsChrome.hitTarget"))
-        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "memory", "skills", "routines", "security", "desktop"])
+        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "memory", "skills", "routines", "security"])
         XCTAssertTrue(chrome.contains(BotsChrome.Label.agentic))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.currentGoal))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.todaysActivity))
@@ -4086,6 +5103,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.studio.identity"))
         XCTAssertTrue(bots.contains("bots.studio.routing"))
         XCTAssertTrue(bots.contains("bots.studio.soul"))
+        XCTAssertTrue(bots.contains("Empty uses the built-in teammate default"))
+        XCTAssertTrue(bots.contains("refreshGeneratedStandingInstructions"))
         XCTAssertTrue(
             bots.contains(".accessibilityLabel(BotsChrome.Label.instructions)"),
             "Soul TextArea must name Instructions the way Description names Description"
@@ -4099,8 +5118,12 @@ final class BotsWindowTests: XCTestCase {
             "Studio Memory TextArea must name the fact field the way Desk inspector does"
         )
         XCTAssertTrue(
-            bots.contains("field.setAccessibilityLabel(\"Remember a fact\")"),
-            "Correct memory NSTextField must name Remember a fact, not sit unlabeled in the alert"
+            bots.contains("bots.memory.correct.field"),
+            "Correct memory edits inline; the editing field must be identifiable"
+        )
+        XCTAssertFalse(
+            bots.contains("NSAlert()"),
+            "Correct memory must edit inline, not through a modal alert"
         )
         XCTAssertTrue(
             bots.contains("studioField(placeholder: \"Remember a fact\", text: $vm.memoryDraft)"),
@@ -4138,9 +5161,18 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertTrue(bots.contains("bots.studio.summary"))
         XCTAssertTrue(bots.contains("bots.studio.desktop.honesty"))
-        XCTAssertTrue(bots.contains("Role & Identity"))
-        XCTAssertTrue(bots.contains("Provider routing"))
-        XCTAssertTrue(bots.contains("Configuration summary"))
+        XCTAssertTrue(
+            bots.contains("BotsChrome.Label.roleAndIdentity") || chrome.contains("Role & Identity"),
+            "Studio Profile header must use the Role & Identity token"
+        )
+        XCTAssertTrue(
+            bots.contains("BotsChrome.Label.providerRouting") || chrome.contains("Provider routing"),
+            "Studio routing header must use the Provider routing token"
+        )
+        XCTAssertTrue(
+            bots.contains("BotsChrome.Label.configurationSummary") || chrome.contains("Configuration summary"),
+            "Studio summary header must use the Configuration summary token"
+        )
         XCTAssertTrue(bots.contains("AgentChatUserBubble"))
         XCTAssertTrue(bots.contains("AgentChatAssistantReply"))
         XCTAssertTrue(bots.contains("AgentChatComposerBar"))
@@ -4207,6 +5239,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.memory.list"))
         XCTAssertTrue(bots.contains("bots.memory.correct"))
         XCTAssertTrue(bots.contains("bots.memory.forget"))
+        XCTAssertTrue(bots.contains("bots.studio.skills.remove"))
         XCTAssertTrue(bots.contains("bots.routines.name"))
         XCTAssertTrue(bots.contains("bots.routines.instruction"))
         XCTAssertTrue(bots.contains("bots.routines.when"))
@@ -4235,6 +5268,23 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(settings.contains("settings.bots.desktopRemote.toggle"))
         XCTAssertFalse(main.contains("SurfaceType.bot"))
         XCTAssertFalse(bots.contains("SurfaceType.bot"))
+        XCTAssertTrue(
+            BotsChrome.avatarSymbols.contains("person.crop.circle"),
+            "the Avatar picker must include the default symbol so a new Bot has a selected chip"
+        )
+        XCTAssertEqual(
+            Set(BotsChrome.avatarSymbols).count,
+            BotsChrome.avatarSymbols.count,
+            "duplicate chips would make the selected Avatar look like two choices"
+        )
+        XCTAssertTrue(
+            bots.contains("BotsChrome.avatarSymbols"),
+            "Studio Avatar must be a symbol picker, not a raw SF Symbol text field"
+        )
+        XCTAssertFalse(
+            bots.contains("studioField(placeholder: \"person.crop.circle\""),
+            "users must not type person.crop.circle to set an Avatar"
+        )
 
         let scheduleTasks = try XCTUnwrap(sidebar.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
         let reportBug = try XCTUnwrap(sidebar.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))

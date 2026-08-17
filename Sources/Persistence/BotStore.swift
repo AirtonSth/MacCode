@@ -792,6 +792,25 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func removeSkillBinding(botID: BotID, skillID: String) throws {
+        let skillID = skillID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !skillID.isEmpty, !skillID.contains("/") else {
+            throw BotStoreError.invalidRow("skill id must be a catalog id, not a path")
+        }
+        try db.transaction {
+            guard let bot = try loadBot(id: botID, database: db), bot.deletedAt == nil else {
+                throw BotStoreError.notFound
+            }
+            let statement = try db.prepare(
+                "DELETE FROM bot_skill_bindings WHERE bot_id = ? AND skill_id = ?;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, botID.value.uuidString.lowercased())
+            try statement.bind(2, skillID)
+            _ = try statement.step()
+        }
+    }
+
     // MARK: - Internals
 
     private func publishLocked(

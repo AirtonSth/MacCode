@@ -42,7 +42,7 @@ public enum BotBrowserCatalog: Sendable {
     public static func description(for name: String) -> String {
         switch name {
         case open:
-            return "Open a URL in this bot's own persistent browser."
+            return "Open a website in this bot's own persistent browser."
         case get:
             return "Read this bot browser's last URL, title, and website-data keys."
         case waitLogin:
@@ -58,7 +58,10 @@ public enum BotBrowserCatalog: Sendable {
         case open:
             return [
                 "type": "object",
-                "properties": botID.merging(["url": ["type": "string"], "title": ["type": "string"]]) { _, new in new },
+                "properties": botID.merging([
+                    "url": ["type": "string", "description": "Website / last website. Same field as the URL to open."],
+                    "title": ["type": "string"],
+                ]) { _, new in new },
                 "required": ["url"],
             ]
         case get:
@@ -278,7 +281,11 @@ public struct BotBrowserService: Sendable {
         try assertOwn(Self.parseOptionalBotID(arguments["bot_id"]))
         switch name {
         case BotBrowserCatalog.open:
-            guard let url = arguments["url"] as? String else {
+            // Tools and compile say website / last website. Schema key stays url.
+            // set_settings leftover last_website already rejects and points
+            // here, so first-chat retried last_website on open. Accept that
+            // advertised name on the existing persist path.
+            guard let url = Self.firstString(arguments, keys: ["url", "website", "last_website"]) else {
                 throw BotBrowserError.invalid("url is required.")
             }
             let target = try open(url: url, title: arguments["title"] as? String)
@@ -317,5 +324,12 @@ public struct BotBrowserService: Sendable {
         guard let raw = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               let uuid = UUID(uuidString: raw) else { return nil }
         return BotID(uuid)
+    }
+
+    static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = arguments[key] as? String { return value }
+        }
+        return nil
     }
 }

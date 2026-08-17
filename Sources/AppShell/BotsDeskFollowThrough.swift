@@ -229,14 +229,20 @@ enum BotsDeskFollowThrough {
         revision: BotRevision,
         userText: String,
         memory: [BotMemoryItem] = [],
-        skills: [BotSkillBinding] = []
+        skills: [BotSkillBinding] = [],
+        routines: [BotRoutine] = [],
+        workspace: BotWorkspaceHonesty? = nil,
+        browser: BotBrowserTarget? = nil
     ) -> String {
         BotBrainCompiler.composeRunPrompt(
             bot: bot,
             revision: revision,
             userText: userText,
             memory: memory,
-            skills: skills
+            skills: skills,
+            routines: routines,
+            workspace: workspace,
+            browser: browser
         )
     }
 }

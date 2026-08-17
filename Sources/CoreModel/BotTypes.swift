@@ -153,6 +153,183 @@ public enum BotRoutineCopy {
         "Test runs are real work. App-closed schedules stay off until autonomy is enabled."
 }
 
+/// Desk always launches supervised. Self-config can persist leftover
+/// `full_access` / `auto_accept_edits`. Those must not compile as live power.
+public enum BotPermission {
+    public static let advertisedModes: [AgentPermissionMode] = [.supervised]
+
+    public static let honestyLabel =
+        "Supervised. Ask before tool actions. Host-brokered writes stay off."
+
+    public static func advertisedOrSupervised(_ mode: AgentPermissionMode) -> AgentPermissionMode {
+        advertisedModes.contains(mode) ? mode : .supervised
+    }
+}
+
+/// Studio provider picker already binds these models. A provider-only
+/// set_settings write must not keep the leftover model from the old route.
+public enum BotRoute {
+    /// Studio already says this next to Default route. Compile it so
+    /// first-chat cannot invent a second route.
+    public static let fallbackOrderHonesty =
+        "One published route. Fallback order is not shipped in P1a."
+
+    public static func defaultModel(for provider: AgentProvider) -> String {
+        switch provider {
+        case .claude: return "opus"
+        case .codex: return AgentDefaultModelSelection.codexBuiltInDefault
+        case .grok: return "grok-4.6"
+        }
+    }
+
+    /// Studio and compile say Claude / Codex / Grok. Parse must accept
+    /// those titles, not only the raw provider id.
+    public static func advertisedTitle(for provider: AgentProvider) -> String {
+        switch provider {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        case .grok: return "Grok"
+        }
+    }
+
+    /// Tools say Default route. Compile says "Grok · grok-4.6". Raw ids stay valid.
+    public static func parse(_ raw: String) -> (provider: AgentProvider, model: String?)? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let provider = parseProviderToken(trimmed) {
+            return (provider, nil)
+        }
+        let parts = trimmed.split(separator: "·", maxSplits: 1, omittingEmptySubsequences: true)
+        guard parts.count == 2, let provider = parseProviderToken(String(parts[0])) else {
+            return nil
+        }
+        let model = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (provider, model.isEmpty ? nil : model)
+    }
+
+    private static func parseProviderToken(_ raw: String) -> AgentProvider? {
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let provider = AgentProvider(rawValue: token.lowercased()) {
+            return provider
+        }
+        return AgentProvider.allCases.first {
+            advertisedTitle(for: $0).caseInsensitiveCompare(token) == .orderedSame
+        }
+    }
+}
+
+/// Studio Avatar is a chip picker. Tools must persist those names on the
+/// same publish path Studio Save already uses.
+public enum BotAvatar {
+    public static let advertisedSymbols: [String] = [
+        "person.crop.circle",
+        "brain.head.profile",
+        "hammer.fill",
+        "terminal.fill",
+        "sparkles",
+        "star.fill",
+        "ant.fill",
+        "leaf.fill",
+    ]
+
+    public static func advertisedName(for symbol: String) -> String {
+        switch symbol {
+        case "person.crop.circle": return "Person"
+        case "brain.head.profile": return "Brain"
+        case "hammer.fill": return "Hammer"
+        case "terminal.fill": return "Terminal"
+        case "sparkles": return "Sparkles"
+        case "star.fill": return "Star"
+        case "ant.fill": return "Ant"
+        case "leaf.fill": return "Leaf"
+        default: return symbol
+        }
+    }
+
+    /// Studio says Star / Person. The SF Symbol stays valid.
+    public static func parse(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if advertisedSymbols.contains(trimmed) { return trimmed }
+        return advertisedSymbols.first {
+            advertisedName(for: $0).caseInsensitiveCompare(trimmed) == .orderedSame
+        }
+    }
+}
+
+/// Hermes seeds `SOUL.md` and falls back when it is empty. OpenClaw seeds
+/// `SOUL.md` / `IDENTITY.md` on first run. An empty Bot soul used to compile
+/// as "No standing instructions." — a New Agent then only saw "You are New Agent."
+///
+/// Identity (name/role) is its own compile layer. Admitted tools are too —
+/// a custom soul must not hide Desk-admitted tools. The starter is replaceable
+/// standing rules.
+public enum BotStandingInstructions {
+    /// Unique last line so Studio can refresh the starter without overwriting a custom soul.
+    public static let generatedSignature =
+        "Do not invent tools, files, accounts, or access you do not have."
+
+    /// Must stay identical to `BotSelfConfigCatalog` mutate tools.
+    public static let rememberFactTool = "bot_put_memory"
+    public static let changeJobTool = "bot_set_settings"
+    public static let forgetFactTool = "bot_forget_memory"
+    public static let correctFactTool = "bot_correct_memory"
+    public static let setSkillTool = "bot_set_skill"
+    public static let removeSkillTool = "bot_remove_skill"
+    public static let saveRoutineTool = "bot_save_routine"
+    public static let setRoutineEnabledTool = "bot_set_routine_enabled"
+    /// Must stay identical to `BotBrowserCatalog.open` / `get` / `waitLogin`.
+    public static let openBrowserTool = "bot_browser_open"
+    public static let getBrowserTool = "bot_browser_get"
+    public static let waitLoginTool = "bot_browser_wait_login"
+
+    public static let generatedCapabilityLine =
+        "When asked to remember a fact, call \(rememberFactTool). When asked to change your name, Role, Instructions, description, Default route, Model, notifications, or avatar, call \(changeJobTool)."
+
+    public static let generatedMutateLine =
+        "When asked to forget a fact, call \(forgetFactTool). When asked to correct a fact, call \(correctFactTool). When asked to add a skill or set it Enabled or Off, call \(setSkillTool). When asked to remove a skill, call \(removeSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to set a routine Active or Off, call \(setRoutineEnabledTool)."
+
+    public static let generatedBrowserLine =
+        "When asked to open a website, call \(openBrowserTool). When asked what is open in that browser, call \(getBrowserTool). When asked to wait for a login, call \(waitLoginTool). That browser is this teammate's, not the user's."
+
+    /// Compiler layer. Starter soul must not own these names.
+    public static let admittedToolsText = [
+        generatedCapabilityLine,
+        generatedMutateLine,
+        generatedBrowserLine,
+    ].joined(separator: "\n")
+
+    public static func fallback(name _: String, title _: String, description _: String = "") -> String {
+        [
+            "Do the job. Ask when blocked. Prefer concrete work over ceremony.",
+            generatedSignature,
+        ].joined(separator: "\n")
+    }
+
+    public static func looksGenerated(_ soul: String) -> Bool {
+        let trimmed = soul.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || trimmed.hasSuffix(generatedSignature)
+    }
+
+    /// Custom soul wins. Empty or starter text resolves to the built-in default.
+    public static func resolved(
+        name: String,
+        title: String,
+        description: String = "",
+        soul: String
+    ) -> String {
+        if looksGenerated(soul) {
+            return fallback(name: name, title: title, description: description)
+        }
+        return soul.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func trimmedNonEmpty(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
 public struct BotDefinition: Codable, Sendable, Equatable {
     public static let liveAccountCap = 50
 

@@ -207,6 +207,16 @@ final class BotStoreTests: XCTestCase {
         }
     }
 
+    func test_removeSkillBinding_dropsOnlyThatCatalogId_becauseDisableIsNotUnbind() throws {
+        // WHY: Off still leaves the row on Studio Skills. Remove must delete
+        // the binding so the teammate no longer lists that catalog id.
+        let bot = try store.create(name: "Piper", title: "", description: "", provider: .claude)
+        try store.setSkillBinding(BotSkillBinding(botID: bot.id, skillID: "keep-me", enabled: true))
+        try store.setSkillBinding(BotSkillBinding(botID: bot.id, skillID: "drop-me", enabled: false))
+        try store.removeSkillBinding(botID: bot.id, skillID: "drop-me")
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).map(\.skillID), ["keep-me"])
+    }
+
     func test_contextReceiptRoundTrip_becausePreviewMustMatchThePersistedCall() throws {
         // WHY: Brain Inspector Source/Effective is a lie if the last receipt
         // cannot be reopened after restart.
@@ -248,7 +258,7 @@ final class BotStoreTests: XCTestCase {
         XCTAssertTrue(loaded.compiledPayload.contains("Prefers dark mode"))
         XCTAssertFalse(loaded.compiledPayload.contains("Old secret"))
         XCTAssertEqual(
-            loaded.memoryLayers.first(where: { $0.text == "Old secret" })?.included,
+            loaded.memoryLayers.first(where: { $0.text.contains("Old secret") })?.included,
             false
         )
     }

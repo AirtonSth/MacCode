@@ -119,6 +119,14 @@ public final class SidebarViewModel: ObservableObject {
         )
     }
 
+    /// Compact Token Saver footer sits beside the Insomnia toggle. The word
+    /// "Insomnia" becomes "Inso..." in a ~217pt Bots sidebar, so compact
+    /// chrome keeps the switch and omits the title. The toggle already names
+    /// the control for VoiceOver.
+    nonisolated public static func insomniaFooterTitle(compact: Bool) -> String? {
+        compact ? nil : "Insomnia"
+    }
+
     public enum InsomniaBatteryDecision {
         case disable
         case keepEnabled
@@ -4732,19 +4740,28 @@ public struct SidebarRootView: View {
     private var insomniaControl: some View {
         HStack(alignment: .center, spacing: DS.Space.sm) {
             insomniaToggle
-            // UX-MAC_SHELL_WINDOW-013: a subtitle summarises which power
-            // exceptions are active so the state is legible at a glance.
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Insomnia")
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                    .lineLimit(1)
+            // Compact Token Saver rings leave too little width for "Insomnia".
+            // Keep Off / Mac stays awake; hide the title so it cannot become Inso...
+            if let title = SidebarViewModel.insomniaFooterTitle(
+                compact: tokenSaverShowsCompactFooterControl
+            ) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.text)
+                        .fixedSize(horizontal: true, vertical: false)
+                    Text(insomniaStateSummary)
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                }
+                .frame(height: 32, alignment: .center)
+            } else {
                 Text(insomniaStateSummary)
                     .font(DS.Font.caption2)
                     .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
             }
-            .frame(height: 32, alignment: .center)
             Spacer(minLength: 0)
             insomniaOptionsMenu
         }
