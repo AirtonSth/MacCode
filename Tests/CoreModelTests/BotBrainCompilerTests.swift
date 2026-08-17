@@ -461,6 +461,37 @@ final class BotBrainCompilerTests: XCTestCase {
         )
     }
 
+    func test_admittedToolsCompileNamesRouteAndNotifications_becauseCustomSoulMustNotHideThem() {
+        // WHY: Compile already injects Route and Notifications. set_settings
+        // is the persist path. A custom soul must still see that those
+        // advertised writes go through the catalog tool.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Switch to Grok")
+        XCTAssertTrue(receipt.compiledPayload.contains("name, job, standing instructions, route, or notifications"))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.changeJobTool))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .tools })?.text,
+            BotStandingInstructions.admittedToolsText
+        )
+    }
+
     func test_routeOmitsEmptyModel_becauseDeskHidesAnUnsetModelPill() {
         // WHY: Desk modelLabel is hidden when the revision model is blank.
         // Compile must not invent a default the owner never advertised.

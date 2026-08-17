@@ -152,6 +152,24 @@ final class BotTypesTests: XCTestCase {
         )
     }
 
+    func test_admittedToolsNameRouteAndNotifications_becauseSetSettingsAlreadyPublishesThem() {
+        // WHY: Desk-admitted bot_set_settings already publishes name, route,
+        // and notifications. The tools line only named job/soul, so first-chat
+        // "switch to Grok" / "stop notifying me" invented a hop or a pretend
+        // change. Hermes agents know which self-config writes are live.
+        let tools = BotStandingInstructions.admittedToolsText
+        XCTAssertTrue(tools.contains(BotStandingInstructions.changeJobTool))
+        XCTAssertTrue(tools.contains("name, job, standing instructions, route, or notifications"))
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout")
+                .contains("route, or notifications"),
+            "tools layer owns the remaining set_settings writes"
+        )
+        XCTAssertFalse(tools.contains("handle"), "handle is create-only")
+        XCTAssertFalse(tools.contains("permission"), "leftover permission is not a live write")
+        XCTAssertFalse(tools.contains("desktop"), "leftover desktop is not a live write")
+    }
+
     func test_controlPlaneFlags_failClosed_becauseLaterPhasesMustNotRunWithoutTheShippedSlice() {
         let defaults = BotControlPlaneFlags()
         XCTAssertTrue(defaults.isBotControlPlaneActive, "P1a ships the control plane on")
