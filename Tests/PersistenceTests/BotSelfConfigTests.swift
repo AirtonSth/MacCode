@@ -203,6 +203,68 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNotNil(properties?["model"])
         XCTAssertNil(properties?["permission_mode"])
         XCTAssertNil(properties?["desktop_kind"])
+        let title = properties?["title"] as? [String: Any]
+        let soul = properties?["soul"] as? [String: Any]
+        let notify = properties?["notifications_enabled"] as? [String: Any]
+        XCTAssertEqual(title?["description"] as? String, "Role / job. Same field as Studio Role.")
+        XCTAssertEqual(soul?["description"] as? String, "Standing instructions.")
+        XCTAssertEqual(notify?["description"] as? String, "Notifications On/Off.")
+    }
+
+    func test_setSettingsAdvertisedNamesPersist_becauseToolsSayJobNotTitle() throws {
+        // WHY: Tools invite job / standing instructions / notifications.
+        // Parse only read title / soul / notifications_enabled, so first-chat
+        // "change your job" invented a hop or left Role untouched.
+        // Studio Role is the same field. Canonical keys still win.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromJob = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "job": "Night scout",
+        ])
+        XCTAssertEqual(fromJob.title, "Night scout", "job maps to title")
+        XCTAssertEqual(try store.get(id: bot.id)?.title, "Night scout")
+
+        let fromRole = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "role": "Reviewer",
+        ])
+        XCTAssertEqual(fromRole.title, "Reviewer")
+
+        let titleWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "title": "Lead",
+            "job": "Ignored job",
+            "role": "Ignored role",
+        ])
+        XCTAssertEqual(titleWins.title, "Lead", "title wins")
+
+        let fromStanding = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "standing_instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromStanding.soul, "Own the inbox.")
+
+        let soulWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "soul": "Speak plainly.",
+            "standing_instructions": "Ignored soul",
+        ])
+        XCTAssertEqual(soulWins.soul, "Speak plainly.", "soul wins")
+
+        let fromNotify = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications": false,
+        ])
+        XCTAssertFalse(fromNotify.notificationsEnabled)
+
+        let notifyWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications_enabled": true,
+            "notifications": false,
+        ])
+        XCTAssertTrue(notifyWins.notificationsEnabled, "notifications_enabled wins")
+        XCTAssertEqual(try store.get(id: bot.id)?.title, "Lead")
     }
 
     func test_setSettingsProviderWithoutModelBindsAdvertisedRoute_becauseLeftoverModelIsNotLive() throws {

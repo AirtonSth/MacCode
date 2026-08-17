@@ -89,13 +89,13 @@ public enum BotSelfConfigCatalog: Sendable {
                 "type": "object",
                 "properties": botID.merging([
                     "name": ["type": "string"],
-                    "title": ["type": "string"],
+                    "title": ["type": "string", "description": "Role / job. Same field as Studio Role."],
                     "description": ["type": "string"],
-                    "soul": ["type": "string"],
+                    "soul": ["type": "string", "description": "Standing instructions."],
                     "provider": ["type": "string"],
                     "provider_instance_id": ["type": "string"],
                     "model": ["type": "string"],
-                    "notifications_enabled": ["type": "boolean"],
+                    "notifications_enabled": ["type": "boolean", "description": "Notifications On/Off."],
                 ]) { _, new in new },
             ]
         case putMemory:
@@ -531,9 +531,15 @@ public struct BotSelfConfigService: Sendable {
     static func parsePatch(_ arguments: [String: Any]) throws -> BotSelfConfigPatch {
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
-        if let title = arguments["title"] as? String { patch.title = title }
+        // Tools and Studio say job / Role. Schema key stays title.
+        if let title = firstString(arguments, keys: ["title", "job", "role"]) {
+            patch.title = title
+        }
         if let description = arguments["description"] as? String { patch.description = description }
-        if let soul = arguments["soul"] as? String { patch.soul = soul }
+        // Tools say standing instructions. Schema key stays soul.
+        if let soul = firstString(arguments, keys: ["soul", "standing_instructions"]) {
+            patch.soul = soul
+        }
         if let model = arguments["model"] as? String { patch.model = model }
         if let instance = arguments["provider_instance_id"] as? String { patch.providerInstanceID = instance }
         if let raw = arguments["provider"] as? String {
@@ -554,10 +560,18 @@ public struct BotSelfConfigService: Sendable {
             }
             patch.desktopKind = kind
         }
-        if arguments["notifications_enabled"] != nil {
-            patch.notificationsEnabled = try parseBool(arguments["notifications_enabled"], label: "notifications_enabled")
+        if arguments["notifications_enabled"] != nil || arguments["notifications"] != nil {
+            let value = arguments["notifications_enabled"] ?? arguments["notifications"]
+            patch.notificationsEnabled = try parseBool(value, label: "notifications_enabled")
         }
         return patch
+    }
+
+    static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = arguments[key] as? String { return value }
+        }
+        return nil
     }
 
     static func parseUUID(_ value: Any?, label: String) throws -> UUID {
