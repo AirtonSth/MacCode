@@ -231,7 +231,8 @@ enum BotsDeskFollowThrough {
         memory: [BotMemoryItem] = [],
         skills: [BotSkillBinding] = [],
         routines: [BotRoutine] = [],
-        workspace: BotWorkspaceHonesty? = nil
+        workspace: BotWorkspaceHonesty? = nil,
+        browser: BotBrowserTarget? = nil
     ) -> String {
         BotBrainCompiler.composeRunPrompt(
             bot: bot,
@@ -240,7 +241,8 @@ enum BotsDeskFollowThrough {
             memory: memory,
             skills: skills,
             routines: routines,
-            workspace: workspace
+            workspace: workspace,
+            browser: browser
         )
     }
 }

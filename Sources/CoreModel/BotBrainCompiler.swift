@@ -21,6 +21,7 @@ public struct BotContextLayer: Codable, Sendable, Equatable, Identifiable {
         case memory
         case skill
         case routine
+        case browser
         case user
     }
 
@@ -135,6 +136,7 @@ public enum BotBrainCompiler {
         skills: [BotSkillBinding] = [],
         routines: [BotRoutine] = [],
         workspace: BotWorkspaceHonesty? = nil,
+        browser: BotBrowserTarget? = nil,
         conversationID: BotConversationID? = nil,
         runID: AgentRunID? = nil,
         now: Date = Date()
@@ -146,7 +148,8 @@ public enum BotBrainCompiler {
             memory: memory,
             skills: skills,
             routines: routines,
-            workspace: workspace
+            workspace: workspace,
+            browser: browser
         )
         return ContextAssemblyReceipt(
             botID: bot.id,
@@ -168,7 +171,8 @@ public enum BotBrainCompiler {
                 memory: memory,
                 skills: skills,
                 routines: routines,
-                workspace: workspace
+                workspace: workspace,
+                browser: browser
             ),
             assembledAt: now
         )
@@ -182,7 +186,8 @@ public enum BotBrainCompiler {
         memory: [BotMemoryItem] = [],
         skills: [BotSkillBinding] = [],
         routines: [BotRoutine] = [],
-        workspace: BotWorkspaceHonesty? = nil
+        workspace: BotWorkspaceHonesty? = nil,
+        browser: BotBrowserTarget? = nil
     ) -> String {
         var lines: [String] = []
         if let identity = identityLine(
@@ -198,6 +203,9 @@ public enum BotBrainCompiler {
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
         lines.append("Route: \(routeLine(provider: revision.provider, model: revision.model))")
         lines.append(BotStandingInstructions.admittedToolsText)
+        if let browser = browserLine(browser) {
+            lines.append(browser)
+        }
         if let description = descriptionLine(revision.description) {
             lines.append(description)
         }
@@ -238,6 +246,16 @@ public enum BotBrainCompiler {
         let isolation = revision.desktopKind.advertisedOrLogical.honestyLabel
         let place = workspace?.placeLabel ?? ""
         return place.isEmpty ? isolation : "\(place). \(isolation)"
+    }
+
+    /// Tools already persist last website. Compile it labeled so first-chat
+    /// "what's open?" cannot invent a URL. Empty stays omitted. Custom soul
+    /// must not hide the advertised last website. Cookies stay out.
+    static func browserLine(_ target: BotBrowserTarget?) -> String? {
+        let url = target?.url.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !url.isEmpty else { return nil }
+        let title = target?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return title.isEmpty ? "Browser: \(url)" : "Browser: \(title) (\(url))"
     }
 
     /// Studio already shows Description. Compile it labeled so first-chat
@@ -334,7 +352,8 @@ public enum BotBrainCompiler {
         memory: [BotMemoryItem],
         skills: [BotSkillBinding],
         routines: [BotRoutine],
-        workspace: BotWorkspaceHonesty? = nil
+        workspace: BotWorkspaceHonesty? = nil,
+        browser: BotBrowserTarget? = nil
     ) -> [BotContextLayer] {
         var layers: [BotContextLayer] = []
         if let identity = identityLine(
@@ -420,6 +439,19 @@ public enum BotBrainCompiler {
                 reason: "Desk-admitted tools. Custom soul must not hide them."
             )
         )
+
+        if let browser = browserLine(browser) {
+            layers.append(
+                BotContextLayer(
+                    id: "browser",
+                    kind: .browser,
+                    title: "Browser",
+                    text: browser,
+                    included: true,
+                    reason: "Advertised last website. Tools already persist it."
+                )
+            )
+        }
 
         if let description = descriptionLine(revision.description) {
             layers.append(

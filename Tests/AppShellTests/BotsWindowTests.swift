@@ -1528,6 +1528,47 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(piper.workspaceID, workspace.id)
     }
 
+    func test_previewBrainIncludesAdvertisedBrowser_becauseDestMustNotOmitTheLastWebsite() throws {
+        // WHY: Tools already persist last website. Dest preview never sent
+        // URL/title, so first-chat "what's open?" invented a hop. Dest
+        // preview and compose must share the advertised last website.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        let store = BotBrowserStore(appSupportDirectory: context.appSupportDirectory)
+        try store.persistTarget(
+            BotBrowserTarget(url: "https://github.com/remotecode", title: "GitHub"),
+            botID: piper.id
+        )
+        vm.composerText = "What's open?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(vm.advertisedBrowser?.url, "https://github.com/remotecode")
+        XCTAssertEqual(vm.advertisedBrowser?.title, "GitHub")
+        XCTAssertTrue(preview.compiledPayload.contains("Browser: GitHub (https://github.com/remotecode)"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(preview.compiledPayload.contains("secret-token"), "cookies stay out")
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What's open?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace,
+                browser: vm.advertisedBrowser
+            )
+        )
+        XCTAssertEqual(
+            preview.layers.first(where: { $0.kind == .browser })?.text,
+            "Browser: GitHub (https://github.com/remotecode)"
+        )
+    }
+
     func test_previewBrainIncludesAdvertisedNotifications_becauseDestMustNotOmitAlerts() throws {
         // WHY: Studio already shows Notifications On/Off. Brain compile never
         // sent that toggle, so first-chat "will you notify me?" invented

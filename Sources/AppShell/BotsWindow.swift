@@ -1355,6 +1355,16 @@ public final class BotsViewModel: ObservableObject {
         return name.isEmpty ? "None" : name
     }
 
+    /// Same last website tools persist. Compile URL + title so first-chat
+    /// cannot invent a page. Blank URL compiles as omitted.
+    public var advertisedBrowser: BotBrowserTarget? {
+        guard let bot = selectedBot else { return nil }
+        let store = BotBrowserStore(appSupportDirectory: context.appSupportDirectory)
+        guard let target = try? store.loadTarget(botID: bot.id) else { return nil }
+        let url = target.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        return url.isEmpty ? nil : target
+    }
+
     public var studioRouteLabel: String {
         switch studioDraft.provider {
         case .claude: return "Claude"
@@ -1406,6 +1416,7 @@ public final class BotsViewModel: ObservableObject {
                 "\($0.definition.id.value.uuidString):\($0.activation.isEnabled):\($0.definition.name):\($0.definition.prompt):\($0.definition.scheduleNote)"
             }.joined(separator: ","),
             advertisedWorkspace?.placeLabel ?? "",
+            advertisedBrowser.map { "\($0.title)\u{1d}\($0.url)" } ?? "",
             selectedConversation?.id.value.uuidString ?? "",
             bot.notificationsEnabled ? "n1" : "n0",
         ].joined(separator: "\u{1f}")
@@ -1421,6 +1432,7 @@ public final class BotsViewModel: ObservableObject {
             skills: skillBindings,
             routines: routines,
             workspace: advertisedWorkspace,
+            browser: advertisedBrowser,
             conversationID: selectedConversation?.id
         )
         cachedPreviewBrainKey = key
@@ -2882,6 +2894,7 @@ public final class BotsViewModel: ObservableObject {
                 skills: skills,
                 routines: routines,
                 workspace: advertisedWorkspace,
+                browser: advertisedBrowser,
                 conversationID: conversation.id
             )
             try botStore.insertContextReceipt(receipt)

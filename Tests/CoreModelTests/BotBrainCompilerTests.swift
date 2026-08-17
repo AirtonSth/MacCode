@@ -461,6 +461,120 @@ final class BotBrainCompilerTests: XCTestCase {
         )
     }
 
+    func test_browserHonestyCompilesForCustomSoul_becauseLastWebsiteIsNotAnEscapeHatch() {
+        // WHY: Tools already persist last website. Brain compile never sent
+        // it, so first-chat "what's open?" invented a hop or a URL. A written
+        // soul must not hide the advertised last website.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let browser = BotBrowserTarget(url: "https://github.com/remotecode", title: "GitHub")
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "What's open?",
+            browser: browser
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("Browser: GitHub (https://github.com/remotecode)"), "Browser: GitHub")
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .browser })?.included, true)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .browser })?.text,
+            "Browser: GitHub (https://github.com/remotecode)"
+        )
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .browser })?.reason,
+            "Advertised last website. Tools already persist it."
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Browser:"),
+            "browser honesty is a compiler layer"
+        )
+    }
+
+    func test_emptyBrowserDoesNotInventAURL_becauseCompileMustNotAdvertiseNone() {
+        // WHY: No last website is not "None". Compile must omit the layer
+        // so first-chat cannot treat an empty browser as a page.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let blank = BotBrowserTarget(url: "  ", title: "  ")
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "What's open?",
+            browser: blank
+        )
+        XCTAssertFalse(receipt.compiledPayload.contains("Browser:"), "empty browser")
+        XCTAssertNil(receipt.layers.first(where: { $0.kind == .browser }))
+        XCTAssertFalse(receipt.compiledPayload.contains("None"))
+    }
+
+    func test_browserHonestyOmitsCookies_becauseWebsiteDataIsNotACompileLayer() {
+        // WHY: get already returns website-data keys. Compile must not dump
+        // cookies into the adapter payload.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let page = BotBrowserPageState(
+            url: "https://github.com/remotecode",
+            title: "GitHub",
+            cookies: ["session": "secret-token"]
+        )
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "What's open?",
+            browser: BotBrowserTarget(url: page.url, title: page.title)
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("Browser: GitHub (https://github.com/remotecode)"))
+        XCTAssertFalse(receipt.compiledPayload.contains("secret-token"), "cookies stay out")
+        XCTAssertFalse(receipt.compiledPayload.contains("session"))
+    }
+
     func test_routeHonestyCompilesForCustomSoul_becauseDeskRouteIsNotAnEscapeHatch() {
         // WHY: Desk already shows provider + model. Brain compile never sent
         // them, so first-chat "what model are you?" invented a route. Route
