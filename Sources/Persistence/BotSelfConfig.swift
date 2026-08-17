@@ -770,6 +770,15 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedWebsiteKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.websiteHonesty)
         }
+        // Studio dest title already says Admitted tools. Compile already
+        // labels Admitted tools. leftover identity already rejects. leftover
+        // admitted_tools still succeeded empty, so first-chat invented a
+        // persist from the dest title. Schema does not grow an
+        // admitted_tools write key. Desk admits the list. Name still
+        // persists. Dest title stays Admitted tools.
+        if arguments.keys.contains(where: Self.isAdvertisedAdmittedToolsKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.workspaceHostAssignedHonesty)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -1042,6 +1051,18 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "url"
             || normalized == "last_website"
             || normalized == "browser"
+    }
+
+    /// admitted_tools is not a schema write key. Studio / compile dest
+    /// title Admitted tools, so parse must fail loud instead of succeeding
+    /// empty. leftover tools / admitted are the same write — layer id
+    /// tools and dest title first word. Desk admits the list. Schema
+    /// does not grow an admitted_tools write key.
+    static func isAdvertisedAdmittedToolsKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "admitted_tools"
+            || normalized == "tools"
+            || normalized == "admitted"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {
