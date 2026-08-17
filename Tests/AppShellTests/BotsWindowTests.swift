@@ -1636,6 +1636,39 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesAdvertisedSkills_becauseDestMustNotSayEnabledSkills() throws {
+        // WHY: Studio already says Skills. Compile listed Enabled skills, so
+        // first-chat "which Skills?" invented a hop. Dest preview and compose
+        // must share the advertised name. Off stays out.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.skillDraft = "weekly-account-health"
+        vm.addSkill()
+        vm.skillDraft = "off-skill"
+        vm.addSkill()
+        vm.setSkillEnabled(skillID: "off-skill", enabled: false)
+        vm.composerText = "Which Skills?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(preview.compiledPayload.contains("Enabled skills"))
+        XCTAssertFalse(preview.compiledPayload.contains("off-skill"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Which Skills?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
     func test_previewBrainIncludesEnabledRoutine_becauseDestMustNotOmitSchedules() throws {
         // WHY: Brain Inspector / Desk send used dest memory+skills and
         // skipped dest routines. Owner-authored Morning scan never reached
@@ -3930,7 +3963,8 @@ final class BotsWindowTests: XCTestCase {
 
         XCTAssertTrue(prompt.contains("Prefers dark mode"))
         XCTAssertFalse(prompt.contains("Old secret"))
-        XCTAssertTrue(prompt.contains("weekly-account-health"))
+        XCTAssertTrue(prompt.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(prompt.contains("Enabled skills"))
         XCTAssertFalse(prompt.contains("off-skill"))
         XCTAssertTrue(prompt.contains("Summarize overnight"))
     }

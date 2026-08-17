@@ -71,7 +71,8 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertFalse(receipt.compiledPayload.contains("Rumor"))
         XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(forgotten.id.value)))
         XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(untrusted.id.value)))
-        XCTAssertTrue(receipt.compiledPayload.contains("weekly-account-health"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Enabled skills"))
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
         XCTAssertTrue(receipt.compiledPayload.contains("Working space: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertTrue(receipt.compiledPayload.contains("Permission: \(BotPermission.honestyLabel)"))
@@ -848,6 +849,46 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(
             receipt.layers.first(where: { $0.text.contains("Nightly archive") })?.reason,
             "Off. Not injected."
+        )
+    }
+
+    func test_skillsCompileAndOffStaysOut_becauseStudioAlreadySaysSkills() {
+        // WHY: Studio already says Skills. Compile listed Enabled skills, so
+        // first-chat "which Skills?" invented a hop. Hermes agents see the
+        // advertised catalog name. Off stays out.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let enabled = BotSkillBinding(botID: bot.id, skillID: "weekly-account-health", enabled: true)
+        let disabled = BotSkillBinding(botID: bot.id, skillID: "off-skill", enabled: false)
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Which Skills?",
+            skills: [enabled, disabled]
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Enabled skills"))
+        XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
+        XCTAssertEqual(receipt.layers.first(where: { $0.text == "weekly-account-health" })?.included, true)
+        XCTAssertEqual(receipt.layers.first(where: { $0.text == "off-skill" })?.included, false)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.text == "off-skill" })?.reason,
+            "Disabled. Not injected."
         )
     }
 

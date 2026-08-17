@@ -226,7 +226,9 @@ public enum BotBrainCompiler {
         }
         let enabled = skills.filter(\.enabled).map(\.skillID).sorted()
         if !enabled.isEmpty {
-            lines.append("Enabled skills: \(enabled.joined(separator: ", "))")
+            // Studio already says Skills. Compile that name so first-chat
+            // "which Skills?" cannot invent a hop. Off stays out.
+            lines.append("Skills: \(enabled.joined(separator: ", "))")
         }
         let liveRoutines = routines.filter(\.activation.isEnabled)
             .sorted { $0.definition.name.localizedCaseInsensitiveCompare($1.definition.name) == .orderedAscending }
