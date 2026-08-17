@@ -78,7 +78,8 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(receipt.compiledPayload.contains("Skills: weekly-account-health"))
         XCTAssertFalse(receipt.compiledPayload.contains("Enabled skills"))
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotBrainCompiler.workspaceHostAssignedHonesty)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertTrue(receipt.compiledPayload.contains("Permission: \(BotPermission.honestyLabel)"))
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Old secret") })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Rumor") })?.included, false)
@@ -111,11 +112,15 @@ final class BotBrainCompilerTests: XCTestCase {
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: leftover, userText: "Hi")
         XCTAssertEqual(receipt.desktopKind, .logicalExecutionSpace)
         XCTAssertEqual(receipt.desktopKind.honestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
-        XCTAssertTrue(receipt.compiledPayload.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        XCTAssertTrue(receipt.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertFalse(receipt.compiledPayload.contains("Guest is not running"))
         XCTAssertEqual(
-            receipt.layers.first(where: { $0.kind == .desktop })?.text,
-            "\(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.workspaceHostAssignedHonesty)"
+            receipt.layers.first(where: { $0.title == "Working space" })?.text,
+            BotBrainCompiler.workspaceHostAssignedHonesty
+        )
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.title == "Desktop" })?.text,
+            "\(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"
         )
     }
 
@@ -142,13 +147,13 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Are you isolated?")
-        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .desktop })?.included, true)
+        XCTAssertEqual(receipt.layers.first(where: { $0.title == "Desktop" })?.included, true)
         XCTAssertEqual(
-            receipt.layers.first(where: { $0.kind == .desktop })?.reason,
-            "Advertised workspace and execution space. Leftover VM kinds compile as logical space."
+            receipt.layers.first(where: { $0.title == "Desktop" })?.reason,
+            "Advertised execution space. Leftover VM kinds compile as logical space."
         )
     }
 
@@ -181,14 +186,19 @@ final class BotBrainCompilerTests: XCTestCase {
             userText: "Which repo is this?",
             workspace: workspace
         )
-        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.workspaceHostAssignedHonesty)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app). \(BotBrainCompiler.workspaceHostAssignedHonesty)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertFalse(receipt.compiledPayload.contains("Working space:"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .desktop })?.included, true)
+        XCTAssertEqual(receipt.layers.first(where: { $0.title == "Working space" })?.included, true)
         XCTAssertEqual(
-            receipt.layers.first(where: { $0.kind == .desktop })?.text,
-            "macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.workspaceHostAssignedHonesty)"
+            receipt.layers.first(where: { $0.title == "Working space" })?.text,
+            "macos-app (/tmp/macos-app). \(BotBrainCompiler.workspaceHostAssignedHonesty)"
+        )
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.title == "Desktop" })?.text,
+            "\(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"
         )
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("macos-app"),
@@ -224,12 +234,13 @@ final class BotBrainCompilerTests: XCTestCase {
             workspace: blank
         )
         XCTAssertEqual(blank.placeLabel, "")
-        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.workspaceHostAssignedHonesty)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotBrainCompiler.workspaceHostAssignedHonesty)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertFalse(receipt.compiledPayload.contains("Workspace: None"))
         XCTAssertFalse(receipt.compiledPayload.contains("Working space:"))
         XCTAssertEqual(
-            receipt.layers.first(where: { $0.kind == .desktop })?.text,
-            "\(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.workspaceHostAssignedHonesty)"
+            receipt.layers.first(where: { $0.title == "Working space" })?.text,
+            BotBrainCompiler.workspaceHostAssignedHonesty
         )
     }
 
@@ -270,9 +281,84 @@ final class BotBrainCompilerTests: XCTestCase {
             "tools must not advertise a workspace write"
         )
         XCTAssertFalse(
+            BotStandingInstructions.admittedToolsText.contains("Desktop"),
+            "tools must not advertise a Desktop write"
+        )
+        XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")
                 .contains(BotBrainCompiler.workspaceHostAssignedHonesty),
             "workspace honesty is a compiler layer, not starter soul"
+        )
+    }
+
+    func test_desktopHonestyCompilesSeparateFromWorkspace_becauseStudioDesktopIsNotAHop() {
+        // WHY: Studio already says Desktop. Compile folded isolation into
+        // Workspace, so first-chat "which Desktop?" invented a hop. Hermes
+        // agents know their execution space even when SOUL.md is custom.
+        // Leftover VM kinds still compile as Logical execution space.
+        // Dest Source title left on Working space.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let leftover = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .dedicatedLocalVM,
+            digest: "x"
+        )
+        let workspace = BotWorkspaceHonesty(name: "macos-app", cwd: "/tmp/macos-app")
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Which Desktop?",
+            workspace: workspace
+        )
+        let leftoverReceipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: leftover,
+            userText: "Which Desktop?"
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app). \(BotBrainCompiler.workspaceHostAssignedHonesty)"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Working space:"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            leftoverReceipt.layers.first(where: { $0.title == "Desktop" })?.text,
+            "\(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"
+        )
+        XCTAssertFalse(leftoverReceipt.compiledPayload.contains("Dedicated local VM"))
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Desktop:"),
+            "Desktop honesty is a compiler layer, not starter soul"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.admittedToolsText.contains("Desktop"),
+            "tools must not advertise a Desktop write"
         )
     }
 

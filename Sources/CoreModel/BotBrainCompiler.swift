@@ -210,10 +210,14 @@ public enum BotBrainCompiler {
             lines.append(identity)
         }
         // Studio already says Workspace. Compile that name so first-chat
-        // "which Workspace?" cannot invent a hop. Isolation honesty stays
-        // on this line. Host-assigned honesty stays so first-chat cannot
-        // invent a set_settings write. Dest Source title stays Working space.
-        lines.append("Workspace: \(workingSpaceText(for: revision, workspace: workspace))")
+        // "which Workspace?" cannot invent a hop. Host-assigned honesty
+        // stays so first-chat cannot invent a set_settings write. Dest
+        // Source title stays Working space.
+        lines.append("Workspace: \(workingSpaceText(workspace))")
+        // Studio already says Desktop. Compile that name so first-chat
+        // "which Desktop?" cannot invent a hop. Isolation honesty lives
+        // here, not on Workspace. Leftover VM kinds compile as logical.
+        lines.append("Desktop: \(desktopText(for: revision))")
         lines.append("Permission: \(BotPermission.honestyLabel)")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
         lines.append("Route: \(routeLine(provider: revision.provider, model: revision.model))")
@@ -264,14 +268,18 @@ public enum BotBrainCompiler {
         return lines.joined(separator: "\n\n")
     }
 
-    static func workingSpaceText(
-        for revision: BotRevision,
-        workspace: BotWorkspaceHonesty? = nil
-    ) -> String {
-        let isolation = revision.desktopKind.advertisedOrLogical.honestyLabel
+    static func workingSpaceText(_ workspace: BotWorkspaceHonesty? = nil) -> String {
         let place = workspace?.placeLabel ?? ""
-        let body = place.isEmpty ? isolation : "\(place). \(isolation)"
-        return "\(body) \(workspaceHostAssignedHonesty)"
+        return place.isEmpty ? workspaceHostAssignedHonesty : "\(place). \(workspaceHostAssignedHonesty)"
+    }
+
+    /// Studio already says Desktop. Compile display title + isolation so
+    /// first-chat "which Desktop?" cannot invent a hop or a VM. Leftover
+    /// Dedicated local VM / Managed remote Mac compile as Logical
+    /// execution space. Not a self-config write — schema omits it.
+    static func desktopText(for revision: BotRevision) -> String {
+        let kind = revision.desktopKind.advertisedOrLogical
+        return "\(kind.displayTitle). \(kind.honestyLabel)"
     }
 
     /// Tools already persist last website. Compile it labeled so first-chat
@@ -437,9 +445,20 @@ public enum BotBrainCompiler {
                 id: "desktop",
                 kind: .desktop,
                 title: "Working space",
-                text: workingSpaceText(for: revision, workspace: workspace),
+                text: workingSpaceText(workspace),
                 included: true,
-                reason: "Advertised workspace and execution space. Leftover VM kinds compile as logical space."
+                reason: "Advertised workspace. Host-assigned. Leftover folder writes stay off."
+            )
+        )
+
+        layers.append(
+            BotContextLayer(
+                id: "desktop-kind",
+                kind: .desktop,
+                title: "Desktop",
+                text: desktopText(for: revision),
+                included: true,
+                reason: "Advertised execution space. Leftover VM kinds compile as logical space."
             )
         )
 

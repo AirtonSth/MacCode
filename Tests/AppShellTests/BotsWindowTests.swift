@@ -1512,7 +1512,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.studioWorkspaceLabel, "macos-app")
         XCTAssertTrue(preview.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app)."))
         XCTAssertFalse(preview.compiledPayload.contains("Working space:"))
-        XCTAssertTrue(preview.compiledPayload.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        XCTAssertTrue(preview.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.workspaceHostAssignedHonesty))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
         XCTAssertEqual(
@@ -1528,6 +1528,34 @@ final class BotsWindowTests: XCTestCase {
             )
         )
         XCTAssertEqual(piper.workspaceID, workspace.id)
+    }
+
+    func test_previewBrainIncludesAdvertisedDesktop_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio already says Desktop. Compile folded isolation into
+        // Workspace, so first-chat "which Desktop?" invented a hop. Dest
+        // preview and compose must share that advertised name.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "Which Desktop?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(vm.studioDesktopSummary, BotDesktopKind.logicalExecutionSpace.displayTitle)
+        XCTAssertTrue(preview.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertFalse(preview.compiledPayload.contains("Working space:"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Which Desktop?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
     }
 
     func test_previewBrainIncludesAdvertisedBrowser_becauseDestMustNotOmitTheLastWebsite() throws {
