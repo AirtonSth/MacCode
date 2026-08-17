@@ -176,6 +176,41 @@ public enum BotRoute {
         case .grok: return "grok-4.6"
         }
     }
+
+    /// Studio and compile say Claude / Codex / Grok. Parse must accept
+    /// those titles, not only the raw provider id.
+    public static func advertisedTitle(for provider: AgentProvider) -> String {
+        switch provider {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        case .grok: return "Grok"
+        }
+    }
+
+    /// Tools say route. Compile says "Grok · grok-4.6". Raw ids stay valid.
+    public static func parse(_ raw: String) -> (provider: AgentProvider, model: String?)? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let provider = parseProviderToken(trimmed) {
+            return (provider, nil)
+        }
+        let parts = trimmed.split(separator: "·", maxSplits: 1, omittingEmptySubsequences: true)
+        guard parts.count == 2, let provider = parseProviderToken(String(parts[0])) else {
+            return nil
+        }
+        let model = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (provider, model.isEmpty ? nil : model)
+    }
+
+    private static func parseProviderToken(_ raw: String) -> AgentProvider? {
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let provider = AgentProvider(rawValue: token.lowercased()) {
+            return provider
+        }
+        return AgentProvider.allCases.first {
+            advertisedTitle(for: $0).caseInsensitiveCompare(token) == .orderedSame
+        }
+    }
 }
 
 /// Hermes seeds `SOUL.md` and falls back when it is empty. OpenClaw seeds

@@ -201,8 +201,11 @@ final class BotSelfConfigTests: XCTestCase {
         let properties = schema["properties"] as? [String: Any]
         XCTAssertNotNil(properties?["provider"])
         XCTAssertNotNil(properties?["model"])
+        XCTAssertNil(properties?["route"], "route is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["permission_mode"])
         XCTAssertNil(properties?["desktop_kind"])
+        let provider = properties?["provider"] as? [String: Any]
+        XCTAssertEqual(provider?["description"] as? String, "Route. Claude, Codex, or Grok.")
         let title = properties?["title"] as? [String: Any]
         let soul = properties?["soul"] as? [String: Any]
         let notify = properties?["notifications_enabled"] as? [String: Any]
@@ -296,6 +299,62 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(modelOnly.provider, AgentProvider.claude.rawValue)
         XCTAssertEqual(modelOnly.model, "opus")
         XCTAssertEqual(modelOnly.providerInstanceID, "claude-work")
+    }
+
+    func test_setSettingsAdvertisedRouteNamesPersist_becauseToolsSayGrokNotRawId() throws {
+        // WHY: Tools invite route. Studio and compile say Claude / Codex /
+        // Grok. Parse only read provider raw values, so first-chat
+        // "switch to Grok" invented a hop or left opus. Canonical
+        // provider still wins. Explicit model still wins.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromTitle = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "provider": "Grok",
+        ])
+        XCTAssertEqual(fromTitle.provider, AgentProvider.grok.rawValue)
+        XCTAssertEqual(fromTitle.model, BotRoute.defaultModel(for: .grok))
+
+        let fromRoute = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "route": "Claude",
+        ])
+        XCTAssertEqual(fromRoute.provider, AgentProvider.claude.rawValue)
+        XCTAssertEqual(fromRoute.model, BotRoute.defaultModel(for: .claude))
+
+        let providerWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "provider": "codex",
+            "route": "Grok",
+        ])
+        XCTAssertEqual(providerWins.provider, AgentProvider.codex.rawValue, "provider wins")
+        XCTAssertEqual(providerWins.model, BotRoute.defaultModel(for: .codex))
+
+        let fromCompiled = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "route": "Grok · grok-4.6",
+        ])
+        XCTAssertEqual(fromCompiled.provider, AgentProvider.grok.rawValue)
+        XCTAssertEqual(fromCompiled.model, "grok-4.6")
+
+        let modelWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "provider": "Claude",
+            "model": "sonnet",
+        ])
+        XCTAssertEqual(modelWins.provider, AgentProvider.claude.rawValue)
+        XCTAssertEqual(modelWins.model, "sonnet")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "route": "ChatGPT",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid("Unknown provider: ChatGPT"))
+        }
     }
 
     func test_leftoverPermissionSnapshotStaysSupervised_becauseFullAccessIsNotLive() throws {

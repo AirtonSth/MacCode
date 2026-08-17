@@ -92,7 +92,7 @@ public enum BotSelfConfigCatalog: Sendable {
                     "title": ["type": "string", "description": "Role / job. Same field as Studio Role."],
                     "description": ["type": "string"],
                     "soul": ["type": "string", "description": "Standing instructions."],
-                    "provider": ["type": "string"],
+                    "provider": ["type": "string", "description": "Route. Claude, Codex, or Grok."],
                     "provider_instance_id": ["type": "string"],
                     "model": ["type": "string"],
                     "notifications_enabled": ["type": "boolean", "description": "Notifications On/Off."],
@@ -542,11 +542,15 @@ public struct BotSelfConfigService: Sendable {
         }
         if let model = arguments["model"] as? String { patch.model = model }
         if let instance = arguments["provider_instance_id"] as? String { patch.providerInstanceID = instance }
-        if let raw = arguments["provider"] as? String {
-            guard let provider = AgentProvider(rawValue: raw) else {
+        // Tools and Studio say route / Grok. Schema key stays provider.
+        if let raw = firstString(arguments, keys: ["provider", "route"]) {
+            guard let parsed = BotRoute.parse(raw) else {
                 throw BotSelfConfigError.invalid("Unknown provider: \(raw)")
             }
-            patch.provider = provider
+            patch.provider = parsed.provider
+            if patch.model == nil, let model = parsed.model {
+                patch.model = model
+            }
         }
         if let raw = arguments["permission_mode"] as? String {
             guard let mode = AgentPermissionMode(rawValue: raw) else {

@@ -164,6 +164,14 @@ final class BotTypesTests: XCTestCase {
         XCTAssertEqual(BotRoute.defaultModel(for: .claude), "opus")
         XCTAssertEqual(BotRoute.defaultModel(for: .codex), AgentDefaultModelSelection.codexBuiltInDefault)
         XCTAssertEqual(BotRoute.defaultModel(for: .grok), "grok-4.6")
+        XCTAssertEqual(BotRoute.advertisedTitle(for: .claude), "Claude")
+        XCTAssertEqual(BotRoute.advertisedTitle(for: .codex), "Codex")
+        XCTAssertEqual(BotRoute.advertisedTitle(for: .grok), "Grok")
+        XCTAssertEqual(BotRoute.parse("Grok")?.provider, .grok)
+        XCTAssertEqual(BotRoute.parse("claude")?.provider, .claude)
+        XCTAssertEqual(BotRoute.parse("Grok · grok-4.6")?.provider, .grok)
+        XCTAssertEqual(BotRoute.parse("Grok · grok-4.6")?.model, "grok-4.6")
+        XCTAssertNil(BotRoute.parse("ChatGPT"))
     }
 
     func test_admittedToolsNameDescriptionRouteAndNotifications_becauseSetSettingsAlreadyPublishesThem() {

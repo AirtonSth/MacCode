@@ -256,17 +256,9 @@ public enum BotBrainCompiler {
     /// "what model are you?" cannot invent a route. Custom soul must not
     /// hide advertised routing.
     static func routeLine(provider: AgentProvider, model: String) -> String {
-        let title = providerTitle(provider)
+        let title = BotRoute.advertisedTitle(for: provider)
         let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         return model.isEmpty ? title : "\(title) · \(model)"
-    }
-
-    static func providerTitle(_ provider: AgentProvider) -> String {
-        switch provider {
-        case .claude: return "Claude"
-        case .codex: return "Codex"
-        case .grok: return "Grok"
-        }
     }
 
     /// Desk already shows `@handle`. Compile it so first-chat "what's your handle?"
