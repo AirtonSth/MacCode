@@ -1413,9 +1413,8 @@ final class BotSelfConfigTests: XCTestCase {
         // isolation honesty. set_settings still coerced leftover
         // desktop_kind to logical and returned success, so first-chat
         // invented a persist. Reject the leftover key. Name still
-        // persists. Snapshot camelCase desktopKind still succeeds empty.
-        // Schema does not grow a desktop_kind key. Dest title stays
-        // Desktop.
+        // persists. Snapshot camelCase desktopKind now rejects. Schema
+        // does not grow a desktop_kind key. Dest title stays Desktop.
         let bot = try store.create(
             name: "Piper",
             title: "Scout",
@@ -1454,12 +1453,76 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
-        let leftover = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "desktopKind": BotDesktopKind.dedicatedLocalVM.rawValue,
-        ])
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktopKind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(leftover.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+    }
+
+    func test_setSettingsRejectsSnapshotDesktopKind_becauseStudioSaysItIsNotASelfConfigWrite() throws {
+        // WHY: Studio already says Desktop. Compile already labels
+        // isolation honesty. Leftover desktop_kind already rejects.
+        // Snapshot still encodes camelCase desktopKind, so first-chat
+        // that reused the last get_settings key invented a persist.
+        // Reject the snapshot key. Name still persists. Schema does
+        // not grow a desktopKind key. Dest title stays Desktop.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertNotNil(object["desktopKind"], "snapshot still encodes leftover camelCase")
+        XCTAssertNil(object["desktop_kind"], "schema does not grow a desktop_kind key")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktopKind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "desktopKind": BotDesktopKind.managedRemoteMac.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "desktopKind reject must not persist a name")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop_kind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
 
         let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "name": "Piper Prime",

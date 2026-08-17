@@ -620,9 +620,11 @@ public struct BotSelfConfigService: Sendable {
         // Studio already says Desktop. Compile already labels isolation
         // honesty. A leftover Desktop / desktop / desktop_kind write
         // used to coerce to logical and return success, so first-chat
-        // invented a persist. Schema does not grow a desktop or
-        // desktop_kind key. Snapshot camelCase desktopKind still
-        // succeeds empty. Dest title stays Desktop.
+        // invented a persist. Snapshot camelCase desktopKind used to
+        // return an empty success, so first-chat invented a persist
+        // from the last get_settings key. Schema does not grow a
+        // desktop, desktop_kind, or desktopKind key. Dest title stays
+        // Desktop.
         if arguments.keys.contains(where: Self.isAdvertisedDesktopKey) {
             throw BotSelfConfigError.invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel)
         }
@@ -790,11 +792,13 @@ public struct BotSelfConfigService: Sendable {
     /// desktop is not a schema key. Studio / compile advertise the name,
     /// so parse must fail loud instead of succeeding empty. Leftover
     /// desktop_kind is the same host-assigned write. Snapshot camelCase
-    /// desktopKind stays an empty-success leftover, not this reject.
+    /// desktopKind is the same write — get_settings still encodes that
+    /// leftover name, so parse must reject it instead of succeeding empty.
     static func isAdvertisedDesktopKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "desktop"
             || normalized == "desktop_kind"
+            || normalized == "desktopkind"
     }
 
     /// approvals is not a schema key. Studio / compile advertise the
