@@ -2479,6 +2479,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(revision.soul.contains(BotStandingInstructions.saveRoutineTool))
         XCTAssertTrue(revision.soul.contains(BotStandingInstructions.setRoutineEnabledTool))
         XCTAssertTrue(revision.soul.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertTrue(revision.soul.contains(BotStandingInstructions.getBrowserTool))
         vm.beginEdit(bot)
         XCTAssertEqual(vm.studioDraft.soul, revision.soul)
         vm.studioDraft.title = "Reviews PRs"

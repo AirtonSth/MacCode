@@ -226,6 +226,7 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.setSkillTool))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.saveRoutineTool))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.setRoutineEnabledTool))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.getBrowserTool))
         XCTAssertFalse(receipt.compiledPayload.contains("You are Piper. Your job is:"))
         XCTAssertTrue(BotStandingInstructions.looksGenerated(starter))
         XCTAssertFalse(BotStandingInstructions.looksGenerated("Speak plainly."))

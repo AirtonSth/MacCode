@@ -8,9 +8,11 @@ final class BotBrowserStoreTests: XCTestCase {
         // exposes. A drift here means first-chat "open this URL" calls a
         // name the server does not have.
         XCTAssertEqual(BotStandingInstructions.openBrowserTool, BotBrowserCatalog.open)
+        XCTAssertEqual(BotStandingInstructions.getBrowserTool, BotBrowserCatalog.get)
         XCTAssertEqual(BotStandingInstructions.waitLoginTool, BotBrowserCatalog.waitLogin)
         let starter = BotStandingInstructions.fallback(name: "Piper", title: "Scout")
         XCTAssertTrue(starter.contains(BotBrowserCatalog.open))
+        XCTAssertTrue(starter.contains(BotBrowserCatalog.get))
         XCTAssertTrue(starter.contains(BotBrowserCatalog.waitLogin))
         XCTAssertTrue(starter.contains("teammate's"))
     }

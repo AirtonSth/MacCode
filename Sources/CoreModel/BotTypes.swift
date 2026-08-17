@@ -184,8 +184,9 @@ public enum BotStandingInstructions {
     public static let setSkillTool = "bot_set_skill"
     public static let saveRoutineTool = "bot_save_routine"
     public static let setRoutineEnabledTool = "bot_set_routine_enabled"
-    /// Must stay identical to `BotBrowserCatalog.open` / `waitLogin`.
+    /// Must stay identical to `BotBrowserCatalog.open` / `get` / `waitLogin`.
     public static let openBrowserTool = "bot_browser_open"
+    public static let getBrowserTool = "bot_browser_get"
     public static let waitLoginTool = "bot_browser_wait_login"
 
     public static let generatedCapabilityLine =
@@ -195,7 +196,7 @@ public enum BotStandingInstructions {
         "When asked to forget a fact, call \(forgetFactTool). When asked to enable or disable a skill, call \(setSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to turn a routine on or off, call \(setRoutineEnabledTool)."
 
     public static let generatedBrowserLine =
-        "When asked to open a website, call \(openBrowserTool). When asked to wait for a login, call \(waitLoginTool). That browser is this teammate's, not the user's."
+        "When asked to open a website, call \(openBrowserTool). When asked what is open in that browser, call \(getBrowserTool). When asked to wait for a login, call \(waitLoginTool). That browser is this teammate's, not the user's."
 
     public static func fallback(name _: String, title _: String, description _: String = "") -> String {
         [

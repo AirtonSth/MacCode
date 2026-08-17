@@ -128,6 +128,7 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(starter.contains(BotStandingInstructions.setRoutineEnabledTool))
         XCTAssertFalse(starter.contains("bot_get_settings"), "compile already injects live settings")
         XCTAssertTrue(starter.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertTrue(starter.contains(BotStandingInstructions.getBrowserTool))
         XCTAssertTrue(starter.contains(BotStandingInstructions.waitLoginTool))
         XCTAssertTrue(starter.contains("teammate's"))
         XCTAssertTrue(starter.contains(BotStandingInstructions.generatedSignature))
