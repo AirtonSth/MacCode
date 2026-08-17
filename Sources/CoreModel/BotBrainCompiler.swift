@@ -14,6 +14,7 @@ public struct BotContextLayer: Codable, Sendable, Equatable, Identifiable {
         case desktop
         case permission
         case route
+        case tools
         case description
         case soul
         case memory
@@ -164,6 +165,7 @@ public enum BotBrainCompiler {
         lines.append("Working space: \(workingSpaceText(for: revision))")
         lines.append("Permission: \(BotPermission.honestyLabel)")
         lines.append("Route: \(routeLine(provider: revision.provider, model: revision.model))")
+        lines.append(BotStandingInstructions.admittedToolsText)
         let description = revision.description.trimmingCharacters(in: .whitespacesAndNewlines)
         if !description.isEmpty {
             lines.append(description)
@@ -309,6 +311,17 @@ public enum BotBrainCompiler {
                 text: routeLine(provider: revision.provider, model: revision.model),
                 included: true,
                 reason: "Advertised provider and model. Desk already shows this route."
+            )
+        )
+
+        layers.append(
+            BotContextLayer(
+                id: "tools",
+                kind: .tools,
+                title: "Admitted tools",
+                text: BotStandingInstructions.admittedToolsText,
+                included: true,
+                reason: "Desk-admitted tools. Custom soul must not hide them."
             )
         )
 

@@ -10,11 +10,15 @@ final class BotBrowserStoreTests: XCTestCase {
         XCTAssertEqual(BotStandingInstructions.openBrowserTool, BotBrowserCatalog.open)
         XCTAssertEqual(BotStandingInstructions.getBrowserTool, BotBrowserCatalog.get)
         XCTAssertEqual(BotStandingInstructions.waitLoginTool, BotBrowserCatalog.waitLogin)
-        let starter = BotStandingInstructions.fallback(name: "Piper", title: "Scout")
-        XCTAssertTrue(starter.contains(BotBrowserCatalog.open))
-        XCTAssertTrue(starter.contains(BotBrowserCatalog.get))
-        XCTAssertTrue(starter.contains(BotBrowserCatalog.waitLogin))
-        XCTAssertTrue(starter.contains("teammate's"))
+        let tools = BotStandingInstructions.admittedToolsText
+        XCTAssertTrue(tools.contains(BotBrowserCatalog.open))
+        XCTAssertTrue(tools.contains(BotBrowserCatalog.get))
+        XCTAssertTrue(tools.contains(BotBrowserCatalog.waitLogin))
+        XCTAssertTrue(tools.contains("teammate's"))
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotBrowserCatalog.open),
+            "tools layer owns browser names"
+        )
     }
 
     func test_websiteDataPersistsPerBotAndDoesNotLeak() throws {

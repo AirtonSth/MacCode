@@ -170,8 +170,9 @@ public enum BotPermission {
 /// `SOUL.md` / `IDENTITY.md` on first run. An empty Bot soul used to compile
 /// as "No standing instructions." — a New Agent then only saw "You are New Agent."
 ///
-/// Identity (name/role) is its own compile layer. The starter is standing
-/// rules plus the live self-config tools Desk already admits.
+/// Identity (name/role) is its own compile layer. Admitted tools are too —
+/// a custom soul must not hide Desk-admitted tools. The starter is replaceable
+/// standing rules.
 public enum BotStandingInstructions {
     /// Unique last line so Studio can refresh the starter without overwriting a custom soul.
     public static let generatedSignature =
@@ -198,11 +199,15 @@ public enum BotStandingInstructions {
     public static let generatedBrowserLine =
         "When asked to open a website, call \(openBrowserTool). When asked what is open in that browser, call \(getBrowserTool). When asked to wait for a login, call \(waitLoginTool). That browser is this teammate's, not the user's."
 
+    /// Compiler layer. Starter soul must not own these names.
+    public static let admittedToolsText = [
+        generatedCapabilityLine,
+        generatedMutateLine,
+        generatedBrowserLine,
+    ].joined(separator: "\n")
+
     public static func fallback(name _: String, title _: String, description _: String = "") -> String {
         [
-            generatedCapabilityLine,
-            generatedMutateLine,
-            generatedBrowserLine,
             "Do the job. Ask when blocked. Prefer concrete work over ceremony.",
             generatedSignature,
         ].joined(separator: "\n")

@@ -27,14 +27,18 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(BotStandingInstructions.setSkillTool, BotSelfConfigCatalog.setSkill)
         XCTAssertEqual(BotStandingInstructions.saveRoutineTool, BotSelfConfigCatalog.saveRoutine)
         XCTAssertEqual(BotStandingInstructions.setRoutineEnabledTool, BotSelfConfigCatalog.setRoutineEnabled)
-        let starter = BotStandingInstructions.fallback(name: "Piper", title: "Scout")
-        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.putMemory))
-        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.setSettings))
-        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.forgetMemory))
-        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.setSkill))
-        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.saveRoutine))
-        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.setRoutineEnabled))
-        XCTAssertFalse(starter.contains(BotSelfConfigCatalog.getSettings))
+        let tools = BotStandingInstructions.admittedToolsText
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.putMemory))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSettings))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.forgetMemory))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSkill))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.saveRoutine))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setRoutineEnabled))
+        XCTAssertFalse(tools.contains(BotSelfConfigCatalog.getSettings))
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.putMemory),
+            "tools layer owns self-config names"
+        )
     }
 
     func test_callUsesLiveCatalogAndPersistsThroughPublish() throws {
