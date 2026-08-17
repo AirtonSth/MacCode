@@ -158,7 +158,12 @@ public struct DistillContentRouter: Sendable {
         let candidate: DistillRouteResult?
         switch type {
         case .json:
-            candidate = (JSONCrusher.tabularCSV(input) ?? JSONCrusher.minify(input))
+            // TOON first when it beats minify and the question is not extractive JSON.
+            // tabularCSV envelope is also not JSON-the-agent-asked-for. Minify last.
+            let keepJSON = ToonCodec.shouldSkipForQuestion(options.query)
+            let toon = keepJSON ? nil : ToonCodec.encodeIfEfficient(input)
+            let tabular = keepJSON ? nil : JSONCrusher.tabularCSV(input)
+            candidate = (toon ?? tabular ?? JSONCrusher.minify(input))
                 .map { DistillRouteResult(output: $0, contentType: .json, lossless: true) }
         case .log:
             candidate = LogCollapser.collapse(input).map { DistillRouteResult(output: $0, contentType: .log, lossless: true) }
