@@ -664,6 +664,16 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedHostBrokeredWritesKey) {
             throw BotSelfConfigError.invalid(BotPermission.honestyLabel)
         }
+        // Studio already says Ask before tool actions. Compile already
+        // labels that honesty. leftover supervised / host_brokered_writes
+        // already reject. leftover ask_before_tool_actions still
+        // succeeded empty, so first-chat invented a persist from the
+        // advertised honesty phrase. Schema does not grow an
+        // ask_before_tool_actions write key. leftover supervised still
+        // rejects. Name still persists. Dest title stays Permission.
+        if arguments.keys.contains(where: Self.isAdvertisedAskBeforeToolActionsKey) {
+            throw BotSelfConfigError.invalid(BotPermission.honestyLabel)
+        }
         // Studio Routines already says Test run. Compile already labels
         // do the Instruction now. A leftover Test run / test_run write
         // used to return an empty success, so first-chat invented a
@@ -924,6 +934,19 @@ public struct BotSelfConfigService: Sendable {
         return normalized == "host_brokered_writes"
             || normalized == "host_brokered"
             || normalized == "effects"
+    }
+
+    /// ask_before_tool_actions is not a schema write key. Studio /
+    /// compile advertise Ask before tool actions, so parse must fail
+    /// loud instead of succeeding empty. leftover supervised stays
+    /// on the Approval mode reject. leftover host_brokered_writes
+    /// stays on the Host-brokered writes reject. Schema does not
+    /// grow an ask_before_tool_actions write key.
+    static func isAdvertisedAskBeforeToolActionsKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "ask_before_tool_actions"
+            || normalized == "ask_before"
+            || normalized == "tool_actions"
     }
 
     /// test_run is not a schema key. Studio / compile advertise the

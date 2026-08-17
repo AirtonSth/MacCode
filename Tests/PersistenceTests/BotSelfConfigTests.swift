@@ -233,6 +233,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["approval_mode"], "approval_mode is host-assigned, not a schema key")
         XCTAssertNil(properties?["permission"], "permission is dest title, not a schema key")
         XCTAssertNil(properties?["supervised"], "supervised is advertised Approval mode value, not a schema key")
+        XCTAssertNil(properties?["ask_before_tool_actions"], "ask_before_tool_actions is advertised honesty, not a schema key")
+        XCTAssertNil(properties?["ask_before"], "ask_before is advertised honesty, not a schema key")
+        XCTAssertNil(properties?["tool_actions"], "tool_actions is advertised honesty, not a schema key")
         XCTAssertNil(properties?["desktop"], "desktop is host-assigned, not a schema key")
         XCTAssertNil(properties?["approvals"], "approvals is not a schema key")
         XCTAssertNil(properties?["allow_once"], "allow_once is not a schema key")
@@ -2429,6 +2432,91 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Supervised reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "Supervised reject must not persist soul")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedAskBeforeToolActions_becauseStudioSaysAskBefore() throws {
+        // WHY: Studio Desk and compile already say Ask before tool
+        // actions. leftover supervised / host_brokered_writes already
+        // reject. leftover ask_before_tool_actions still succeeded
+        // empty, so first-chat invented a persist from the advertised
+        // honesty phrase. Reject the advertised name with Permission
+        // honesty. leftover supervised still rejects. leftover
+        // host_brokered_writes still rejects. bot_id still owns the
+        // caller check. Name still persists. Schema does not grow an
+        // ask_before_tool_actions write key. Dest title stays Permission.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["ask_before_tool_actions"],
+            "schema does not grow an ask_before_tool_actions write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "ask_before_tool_actions": false,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Ask before tool actions": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "ask_before": false,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "tool_actions": "unsupervised",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "supervised": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "host_brokered_writes": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Ask before reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Ask before reject must not persist soul")
         XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
