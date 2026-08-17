@@ -250,6 +250,134 @@ public enum BotBlobatar {
         }
         return map
     }
+
+    /// Idle loop from blobatar motion-spec. Pure in `time` so tests replay.
+    public static func motion(name: String, time: TimeInterval, expression: BotBlobatarExpression, amplitude: Double) -> BotBlobatarMotion {
+        BotBlobatarMotion.sample(name: name, time: time, expression: expression, amplitude: amplitude)
+    }
+}
+
+public enum BotBlobatarMotionMode: String, Sendable {
+    case frozen
+    case always
+    case hover
+}
+
+public struct BotBlobatarMotion: Equatable, Sendable {
+    public var breatheX: Double
+    public var breatheY: Double
+    public var bobY: Double
+    public var blink: Double
+    public var glanceX: Double
+    public var glanceY: Double
+    public var shakeX: Double
+    public var shakeY: Double
+
+    public init(
+        breatheX: Double,
+        breatheY: Double,
+        bobY: Double,
+        blink: Double,
+        glanceX: Double,
+        glanceY: Double,
+        shakeX: Double,
+        shakeY: Double
+    ) {
+        self.breatheX = breatheX
+        self.breatheY = breatheY
+        self.bobY = bobY
+        self.blink = blink
+        self.glanceX = glanceX
+        self.glanceY = glanceY
+        self.shakeX = shakeX
+        self.shakeY = shakeY
+    }
+
+    public static let still = BotBlobatarMotion(
+        breatheX: 1, breatheY: 1, bobY: 0, blink: 1,
+        glanceX: 0, glanceY: 0, shakeX: 0, shakeY: 0
+    )
+
+    public static func sample(
+        name: String,
+        time: TimeInterval,
+        expression: BotBlobatarExpression,
+        amplitude: Double
+    ) -> BotBlobatarMotion {
+        let amp = min(1, max(0, amplitude))
+        if amp == 0 { return .still }
+        let seed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = Traits(seed: seed.isEmpty ? "bot" : seed, overrides: [:])
+        let breathePhase = t.num("motion.phase", 0, 2.8)
+        let bobPhase = t.num("motion.bob", 0, 3.4)
+        let blinkPeriod = t.num("motion.blink", 3.5, 6.5)
+        let blinkPhase = t.num("motion.blinkPhase", 0, blinkPeriod)
+        let saccadePeriod = t.num("motion.saccade", 4.2, 7.6)
+        let saccadePhase = t.num("motion.saccadePhase", 0, saccadePeriod)
+        let lookX = t.num("motion.lookX", 1, 2.2) * (t("motion.lookXFlip") < 0.5 ? -1 : 1)
+        let lookY = t.num("motion.lookY", 0.8, 1.7) * (t("motion.lookYFlip") < 0.5 ? -1 : 1)
+
+        let breathe = alternate(time, period: 2.8, phase: breathePhase)
+        let bob = alternate(time, period: 3.4, phase: bobPhase)
+        let blink = blinkWindow((time + blinkPhase).truncatingRemainder(dividingBy: blinkPeriod) / blinkPeriod)
+        let glance = glanceAt((time + saccadePhase).truncatingRemainder(dividingBy: saccadePeriod) / saccadePeriod, lookX: lookX, lookY: lookY)
+        let shake = expression == .mad ? sin(time * 48) * 0.35 * amp : 0
+
+        return BotBlobatarMotion(
+            breatheX: 1 + 0.022 * breathe * amp,
+            breatheY: 1 - 0.018 * breathe * amp,
+            bobY: -1.1 * bob * amp,
+            blink: 1 - (1 - blink) * amp,
+            glanceX: glance.0 * amp,
+            glanceY: glance.1 * amp,
+            shakeX: shake,
+            shakeY: shake * 0.4
+        )
+    }
+}
+
+private func alternate(_ time: Double, period: Double, phase: Double) -> Double {
+    let span = period * 2
+    var u = (time + phase).truncatingRemainder(dividingBy: span) / period
+    if u < 0 { u += 2 }
+    let eased: Double
+    if u <= 1 {
+        eased = easeInOut(u)
+    } else {
+        eased = easeInOut(2 - u)
+    }
+    return eased
+}
+
+private func easeInOut(_ t: Double) -> Double {
+    t < 0.5 ? 2 * t * t : 1 - pow(-2 * t + 2, 2) / 2
+}
+
+private func blinkWindow(_ p: Double) -> Double {
+    if p < 0.972 { return 1 }
+    if p < 0.986 {
+        return 1 - 0.92 * ((p - 0.972) / 0.014)
+    }
+    return 0.08 + 0.92 * min(1, (p - 0.986) / 0.014)
+}
+
+private func glanceAt(_ p: Double, lookX: Double, lookY: Double) -> (Double, Double) {
+    let stops: [(Double, Double)] = [
+        (0, 0),
+        (-lookX, -lookY),
+        (lookX, 0),
+        (0, lookY),
+        (lookX, -lookY),
+        (-lookX, 0),
+    ]
+    let slot = p * Double(stops.count)
+    let index = min(stops.count - 1, max(0, Int(slot)))
+    let local = slot - Double(index)
+    let from = stops[index]
+    let to = stops[(index + 1) % stops.count]
+    if local < 0.85 { return from }
+    let t = (local - 0.85) / 0.15
+    return (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
 }
 
 // MARK: - Hash / traits (blobatar)
