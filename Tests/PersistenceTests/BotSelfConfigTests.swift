@@ -1350,8 +1350,8 @@ final class BotSelfConfigTests: XCTestCase {
         // permission_mode to supervised and returned success, so
         // first-chat invented a persist. Reject the leftover key.
         // Name still persists. Leftover desktop_kind now rejects.
-        // Schema does not grow a permission_mode key. Dest title stays
-        // Permission.
+        // Snapshot camelCase permissionMode now rejects. Schema does
+        // not grow a permission_mode key. Dest title stays Permission.
         let bot = try store.create(
             name: "Piper",
             title: "Scout",
@@ -1400,6 +1400,66 @@ final class BotSelfConfigTests: XCTestCase {
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(leftover.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+    }
+
+    func test_setSettingsRejectsSnapshotPermissionMode_becauseStudioSaysItIsHostAssigned() throws {
+        // WHY: Studio already says Approval mode. Compile already labels
+        // host-assigned honesty. Leftover permission_mode already
+        // rejects. Snapshot still encodes camelCase permissionMode, so
+        // first-chat that reused the last get_settings key invented a
+        // persist. Reject the snapshot key. Name still persists. Schema
+        // does not grow a permissionMode key. Dest title stays
+        // Permission.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertNotNil(object["permissionMode"], "snapshot still encodes leftover camelCase")
+        XCTAssertNil(object["permission_mode"], "schema does not grow a permission_mode key")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permissionMode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "permissionMode": AgentPermissionMode.autoAcceptEdits.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "permissionMode reject must not persist a name")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
 
         let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "name": "Piper Prime",
