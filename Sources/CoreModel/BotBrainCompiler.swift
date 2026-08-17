@@ -290,6 +290,9 @@ public enum BotBrainCompiler {
 
     /// Desk already shows `@handle`. Compile it so first-chat "what's your handle?"
     /// cannot invent one. Custom soul must not hide advertised identity.
+    /// Studio already says Role. Compile that name so first-chat "what's your
+    /// Role?" cannot invent a hop. Empty Role stays omitted. Custom soul
+    /// must not hide the advertised job.
     /// Studio already picks Avatar. Compile the advertised chip so first-chat
     /// "what's my avatar?" cannot invent a symbol. Leftover SF paths stay out.
     static func identityLine(
@@ -300,23 +303,31 @@ public enum BotBrainCompiler {
     ) -> String? {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let handle = handle.trimmingCharacters(in: .whitespacesAndNewlines)
-        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
         var who = name
         if !handle.isEmpty {
             let tagged = "@\(handle)"
             who = who.isEmpty ? tagged : "\(who) (\(tagged))"
         }
-        if !title.isEmpty {
-            who = who.isEmpty ? title : "\(who) — \(title)"
-        }
+        let role = roleLine(title)
         let avatar = avatarLine(avatarSymbol)
-        if who.isEmpty {
-            return avatar.map { "\($0)." }
+        var parts: [String] = []
+        if !who.isEmpty {
+            parts.append("You are \(who).")
+        }
+        if let role {
+            parts.append("\(role).")
         }
         if let avatar {
-            return "You are \(who). \(avatar)."
+            parts.append("\(avatar).")
         }
-        return "You are \(who)."
+        if parts.isEmpty { return nil }
+        return parts.joined(separator: " ")
+    }
+
+    /// Studio says Role. Compile that name, never an unlabeled job after an em-dash.
+    static func roleLine(_ title: String) -> String? {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : "Role: \(trimmed)"
     }
 
     /// Studio says Star / Person. Compile that name, never the SF Symbol.

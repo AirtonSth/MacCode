@@ -65,6 +65,8 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.payloadDigest, BotDigest.sha256Hex(composed))
         XCTAssertEqual(receipt.compilerVersion, ContextAssemblyReceipt.compilerVersion)
         XCTAssertTrue(receipt.compiledPayload.contains("Fact: Prefers dark mode"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Role: Scout"))
+        XCTAssertFalse(receipt.compiledPayload.contains("You are Piper (@piper) — Scout"))
         XCTAssertTrue(receipt.compiledPayload.contains("Description: Looks around"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(live.id.value)))
         XCTAssertFalse(receipt.compiledPayload.contains("Old secret"))
@@ -306,10 +308,11 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Go")
-        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper) — Reviews PRs."))
+        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper). Role: Reviews PRs."))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.admittedToolsText))
         XCTAssertFalse(starter.contains(BotStandingInstructions.rememberFactTool), "tools layer owns remember")
         XCTAssertFalse(receipt.compiledPayload.contains("You are Piper. Your job is:"))
+        XCTAssertFalse(receipt.compiledPayload.contains("You are Piper (@piper) — Reviews PRs."))
         XCTAssertTrue(BotStandingInstructions.looksGenerated(starter))
         XCTAssertFalse(BotStandingInstructions.looksGenerated("Speak plainly."))
     }
@@ -372,13 +375,13 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's your handle?")
-        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper) — Scout."))
+        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper). Role: Scout."))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .identity })?.included, true)
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .identity })?.text,
-            "You are Piper (@piper) — Scout. Avatar: Person."
+            "You are Piper (@piper). Role: Scout. Avatar: Person."
         )
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .identity })?.reason,
@@ -388,6 +391,69 @@ final class BotBrainCompilerTests: XCTestCase {
             BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("@piper"),
             "handle honesty is a compiler layer, not starter soul"
         )
+    }
+
+    func test_roleHonestyCompilesForCustomSoul_becauseStudioRoleIsNotAnEscapeHatch() {
+        // WHY: Studio already says Role. Compile put the job unlabeled after
+        // an em-dash, so first-chat "what's your Role?" invented a hop. A
+        // written soul must not hide the advertised job.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's your Role?")
+        XCTAssertTrue(receipt.compiledPayload.contains("Role: Scout"), "Role: Scout")
+        XCTAssertFalse(receipt.compiledPayload.contains("You are Piper (@piper) — Scout"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .identity })?.included, true)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .identity })?.text,
+            "You are Piper (@piper). Role: Scout. Avatar: Person."
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Role:"),
+            "role honesty is a compiler layer, not starter soul"
+        )
+    }
+
+    func test_emptyRoleDoesNotInventAJob_becauseCompileMustNotAdvertiseNone() {
+        // WHY: Studio Role can be empty. Compile must omit the label, not
+        // invent "No job yet" from dest chrome.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "  ", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "  ",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's your Role?")
+        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper)."))
+        XCTAssertFalse(receipt.compiledPayload.contains("Role:"))
+        XCTAssertFalse(receipt.compiledPayload.contains("No job yet"))
     }
 
     func test_avatarHonestyCompilesForCustomSoul_becauseStudioAvatarIsNotAnEscapeHatch() {
@@ -420,7 +486,7 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .identity })?.included, true)
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .identity })?.text,
-            "You are Piper (@piper) — Scout. Avatar: Star."
+            "You are Piper (@piper). Role: Scout. Avatar: Star."
         )
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .identity })?.reason,
@@ -458,7 +524,7 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertFalse(receipt.compiledPayload.contains("bird"))
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .identity })?.text,
-            "You are Piper (@piper) — Scout."
+            "You are Piper (@piper). Role: Scout."
         )
     }
 
@@ -830,7 +896,7 @@ final class BotBrainCompilerTests: XCTestCase {
                 ),
             ]
         )
-        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper) — Scout."))
+        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper). Role: Scout."))
         XCTAssertTrue(receipt.compiledPayload.contains("Active routines (not while the app is closed):"))
         XCTAssertFalse(receipt.compiledPayload.contains("Enabled routines"))
         XCTAssertTrue(receipt.compiledPayload.contains("Morning scan: Instruction: Scan overnight failures. When: Weekdays 9:00"))

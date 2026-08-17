@@ -1636,6 +1636,33 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesAdvertisedRole_becauseDestMustNotLeaveTheJobUnlabeled() throws {
+        // WHY: Studio already says Role. Compile put the job unlabeled after
+        // an em-dash, so first-chat "what's your Role?" invented a hop. Dest
+        // preview and compose must share the advertised name. Empty stays out.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "What's your Role?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Role: Scout"))
+        XCTAssertFalse(preview.compiledPayload.contains("You are Piper (@piper) — Scout"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What's your Role?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
     func test_previewBrainIncludesAdvertisedSkills_becauseDestMustNotSayEnabledSkills() throws {
         // WHY: Studio already says Skills. Compile listed Enabled skills, so
         // first-chat "which Skills?" invented a hop. Dest preview and compose
@@ -3963,6 +3990,8 @@ final class BotsWindowTests: XCTestCase {
 
         XCTAssertTrue(prompt.contains("Prefers dark mode"))
         XCTAssertFalse(prompt.contains("Old secret"))
+        XCTAssertTrue(prompt.contains("Role: Scout"))
+        XCTAssertFalse(prompt.contains("You are Piper (@piper) — Scout"))
         XCTAssertTrue(prompt.contains("Skills: weekly-account-health"))
         XCTAssertFalse(prompt.contains("Enabled skills"))
         XCTAssertFalse(prompt.contains("off-skill"))
