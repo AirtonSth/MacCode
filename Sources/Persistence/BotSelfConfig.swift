@@ -661,7 +661,9 @@ public struct BotSelfConfigService: Sendable {
         if let number = value as? NSNumber { return number.boolValue }
         if let raw = value as? String {
             switch raw.lowercased() {
-            case "true", "1", "yes", "on": return true
+            // Studio already says Active and Enabled. Parse only read
+            // on/true, so first-chat "set this Active" invented a hop.
+            case "true", "1", "yes", "on", "active", "enabled": return true
             case "false", "0", "no", "off": return false
             default: break
             }

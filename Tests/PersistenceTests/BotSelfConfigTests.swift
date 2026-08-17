@@ -534,10 +534,10 @@ final class BotSelfConfigTests: XCTestCase {
     }
 
     func test_setRoutineEnabledAdvertisedActivePersists_becauseStudioSaysActiveNotEnabled() throws {
-        // WHY: Studio already says Active. Parse only read enabled, so
-        // first-chat "set this Active" invented a hop or left the leftover
-        // switch. Canonical enabled still wins. Schema does not grow a
-        // second key.
+        // WHY: Studio already says Active. Parse only read enabled / on,
+        // so first-chat "set this Active" invented a hop or left the leftover
+        // switch. Advertised Active token persists. Canonical enabled still
+        // wins. Schema does not grow a second key.
         let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
         let created = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
@@ -552,6 +552,13 @@ final class BotSelfConfigTests: XCTestCase {
             "active": true,
         ])
         XCTAssertEqual(fromActive.routines.first?.enabled, true, "Active persists")
+        XCTAssertEqual(try store.listRoutines(botID: bot.id).first?.activation.isEnabled, true)
+
+        let fromActiveToken = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": "Active",
+        ])
+        XCTAssertEqual(fromActiveToken.routines.first?.enabled, true, "advertised Active token persists")
         XCTAssertEqual(try store.listRoutines(botID: bot.id).first?.activation.isEnabled, true)
 
         let fromOff = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
@@ -585,8 +592,9 @@ final class BotSelfConfigTests: XCTestCase {
     func test_setSkillAdvertisedAddPersists_becauseStudioAddOnlySendsTheCatalogId() throws {
         // WHY: Studio Add already binds via setSkillBinding(enabled: true).
         // Tools required enabled, so first-chat "add this skill" invented a
-        // hop or a fake add tool. Omit enabled to Add it Enabled. Explicit
-        // Off still disables. Canonical enabled still wins.
+        // hop or a fake add tool. Omit enabled to Add it Enabled. Advertised
+        // Enabled token persists. Explicit Off still disables. Canonical
+        // enabled still wins.
         let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
 
@@ -595,6 +603,13 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(fromAdd.skills.map(\.skillID), ["weekly-account-health"], "Add persists")
         XCTAssertEqual(fromAdd.skills.first?.enabled, true, "Add persists")
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, true)
+
+        let fromEnabledToken = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+            "enabled": "Enabled",
+        ])
+        XCTAssertEqual(fromEnabledToken.skills.first?.enabled, true, "advertised Enabled token persists")
         XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, true)
 
         let fromOff = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
