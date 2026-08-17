@@ -167,13 +167,20 @@ public enum BotStandingInstructions {
     /// Must stay identical to `BotSelfConfigCatalog.putMemory` / `setSettings`.
     public static let rememberFactTool = "bot_put_memory"
     public static let changeJobTool = "bot_set_settings"
+    /// Must stay identical to `BotBrowserCatalog.open` / `waitLogin`.
+    public static let openBrowserTool = "bot_browser_open"
+    public static let waitLoginTool = "bot_browser_wait_login"
 
     public static let generatedCapabilityLine =
         "When asked to remember a fact, call \(rememberFactTool). When asked to change your job or standing instructions, call \(changeJobTool)."
 
+    public static let generatedBrowserLine =
+        "When asked to open a website, call \(openBrowserTool). When asked to wait for a login, call \(waitLoginTool). That browser is this teammate's, not the user's."
+
     public static func fallback(name _: String, title _: String, description _: String = "") -> String {
         [
             generatedCapabilityLine,
+            generatedBrowserLine,
             "Do the job. Ask when blocked. Prefer concrete work over ceremony.",
             generatedSignature,
         ].joined(separator: "\n")

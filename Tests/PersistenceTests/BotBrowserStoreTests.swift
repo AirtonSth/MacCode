@@ -3,6 +3,18 @@ import CoreModel
 @testable import Persistence
 
 final class BotBrowserStoreTests: XCTestCase {
+    func test_standingStarterNamesLiveBrowserTools_becauseDeskAlreadyAdmitsThem() {
+        // WHY: Generated soul must name the same tools the bot-browser MCP
+        // exposes. A drift here means first-chat "open this URL" calls a
+        // name the server does not have.
+        XCTAssertEqual(BotStandingInstructions.openBrowserTool, BotBrowserCatalog.open)
+        XCTAssertEqual(BotStandingInstructions.waitLoginTool, BotBrowserCatalog.waitLogin)
+        let starter = BotStandingInstructions.fallback(name: "Piper", title: "Scout")
+        XCTAssertTrue(starter.contains(BotBrowserCatalog.open))
+        XCTAssertTrue(starter.contains(BotBrowserCatalog.waitLogin))
+        XCTAssertTrue(starter.contains("teammate's"))
+    }
+
     func test_websiteDataPersistsPerBotAndDoesNotLeak() throws {
         // WHY: two bots must keep isolated cookies/local storage across reopen.
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
