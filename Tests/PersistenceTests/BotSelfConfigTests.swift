@@ -284,6 +284,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["browser"], "browser is an advertised compile heading, not a set_settings key")
         XCTAssertNil(properties?["logical_execution_space"], "logical_execution_space is an advertised compile title, not a set_settings key")
         XCTAssertNil(properties?["logical_space"], "logical_space is an advertised Desktop pill, not a set_settings key")
+        XCTAssertNil(properties?["same_macos_account"], "same_macos_account is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["macos_account"], "macos_account is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["same_account"], "same_account is advertised Desktop honesty, not a schema key")
         XCTAssertNil(properties?["admitted_tools"], "admitted_tools is advertised dest title, not a schema write key")
         XCTAssertNil(properties?["tools"], "tools is leftover dest layer id, not a schema write key")
         XCTAssertNil(properties?["admitted"], "admitted is leftover dest title first word, not a schema write key")
@@ -2518,6 +2521,91 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(still.name, "Piper", "Ask before reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "Ask before reject must not persist soul")
         XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedSameMacOSAccount_becauseStudioSaysSameAccount() throws {
+        // WHY: Studio Desk and compile already say Same macOS account.
+        // leftover desktop / logical_execution_space already reject.
+        // leftover same_macos_account still succeeded empty, so
+        // first-chat invented a persist from the advertised honesty
+        // phrase. Reject the advertised name with Desktop isolation
+        // honesty. leftover desktop still rejects. leftover
+        // logical_execution_space still rejects. bot_id still owns the
+        // caller check. Name still persists. Schema does not grow a
+        // same_macos_account write key. Dest title stays Desktop.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["same_macos_account"],
+            "schema does not grow a same_macos_account write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "same_macos_account": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Same macOS account": false,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "macos_account": "isolated",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "same_account": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop": "logical",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "logical_execution_space": "isolated",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Same macOS account reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Same macOS account reject must not persist soul")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
         XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 

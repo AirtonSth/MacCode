@@ -646,6 +646,16 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedDesktopKey) {
             throw BotSelfConfigError.invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel)
         }
+        // Studio already says Same macOS account. Compile already labels
+        // that honesty. leftover desktop / logical_execution_space already
+        // reject. leftover same_macos_account still succeeded empty, so
+        // first-chat invented a persist from the advertised honesty
+        // phrase. Schema does not grow a same_macos_account write key.
+        // leftover desktop still rejects. Name still persists. Dest
+        // title stays Desktop.
+        if arguments.keys.contains(where: Self.isAdvertisedSameMacOSAccountKey) {
+            throw BotSelfConfigError.invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+        }
         // Studio Security already says Approvals. Compile already labels
         // Allow once / Deny stay off. A leftover Approvals / allow_once
         // / deny write used to return an empty success, so first-chat
@@ -909,6 +919,18 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "desktopkind"
             || normalized == "logical_execution_space"
             || normalized == "logical_space"
+    }
+
+    /// same_macos_account is not a schema write key. Studio / compile
+    /// advertise Same macOS account, so parse must fail loud instead of
+    /// succeeding empty. leftover desktop stays on the Desktop reject.
+    /// leftover logical_execution_space stays on the Desktop reject.
+    /// Schema does not grow a same_macos_account write key.
+    static func isAdvertisedSameMacOSAccountKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "same_macos_account"
+            || normalized == "macos_account"
+            || normalized == "same_account"
     }
 
     /// approvals is not a schema key. Studio / compile advertise the
