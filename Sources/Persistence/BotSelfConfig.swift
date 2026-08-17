@@ -31,13 +31,14 @@ public enum BotSelfConfigCatalog: Sendable {
     public static let setSettings = "bot_set_settings"
     public static let putMemory = "bot_put_memory"
     public static let forgetMemory = "bot_forget_memory"
+    public static let correctMemory = "bot_correct_memory"
     public static let setSkill = "bot_set_skill"
     public static let saveRoutine = "bot_save_routine"
     public static let setRoutineEnabled = "bot_set_routine_enabled"
 
     public static var toolNames: [String] {
         [
-            getSettings, setSettings, putMemory, forgetMemory,
+            getSettings, setSettings, putMemory, forgetMemory, correctMemory,
             setSkill, saveRoutine, setRoutineEnabled,
         ]
     }
@@ -62,6 +63,8 @@ public enum BotSelfConfigCatalog: Sendable {
             return "Remember a fact on this bot."
         case forgetMemory:
             return "Forget one of this bot's memory facts."
+        case correctMemory:
+            return "Correct one of this bot's memory facts. Writes a new revision. Same path as Studio Correct."
         case setSkill:
             return "Enable or disable a catalog skill on this bot."
         case saveRoutine:
@@ -103,6 +106,15 @@ public enum BotSelfConfigCatalog: Sendable {
                 "type": "object",
                 "properties": botID.merging(["memory_id": ["type": "string"]]) { _, new in new },
                 "required": ["memory_id"],
+            ]
+        case correctMemory:
+            return [
+                "type": "object",
+                "properties": botID.merging([
+                    "memory_id": ["type": "string"],
+                    "content": ["type": "string"],
+                ]) { _, new in new },
+                "required": ["memory_id", "content"],
             ]
         case setSkill:
             return [
@@ -375,6 +387,18 @@ public struct BotSelfConfigService: Sendable {
         return try snapshot()
     }
 
+    public func correctMemory(id: BotMemoryItemID, content: String) throws -> BotSelfConfigSnapshot {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw BotSelfConfigError.invalid("Memory content is required.") }
+        let items = try store.listMemory(botID: callerBotID, includeForgotten: true)
+        guard let item = items.first(where: { $0.id == id }) else {
+            throw BotSelfConfigError.notFound
+        }
+        guard item.botID == callerBotID else { throw BotSelfConfigError.crossBot }
+        _ = try store.correctMemory(id: id, content: trimmed)
+        return try snapshot()
+    }
+
     public func setSkill(skillID: String, enabled: Bool) throws -> BotSelfConfigSnapshot {
         try store.setSkillBinding(
             BotSkillBinding(botID: callerBotID, skillID: skillID, enabled: enabled)
@@ -432,6 +456,14 @@ public struct BotSelfConfigService: Sendable {
             return try putMemory(content: content)
         case BotSelfConfigCatalog.forgetMemory:
             return try forgetMemory(id: BotMemoryItemID(try Self.parseUUID(arguments["memory_id"], label: "memory_id")))
+        case BotSelfConfigCatalog.correctMemory:
+            guard let content = arguments["content"] as? String else {
+                throw BotSelfConfigError.invalid("Memory content is required.")
+            }
+            return try correctMemory(
+                id: BotMemoryItemID(try Self.parseUUID(arguments["memory_id"], label: "memory_id")),
+                content: content
+            )
         case BotSelfConfigCatalog.setSkill:
             guard let skillID = arguments["skill_id"] as? String else {
                 throw BotSelfConfigError.invalid("skill_id is required.")

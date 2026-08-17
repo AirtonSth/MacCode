@@ -24,6 +24,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(BotStandingInstructions.rememberFactTool, BotSelfConfigCatalog.putMemory)
         XCTAssertEqual(BotStandingInstructions.changeJobTool, BotSelfConfigCatalog.setSettings)
         XCTAssertEqual(BotStandingInstructions.forgetFactTool, BotSelfConfigCatalog.forgetMemory)
+        XCTAssertEqual(BotStandingInstructions.correctFactTool, BotSelfConfigCatalog.correctMemory)
         XCTAssertEqual(BotStandingInstructions.setSkillTool, BotSelfConfigCatalog.setSkill)
         XCTAssertEqual(BotStandingInstructions.saveRoutineTool, BotSelfConfigCatalog.saveRoutine)
         XCTAssertEqual(BotStandingInstructions.setRoutineEnabledTool, BotSelfConfigCatalog.setRoutineEnabled)
@@ -31,6 +32,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.putMemory))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSettings))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.forgetMemory))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.correctMemory))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSkill))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.saveRoutine))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setRoutineEnabled))
@@ -38,6 +40,10 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.putMemory),
             "tools layer owns self-config names"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.correctMemory),
+            "tools layer owns correct"
         )
     }
 
@@ -57,6 +63,7 @@ final class BotSelfConfigTests: XCTestCase {
             BotSelfConfigCatalog.setSettings,
             BotSelfConfigCatalog.putMemory,
             BotSelfConfigCatalog.forgetMemory,
+            BotSelfConfigCatalog.correctMemory,
             BotSelfConfigCatalog.setSkill,
             BotSelfConfigCatalog.saveRoutine,
             BotSelfConfigCatalog.setRoutineEnabled,
@@ -94,6 +101,13 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(withMemory.memory.map(\.content), ["Prefers dark mode"])
         let memoryID = try XCTUnwrap(withMemory.memory.first?.id)
+
+        let corrected = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "content": "Prefers light mode",
+        ])
+        XCTAssertEqual(corrected.memory.map(\.content), ["Prefers light mode"])
+        XCTAssertEqual(corrected.memory.first?.id, memoryID)
 
         let withSkill = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
             "skill_id": "weekly-account-health",
@@ -262,5 +276,54 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(auto.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertFalse(auto.permissionMode.contains("auto_accept_edits"))
+    }
+
+    func test_correctMemoryKeepsId_becauseStudioCorrectDoesNotMintANewFact() throws {
+        // WHY: Studio Correct writes a revision on the same fact.
+        // Tools never named that path, so first-chat "correct this"
+        // invented forget+put and lost the id. Hermes agents update
+        // memory in place.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let created = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dark mode",
+        ])
+        let memoryID = try XCTUnwrap(created.memory.first?.id)
+        let after = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "content": "Prefers light mode",
+        ])
+        XCTAssertEqual(after.memory.count, 1)
+        XCTAssertEqual(after.memory.first?.id, memoryID)
+        XCTAssertEqual(after.memory.first?.content, "Prefers light mode")
+        let itemID = BotMemoryItemID(try XCTUnwrap(UUID(uuidString: memoryID)))
+        let revisions = try store.listMemoryRevisions(itemID: itemID)
+        XCTAssertEqual(revisions.map(\.content), ["Prefers dark mode", "Prefers light mode"])
+    }
+
+    func test_correctMemoryRejectedWhenForgotten_becauseTombstonesAreNotRewritable() throws {
+        // WHY: Studio Correct cannot rewrite a forgotten fact. The new
+        // tool must fail the same way instead of minting a live row.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let created = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Old secret",
+        ])
+        let memoryID = try XCTUnwrap(created.memory.first?.id)
+        _ = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "memory_id": memoryID,
+        ])
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+                "memory_id": memoryID,
+                "content": "Still secret",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? BotStoreError,
+                .invalidRow("forgotten memory cannot be rewritten")
+            )
+        }
+        XCTAssertTrue(try service.snapshot().memory.isEmpty)
     }
 }
