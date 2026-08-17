@@ -179,6 +179,26 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
     public var skills: [Skill]
     public var routines: [Routine]
 
+    // Tools require notifications_enabled / provider_instance_id. Snapshot
+    // used Swift camelCase, so same-turn notify/account persist invented a hop.
+    enum CodingKeys: String, CodingKey {
+        case id
+        case handle
+        case name
+        case title
+        case description
+        case soul
+        case provider
+        case providerInstanceID = "provider_instance_id"
+        case model
+        case permissionMode
+        case desktopKind
+        case notificationsEnabled = "notifications_enabled"
+        case memory
+        case skills
+        case routines
+    }
+
     public struct Item: Codable, Equatable, Sendable {
         public var id: String
         public var content: String

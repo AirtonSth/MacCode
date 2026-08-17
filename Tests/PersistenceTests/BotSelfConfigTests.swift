@@ -729,4 +729,34 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(try service.snapshot().skills.first?.skillID, "weekly-account-health")
         XCTAssertEqual(try service.snapshot().routines.first?.scheduleNote, "Weekdays 9:00")
     }
+
+    func test_encodeSnapshotUsesCatalogSettingsKeys_becauseSwiftNamesInventedAHop() throws {
+        // WHY: set_settings requires notifications_enabled / provider_instance_id.
+        // Snapshot used Swift notificationsEnabled / providerInstanceID, so
+        // same-turn "turn notifications off" invented a hop. Hermes agents
+        // reuse the key the last write returned. Canonical Swift fields stay.
+        // Leftover permission/desktop stay camelCase — catalog omits those writes.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let after = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications_enabled": false,
+            "provider_instance_id": "claude-work",
+        ])
+        XCTAssertFalse(after.notificationsEnabled)
+        XCTAssertEqual(after.providerInstanceID, "claude-work")
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["notifications_enabled"] as? Bool, false, "notifications_enabled persists")
+        XCTAssertNil(object["notificationsEnabled"], "Swift notificationsEnabled omitted")
+        XCTAssertEqual(object["provider_instance_id"] as? String, "claude-work", "provider_instance_id persists")
+        XCTAssertNil(object["providerInstanceID"], "Swift providerInstanceID omitted")
+        XCTAssertEqual(object["permissionMode"] as? String, AgentPermissionMode.supervised.rawValue)
+        XCTAssertNil(object["permission_mode"], "leftover permission stays unnamed")
+        XCTAssertEqual(object["desktopKind"] as? String, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertNil(object["desktop_kind"], "leftover desktop stays unnamed")
+        XCTAssertEqual(try store.get(id: bot.id)?.notificationsEnabled, false)
+        XCTAssertEqual(try store.getRevision(id: try XCTUnwrap(store.get(id: bot.id)?.currentRevisionID))?.providerInstanceID, "claude-work")
+    }
 }
