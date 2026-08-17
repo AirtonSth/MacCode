@@ -160,8 +160,8 @@ final class BotBrainCompilerTests: XCTestCase {
     }
 
     func test_generatedSoulPicksUpRole_becauseJobIsAutoConfigNotASecondForm() {
-        // WHY: Filling Role and leaving Instructions empty must still shape
-        // the brain. Beginners should not have to write SOUL.md to get a job.
+        // WHY: Role still shapes identity. The starter must not repeat
+        // "You are … Your job is" — that was a second identity form.
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Reviews PRs", description: "")
         let starter = BotStandingInstructions.fallback(name: "Piper", title: "", description: "")
         let revision = BotRevision(
@@ -181,7 +181,9 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Go")
-        XCTAssertTrue(receipt.compiledPayload.contains("Your job is: Reviews PRs."))
+        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper — Reviews PRs."))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.rememberFactTool))
+        XCTAssertFalse(receipt.compiledPayload.contains("You are Piper. Your job is:"))
         XCTAssertTrue(BotStandingInstructions.looksGenerated(starter))
         XCTAssertFalse(BotStandingInstructions.looksGenerated("Speak plainly."))
     }

@@ -17,6 +17,17 @@ final class BotSelfConfigTests: XCTestCase {
         db = nil
     }
 
+    func test_standingStarterNamesLiveSelfConfigTools_becauseDeskAlreadyAdmitsThem() {
+        // WHY: Generated soul must name the same tools the MCP catalog
+        // exposes. A drift here means first-chat "remember this" calls a
+        // name the server does not have.
+        XCTAssertEqual(BotStandingInstructions.rememberFactTool, BotSelfConfigCatalog.putMemory)
+        XCTAssertEqual(BotStandingInstructions.changeJobTool, BotSelfConfigCatalog.setSettings)
+        let starter = BotStandingInstructions.fallback(name: "Piper", title: "Scout")
+        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.putMemory))
+        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.setSettings))
+    }
+
     func test_callUsesLiveCatalogAndPersistsThroughPublish() throws {
         // WHY: Studio Save and the bot self-config surface must share one persist path.
         let bot = try store.create(

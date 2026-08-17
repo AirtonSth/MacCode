@@ -117,7 +117,9 @@ final class BotTypesTests: XCTestCase {
         // WHY: Hermes never overwrites a user SOUL.md. Role auto-config may
         // refresh the starter, but a written soul must stay untouched.
         let starter = BotStandingInstructions.fallback(name: "New Agent", title: "", description: "")
-        XCTAssertTrue(starter.contains("New Agent"))
+        XCTAssertFalse(starter.contains("You are"), "identity layer owns the name")
+        XCTAssertTrue(starter.contains(BotStandingInstructions.rememberFactTool))
+        XCTAssertTrue(starter.contains(BotStandingInstructions.changeJobTool))
         XCTAssertTrue(starter.contains(BotStandingInstructions.generatedSignature))
         XCTAssertTrue(BotStandingInstructions.looksGenerated(""))
         XCTAssertTrue(BotStandingInstructions.looksGenerated(starter))
@@ -126,9 +128,9 @@ final class BotTypesTests: XCTestCase {
             BotStandingInstructions.resolved(name: "Piper", title: "Scout", soul: ""),
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")
         )
-        XCTAssertTrue(
-            BotStandingInstructions.resolved(name: "Piper", title: "Scout", soul: starter)
-                .contains("Your job is: Scout.")
+        XCTAssertEqual(
+            BotStandingInstructions.resolved(name: "Piper", title: "Scout", soul: starter),
+            starter
         )
         XCTAssertEqual(
             BotStandingInstructions.resolved(name: "Piper", title: "Scout", soul: "Own the inbox."),

@@ -2436,11 +2436,13 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertTrue(BotStandingInstructions.looksGenerated(revision.soul))
         XCTAssertTrue(revision.soul.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertTrue(revision.soul.contains(BotStandingInstructions.rememberFactTool))
         vm.beginEdit(bot)
         XCTAssertEqual(vm.studioDraft.soul, revision.soul)
         vm.studioDraft.title = "Reviews PRs"
         vm.refreshGeneratedStandingInstructions()
-        XCTAssertTrue(vm.studioDraft.soul.contains("Your job is: Reviews PRs."))
+        XCTAssertTrue(vm.studioDraft.soul.contains(BotStandingInstructions.changeJobTool))
+        XCTAssertFalse(vm.studioDraft.soul.contains("You are"), "Role must not rewrite identity into Instructions")
         vm.studioDraft.soul = "Speak plainly."
         vm.studioDraft.title = "Other job"
         vm.refreshGeneratedStandingInstructions()
