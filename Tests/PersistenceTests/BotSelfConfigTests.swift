@@ -1936,6 +1936,95 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(viaPrompt.routines.first?.prompt, "Triage the inbox", "save_routine still owns prompt")
     }
 
+    func test_setSettingsRejectsSnapshotScheduleNote_becauseStudioSaysSaveRoutine() throws {
+        // WHY: Studio already says When. Compile already labels When.
+        // leftover when already rejects. Snapshot still encodes leftover
+        // schedule_note, so first-chat that reused the last get_settings
+        // key invented a persist. Reject the snapshot key. save_routine
+        // still persists When. leftover when still rejects. leftover
+        // Instruction / prompt still reject. Name still persists.
+        // Schema does not grow a schedule_note write key. Dest title
+        // stays Routine.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.scheduleNote, "Weekdays 9:00")
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        let routines = try XCTUnwrap(object["routines"] as? [[String: Any]])
+        XCTAssertEqual(routines.first?["prompt"] as? String, "Summarize overnight")
+        XCTAssertEqual(routines.first?["schedule_note"] as? String, "Weekdays 9:00")
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["schedule_note"],
+            "schema does not grow a schedule_note write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "schedule_note": "Weekdays 9:00",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.whenHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "schedule_note": "Weekdays 9:00",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.whenHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "when": "Weekdays 9:00",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.whenHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "prompt": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "schedule_note reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "schedule_note reject must not persist soul")
+        XCTAssertEqual(still.routines.first?.scheduleNote, "Weekdays 9:00")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.routines.first?.scheduleNote, "Weekdays 9:00")
+
+        let viaNote = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "routine_id": try XCTUnwrap(saved.routines.first?.id),
+            "name": "Morning",
+            "prompt": "Summarize overnight",
+            "schedule_note": "Daily 8:00",
+        ])
+        XCTAssertEqual(viaNote.routines.first?.scheduleNote, "Daily 8:00", "save_routine still owns schedule_note")
+    }
+
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
         // WHY: Studio already picks Avatar and publish already writes
         // avatar_symbol. Tools never named that path, so first-chat

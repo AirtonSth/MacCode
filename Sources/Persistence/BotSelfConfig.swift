@@ -706,7 +706,10 @@ public struct BotSelfConfigService: Sendable {
         }
         // Studio already says When. Compile already labels When. A
         // leftover when write used to return an empty success, so
-        // first-chat invented a persist. Schema does not grow a when
+        // first-chat invented a persist. Snapshot leftover
+        // schedule_note used to return an empty success, so
+        // first-chat invented a persist from the last get_settings
+        // key. Schema does not grow a when or schedule_note write
         // key. save_routine still persists Instruction / When.
         // set_routine_enabled still persists Active. Dest title stays
         // Routine.
@@ -916,12 +919,17 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "prompt"
     }
 
-    /// when is not a schema key. Studio / compile advertise the name,
-    /// so parse must fail loud instead of succeeding empty. save_routine
-    /// still persists When. Schema does not grow a when key.
+    /// when is not a set_settings schema key. Studio / compile
+    /// advertise the name, so parse must fail loud instead of succeeding
+    /// empty. Snapshot leftover schedule_note is the same write —
+    /// get_settings still encodes that leftover name, so parse must
+    /// reject it instead of succeeding empty. save_routine still
+    /// persists When. Schema does not grow a when or schedule_note
+    /// write key.
     static func isAdvertisedWhenKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "when"
+            || normalized == "schedule_note"
     }
 
     /// active is not a schema key. Studio / compile advertise the name,
