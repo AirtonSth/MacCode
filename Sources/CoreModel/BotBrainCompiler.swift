@@ -203,6 +203,14 @@ public enum BotBrainCompiler {
     public static let whenHonesty =
         "When: call \(BotStandingInstructions.saveRoutineTool). Same path as Studio Save routine. Not a set_settings write."
 
+    /// Studio already says Active. Compile already labels Active. A leftover
+    /// active / enabled / on / off write on set_settings used to return an
+    /// empty success, so first-chat invented a persist. Hermes cron
+    /// writes stay on set_routine_enabled. Dest Source title stays Routine.
+    /// Schema does not grow an active key.
+    public static let activeHonesty =
+        "Active: call \(BotStandingInstructions.setRoutineEnabledTool). Same path as Studio Active. Not a set_settings write."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,
