@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -642,6 +642,14 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedHostBrokeredWritesKey) {
             throw BotSelfConfigError.invalid(BotPermission.honestyLabel)
         }
+        // Studio Routines already says Test run. Compile already labels
+        // do the Instruction now. A leftover Test run / test_run write
+        // used to return an empty success, so first-chat invented a
+        // persist. Schema does not grow a test_run key. Dest title stays
+        // Routine. The owner Test run button stays.
+        if arguments.keys.contains(where: Self.isAdvertisedTestRunKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.testRunHonesty)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -758,6 +766,16 @@ public struct BotSelfConfigService: Sendable {
         return normalized == "host_brokered_writes"
             || normalized == "host_brokered"
             || normalized == "effects"
+    }
+
+    /// test_run is not a schema key. Studio / compile advertise the
+    /// name, so parse must fail loud instead of succeeding empty.
+    /// Schema does not grow a test tool. Dest title stays Routine.
+    static func isAdvertisedTestRunKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "test_run"
+            || normalized == "test_run_requested"
+            || normalized == "last_test_run_requested_at"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {
