@@ -277,6 +277,8 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["url"], "url is a leftover bot_browser_open key, not a set_settings key")
         XCTAssertNil(properties?["last_website"], "last_website is an advertised compile name, not a set_settings key")
         XCTAssertNil(properties?["browser"], "browser is an advertised compile heading, not a set_settings key")
+        XCTAssertNil(properties?["logical_execution_space"], "logical_execution_space is an advertised compile title, not a set_settings key")
+        XCTAssertNil(properties?["logical_space"], "logical_space is an advertised Desktop pill, not a set_settings key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
@@ -2013,6 +2015,80 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedLogicalExecutionSpace_becauseStudioSaysItIsNotASelfConfigWrite() throws {
+        // WHY: Studio already says Logical execution space. Compile
+        // already labels Desktop with that title. leftover desktop /
+        // desktop_kind / desktopKind already reject. leftover
+        // logical_execution_space still succeeded empty, so first-chat
+        // invented a persist from the compile title. Reject the
+        // advertised name with desktop honesty. leftover desktop still
+        // rejects. Name still persists. Schema does not grow a
+        // logical_execution_space write key. Dest title stays Desktop.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["logical_execution_space"],
+            "schema does not grow a logical_execution_space write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "logical_execution_space": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Logical execution space": BotDesktopKind.logicalExecutionSpace.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "logical_space": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop": BotDesktopKind.logicalExecutionSpace.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Logical execution space reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Logical execution space reject must not persist soul")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
+        XCTAssertEqual(renamed.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
     }
 
     func test_setSettingsRejectsSnapshotId_becauseStudioSaysIdentityIsHostAssigned() throws {
