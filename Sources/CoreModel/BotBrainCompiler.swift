@@ -15,6 +15,7 @@ public struct BotContextLayer: Codable, Sendable, Equatable, Identifiable {
         case soul
         case memory
         case skill
+        case routine
         case user
     }
 
@@ -106,6 +107,7 @@ public enum BotBrainCompiler {
         userText: String,
         memory: [BotMemoryItem] = [],
         skills: [BotSkillBinding] = [],
+        routines: [BotRoutine] = [],
         conversationID: BotConversationID? = nil,
         runID: AgentRunID? = nil,
         now: Date = Date()
@@ -115,7 +117,8 @@ public enum BotBrainCompiler {
             revision: revision,
             userText: userText,
             memory: memory,
-            skills: skills
+            skills: skills,
+            routines: routines
         )
         return ContextAssemblyReceipt(
             botID: bot.id,
@@ -135,7 +138,8 @@ public enum BotBrainCompiler {
                 revision: revision,
                 userText: userText,
                 memory: memory,
-                skills: skills
+                skills: skills,
+                routines: routines
             ),
             assembledAt: now
         )
@@ -147,7 +151,8 @@ public enum BotBrainCompiler {
         revision: BotRevision,
         userText: String,
         memory: [BotMemoryItem] = [],
-        skills: [BotSkillBinding] = []
+        skills: [BotSkillBinding] = [],
+        routines: [BotRoutine] = []
     ) -> String {
         var lines: [String] = []
         let job = [bot.name, revision.title].filter { !$0.isEmpty }.joined(separator: " — ")
@@ -177,9 +182,25 @@ public enum BotBrainCompiler {
         if !enabled.isEmpty {
             lines.append("Enabled skills: \(enabled.joined(separator: ", "))")
         }
+        let liveRoutines = routines.filter(\.activation.isEnabled)
+            .sorted { $0.definition.name.localizedCaseInsensitiveCompare($1.definition.name) == .orderedAscending }
+        if !liveRoutines.isEmpty {
+            lines.append("Enabled routines (not while the app is closed):")
+            lines.append(contentsOf: liveRoutines.map(Self.routineLine))
+        }
         lines.append("User request:")
         lines.append(userText)
         return lines.joined(separator: "\n\n")
+    }
+
+    static func routineLine(_ routine: BotRoutine) -> String {
+        let name = routine.definition.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = routine.definition.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let note = routine.definition.scheduleNote.trimmingCharacters(in: .whitespacesAndNewlines)
+        if note.isEmpty {
+            return "- \(name): \(prompt)"
+        }
+        return "- \(name) (\(note)): \(prompt)"
     }
 
     static func sourceLayers(
@@ -187,7 +208,8 @@ public enum BotBrainCompiler {
         revision: BotRevision,
         userText: String,
         memory: [BotMemoryItem],
-        skills: [BotSkillBinding]
+        skills: [BotSkillBinding],
+        routines: [BotRoutine]
     ) -> [BotContextLayer] {
         var layers: [BotContextLayer] = []
         let job = [bot.name, revision.title].filter { !$0.isEmpty }.joined(separator: " — ")
@@ -294,6 +316,23 @@ public enum BotBrainCompiler {
                     included: binding.enabled,
                     reason: binding.enabled
                         ? "Enabled catalog binding."
+                        : "Disabled. Not injected."
+                )
+            )
+        }
+
+        for routine in routines.sorted(by: {
+            $0.definition.name.localizedCaseInsensitiveCompare($1.definition.name) == .orderedAscending
+        }) {
+            layers.append(
+                BotContextLayer(
+                    id: "routine-\(routine.definition.id.value.uuidString.lowercased())",
+                    kind: .routine,
+                    title: "Routine",
+                    text: routineLine(routine),
+                    included: routine.activation.isEnabled,
+                    reason: routine.activation.isEnabled
+                        ? "Enabled. Runs only while the app is open."
                         : "Disabled. Not injected."
                 )
             )

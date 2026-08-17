@@ -1257,6 +1257,7 @@ public final class BotsViewModel: ObservableObject {
                         attachments: attached,
                         memory: brain.memory,
                         skills: brain.skills,
+                        routines: brain.routines,
                         router: router
                     )
                     self.clearDeskSendInFlight(for: bot.id)
@@ -1389,6 +1390,9 @@ public final class BotsViewModel: ObservableObject {
             request,
             memory.map(\.content).joined(separator: "\u{1e}"),
             skillBindings.map(\.skillID).joined(separator: ","),
+            routines.map {
+                "\($0.definition.id.value.uuidString):\($0.activation.isEnabled):\($0.definition.name):\($0.definition.prompt):\($0.definition.scheduleNote)"
+            }.joined(separator: ","),
             selectedConversation?.id.value.uuidString ?? "",
         ].joined(separator: "\u{1f}")
         if cachedPreviewBrainKey == key, let cached = cachedPreviewBrain {
@@ -1401,6 +1405,7 @@ public final class BotsViewModel: ObservableObject {
             userText: request,
             memory: memory,
             skills: skillBindings,
+            routines: routines,
             conversationID: selectedConversation?.id
         )
         cachedPreviewBrainKey = key
@@ -2796,15 +2801,17 @@ public final class BotsViewModel: ObservableObject {
 
     /// Send dest used to listMemory/listSkillBindings after dest
     /// painted the bubble. Use dest cache when this teammate is open.
-    private func destBrainInputs(for bot: BotDefinition) -> (memory: [BotMemoryItem], skills: [BotSkillBinding]) {
+    private func destBrainInputs(for bot: BotDefinition) -> (memory: [BotMemoryItem], skills: [BotSkillBinding], routines: [BotRoutine]) {
         if selectedBotID == bot.id {
-            return (memoryItems, skillBindings)
+            return (memoryItems, skillBindings, routines)
         }
         memoryListCountForTesting += 1
         skillListCountForTesting += 1
+        routineListCountForTesting += 1
         let memory = (try? botStore.listMemory(botID: bot.id, includeForgotten: true)) ?? []
         let skills = (try? botStore.listSkillBindings(botID: bot.id)) ?? []
-        return (memory, skills)
+        let listedRoutines = (try? botStore.listRoutines(botID: bot.id)) ?? []
+        return (memory, skills, listedRoutines)
     }
 
     private func startSupervisedRun(
@@ -2815,6 +2822,7 @@ public final class BotsViewModel: ObservableObject {
         attachments: [AgentAttachment] = [],
         memory: [BotMemoryItem],
         skills: [BotSkillBinding],
+        routines: [BotRoutine] = [],
         router: AppCommandRouter
     ) async -> AgentRunID? {
         let workspaceID = bot.workspaceID
@@ -2857,6 +2865,7 @@ public final class BotsViewModel: ObservableObject {
                 userText: userText,
                 memory: memory,
                 skills: skills,
+                routines: routines,
                 conversationID: conversation.id
             )
             try botStore.insertContextReceipt(receipt)

@@ -1494,6 +1494,43 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesEnabledRoutine_becauseDestMustNotOmitSchedules() throws {
+        // WHY: Brain Inspector / Desk send used dest memory+skills and
+        // skipped dest routines. Owner-authored Morning scan never reached
+        // the model unless it called get_settings.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openDesk(piper)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.saveRoutine()
+        let id = try XCTUnwrap(vm.routines.first?.definition.id)
+        let listsBefore = vm.routineListCountForTesting
+        vm.setRoutineEnabled(id: id, enabled: true)
+        vm.composerText = "What do you run?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Morning scan (Weekdays 9:00): Scan overnight failures"))
+        XCTAssertTrue(preview.compiledPayload.contains("not while the app is closed"))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What do you run?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines
+            )
+        )
+        XCTAssertEqual(
+            vm.routineListCountForTesting,
+            listsBefore,
+            "preview dest must use dest-cached routines"
+        )
+    }
+
     func test_saveRoutineKeepsExistingRoutines_becauseStaleEmptyMustNotLookCurrent() throws {
         // WHY: dest-first save is honest only when older schedules stay
         // visible and the new row paints first.

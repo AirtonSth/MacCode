@@ -187,4 +187,63 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(BotStandingInstructions.looksGenerated(starter))
         XCTAssertFalse(BotStandingInstructions.looksGenerated("Speak plainly."))
     }
+
+    func test_enabledRoutineCompilesAndDisabledStaysOut_becauseSchedulesAreAuthority() {
+        // WHY: Hermes/OpenClaw agents know their cron jobs. Studio Routines
+        // were owner-authored but Desk compile never mentioned them, so
+        // "what do you run in the morning?" invented work. Disabled rows
+        // and app-closed honesty must stay — P1a has no autonomy.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let morning = BotRoutineDefinition(
+            botID: bot.id,
+            name: "Morning scan",
+            prompt: "Scan overnight failures",
+            scheduleNote: "Weekdays 9:00"
+        )
+        let off = BotRoutineDefinition(
+            botID: bot.id,
+            name: "Nightly archive",
+            prompt: "Archive the inbox"
+        )
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "What do you run?",
+            routines: [
+                BotRoutine(
+                    definition: morning,
+                    activation: BotRoutineActivation(routineID: morning.id, botID: bot.id, isEnabled: true)
+                ),
+                BotRoutine(
+                    definition: off,
+                    activation: BotRoutineActivation(routineID: off.id, botID: bot.id, isEnabled: false)
+                ),
+            ]
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("Enabled routines (not while the app is closed):"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Morning scan (Weekdays 9:00): Scan overnight failures"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Nightly archive"))
+        XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Morning scan") })?.included, true)
+        XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Nightly archive") })?.included, false)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.text.contains("Nightly archive") })?.reason,
+            "Disabled. Not injected."
+        )
+    }
 }
