@@ -44,29 +44,10 @@ public enum BotsChrome {
     public static let desktopPaneWidth: CGFloat = 340
 
     /// Studio Avatar is a chip picker. Default matches BotDefinition.
-    public static let avatarSymbols: [String] = [
-        "person.crop.circle",
-        "brain.head.profile",
-        "hammer.fill",
-        "terminal.fill",
-        "sparkles",
-        "star.fill",
-        "ant.fill",
-        "leaf.fill",
-    ]
+    public static let avatarSymbols: [String] = BotAvatar.advertisedSymbols
 
     public static func avatarSymbolName(_ symbol: String) -> String {
-        switch symbol {
-        case "person.crop.circle": return "Person"
-        case "brain.head.profile": return "Brain"
-        case "hammer.fill": return "Hammer"
-        case "terminal.fill": return "Terminal"
-        case "sparkles": return "Sparkles"
-        case "star.fill": return "Star"
-        case "ant.fill": return "Ant"
-        case "leaf.fill": return "Leaf"
-        default: return symbol
-        }
+        BotAvatar.advertisedName(for: symbol)
     }
 
     public static let allVisibleLabels: [String] = [

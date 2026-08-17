@@ -484,7 +484,7 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Change your description")
-        XCTAssertTrue(receipt.compiledPayload.contains("name, job, standing instructions, description, route, or notifications"))
+        XCTAssertTrue(receipt.compiledPayload.contains("name, job, standing instructions, description, route, notifications, or avatar"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.changeJobTool))
         XCTAssertTrue(receipt.compiledPayload.contains("Description: Looks around"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))

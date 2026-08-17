@@ -213,6 +213,45 @@ public enum BotRoute {
     }
 }
 
+/// Studio Avatar is a chip picker. Tools must persist those names on the
+/// same publish path Studio Save already uses.
+public enum BotAvatar {
+    public static let advertisedSymbols: [String] = [
+        "person.crop.circle",
+        "brain.head.profile",
+        "hammer.fill",
+        "terminal.fill",
+        "sparkles",
+        "star.fill",
+        "ant.fill",
+        "leaf.fill",
+    ]
+
+    public static func advertisedName(for symbol: String) -> String {
+        switch symbol {
+        case "person.crop.circle": return "Person"
+        case "brain.head.profile": return "Brain"
+        case "hammer.fill": return "Hammer"
+        case "terminal.fill": return "Terminal"
+        case "sparkles": return "Sparkles"
+        case "star.fill": return "Star"
+        case "ant.fill": return "Ant"
+        case "leaf.fill": return "Leaf"
+        default: return symbol
+        }
+    }
+
+    /// Studio says Star / Person. The SF Symbol stays valid.
+    public static func parse(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if advertisedSymbols.contains(trimmed) { return trimmed }
+        return advertisedSymbols.first {
+            advertisedName(for: $0).caseInsensitiveCompare(trimmed) == .orderedSame
+        }
+    }
+}
+
 /// Hermes seeds `SOUL.md` and falls back when it is empty. OpenClaw seeds
 /// `SOUL.md` / `IDENTITY.md` on first run. An empty Bot soul used to compile
 /// as "No standing instructions." — a New Agent then only saw "You are New Agent."
@@ -240,7 +279,7 @@ public enum BotStandingInstructions {
     public static let waitLoginTool = "bot_browser_wait_login"
 
     public static let generatedCapabilityLine =
-        "When asked to remember a fact, call \(rememberFactTool). When asked to change your name, job, standing instructions, description, route, or notifications, call \(changeJobTool)."
+        "When asked to remember a fact, call \(rememberFactTool). When asked to change your name, job, standing instructions, description, route, notifications, or avatar, call \(changeJobTool)."
 
     public static let generatedMutateLine =
         "When asked to forget a fact, call \(forgetFactTool). When asked to correct a fact, call \(correctFactTool). When asked to enable or disable a skill, call \(setSkillTool). When asked to remove a skill, call \(removeSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to turn a routine on or off, call \(setRoutineEnabledTool)."

@@ -194,14 +194,16 @@ final class BotSelfConfigTests: XCTestCase {
         // The MCP schema still invited those writes, so first-chat
         // "set full access" invented live unsupervised power.
         let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setSettings)
-        XCTAssertTrue(description.contains("name, job, standing instructions, description, route, or notifications"))
+        XCTAssertTrue(description.contains("name, job, standing instructions, description, route, notifications, or avatar"))
         XCTAssertFalse(description.contains("permission"))
         XCTAssertFalse(description.contains("desktop"))
         let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)
         let properties = schema["properties"] as? [String: Any]
         XCTAssertNotNil(properties?["provider"])
         XCTAssertNotNil(properties?["model"])
+        XCTAssertNotNil(properties?["avatar_symbol"])
         XCTAssertNil(properties?["route"], "route is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["avatar"], "avatar is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["permission_mode"])
         XCTAssertNil(properties?["desktop_kind"])
         let provider = properties?["provider"] as? [String: Any]
@@ -209,12 +211,65 @@ final class BotSelfConfigTests: XCTestCase {
         let title = properties?["title"] as? [String: Any]
         let soul = properties?["soul"] as? [String: Any]
         let notify = properties?["notifications_enabled"] as? [String: Any]
+        let avatar = properties?["avatar_symbol"] as? [String: Any]
         XCTAssertEqual(title?["description"] as? String, "Role / job. Same field as Studio Role.")
         XCTAssertEqual(soul?["description"] as? String, "Instructions. Same field as Studio Instructions.")
         XCTAssertEqual(notify?["description"] as? String, "Notifications On/Off.")
+        XCTAssertEqual(avatar?["description"] as? String, "Avatar. Same field as Studio Avatar.")
         XCTAssertNil(properties?["notifications"], "notifications is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["instructions"], "instructions is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["standing_instructions"], "standing_instructions is an advertised alias, not a second schema key")
+    }
+
+    func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
+        // WHY: Studio already picks Avatar and publish already writes
+        // avatar_symbol. Tools never named that path, so first-chat
+        // "change my avatar" invented a hop. Canonical avatar_symbol
+        // still wins. Schema does not grow an avatar key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude
+        )
+        XCTAssertEqual(bot.avatarSymbol, "person.crop.circle")
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromName = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "avatar": "Star",
+        ])
+        XCTAssertEqual(fromName.avatarSymbol, "star.fill", "Star persists")
+        XCTAssertEqual(try store.get(id: bot.id)?.avatarSymbol, "star.fill")
+
+        let fromSymbol = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "avatar": "leaf.fill",
+        ])
+        XCTAssertEqual(fromSymbol.avatarSymbol, "leaf.fill")
+
+        let symbolWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "avatar_symbol": "hammer.fill",
+            "avatar": "Star",
+        ])
+        XCTAssertEqual(symbolWins.avatarSymbol, "hammer.fill", "avatar_symbol wins")
+        XCTAssertEqual(try store.get(id: bot.id)?.avatarSymbol, "hammer.fill")
+
+        let json = try service.encodeSnapshot(symbolWins)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["avatar_symbol"] as? String, "hammer.fill", "avatar_symbol persists")
+        XCTAssertNil(object["avatar"], "avatar is an advertised alias, not a second schema key")
+        XCTAssertNil(object["avatarSymbol"], "Swift avatarSymbol omitted")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "avatar": "Robot",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid("Unknown avatar: Robot"))
+        }
+        XCTAssertEqual(try store.get(id: bot.id)?.avatarSymbol, "hammer.fill")
     }
 
     func test_setSettingsAdvertisedNamesPersist_becauseToolsSayJobNotTitle() throws {

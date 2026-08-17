@@ -174,6 +174,18 @@ final class BotTypesTests: XCTestCase {
         XCTAssertNil(BotRoute.parse("ChatGPT"))
     }
 
+    func test_avatarParseAcceptsStudioNames_becauseToolsMustPersistTheChipLabel() {
+        // WHY: Studio Avatar chips announce Person / Star. Tools must
+        // persist those names on the same publish path, not invent a
+        // second picker.
+        XCTAssertEqual(BotAvatar.parse("Star"), "star.fill")
+        XCTAssertEqual(BotAvatar.parse("person.crop.circle"), "person.crop.circle")
+        XCTAssertEqual(BotAvatar.advertisedName(for: "star.fill"), "Star")
+        XCTAssertNil(BotAvatar.parse("Robot"))
+        XCTAssertTrue(BotAvatar.advertisedSymbols.contains("person.crop.circle"))
+        XCTAssertEqual(Set(BotAvatar.advertisedSymbols).count, BotAvatar.advertisedSymbols.count)
+    }
+
     func test_admittedToolsNameDescriptionRouteAndNotifications_becauseSetSettingsAlreadyPublishesThem() {
         // WHY: Desk-admitted bot_set_settings already publishes description.
         // Tools named name/job/soul/route/notifications, so first-chat
@@ -181,10 +193,10 @@ final class BotTypesTests: XCTestCase {
         // which self-config writes are live.
         let tools = BotStandingInstructions.admittedToolsText
         XCTAssertTrue(tools.contains(BotStandingInstructions.changeJobTool))
-        XCTAssertTrue(tools.contains("name, job, standing instructions, description, route, or notifications"))
+        XCTAssertTrue(tools.contains("name, job, standing instructions, description, route, notifications, or avatar"))
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")
-                .contains("description, route, or notifications"),
+                .contains("notifications, or avatar"),
             "tools layer owns the remaining set_settings writes"
         )
         XCTAssertFalse(tools.contains("handle"), "handle is create-only")

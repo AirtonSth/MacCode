@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, job, standing instructions, description, route, or notifications. Same path as Studio Save."
+            return "Publish this bot's own name, job, standing instructions, description, route, notifications, or avatar. Same path as Studio Save."
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -96,6 +96,7 @@ public enum BotSelfConfigCatalog: Sendable {
                     "provider_instance_id": ["type": "string"],
                     "model": ["type": "string"],
                     "notifications_enabled": ["type": "boolean", "description": "Notifications On/Off."],
+                    "avatar_symbol": ["type": "string", "description": "Avatar. Same field as Studio Avatar."],
                 ]) { _, new in new },
             ]
         case putMemory:
@@ -168,6 +169,7 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
     public var name: String
     public var title: String
     public var description: String
+    public var avatarSymbol: String
     public var soul: String
     public var provider: String
     public var providerInstanceID: String
@@ -187,6 +189,7 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
         case name
         case title
         case description
+        case avatarSymbol = "avatar_symbol"
         case soul
         case provider
         case providerInstanceID = "provider_instance_id"
@@ -242,6 +245,7 @@ public struct BotSelfConfigPatch: Equatable, Sendable {
     public var name: String?
     public var title: String?
     public var description: String?
+    public var avatarSymbol: String?
     public var soul: String?
     public var provider: AgentProvider?
     public var providerInstanceID: String?
@@ -254,6 +258,7 @@ public struct BotSelfConfigPatch: Equatable, Sendable {
         name: String? = nil,
         title: String? = nil,
         description: String? = nil,
+        avatarSymbol: String? = nil,
         soul: String? = nil,
         provider: AgentProvider? = nil,
         providerInstanceID: String? = nil,
@@ -265,6 +270,7 @@ public struct BotSelfConfigPatch: Equatable, Sendable {
         self.name = name
         self.title = title
         self.description = description
+        self.avatarSymbol = avatarSymbol
         self.soul = soul
         self.provider = provider
         self.providerInstanceID = providerInstanceID
@@ -275,7 +281,7 @@ public struct BotSelfConfigPatch: Equatable, Sendable {
     }
 
     public var isEmpty: Bool {
-        name == nil && title == nil && description == nil && soul == nil
+        name == nil && title == nil && description == nil && avatarSymbol == nil && soul == nil
             && provider == nil && providerInstanceID == nil && model == nil
             && permissionMode == nil && desktopKind == nil && notificationsEnabled == nil
     }
@@ -339,6 +345,7 @@ public struct BotSelfConfigService: Sendable {
             name: bot.name,
             title: bot.title,
             description: bot.description,
+            avatarSymbol: bot.avatarSymbol,
             soul: revision?.soul ?? "",
             provider: (revision?.provider ?? .claude).rawValue,
             providerInstanceID: revision?.providerInstanceID ?? "",
@@ -410,6 +417,7 @@ public struct BotSelfConfigService: Sendable {
             botID: callerBotID,
             expectedCurrentRevisionID: currentID,
             draft: draft,
+            avatarSymbol: patch.avatarSymbol,
             notificationsEnabled: patch.notificationsEnabled
         )
         return try snapshot()
@@ -577,6 +585,13 @@ public struct BotSelfConfigService: Sendable {
     static func parsePatch(_ arguments: [String: Any]) throws -> BotSelfConfigPatch {
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
+        // Tools and Studio say Avatar. Schema key stays avatar_symbol.
+        if let raw = firstString(arguments, keys: ["avatar_symbol", "avatar"]) {
+            guard let symbol = BotAvatar.parse(raw) else {
+                throw BotSelfConfigError.invalid("Unknown avatar: \(raw)")
+            }
+            patch.avatarSymbol = symbol
+        }
         // Tools and Studio say job / Role. Schema key stays title.
         if let title = firstString(arguments, keys: ["title", "job", "role"]) {
             patch.title = title
