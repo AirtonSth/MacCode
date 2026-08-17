@@ -624,9 +624,12 @@ public struct BotSelfConfigService: Sendable {
         // write used to coerce to supervised and return success, so
         // first-chat invented a persist. Snapshot camelCase permissionMode
         // used to return an empty success, so first-chat invented a
-        // persist from the last get_settings key. Schema does not grow
-        // an approval_mode, permission_mode, or permissionMode key.
-        // Leftover desktop_kind now rejects. Dest title stays Permission.
+        // persist from the last get_settings key. leftover supervised
+        // still succeeded empty after permission_mode rejected, so
+        // first-chat invented a persist from the Desk pill and compile
+        // "Supervised." Schema does not grow an approval_mode,
+        // permission_mode, permissionMode, or supervised key. Leftover
+        // desktop_kind now rejects. Dest title stays Permission.
         if arguments.keys.contains(where: Self.isAdvertisedApprovalModeKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.approvalModeHostAssignedHonesty)
         }
@@ -867,7 +870,10 @@ public struct BotSelfConfigService: Sendable {
     /// Leftover permission_mode is the same host-assigned write.
     /// Snapshot camelCase permissionMode is the same write —
     /// get_settings still encodes that leftover name, so parse must
-    /// reject it instead of succeeding empty.
+    /// reject it instead of succeeding empty. leftover supervised is
+    /// the same write — Desk pill, Studio summary, and compile
+    /// "Supervised." are the advertised dest values. Snapshot still
+    /// encodes that leftover raw value.
     static func isAdvertisedApprovalModeKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "approval"
@@ -875,6 +881,7 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "permission"
             || normalized == "permission_mode"
             || normalized == "permissionmode"
+            || normalized == "supervised"
     }
 
     /// desktop is not a schema key. Studio / compile advertise the name,
