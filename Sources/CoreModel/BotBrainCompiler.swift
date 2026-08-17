@@ -186,6 +186,15 @@ public enum BotBrainCompiler {
     public static let routinesHonesty =
         "Routines: call \(BotStandingInstructions.saveRoutineTool). Same path as Studio Save routine. Not a set_settings write."
 
+    /// Studio already says Instruction. Compile already labels Instruction.
+    /// A leftover instruction write on set_settings used to return an
+    /// empty success, so first-chat invented a persist. Hermes cron
+    /// writes stay on save_routine. Plural Instructions still persist
+    /// soul. Dest Source title stays Routine. Schema does not grow an
+    /// instruction key.
+    public static let instructionHonesty =
+        "Instruction: call \(BotStandingInstructions.saveRoutineTool). Same path as Studio Save routine. Not a set_settings write."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,

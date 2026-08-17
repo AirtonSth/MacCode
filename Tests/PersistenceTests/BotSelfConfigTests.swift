@@ -254,6 +254,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["routine"], "routine is an advertised save_routine alias, not a set_settings key")
         XCTAssertNil(properties?["routine_id"], "routine_id is a save_routine key, not a set_settings key")
         XCTAssertNil(properties?["save_routine"], "save_routine is not a schema key")
+        XCTAssertNil(properties?["instruction"], "instruction is an advertised save_routine alias, not a set_settings key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
@@ -265,6 +266,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(description.contains(BotBrainCompiler.memoryHonesty), "catalog names Memory honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.skillsHonesty), "catalog names Skills honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.routinesHonesty), "catalog names Routines honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.instructionHonesty), "catalog names Instruction honesty")
     }
 
     func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
@@ -940,6 +942,86 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.routines.first?.name, "Morning")
+        XCTAssertEqual(renamed.routines.first?.enabled, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedInstruction_becauseStudioSaysSaveRoutine() throws {
+        // WHY: Studio already says Instruction. Compile already labels
+        // Instruction. set_settings still accepted instruction as an
+        // empty success, so first-chat invented a persist. Reject the
+        // advertised name. Plural Instructions still persist soul.
+        // save_routine still persists Instruction / When.
+        // set_routine_enabled still persists Active. Name still
+        // persists. Leftover permission_mode still coerces. Schema does
+        // not grow an instruction key. Dest title stays Routine.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "instruction": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "instruction": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Instruction reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Instruction reject must not persist soul")
+        XCTAssertEqual(still.routines.count, 0, "Instruction reject must not persist a schedule")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.name, "Morning")
+        XCTAssertEqual(saved.routines.first?.prompt, "Summarize overnight")
+        XCTAssertEqual(saved.routines.first?.scheduleNote, "Weekdays 9:00")
+        let routineID = try XCTUnwrap(saved.routines.first?.id)
+
+        let activated = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": true,
+        ])
+        XCTAssertEqual(activated.routines.first?.enabled, true)
+
+        let leftover = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+        ])
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.soul, "Own the inbox.")
+        XCTAssertEqual(leftover.routines.first?.name, "Morning")
+        XCTAssertEqual(leftover.routines.first?.enabled, true)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
         XCTAssertEqual(renamed.routines.first?.name, "Morning")
         XCTAssertEqual(renamed.routines.first?.enabled, true)
     }

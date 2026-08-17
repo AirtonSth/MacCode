@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.routinesHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -675,6 +675,16 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedRoutinesKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.routinesHonesty)
         }
+        // Studio already says Instruction. Compile already labels
+        // Instruction. A leftover instruction write used to return an
+        // empty success, so first-chat invented a persist. Schema does
+        // not grow an instruction key. Plural Instructions still
+        // persist soul. save_routine still persists Instruction / When.
+        // set_routine_enabled still persists Active. Dest title stays
+        // Routine.
+        if arguments.keys.contains(where: Self.isAdvertisedInstructionKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.instructionHonesty)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -835,6 +845,15 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "routine"
             || normalized == "routine_id"
             || normalized == "save_routine"
+    }
+
+    /// instruction is not a schema key. Studio / compile advertise the
+    /// name, so parse must fail loud instead of succeeding empty.
+    /// Plural instructions still persist soul. save_routine still
+    /// persists Instruction. Schema does not grow an instruction key.
+    static func isAdvertisedInstructionKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "instruction"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {
