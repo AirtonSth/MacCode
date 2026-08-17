@@ -10,8 +10,13 @@ final class BotBlobatarTests: XCTestCase {
         let b = BotBlobatar.figure(name: "Piper", spec: spec)
         XCTAssertEqual(a, b)
         XCTAssertEqual(a.resolvedShape, .cloud)
-        let other = BotBlobatar.figure(name: "Scout", spec: spec)
-        XCTAssertNotEqual(a.body.cx, other.body.cx)
+        XCTAssertEqual(
+            BotBlobatar.figure(name: "Scout", spec: spec, handle: "piper"),
+            a,
+            "a fixed leftover token must not remake the creature when the name changes"
+        )
+        let unlocked = BotBlobatar.figure(name: "Scout", spec: .default)
+        XCTAssertNotEqual(a.body.cx, unlocked.body.cx)
     }
 
     func test_tokenRoundTripsStudioChoices_becauseSaveMustKeepWhatThePickerWrote() {
@@ -29,6 +34,32 @@ final class BotBlobatarTests: XCTestCase {
         let spec = BotBlobatarSpec.default
         let shapes = (0..<40).map { BotBlobatar.figure(name: "seed-\($0)", spec: spec).resolvedShape }
         XCTAssertGreaterThan(Set(shapes).count, 1)
+        let piper = BotBlobatar.figure(name: "Piper", spec: .default)
+        let scout = BotBlobatar.figure(name: "Scout", spec: .default)
+        XCTAssertNotEqual(piper, scout, "an undefined avatar must follow the live name")
+    }
+
+    func test_fixedSeedIgnoresNameChange_becauseAPickedAvatarMustStayPut() {
+        // WHY: Once the owner clicks Cloud, renaming the bot must not
+        // invent a new creature. Only another picker click may change it.
+        let locked = BotBlobatarSpec(
+            shape: .cloud,
+            expression: .idle,
+            background: .none,
+            hue: .named("coral"),
+            frozenSeed: "piper"
+        )
+        XCTAssertEqual(
+            BotBlobatar.figure(name: "Piper", spec: locked),
+            BotBlobatar.figure(name: "Scout", spec: locked)
+        )
+        XCTAssertEqual(BotBlobatarSpec.parse(locked.token), locked)
+        var reset = locked
+        reset.shape = .auto
+        reset.expression = .idle
+        reset.background = .none
+        reset.hue = .auto
+        XCTAssertTrue(reset.isDefaultAppearance)
     }
 
     func test_motionSampleIsDeterministic_becauseAReplayMustMatchTheLiveFace() {
