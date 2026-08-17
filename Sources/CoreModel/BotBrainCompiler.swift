@@ -195,6 +195,14 @@ public enum BotBrainCompiler {
     public static let instructionHonesty =
         "Instruction: call \(BotStandingInstructions.saveRoutineTool). Same path as Studio Save routine. Not a set_settings write."
 
+    /// Studio already says When. Compile already labels When. A leftover
+    /// when write on set_settings used to return an empty success, so
+    /// first-chat invented a persist. Hermes cron writes stay on
+    /// save_routine. Dest Source title stays Routine. Schema does not
+    /// grow a when key.
+    public static let whenHonesty =
+        "When: call \(BotStandingInstructions.saveRoutineTool). Same path as Studio Save routine. Not a set_settings write."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,
