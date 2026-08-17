@@ -181,7 +181,42 @@ final class BotBrowserStoreTests: XCTestCase {
         let properties = schema["properties"] as? [String: Any]
         XCTAssertNotNil(properties?["url"])
         XCTAssertNil(properties?["website"], "website is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["last_website"], "last_website is an advertised alias, not a second schema key")
         let url = properties?["url"] as? [String: Any]
-        XCTAssertEqual(url?["description"] as? String, "Website. Same field as the URL to open.")
+        XCTAssertEqual(url?["description"] as? String, "Website / last website. Same field as the URL to open.")
+    }
+
+    func test_openAdvertisedLastWebsitePersists_becauseHonestySaysLastWebsite() throws {
+        // WHY: set_settings leftover last_website already rejects and
+        // points at bot_browser_open ("Same path as last website"). Open
+        // only read url / website, so first-chat retried last_website and
+        // invented a hop. Canonical url still wins. Schema does not grow
+        // a last_website key. Dest title stays Browser.
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-bot-browser-last-website-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bot = BotID()
+        let service = BotBrowserService(
+            callerBotID: bot,
+            store: BotBrowserStore(appSupportDirectory: root)
+        )
+
+        let fromLastWebsite = try service.call(name: BotBrowserCatalog.open, arguments: [
+            "last_website": "https://login.example.test/in",
+        ])
+        XCTAssertEqual(fromLastWebsite["url"] as? String, "https://login.example.test/in", "last website persists")
+        XCTAssertEqual(try service.current()?.url, "https://login.example.test/in")
+
+        let urlWins = try service.call(name: BotBrowserCatalog.open, arguments: [
+            "url": "https://login.example.test/home",
+            "last_website": "https://ignored.example.test",
+        ])
+        XCTAssertEqual(urlWins["url"] as? String, "https://login.example.test/home", "url wins")
+        XCTAssertEqual(try service.current()?.url, "https://login.example.test/home")
+
+        let websiteStillWorks = try service.call(name: BotBrowserCatalog.open, arguments: [
+            "website": "https://login.example.test/again",
+        ])
+        XCTAssertEqual(websiteStillWorks["url"] as? String, "https://login.example.test/again", "website still persists")
     }
 }

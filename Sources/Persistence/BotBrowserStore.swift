@@ -59,7 +59,7 @@ public enum BotBrowserCatalog: Sendable {
             return [
                 "type": "object",
                 "properties": botID.merging([
-                    "url": ["type": "string", "description": "Website. Same field as the URL to open."],
+                    "url": ["type": "string", "description": "Website / last website. Same field as the URL to open."],
                     "title": ["type": "string"],
                 ]) { _, new in new },
                 "required": ["url"],
@@ -281,8 +281,11 @@ public struct BotBrowserService: Sendable {
         try assertOwn(Self.parseOptionalBotID(arguments["bot_id"]))
         switch name {
         case BotBrowserCatalog.open:
-            // Tools say website. Schema key stays url.
-            guard let url = Self.firstString(arguments, keys: ["url", "website"]) else {
+            // Tools and compile say website / last website. Schema key stays url.
+            // set_settings leftover last_website already rejects and points
+            // here, so first-chat retried last_website on open. Accept that
+            // advertised name on the existing persist path.
+            guard let url = Self.firstString(arguments, keys: ["url", "website", "last_website"]) else {
                 throw BotBrowserError.invalid("url is required.")
             }
             let target = try open(url: url, title: arguments["title"] as? String)
