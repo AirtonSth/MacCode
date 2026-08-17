@@ -408,6 +408,66 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(when?["description"] as? String, "When. Same field as Studio When.")
     }
 
+    func test_putMemoryAdvertisedFactPersists_becauseStudioSaysRememberAFact() throws {
+        // WHY: Tools and Studio say Remember a fact. Parse only read
+        // content, so first-chat "remember this fact" invented a hop or
+        // dropped the row. Canonical content still wins. Schema does not
+        // grow a second key.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromFact = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "fact": "Prefers dark mode",
+        ])
+        XCTAssertEqual(fromFact.memory.map(\.content), ["Prefers dark mode"])
+        XCTAssertEqual(try store.listMemory(botID: bot.id).map(\.content), ["Prefers dark mode"])
+
+        let contentWins = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers light mode",
+            "fact": "Ignored fact",
+        ])
+        XCTAssertEqual(contentWins.memory.map(\.content), ["Prefers dark mode", "Prefers light mode"])
+        XCTAssertEqual(contentWins.memory.last?.content, "Prefers light mode", "content wins")
+
+        let memoryID = try XCTUnwrap(fromFact.memory.first?.id)
+        let corrected = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "fact": "Prefers dusk",
+        ])
+        XCTAssertEqual(corrected.memory.first(where: { $0.id == memoryID })?.content, "Prefers dusk")
+
+        let correctContentWins = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "content": "Prefers dawn",
+            "fact": "Ignored correction",
+        ])
+        XCTAssertEqual(
+            correctContentWins.memory.first(where: { $0.id == memoryID })?.content,
+            "Prefers dawn",
+            "content wins"
+        )
+    }
+
+    func test_putMemoryCatalogDescribesFact_becauseThatIsTheStudioField() {
+        // WHY: Schema key stays content. Description must name Fact so
+        // first-chat does not invent a hop.
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.putMemory)
+        XCTAssertTrue(description.contains("fact"))
+        let putSchema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.putMemory)
+        let putProperties = putSchema["properties"] as? [String: Any]
+        XCTAssertNotNil(putProperties?["content"])
+        XCTAssertNil(putProperties?["fact"], "fact is an advertised alias, not a second schema key")
+        let putContent = putProperties?["content"] as? [String: Any]
+        XCTAssertEqual(putContent?["description"] as? String, "Fact. Same field as Studio Remember a fact.")
+
+        let correctSchema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.correctMemory)
+        let properties = correctSchema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["content"])
+        XCTAssertNil(properties?["fact"], "fact is an advertised alias, not a second schema key")
+        let content = properties?["content"] as? [String: Any]
+        XCTAssertEqual(content?["description"] as? String, "Fact. Same field as Studio Remember a fact.")
+    }
+
     func test_leftoverPermissionSnapshotStaysSupervised_becauseFullAccessIsNotLive() throws {
         // WHY: Brain compile already treats leftover full_access as
         // supervised. get_settings still returned the raw leftover, so

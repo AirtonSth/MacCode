@@ -101,7 +101,9 @@ public enum BotSelfConfigCatalog: Sendable {
         case putMemory:
             return [
                 "type": "object",
-                "properties": botID.merging(["content": ["type": "string"]]) { _, new in new },
+                "properties": botID.merging([
+                    "content": ["type": "string", "description": "Fact. Same field as Studio Remember a fact."],
+                ]) { _, new in new },
                 "required": ["content"],
             ]
         case forgetMemory:
@@ -115,7 +117,7 @@ public enum BotSelfConfigCatalog: Sendable {
                 "type": "object",
                 "properties": botID.merging([
                     "memory_id": ["type": "string"],
-                    "content": ["type": "string"],
+                    "content": ["type": "string", "description": "Fact. Same field as Studio Remember a fact."],
                 ]) { _, new in new },
                 "required": ["memory_id", "content"],
             ]
@@ -472,14 +474,15 @@ public struct BotSelfConfigService: Sendable {
             if patch.isEmpty { return try snapshot() }
             return try apply(patch)
         case BotSelfConfigCatalog.putMemory:
-            guard let content = arguments["content"] as? String else {
+            // Tools and Studio say Remember a fact. Schema key stays content.
+            guard let content = Self.firstString(arguments, keys: ["content", "fact"]) else {
                 throw BotSelfConfigError.invalid("Memory content is required.")
             }
             return try putMemory(content: content)
         case BotSelfConfigCatalog.forgetMemory:
             return try forgetMemory(id: BotMemoryItemID(try Self.parseUUID(arguments["memory_id"], label: "memory_id")))
         case BotSelfConfigCatalog.correctMemory:
-            guard let content = arguments["content"] as? String else {
+            guard let content = Self.firstString(arguments, keys: ["content", "fact"]) else {
                 throw BotSelfConfigError.invalid("Memory content is required.")
             }
             return try correctMemory(
