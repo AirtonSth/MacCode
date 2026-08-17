@@ -1189,6 +1189,70 @@ final class BotBrainCompilerTests: XCTestCase {
             receipt.layers.first(where: { $0.text.contains("Nightly archive") })?.reason,
             "Off. Not injected."
         )
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.testRunHonesty))
+        XCTAssertTrue(receipt.compiledPayload.contains("Test run: do the Instruction now"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Does not set Active"))
+        XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Morning scan") })?.title, "Routine")
+    }
+
+    func test_testRunHonestyCompilesForCustomSoul_becauseStudioTestRunIsNotAHop() {
+        // WHY: Studio already says Test run. Compile listed Active routines
+        // only, so first-chat "test this routine" invented a hop or a
+        // schedule fire. Hermes test runs are live work, not a fake cron.
+        // Dest Source title stays Routine. Schema does not grow a test tool.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let morning = BotRoutineDefinition(
+            botID: bot.id,
+            name: "Morning scan",
+            prompt: "Scan overnight failures"
+        )
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Test this routine",
+            routines: [
+                BotRoutine(
+                    definition: morning,
+                    activation: BotRoutineActivation(routineID: morning.id, botID: bot.id, isEnabled: true)
+                )
+            ]
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.testRunHonesty))
+        XCTAssertTrue(receipt.compiledPayload.contains("Test run: do the Instruction now. Does not set Active."))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotRoutineCopy.testRunHonestyCaption))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertFalse(receipt.compiledPayload.contains("bot_test_routine"))
+        XCTAssertFalse(
+            BotStandingInstructions.admittedToolsText.contains("Test run"),
+            "tools must not advertise a Test run write"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Test run:"),
+            "compiler layer owns Test run"
+        )
+        XCTAssertFalse(receipt.layers.contains { $0.title == "Test run" })
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .routine })?.title, "Routine")
+        let empty = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Test this routine")
+        XCTAssertTrue(empty.compiledPayload.contains(BotBrainCompiler.testRunHonesty))
+        XCTAssertFalse(empty.compiledPayload.contains("Active routines"))
+        XCTAssertNil(empty.layers.first(where: { $0.kind == .routine }))
     }
 
     func test_skillsCompileAndOffStaysOut_becauseStudioAlreadySaysSkills() {

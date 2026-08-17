@@ -123,6 +123,7 @@ final class BotTypesTests: XCTestCase {
         XCTAssertFalse(starter.contains("Route:"), "route layer owns the provider/model")
         XCTAssertFalse(starter.contains("Default route:"), "route layer owns Default route")
         XCTAssertFalse(starter.contains("Model:"), "route layer owns Model")
+        XCTAssertFalse(starter.contains("Test run:"), "compiler layer owns Test run")
         XCTAssertFalse(starter.contains(BotStandingInstructions.rememberFactTool), "tools layer owns remember")
         XCTAssertFalse(starter.contains(BotStandingInstructions.correctFactTool), "tools layer owns correct")
         XCTAssertFalse(starter.contains(BotStandingInstructions.removeSkillTool), "tools layer owns remove")

@@ -154,6 +154,14 @@ public enum BotBrainCompiler {
     /// title stays Permission.
     public static let approvalsHonesty = "Approvals: Allow once / Deny stay off until P1b."
 
+    /// Studio already says Test run. Compile listed Active routines only,
+    /// so first-chat "test this routine" invented a hop or a schedule fire.
+    /// Hermes test runs are live work, not a fake cron. Compile that so
+    /// the model does the Instruction now and does not set Active. Dest
+    /// Source title stays Routine. Schema does not grow a test tool.
+    public static let testRunHonesty =
+        "Test run: do the Instruction now. Does not set Active. \(BotRoutineCopy.testRunHonestyCaption)"
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,
@@ -293,6 +301,11 @@ public enum BotBrainCompiler {
             lines.append("Active routines (not while the app is closed):")
             lines.append(contentsOf: liveRoutines.map(Self.routineLine))
         }
+        // Studio already says Test run. Compile that name so first-chat
+        // "test this routine" cannot invent a hop or a schedule fire.
+        // Do the Instruction now. Does not set Active. Dest Source title
+        // stays Routine. Schema does not grow a test tool.
+        lines.append(testRunHonesty)
         lines.append("User request:")
         lines.append(userText)
         return lines.joined(separator: "\n\n")

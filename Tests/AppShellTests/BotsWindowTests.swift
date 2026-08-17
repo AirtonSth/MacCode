@@ -1846,6 +1846,44 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesAdvertisedTestRun_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio already says Test run. Compile listed Active routines
+        // only, so first-chat "test this routine" invented a hop or a
+        // schedule fire. Dest preview and compose must share the advertised
+        // name. Dest Source title stays Routine. Schema does not grow a
+        // test tool.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.saveRoutine()
+        let id = try XCTUnwrap(vm.routines.first?.definition.id)
+        vm.setRoutineEnabled(id: id, enabled: true)
+        vm.composerText = "Test this routine"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Test run: do the Instruction now. Does not set Active."))
+        XCTAssertTrue(preview.compiledPayload.contains(BotRoutineCopy.testRunHonestyCaption))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(preview.compiledPayload.contains("bot_test_routine"))
+        XCTAssertFalse(preview.layers.contains { $0.title == "Test run" })
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .routine })?.title, "Routine")
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Test this routine",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
     func test_previewBrainIncludesAdvertisedSkills_becauseDestMustNotSayEnabledSkills() throws {
         // WHY: Studio already says Skills. Compile listed Enabled skills, so
         // first-chat "which Skills?" invented a hop. Dest preview and compose
