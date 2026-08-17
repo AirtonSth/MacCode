@@ -152,7 +152,7 @@ public enum BotSelfConfigCatalog: Sendable {
                 "type": "object",
                 "properties": botID.merging([
                     "routine_id": ["type": "string"],
-                    "enabled": ["type": "boolean"],
+                    "enabled": ["type": "boolean", "description": "Active. Same field as Studio Active."],
                 ]) { _, new in new },
                 "required": ["routine_id", "enabled"],
             ]
@@ -549,9 +549,11 @@ public struct BotSelfConfigService: Sendable {
             let note = Self.firstString(arguments, keys: ["schedule_note", "when"]) ?? ""
             return try saveRoutine(name: name, prompt: prompt, scheduleNote: note, id: routineID)
         case BotSelfConfigCatalog.setRoutineEnabled:
+            // Tools and Studio say Active. Schema key stays enabled.
+            let enabledValue = arguments["enabled"] ?? arguments["active"]
             return try setRoutineEnabled(
                 id: BotRoutineID(try Self.parseUUID(arguments["routine_id"], label: "routine_id")),
-                enabled: try Self.parseBool(arguments["enabled"], label: "enabled")
+                enabled: try Self.parseBool(enabledValue, label: "enabled")
             )
         default:
             throw BotSelfConfigError.invalid("unknown tool: \(name)")

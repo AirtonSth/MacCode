@@ -478,6 +478,53 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(when?["description"] as? String, "When. Same field as Studio When.")
     }
 
+    func test_setRoutineEnabledAdvertisedActivePersists_becauseStudioSaysActiveNotEnabled() throws {
+        // WHY: Studio already says Active. Parse only read enabled, so
+        // first-chat "set this Active" invented a hop or left the leftover
+        // switch. Canonical enabled still wins. Schema does not grow a
+        // second key.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let created = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "prompt": "Summarize overnight",
+        ])
+        let routineID = try XCTUnwrap(created.routines.first?.id)
+        XCTAssertEqual(created.routines.first?.enabled, false)
+
+        let fromActive = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": true,
+        ])
+        XCTAssertEqual(fromActive.routines.first?.enabled, true, "Active persists")
+        XCTAssertEqual(try store.listRoutines(botID: bot.id).first?.activation.isEnabled, true)
+
+        let fromOff = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": "Off",
+        ])
+        XCTAssertEqual(fromOff.routines.first?.enabled, false, "Active Off persists")
+
+        let enabledWins = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "enabled": true,
+            "active": false,
+        ])
+        XCTAssertEqual(enabledWins.routines.first?.enabled, true, "enabled wins")
+        XCTAssertEqual(try store.listRoutines(botID: bot.id).first?.activation.isEnabled, true)
+    }
+
+    func test_setRoutineEnabledCatalogDescribesActive_becauseThatIsTheStudioField() {
+        // WHY: Schema key stays enabled. Description must name Active so
+        // first-chat does not invent a hop.
+        let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setRoutineEnabled)
+        let properties = schema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["enabled"])
+        XCTAssertNil(properties?["active"], "active is an advertised alias, not a second schema key")
+        let enabled = properties?["enabled"] as? [String: Any]
+        XCTAssertEqual(enabled?["description"] as? String, "Active. Same field as Studio Active.")
+    }
+
     func test_putMemoryAdvertisedFactPersists_becauseStudioSaysRememberAFact() throws {
         // WHY: Tools and Studio say Remember a fact. Parse only read
         // content, so first-chat "remember this fact" invented a hop or
