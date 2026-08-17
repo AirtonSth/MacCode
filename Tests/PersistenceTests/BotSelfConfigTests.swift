@@ -226,8 +226,12 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["fallback"], "fallback is not a schema key")
         XCTAssertNil(properties?["fallback_order"], "fallback_order is not a schema key")
         XCTAssertNil(properties?["handle"], "handle is create-only, not a schema key")
+        XCTAssertNil(properties?["workspace"], "workspace is host-assigned, not a schema key")
+        XCTAssertNil(properties?["working_space"], "working_space is not a schema key")
+        XCTAssertNil(properties?["cwd"], "cwd is not a schema key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
     }
 
     func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
@@ -328,6 +332,54 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.handle, "piper", "Name persist must leave handle")
         XCTAssertEqual(try store.get(id: bot.id)?.handle, "piper")
+    }
+
+    func test_setSettingsRejectsAdvertisedWorkspace_becauseStudioSaysItIsHostAssigned() throws {
+        // WHY: Studio already shows Workspace. Compile already labels
+        // host-assigned honesty. set_settings still accepted workspace /
+        // cwd as an empty success, so first-chat "use this Workspace"
+        // invented a persist. Reject the advertised name. Name still
+        // persists. Schema does not grow a workspace key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "workspace": "macos-app",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Working space": "/tmp/macos-app",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "cwd": "/tmp/macos-app",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Workspace reject must not persist a name")
+        XCTAssertEqual(still.provider, AgentProvider.claude.rawValue)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
