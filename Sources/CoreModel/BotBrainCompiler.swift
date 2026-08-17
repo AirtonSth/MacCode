@@ -12,6 +12,7 @@ public struct BotContextLayer: Codable, Sendable, Equatable, Identifiable {
     public enum Kind: String, Codable, Sendable {
         case identity
         case desktop
+        case permission
         case description
         case soul
         case memory
@@ -130,7 +131,7 @@ public enum BotBrainCompiler {
             revisionDigest: revision.digest,
             provider: revision.provider,
             model: revision.model,
-            permissionMode: revision.permissionMode,
+            permissionMode: BotPermission.advertisedOrSupervised(revision.permissionMode),
             desktopKind: revision.desktopKind.advertisedOrLogical,
             compiledPayload: payload,
             payloadDigest: BotDigest.sha256Hex(payload),
@@ -161,6 +162,7 @@ public enum BotBrainCompiler {
             lines.append("You are \(job).")
         }
         lines.append("Working space: \(workingSpaceText(for: revision))")
+        lines.append("Permission: \(BotPermission.honestyLabel)")
         let description = revision.description.trimmingCharacters(in: .whitespacesAndNewlines)
         if !description.isEmpty {
             lines.append(description)
@@ -251,6 +253,17 @@ public enum BotBrainCompiler {
                 text: workingSpaceText(for: revision),
                 included: true,
                 reason: "Advertised execution space. Leftover VM kinds compile as logical space."
+            )
+        )
+
+        layers.append(
+            BotContextLayer(
+                id: "permission",
+                kind: .permission,
+                title: "Permission",
+                text: BotPermission.honestyLabel,
+                included: true,
+                reason: "Advertised supervised route. Leftover full-access kinds compile as supervised."
             )
         )
 

@@ -4333,7 +4333,7 @@ public struct BotsRootView: View {
             Text("What this Bot can do")
                 .font(DS.Font.bodyStrong)
                 .foregroundColor(DS.Palette.text)
-            Text("Supervised route only. Host-brokered writes stay off.")
+            Text(BotPermission.honestyLabel)
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textSecondary)
             Text(receipt.desktopKind.honestyLabel)

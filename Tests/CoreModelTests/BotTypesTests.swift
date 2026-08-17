@@ -178,4 +178,17 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("Test runs are real work"))
         XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("App-closed schedules stay off"))
     }
+
+    func test_permissionAdvertisedOrSupervised_becauseLeftoverFullAccessIsNotLivePower() {
+        XCTAssertEqual(BotPermission.advertisedModes, [.supervised])
+        XCTAssertEqual(BotPermission.advertisedOrSupervised(.supervised), .supervised)
+        XCTAssertEqual(BotPermission.advertisedOrSupervised(.fullAccess), .supervised)
+        XCTAssertEqual(BotPermission.advertisedOrSupervised(.autoAcceptEdits), .supervised)
+        XCTAssertTrue(BotPermission.honestyLabel.contains("Supervised"))
+        XCTAssertTrue(BotPermission.honestyLabel.contains("Host-brokered writes stay off"))
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotPermission.honestyLabel),
+            "permission honesty is a compiler layer, not starter soul"
+        )
+    }
 }

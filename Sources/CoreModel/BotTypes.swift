@@ -153,6 +153,19 @@ public enum BotRoutineCopy {
         "Test runs are real work. App-closed schedules stay off until autonomy is enabled."
 }
 
+/// Desk always launches supervised. Self-config can persist leftover
+/// `full_access` / `auto_accept_edits`. Those must not compile as live power.
+public enum BotPermission {
+    public static let advertisedModes: [AgentPermissionMode] = [.supervised]
+
+    public static let honestyLabel =
+        "Supervised. Ask before tool actions. Host-brokered writes stay off."
+
+    public static func advertisedOrSupervised(_ mode: AgentPermissionMode) -> AgentPermissionMode {
+        advertisedModes.contains(mode) ? mode : .supervised
+    }
+}
+
 /// Hermes seeds `SOUL.md` and falls back when it is empty. OpenClaw seeds
 /// `SOUL.md` / `IDENTITY.md` on first run. An empty Bot soul used to compile
 /// as "No standing instructions." — a New Agent then only saw "You are New Agent."

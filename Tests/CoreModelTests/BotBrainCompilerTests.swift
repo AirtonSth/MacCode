@@ -68,6 +68,7 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(receipt.compiledPayload.contains("weekly-account-health"))
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
         XCTAssertTrue(receipt.compiledPayload.contains("Working space: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Permission: \(BotPermission.honestyLabel)"))
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "Old secret" })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "Rumor" })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "Prefers dark mode" })?.included, true)
@@ -227,6 +228,71 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertFalse(receipt.compiledPayload.contains("You are Piper. Your job is:"))
         XCTAssertTrue(BotStandingInstructions.looksGenerated(starter))
         XCTAssertFalse(BotStandingInstructions.looksGenerated("Speak plainly."))
+    }
+
+    func test_leftoverFullAccessReceiptResolvesToSupervised_becauseDeskNeverLaunchesIt() {
+        // WHY: Studio/Desk advertise Supervised. Self-config can persist
+        // leftover full_access. Brain header used to show that leftover as
+        // live power, and the model never saw the advertised route, so
+        // "just write the file" invented unsupervised access.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let leftover = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .fullAccess,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: leftover, userText: "Just write the file")
+        XCTAssertEqual(receipt.permissionMode, .supervised)
+        XCTAssertTrue(receipt.compiledPayload.contains("Permission: \(BotPermission.honestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains("full_access"))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.included, true)
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.text, BotPermission.honestyLabel)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .permission })?.reason,
+            "Advertised supervised route. Leftover full-access kinds compile as supervised."
+        )
+    }
+
+    func test_permissionHonestyCompilesForCustomSoul_becauseRouteHonestyIsNotAnEscapeHatch() {
+        // WHY: Working-space honesty is a RemoteCode layer. Permission is
+        // the same class of advertised fact — a written soul must not hide
+        // that Desk launches supervised.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .autoAcceptEdits,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Can you just do it?")
+        XCTAssertEqual(receipt.permissionMode, .supervised)
+        XCTAssertTrue(receipt.compiledPayload.contains("Permission: \(BotPermission.honestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains("auto_accept_edits"))
+        XCTAssertFalse(BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotPermission.honestyLabel))
     }
 
     func test_enabledRoutineCompilesAndDisabledStaysOut_becauseSchedulesAreAuthority() {
