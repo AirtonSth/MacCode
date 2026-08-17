@@ -666,6 +666,16 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedIsolatedKey) {
             throw BotSelfConfigError.invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel)
         }
+        // Studio already says Not a dedicated Desktop. Compile already
+        // labels that honesty. leftover desktop / isolated already
+        // reject. leftover dedicated still succeeded empty, so
+        // first-chat invented a persist from the advertised honesty
+        // phrase. Schema does not grow a dedicated write key.
+        // leftover desktop still rejects. leftover isolated still
+        // rejects. Name still persists. Dest title stays Desktop.
+        if arguments.keys.contains(where: Self.isAdvertisedDedicatedKey) {
+            throw BotSelfConfigError.invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+        }
         // Studio Security already says Approvals. Compile already labels
         // Allow once / Deny stay off. A leftover Approvals / allow_once
         // / deny write used to return an empty success, so first-chat
@@ -953,6 +963,18 @@ public struct BotSelfConfigService: Sendable {
         return normalized == "isolated"
             || normalized == "not_isolated"
             || normalized == "isolated_desktop"
+    }
+
+    /// dedicated is not a schema write key. Studio / compile advertise
+    /// Not a dedicated Desktop, so parse must fail loud instead of
+    /// succeeding empty. leftover desktop stays on the Desktop reject.
+    /// leftover isolated stays on the isolated reject. Schema does
+    /// not grow a dedicated write key.
+    static func isAdvertisedDedicatedKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "dedicated"
+            || normalized == "not_dedicated"
+            || normalized == "dedicated_desktop"
     }
 
     /// approvals is not a schema key. Studio / compile advertise the

@@ -290,6 +290,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["isolated"], "isolated is advertised Desktop honesty, not a schema key")
         XCTAssertNil(properties?["not_isolated"], "not_isolated is advertised Desktop honesty, not a schema key")
         XCTAssertNil(properties?["isolated_desktop"], "isolated_desktop is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["dedicated"], "dedicated is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["not_dedicated"], "not_dedicated is advertised Desktop honesty, not a schema key")
+        XCTAssertNil(properties?["dedicated_desktop"], "dedicated_desktop is advertised Desktop honesty, not a schema key")
         XCTAssertNil(properties?["admitted_tools"], "admitted_tools is advertised dest title, not a schema write key")
         XCTAssertNil(properties?["tools"], "tools is leftover dest layer id, not a schema write key")
         XCTAssertNil(properties?["admitted"], "admitted is leftover dest title first word, not a schema write key")
@@ -2686,6 +2689,84 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "isolated reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "isolated reject must not persist soul")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedDedicated_becauseStudioSaysNotDedicated() throws {
+        // WHY: Studio Desk and compile already say Not a dedicated Desktop.
+        // leftover desktop / isolated already reject.
+        // leftover dedicated still succeeded empty, so first-chat
+        // invented a persist from the advertised honesty phrase.
+        // Reject the advertised name with Desktop isolation honesty.
+        // leftover desktop still rejects. leftover isolated still
+        // rejects. bot_id still owns the caller check. Name still
+        // persists. Schema does not grow a dedicated write key.
+        // Dest title stays Desktop.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["dedicated"],
+            "schema does not grow a dedicated write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "dedicated": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "not dedicated": false,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "dedicated_desktop": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop": "logical",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "isolated": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "dedicated reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "dedicated reject must not persist soul")
         XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
         XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
