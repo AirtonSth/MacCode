@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.removeHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -701,6 +701,15 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedSkillsKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.skillsHonesty)
         }
+        // Studio already says Remove. Compile already names
+        // bot_remove_skill. A leftover Remove / remove write used to
+        // return an empty success, so first-chat invented a persist.
+        // Schema does not grow a remove key. remove_skill still
+        // persists Remove. leftover Skills / skill / skill_id / add_skill
+        // still reject. Dest title stays Skills.
+        if arguments.keys.contains(where: Self.isAdvertisedRemoveKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.removeHonesty)
+        }
         // Studio already says Routines. Compile already labels Routines.
         // A leftover Routines / routine write used to return an empty
         // success, so first-chat invented a persist. Schema does not
@@ -935,6 +944,18 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "skill"
             || normalized == "skill_id"
             || normalized == "add_skill"
+    }
+
+    /// remove is not a set_settings schema key. Studio / compile
+    /// advertise Remove, so parse must fail loud instead of succeeding
+    /// empty. remove_skill still persists Remove. Schema does not
+    /// grow a remove write key. leftover Skills / skill / skill_id
+    /// stay on the Skills reject.
+    static func isAdvertisedRemoveKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "remove"
+            || normalized == "remove_skill"
+            || normalized == "unbind"
     }
 
     /// routines is not a schema key. Studio / compile advertise the

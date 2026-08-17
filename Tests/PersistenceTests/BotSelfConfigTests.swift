@@ -257,6 +257,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["skill"], "skill is an advertised set_skill alias, not a set_settings key")
         XCTAssertNil(properties?["skill_id"], "skill_id is a set_skill key, not a set_settings key")
         XCTAssertNil(properties?["add_skill"], "add_skill is not a schema key")
+        XCTAssertNil(properties?["remove"], "remove is an advertised remove_skill alias, not a set_settings key")
+        XCTAssertNil(properties?["remove_skill"], "remove_skill is not a set_settings key")
+        XCTAssertNil(properties?["unbind"], "unbind is not a set_settings key")
         XCTAssertNil(properties?["routines"], "routines is not a schema key")
         XCTAssertNil(properties?["routine"], "routine is an advertised save_routine alias, not a set_settings key")
         XCTAssertNil(properties?["routine_id"], "routine_id is a save_routine key, not a set_settings key")
@@ -283,6 +286,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(description.contains(BotBrainCompiler.forgetHonesty), "catalog names Forget honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.correctHonesty), "catalog names Correct honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.skillsHonesty), "catalog names Skills honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.removeHonesty), "catalog names Remove honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.routinesHonesty), "catalog names Routines honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.instructionHonesty), "catalog names Instruction honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.whenHonesty), "catalog names When honesty")
@@ -1092,6 +1096,90 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertEqual(renamed.skills.first?.skillID, "weekly-account-health")
+    }
+
+    func test_setSettingsRejectsAdvertisedRemove_becauseStudioSaysRemoveSkill() throws {
+        // WHY: Studio already says Remove. Compile already names
+        // bot_remove_skill. leftover Skills / skill / skill_id / add_skill
+        // already reject. leftover remove still succeeded empty, so
+        // first-chat invented a persist. Reject the advertised name with
+        // Remove honesty, not set_skill honesty. remove_skill still
+        // persists Remove. leftover Skills still reject. Name still
+        // persists. Schema does not grow a remove write key. Dest title
+        // stays Skills.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let added = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+        ])
+        XCTAssertEqual(added.skills.first?.skillID, "weekly-account-health")
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["remove"],
+            "schema does not grow a remove write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "remove": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.removeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Remove": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.removeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "remove_skill": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.removeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "unbind": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.removeHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "skill_id": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Remove reject must not persist a name")
+        XCTAssertEqual(still.skills.first?.skillID, "weekly-account-health")
+        XCTAssertEqual(still.skills.first?.enabled, true)
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.skills.first?.skillID, "weekly-account-health")
+
+        let removed = try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
+            "skill_id": "weekly-account-health",
+        ])
+        XCTAssertEqual(removed.skills.count, 0, "remove_skill still owns Remove")
     }
 
     func test_setSettingsRejectsAdvertisedRoutines_becauseStudioSaysSaveRoutine() throws {

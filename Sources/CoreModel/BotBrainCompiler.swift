@@ -194,6 +194,14 @@ public enum BotBrainCompiler {
     public static let skillsHonesty =
         "Skills: call \(BotStandingInstructions.setSkillTool). Same path as Studio Add. Not a set_settings write."
 
+    /// Studio already says Remove. Compile already names bot_remove_skill.
+    /// A leftover Remove / remove write on set_settings used to return
+    /// an empty success, so first-chat invented a persist. Hermes skill
+    /// unbinds stay on remove_skill. Dest Source title stays Skills.
+    /// Schema does not grow a remove key.
+    public static let removeHonesty =
+        "Remove: call \(BotStandingInstructions.removeSkillTool). Same path as Studio Remove. Not a set_settings write."
+
     /// Studio already says Routines. Compile already labels Routines.
     /// A leftover Routines / routine write on set_settings used to return
     /// an empty success, so first-chat invented a persist. Hermes cron
