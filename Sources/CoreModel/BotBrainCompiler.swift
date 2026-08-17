@@ -11,6 +11,7 @@ public struct BotContextLayer: Codable, Sendable, Equatable, Identifiable {
 
     public enum Kind: String, Codable, Sendable {
         case identity
+        case desktop
         case description
         case soul
         case memory
@@ -159,6 +160,7 @@ public enum BotBrainCompiler {
         if !job.isEmpty {
             lines.append("You are \(job).")
         }
+        lines.append("Working space: \(workingSpaceText(for: revision))")
         let description = revision.description.trimmingCharacters(in: .whitespacesAndNewlines)
         if !description.isEmpty {
             lines.append(description)
@@ -191,6 +193,10 @@ public enum BotBrainCompiler {
         lines.append("User request:")
         lines.append(userText)
         return lines.joined(separator: "\n\n")
+    }
+
+    static func workingSpaceText(for revision: BotRevision) -> String {
+        revision.desktopKind.advertisedOrLogical.honestyLabel
     }
 
     static func routineLine(_ routine: BotRoutine) -> String {
@@ -236,6 +242,17 @@ public enum BotBrainCompiler {
                 )
             )
         }
+
+        layers.append(
+            BotContextLayer(
+                id: "desktop",
+                kind: .desktop,
+                title: "Working space",
+                text: workingSpaceText(for: revision),
+                included: true,
+                reason: "Advertised execution space. Leftover VM kinds compile as logical space."
+            )
+        )
 
         let description = revision.description.trimmingCharacters(in: .whitespacesAndNewlines)
         if description.isEmpty {

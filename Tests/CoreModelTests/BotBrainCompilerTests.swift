@@ -67,6 +67,7 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertFalse(receipt.compiledPayload.contains("Rumor"))
         XCTAssertTrue(receipt.compiledPayload.contains("weekly-account-health"))
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Working space: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "Old secret" })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "Rumor" })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "Prefers dark mode" })?.included, true)
@@ -98,6 +99,42 @@ final class BotBrainCompilerTests: XCTestCase {
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: leftover, userText: "Hi")
         XCTAssertEqual(receipt.desktopKind, .logicalExecutionSpace)
         XCTAssertEqual(receipt.desktopKind.honestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+        XCTAssertTrue(receipt.compiledPayload.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        XCTAssertFalse(receipt.compiledPayload.contains("Guest is not running"))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .desktop })?.text, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+    }
+
+    func test_workingSpaceCompilesForCustomSoul_becauseIsolationHonestyIsNotAnEscapeHatch() {
+        // WHY: Studio already shows desktop honesty to the owner. The model
+        // never saw it, so "are you isolated?" invented a VM. A written soul
+        // must not hide the advertised execution space — Hermes agents know
+        // their sandbox even when SOUL.md is custom.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Are you isolated?")
+        XCTAssertTrue(receipt.compiledPayload.contains("Working space: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .desktop })?.included, true)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .desktop })?.reason,
+            "Advertised execution space. Leftover VM kinds compile as logical space."
+        )
     }
 
     func test_emptySoulFallsBackToStandingDefault_becauseANewAgentMustNotCompileSoulless() {
