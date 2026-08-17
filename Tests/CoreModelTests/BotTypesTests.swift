@@ -113,6 +113,29 @@ final class BotTypesTests: XCTestCase {
         XCTAssertEqual(leftover.advertisedOrLogical, .logicalExecutionSpace)
     }
 
+    func test_standingInstructionsFallback_keepsCustomSoulAsEscapeHatch() {
+        // WHY: Hermes never overwrites a user SOUL.md. Role auto-config may
+        // refresh the starter, but a written soul must stay untouched.
+        let starter = BotStandingInstructions.fallback(name: "New Agent", title: "", description: "")
+        XCTAssertTrue(starter.contains("New Agent"))
+        XCTAssertTrue(starter.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertTrue(BotStandingInstructions.looksGenerated(""))
+        XCTAssertTrue(BotStandingInstructions.looksGenerated(starter))
+        XCTAssertFalse(BotStandingInstructions.looksGenerated("Own the inbox."))
+        XCTAssertEqual(
+            BotStandingInstructions.resolved(name: "Piper", title: "Scout", soul: ""),
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout")
+        )
+        XCTAssertTrue(
+            BotStandingInstructions.resolved(name: "Piper", title: "Scout", soul: starter)
+                .contains("Your job is: Scout.")
+        )
+        XCTAssertEqual(
+            BotStandingInstructions.resolved(name: "Piper", title: "Scout", soul: "Own the inbox."),
+            "Own the inbox."
+        )
+    }
+
     func test_controlPlaneFlags_failClosed_becauseLaterPhasesMustNotRunWithoutTheShippedSlice() {
         let defaults = BotControlPlaneFlags()
         XCTAssertTrue(defaults.isBotControlPlaneActive, "P1a ships the control plane on")

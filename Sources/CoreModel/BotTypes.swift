@@ -153,6 +153,56 @@ public enum BotRoutineCopy {
         "Test runs are real work. App-closed schedules stay off until autonomy is enabled."
 }
 
+/// Hermes seeds `SOUL.md` and falls back when it is empty. OpenClaw seeds
+/// `SOUL.md` / `IDENTITY.md` on first run. An empty Bot soul used to compile
+/// as "No standing instructions." — a New Agent then only saw "You are New Agent."
+public enum BotStandingInstructions {
+    /// Unique last line so Studio can refresh the starter without overwriting a custom soul.
+    public static let generatedSignature =
+        "Do not invent tools, files, accounts, or access you do not have."
+
+    public static func fallback(name: String, title: String, description: String = "") -> String {
+        let displayName = trimmedNonEmpty(name) ?? "this teammate"
+        let role = trimmedNonEmpty(title)
+        let detail = trimmedNonEmpty(description)
+        var lines: [String] = []
+        if let role {
+            lines.append("You are \(displayName). Your job is: \(role).")
+        } else {
+            lines.append("You are \(displayName), a RemoteCode teammate.")
+        }
+        if let detail {
+            lines.append(detail)
+        }
+        lines.append("Do the job. Ask when blocked. Prefer concrete work over ceremony.")
+        lines.append(generatedSignature)
+        return lines.joined(separator: "\n")
+    }
+
+    public static func looksGenerated(_ soul: String) -> Bool {
+        let trimmed = soul.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || trimmed.hasSuffix(generatedSignature)
+    }
+
+    /// Custom soul wins. Empty or starter text resolves to the current name/role.
+    public static func resolved(
+        name: String,
+        title: String,
+        description: String = "",
+        soul: String
+    ) -> String {
+        if looksGenerated(soul) {
+            return fallback(name: name, title: title, description: description)
+        }
+        return soul.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func trimmedNonEmpty(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
 public struct BotDefinition: Codable, Sendable, Equatable {
     public static let liveAccountCap = 50
 

@@ -2423,6 +2423,30 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.allSatisfy { $0.name == "New Agent" })
     }
 
+    func test_beginCreateSeedsStandingInstructions_becauseHermesDoesNotStartSoulless() throws {
+        // WHY: Live Studio/Desk New Agent compiled with "No standing
+        // instructions." Hermes seeds SOUL.md; we persist the starter so
+        // first chat and Studio both show a replaceable default.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.beginCreate()
+        let bot = try XCTUnwrap(try context.botStore.list().first)
+        let revision = try XCTUnwrap(
+            bot.currentRevisionID.flatMap { try context.botStore.getRevision(id: $0) }
+        )
+        XCTAssertTrue(BotStandingInstructions.looksGenerated(revision.soul))
+        XCTAssertTrue(revision.soul.contains(BotStandingInstructions.generatedSignature))
+        vm.beginEdit(bot)
+        XCTAssertEqual(vm.studioDraft.soul, revision.soul)
+        vm.studioDraft.title = "Reviews PRs"
+        vm.refreshGeneratedStandingInstructions()
+        XCTAssertTrue(vm.studioDraft.soul.contains("Your job is: Reviews PRs."))
+        vm.studioDraft.soul = "Speak plainly."
+        vm.studioDraft.title = "Other job"
+        vm.refreshGeneratedStandingInstructions()
+        XCTAssertEqual(vm.studioDraft.soul, "Speak plainly.", "custom soul is the expert escape hatch")
+    }
+
     func test_openDeskMarksUnreadConversationRead_becauseOpeningTheChatClearsFleetAttention() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -4502,6 +4526,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.studio.identity"))
         XCTAssertTrue(bots.contains("bots.studio.routing"))
         XCTAssertTrue(bots.contains("bots.studio.soul"))
+        XCTAssertTrue(bots.contains("Empty uses the built-in teammate default"))
+        XCTAssertTrue(bots.contains("refreshGeneratedStandingInstructions"))
         XCTAssertTrue(
             bots.contains(".accessibilityLabel(BotsChrome.Label.instructions)"),
             "Soul TextArea must name Instructions the way Description names Description"

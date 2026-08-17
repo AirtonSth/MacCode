@@ -158,7 +158,12 @@ public enum BotBrainCompiler {
         if !description.isEmpty {
             lines.append(description)
         }
-        let soul = revision.soul.trimmingCharacters(in: .whitespacesAndNewlines)
+        let soul = BotStandingInstructions.resolved(
+            name: bot.name,
+            title: revision.title,
+            description: revision.description,
+            soul: revision.soul
+        )
         if !soul.isEmpty {
             lines.append("Standing instructions:")
             lines.append(soul)
@@ -235,30 +240,26 @@ public enum BotBrainCompiler {
             )
         }
 
-        let soul = revision.soul.trimmingCharacters(in: .whitespacesAndNewlines)
-        if soul.isEmpty {
-            layers.append(
-                BotContextLayer(
-                    id: "soul",
-                    kind: .soul,
-                    title: "Standing instructions",
-                    text: "",
-                    included: false,
-                    reason: "No standing instructions."
-                )
+        let publishedSoul = revision.soul.trimmingCharacters(in: .whitespacesAndNewlines)
+        let soul = BotStandingInstructions.resolved(
+            name: bot.name,
+            title: revision.title,
+            description: revision.description,
+            soul: revision.soul
+        )
+        let soulReason = BotStandingInstructions.looksGenerated(publishedSoul)
+            ? "Built-in teammate default. Write standing instructions to replace it."
+            : "Standing instructions are published with the revision."
+        layers.append(
+            BotContextLayer(
+                id: "soul",
+                kind: .soul,
+                title: "Standing instructions",
+                text: soul,
+                included: true,
+                reason: soulReason
             )
-        } else {
-            layers.append(
-                BotContextLayer(
-                    id: "soul",
-                    kind: .soul,
-                    title: "Standing instructions",
-                    text: soul,
-                    included: true,
-                    reason: "Standing instructions are published with the revision."
-                )
-            )
-        }
+        )
 
         for item in memory {
             let forgotten = item.forgottenAt != nil

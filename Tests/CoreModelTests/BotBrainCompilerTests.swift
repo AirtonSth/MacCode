@@ -99,4 +99,90 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.desktopKind, .logicalExecutionSpace)
         XCTAssertEqual(receipt.desktopKind.honestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
     }
+
+    func test_emptySoulFallsBackToStandingDefault_becauseANewAgentMustNotCompileSoulless() {
+        // WHY: Hermes seeds SOUL.md and falls back when it is empty. OpenClaw
+        // seeds SOUL.md on first run. Live Desk Brain showed "No standing
+        // instructions" / Excluded for New Agent — the model only saw
+        // "You are New Agent." A jobless teammate still needs standing rules.
+        let bot = BotDefinition(handle: "new-agent", name: "New Agent", title: "", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "New Agent",
+            title: "",
+            description: "",
+            soul: "",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "qual seu nome?")
+        let composed = BotBrainCompiler.composeRunPrompt(bot: bot, revision: revision, userText: "qual seu nome?")
+        XCTAssertEqual(receipt.compiledPayload, composed)
+        XCTAssertTrue(receipt.compiledPayload.contains("Standing instructions:"))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        let layer = receipt.layers.first { $0.kind == .soul }
+        XCTAssertEqual(layer?.included, true)
+        XCTAssertEqual(layer?.text, BotStandingInstructions.fallback(name: "New Agent", title: "", description: ""))
+        XCTAssertTrue(layer?.reason.contains("Built-in teammate default") == true)
+    }
+
+    func test_publishedSoulReplacesFallback_becauseCustomInstructionsStayTheEscapeHatch() {
+        // WHY: Auto-config must not hide power. A written soul is identity;
+        // the starter must not leak into the payload beside it.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Hi")
+        XCTAssertTrue(receipt.compiledPayload.contains("Be brief."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first { $0.kind == .soul }?.reason, "Standing instructions are published with the revision.")
+    }
+
+    func test_generatedSoulPicksUpRole_becauseJobIsAutoConfigNotASecondForm() {
+        // WHY: Filling Role and leaving Instructions empty must still shape
+        // the brain. Beginners should not have to write SOUL.md to get a job.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Reviews PRs", description: "")
+        let starter = BotStandingInstructions.fallback(name: "Piper", title: "", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Reviews PRs",
+            description: "",
+            soul: starter,
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Go")
+        XCTAssertTrue(receipt.compiledPayload.contains("Your job is: Reviews PRs."))
+        XCTAssertTrue(BotStandingInstructions.looksGenerated(starter))
+        XCTAssertFalse(BotStandingInstructions.looksGenerated("Speak plainly."))
+    }
 }

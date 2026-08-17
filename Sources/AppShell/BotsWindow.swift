@@ -670,7 +670,14 @@ public final class BotsViewModel: ObservableObject {
         }
         do {
             // Match the bar: create opens a teammate immediately; profile is optional.
-            let bot = try create(name: "New Agent", title: "", description: "")
+            // Hermes seeds SOUL.md on first run — do not start a soulless New Agent.
+            let name = "New Agent"
+            let bot = try create(
+                name: name,
+                title: "",
+                description: "",
+                soul: BotStandingInstructions.fallback(name: name, title: "", description: "")
+            )
             openDesk(bot)
         } catch {
             errorMessage = String(describing: error)
@@ -684,6 +691,16 @@ public final class BotsViewModel: ObservableObject {
         persistSelection()
         leaveDeskLiveWatch()
         reloadStudioSupport(id: bot.id)
+    }
+
+    /// Keep the starter soul aligned with Role & Identity until the user writes their own.
+    public func refreshGeneratedStandingInstructions() {
+        guard BotStandingInstructions.looksGenerated(studioDraft.soul) else { return }
+        studioDraft.soul = BotStandingInstructions.fallback(
+            name: studioDraft.name,
+            title: studioDraft.title,
+            description: studioDraft.description
+        )
     }
 
     /// Studio is a dest. Keep the last selected tab; Edit still opens Profile.
@@ -925,6 +942,13 @@ public final class BotsViewModel: ObservableObject {
         }
         let handle = studioDraft.handle.trimmingCharacters(in: .whitespacesAndNewlines)
         let desktop = resolvedDesktopKind(studioDraft.desktopKind)
+        let soul = BotStandingInstructions.resolved(
+            name: name,
+            title: studioDraft.title,
+            description: studioDraft.description,
+            soul: studioDraft.soul
+        )
+        studioDraft.soul = soul
         if let botID = studioDraft.botID {
             guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
                 throw BotStoreError.notFound
@@ -933,7 +957,7 @@ public final class BotsViewModel: ObservableObject {
                 name: name,
                 title: studioDraft.title,
                 description: studioDraft.description,
-                soul: studioDraft.soul,
+                soul: soul,
                 provider: studioDraft.provider,
                 providerInstanceID: studioDraft.providerInstanceID.isEmpty
                     ? studioDraft.provider.rawValue
@@ -972,7 +996,7 @@ public final class BotsViewModel: ObservableObject {
             title: studioDraft.title,
             description: studioDraft.description,
             handle: handle.isEmpty ? nil : handle,
-            soul: studioDraft.soul,
+            soul: soul,
             provider: studioDraft.provider,
             providerInstanceID: studioDraft.providerInstanceID.isEmpty ? nil : studioDraft.providerInstanceID,
             model: studioDraft.model,
@@ -3666,14 +3690,21 @@ public struct BotsRootView: View {
                         if vm.studioDraft.isNew, vm.studioDraft.handle.isEmpty || handleMatchesDerivedName {
                             vm.studioDraft.handle = BotHandle.derive(from: name) ?? vm.studioDraft.handle
                         }
+                        vm.refreshGeneratedStandingInstructions()
                     }
             }
             studioFormRow("Role") {
                 studioField(placeholder: "What this teammate does", text: $vm.studioDraft.title)
+                    .onChange(of: vm.studioDraft.title) { _ in
+                        vm.refreshGeneratedStandingInstructions()
+                    }
             }
             studioFormRow("Description") {
                 studioMultiline(text: $vm.studioDraft.description, minHeight: 72)
                     .accessibilityIdentifier("bots.studio.description")
+                    .onChange(of: vm.studioDraft.description) { _ in
+                        vm.refreshGeneratedStandingInstructions()
+                    }
             }
             studioFormRow("Handle") {
                 studioField(placeholder: "piper", text: $vm.studioDraft.handle)
@@ -3746,7 +3777,7 @@ public struct BotsRootView: View {
             DSSectionHeaderG(BotsChrome.Label.instructions)
             studioMultiline(text: $vm.studioDraft.soul, minHeight: 140)
                 .accessibilityLabel(BotsChrome.Label.instructions)
-            Text("Published with the Bot. This is not an Agent thread.")
+            Text("Empty uses the built-in teammate default. Write your own to replace it. Published with the Bot.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
         }
