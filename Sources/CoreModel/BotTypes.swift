@@ -169,6 +169,11 @@ public enum BotPermission {
 /// Studio provider picker already binds these models. A provider-only
 /// set_settings write must not keep the leftover model from the old route.
 public enum BotRoute {
+    /// Studio already says this next to Default route. Compile it so
+    /// first-chat cannot invent a second route.
+    public static let fallbackOrderHonesty =
+        "One published route. Fallback order is not shipped in P1a."
+
     public static func defaultModel(for provider: AgentProvider) -> String {
         switch provider {
         case .claude: return "opus"

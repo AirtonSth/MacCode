@@ -250,8 +250,10 @@ public enum BotBrainCompiler {
         lines.append("Approval mode: \(approvalModeText())")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
         // Studio already says Default route. Compile that name so first-chat
-        // "what's your Default route?" cannot invent a hop. Dest Source
-        // title stays Route.
+        // "what's your Default route?" cannot invent a hop. Studio already
+        // says Fallback order is not shipped. Compile that honesty so
+        // first-chat "if Claude is down use Grok" cannot invent a second
+        // route. Dest Source title stays Route.
         lines.append("Default route: \(routeLine(provider: revision.provider, model: revision.model))")
         // Studio already says Model. Compile that name so first-chat
         // "what's your Model?" cannot invent a hop. Empty stays omitted
@@ -362,11 +364,14 @@ public enum BotBrainCompiler {
 
     /// Studio already says Default route. Compile provider + model so
     /// first-chat "what's your Default route?" cannot invent a hop.
-    /// Custom soul must not hide advertised routing.
+    /// Studio already says Fallback order is not shipped. Compile that
+    /// so first-chat cannot invent a second route. Custom soul must not
+    /// hide advertised routing. Dest Source title stays Route.
     static func routeLine(provider: AgentProvider, model: String) -> String {
         let title = BotRoute.advertisedTitle(for: provider)
         let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        return model.isEmpty ? title : "\(title) · \(model)"
+        let route = model.isEmpty ? title : "\(title) · \(model)"
+        return "\(route). \(BotRoute.fallbackOrderHonesty)"
     }
 
     /// Studio already says Model. Compile that name so first-chat

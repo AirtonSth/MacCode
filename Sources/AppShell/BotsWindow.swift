@@ -3802,7 +3802,7 @@ public struct BotsRootView: View {
             studioFormRow("Model") {
                 studioField(placeholder: "Model id", text: $vm.studioDraft.model)
             }
-            Text("One published route. Fallback order is not shipped in P1a.")
+            Text(BotRoute.fallbackOrderHonesty)
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
         }

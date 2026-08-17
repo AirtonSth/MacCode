@@ -1830,6 +1830,7 @@ final class BotsWindowTests: XCTestCase {
         let preview = try XCTUnwrap(vm.previewBrain())
         XCTAssertTrue(preview.compiledPayload.contains("Model: opus"))
         XCTAssertTrue(preview.compiledPayload.contains("Default route: Claude · opus"))
+        XCTAssertTrue(preview.compiledPayload.contains(BotRoute.fallbackOrderHonesty))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
         XCTAssertEqual(preview.layers.first(where: { $0.kind == .route })?.title, "Route")
         XCTAssertEqual(
@@ -1838,6 +1839,38 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "What's your Model?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedFallbackOrder_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio already says Fallback order is not shipped. Compile
+        // listed Default route only, so first-chat "if Claude is down use
+        // Grok" invented a second route. Dest preview and compose must
+        // share that advertised honesty. Dest Source title stays Route.
+        // Schema does not grow a fallback tool.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "If Claude is down use Grok"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains(BotRoute.fallbackOrderHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains("Default route: Claude · opus. \(BotRoute.fallbackOrderHonesty)"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(preview.compiledPayload.contains("bot_set_fallback"))
+        XCTAssertFalse(preview.layers.contains { $0.title == "Fallback" })
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .route })?.title, "Route")
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "If Claude is down use Grok",
                 memory: vm.memoryItems,
                 skills: vm.skillBindings,
                 routines: vm.routines,
