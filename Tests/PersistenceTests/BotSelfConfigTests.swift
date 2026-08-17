@@ -225,7 +225,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["standing_instructions"], "standing_instructions is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["fallback"], "fallback is not a schema key")
         XCTAssertNil(properties?["fallback_order"], "fallback_order is not a schema key")
+        XCTAssertNil(properties?["handle"], "handle is create-only, not a schema key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
     }
 
     func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
@@ -275,6 +277,57 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(route.provider, AgentProvider.grok.rawValue)
         XCTAssertEqual(route.model, BotRoute.defaultModel(for: .grok))
+    }
+
+    func test_setSettingsRejectsAdvertisedHandle_becauseStudioSaysItIsCreateOnly() throws {
+        // WHY: Studio Handle is create-only after first save. Compile
+        // already labels that honesty. set_settings still accepted
+        // handle as an empty success, so first-chat "change your handle"
+        // invented a persist. Reject the advertised name. Name still
+        // persists. Schema does not grow a handle key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        XCTAssertEqual(try store.get(id: bot.id)?.handle, "piper")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "handle": "night-piper",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.handleCreateOnlyHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Handle": "night-piper",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.handleCreateOnlyHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "@handle": "night-piper",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.handleCreateOnlyHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.handle, "piper", "Handle reject must not persist a handle")
+        XCTAssertEqual(still.name, "Piper", "Handle reject must not persist a name")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.handle, "piper", "Name persist must leave handle")
+        XCTAssertEqual(try store.get(id: bot.id)?.handle, "piper")
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {

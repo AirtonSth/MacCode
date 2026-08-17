@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -594,6 +594,13 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedFallbackOrderKey) {
             throw BotSelfConfigError.invalid(BotRoute.fallbackOrderHonesty)
         }
+        // Studio Handle is create-only after first save. Compile already
+        // labels that honesty. A leftover handle write used to return an
+        // empty success, so first-chat invented a persist. Schema does
+        // not grow a handle key. Name still persists.
+        if arguments.keys.contains(where: Self.isAdvertisedHandleKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.handleCreateOnlyHonesty)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -648,6 +655,16 @@ public struct BotSelfConfigService: Sendable {
     static func isAdvertisedFallbackOrderKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "fallback" || normalized == "fallback_order"
+    }
+
+    /// handle is not a schema key. Studio / compile advertise the name,
+    /// so parse must fail loud instead of succeeding empty.
+    static func isAdvertisedHandleKey(_ key: String) -> Bool {
+        var normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        if normalized.hasPrefix("@") {
+            normalized.removeFirst()
+        }
+        return normalized == "handle"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {
