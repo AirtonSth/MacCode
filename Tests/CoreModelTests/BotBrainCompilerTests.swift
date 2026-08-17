@@ -482,6 +482,7 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.permissionMode, .supervised)
         XCTAssertTrue(receipt.compiledPayload.contains("Approval mode: \(BotBrainCompiler.approvalModeText())"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.approvalsHonesty))
         XCTAssertFalse(receipt.compiledPayload.contains("Permission:"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains("full_access"))
@@ -498,9 +499,54 @@ final class BotBrainCompilerTests: XCTestCase {
             "tools must not advertise an Approval mode write"
         )
         XCTAssertFalse(
+            BotStandingInstructions.admittedToolsText.contains("Approvals"),
+            "tools must not advertise an Approvals write"
+        )
+        XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")
                 .contains(BotBrainCompiler.approvalModeHostAssignedHonesty),
             "approval-mode honesty is a compiler layer, not starter soul"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout")
+                .contains(BotBrainCompiler.approvalsHonesty),
+            "approvals honesty is a compiler layer, not starter soul"
+        )
+    }
+
+    func test_approvalsHonestyCompilesForCustomSoul_becauseAllowOnceIsNotAnEscapeHatch() {
+        // WHY: Studio Security already says Approvals and Allow once / Deny
+        // stay off until P1b. Compile listed Approval mode only, so
+        // first-chat "Allow once" invented a grant. Dest Source title stays
+        // Permission. Tools do not advertise a write.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Allow once")
+        XCTAssertTrue(receipt.compiledPayload.contains("Approval mode: \(BotBrainCompiler.approvalModeText())"))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.approvalsHonesty))
+        XCTAssertTrue(receipt.compiledPayload.contains("Allow once / Deny stay off until P1b"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains("Permission:"))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.title, "Permission")
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.text, BotBrainCompiler.approvalModeText())
+        XCTAssertFalse(
+            BotStandingInstructions.admittedToolsText.contains("Allow once"),
+            "tools must not advertise an Allow once write"
         )
     }
 

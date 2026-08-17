@@ -147,6 +147,13 @@ public enum BotBrainCompiler {
     /// not invent a persist. Dest Source title stays Permission.
     public static let approvalModeHostAssignedHonesty = "Host-assigned. Not a self-config write."
 
+    /// Studio Security already says Approvals and Allow once / Deny stay
+    /// off until P1b. Compile listed Approval mode only, so first-chat
+    /// "Allow once" invented a grant. Hermes grants are host-owned.
+    /// Compile that so the model does not invent a persist. Dest Source
+    /// title stays Permission.
+    public static let approvalsHonesty = "Approvals: Allow once / Deny stay off until P1b."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,
@@ -227,9 +234,11 @@ public enum BotBrainCompiler {
         // here, not on Workspace. Leftover VM kinds compile as logical.
         lines.append("Desktop: \(desktopText(for: revision))")
         // Studio already says Approval mode. Compile that name so first-chat
-        // "what's your Approval mode?" cannot invent a hop. Host-assigned
-        // honesty stays so first-chat cannot invent a set_settings write.
-        // Dest Source title stays Permission.
+        // "what's your Approval mode?" cannot invent a hop. Studio Security
+        // already says Approvals. Compile that name so first-chat "Allow
+        // once" cannot invent a grant. Host-assigned honesty stays so
+        // first-chat cannot invent a set_settings write. Dest Source
+        // title stays Permission.
         lines.append("Approval mode: \(approvalModeText())")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
         lines.append("Route: \(routeLine(provider: revision.provider, model: revision.model))")
@@ -286,10 +295,11 @@ public enum BotBrainCompiler {
     }
 
     /// Studio already says Approval mode. Compile supervised honesty plus
-    /// host-assigned so first-chat cannot invent a persist. Leftover
+    /// Approvals Allow once / Deny stay off plus host-assigned so
+    /// first-chat cannot invent a persist or a grant. Leftover
     /// full_access / auto_accept_edits still compile as supervised.
     static func approvalModeText() -> String {
-        "\(BotPermission.honestyLabel) \(approvalModeHostAssignedHonesty)"
+        "\(BotPermission.honestyLabel) \(approvalsHonesty) \(approvalModeHostAssignedHonesty)"
     }
 
     /// Studio already says Desktop. Compile display title + isolation so

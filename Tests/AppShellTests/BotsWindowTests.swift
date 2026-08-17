@@ -1680,8 +1680,9 @@ final class BotsWindowTests: XCTestCase {
         vm.composerText = "What's your Approval mode?"
         let preview = try XCTUnwrap(vm.previewBrain())
         XCTAssertEqual(vm.studioApprovalLabel, "Supervised")
-        XCTAssertTrue(preview.compiledPayload.contains("Approval mode: \(BotPermission.honestyLabel) \(BotBrainCompiler.approvalModeHostAssignedHonesty)"))
+        XCTAssertTrue(preview.compiledPayload.contains("Approval mode: \(BotPermission.honestyLabel) \(BotBrainCompiler.approvalsHonesty) \(BotBrainCompiler.approvalModeHostAssignedHonesty)"))
         XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.approvalsHonesty))
         XCTAssertFalse(preview.compiledPayload.contains("Permission:"))
         XCTAssertEqual(preview.layers.first(where: { $0.kind == .permission })?.title, "Permission")
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
@@ -1691,6 +1692,41 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "What's your Approval mode?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
+    func test_previewBrainIncludesAdvertisedApprovals_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio Security already says Approvals. Compile listed
+        // Approval mode only, so first-chat "Allow once" invented a grant.
+        // Dest preview and compose must share that advertised name. Dest
+        // Source title stays Permission.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "Allow once"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.approvalsHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains("Allow once / Deny stay off until P1b"))
+        XCTAssertTrue(preview.compiledPayload.contains("Approval mode: \(BotPermission.honestyLabel) \(BotBrainCompiler.approvalsHonesty) \(BotBrainCompiler.approvalModeHostAssignedHonesty)"))
+        XCTAssertFalse(preview.compiledPayload.contains("Permission:"))
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .permission })?.title, "Permission")
+        XCTAssertEqual(
+            preview.layers.first(where: { $0.kind == .permission })?.text,
+            "\(BotPermission.honestyLabel) \(BotBrainCompiler.approvalsHonesty) \(BotBrainCompiler.approvalModeHostAssignedHonesty)"
+        )
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Allow once",
                 memory: vm.memoryItems,
                 skills: vm.skillBindings,
                 routines: vm.routines,
