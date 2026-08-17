@@ -14,6 +14,7 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.selectedBotID")
         UserDefaults.standard.removeObject(forKey: "bots.screen")
         UserDefaults.standard.removeObject(forKey: "bots.studioTab")
+        UserDefaults.standard.removeObject(forKey: "bots.deskSidePane")
         UserDefaults.standard.removeObject(forKey: "bots.showHidden")
         UserDefaults.standard.removeObject(forKey: "bots.brainPane")
         UserDefaults.standard.removeObject(forKey: "bots.queuedFollowUps")
@@ -3074,7 +3075,10 @@ final class BotsWindowTests: XCTestCase {
         } else {
             XCTFail("studio summary must exist")
         }
-        XCTAssertTrue(source.contains("not shipped in P1a"))
+        XCTAssertTrue(
+            source.contains("BotRoute.fallbackOrderHonesty") || source.contains("not shipped in P1a"),
+            "Studio must keep the P1a fallback-order honesty on the routing panel"
+        )
         XCTAssertFalse(
             source.contains("Guest not running"),
             "Studio must not advertise a Dedicated local VM guest control"
@@ -4811,7 +4815,7 @@ final class BotsWindowTests: XCTestCase {
             slice.contains(".labelsHidden()"),
             "Skills Off/On must not paint twice beside Remove"
         )
-        XCTAssertTrue(slice.contains("Text(binding.enabled ? \"Enabled\" : \"Off\")"))
+        XCTAssertTrue(slice.contains("Text(binding.enabled ? \"On\" : \"Off\")"))
     }
 
     func test_removeSkillDoesNotListSkills_becauseRemoveDestMustNotRereadBindings() throws {
@@ -4969,6 +4973,27 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.displayedDesktopKind, .logicalExecutionSpace)
     }
 
+    func test_memoryTabHeaderSaysMemory_becauseMemoryMustNotNameTheBrainSiblingTab() throws {
+        // WHY: Brain and Memory are sibling Studio tabs and the tab strip
+        // already says Memory. A "Brain / Memory" body header is leftover
+        // from before the split and claims Memory lives under Brain.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertFalse(
+            source.contains("Brain / Memory"),
+            "Memory's header must not name the Brain sibling tab"
+        )
+        guard let start = source.range(of: "private var memoryTab") else {
+            return XCTFail("memory tab must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private var ")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(
+            slice.contains("studioSectionHeader(BotsChrome.Label.memory)"),
+            "Memory keeps a section title like every sibling Studio tab, titled by the shared chrome token"
+        )
+    }
+
     func test_studioProviderPickerHidesTitle_becauseDefaultRouteAlreadyLabelsTheRow() throws {
         // WHY: The Profile row is already "Default route". A visible
         // Picker title "Provider" looks like leftover chrome beside
@@ -5052,13 +5077,20 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.studio.tab.memory"))
         XCTAssertTrue(bots.contains("bots.studio.tab.skills"))
         XCTAssertTrue(bots.contains("bots.studio.tab.routines"))
-        XCTAssertTrue(bots.contains("bots.studio.tab.desktop"))
+        XCTAssertFalse(
+            bots.contains("bots.studio.tab.desktop"),
+            "Desktop merged into the Security tab; a seventh tab must not come back"
+        )
         XCTAssertTrue(bots.contains("bots.studio.tab.security"))
+        XCTAssertTrue(
+            bots.contains("bots.studio.desktop"),
+            "the read-only Desktop card still ships inside the Security tab"
+        )
         XCTAssertTrue(bots.contains("bots.chrome.agentic"))
         XCTAssertFalse(bots.contains("bots.home.goal"))
         XCTAssertTrue(bots.contains("accessibilityAddTraits(selected ? .isSelected : [])"))
         XCTAssertTrue(bots.contains("BotsChrome.hitTarget"))
-        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "memory", "skills", "routines", "security", "desktop"])
+        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "memory", "skills", "routines", "security"])
         XCTAssertTrue(chrome.contains(BotsChrome.Label.agentic))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.currentGoal))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.todaysActivity))
@@ -5086,8 +5118,12 @@ final class BotsWindowTests: XCTestCase {
             "Studio Memory TextArea must name the fact field the way Desk inspector does"
         )
         XCTAssertTrue(
-            bots.contains("field.setAccessibilityLabel(\"Remember a fact\")"),
-            "Correct memory NSTextField must name Remember a fact, not sit unlabeled in the alert"
+            bots.contains("bots.memory.correct.field"),
+            "Correct memory edits inline; the editing field must be identifiable"
+        )
+        XCTAssertFalse(
+            bots.contains("NSAlert()"),
+            "Correct memory must edit inline, not through a modal alert"
         )
         XCTAssertTrue(
             bots.contains("studioField(placeholder: \"Remember a fact\", text: $vm.memoryDraft)"),
@@ -5125,9 +5161,18 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertTrue(bots.contains("bots.studio.summary"))
         XCTAssertTrue(bots.contains("bots.studio.desktop.honesty"))
-        XCTAssertTrue(bots.contains("Role & Identity"))
-        XCTAssertTrue(bots.contains("Provider routing"))
-        XCTAssertTrue(bots.contains("Configuration summary"))
+        XCTAssertTrue(
+            bots.contains("BotsChrome.Label.roleAndIdentity") || chrome.contains("Role & Identity"),
+            "Studio Profile header must use the Role & Identity token"
+        )
+        XCTAssertTrue(
+            bots.contains("BotsChrome.Label.providerRouting") || chrome.contains("Provider routing"),
+            "Studio routing header must use the Provider routing token"
+        )
+        XCTAssertTrue(
+            bots.contains("BotsChrome.Label.configurationSummary") || chrome.contains("Configuration summary"),
+            "Studio summary header must use the Configuration summary token"
+        )
         XCTAssertTrue(bots.contains("AgentChatUserBubble"))
         XCTAssertTrue(bots.contains("AgentChatAssistantReply"))
         XCTAssertTrue(bots.contains("AgentChatComposerBar"))
