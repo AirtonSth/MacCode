@@ -1879,6 +1879,43 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesAdvertisedRoutines_becauseDestMustNotSayActiveRoutines() throws {
+        // WHY: Studio already says Routines. Compile listed Active routines,
+        // so first-chat "what are your Routines?" invented a hop. Dest
+        // preview and compose must share the advertised name. Active stays
+        // on each live line. Dest Source title stays Routine.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.saveRoutine()
+        let id = try XCTUnwrap(vm.routines.first?.definition.id)
+        vm.setRoutineEnabled(id: id, enabled: true)
+        vm.composerText = "What are your Routines?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Routines (not while the app is closed):"))
+        XCTAssertTrue(preview.compiledPayload.contains("Morning scan: Instruction: Scan overnight failures. When: Weekdays 9:00. Active."))
+        XCTAssertFalse(preview.compiledPayload.contains("Active routines"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(preview.layers.contains { $0.title == "Routines" })
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .routine })?.title, "Routine")
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What are your Routines?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
     func test_previewBrainIncludesAdvertisedTestRun_becauseDestMustNotInviteAHop() throws {
         // WHY: Studio already says Test run. Compile listed Active routines
         // only, so first-chat "test this routine" invented a hop or a

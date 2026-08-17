@@ -125,6 +125,7 @@ final class BotTypesTests: XCTestCase {
         XCTAssertFalse(starter.contains("Model:"), "route layer owns Model")
         XCTAssertFalse(starter.contains("Fallback order"), "compiler layer owns Fallback order")
         XCTAssertFalse(starter.contains("Test run:"), "compiler layer owns Test run")
+        XCTAssertFalse(starter.contains("Routines (not while"), "compiler layer owns Routines")
         XCTAssertFalse(starter.contains(BotStandingInstructions.rememberFactTool), "tools layer owns remember")
         XCTAssertFalse(starter.contains(BotStandingInstructions.correctFactTool), "tools layer owns correct")
         XCTAssertFalse(starter.contains(BotStandingInstructions.removeSkillTool), "tools layer owns remove")

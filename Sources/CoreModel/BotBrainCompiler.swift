@@ -298,9 +298,11 @@ public enum BotBrainCompiler {
         let liveRoutines = routines.filter(\.activation.isEnabled)
             .sorted { $0.definition.name.localizedCaseInsensitiveCompare($1.definition.name) == .orderedAscending }
         if !liveRoutines.isEmpty {
-            // Studio already says Active. Compile that name so first-chat
+            // Studio already says Routines. Compile that name so first-chat
+            // "what are your Routines?" cannot invent a hop. Studio already
+            // says Active. Keep Active on each live line so first-chat
             // "which are Active?" cannot invent a hop. Off stays out.
-            lines.append("Active routines (not while the app is closed):")
+            lines.append("Routines (not while the app is closed):")
             lines.append(contentsOf: liveRoutines.map(Self.routineLine))
         }
         // Studio already says Test run. Compile that name so first-chat
@@ -452,16 +454,19 @@ public enum BotBrainCompiler {
 
     /// Studio already says Instruction and When. Compile those names so
     /// first-chat "what's the Instruction?" cannot invent a hop. Empty
-    /// When stays omitted. Off stays out of this line.
+    /// When stays omitted. Studio already says Active. Live lines keep
+    /// that name so first-chat "which are Active?" cannot invent a hop.
+    /// Off dest rows omit Active.
     static func routineLine(_ routine: BotRoutine) -> String {
         let name = routine.definition.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let prompt = routine.definition.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let note = routine.definition.scheduleNote.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = mutateKey(routine.definition.id.value)
+        let active = routine.activation.isEnabled ? " Active." : ""
         if note.isEmpty {
-            return "- \(name): Instruction: \(prompt) [\(key)]"
+            return "- \(name): Instruction: \(prompt).\(active) [\(key)]"
         }
-        return "- \(name): Instruction: \(prompt). When: \(note) [\(key)]"
+        return "- \(name): Instruction: \(prompt). When: \(note).\(active) [\(key)]"
     }
 
     static func sourceLayers(

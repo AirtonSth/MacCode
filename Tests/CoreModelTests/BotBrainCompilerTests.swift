@@ -1228,11 +1228,12 @@ final class BotBrainCompilerTests: XCTestCase {
             ]
         )
         XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper). \(BotBrainCompiler.handleCreateOnlyHonesty) Role: Scout."))
-        XCTAssertTrue(receipt.compiledPayload.contains("Active routines (not while the app is closed):"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Routines (not while the app is closed):"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Active routines"))
         XCTAssertFalse(receipt.compiledPayload.contains("Enabled routines"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Morning scan: Instruction: Scan overnight failures. When: Weekdays 9:00"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Morning scan: Instruction: Scan overnight failures. When: Weekdays 9:00. Active."))
         XCTAssertFalse(receipt.compiledPayload.contains("Morning scan (Weekdays 9:00):"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Inbox sweep: Instruction: Clear the inbox"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Inbox sweep: Instruction: Clear the inbox. Active."))
         XCTAssertFalse(receipt.compiledPayload.contains("Inbox sweep: Instruction: Clear the inbox. When:"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(morning.id.value)))
         XCTAssertFalse(receipt.compiledPayload.contains("Nightly archive"))
@@ -1309,8 +1310,70 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .routine })?.title, "Routine")
         let empty = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Test this routine")
         XCTAssertTrue(empty.compiledPayload.contains(BotBrainCompiler.testRunHonesty))
+        XCTAssertFalse(empty.compiledPayload.contains("Routines (not while the app is closed):"))
         XCTAssertFalse(empty.compiledPayload.contains("Active routines"))
         XCTAssertNil(empty.layers.first(where: { $0.kind == .routine }))
+    }
+
+    func test_routinesHonestyCompilesForCustomSoul_becauseStudioRoutinesIsNotAHop() {
+        // WHY: Studio already says Routines. Compile listed Active routines,
+        // so first-chat "what are your Routines?" invented a hop. Hermes
+        // agents see the advertised tab name. Active stays on each live
+        // line. Dest Source title stays Routine. Schema does not grow a
+        // routines tool.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let morning = BotRoutineDefinition(
+            botID: bot.id,
+            name: "Morning scan",
+            prompt: "Scan overnight failures",
+            scheduleNote: "Weekdays 9:00"
+        )
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "What are your Routines?",
+            routines: [
+                BotRoutine(
+                    definition: morning,
+                    activation: BotRoutineActivation(routineID: morning.id, botID: bot.id, isEnabled: true)
+                )
+            ]
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("Routines (not while the app is closed):"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Morning scan: Instruction: Scan overnight failures. When: Weekdays 9:00. Active."))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains("Active routines"))
+        XCTAssertFalse(receipt.compiledPayload.contains("bot_list_routines"))
+        XCTAssertFalse(
+            BotStandingInstructions.admittedToolsText.contains("Routines (not while"),
+            "tools must not advertise a Routines list write"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Routines (not while"),
+            "compiler layer owns Routines"
+        )
+        XCTAssertFalse(receipt.layers.contains { $0.title == "Routines" })
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .routine })?.title, "Routine")
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.text.contains("Morning scan") })?.reason,
+            "Active. Runs only while the app is open."
+        )
     }
 
     func test_skillsCompileAndOffStaysOut_becauseStudioAlreadySaysSkills() {
