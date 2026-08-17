@@ -1302,6 +1302,18 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    public func removeSkill(skillID: String) {
+        guard let bot = selectedBot else { return }
+        do {
+            // Dest first. Remove used to listSkillBindings after the
+            // store dropped this row. Drop it locally.
+            try botStore.removeSkillBinding(botID: bot.id, skillID: skillID)
+            dropRemovedSkill(skillID, botID: bot.id)
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
     public var studioWorkspaceLabel: String {
         let id = selectedBot?.workspaceID ?? context.state.window.selectedWorkspaceID
         if let id, let name = context.state.workspaces[id]?.name, !name.isEmpty {
@@ -1793,6 +1805,11 @@ public final class BotsViewModel: ObservableObject {
         }
         skillBindings[index] = binding
         rememberStudioSupport(for: binding.botID)
+    }
+
+    private func dropRemovedSkill(_ skillID: String, botID: BotID) {
+        skillBindings.removeAll { $0.skillID == skillID }
+        rememberStudioSupport(for: botID)
     }
 
     /// Test run dest used to listRoutines after the store stamped this
@@ -4602,6 +4619,11 @@ public struct BotsRootView: View {
                                 .foregroundColor(DS.Palette.textTertiary)
                         }
                         Spacer()
+                        Button("Remove", role: .destructive) {
+                            vm.removeSkill(skillID: binding.skillID)
+                        }
+                        .buttonStyle(DSSecondaryButtonStyle())
+                        .accessibilityIdentifier("bots.studio.skills.remove")
                         Toggle(binding.enabled ? "On" : "Off", isOn: Binding(
                             get: { binding.enabled },
                             set: { vm.setSkillEnabled(skillID: binding.skillID, enabled: $0) }

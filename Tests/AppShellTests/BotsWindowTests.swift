@@ -4226,6 +4226,50 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.screen, .studio)
     }
 
+    func test_removeSkillDoesNotListSkills_becauseRemoveDestMustNotRereadBindings() throws {
+        // WHY: Remove dest must drop the row without listing every skill,
+        // or the Skills tab looks current only after a reread.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(piper)
+        vm.skillDraft = "weekly-account-health"
+        vm.addSkill()
+        let afterAdd = vm.skillListCountForTesting
+        vm.removeSkill(skillID: "weekly-account-health")
+        XCTAssertTrue(vm.skillBindings.isEmpty)
+        XCTAssertEqual(vm.enabledSkillCount, 0)
+        XCTAssertEqual(
+            vm.skillListCountForTesting,
+            afterAdd,
+            "remove dest must not reread every skill"
+        )
+        XCTAssertTrue(try context.botStore.listSkillBindings(botID: piper.id).isEmpty)
+    }
+
+    func test_removeSkillKeepsExistingSkills_becauseStaleEmptyMustNotLookCurrent() throws {
+        // WHY: dest-first remove is honest only when the other bindings stay
+        // visible after this catalog id leaves the list.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        try context.botStore.setSkillBinding(
+            BotSkillBinding(botID: piper.id, skillID: "keep-me", enabled: true)
+        )
+        vm.beginEdit(piper)
+        vm.skillDraft = "drop-me"
+        vm.addSkill()
+        let afterAdd = vm.skillListCountForTesting
+        vm.removeSkill(skillID: "drop-me")
+        XCTAssertEqual(vm.skillBindings.map(\.skillID), ["keep-me"])
+        XCTAssertTrue(try XCTUnwrap(vm.skillBindings.first).enabled)
+        XCTAssertEqual(vm.skillListCountForTesting, afterAdd)
+        XCTAssertEqual(
+            try context.botStore.listSkillBindings(botID: piper.id).map(\.skillID),
+            ["keep-me"]
+        )
+    }
+
     func test_studioDoesNotPersistDedicatedLocalVM_becauseItIsNotAdvertised() throws {
         // WHY: Product must not advertise Dedicated local VM. A leftover draft
         // kind must fall back to logical space instead of publishing a hidden mode.
@@ -4542,6 +4586,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.memory.list"))
         XCTAssertTrue(bots.contains("bots.memory.correct"))
         XCTAssertTrue(bots.contains("bots.memory.forget"))
+        XCTAssertTrue(bots.contains("bots.studio.skills.remove"))
         XCTAssertTrue(bots.contains("bots.routines.name"))
         XCTAssertTrue(bots.contains("bots.routines.instruction"))
         XCTAssertTrue(bots.contains("bots.routines.when"))
