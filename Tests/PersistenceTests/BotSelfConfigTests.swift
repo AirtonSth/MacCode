@@ -210,9 +210,11 @@ final class BotSelfConfigTests: XCTestCase {
         let soul = properties?["soul"] as? [String: Any]
         let notify = properties?["notifications_enabled"] as? [String: Any]
         XCTAssertEqual(title?["description"] as? String, "Role / job. Same field as Studio Role.")
-        XCTAssertEqual(soul?["description"] as? String, "Standing instructions.")
+        XCTAssertEqual(soul?["description"] as? String, "Instructions. Same field as Studio Instructions.")
         XCTAssertEqual(notify?["description"] as? String, "Notifications On/Off.")
         XCTAssertNil(properties?["notifications"], "notifications is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["instructions"], "instructions is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["standing_instructions"], "standing_instructions is an advertised alias, not a second schema key")
     }
 
     func test_setSettingsAdvertisedNamesPersist_becauseToolsSayJobNotTitle() throws {
@@ -269,6 +271,40 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertTrue(notifyWins.notificationsEnabled, "notifications_enabled wins")
         XCTAssertEqual(try store.get(id: bot.id)?.title, "Lead")
+    }
+
+    func test_setSettingsAdvertisedInstructionsPersist_becauseStudioSaysInstructionsNotSoul() throws {
+        // WHY: Studio already says Instructions. Parse only read soul /
+        // standing_instructions, so first-chat "change your instructions"
+        // invented a hop or left the leftover soul. Canonical soul still
+        // wins. Schema does not grow an instructions key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "Instructions persist")
+        XCTAssertEqual(try store.getRevision(id: try XCTUnwrap(store.get(id: bot.id)?.currentRevisionID))?.soul, "Own the inbox.")
+
+        let standingWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "standing_instructions": "Ask when blocked.",
+            "instructions": "Ignored instructions",
+        ])
+        XCTAssertEqual(standingWins.soul, "Ask when blocked.", "standing_instructions wins")
+
+        let soulWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "soul": "Speak plainly.",
+            "standing_instructions": "Ignored standing",
+            "instructions": "Ignored instructions",
+        ])
+        XCTAssertEqual(soulWins.soul, "Speak plainly.", "soul wins")
     }
 
     func test_setSettingsAdvertisedOnOffPersist_becauseStudioSaysOnNotTrue() throws {

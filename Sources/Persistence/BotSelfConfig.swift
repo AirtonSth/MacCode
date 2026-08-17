@@ -91,7 +91,7 @@ public enum BotSelfConfigCatalog: Sendable {
                     "name": ["type": "string"],
                     "title": ["type": "string", "description": "Role / job. Same field as Studio Role."],
                     "description": ["type": "string"],
-                    "soul": ["type": "string", "description": "Standing instructions."],
+                    "soul": ["type": "string", "description": "Instructions. Same field as Studio Instructions."],
                     "provider": ["type": "string", "description": "Route. Claude, Codex, or Grok."],
                     "provider_instance_id": ["type": "string"],
                     "model": ["type": "string"],
@@ -540,8 +540,8 @@ public struct BotSelfConfigService: Sendable {
             patch.title = title
         }
         if let description = arguments["description"] as? String { patch.description = description }
-        // Tools say standing instructions. Schema key stays soul.
-        if let soul = firstString(arguments, keys: ["soul", "standing_instructions"]) {
+        // Tools and Studio say standing instructions / Instructions. Schema key stays soul.
+        if let soul = firstString(arguments, keys: ["soul", "standing_instructions", "instructions"]) {
             patch.soul = soul
         }
         if let model = arguments["model"] as? String { patch.model = model }
