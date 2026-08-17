@@ -4630,6 +4630,7 @@ public struct BotsRootView: View {
                             set: { vm.setSkillEnabled(skillID: binding.skillID, enabled: $0) }
                         ))
                         .toggleStyle(.switch)
+                        .labelsHidden()
                         .controlSize(.small)
                         .accessibilityLabel(binding.skillID)
                     }

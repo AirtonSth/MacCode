@@ -4226,6 +4226,25 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.screen, .studio)
     }
 
+    func test_studioSkillToggleHidesTitle_becauseRowCaptionAlreadySaysOff() throws {
+        // WHY: After Remove landed, the Skills row painted Off as a caption
+        // and again as the Toggle title next to the switch. Hide the title;
+        // keep the caption and VoiceOver name.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private var skillsTab") else {
+            return XCTFail("skillsTab must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n    private func memoryRow")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("Toggle(binding.enabled ? \"On\" : \"Off\""))
+        XCTAssertTrue(
+            slice.contains(".labelsHidden()"),
+            "Skills Off/On must not paint twice beside Remove"
+        )
+        XCTAssertTrue(slice.contains("Text(binding.enabled ? \"Enabled\" : \"Off\")"))
+    }
+
     func test_removeSkillDoesNotListSkills_becauseRemoveDestMustNotRereadBindings() throws {
         // WHY: Remove dest must drop the row without listing every skill,
         // or the Skills tab looks current only after a reread.
