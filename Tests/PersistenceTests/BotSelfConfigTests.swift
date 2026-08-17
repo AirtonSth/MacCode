@@ -247,6 +247,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["remember_a_fact"], "remember_a_fact is not a schema key")
         XCTAssertNil(properties?["memory_id"], "memory_id is leftover snapshot identity, not a set_settings key")
         XCTAssertNil(properties?["content"], "content is leftover snapshot fact, not a set_settings key")
+        XCTAssertNil(properties?["forget"], "forget is an advertised forget_memory alias, not a set_settings key")
+        XCTAssertNil(properties?["forget_memory"], "forget_memory is not a set_settings key")
+        XCTAssertNil(properties?["forgotten"], "forgotten is not a set_settings key")
         XCTAssertNil(properties?["skills"], "skills is not a schema key")
         XCTAssertNil(properties?["skill"], "skill is an advertised set_skill alias, not a set_settings key")
         XCTAssertNil(properties?["skill_id"], "skill_id is a set_skill key, not a set_settings key")
@@ -274,6 +277,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(description.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel), "catalog names Desktop isolation honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.testRunHonesty), "catalog names Test run honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.memoryHonesty), "catalog names Memory honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.forgetHonesty), "catalog names Forget honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.skillsHonesty), "catalog names Skills honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.routinesHonesty), "catalog names Routines honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.instructionHonesty), "catalog names Instruction honesty")
@@ -830,6 +834,90 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertEqual(renamed.memory.first?.content, "Prefers dark mode")
+    }
+
+    func test_setSettingsRejectsAdvertisedForget_becauseStudioSaysForgetMemory() throws {
+        // WHY: Studio already says Forget. Compile already names
+        // bot_forget_memory. leftover Memory / fact / memory_id already
+        // reject. leftover forget still succeeded empty, so first-chat
+        // invented a persist. Reject the advertised name with Forget
+        // honesty, not put_memory honesty. forget_memory still persists
+        // Forget. leftover Memory still rejects. Name still persists.
+        // Schema does not grow a forget write key. Dest title stays
+        // Memory.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "fact": "Prefers dark mode",
+        ])
+        let memoryID = try XCTUnwrap(remembered.memory.first?.id)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["forget"],
+            "schema does not grow a forget write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "forget": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Forget": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "forget_memory": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "forgotten": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "fact": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Forget reject must not persist a name")
+        XCTAssertEqual(still.memory.first?.id, memoryID)
+        XCTAssertEqual(still.memory.first?.content, "Prefers dark mode")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.memory.first?.content, "Prefers dark mode")
+
+        let forgotten = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+            "memory_id": memoryID,
+        ])
+        XCTAssertEqual(forgotten.memory.count, 0, "forget_memory still owns Forget")
     }
 
     func test_setSettingsRejectsAdvertisedSkills_becauseStudioSaysAdd() throws {

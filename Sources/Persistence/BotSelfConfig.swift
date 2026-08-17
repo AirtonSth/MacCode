@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -675,6 +675,15 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedMemoryKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.memoryHonesty)
         }
+        // Studio already says Forget. Compile already names
+        // bot_forget_memory. A leftover Forget / forget write used to
+        // return an empty success, so first-chat invented a persist.
+        // Schema does not grow a forget key. forget_memory still
+        // persists Forget. leftover Memory / fact / memory_id still
+        // reject. Dest title stays Memory.
+        if arguments.keys.contains(where: Self.isAdvertisedForgetKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.forgetHonesty)
+        }
         // Studio already says Skills. Compile already labels Skills.
         // A leftover Skills / skill write used to return an empty
         // success, so first-chat invented a persist. Schema does not
@@ -881,6 +890,18 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "remember_a_fact"
             || normalized == "memory_id"
             || normalized == "content"
+    }
+
+    /// forget is not a set_settings schema key. Studio / compile
+    /// advertise Forget, so parse must fail loud instead of succeeding
+    /// empty. forget_memory still persists Forget. Schema does not
+    /// grow a forget write key. leftover Memory / fact / memory_id
+    /// stay on the Memory reject.
+    static func isAdvertisedForgetKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "forget"
+            || normalized == "forget_memory"
+            || normalized == "forgotten"
     }
 
     /// skills is not a schema key. Studio / compile advertise the
