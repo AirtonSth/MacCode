@@ -3615,6 +3615,8 @@ final class BotSelfConfigTests: XCTestCase {
         let putProperties = putSchema["properties"] as? [String: Any]
         XCTAssertNotNil(putProperties?["content"])
         XCTAssertNil(putProperties?["fact"], "fact is an advertised alias, not a second schema key")
+        XCTAssertNil(putProperties?["remember"], "remember is an advertised alias, not a second schema key")
+        XCTAssertNil(putProperties?["remember_a_fact"], "remember_a_fact is an advertised alias, not a second schema key")
         let putContent = putProperties?["content"] as? [String: Any]
         XCTAssertEqual(putContent?["description"] as? String, "Fact. Same field as Studio Remember a fact.")
 
@@ -3624,6 +3626,48 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["fact"], "fact is an advertised alias, not a second schema key")
         let content = properties?["content"] as? [String: Any]
         XCTAssertEqual(content?["description"] as? String, "Fact. Same field as Studio Remember a fact.")
+    }
+
+    func test_putMemoryAdvertisedRememberPersists_becauseHonestySaysRememberAFact() throws {
+        // WHY: set_settings leftover remember already rejects and points
+        // at bot_put_memory ("Same path as Studio Remember a fact"). Put
+        // only read content / fact, so first-chat retried remember and
+        // invented a hop. Canonical content still wins. Schema does not
+        // grow a remember key. Dest title stays Memory.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromRemember = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "remember": "Prefers dark mode",
+        ])
+        XCTAssertEqual(fromRemember.memory.map(\.content), ["Prefers dark mode"], "remember persists")
+        XCTAssertEqual(try store.listMemory(botID: bot.id).map(\.content), ["Prefers dark mode"])
+
+        let fromRememberAFact = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "remember_a_fact": "Prefers dusk",
+        ])
+        XCTAssertEqual(fromRememberAFact.memory.last?.content, "Prefers dusk", "remember_a_fact persists")
+
+        let contentWins = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers light mode",
+            "remember": "Ignored remember",
+            "remember_a_fact": "Ignored remember a fact",
+        ])
+        XCTAssertEqual(contentWins.memory.last?.content, "Prefers light mode", "content wins")
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "remember": "Must not persist",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.memory.map(\.content), [
+            "Prefers dark mode",
+            "Prefers dusk",
+            "Prefers light mode",
+        ], "leftover remember still rejects on set_settings")
     }
 
     func test_leftoverPermissionSnapshotStaysSupervised_becauseFullAccessIsNotLive() throws {

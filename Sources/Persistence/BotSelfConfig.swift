@@ -523,7 +523,10 @@ public struct BotSelfConfigService: Sendable {
             return try apply(patch)
         case BotSelfConfigCatalog.putMemory:
             // Tools and Studio say Remember a fact. Schema key stays content.
-            guard let content = Self.firstString(arguments, keys: ["content", "fact"]) else {
+            // set_settings leftover remember already rejects and points
+            // here, so first-chat retried remember on put_memory. Accept
+            // that advertised name on the existing persist path.
+            guard let content = Self.firstString(arguments, keys: ["content", "fact", "remember", "remember_a_fact"]) else {
                 throw BotSelfConfigError.invalid("Memory content is required.")
             }
             return try putMemory(content: content)
