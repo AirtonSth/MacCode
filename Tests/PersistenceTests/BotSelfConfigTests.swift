@@ -194,7 +194,7 @@ final class BotSelfConfigTests: XCTestCase {
         // The MCP schema still invited those writes, so first-chat
         // "set full access" invented live unsupervised power.
         let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setSettings)
-        XCTAssertTrue(description.contains("name, Role, Instructions, description, route, notifications, or avatar"))
+        XCTAssertTrue(description.contains("name, Role, Instructions, description, route, Model, notifications, or avatar"))
         XCTAssertFalse(description.contains("job, standing instructions"), "leftover job is not advertised")
         XCTAssertFalse(description.contains("permission"))
         XCTAssertFalse(description.contains("desktop"))
@@ -211,10 +211,12 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(provider?["description"] as? String, "Route. Claude, Codex, or Grok.")
         let title = properties?["title"] as? [String: Any]
         let soul = properties?["soul"] as? [String: Any]
+        let model = properties?["model"] as? [String: Any]
         let notify = properties?["notifications_enabled"] as? [String: Any]
         let avatar = properties?["avatar_symbol"] as? [String: Any]
         XCTAssertEqual(title?["description"] as? String, "Role / job. Same field as Studio Role.")
         XCTAssertEqual(soul?["description"] as? String, "Instructions. Same field as Studio Instructions.")
+        XCTAssertEqual(model?["description"] as? String, "Model. Same field as Studio Model.")
         XCTAssertEqual(notify?["description"] as? String, "Notifications On/Off.")
         XCTAssertEqual(avatar?["description"] as? String, "Avatar. Same field as Studio Avatar.")
         XCTAssertNil(properties?["notifications"], "notifications is an advertised alias, not a second schema key")

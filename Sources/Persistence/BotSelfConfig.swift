@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, route, notifications, or avatar. Same path as Studio Save."
+            return "Publish this bot's own name, Role, Instructions, description, route, Model, notifications, or avatar. Same path as Studio Save."
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -94,7 +94,7 @@ public enum BotSelfConfigCatalog: Sendable {
                     "soul": ["type": "string", "description": "Instructions. Same field as Studio Instructions."],
                     "provider": ["type": "string", "description": "Route. Claude, Codex, or Grok."],
                     "provider_instance_id": ["type": "string"],
-                    "model": ["type": "string"],
+                    "model": ["type": "string", "description": "Model. Same field as Studio Model."],
                     "notifications_enabled": ["type": "boolean", "description": "Notifications On/Off."],
                     "avatar_symbol": ["type": "string", "description": "Avatar. Same field as Studio Avatar."],
                 ]) { _, new in new },

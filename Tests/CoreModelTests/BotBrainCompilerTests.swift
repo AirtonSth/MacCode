@@ -952,9 +952,9 @@ final class BotBrainCompilerTests: XCTestCase {
     }
 
     func test_admittedToolsCompileNamesDescription_becauseCustomSoulMustNotHideThem() {
-        // WHY: Studio already says Role and Instructions. Tools named
-        // job/standing instructions, so first-chat "change your Role"
-        // invented a hop. A custom soul must still see advertised writes.
+        // WHY: Studio already says Model. Tools named route only, so
+        // first-chat "change your Model" invented a hop. A custom soul
+        // must still see that advertised write.
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "Looks around")
         let revision = BotRevision(
             botID: bot.id,
@@ -973,7 +973,7 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Change your description")
-        XCTAssertTrue(receipt.compiledPayload.contains("name, Role, Instructions, description, route, notifications, or avatar"))
+        XCTAssertTrue(receipt.compiledPayload.contains("name, Role, Instructions, description, route, Model, notifications, or avatar"))
         XCTAssertFalse(receipt.compiledPayload.contains("job, standing instructions"), "leftover job is not advertised")
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.changeJobTool))
         XCTAssertTrue(receipt.compiledPayload.contains("Description: Looks around"))
