@@ -694,11 +694,13 @@ public struct BotSelfConfigService: Sendable {
         }
         // Studio already says Instruction. Compile already labels
         // Instruction. A leftover instruction write used to return an
-        // empty success, so first-chat invented a persist. Schema does
-        // not grow an instruction key. Plural Instructions still
-        // persist soul. save_routine still persists Instruction / When.
-        // set_routine_enabled still persists Active. Dest title stays
-        // Routine.
+        // empty success, so first-chat invented a persist. Snapshot
+        // leftover prompt used to return an empty success, so
+        // first-chat invented a persist from the last get_settings
+        // key. Schema does not grow an instruction or prompt write
+        // key. Plural Instructions still persist soul. save_routine
+        // still persists Instruction / When. set_routine_enabled
+        // still persists Active. Dest title stays Routine.
         if arguments.keys.contains(where: Self.isAdvertisedInstructionKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.instructionHonesty)
         }
@@ -901,13 +903,17 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "save_routine"
     }
 
-    /// instruction is not a schema key. Studio / compile advertise the
-    /// name, so parse must fail loud instead of succeeding empty.
-    /// Plural instructions still persist soul. save_routine still
-    /// persists Instruction. Schema does not grow an instruction key.
+    /// instruction is not a set_settings schema key. Studio / compile
+    /// advertise the name, so parse must fail loud instead of succeeding
+    /// empty. Snapshot leftover prompt is the same write —
+    /// get_settings still encodes that leftover name, so parse must
+    /// reject it instead of succeeding empty. Plural instructions still
+    /// persist soul. save_routine still persists Instruction. Schema
+    /// does not grow an instruction or prompt write key.
     static func isAdvertisedInstructionKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "instruction"
+            || normalized == "prompt"
     }
 
     /// when is not a schema key. Studio / compile advertise the name,

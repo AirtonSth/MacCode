@@ -256,6 +256,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["routine_id"], "routine_id is a save_routine key, not a set_settings key")
         XCTAssertNil(properties?["save_routine"], "save_routine is not a schema key")
         XCTAssertNil(properties?["instruction"], "instruction is an advertised save_routine alias, not a set_settings key")
+        XCTAssertNil(properties?["prompt"], "prompt is leftover snapshot Instruction, not a set_settings key")
         XCTAssertNil(properties?["when"], "when is an advertised save_routine alias, not a set_settings key")
         XCTAssertNil(properties?["active"], "active is an advertised set_routine_enabled alias, not a set_settings key")
         XCTAssertNil(properties?["enabled"], "enabled is a leftover set_routine_enabled key, not a set_settings key")
@@ -1844,6 +1845,95 @@ final class BotSelfConfigTests: XCTestCase {
             "content": "Prefers light mode",
         ])
         XCTAssertEqual(viaContent.memory.last?.content, "Prefers light mode", "put_memory still owns content")
+    }
+
+    func test_setSettingsRejectsSnapshotPrompt_becauseStudioSaysSaveRoutine() throws {
+        // WHY: Studio already says Instruction. Compile already labels
+        // Instruction. leftover instruction already rejects. Snapshot
+        // still encodes leftover prompt, so first-chat that reused the
+        // last get_settings key invented a persist. Reject the snapshot
+        // key. save_routine still persists Instruction. leftover
+        // instruction still rejects. leftover Memory / content still
+        // reject. Name still persists. Schema does not grow a prompt
+        // write key. Dest title stays Routine.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.prompt, "Summarize overnight")
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        let routines = try XCTUnwrap(object["routines"] as? [[String: Any]])
+        XCTAssertEqual(routines.first?["prompt"] as? String, "Summarize overnight")
+        XCTAssertEqual(routines.first?["schedule_note"] as? String, "Weekdays 9:00")
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["prompt"],
+            "schema does not grow a prompt write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "prompt": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "prompt": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "instruction": "Summarize overnight",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.instructionHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "content": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "prompt reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "prompt reject must not persist soul")
+        XCTAssertEqual(still.routines.first?.prompt, "Summarize overnight")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.routines.first?.prompt, "Summarize overnight")
+
+        let viaPrompt = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "routine_id": try XCTUnwrap(saved.routines.first?.id),
+            "name": "Morning",
+            "prompt": "Triage the inbox",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(viaPrompt.routines.first?.prompt, "Triage the inbox", "save_routine still owns prompt")
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
