@@ -232,10 +232,12 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["approval"], "approval is not a schema key")
         XCTAssertNil(properties?["approval_mode"], "approval_mode is host-assigned, not a schema key")
         XCTAssertNil(properties?["permission"], "permission is dest title, not a schema key")
+        XCTAssertNil(properties?["desktop"], "desktop is host-assigned, not a schema key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.approvalModeHostAssignedHonesty), "catalog names Approval mode host-assigned honesty")
+        XCTAssertTrue(description.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel), "catalog names Desktop isolation honesty")
     }
 
     func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
@@ -440,6 +442,62 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedDesktop_becauseStudioSaysItIsNotASelfConfigWrite() throws {
+        // WHY: Studio already says Desktop. Compile already labels
+        // isolation honesty. set_settings still accepted Desktop /
+        // desktop as an empty success, so first-chat "set Desktop to
+        // Dedicated local VM" invented a persist. Reject the advertised
+        // name. Name still persists. Leftover desktop_kind still coerces.
+        // Schema does not grow a desktop key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktop": "Dedicated local VM",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Desktop": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "desktop": "logicalExecutionSpace",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Desktop reject must not persist a name")
+        XCTAssertEqual(still.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+
+        let leftover = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "desktop_kind": BotDesktopKind.dedicatedLocalVM.rawValue,
+        ])
+        XCTAssertEqual(leftover.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {

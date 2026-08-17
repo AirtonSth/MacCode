@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -616,6 +616,14 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedApprovalModeKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.approvalModeHostAssignedHonesty)
         }
+        // Studio already says Desktop. Compile already labels isolation
+        // honesty. A leftover Desktop / desktop write used to return an
+        // empty success, so first-chat invented a persist. Schema does
+        // not grow a desktop key. Leftover desktop_kind still coerces.
+        // Dest title stays Desktop.
+        if arguments.keys.contains(where: Self.isAdvertisedDesktopKey) {
+            throw BotSelfConfigError.invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -699,6 +707,14 @@ public struct BotSelfConfigService: Sendable {
         return normalized == "approval"
             || normalized == "approval_mode"
             || normalized == "permission"
+    }
+
+    /// desktop is not a schema key. Studio / compile advertise the name,
+    /// so parse must fail loud instead of succeeding empty. Leftover
+    /// desktop_kind stays a coerce path, not this reject.
+    static func isAdvertisedDesktopKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "desktop"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {
