@@ -162,6 +162,14 @@ public enum BotBrainCompiler {
     public static let testRunHonesty =
         "Test run: do the Instruction now. Does not set Active. \(BotRoutineCopy.testRunHonestyCaption)"
 
+    /// Studio already says Memory and Remember a fact. Compile already
+    /// labels Memory / Fact. A leftover Memory / fact write on
+    /// set_settings used to return an empty success, so first-chat
+    /// invented a persist. Hermes memory writes stay on put_memory.
+    /// Dest Source title stays Memory. Schema does not grow a memory key.
+    public static let memoryHonesty =
+        "Memory: call \(BotStandingInstructions.rememberFactTool). Same path as Studio Remember a fact. Not a set_settings write."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,

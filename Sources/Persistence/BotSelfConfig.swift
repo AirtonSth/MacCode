@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -650,6 +650,14 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedTestRunKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.testRunHonesty)
         }
+        // Studio already says Memory. Compile already labels Fact.
+        // A leftover Memory / fact write used to return an empty
+        // success, so first-chat invented a persist. Schema does not
+        // grow a memory key. put_memory still persists Fact. Dest
+        // title stays Memory.
+        if arguments.keys.contains(where: Self.isAdvertisedMemoryKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.memoryHonesty)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -776,6 +784,17 @@ public struct BotSelfConfigService: Sendable {
         return normalized == "test_run"
             || normalized == "test_run_requested"
             || normalized == "last_test_run_requested_at"
+    }
+
+    /// memory is not a schema key. Studio / compile advertise the
+    /// name, so parse must fail loud instead of succeeding empty.
+    /// put_memory still persists Fact. Schema does not grow a memory key.
+    static func isAdvertisedMemoryKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "memory"
+            || normalized == "fact"
+            || normalized == "remember"
+            || normalized == "remember_a_fact"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {

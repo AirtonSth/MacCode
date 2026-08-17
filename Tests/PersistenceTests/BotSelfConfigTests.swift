@@ -242,6 +242,10 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["test_run"], "test_run is not a schema key")
         XCTAssertNil(properties?["test_run_requested"], "test_run_requested is not a schema key")
         XCTAssertNil(properties?["last_test_run_requested_at"], "last_test_run_requested_at is not a schema key")
+        XCTAssertNil(properties?["memory"], "memory is not a schema key")
+        XCTAssertNil(properties?["fact"], "fact is an advertised put_memory alias, not a set_settings key")
+        XCTAssertNil(properties?["remember"], "remember is not a schema key")
+        XCTAssertNil(properties?["remember_a_fact"], "remember_a_fact is not a schema key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
@@ -250,6 +254,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(description.contains(BotPermission.honestyLabel), "catalog names Host-brokered writes honesty")
         XCTAssertTrue(description.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel), "catalog names Desktop isolation honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.testRunHonesty), "catalog names Test run honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.memoryHonesty), "catalog names Memory honesty")
     }
 
     func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
@@ -699,6 +704,77 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedMemory_becauseStudioSaysRememberAFact() throws {
+        // WHY: Studio already says Memory. Compile already labels Fact.
+        // set_settings still accepted Memory / fact as an empty success,
+        // so first-chat invented a persist. Reject the advertised name.
+        // put_memory still persists Fact. Name still persists. Leftover
+        // permission_mode still coerces. Schema does not grow a memory
+        // key. Dest title stays Memory.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "memory": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "fact": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "remember": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Remember a fact": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Memory reject must not persist a name")
+        XCTAssertEqual(still.memory.count, 0, "Memory reject must not persist a fact")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "fact": "Prefers dark mode",
+        ])
+        XCTAssertEqual(remembered.memory.first?.content, "Prefers dark mode")
+
+        let leftover = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+        ])
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.memory.first?.content, "Prefers dark mode")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.memory.first?.content, "Prefers dark mode")
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
