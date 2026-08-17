@@ -64,4 +64,17 @@ final class InsomniaStatusPillTests: XCTestCase {
             "the disable action must only be wired when the pill is visible and Insomnia is on"
         )
     }
+
+    func test_compactFooterOmitsInsomniaTitle_becauseNarrowBotsSidebarTruncatesToInso() {
+        XCTAssertNil(
+            SidebarViewModel.insomniaFooterTitle(compact: true),
+            "compact Token Saver footer must not paint the word Insomnia — " +
+            "a 217pt Bots sidebar clips it to Inso... next to the rings"
+        )
+        XCTAssertEqual(
+            SidebarViewModel.insomniaFooterTitle(compact: false),
+            "Insomnia",
+            "the stacked footer still has room for the full Insomnia title"
+        )
+    }
 }
