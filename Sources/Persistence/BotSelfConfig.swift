@@ -600,8 +600,8 @@ public struct BotSelfConfigService: Sendable {
         if let number = value as? NSNumber { return number.boolValue }
         if let raw = value as? String {
             switch raw.lowercased() {
-            case "true", "1", "yes": return true
-            case "false", "0", "no": return false
+            case "true", "1", "yes", "on": return true
+            case "false", "0", "no", "off": return false
             default: break
             }
         }

@@ -212,6 +212,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(title?["description"] as? String, "Role / job. Same field as Studio Role.")
         XCTAssertEqual(soul?["description"] as? String, "Standing instructions.")
         XCTAssertEqual(notify?["description"] as? String, "Notifications On/Off.")
+        XCTAssertNil(properties?["notifications"], "notifications is an advertised alias, not a second schema key")
     }
 
     func test_setSettingsAdvertisedNamesPersist_becauseToolsSayJobNotTitle() throws {
@@ -268,6 +269,39 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertTrue(notifyWins.notificationsEnabled, "notifications_enabled wins")
         XCTAssertEqual(try store.get(id: bot.id)?.title, "Lead")
+    }
+
+    func test_setSettingsAdvertisedOnOffPersist_becauseStudioSaysOnNotTrue() throws {
+        // WHY: Studio summary and the schema already say On/Off.
+        // ParseBool only read true/1/yes, so first-chat "turn notifications
+        // Off" invented a hop or left the leftover switch. Canonical bool
+        // still wins. Schema does not grow a notifications key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromOff = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications": "Off",
+        ])
+        XCTAssertFalse(fromOff.notificationsEnabled, "Off persists")
+        XCTAssertEqual(try store.get(id: bot.id)?.notificationsEnabled, false)
+
+        let fromOn = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications": "On",
+        ])
+        XCTAssertTrue(fromOn.notificationsEnabled, "On persists")
+        XCTAssertEqual(try store.get(id: bot.id)?.notificationsEnabled, true)
+
+        let boolWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "notifications_enabled": false,
+            "notifications": "On",
+        ])
+        XCTAssertFalse(boolWins.notificationsEnabled, "notifications_enabled wins")
     }
 
     func test_setSettingsProviderWithoutModelBindsAdvertisedRoute_becauseLeftoverModelIsNotLive() throws {
