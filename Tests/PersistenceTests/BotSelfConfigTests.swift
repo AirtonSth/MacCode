@@ -26,6 +26,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(BotStandingInstructions.forgetFactTool, BotSelfConfigCatalog.forgetMemory)
         XCTAssertEqual(BotStandingInstructions.correctFactTool, BotSelfConfigCatalog.correctMemory)
         XCTAssertEqual(BotStandingInstructions.setSkillTool, BotSelfConfigCatalog.setSkill)
+        XCTAssertEqual(BotStandingInstructions.removeSkillTool, BotSelfConfigCatalog.removeSkill)
         XCTAssertEqual(BotStandingInstructions.saveRoutineTool, BotSelfConfigCatalog.saveRoutine)
         XCTAssertEqual(BotStandingInstructions.setRoutineEnabledTool, BotSelfConfigCatalog.setRoutineEnabled)
         let tools = BotStandingInstructions.admittedToolsText
@@ -34,6 +35,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.forgetMemory))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.correctMemory))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSkill))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.removeSkill))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.saveRoutine))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setRoutineEnabled))
         XCTAssertFalse(tools.contains(BotSelfConfigCatalog.getSettings))
@@ -44,6 +46,10 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.correctMemory),
             "tools layer owns correct"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.removeSkill),
+            "tools layer owns remove"
         )
     }
 
@@ -65,6 +71,7 @@ final class BotSelfConfigTests: XCTestCase {
             BotSelfConfigCatalog.forgetMemory,
             BotSelfConfigCatalog.correctMemory,
             BotSelfConfigCatalog.setSkill,
+            BotSelfConfigCatalog.removeSkill,
             BotSelfConfigCatalog.saveRoutine,
             BotSelfConfigCatalog.setRoutineEnabled,
         ])
@@ -325,5 +332,58 @@ final class BotSelfConfigTests: XCTestCase {
             )
         }
         XCTAssertTrue(try service.snapshot().memory.isEmpty)
+    }
+
+    func test_removeSkillDropsBinding_becauseDisableIsNotUnbind() throws {
+        // WHY: Studio Remove deletes the catalog row. Tools only named
+        // enable/disable, so first-chat "remove this skill" invented
+        // disable and left the id bound. Disable is not unbind.
+        // Hermes agents unbind in place.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        _ = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "keep-me",
+            "enabled": true,
+        ])
+        _ = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "drop-me",
+            "enabled": true,
+        ])
+        let disabled = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "drop-me",
+            "enabled": false,
+        ])
+        XCTAssertEqual(Set(disabled.skills.map(\.skillID)), ["keep-me", "drop-me"])
+        XCTAssertEqual(disabled.skills.first(where: { $0.skillID == "drop-me" })?.enabled, false)
+        let removed = try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
+            "skill_id": "drop-me",
+        ])
+        XCTAssertEqual(removed.skills.map(\.skillID), ["keep-me"])
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).map(\.skillID), ["keep-me"])
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
+                "skill_id": "drop-me",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .notFound)
+        }
+    }
+
+    func test_removeSkillRejectedWhenPath_becauseCatalogIdsAreNotFilesystemPaths() throws {
+        // WHY: Studio Add already rejects paths. Unbind must fail the same
+        // way instead of pretending a path is a live catalog id.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
+                "skill_id": "/tmp/skill.md",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? BotStoreError,
+                .invalidRow("skill id must be a catalog id, not a path")
+            )
+        }
+        XCTAssertTrue(try service.snapshot().skills.isEmpty)
     }
 }

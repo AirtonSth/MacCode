@@ -33,13 +33,14 @@ public enum BotSelfConfigCatalog: Sendable {
     public static let forgetMemory = "bot_forget_memory"
     public static let correctMemory = "bot_correct_memory"
     public static let setSkill = "bot_set_skill"
+    public static let removeSkill = "bot_remove_skill"
     public static let saveRoutine = "bot_save_routine"
     public static let setRoutineEnabled = "bot_set_routine_enabled"
 
     public static var toolNames: [String] {
         [
             getSettings, setSettings, putMemory, forgetMemory, correctMemory,
-            setSkill, saveRoutine, setRoutineEnabled,
+            setSkill, removeSkill, saveRoutine, setRoutineEnabled,
         ]
     }
 
@@ -67,6 +68,8 @@ public enum BotSelfConfigCatalog: Sendable {
             return "Correct one of this bot's memory facts. Writes a new revision. Same path as Studio Correct."
         case setSkill:
             return "Enable or disable a catalog skill on this bot."
+        case removeSkill:
+            return "Remove a catalog skill from this bot. Same path as Studio Remove. Disable is not unbind."
         case saveRoutine:
             return "Create or update a routine on this bot."
         case setRoutineEnabled:
@@ -124,6 +127,12 @@ public enum BotSelfConfigCatalog: Sendable {
                     "enabled": ["type": "boolean"],
                 ]) { _, new in new },
                 "required": ["skill_id", "enabled"],
+            ]
+        case removeSkill:
+            return [
+                "type": "object",
+                "properties": botID.merging(["skill_id": ["type": "string"]]) { _, new in new },
+                "required": ["skill_id"],
             ]
         case saveRoutine:
             return [
@@ -406,6 +415,19 @@ public struct BotSelfConfigService: Sendable {
         return try snapshot()
     }
 
+    public func removeSkill(skillID: String) throws -> BotSelfConfigSnapshot {
+        let trimmed = skillID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("/") else {
+            throw BotStoreError.invalidRow("skill id must be a catalog id, not a path")
+        }
+        let existing = try store.listSkillBindings(botID: callerBotID)
+        guard existing.contains(where: { $0.skillID == trimmed }) else {
+            throw BotSelfConfigError.notFound
+        }
+        try store.removeSkillBinding(botID: callerBotID, skillID: trimmed)
+        return try snapshot()
+    }
+
     public func saveRoutine(name: String, prompt: String, scheduleNote: String, id: BotRoutineID?) throws -> BotSelfConfigSnapshot {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -469,6 +491,11 @@ public struct BotSelfConfigService: Sendable {
                 throw BotSelfConfigError.invalid("skill_id is required.")
             }
             return try setSkill(skillID: skillID, enabled: try Self.parseBool(arguments["enabled"], label: "enabled"))
+        case BotSelfConfigCatalog.removeSkill:
+            guard let skillID = arguments["skill_id"] as? String else {
+                throw BotSelfConfigError.invalid("skill_id is required.")
+            }
+            return try removeSkill(skillID: skillID)
         case BotSelfConfigCatalog.saveRoutine:
             guard let name = arguments["name"] as? String,
                   let prompt = arguments["prompt"] as? String else {

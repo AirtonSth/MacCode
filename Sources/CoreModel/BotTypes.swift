@@ -196,6 +196,7 @@ public enum BotStandingInstructions {
     public static let forgetFactTool = "bot_forget_memory"
     public static let correctFactTool = "bot_correct_memory"
     public static let setSkillTool = "bot_set_skill"
+    public static let removeSkillTool = "bot_remove_skill"
     public static let saveRoutineTool = "bot_save_routine"
     public static let setRoutineEnabledTool = "bot_set_routine_enabled"
     /// Must stay identical to `BotBrowserCatalog.open` / `get` / `waitLogin`.
@@ -207,7 +208,7 @@ public enum BotStandingInstructions {
         "When asked to remember a fact, call \(rememberFactTool). When asked to change your name, job, standing instructions, description, route, or notifications, call \(changeJobTool)."
 
     public static let generatedMutateLine =
-        "When asked to forget a fact, call \(forgetFactTool). When asked to correct a fact, call \(correctFactTool). When asked to enable or disable a skill, call \(setSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to turn a routine on or off, call \(setRoutineEnabledTool)."
+        "When asked to forget a fact, call \(forgetFactTool). When asked to correct a fact, call \(correctFactTool). When asked to enable or disable a skill, call \(setSkillTool). When asked to remove a skill, call \(removeSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to turn a routine on or off, call \(setRoutineEnabledTool)."
 
     public static let generatedBrowserLine =
         "When asked to open a website, call \(openBrowserTool). When asked what is open in that browser, call \(getBrowserTool). When asked to wait for a login, call \(waitLoginTool). That browser is this teammate's, not the user's."
