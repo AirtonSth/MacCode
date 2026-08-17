@@ -223,6 +223,58 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["notifications"], "notifications is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["instructions"], "instructions is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["standing_instructions"], "standing_instructions is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["fallback"], "fallback is not a schema key")
+        XCTAssertNil(properties?["fallback_order"], "fallback_order is not a schema key")
+        XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
+    }
+
+    func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
+        // WHY: Studio already says Fallback order is not shipped. Compile
+        // already labels that honesty. set_settings still accepted
+        // fallback_order as an empty success, so first-chat "if Claude is
+        // down use Grok" invented a persist. Reject the advertised name.
+        // Default route still persists. Schema does not grow a fallback key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "fallback_order": "Grok, Claude",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotRoute.fallbackOrderHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Fallback order": "Grok then Claude",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotRoute.fallbackOrderHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "provider": "Grok",
+                "fallback": "Claude",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotRoute.fallbackOrderHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.provider, AgentProvider.claude.rawValue, "Fallback reject must not persist a route")
+        XCTAssertEqual(still.model, "opus", "Fallback reject must not persist a model")
+
+        let route = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "default_route": "Grok",
+        ])
+        XCTAssertEqual(route.provider, AgentProvider.grok.rawValue)
+        XCTAssertEqual(route.model, BotRoute.defaultModel(for: .grok))
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
