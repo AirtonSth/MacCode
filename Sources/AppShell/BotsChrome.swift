@@ -127,7 +127,13 @@ public struct BotsAvatarView: View {
     public var body: some View {
         Group {
             if let symbol, let spec = BotBlobatarSpec.parse(symbol) {
-                BotBlobatarView(name: name.isEmpty ? handle : name, spec: spec, size: size, motion: .always)
+                BotBlobatarView(
+                    name: name.isEmpty ? handle : name,
+                    spec: spec,
+                    size: size,
+                    motion: .always,
+                    handle: handle
+                )
             } else {
                 symbolFallback
             }

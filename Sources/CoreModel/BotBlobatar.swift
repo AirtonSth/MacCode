@@ -87,6 +87,8 @@ public struct BotBlobatarSpec: Equatable, Sendable {
     public var expression: BotBlobatarExpression
     public var background: BotBlobatarBackground
     public var hue: BotBlobatarHue
+    /// When set, the figure no longer follows the live name.
+    public var frozenSeed: String?
 
     public static let `default` = BotBlobatarSpec(
         shape: .auto,
@@ -101,16 +103,39 @@ public struct BotBlobatarSpec: Equatable, Sendable {
         shape: BotBlobatarShape = .auto,
         expression: BotBlobatarExpression = .idle,
         background: BotBlobatarBackground = .none,
-        hue: BotBlobatarHue = .auto
+        hue: BotBlobatarHue = .auto,
+        frozenSeed: String? = nil
     ) {
         self.shape = shape
         self.expression = expression
         self.background = background
         self.hue = hue
+        self.frozenSeed = frozenSeed
+    }
+
+    public var isDefaultAppearance: Bool {
+        shape == .auto && expression == .idle && background == .none && hue == .auto
+    }
+
+    /// User picked something in Studio, or a leftover custom token.
+    public var isUserFixed: Bool {
+        !isDefaultAppearance || !(frozenSeed ?? "").isEmpty
     }
 
     public var token: String {
-        "\(Self.tokenPrefix)\(shape.rawValue):\(expression.rawValue):\(background.rawValue):\(hue.token)"
+        let base = "\(Self.tokenPrefix)\(shape.rawValue):\(expression.rawValue):\(background.rawValue):\(hue.token)"
+        guard let frozenSeed, !frozenSeed.isEmpty else { return base }
+        return "\(base):\(Self.encodeSeed(frozenSeed))"
+    }
+
+    public func renderSeed(liveName: String, handle: String = "") -> String {
+        let live = liveName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tag = handle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let frozenSeed, !frozenSeed.isEmpty { return frozenSeed }
+        if isUserFixed, !tag.isEmpty { return tag }
+        if !live.isEmpty { return live }
+        if !tag.isEmpty { return tag }
+        return "bot"
     }
 
     public var advertisedName: String {
@@ -146,7 +171,7 @@ public struct BotBlobatarSpec: Equatable, Sendable {
 
     private static func parseToken(_ body: String) -> BotBlobatarSpec? {
         let parts = body.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
-        guard parts.count == 4,
+        guard parts.count >= 4,
               let shape = BotBlobatarShape(rawValue: parts[0]),
               let expression = BotBlobatarExpression(rawValue: parts[1]),
               let background = BotBlobatarBackground(rawValue: parts[2])
@@ -159,7 +184,31 @@ public struct BotBlobatarSpec: Equatable, Sendable {
         } else {
             return nil
         }
-        return BotBlobatarSpec(shape: shape, expression: expression, background: background, hue: hue)
+        let seed: String?
+        if parts.count > 4 {
+            let raw = parts.dropFirst(4).joined(separator: ":")
+            let decoded = decodeSeed(raw)
+            seed = decoded.isEmpty ? nil : decoded
+        } else {
+            seed = nil
+        }
+        return BotBlobatarSpec(
+            shape: shape,
+            expression: expression,
+            background: background,
+            hue: hue,
+            frozenSeed: seed
+        )
+    }
+
+    private static let seedAllowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-._~")
+
+    private static func encodeSeed(_ raw: String) -> String {
+        raw.addingPercentEncoding(withAllowedCharacters: seedAllowed) ?? raw
+    }
+
+    private static func decodeSeed(_ raw: String) -> String {
+        raw.removingPercentEncoding ?? raw
     }
 }
 
@@ -220,9 +269,9 @@ public enum BotBlobatar {
         .init(id: "violet", degrees: 290, preview: 0xC084FC),
     ]
 
-    public static func figure(name: String, spec: BotBlobatarSpec) -> BotBlobatarFigure {
-        let seed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let traits = Traits(seed: seed.isEmpty ? "bot" : seed, overrides: overrides(for: spec))
+    public static func figure(name: String, spec: BotBlobatarSpec, handle: String = "") -> BotBlobatarFigure {
+        let seed = spec.renderSeed(liveName: name, handle: handle)
+        let traits = Traits(seed: seed, overrides: overrides(for: spec))
         var layout = layout(traits)
         let pose = Pose.forExpression(spec.expression)
         layout = pose.bake(layout)

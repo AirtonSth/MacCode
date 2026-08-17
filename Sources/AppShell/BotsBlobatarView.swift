@@ -8,25 +8,34 @@ public struct BotBlobatarView: View {
     public var spec: BotBlobatarSpec
     public var size: CGFloat
     public var motion: BotBlobatarMotionMode
+    public var handle: String
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hovering = false
 
-    public init(name: String, spec: BotBlobatarSpec, size: CGFloat, motion: BotBlobatarMotionMode = .frozen) {
+    public init(
+        name: String,
+        spec: BotBlobatarSpec,
+        size: CGFloat,
+        motion: BotBlobatarMotionMode = .frozen,
+        handle: String = ""
+    ) {
         self.name = name
         self.spec = spec
         self.size = size
         self.motion = motion
+        self.handle = handle
     }
 
     public var body: some View {
-        let figure = BotBlobatar.figure(name: name, spec: spec)
+        let figure = BotBlobatar.figure(name: name, spec: spec, handle: handle)
+        let motionSeed = spec.renderSeed(liveName: name, handle: handle)
         let paused = reduceMotion || motion == .frozen || (motion == .hover && !hovering)
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: paused)) { timeline in
             let pose = paused
                 ? BotBlobatarMotion.still
                 : BotBlobatar.motion(
-                    name: name,
+                    name: motionSeed,
                     time: timeline.date.timeIntervalSinceReferenceDate,
                     expression: spec.expression,
                     amplitude: 1
@@ -189,6 +198,7 @@ public struct BotBlobatarView: View {
 struct BotBlobatarEditor: View {
     @Binding var token: String
     var seed: String
+    var handle: String = ""
 
     private var spec: BotBlobatarSpec {
         BotBlobatarSpec.parse(token) ?? .default
@@ -203,7 +213,7 @@ struct BotBlobatarEditor: View {
                             label: shape.rawValue,
                             selected: spec.shape == shape,
                             identifier: "bots.studio.avatar.shape.\(shape.rawValue)",
-                            preview: BotBlobatarSpec(shape: shape, expression: spec.expression, background: spec.background, hue: spec.hue)
+                            preview: previewing { $0.shape = shape }
                         ) {
                             apply { $0.shape = shape }
                         }
@@ -217,7 +227,7 @@ struct BotBlobatarEditor: View {
                             label: expression.rawValue,
                             selected: spec.expression == expression,
                             identifier: "bots.studio.avatar.expression.\(expression.rawValue)",
-                            preview: BotBlobatarSpec(shape: spec.shape, expression: expression, background: spec.background, hue: spec.hue)
+                            preview: previewing { $0.expression = expression }
                         ) {
                             apply { $0.expression = expression }
                         }
@@ -253,7 +263,7 @@ struct BotBlobatarEditor: View {
     private func tile(label: String, selected: Bool, identifier: String, preview: BotBlobatarSpec, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             VStack(spacing: DS.Space.xs) {
-                BotBlobatarView(name: seed, spec: preview, size: 36, motion: .frozen)
+                BotBlobatarView(name: seed, spec: preview, size: 36, motion: .frozen, handle: handle)
                 Text(label)
                     .font(DS.Font.caption2)
                     .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
@@ -346,9 +356,20 @@ struct BotBlobatarEditor: View {
         .accessibilityIdentifier("bots.studio.avatar.hue")
     }
 
+    private func previewing(_ mutate: (inout BotBlobatarSpec) -> Void) -> BotBlobatarSpec {
+        var next = spec
+        mutate(&next)
+        return next
+    }
+
     private func apply(_ mutate: (inout BotBlobatarSpec) -> Void) {
         var next = spec
         mutate(&next)
+        if next.isDefaultAppearance {
+            next.frozenSeed = nil
+        } else if next.frozenSeed == nil || next.frozenSeed?.isEmpty == true {
+            next.frozenSeed = seed
+        }
         token = next.token
     }
 }

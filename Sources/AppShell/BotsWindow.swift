@@ -4473,7 +4473,8 @@ public struct BotsRootView: View {
                     .accessibilityHidden(true)
                 BotBlobatarEditor(
                     token: $vm.studioDraft.avatarSymbol,
-                    seed: vm.studioDraft.name.isEmpty ? vm.studioDraft.handle : vm.studioDraft.name
+                    seed: vm.studioDraft.name.isEmpty ? vm.studioDraft.handle : vm.studioDraft.name,
+                    handle: vm.studioDraft.handle
                 )
             }
         }
