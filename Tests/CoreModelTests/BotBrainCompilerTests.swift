@@ -80,7 +80,7 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
         XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotBrainCompiler.workspaceHostAssignedHonesty)"))
         XCTAssertTrue(receipt.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Permission: \(BotPermission.honestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Approval mode: \(BotBrainCompiler.approvalModeText())"))
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Old secret") })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Rumor") })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Prefers dark mode") })?.included, true)
@@ -480,15 +480,27 @@ final class BotBrainCompilerTests: XCTestCase {
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: leftover, userText: "Just write the file")
         XCTAssertEqual(receipt.permissionMode, .supervised)
-        XCTAssertTrue(receipt.compiledPayload.contains("Permission: \(BotPermission.honestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Approval mode: \(BotBrainCompiler.approvalModeText())"))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        XCTAssertFalse(receipt.compiledPayload.contains("Permission:"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains("full_access"))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.included, true)
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.text, BotPermission.honestyLabel)
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.title, "Permission")
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.text, BotBrainCompiler.approvalModeText())
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .permission })?.reason,
             "Advertised supervised route. Leftover full-access kinds compile as supervised."
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.admittedToolsText.contains("Approval mode"),
+            "tools must not advertise an Approval mode write"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout")
+                .contains(BotBrainCompiler.approvalModeHostAssignedHonesty),
+            "approval-mode honesty is a compiler layer, not starter soul"
         )
     }
 
@@ -1009,7 +1021,7 @@ final class BotBrainCompilerTests: XCTestCase {
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Can you just do it?")
         XCTAssertEqual(receipt.permissionMode, .supervised)
-        XCTAssertTrue(receipt.compiledPayload.contains("Permission: \(BotPermission.honestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Approval mode: \(BotBrainCompiler.approvalModeText())"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains("auto_accept_edits"))
         XCTAssertFalse(BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotPermission.honestyLabel))

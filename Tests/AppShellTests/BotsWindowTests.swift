@@ -1668,6 +1668,37 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesAdvertisedApprovalMode_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio already says Approval mode. Compile listed Permission,
+        // so first-chat "what's your Approval mode?" invented a hop. Dest
+        // preview and compose must share that advertised name. Dest Source
+        // title stays Permission.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "What's your Approval mode?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(vm.studioApprovalLabel, "Supervised")
+        XCTAssertTrue(preview.compiledPayload.contains("Approval mode: \(BotPermission.honestyLabel) \(BotBrainCompiler.approvalModeHostAssignedHonesty)"))
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        XCTAssertFalse(preview.compiledPayload.contains("Permission:"))
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .permission })?.title, "Permission")
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What's your Approval mode?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
     func test_previewBrainIncludesAdvertisedHandleCreateOnlyHonesty_becauseDestMustNotInviteAWrite() throws {
         // WHY: Studio Handle is create-only after first save. Compile already
         // showed @handle next to Role, so first-chat "change your handle"
