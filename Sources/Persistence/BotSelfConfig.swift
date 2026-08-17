@@ -608,6 +608,14 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedWorkspaceKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.workspaceHostAssignedHonesty)
         }
+        // Studio already says Approval mode. Compile already labels that
+        // honesty. A leftover Approval mode / approval write used to
+        // return an empty success, so first-chat invented a persist.
+        // Schema does not grow an approval_mode key. Leftover
+        // permission_mode still coerces. Dest title stays Permission.
+        if arguments.keys.contains(where: Self.isAdvertisedApprovalModeKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.approvalModeHostAssignedHonesty)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -681,6 +689,16 @@ public struct BotSelfConfigService: Sendable {
         return normalized == "workspace"
             || normalized == "working_space"
             || normalized == "cwd"
+    }
+
+    /// approval_mode is not a schema key. Studio / compile advertise the
+    /// name, so parse must fail loud instead of succeeding empty.
+    /// Leftover permission_mode stays a coerce path, not this reject.
+    static func isAdvertisedApprovalModeKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "approval"
+            || normalized == "approval_mode"
+            || normalized == "permission"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {

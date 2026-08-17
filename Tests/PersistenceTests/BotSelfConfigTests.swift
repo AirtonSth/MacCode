@@ -229,9 +229,13 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["workspace"], "workspace is host-assigned, not a schema key")
         XCTAssertNil(properties?["working_space"], "working_space is not a schema key")
         XCTAssertNil(properties?["cwd"], "cwd is not a schema key")
+        XCTAssertNil(properties?["approval"], "approval is not a schema key")
+        XCTAssertNil(properties?["approval_mode"], "approval_mode is host-assigned, not a schema key")
+        XCTAssertNil(properties?["permission"], "permission is dest title, not a schema key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.approvalModeHostAssignedHonesty), "catalog names Approval mode host-assigned honesty")
     }
 
     func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
@@ -380,6 +384,62 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
+    }
+
+    func test_setSettingsRejectsAdvertisedApprovalMode_becauseStudioSaysItIsHostAssigned() throws {
+        // WHY: Studio already says Approval mode. Compile already labels
+        // host-assigned honesty. set_settings still accepted Approval mode
+        // / approval as an empty success, so first-chat "set Approval mode
+        // to full access" invented a persist. Reject the advertised name.
+        // Name still persists. Leftover permission_mode still coerces.
+        // Schema does not grow an approval_mode key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "approval_mode": "full_access",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Approval mode": "full_access",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "permission": "full_access",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Approval mode reject must not persist a name")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let leftover = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+        ])
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
