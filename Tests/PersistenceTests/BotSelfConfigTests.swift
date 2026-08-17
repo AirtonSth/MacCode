@@ -250,6 +250,10 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["skill"], "skill is an advertised set_skill alias, not a set_settings key")
         XCTAssertNil(properties?["skill_id"], "skill_id is a set_skill key, not a set_settings key")
         XCTAssertNil(properties?["add_skill"], "add_skill is not a schema key")
+        XCTAssertNil(properties?["routines"], "routines is not a schema key")
+        XCTAssertNil(properties?["routine"], "routine is an advertised save_routine alias, not a set_settings key")
+        XCTAssertNil(properties?["routine_id"], "routine_id is a save_routine key, not a set_settings key")
+        XCTAssertNil(properties?["save_routine"], "save_routine is not a schema key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
@@ -260,6 +264,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(description.contains(BotBrainCompiler.testRunHonesty), "catalog names Test run honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.memoryHonesty), "catalog names Memory honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.skillsHonesty), "catalog names Skills honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.routinesHonesty), "catalog names Routines honesty")
     }
 
     func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
@@ -852,6 +857,91 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertEqual(renamed.skills.first?.skillID, "weekly-account-health")
+    }
+
+    func test_setSettingsRejectsAdvertisedRoutines_becauseStudioSaysSaveRoutine() throws {
+        // WHY: Studio already says Routines. Compile already labels
+        // Routines. set_settings still accepted Routines / routine as an
+        // empty success, so first-chat invented a persist. Reject the
+        // advertised name. save_routine still persists Instruction /
+        // When. set_routine_enabled still persists Active. Name still
+        // persists. Leftover permission_mode still coerces. Schema does
+        // not grow a routines key. Dest title stays Routines.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "routines": "Morning",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.routinesHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "routine": "Morning",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.routinesHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "routine_id": "00000000-0000-0000-0000-000000000001",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.routinesHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "save_routine": "Morning",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.routinesHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Routines reject must not persist a name")
+        XCTAssertEqual(still.routines.count, 0, "Routines reject must not persist a schedule")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.name, "Morning")
+        XCTAssertEqual(saved.routines.first?.prompt, "Summarize overnight")
+        XCTAssertEqual(saved.routines.first?.scheduleNote, "Weekdays 9:00")
+        let routineID = try XCTUnwrap(saved.routines.first?.id)
+
+        let activated = try service.call(name: BotSelfConfigCatalog.setRoutineEnabled, arguments: [
+            "routine_id": routineID,
+            "active": true,
+        ])
+        XCTAssertEqual(activated.routines.first?.enabled, true)
+
+        let leftover = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+        ])
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.routines.first?.name, "Morning")
+        XCTAssertEqual(leftover.routines.first?.enabled, true)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.routines.first?.name, "Morning")
+        XCTAssertEqual(renamed.routines.first?.enabled, true)
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {

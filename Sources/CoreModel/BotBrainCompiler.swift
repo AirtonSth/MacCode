@@ -178,6 +178,14 @@ public enum BotBrainCompiler {
     public static let skillsHonesty =
         "Skills: call \(BotStandingInstructions.setSkillTool). Same path as Studio Add. Not a set_settings write."
 
+    /// Studio already says Routines. Compile already labels Routines.
+    /// A leftover Routines / routine write on set_settings used to return
+    /// an empty success, so first-chat invented a persist. Hermes cron
+    /// writes stay on save_routine / set_routine_enabled. Dest Source
+    /// title stays Routines. Schema does not grow a routines key.
+    public static let routinesHonesty =
+        "Routines: call \(BotStandingInstructions.saveRoutineTool). Same path as Studio Save routine. Not a set_settings write."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,
