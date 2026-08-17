@@ -1663,6 +1663,34 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesAdvertisedInstructions_becauseDestMustNotSayStandingInstructions() throws {
+        // WHY: Studio already says Instructions. Compile headed the soul
+        // with Standing instructions, so first-chat "what are your
+        // Instructions?" invented a hop. Dest preview and compose must
+        // share the advertised name. Custom soul still wins the body.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "What are your Instructions?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Instructions:"))
+        XCTAssertFalse(preview.compiledPayload.contains("Standing instructions:"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What are your Instructions?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
     func test_previewBrainIncludesAdvertisedSkills_becauseDestMustNotSayEnabledSkills() throws {
         // WHY: Studio already says Skills. Compile listed Enabled skills, so
         // first-chat "which Skills?" invented a hop. Dest preview and compose
@@ -3992,6 +4020,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(prompt.contains("Old secret"))
         XCTAssertTrue(prompt.contains("Role: Scout"))
         XCTAssertFalse(prompt.contains("You are Piper (@piper) — Scout"))
+        XCTAssertTrue(prompt.contains("Instructions:"))
+        XCTAssertFalse(prompt.contains("Standing instructions:"))
         XCTAssertTrue(prompt.contains("Skills: weekly-account-health"))
         XCTAssertFalse(prompt.contains("Enabled skills"))
         XCTAssertFalse(prompt.contains("off-skill"))

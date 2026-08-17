@@ -216,7 +216,10 @@ public enum BotBrainCompiler {
             soul: revision.soul
         )
         if !soul.isEmpty {
-            lines.append("Standing instructions:")
+            // Studio already says Instructions. Compile that name so
+            // first-chat "what are your Instructions?" cannot invent a hop.
+            // Custom soul still wins the body.
+            lines.append("Instructions:")
             lines.append(soul)
         }
         let liveMemory = memory.filter { $0.forgottenAt == nil && $0.trusted }

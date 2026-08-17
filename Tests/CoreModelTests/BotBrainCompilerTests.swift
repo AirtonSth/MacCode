@@ -252,7 +252,8 @@ final class BotBrainCompilerTests: XCTestCase {
         let composed = BotBrainCompiler.composeRunPrompt(bot: bot, revision: revision, userText: "qual seu nome?")
         XCTAssertEqual(receipt.compiledPayload, composed)
         XCTAssertTrue(receipt.compiledPayload.contains("You are New Agent (@new-agent)."))
-        XCTAssertTrue(receipt.compiledPayload.contains("Standing instructions:"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Instructions:"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Standing instructions:"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         let layer = receipt.layers.first { $0.kind == .soul }
         XCTAssertEqual(layer?.included, true)
@@ -282,6 +283,8 @@ final class BotBrainCompilerTests: XCTestCase {
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Hi")
         XCTAssertTrue(receipt.compiledPayload.contains("Be brief."))
+        XCTAssertTrue(receipt.compiledPayload.contains("Instructions:"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Standing instructions:"))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first { $0.kind == .soul }?.reason, "Standing instructions are published with the revision.")
     }
