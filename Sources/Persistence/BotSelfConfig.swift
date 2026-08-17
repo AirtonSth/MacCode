@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, route, Model, notifications, or avatar. Same path as Studio Save."
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save."
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -92,7 +92,7 @@ public enum BotSelfConfigCatalog: Sendable {
                     "title": ["type": "string", "description": "Role / job. Same field as Studio Role."],
                     "description": ["type": "string"],
                     "soul": ["type": "string", "description": "Instructions. Same field as Studio Instructions."],
-                    "provider": ["type": "string", "description": "Route. Claude, Codex, or Grok."],
+                    "provider": ["type": "string", "description": "Default route. Claude, Codex, or Grok. Same field as Studio Default route."],
                     "provider_instance_id": ["type": "string"],
                     "model": ["type": "string", "description": "Model. Same field as Studio Model."],
                     "notifications_enabled": ["type": "boolean", "description": "Notifications On/Off."],
@@ -607,8 +607,8 @@ public struct BotSelfConfigService: Sendable {
         }
         if let model = arguments["model"] as? String { patch.model = model }
         if let instance = arguments["provider_instance_id"] as? String { patch.providerInstanceID = instance }
-        // Tools and Studio say route / Grok. Schema key stays provider.
-        if let raw = firstString(arguments, keys: ["provider", "route"]) {
+        // Tools and Studio say Default route / Grok. Schema key stays provider.
+        if let raw = firstString(arguments, keys: ["provider", "route", "default_route"]) {
             guard let parsed = BotRoute.parse(raw) else {
                 throw BotSelfConfigError.invalid("Unknown provider: \(raw)")
             }

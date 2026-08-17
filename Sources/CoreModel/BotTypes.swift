@@ -187,7 +187,7 @@ public enum BotRoute {
         }
     }
 
-    /// Tools say route. Compile says "Grok · grok-4.6". Raw ids stay valid.
+    /// Tools say Default route. Compile says "Grok · grok-4.6". Raw ids stay valid.
     public static func parse(_ raw: String) -> (provider: AgentProvider, model: String?)? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -279,7 +279,7 @@ public enum BotStandingInstructions {
     public static let waitLoginTool = "bot_browser_wait_login"
 
     public static let generatedCapabilityLine =
-        "When asked to remember a fact, call \(rememberFactTool). When asked to change your name, Role, Instructions, description, route, Model, notifications, or avatar, call \(changeJobTool)."
+        "When asked to remember a fact, call \(rememberFactTool). When asked to change your name, Role, Instructions, description, Default route, Model, notifications, or avatar, call \(changeJobTool)."
 
     public static let generatedMutateLine =
         "When asked to forget a fact, call \(forgetFactTool). When asked to correct a fact, call \(correctFactTool). When asked to add a skill or set it Enabled or Off, call \(setSkillTool). When asked to remove a skill, call \(removeSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to set a routine Active or Off, call \(setRoutineEnabledTool)."

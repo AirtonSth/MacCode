@@ -241,7 +241,10 @@ public enum BotBrainCompiler {
         // title stays Permission.
         lines.append("Approval mode: \(approvalModeText())")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
-        lines.append("Route: \(routeLine(provider: revision.provider, model: revision.model))")
+        // Studio already says Default route. Compile that name so first-chat
+        // "what's your Default route?" cannot invent a hop. Dest Source
+        // title stays Route.
+        lines.append("Default route: \(routeLine(provider: revision.provider, model: revision.model))")
         lines.append(BotStandingInstructions.admittedToolsText)
         if let browser = browserLine(browser) {
             lines.append(browser)
@@ -338,9 +341,9 @@ public enum BotBrainCompiler {
             : "Off. This Mac will not alert the owner."
     }
 
-    /// Desk already shows provider + model. Compile them so first-chat
-    /// "what model are you?" cannot invent a route. Custom soul must not
-    /// hide advertised routing.
+    /// Studio already says Default route. Compile provider + model so
+    /// first-chat "what's your Default route?" cannot invent a hop.
+    /// Custom soul must not hide advertised routing.
     static func routeLine(provider: AgentProvider, model: String) -> String {
         let title = BotRoute.advertisedTitle(for: provider)
         let model = model.trimmingCharacters(in: .whitespacesAndNewlines)

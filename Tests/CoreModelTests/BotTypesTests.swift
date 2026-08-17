@@ -121,6 +121,7 @@ final class BotTypesTests: XCTestCase {
         XCTAssertFalse(starter.contains("You are"), "identity layer owns the name")
         XCTAssertFalse(starter.contains("@"), "identity layer owns the handle")
         XCTAssertFalse(starter.contains("Route:"), "route layer owns the provider/model")
+        XCTAssertFalse(starter.contains("Default route:"), "route layer owns Default route")
         XCTAssertFalse(starter.contains(BotStandingInstructions.rememberFactTool), "tools layer owns remember")
         XCTAssertFalse(starter.contains(BotStandingInstructions.correctFactTool), "tools layer owns correct")
         XCTAssertFalse(starter.contains(BotStandingInstructions.removeSkillTool), "tools layer owns remove")
@@ -187,12 +188,12 @@ final class BotTypesTests: XCTestCase {
     }
 
     func test_admittedToolsNameDescriptionRouteAndNotifications_becauseSetSettingsAlreadyPublishesThem() {
-        // WHY: Studio already says Model and set_settings already publishes
-        // it. Tools named route only, so first-chat "change your Model"
-        // invented a hop. Hermes agents persist the advertised name.
+        // WHY: Studio already says Default route and Model. Tools named
+        // route only, so first-chat "change your Default route" invented
+        // a hop. Hermes agents persist the advertised name.
         let tools = BotStandingInstructions.admittedToolsText
         XCTAssertTrue(tools.contains(BotStandingInstructions.changeJobTool))
-        XCTAssertTrue(tools.contains("name, Role, Instructions, description, route, Model, notifications, or avatar"))
+        XCTAssertTrue(tools.contains("name, Role, Instructions, description, Default route, Model, notifications, or avatar"))
         XCTAssertFalse(tools.contains("job, standing instructions"), "leftover job is not advertised")
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")

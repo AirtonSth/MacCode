@@ -194,7 +194,7 @@ final class BotSelfConfigTests: XCTestCase {
         // The MCP schema still invited those writes, so first-chat
         // "set full access" invented live unsupervised power.
         let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setSettings)
-        XCTAssertTrue(description.contains("name, Role, Instructions, description, route, Model, notifications, or avatar"))
+        XCTAssertTrue(description.contains("name, Role, Instructions, description, Default route, Model, notifications, or avatar"))
         XCTAssertFalse(description.contains("job, standing instructions"), "leftover job is not advertised")
         XCTAssertFalse(description.contains("permission"))
         XCTAssertFalse(description.contains("desktop"))
@@ -204,11 +204,12 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNotNil(properties?["model"])
         XCTAssertNotNil(properties?["avatar_symbol"])
         XCTAssertNil(properties?["route"], "route is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["default_route"], "default_route is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["avatar"], "avatar is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["permission_mode"])
         XCTAssertNil(properties?["desktop_kind"])
         let provider = properties?["provider"] as? [String: Any]
-        XCTAssertEqual(provider?["description"] as? String, "Route. Claude, Codex, or Grok.")
+        XCTAssertEqual(provider?["description"] as? String, "Default route. Claude, Codex, or Grok. Same field as Studio Default route.")
         let title = properties?["title"] as? [String: Any]
         let soul = properties?["soul"] as? [String: Any]
         let model = properties?["model"] as? [String: Any]
@@ -430,10 +431,9 @@ final class BotSelfConfigTests: XCTestCase {
     }
 
     func test_setSettingsAdvertisedRouteNamesPersist_becauseToolsSayGrokNotRawId() throws {
-        // WHY: Tools invite route. Studio and compile say Claude / Codex /
-        // Grok. Parse only read provider raw values, so first-chat
-        // "switch to Grok" invented a hop or left opus. Canonical
-        // provider still wins. Explicit model still wins.
+        // WHY: Studio already says Default route. Tools named route, so
+        // first-chat "change your Default route" invented a hop or left
+        // opus. Canonical provider still wins. Explicit model still wins.
         let bot = try store.create(
             name: "Piper",
             title: "Scout",
@@ -455,6 +455,12 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(fromRoute.provider, AgentProvider.claude.rawValue)
         XCTAssertEqual(fromRoute.model, BotRoute.defaultModel(for: .claude))
+
+        let fromDefaultRoute = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "default_route": "Grok",
+        ])
+        XCTAssertEqual(fromDefaultRoute.provider, AgentProvider.grok.rawValue)
+        XCTAssertEqual(fromDefaultRoute.model, BotRoute.defaultModel(for: .grok))
 
         let providerWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "provider": "codex",
