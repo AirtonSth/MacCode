@@ -190,7 +190,9 @@ public struct AgentChatAssistantReply: View {
                     AgentChatTranscriptChrome.copyToPasteboard(text)
                 } label: {
                     Image(systemName: "doc.on.doc")
-                        .font(.system(size: 10))
+                        .font(.system(size: 11, weight: .regular))
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(DS.Palette.textTertiary)
