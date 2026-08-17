@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, job, standing instructions, description, route, notifications, or avatar. Same path as Studio Save."
+            return "Publish this bot's own name, Role, Instructions, description, route, notifications, or avatar. Same path as Studio Save."
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -601,7 +601,7 @@ public struct BotSelfConfigService: Sendable {
             patch.title = title
         }
         if let description = arguments["description"] as? String { patch.description = description }
-        // Tools and Studio say standing instructions / Instructions. Schema key stays soul.
+        // Tools and Studio say Instructions. Schema key stays soul.
         if let soul = firstString(arguments, keys: ["soul", "standing_instructions", "instructions"]) {
             patch.soul = soul
         }

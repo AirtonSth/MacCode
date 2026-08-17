@@ -187,13 +187,13 @@ final class BotTypesTests: XCTestCase {
     }
 
     func test_admittedToolsNameDescriptionRouteAndNotifications_becauseSetSettingsAlreadyPublishesThem() {
-        // WHY: Desk-admitted bot_set_settings already publishes description.
-        // Tools named name/job/soul/route/notifications, so first-chat
-        // "change your description" invented a hop. Hermes agents know
-        // which self-config writes are live.
+        // WHY: Studio already says Role and Instructions. Tools named
+        // job/standing instructions, so first-chat "change your Role"
+        // invented a hop. Hermes agents persist the advertised names.
         let tools = BotStandingInstructions.admittedToolsText
         XCTAssertTrue(tools.contains(BotStandingInstructions.changeJobTool))
-        XCTAssertTrue(tools.contains("name, job, standing instructions, description, route, notifications, or avatar"))
+        XCTAssertTrue(tools.contains("name, Role, Instructions, description, route, notifications, or avatar"))
+        XCTAssertFalse(tools.contains("job, standing instructions"), "leftover job is not advertised")
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")
                 .contains("notifications, or avatar"),

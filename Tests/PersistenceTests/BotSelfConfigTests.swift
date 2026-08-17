@@ -194,7 +194,8 @@ final class BotSelfConfigTests: XCTestCase {
         // The MCP schema still invited those writes, so first-chat
         // "set full access" invented live unsupervised power.
         let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setSettings)
-        XCTAssertTrue(description.contains("name, job, standing instructions, description, route, notifications, or avatar"))
+        XCTAssertTrue(description.contains("name, Role, Instructions, description, route, notifications, or avatar"))
+        XCTAssertFalse(description.contains("job, standing instructions"), "leftover job is not advertised")
         XCTAssertFalse(description.contains("permission"))
         XCTAssertFalse(description.contains("desktop"))
         let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)
@@ -273,7 +274,7 @@ final class BotSelfConfigTests: XCTestCase {
     }
 
     func test_setSettingsAdvertisedNamesPersist_becauseToolsSayJobNotTitle() throws {
-        // WHY: Tools invite job / standing instructions / notifications.
+        // WHY: Tools invite Role / Instructions / notifications.
         // Parse only read title / soul / notifications_enabled, so first-chat
         // "change your job" invented a hop or left Role untouched.
         // Studio Role is the same field. Canonical keys still win.
