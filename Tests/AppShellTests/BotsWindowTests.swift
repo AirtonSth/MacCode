@@ -1528,6 +1528,37 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(piper.workspaceID, workspace.id)
     }
 
+    func test_previewBrainIncludesAdvertisedMemoryMutateKey_becauseDestMustNotOmitForgetKeys() throws {
+        // WHY: Studio Memory already has Forget. Brain compile listed the
+        // fact without memory_id, so first-chat forget invented a UUID.
+        // Dest preview and compose must share the advertised key.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.memoryDraft = "Prefers dark mode"
+        vm.addMemory()
+        let item = try XCTUnwrap(vm.memoryItems.first)
+        vm.composerText = "Forget the dark-mode fact"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        let key = item.id.value.uuidString.lowercased()
+        XCTAssertTrue(preview.compiledPayload.contains("Prefers dark mode"))
+        XCTAssertTrue(preview.compiledPayload.contains(key))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Forget the dark-mode fact",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
     func test_previewBrainIncludesEnabledRoutine_becauseDestMustNotOmitSchedules() throws {
         // WHY: Brain Inspector / Desk send used dest memory+skills and
         // skipped dest routines. Owner-authored Morning scan never reached

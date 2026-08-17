@@ -258,7 +258,7 @@ final class BotStoreTests: XCTestCase {
         XCTAssertTrue(loaded.compiledPayload.contains("Prefers dark mode"))
         XCTAssertFalse(loaded.compiledPayload.contains("Old secret"))
         XCTAssertEqual(
-            loaded.memoryLayers.first(where: { $0.text == "Old secret" })?.included,
+            loaded.memoryLayers.first(where: { $0.text.contains("Old secret") })?.included,
             false
         )
     }

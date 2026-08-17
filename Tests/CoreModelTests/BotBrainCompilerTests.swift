@@ -36,9 +36,11 @@ final class BotBrainCompilerTests: XCTestCase {
             source: "chat"
         )
         var forgotten = live
+        forgotten.id = BotMemoryItemID()
         forgotten.content = "Old secret"
         forgotten.forgottenAt = Date()
         var untrusted = live
+        untrusted.id = BotMemoryItemID()
         untrusted.content = "Rumor"
         untrusted.trusted = false
         let enabled = BotSkillBinding(botID: bot.id, skillID: "weekly-account-health", enabled: true)
@@ -63,15 +65,18 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.payloadDigest, BotDigest.sha256Hex(composed))
         XCTAssertEqual(receipt.compilerVersion, ContextAssemblyReceipt.compilerVersion)
         XCTAssertTrue(receipt.compiledPayload.contains("Prefers dark mode"))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(live.id.value)))
         XCTAssertFalse(receipt.compiledPayload.contains("Old secret"))
         XCTAssertFalse(receipt.compiledPayload.contains("Rumor"))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(forgotten.id.value)))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(untrusted.id.value)))
         XCTAssertTrue(receipt.compiledPayload.contains("weekly-account-health"))
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
         XCTAssertTrue(receipt.compiledPayload.contains("Working space: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertTrue(receipt.compiledPayload.contains("Permission: \(BotPermission.honestyLabel)"))
-        XCTAssertEqual(receipt.layers.first(where: { $0.text == "Old secret" })?.included, false)
-        XCTAssertEqual(receipt.layers.first(where: { $0.text == "Rumor" })?.included, false)
-        XCTAssertEqual(receipt.layers.first(where: { $0.text == "Prefers dark mode" })?.included, true)
+        XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Old secret") })?.included, false)
+        XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Rumor") })?.included, false)
+        XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Prefers dark mode") })?.included, true)
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "off-skill" })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .user })?.text, "Summarize overnight")
         XCTAssertEqual(receipt.desktopKind, .logicalExecutionSpace)
@@ -562,12 +567,106 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper) — Scout."))
         XCTAssertTrue(receipt.compiledPayload.contains("Enabled routines (not while the app is closed):"))
         XCTAssertTrue(receipt.compiledPayload.contains("Morning scan (Weekdays 9:00): Scan overnight failures"))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(morning.id.value)))
         XCTAssertFalse(receipt.compiledPayload.contains("Nightly archive"))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(off.id.value)))
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Morning scan") })?.included, true)
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Nightly archive") })?.included, false)
         XCTAssertEqual(
             receipt.layers.first(where: { $0.text.contains("Nightly archive") })?.reason,
             "Disabled. Not injected."
         )
+    }
+
+    func test_memoryMutateKeyCompilesForCustomSoul_becauseForgetMustNotInventAnId() {
+        // WHY: Desk already admits bot_forget_memory and requires memory_id.
+        // Compile listed the fact without the key, so first-chat "forget this"
+        // invented a UUID or a hidden get-settings hop. Hermes memory is in
+        // context with enough to act. A written soul must not hide the key.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let live = BotMemoryItem(
+            botID: bot.id,
+            currentRevisionID: UUID(),
+            content: "Prefers dark mode",
+            provenance: "user",
+            trusted: true,
+            source: "chat"
+        )
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Forget the dark-mode fact",
+            memory: [live]
+        )
+        let key = BotBrainCompiler.mutateKey(live.id.value)
+        XCTAssertTrue(receipt.compiledPayload.contains("Trusted memory:"))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.memoryLine(live)))
+        XCTAssertTrue(receipt.compiledPayload.contains(key))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.text, BotBrainCompiler.memoryLine(live))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.included, true)
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(key),
+            "mutate keys are a compiler layer, not starter soul"
+        )
+    }
+
+    func test_forgottenMemoryDoesNotCompileMutateKey_becauseTombstonesAreNotAuthority() {
+        // WHY: Forget must remove the key from the adapter payload. A custom
+        // soul still sees live keys; a tombstone must not remain callable.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        var forgotten = BotMemoryItem(
+            botID: bot.id,
+            currentRevisionID: UUID(),
+            content: "Old secret",
+            provenance: "user",
+            trusted: true,
+            source: "chat"
+        )
+        forgotten.forgottenAt = Date()
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "What do you remember?",
+            memory: [forgotten]
+        )
+        XCTAssertFalse(receipt.compiledPayload.contains("Trusted memory:"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Old secret"))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(forgotten.id.value)))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.included, false)
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.text, BotBrainCompiler.memoryLine(forgotten))
     }
 }

@@ -208,7 +208,7 @@ public enum BotBrainCompiler {
         let liveMemory = memory.filter { $0.forgottenAt == nil && $0.trusted }
         if !liveMemory.isEmpty {
             lines.append("Trusted memory:")
-            lines.append(contentsOf: liveMemory.map { "- \($0.content)" })
+            lines.append(contentsOf: liveMemory.map(Self.memoryLine))
         }
         let enabled = skills.filter(\.enabled).map(\.skillID).sorted()
         if !enabled.isEmpty {
@@ -268,14 +268,26 @@ public enum BotBrainCompiler {
         return who.isEmpty ? nil : "You are \(who)."
     }
 
+    /// Desk forget/toggle tools require these keys. Snapshot already
+    /// lowercases them. Compile them so first-chat cannot invent a UUID
+    /// or a hidden get-settings hop. Custom soul must not hide them.
+    static func mutateKey(_ id: UUID) -> String {
+        id.uuidString.lowercased()
+    }
+
+    static func memoryLine(_ item: BotMemoryItem) -> String {
+        "- \(item.content) [\(mutateKey(item.id.value))]"
+    }
+
     static func routineLine(_ routine: BotRoutine) -> String {
         let name = routine.definition.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let prompt = routine.definition.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let note = routine.definition.scheduleNote.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = mutateKey(routine.definition.id.value)
         if note.isEmpty {
-            return "- \(name): \(prompt)"
+            return "- \(name): \(prompt) [\(key)]"
         }
-        return "- \(name) (\(note)): \(prompt)"
+        return "- \(name) (\(note)): \(prompt) [\(key)]"
     }
 
     static func sourceLayers(
@@ -418,7 +430,7 @@ public enum BotBrainCompiler {
                     id: "memory-\(item.id.value.uuidString.lowercased())",
                     kind: .memory,
                     title: "Memory",
-                    text: item.content,
+                    text: memoryLine(item),
                     included: included,
                     reason: reason
                 )
