@@ -43,10 +43,13 @@ final class ComputerUseMCPInstallTests: XCTestCase {
     func test_grokSessionAdmitUsesTheSameServerAndKeepsLeftovers() {
         let leftover: [Any] = [["name": "user-slack", "command": "npx"]]
         let servers = GrokACPClient.sessionMCPServers(existing: leftover, command: "/tmp/RemoteCodeDistillService")
-        XCTAssertTrue(ComputerUseMCPAdmit.containsAdmittedGrokACP(servers))
+        XCTAssertFalse(
+            ComputerUseMCPAdmit.containsAdmittedGrokACP(servers),
+            "Grok sessions must use macos-harness, not remotecode-computer-use"
+        )
         let names = servers.compactMap { ($0 as? [String: Any])?["name"] as? String }
         XCTAssertTrue(names.contains("user-slack"))
-        XCTAssertEqual(names.filter { $0 == ComputerUseMCPAdmit.serverName }.count, 1)
+        XCTAssertEqual(names.filter { $0 == ComputerUseMCPAdmit.serverName }.count, 0)
     }
 
     func test_defaultAdmitPathCoversClaudeCodexAndGrok() {

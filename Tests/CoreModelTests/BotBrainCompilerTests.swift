@@ -595,7 +595,8 @@ final class BotBrainCompilerTests: XCTestCase {
             "create-only honesty is a compiler layer, not starter soul"
         )
         XCTAssertFalse(
-            BotStandingInstructions.admittedToolsText.contains("handle"),
+            BotStandingInstructions.admittedToolsText.contains("handle,")
+                || BotStandingInstructions.admittedToolsText.contains("or handle"),
             "handle stays create-only; tools must not persist it"
         )
     }

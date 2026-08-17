@@ -2454,6 +2454,29 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "Refactor the auth module please" })
     }
 
+    func test_sendDispatchesMentionedBotsAfterStart() async throws {
+        // WHY: @quinn in Agent App must dispatch after the Agent turn starts.
+        // A hook that never runs from send() leaves mentions as dead composer sugar.
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "New thread")
+        let quinn = BotDefinition(
+            handle: "quinn",
+            name: "Quinn",
+            title: "CRM Controller",
+            description: ""
+        )
+        vm.mentionableBotsProvider = { [quinn] }
+        let done = expectation(description: "bot mention dispatch")
+        vm.onDispatchBotMentions = { peers, _, _ in
+            XCTAssertEqual(peers.map(\.id), [quinn.id])
+            done.fulfill()
+        }
+        vm.prompt = "@quinn check WhatsApp"
+        await vm.send()
+        XCTAssertEqual(vm.lastDispatchedMentionHandlesForTesting, ["quinn"])
+        await fulfillment(of: [done], timeout: 1)
+    }
+
     func test_send_emptyPendingThreadStartsRunInsteadOfQueueing() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-empty-pending-send-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()

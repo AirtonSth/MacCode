@@ -298,11 +298,16 @@ public enum BotStandingInstructions {
     public static let generatedBrowserLine =
         "When asked to open a website, call \(openBrowserTool). When asked what is open in that browser, call \(getBrowserTool). When asked to wait for a login, call \(waitLoginTool). That browser is this teammate's, not the user's."
 
+    public static let macosHarnessTool = "macos-harness"
+    public static let generatedMacOSHarnessLine =
+        "When asked to see the screen, click, type, or press keys on this Mac, run \(macosHarnessTool) with a Python program using mac.see, mac.key, mac.type, mac.click, mac.ax, and mac.script. If \(macosHarnessTool) is missing, install it with uv tool install --python 3.12 --upgrade macos-harness from https://github.com/browser-use/macos-harness then retry. Do not call remotecode-computer-use."
+
     /// Compiler layer. Starter soul must not own these names.
     public static let admittedToolsText = [
         generatedCapabilityLine,
         generatedMutateLine,
         generatedBrowserLine,
+        generatedMacOSHarnessLine,
     ].joined(separator: "\n")
 
     public static func fallback(name _: String, title _: String, description _: String = "") -> String {

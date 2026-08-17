@@ -1,9 +1,8 @@
 import Foundation
-import CoreModel
 
-/// `@handle` tokens in Desk composer text. Handle match wins, then name.
-enum BotMentionParser {
-    static func activeQuery(in text: String) -> String? {
+/// `@handle` tokens in composer text. Handle match wins, then name.
+public enum BotMentionParser {
+    public static func activeQuery(in text: String) -> String? {
         guard let at = text.lastIndex(of: "@") else { return nil }
         if at > text.startIndex {
             let before = text[text.index(before: at)]
@@ -14,7 +13,7 @@ enum BotMentionParser {
         return String(after)
     }
 
-    static func suggestions(
+    public static func suggestions(
         query: String,
         bots: [BotDefinition],
         excluding: BotID?
@@ -28,7 +27,7 @@ enum BotMentionParser {
         }
     }
 
-    static func mentionedBots(
+    public static func mentionedBots(
         in text: String,
         bots: [BotDefinition],
         excluding: BotID?
@@ -45,7 +44,7 @@ enum BotMentionParser {
         return result
     }
 
-    static func applying(_ bot: BotDefinition, to text: String) -> String {
+    public static func applying(_ bot: BotDefinition, to text: String) -> String {
         guard let at = text.lastIndex(of: "@") else {
             return text + "@\(bot.handle) "
         }
@@ -53,7 +52,7 @@ enum BotMentionParser {
         return "\(prefix)@\(bot.handle) "
     }
 
-    static func resolve(
+    public static func resolve(
         _ token: String,
         in bots: [BotDefinition],
         excluding: BotID?
@@ -68,7 +67,7 @@ enum BotMentionParser {
         }
     }
 
-    static func mentionTokens(in text: String) -> [String] {
+    public static func mentionTokens(in text: String) -> [String] {
         var tokens: [String] = []
         var index = text.startIndex
         while index < text.endIndex {
@@ -93,5 +92,39 @@ enum BotMentionParser {
             }
         }
         return tokens
+    }
+}
+
+/// Persistable caption for a teammate turn inside an Agent App thread.
+public enum BotPeerTranscript {
+    private static let prefix = "[[rc:bot-from:"
+
+    public static func encode(peer: BotDefinition, text: String) -> String {
+        "\(prefix)\(peer.handle)|\(peer.name)|\(peer.title)]]\n\(text)"
+    }
+
+    public static func parse(_ content: String) -> (caption: String, body: String)? {
+        guard content.hasPrefix(prefix),
+              let end = content.range(of: "]]") else { return nil }
+        let payload = content[content.index(content.startIndex, offsetBy: prefix.count)..<end.lowerBound]
+        let parts = payload.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 2 else { return nil }
+        let handle = parts[0]
+        let name = parts[1]
+        let title = parts.count > 2 ? parts[2] : ""
+        let identity = [name, title.isEmpty ? nil : title, handle]
+            .compactMap { $0 }
+            .joined(separator: " - ")
+        let bodyStart = content.index(end.upperBound, offsetBy: 0)
+        var body = String(content[bodyStart...])
+        if body.hasPrefix("\n") { body.removeFirst() }
+        return ("Message from \(identity)", body)
+    }
+
+    public static func messagedCaption(for bot: BotDefinition) -> String {
+        let identity = [bot.name, bot.title.isEmpty ? nil : bot.title, bot.handle]
+            .compactMap { $0 }
+            .joined(separator: " - ")
+        return "Messaged \(identity)"
     }
 }

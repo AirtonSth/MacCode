@@ -2996,10 +2996,13 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskRunModel, BotsViewModel.defaultModel(for: .grok))
         XCTAssertEqual(vm.deskRunPermissionMode, .fullAccess)
         XCTAssertEqual(vm.resolvedProvider(for: bot), .claude)
+        vm.setDeskReasoningEffort(.high)
+        XCTAssertEqual(vm.deskRunReasoning, .high)
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.source\")"))
         XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.model\")"))
         XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.permission\")"))
+        XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.model.popover\")"))
         guard let start = source.range(of: "private func startSupervisedRun") else {
             return XCTFail("startSupervisedRun must exist")
         }
@@ -3008,10 +3011,35 @@ final class BotsWindowTests: XCTestCase {
         let slice = String(source[start.lowerBound..<end])
         XCTAssertTrue(slice.contains("provider: deskRouting.provider"))
         XCTAssertTrue(slice.contains("permissionMode: deskRouting.permissionMode"))
+        XCTAssertTrue(slice.contains("reasoningEffort: effort"))
+        XCTAssertTrue(slice.contains("workspace: nil"))
         XCTAssertFalse(
             slice.contains("provider: revision.provider"),
             "Desk send must not stay locked to the published Studio route"
         )
+        XCTAssertFalse(
+            slice.contains("reasoningEffort: revision.reasoningEffort"),
+            "Desk send must use the composer reasoning chip"
+        )
+    }
+
+    func test_deskHeaderFollowsComposerRoute() throws {
+        // WHY: the identity row used to keep Studio's published Claude/opus
+        // after the footer switched to Grok. The live send route must show.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude, model: "opus")
+        vm.openDesk(bot)
+        XCTAssertEqual(vm.providerLabel(for: bot), "Claude")
+        XCTAssertEqual(vm.modelLabel(for: bot), "opus")
+        vm.setDeskProvider(.grok)
+        vm.setDeskRoutingMode(.manual)
+        vm.setDeskModel(BotsViewModel.defaultModel(for: .grok))
+        vm.setDeskPermissionMode(.fullAccess)
+        XCTAssertEqual(vm.providerLabel(for: bot), "Grok")
+        XCTAssertEqual(vm.modelLabel(for: bot), BotsViewModel.defaultModel(for: .grok))
+        XCTAssertEqual(vm.permissionLabel(for: bot), "Full access")
+        XCTAssertEqual(vm.resolvedProvider(for: bot), .claude)
     }
 
     func test_botMentionParserResolvesHandle_excludingOpenTeammate() throws {
@@ -3054,6 +3082,20 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(outbound.peer?.botID, quinn.id)
         XCTAssertEqual(outbound.peer?.caption, "Messaged Quinn - CRM Controller - \(quinn.handle)")
         XCTAssertTrue(outbound.text.contains("@quinn"))
+    }
+
+    func test_runMentionedPromptTargetsPeerFromAgentApp() async throws {
+        // WHY: Agent App mentions call this entry. It must mark the peer
+        // and persist onto that teammate without stealing the open Desk.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        let reply = await vm.runMentionedPrompt(peer: quinn, text: "@quinn check WhatsApp")
+        XCTAssertEqual(vm.lastMentionedBotIDForTesting, quinn.id)
+        XCTAssertNil(reply, "no provider is wired in this harness, so the peer run cannot finish")
+        XCTAssertEqual(vm.selectedBotID, piper.id)
     }
 
     func test_beginCreateTwiceAllocatesDistinctHandles_becauseNewAgentIsAPlaceholder() throws {

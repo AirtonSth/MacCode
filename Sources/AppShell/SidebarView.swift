@@ -5562,6 +5562,7 @@ public final class SidebarView: NSObject {
         ])
         self.view = container
         super.init()
+        router.botsViewModel = botsViewModel
         h.rootView = SidebarRootView(
             vm: viewModel,
             botsVM: botsViewModel,

@@ -4292,6 +4292,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return entries
     }
 
+    public var mentionableBotsProvider: () -> [BotDefinition] = { [] }
+    public var onDispatchBotMentions: (([BotDefinition], String, AgentThreadID) async -> Void)?
+
     public var composerSuggestions: [AgentComposerSuggestion] {
         let isClaude = selectedProviderSnapshot?.provider == .claude
         return AgentComposerSuggestions.suggestions(
@@ -4300,7 +4303,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             snapshot: selectedProviderSnapshot,
             localSlashCommands: Self.localSlashCommands,
             extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
-            extraSkillNames: isClaude ? claudeProjectSlashEntries() : []
+            extraSkillNames: isClaude ? claudeProjectSlashEntries() : [],
+            mentionableBots: mentionableBotsProvider()
         )
     }
 
@@ -6187,6 +6191,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if selectedThreadCanQueuePrompt,
            await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
+            dispatchBotMentions(in: text, threadId: sendThreadId)
             return
         }
         if await startProviderRun(
@@ -6197,7 +6202,70 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             recoveryDisplayText: originalPrompt
         ) == nil {
             restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+        } else {
+            dispatchBotMentions(in: text, threadId: sendThreadId)
         }
+    }
+
+    public private(set) var lastDispatchedMentionHandlesForTesting: [String] = []
+
+    public func dispatchBotMentions(in text: String, threadId: AgentThreadID?) {
+        guard let threadId else { return }
+        let peers = BotMentionParser.mentionedBots(
+            in: text,
+            bots: mentionableBotsProvider(),
+            excluding: nil
+        )
+        lastDispatchedMentionHandlesForTesting = peers.map(\.handle)
+        guard !peers.isEmpty, let onDispatchBotMentions else { return }
+        Task { await onDispatchBotMentions(peers, text, threadId) }
+    }
+
+    public func presentBotPeerMessage(peer: BotDefinition, text: String, threadId: AgentThreadID) {
+        let message = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: BotPeerTranscript.encode(peer: peer, text: text)
+        )
+        do {
+            try messageRepo.append(message)
+        } catch {
+            statusMessage = String(describing: error)
+            return
+        }
+        guard selectedThreadId == threadId else { return }
+        messages.append(message)
+    }
+
+    /// Hop-1 after a mentioned bot replies. No `@handle` so dispatch cannot loop.
+    /// Queues without consuming the composer draft when this thread is live.
+    public func sendBotPeerFollowUp(text: String, threadId: AgentThreadID) async {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, selectedThreadId == threadId else { return }
+        if selectedThreadCanQueuePrompt, let queuedMessageRepo {
+            do {
+                let routing = (try? threadRepo.get(id: threadId))?.effectiveRoutingConfiguration
+                    ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
+                let queued = try queuedMessageRepo.enqueue(
+                    threadId: threadId,
+                    text: trimmed,
+                    attachments: [],
+                    interactionMode: interactionMode,
+                    routingSnapshot: AgentQueuedMessageRoutingSnapshot(configuration: routing)
+                )
+                reloadQueuedMessages()
+                onQueuedMessageEvent?(AgentQueueEventKinds.queued, queued)
+            } catch {
+                statusMessage = String(describing: error)
+            }
+            return
+        }
+        _ = await startProviderRun(
+            text: trimmed,
+            attached: [],
+            recordHistory: false,
+            interactionMode: interactionMode
+        )
     }
 
     /// Puts the draft back only when send never started a turn and the composer
@@ -8439,6 +8507,7 @@ public struct AgentComposerSuggestion: Identifiable, Equatable, Sendable {
     public enum Kind: Sendable {
         case slashCommand
         case skill
+        case bot
     }
 
     public let id: String
@@ -8470,9 +8539,23 @@ public enum AgentComposerSuggestions {
         localSlashCommands: [String],
         extraCommands: [String] = [],
         extraSkillNames: [String] = [],
+        mentionableBots: [BotDefinition] = [],
         limit: Int = 8
     ) -> [AgentComposerSuggestion] {
         let token = activeToken(in: text, cursorOffset: cursorOffset)
+        if token.hasPrefix("@") {
+            let query = String(token.dropFirst())
+            return BotMentionParser.suggestions(query: query, bots: mentionableBots, excluding: nil)
+                .prefix(limit)
+                .map { bot in
+                    AgentComposerSuggestion(
+                        title: bot.name,
+                        subtitle: bot.title.isEmpty ? "@\(bot.handle)" : "\(bot.title) · @\(bot.handle)",
+                        insertText: "@\(bot.handle) ",
+                        kind: .bot
+                    )
+                }
+        }
         // Both `/` and `$` open the same mixed catalog: modes/commands + skills.
         // Insert text keeps the typed trigger so `/sam-work` and `$goal` work.
         guard let trigger = token.first, trigger == "/" || trigger == "$" else { return [] }
@@ -10698,6 +10781,13 @@ public struct AgentAppView: View {
     /// grows vertically with content — no character or line-count truncation.
     static func userMessageDisplayText(_ text: String) -> String {
         text
+    }
+
+    static func messagedCaption(in text: String, bots: [BotDefinition]) -> String? {
+        guard let bot = BotMentionParser.mentionedBots(in: text, bots: bots, excluding: nil).first else {
+            return nil
+        }
+        return BotPeerTranscript.messagedCaption(for: bot)
     }
 
     /// Visible-text check without allocating a trimmed copy.
@@ -13799,6 +13889,15 @@ public struct AgentAppView: View {
             HStack(alignment: .top, spacing: 0) {
                 Spacer(minLength: Self.userMessageBubbleLeadingGutter)
                 VStack(alignment: .trailing, spacing: DS.Space.xs) {
+                    if let caption = Self.messagedCaption(
+                        in: displayText,
+                        bots: vm.mentionableBotsProvider()
+                    ) {
+                        Text(caption)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .accessibilityIdentifier("agent.peer.messaged")
+                    }
                     // WHY: SwiftUI Text (not NSTextView) so short prompts hug content
                     // and long prompts wrap. No lineLimit / no fixed height — full
                     // prompt always visible and height grows with content.
@@ -13900,8 +13999,17 @@ public struct AgentAppView: View {
                                     .accessibilityLabel("Token Saver optimized this reply")
                                     .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(msg.id.value.uuidString)")
                             }
-                            assistantProse(msg.content)
-                            assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content), identifierSuffix: msg.id.value.uuidString)
+                            if let parsed = BotPeerTranscript.parse(msg.content) {
+                                Text(parsed.caption)
+                                    .font(DS.Font.caption)
+                                    .foregroundColor(DS.Palette.textTertiary)
+                                    .accessibilityIdentifier("agent.peer.from")
+                                assistantProse(parsed.body)
+                                assistantCopyBar(text: parsed.body, identifierSuffix: msg.id.value.uuidString)
+                            } else {
+                                assistantProse(msg.content)
+                                assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content), identifierSuffix: msg.id.value.uuidString)
+                            }
                         }
                     }
                 }
@@ -15562,10 +15670,18 @@ public struct AgentAppView: View {
         }
     }
 
+    private func suggestionIcon(_ kind: AgentComposerSuggestion.Kind) -> String {
+        switch kind {
+        case .skill: return "puzzlepiece.extension"
+        case .bot: return "person.crop.circle"
+        case .slashCommand: return "command"
+        }
+    }
+
     private func suggestionRow(_ suggestion: AgentComposerSuggestion, highlighted: Bool) -> some View {
         Button { vm.applyComposerSuggestion(suggestion); suggestionPopupDismissed = true } label: {
             HStack(spacing: DS.Space.sm) {
-                Image(systemName: suggestion.kind == .skill ? "puzzlepiece.extension" : "command")
+                Image(systemName: suggestionIcon(suggestion.kind))
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(highlighted ? DS.Palette.accent : DS.Palette.textSecondary)
                     .frame(width: 16)

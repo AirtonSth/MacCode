@@ -48,12 +48,12 @@ final class BotSelfConfigMCPInstallTests: XCTestCase {
             command: "/tmp/RemoteCodeDistillService",
             environment: [:]
         )
-        XCTAssertTrue(ComputerUseMCPAdmit.containsAdmittedGrokACP(servers))
+        XCTAssertFalse(ComputerUseMCPAdmit.containsAdmittedGrokACP(servers))
         XCTAssertTrue(BotSelfConfigMCPAdmit.containsAdmittedGrokACP(servers))
         let names = servers.compactMap { ($0 as? [String: Any])?["name"] as? String }
         XCTAssertTrue(names.contains("user-slack"))
         XCTAssertEqual(names.filter { $0 == BotSelfConfigMCPAdmit.serverName }.count, 1)
-        XCTAssertEqual(names.filter { $0 == ComputerUseMCPAdmit.serverName }.count, 1)
+        XCTAssertEqual(names.filter { $0 == ComputerUseMCPAdmit.serverName }.count, 0)
     }
 
     func test_defaultAdmitPathCoversClaudeCodexAndGrok() {

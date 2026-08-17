@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import CoreModel
 @testable import Surfaces
 
 // macos:32 -- pure-seam coverage for the caret-anchored suggestion popup.
@@ -52,6 +53,48 @@ final class ComposerSuggestionPopupTests: XCTestCase {
     }
 
     // WHY: typing `/ta` must filter down to the matching discovered skill.
+    // WHY: Agent App `@` must list mentionable bots so a teammate can be
+    // addressed from the same composer as slash commands.
+    func test_atTokenSuggestsMentionableBots() {
+        let quinn = BotDefinition(
+            handle: "quinn",
+            name: "Quinn",
+            title: "CRM Controller",
+            description: ""
+        )
+        let piper = BotDefinition(
+            handle: "piper",
+            name: "Piper",
+            title: "Seller",
+            description: ""
+        )
+        let out = AgentComposerSuggestions.suggestions(
+            for: "@q",
+            snapshot: nil,
+            localSlashCommands: ["/clear"],
+            mentionableBots: [quinn, piper],
+            limit: 20
+        )
+        XCTAssertEqual(out.map(\.kind), [.bot])
+        XCTAssertEqual(out.map(\.insertText), ["@quinn "])
+        XCTAssertEqual(out.first?.title, "Quinn")
+        XCTAssertTrue(out.first?.subtitle.contains("@quinn") == true)
+        let empty = AgentComposerSuggestions.suggestions(
+            for: "@",
+            snapshot: nil,
+            localSlashCommands: [],
+            mentionableBots: [quinn, piper]
+        )
+        XCTAssertEqual(Set(empty.map(\.insertText)), ["@quinn ", "@piper "])
+        let slashStillWins = AgentComposerSuggestions.suggestions(
+            for: "/",
+            snapshot: nil,
+            localSlashCommands: ["/clear"],
+            mentionableBots: [quinn]
+        )
+        XCTAssertFalse(slashStillWins.contains(where: { $0.kind == .bot }))
+    }
+
     func testExtraSkillsAreFilteredByQuery() {
         let out = AgentComposerSuggestions.suggestions(
             for: "/ta",

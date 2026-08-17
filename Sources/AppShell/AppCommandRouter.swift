@@ -299,6 +299,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
+    public weak var botsViewModel: BotsViewModel?
     var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
     var providerSignInTerminalInputSenderForTests: ((SurfaceID, String) -> TerminalInputStatus)?
     var terminalRestartRuntimePreparerForTesting: ((WorkspaceID, String, SurfaceID) -> TerminalPreparedPTYRuntime?)?
@@ -766,6 +767,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                         wireQueueDrainControl(on: agent.viewModel, context: ctx)
                         Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
+                        configureAgentAppBotMentions(agent)
                         agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                             self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
                         }
@@ -2452,6 +2454,43 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         _ = db
         viewModel.isScheduledThreadRunning = nil
         viewModel.stopScheduledThread = nil
+    }
+
+    /// Agent App `@handle` mentions start a teammate and paint Message from
+    /// back into this thread. Surfaces cannot import AppShell; the store and
+    /// Desk runner stay here.
+    private func configureAgentAppBotMentions(_ agent: AgentAppSurface) {
+        agent.viewModel.mentionableBotsProvider = { [weak self] in
+            (try? self?.context?.botStore.list()) ?? []
+        }
+        agent.viewModel.onDispatchBotMentions = { [weak self, weak agent] peers, text, threadId in
+            await self?.dispatchAgentAppBotMentions(
+                peers: peers,
+                text: text,
+                threadId: threadId,
+                onto: agent
+            )
+        }
+    }
+
+    private func dispatchAgentAppBotMentions(
+        peers: [BotDefinition],
+        text: String,
+        threadId: AgentThreadID,
+        onto agent: AgentAppSurface?
+    ) async {
+        guard let agent else { return }
+        // sam-goal: hop-1 only. A follow-up that still contains @handle
+        // would loop. Upgrade: multi-hop with an explicit hop budget.
+        for peer in peers {
+            guard let reply = await botsViewModel?.runMentionedPrompt(peer: peer, text: text),
+                  !reply.isEmpty else { continue }
+            agent.viewModel.presentBotPeerMessage(peer: peer, text: reply, threadId: threadId)
+            await agent.viewModel.sendBotPeerFollowUp(
+                text: "\(peer.name) replied:\n\(reply)",
+                threadId: threadId
+            )
+        }
     }
 
     /// Bind the cumulative Token Saver "saved in this thread" footer to the shared ledger.
@@ -6521,6 +6560,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                 wireQueueDrainControl(on: agent.viewModel, context: ctx)
                 Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
+                configureAgentAppBotMentions(agent)
                 agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                     self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
                 }

@@ -26,19 +26,32 @@ public struct BotDeskRouting: Equatable, Codable {
     public var model: String
     public var routingMode: AgentRoutingMode
     public var permissionMode: AgentPermissionMode
+    public var reasoningEffort: AgentReasoningEffort
 
     public init(
         provider: AgentProvider = .codex,
         providerInstanceID: String = AgentProvider.codex.rawValue,
         model: String = "",
         routingMode: AgentRoutingMode = .auto,
-        permissionMode: AgentPermissionMode = .supervised
+        permissionMode: AgentPermissionMode = .supervised,
+        reasoningEffort: AgentReasoningEffort = .medium
     ) {
         self.provider = provider
         self.providerInstanceID = providerInstanceID
         self.model = model
         self.routingMode = routingMode
         self.permissionMode = permissionMode
+        self.reasoningEffort = reasoningEffort
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decode(AgentProvider.self, forKey: .provider)
+        providerInstanceID = try container.decode(String.self, forKey: .providerInstanceID)
+        model = try container.decode(String.self, forKey: .model)
+        routingMode = try container.decode(AgentRoutingMode.self, forKey: .routingMode)
+        permissionMode = try container.decode(AgentPermissionMode.self, forKey: .permissionMode)
+        reasoningEffort = try container.decodeIfPresent(AgentReasoningEffort.self, forKey: .reasoningEffort) ?? .medium
     }
 
     public func resolvedModel(defaultModel: (AgentProvider) -> String) -> String {
@@ -449,6 +462,7 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var lastDeskRunProviderForTesting: AgentProvider?
     public private(set) var lastDeskRunModelForTesting: String?
     public private(set) var lastDeskRunPermissionForTesting: AgentPermissionMode?
+    public private(set) var lastDeskRunReasoningForTesting: AgentReasoningEffort?
     public private(set) var lastMentionedBotIDForTesting: BotID?
     @Published public var isStopping = false
     @Published public private(set) var queuedFollowUps: [BotQueuedFollowUp] = []
@@ -751,11 +765,21 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func modelLabel(for bot: BotDefinition) -> String? {
-        trimmedNonEmpty(cachedRevision(for: bot)?.model)
+        if bot.id == selectedBotID {
+            return deskModelDisplayLabel
+        }
+        return trimmedNonEmpty(cachedRevision(for: bot)?.model)
     }
 
     public func permissionLabel(for bot: BotDefinition) -> String {
-        "Supervised"
+        if bot.id == selectedBotID {
+            switch deskRouting.permissionMode {
+            case .supervised: return "Supervised"
+            case .autoAcceptEdits: return "Auto-accept edits"
+            case .fullAccess: return "Full access"
+            }
+        }
+        return "Supervised"
     }
 
     private func trimmedNonEmpty(_ value: String?) -> String? {
@@ -1494,6 +1518,47 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// Agent App `@mention` entry. Starts this teammate without stealing the
+    /// open Desk selection, then returns the finished assistant text.
+    @discardableResult
+    public func runMentionedPrompt(peer: BotDefinition, text: String) async -> String? {
+        lastMentionedBotIDForTesting = peer.id
+        let display = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !display.isEmpty else { return nil }
+        do {
+            let conversation = try persistUserMessage(bot: peer, text: display, adoptSelection: false)
+            appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: peer.id)
+            let brain = destBrainInputs(for: peer)
+            guard let router = resolvedRouter(),
+                  let revision = try currentRevision(for: peer) else {
+                recordNeedsAttention(bot: peer, conversation: conversation, userText: display)
+                return nil
+            }
+            let relay = "An Agent App teammate asked you:\n\(display)"
+            let started = await startSupervisedRun(
+                bot: peer,
+                revision: revision,
+                conversation: conversation,
+                userText: relay,
+                attachments: [],
+                memory: brain.memory,
+                skills: brain.skills,
+                routines: brain.routines,
+                router: router
+            )
+            guard let runId = started else {
+                recordNeedsAttention(bot: peer, conversation: conversation, userText: display)
+                return nil
+            }
+            lastLinkedRunIDByBot[peer.id] = runId
+            await followLinkedRun(bot: peer, conversation: conversation, runId: runId)
+            return lastAssistantText(for: peer.id)
+        } catch {
+            errorMessage = String(describing: error)
+            return nil
+        }
+    }
+
     public func addSkill() {
         let skillID = skillDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !skillID.isEmpty, let bot = selectedBot else { return }
@@ -2126,7 +2191,10 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func providerLabel(for bot: BotDefinition) -> String? {
-        resolvedProvider(for: bot).map(providerChipTitle)
+        if bot.id == selectedBotID {
+            return providerChipTitle(deskRouting.provider)
+        }
+        return resolvedProvider(for: bot).map(providerChipTitle)
     }
 
     public func resolvedProvider(for bot: BotDefinition) -> AgentProvider? {
@@ -2401,14 +2469,16 @@ public final class BotsViewModel: ObservableObject {
         deskRouting.providerInstanceID = instance
         if deskRouting.routingMode == .auto {
             deskRouting.model = ""
-        } else if !deskModels.contains(where: { $0 == deskRouting.model }) {
+        } else if !deskModels.contains(where: { $0.id == deskRouting.model }) {
             deskRouting.model = Self.defaultModel(for: provider)
         }
+        normalizeDeskReasoning()
     }
 
     public func setDeskModel(_ model: String) {
         deskRouting.model = model
         deskRouting.routingMode = .manual
+        normalizeDeskReasoning()
     }
 
     public func setDeskRoutingMode(_ mode: AgentRoutingMode) {
@@ -2418,10 +2488,17 @@ public final class BotsViewModel: ObservableObject {
         } else if deskRouting.model.isEmpty {
             deskRouting.model = Self.defaultModel(for: deskRouting.provider)
         }
+        normalizeDeskReasoning()
     }
 
     public func setDeskPermissionMode(_ mode: AgentPermissionMode) {
         deskRouting.permissionMode = mode
+    }
+
+    public func setDeskReasoningEffort(_ effort: AgentReasoningEffort) {
+        let supported = deskSupportedReasoning
+        deskRouting.reasoningEffort = supported.contains(effort) ? effort : (supported.first ?? .medium)
+        deskRouting.routingMode = .manual
     }
 
     public var botMentionSuggestions: [BotDefinition] {
@@ -2443,6 +2520,14 @@ public final class BotsViewModel: ObservableObject {
         deskRouting.resolvedModel(defaultModel: Self.defaultModel(for:))
     }
 
+    public var deskRunReasoning: AgentReasoningEffort {
+        let supported = deskSupportedReasoning
+        if supported.isEmpty { return deskRouting.reasoningEffort }
+        return supported.contains(deskRouting.reasoningEffort)
+            ? deskRouting.reasoningEffort
+            : (supported.contains(.high) ? .high : (supported.first ?? .medium))
+    }
+
     public var deskRunPermissionMode: AgentPermissionMode { deskRouting.permissionMode }
 
     public var selectedDeskSnapshot: AgentProviderSnapshot? {
@@ -2450,8 +2535,41 @@ public final class BotsViewModel: ObservableObject {
             ?? providers.first(where: { $0.provider == deskRouting.provider })
     }
 
-    public var deskModels: [String] {
-        selectedDeskSnapshot?.models.map(\.id) ?? []
+    public var deskModels: [AgentModelDescriptor] {
+        let snapshot = selectedDeskSnapshot
+        let optionProvider = snapshot?.provider ?? deskRouting.provider
+        let snapshotModels = snapshot?.models.filter { $0.provider == optionProvider } ?? []
+        if !snapshotModels.isEmpty { return snapshotModels }
+        return [AgentModelDescriptor(id: Self.defaultModel(for: optionProvider), label: Self.defaultModel(for: optionProvider), provider: optionProvider)]
+    }
+
+    public var deskModelDisplayLabel: String {
+        if deskRouting.routingMode == .auto { return "Auto" }
+        let id = deskRunModel
+        return deskModels.first(where: { $0.id == id })?.label ?? id
+    }
+
+    public var deskSelectedModel: AgentModelDescriptor? {
+        deskModels.first(where: { $0.id == deskRunModel })
+    }
+
+    public var deskSupportedReasoning: [AgentReasoningEffort] {
+        if deskRouting.provider == .grok {
+            return GrokReasoningPolicy.supportedEfforts(for: deskRunModel)
+        }
+        return deskSelectedModel?.supportedReasoningEfforts ?? []
+    }
+
+    public var deskSupportsReasoning: Bool {
+        !deskSupportedReasoning.isEmpty
+    }
+
+    private func normalizeDeskReasoning() {
+        let supported = deskSupportedReasoning
+        guard !supported.isEmpty else { return }
+        if !supported.contains(deskRouting.reasoningEffort) {
+            deskRouting.reasoningEffort = supported.contains(.high) ? .high : (supported.first ?? .medium)
+        }
     }
 
     public var deskPermissionModes: [AgentPermissionMode] {
@@ -2481,8 +2599,10 @@ public final class BotsViewModel: ObservableObject {
                 providerInstanceID: revision.providerInstanceID,
                 model: revision.model,
                 routingMode: revision.model.isEmpty ? .auto : .manual,
-                permissionMode: .supervised
+                permissionMode: .supervised,
+                reasoningEffort: revision.reasoningEffort
             )
+            normalizeDeskReasoning()
         } else {
             deskRouting = BotDeskRouting()
         }
@@ -3364,13 +3484,14 @@ public final class BotsViewModel: ObservableObject {
         router: AppCommandRouter,
         paintBotID: BotID? = nil
     ) async -> AgentRunID? {
-        let workspaceID = bot.workspaceID
-            ?? context.state.window.selectedWorkspaceID
-            ?? context.state.window.workspaces.first
+        // Bots are not a workspace tab. Do not bind the turn to a folder
+        // or worktree — Local execution only.
         let model = deskRunModel
+        let effort = deskRunReasoning
         lastDeskRunProviderForTesting = deskRouting.provider
         lastDeskRunModelForTesting = model
         lastDeskRunPermissionForTesting = deskRouting.permissionMode
+        lastDeskRunReasoningForTesting = effort
         do {
             let thread: AgentThread
             if let linked = conversation.linkedAgentThreadID,
@@ -3381,12 +3502,12 @@ public final class BotsViewModel: ObservableObject {
                 thread = existing
             } else {
                 thread = try router.createAgentThread(
-                    workspace: workspaceID,
+                    workspace: nil,
                     title: conversation.title,
                     provider: deskRouting.provider,
                     model: model,
                     permissionMode: deskRouting.permissionMode,
-                    reasoningEffort: revision.reasoningEffort,
+                    reasoningEffort: effort,
                     providerInstanceId: deskRouting.providerInstanceID,
                     runAsUser: AgentRunAsUser.current(),
                     surfaceID: nil,
@@ -3412,7 +3533,7 @@ public final class BotsViewModel: ObservableObject {
                 memory: memory,
                 skills: skills,
                 routines: routines,
-                workspace: advertisedWorkspace,
+                workspace: nil,
                 browser: advertisedBrowser,
                 conversationID: conversation.id
             )
@@ -3427,7 +3548,7 @@ public final class BotsViewModel: ObservableObject {
                 provider: deskRouting.provider,
                 model: model,
                 permissionMode: deskRouting.permissionMode,
-                reasoningEffort: revision.reasoningEffort,
+                reasoningEffort: effort,
                 providerInstanceId: deskRouting.providerInstanceID,
                 attachments: attachments
             )
@@ -4019,6 +4140,7 @@ public struct BotsRootView: View {
     /// Inline memory correction state (view-local; not workflow state).
     @State private var editingMemoryID: BotMemoryItemID?
     @State private var editingMemoryText: String = ""
+    @State private var showDeskModelOptions = false
 
     public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
         self.vm = vm
@@ -5310,37 +5432,111 @@ public struct BotsRootView: View {
 
     private var deskModelMenu: some View {
         let auto = vm.deskRouting.routingMode == .auto
-        let title = auto ? "Auto" : (vm.deskRouting.model.isEmpty ? "Auto" : vm.deskRouting.model)
-        return Menu {
-            Button {
-                vm.setDeskRoutingMode(.auto)
-            } label: {
-                if auto { Image(systemName: "checkmark") }
-                Text("Auto")
+        let title: String = {
+            if auto { return "Auto" }
+            if vm.deskSupportsReasoning {
+                return "\(vm.deskModelDisplayLabel) · \(vm.deskRunReasoning.displayName)"
             }
-            .disabled(deskRoutingLocked)
-            let models = vm.deskModels
-            if !models.isEmpty { Divider() }
-            ForEach(models, id: \.self) { model in
-                Button {
-                    vm.setDeskModel(model)
-                } label: {
-                    if !auto && model == vm.deskRouting.model { Image(systemName: "checkmark") }
-                    Text(model)
-                }
-                .disabled(deskRoutingLocked)
-            }
+            return vm.deskModelDisplayLabel
+        }()
+        return Button {
+            showDeskModelOptions.toggle()
         } label: {
             deskChipLabel(icon: nil, title: title, chevron: true)
         }
-        .menuStyle(.button)
         .buttonStyle(.plain)
-        .menuIndicator(.hidden)
         .fixedSize()
         .disabled(deskRoutingLocked)
-        .help("Model")
+        .help("Model · reasoning effort")
         .accessibilityLabel("Model \(title)")
         .accessibilityIdentifier("bots.desk.model")
+        .popover(isPresented: $showDeskModelOptions, arrowEdge: .bottom) {
+            deskModelPopover
+        }
+    }
+
+    private var deskModelPopover: some View {
+        let auto = vm.deskRouting.routingMode == .auto
+        let models = vm.deskModels
+        return VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.md) {
+                Text("Model")
+                    .font(DS.Font.caption.weight(.medium))
+                    .foregroundColor(DS.Palette.text)
+                Spacer(minLength: DS.Space.xxl)
+                Text("Auto")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.text)
+                Toggle("", isOn: Binding(
+                    get: { auto },
+                    set: { vm.setDeskRoutingMode($0 ? .auto : .manual) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .tint(DS.Palette.success)
+                .disabled(deskRoutingLocked)
+                .accessibilityLabel("Automatic model routing")
+            }
+            if !auto {
+                Divider()
+                Text("Model")
+                    .font(DS.Font.caption2.weight(.semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                ForEach(models, id: \.id) { model in
+                    Button {
+                        vm.setDeskModel(model.id)
+                        showDeskModelOptions = false
+                    } label: {
+                        HStack(spacing: DS.Space.sm) {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 10, weight: .semibold))
+                                .frame(width: 12)
+                                .opacity(model.id == vm.deskRunModel ? 1 : 0)
+                            Text(model.label)
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.text)
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, DS.Space.xs)
+                        .padding(.vertical, DS.Space.xs)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(deskRoutingLocked)
+                }
+                if vm.deskSupportsReasoning {
+                    Divider()
+                    Text("Reasoning effort")
+                        .font(DS.Font.caption2.weight(.semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                    ForEach(vm.deskSupportedReasoning, id: \.self) { effort in
+                        Button {
+                            vm.setDeskReasoningEffort(effort)
+                            showDeskModelOptions = false
+                        } label: {
+                            HStack(spacing: DS.Space.sm) {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .frame(width: 12)
+                                    .opacity(effort == vm.deskRunReasoning ? 1 : 0)
+                                Text(effort.displayName)
+                                    .font(DS.Font.caption)
+                                    .foregroundColor(DS.Palette.text)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, DS.Space.xs)
+                            .padding(.vertical, DS.Space.xs)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(deskRoutingLocked)
+                    }
+                }
+            }
+        }
+        .padding(DS.Space.sm)
+        .frame(minWidth: 220)
+        .background(DS.Palette.surfaceOverlay)
+        .accessibilityIdentifier("bots.desk.model.popover")
     }
 
     private var deskPermissionMenu: some View {
@@ -5374,12 +5570,11 @@ public struct BotsRootView: View {
     }
 
     private var deskExecutionChip: some View {
-        let title = vm.studioWorkspaceLabel == "None" ? "Local" : vm.studioWorkspaceLabel
-        return deskChip(
+        deskChip(
             icon: "folder",
-            title: title,
+            title: "Local",
             identifier: "bots.desk.execution",
-            help: "Runs in the current workspace"
+            help: "Bots run locally. They are not bound to a workspace folder or worktree."
         )
     }
 

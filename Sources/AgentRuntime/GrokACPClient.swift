@@ -609,9 +609,9 @@ public final class GrokACPClient: @unchecked Sendable {
         let resolved = command
             ?? AgentSkillInstaller.resolveServiceBinary()?.path
             ?? ComputerUseMCPAdmit.fallbackCommand
-        let withComputerUse = ComputerUseMCPAdmit.admitGrokACP(existing: existing, command: resolved)
+        // Bots drive the Mac through macos-harness (skill + CLI), not remotecode-computer-use.
         let withSelfConfig = BotSelfConfigMCPAdmit.admitGrokACP(
-            existing: withComputerUse,
+            existing: existing,
             command: resolved,
             environment: environment
         )

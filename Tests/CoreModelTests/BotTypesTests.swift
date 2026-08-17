@@ -146,6 +146,9 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(tools.contains(BotStandingInstructions.getBrowserTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.waitLoginTool))
         XCTAssertTrue(tools.contains("teammate's"))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.macosHarnessTool))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.generatedMacOSHarnessLine))
+        XCTAssertFalse(tools.contains("desktop"), "leftover desktop is not a live write")
         XCTAssertTrue(starter.contains(BotStandingInstructions.generatedSignature))
         XCTAssertTrue(BotStandingInstructions.looksGenerated(""))
         XCTAssertTrue(BotStandingInstructions.looksGenerated(starter))
@@ -220,9 +223,25 @@ final class BotTypesTests: XCTestCase {
                 .contains("notifications, or avatar"),
             "tools layer owns the remaining set_settings writes"
         )
-        XCTAssertFalse(tools.contains("handle"), "handle is create-only")
+        XCTAssertFalse(tools.contains("handle,"), "handle is create-only")
+        XCTAssertFalse(tools.contains("or handle"), "handle is create-only")
         XCTAssertFalse(tools.contains("permission"), "leftover permission is not a live write")
         XCTAssertFalse(tools.contains("desktop"), "leftover desktop is not a live write")
+    }
+
+    func test_admittedToolsNameMacOSHarness() {
+        // WHY: bots must drive the Mac through macos-harness on every
+        // provider. Naming remotecode-computer-use would send them back
+        // to the retired MCP.
+        let tools = BotStandingInstructions.admittedToolsText
+        XCTAssertTrue(tools.contains(BotStandingInstructions.macosHarnessTool))
+        XCTAssertTrue(tools.contains("mac.see"))
+        XCTAssertTrue(tools.contains("Do not call remotecode-computer-use"))
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout")
+                .contains(BotStandingInstructions.macosHarnessTool),
+            "tools layer owns macos-harness"
+        )
     }
 
     func test_admittedToolsNameAddSkill_becauseSetSkillAlreadyBindsTheCatalogId() {

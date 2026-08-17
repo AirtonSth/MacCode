@@ -1313,7 +1313,11 @@ final class GrokACPProtocolTests: XCTestCase {
             contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPClient.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(clientSource.contains("sessionMCPServers"), "Grok session/new and session/load must admit computer-use MCP")
+        XCTAssertTrue(clientSource.contains("sessionMCPServers"), "Grok session/new and session/load must still send MCP servers")
+        XCTAssertFalse(
+            clientSource.contains("ComputerUseMCPAdmit.admitGrokACP"),
+            "Grok sessions must not admit remotecode-computer-use; bots use macos-harness"
+        )
         XCTAssertTrue(clientSource.contains("noReplay"), "loadSession must accept noReplay")
         XCTAssertTrue(
             clientSource.contains("\"noReplay\": true") || clientSource.contains("[\"noReplay\": true]"),

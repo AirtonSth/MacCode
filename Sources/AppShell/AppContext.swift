@@ -1964,10 +1964,10 @@ public final class AppContext {
                 )
             }
             do {
-                try installer.installComputerUseMCP()
+                try installer.installMacOSHarness()
             } catch {
                 NSLog(
-                    "RemoteCode: installComputerUseMCP before agent turn failed: \(error.localizedDescription)"
+                    "RemoteCode: installMacOSHarness before agent turn failed: \(error.localizedDescription)"
                 )
             }
             do {
@@ -2084,10 +2084,10 @@ public final class AppContext {
             }
         }
         do {
-            try installer.installComputerUseMCP()
+            try installer.installMacOSHarness()
         } catch {
             NSLog(
-                "RemoteCode: installComputerUseMCP before subagent env failed: \(error.localizedDescription)"
+                "RemoteCode: installMacOSHarness before subagent env failed: \(error.localizedDescription)"
             )
         }
         do {
@@ -2591,9 +2591,9 @@ public final class AppContext {
     func reconcileComputerUseMCP() {
         let installer = makeAgentSkillInstaller()
         do {
-            try installer.installComputerUseMCP()
+            try installer.installMacOSHarness()
         } catch {
-            NSLog("RemoteCode: installComputerUseMCP failed: \(error.localizedDescription)")
+            NSLog("RemoteCode: installMacOSHarness failed: \(error.localizedDescription)")
         }
         do {
             try installer.installBotSelfConfigMCP()
