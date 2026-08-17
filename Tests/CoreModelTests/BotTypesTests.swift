@@ -204,6 +204,19 @@ final class BotTypesTests: XCTestCase {
         XCTAssertFalse(tools.contains("desktop"), "leftover desktop is not a live write")
     }
 
+    func test_admittedToolsNameAddSkill_becauseSetSkillAlreadyBindsTheCatalogId() {
+        // WHY: Studio already has Add and set_skill already writes the
+        // binding. Tools only said enable or disable, so first-chat
+        // "add this skill" invented a hop. Hermes agents add in place.
+        let tools = BotStandingInstructions.admittedToolsText
+        XCTAssertTrue(tools.contains("add a skill"))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.setSkillTool))
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("add a skill"),
+            "tools layer owns add"
+        )
+    }
+
     func test_controlPlaneFlags_failClosed_becauseLaterPhasesMustNotRunWithoutTheShippedSlice() {
         let defaults = BotControlPlaneFlags()
         XCTAssertTrue(defaults.isBotControlPlaneActive, "P1a ships the control plane on")

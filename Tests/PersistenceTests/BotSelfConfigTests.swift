@@ -580,6 +580,53 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(enabled?["description"] as? String, "Active. Same field as Studio Active.")
     }
 
+    func test_setSkillAdvertisedAddPersists_becauseStudioAddOnlySendsTheCatalogId() throws {
+        // WHY: Studio Add already binds via setSkillBinding(enabled: true).
+        // Tools required enabled, so first-chat "add this skill" invented a
+        // hop or a fake add tool. Omit enabled to Add it Enabled. Explicit
+        // Off still disables. Canonical enabled still wins.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromAdd = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+        ])
+        XCTAssertEqual(fromAdd.skills.map(\.skillID), ["weekly-account-health"], "Add persists")
+        XCTAssertEqual(fromAdd.skills.first?.enabled, true, "Add persists")
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, true)
+
+        let fromOff = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+            "enabled": "Off",
+        ])
+        XCTAssertEqual(fromOff.skills.first?.enabled, false, "Off persists")
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, false)
+
+        let enabledWins = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+            "enabled": true,
+        ])
+        XCTAssertEqual(enabledWins.skills.first?.enabled, true, "enabled wins")
+        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, true)
+    }
+
+    func test_setSkillCatalogDescribesAdd_becauseThatIsTheStudioPath() {
+        // WHY: Schema does not grow an add tool. Description must name Add
+        // so first-chat does not invent a hop. enabled stays optional.
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setSkill)
+        XCTAssertTrue(description.contains("Add"), "Same path as Studio Add")
+        let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSkill)
+        let properties = schema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["skill_id"])
+        XCTAssertNotNil(properties?["enabled"])
+        XCTAssertNil(properties?["add"], "add is advertised on set_skill, not a second schema key")
+        XCTAssertEqual(schema["required"] as? [String], ["skill_id"])
+        let enabled = properties?["enabled"] as? [String: Any]
+        XCTAssertEqual(enabled?["description"] as? String, "Enabled. Omit to Add. Same field as Studio Skills.")
+        let skillID = properties?["skill_id"] as? [String: Any]
+        XCTAssertEqual(skillID?["description"] as? String, "Catalog id. Same field as Studio Add.")
+    }
+
     func test_putMemoryAdvertisedFactPersists_becauseStudioSaysRememberAFact() throws {
         // WHY: Tools and Studio say Remember a fact. Parse only read
         // content, so first-chat "remember this fact" invented a hop or

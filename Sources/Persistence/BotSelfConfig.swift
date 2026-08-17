@@ -67,7 +67,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case correctMemory:
             return "Correct one of this bot's memory facts. Writes a new revision. Same path as Studio Correct."
         case setSkill:
-            return "Enable or disable a catalog skill on this bot."
+            return "Add a catalog skill or turn it Enabled or Off. Same path as Studio Add. Disable is not unbind."
         case removeSkill:
             return "Remove a catalog skill from this bot. Same path as Studio Remove. Disable is not unbind."
         case saveRoutine:
@@ -126,10 +126,10 @@ public enum BotSelfConfigCatalog: Sendable {
             return [
                 "type": "object",
                 "properties": botID.merging([
-                    "skill_id": ["type": "string"],
-                    "enabled": ["type": "boolean"],
+                    "skill_id": ["type": "string", "description": "Catalog id. Same field as Studio Add."],
+                    "enabled": ["type": "boolean", "description": "Enabled. Omit to Add. Same field as Studio Skills."],
                 ]) { _, new in new },
-                "required": ["skill_id", "enabled"],
+                "required": ["skill_id"],
             ]
         case removeSkill:
             return [
@@ -541,7 +541,11 @@ public struct BotSelfConfigService: Sendable {
             guard let skillID = arguments["skill_id"] as? String else {
                 throw BotSelfConfigError.invalid("skill_id is required.")
             }
-            return try setSkill(skillID: skillID, enabled: try Self.parseBool(arguments["enabled"], label: "enabled"))
+            // Studio Add only sends the catalog id. Omit enabled to bind it Enabled.
+            let enabled = arguments["enabled"] == nil
+                ? true
+                : try Self.parseBool(arguments["enabled"], label: "enabled")
+            return try setSkill(skillID: skillID, enabled: enabled)
         case BotSelfConfigCatalog.removeSkill:
             guard let skillID = arguments["skill_id"] as? String else {
                 throw BotSelfConfigError.invalid("skill_id is required.")
