@@ -115,7 +115,7 @@ public struct BotStudioDraft: Equatable, Codable {
         title: String = "",
         description: String = "",
         handle: String = "",
-        avatarSymbol: String = "person.crop.circle",
+        avatarSymbol: String = BotBlobatarSpec.default.token,
         soul: String = "",
         provider: AgentProvider = .claude,
         providerInstanceID: String = "claude",
@@ -803,7 +803,8 @@ public final class BotsViewModel: ObservableObject {
                 name: name,
                 title: "",
                 description: "",
-                soul: BotStandingInstructions.fallback(name: name, title: "", description: "")
+                soul: BotStandingInstructions.fallback(name: name, title: "", description: ""),
+                avatarSymbol: BotBlobatarSpec.default.token
             )
             beginEdit(bot)
         } catch {
@@ -4339,20 +4340,19 @@ public struct BotsRootView: View {
                         vm.refreshGeneratedStandingInstructions()
                     }
             }
-            HStack(alignment: .top, spacing: DS.Space.xl) {
-                labeledField("Handle") {
-                    studioField(placeholder: "piper", text: $vm.studioDraft.handle)
-                        .disabled(!vm.studioDraft.isNew)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    Text("Avatar")
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .accessibilityHidden(true)
-                    avatarSymbolPicker
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            labeledField("Handle") {
+                studioField(placeholder: "piper", text: $vm.studioDraft.handle)
+                    .disabled(!vm.studioDraft.isNew)
+            }
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text("Avatar")
+                    .font(DS.Font.caption.weight(.medium))
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityHidden(true)
+                BotBlobatarEditor(
+                    token: $vm.studioDraft.avatarSymbol,
+                    seed: vm.studioDraft.name.isEmpty ? vm.studioDraft.handle : vm.studioDraft.name
+                )
             }
         }
         .accessibilityIdentifier("bots.studio.identity")
@@ -4360,34 +4360,6 @@ public struct BotsRootView: View {
 
     private var handleMatchesDerivedName: Bool {
         vm.studioDraft.handle == (BotHandle.derive(from: vm.studioDraft.name) ?? "")
-    }
-
-    private var avatarSymbolPicker: some View {
-        HStack(spacing: DS.Space.sm) {
-            ForEach(BotsChrome.avatarSymbols, id: \.self) { symbol in
-                let selected = vm.studioDraft.avatarSymbol == symbol
-                Button {
-                    vm.studioDraft.avatarSymbol = symbol
-                } label: {
-                    Image(systemName: symbol)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(selected ? DS.Palette.accent : DS.Palette.textSecondary)
-                        .frame(width: 32, height: 32)
-                        .background(selected ? DS.Palette.selection : DS.Palette.surfaceRaised)
-                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                                .strokeBorder(selected ? DS.Palette.accent : DS.Palette.line, lineWidth: DS.Border.hairline)
-                        )
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(BotsChrome.avatarSymbolName(symbol))
-                .accessibilityAddTraits(selected ? .isSelected : [])
-                .accessibilityIdentifier("bots.studio.avatar.\(symbol)")
-            }
-        }
-        .accessibilityIdentifier("bots.studio.avatar")
     }
 
     private var studioProvider: some View {

@@ -5128,7 +5128,12 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(
             BotsChrome.avatarSymbolName("person.crop.circle"),
             "Person",
-            "VoiceOver on an Avatar chip must say Person, not person.crop.circle"
+            "VoiceOver on a leftover SF chip must say Person, not person.crop.circle"
+        )
+        XCTAssertEqual(
+            BotsChrome.avatarSymbolName("blobatar:v1:cloud:idle:none:auto"),
+            "Cloud",
+            "VoiceOver on a blobatar must say Cloud, not the token"
         )
         for symbol in BotsChrome.avatarSymbols {
             XCTAssertFalse(
@@ -5136,6 +5141,26 @@ final class BotsWindowTests: XCTestCase {
                 "\(symbol) must not leak an SF Symbol path into the Avatar name"
             )
         }
+    }
+
+    func test_studioAvatarPickerIsBlobatar_becauseStudioLetsTheUserComposeTheCreature() throws {
+        // WHY: Studio Avatar used to be eight SF chips. The owner now
+        // composes shape / expression / background / hue, matching the
+        // blobatar editor. A leftover symbol row would hide that.
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let editor = try String(contentsOf: sourceURL("Sources/AppShell/BotsBlobatarView.swift"), encoding: .utf8)
+        XCTAssertTrue(bots.contains("BotBlobatarEditor"))
+        XCTAssertTrue(bots.contains("BotBlobatarSpec.default.token"))
+        XCTAssertTrue(editor.contains("bots.studio.avatar.shape"))
+        XCTAssertTrue(editor.contains("bots.studio.avatar.expression"))
+        XCTAssertTrue(editor.contains("bots.studio.avatar.background"))
+        XCTAssertTrue(editor.contains("bots.studio.avatar.hue"))
+        XCTAssertTrue(editor.contains("BotBlobatarShape.allCases"))
+        XCTAssertTrue(editor.contains("bots.studio.avatar.shape.\\(shape.rawValue)"))
+        XCTAssertFalse(
+            bots.contains("studioField(placeholder: \"person.crop.circle\""),
+            "users must not type person.crop.circle to set an Avatar"
+        )
     }
 
     func test_botsOpensInMainContent_andSidebarSitsUnderScheduleTasks() throws {
@@ -5381,17 +5406,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(main.contains("SurfaceType.bot"))
         XCTAssertFalse(bots.contains("SurfaceType.bot"))
         XCTAssertTrue(
-            BotsChrome.avatarSymbols.contains("person.crop.circle"),
-            "the Avatar picker must include the default symbol so a new Bot has a selected chip"
-        )
-        XCTAssertEqual(
-            Set(BotsChrome.avatarSymbols).count,
-            BotsChrome.avatarSymbols.count,
-            "duplicate chips would make the selected Avatar look like two choices"
-        )
-        XCTAssertTrue(
-            bots.contains("BotsChrome.avatarSymbols"),
-            "Studio Avatar must be a symbol picker, not a raw SF Symbol text field"
+            bots.contains("BotBlobatarEditor"),
+            "Studio Avatar is the blobatar composer, not a leftover SF chip row"
         )
         XCTAssertFalse(
             bots.contains("studioField(placeholder: \"person.crop.circle\""),
