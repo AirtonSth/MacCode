@@ -23,12 +23,16 @@ final class LossyProseGuardTests: XCTestCase {
         XCTAssertEqual(guarded, lossy, "all literals preserved => adopt the compressed output")
     }
 
-    func test_commandOutput_isExemptFromGuard() {
-        // Contract extraction may legitimately drop numbers/paths; the guard must not fire.
-        let input = "tests: 412 passed, 0 failed at /tmp/run.log:99"
+    func test_commandOutput_extractivePassFailStaysExempt() {
+        // PASS/FAIL contracts may drop surrounding stdout; the guard must not fire.
+        let extractive = DistillRequest(
+            mode: .commandOutput,
+            input: "tests: 412 passed, 0 failed at /tmp/run.log:99",
+            question: "PASS/FAIL only."
+        )
         let extracted = "PASS"
-        let guarded = MLXDistillRuntime.guardLossyProseOutput(extracted, request: request(.commandOutput, input: input))
-        XCTAssertEqual(guarded, extracted, ".commandOutput is contract extraction, exempt from the literal guard")
+        let guarded = MLXDistillRuntime.guardLossyProseOutput(extracted, request: extractive)
+        XCTAssertEqual(guarded, extracted, "PASS/FAIL contract extraction stays exempt from the literal guard")
     }
 
     func test_longText_rejectsOutputThatDropsTagOrMarker() {

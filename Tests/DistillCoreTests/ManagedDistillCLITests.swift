@@ -617,6 +617,81 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(transportCalls, 2, "retry must recover the saving after one transient failure, then stop")
     }
 
+    // MARK: - hook pre-tool-pipe
+
+    func test_hookPreToolPipe_rewritesWrapEligibleGrokShellAndPreservesOtherFields() async throws {
+        // WHY: Grok cannot rewrite tool *output*. PreToolUse updatedInput is the
+        // documented way to make wrap-eligible run_terminal_command actually pipe.
+        let stdin = try JSONSerialization.data(withJSONObject: [
+            "hookEventName": "pre_tool_use",
+            "toolName": "run_terminal_command",
+            "toolInput": [
+                "command": "swift test --filter Foo",
+                "description": "run tests",
+                "background": false,
+            ],
+        ] as [String: Any])
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "pre-tool-pipe"],
+            stdin: stdin,
+            state: state,
+            distillAdmission: { true }
+        ) { _ in
+            XCTFail("pre-tool-pipe must not call the sidecar")
+            return nil
+        }
+        let result = cli.hookPreToolPipe(
+            processArguments: ["/tmp/not-distill"],
+            environment: ["RC_REMOTE_CODE_MANAGED_BIN": "/opt/rc-bin"],
+            homeDirectory: "/tmp",
+            fileExists: { $0 == "/opt/rc-bin/distill" }
+        )
+        XCTAssertEqual(result.exitCode, 0)
+        let obj = try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any]
+        let hookOut = obj?["hookSpecificOutput"] as? [String: Any]
+        XCTAssertEqual(hookOut?["hookEventName"] as? String, "PreToolUse")
+        let updated = try XCTUnwrap(hookOut?["updatedInput"] as? [String: Any])
+        let command = try XCTUnwrap(updated["command"] as? String)
+        XCTAssertTrue(command.hasPrefix("swift test --filter Foo | "))
+        XCTAssertTrue(command.contains("/opt/rc-bin/distill"))
+        XCTAssertEqual(updated["description"] as? String, "run tests")
+        XCTAssertEqual(updated["background"] as? Bool, false)
+    }
+
+    func test_hookPreToolPipe_exactOutputAndAdmissionOffFailOpen() async throws {
+        let exact = try JSONSerialization.data(withJSONObject: [
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": ["command": "rg -n FAIL Sources"],
+        ] as [String: Any])
+        let admitted = ManagedDistillCLI(
+            arguments: ["hook", "pre-tool-pipe"],
+            stdin: exact,
+            state: state,
+            distillAdmission: { true }
+        ) { _ in nil }
+        let exactResult = admitted.hookPreToolPipe(fileExists: { _ in true })
+        XCTAssertEqual(exactResult.exitCode, 0)
+        XCTAssertEqual(String(decoding: exactResult.stdout, as: UTF8.self), "{}")
+
+        let wrap = try JSONSerialization.data(withJSONObject: [
+            "toolName": "run_terminal_command",
+            "toolInput": ["command": "swift test"],
+        ] as [String: Any])
+        let denied = ManagedDistillCLI(
+            arguments: ["hook", "pre-tool-pipe"],
+            stdin: wrap,
+            state: state,
+            distillAdmission: { false }
+        ) { _ in
+            XCTFail("denied admission must not transport")
+            return nil
+        }
+        let (out, code) = await denied.run()
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
+    }
+
     // MARK: - hook post-tool-use
 
     func test_hookPostToolUse_reachableSidecar_returnsUpdatedToolOutput() async throws {

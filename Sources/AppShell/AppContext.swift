@@ -2483,6 +2483,9 @@ public final class AppContext {
             capture("retrieve MCP cleanup") {
                 try installer.uninstallRetrieveMCP()
             }
+            capture("Grok PreToolUse pipe hook cleanup") {
+                _ = try installer.uninstallGrokPreToolPipeHook()
+            }
         }
 
         if tokenSaverEnabled {
@@ -2511,6 +2514,9 @@ public final class AppContext {
             }
             capture("retrieve MCP") {
                 try installer.installRetrieveMCP()
+            }
+            capture("Grok PreToolUse pipe hook") {
+                try installer.installGrokPreToolPipeHook()
             }
             LoginShellEnvironment.prewarm()
             if let appPrivateResult {

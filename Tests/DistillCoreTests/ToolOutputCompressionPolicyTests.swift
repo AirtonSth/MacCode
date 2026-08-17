@@ -89,6 +89,83 @@ final class ToolOutputCompressionPolicyTests: XCTestCase {
         XCTAssertFalse(ToolOutputCompressionPolicy.shellCommandLooksExactOutput("env FOO=1 swift test"))
     }
 
+    func test_commandFieldKeepsShellPipeInsteadOfSiblingFieldSplit() {
+        // WHY: summarizeToolInput joins fields with ` | `; splitting the command
+        // on that same marker dropped `| distill` and classified voluntary pipes as raw rg.
+        let summary = #"command=rg -n FAIL Sources | distill "Which tests failed?" | path=Sources"#
+        XCTAssertEqual(
+            ToolOutputCompressionPolicy.commandField(from: summary),
+            #"rg -n FAIL Sources | distill "Which tests failed?""#
+        )
+        XCTAssertTrue(
+            ToolOutputCompressionPolicy.lastPipelineCommandIsVoluntaryDistill(
+                ToolOutputCompressionPolicy.commandField(from: summary)
+            )
+        )
+    }
+
+    func test_voluntaryLastPipeDistillIsAdmittedAndRawExactOutputStillSkips() {
+        let large = largeOutput()
+        let policy = ToolOutputCompressionPolicy()
+
+        XCTAssertTrue(ToolOutputCompressionPolicy.lastPipelineCommandIsVoluntaryDistill(
+            #"rg -n FAIL Sources | distill "Which tests failed? Keep file:line.""#
+        ))
+        XCTAssertFalse(
+            ToolOutputCompressionPolicy.shellCommandLooksExactOutput(
+                #"rg -n FAIL Sources | distill "Which tests failed?""#
+            ),
+            "WHY: last pipeline command is distill — do not treat as exact-output skip"
+        )
+        XCTAssertTrue(
+            ToolOutputCompressionPolicy.shellCommandLooksExactOutput("rg -n FAIL Sources"),
+            "WHY: raw rg must stay uncompressed"
+        )
+        XCTAssertFalse(
+            ToolOutputCompressionPolicy.lastPipelineCommandIsVoluntaryDistill(#"echo "a | b" | rg -n FAIL"#),
+            "quoted pipe must not fake a distill tail; last command is still rg"
+        )
+
+        for tool in ["Bash", "run_terminal_command", "local_shell", "shell"] {
+            let raw = policy.decision(
+                toolName: tool,
+                output: large,
+                toolArgumentsSummary: "command=rg -n FAIL Sources"
+            )
+            XCTAssertFalse(raw.shouldCompress, "\(tool) raw rg must skip")
+            XCTAssertEqual(raw.skipReason, .exactOutputShell, "\(tool)")
+
+            let voluntary = policy.decision(
+                toolName: tool,
+                output: large,
+                toolArgumentsSummary: #"command=rg -n FAIL Sources | distill "Which tests failed?""#
+            )
+            XCTAssertTrue(voluntary.shouldCompress, "\(tool) rg | distill must be admitted")
+            XCTAssertNil(voluntary.skipReason, "\(tool)")
+
+            let gitGrepVoluntary = policy.decision(
+                toolName: tool,
+                output: large,
+                toolArgumentsSummary: #"command=git grep -n TODO | distill "Where is TODO?""#
+            )
+            XCTAssertTrue(gitGrepVoluntary.shouldCompress, "\(tool) git grep | distill must be admitted")
+        }
+    }
+
+    func test_grokRunTerminalCommandIsAShellToolForExactOutputPolicy() {
+        XCTAssertEqual(policy.profile(for: "run_terminal_command"), .moderate)
+        XCTAssertTrue(
+            ToolOutputCompressionPolicy.shellLikeNormalizedToolNames.contains("runterminalcommand")
+        )
+        let smallExact = policy.decision(
+            toolName: "run_terminal_command",
+            output: largeOutput(),
+            toolArgumentsSummary: "command=cat Sources/App.swift"
+        )
+        XCTAssertFalse(smallExact.shouldCompress)
+        XCTAssertEqual(smallExact.skipReason, .exactOutputShell)
+    }
+
     func test_profilesMatchPlanForSearchShellAndWebFetch() {
         XCTAssertEqual(policy.decision(toolName: "Grep", output: largeOutput()).profile, .conservative)
         XCTAssertEqual(policy.decision(toolName: "Glob", output: largeOutput()).profile, .conservative)

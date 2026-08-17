@@ -9,7 +9,7 @@ import Foundation
 ///
 /// Split:
 /// - **exact-output family**: line slices, search matches, file dumps — agent needs every line.
-///   Never install wrappers; agent instructions must skip `| distill`.
+///   Never install wrappers; skip auto `| distill`. Voluntary last-pipe `… | distill "<q>"` is allowed.
 /// - **compressible family**: everything else that gets a PATH wrapper. Subcommands are not
 ///   allowlisted — `CommandWrapPolicy` compresses any terminal-to-agent stdout above threshold
 ///   (except exact-output / exact-patch carve-outs).

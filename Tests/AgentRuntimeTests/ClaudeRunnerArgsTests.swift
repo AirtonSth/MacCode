@@ -574,6 +574,16 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let timeout = commandHooks[0]["timeout"] as? NSNumber
         XCTAssertEqual(timeout?.intValue, 45,
                        "PostToolUse command hook timeout must be 45 seconds for nested large tools")
+
+        let preToolUse = try XCTUnwrap(hooks["PreToolUse"] as? [[String: Any]],
+                                       "Token Saver must also register Bash PreToolUse auto-pipe")
+        XCTAssertEqual(preToolUse[0]["matcher"] as? String, "Bash")
+        let preHooks = try XCTUnwrap(preToolUse[0]["hooks"] as? [[String: Any]])
+        XCTAssertEqual(
+            preHooks[0]["command"] as? String,
+            AgentSkillInstaller.defaultManagedCLIBinDirectory()
+                .appendingPathComponent("distill").path + " hook pre-tool-pipe"
+        )
     }
 
     /// (c) Flag present AND engine .ultracode → exactly one --settings containing

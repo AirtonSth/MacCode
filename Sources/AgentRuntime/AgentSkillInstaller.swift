@@ -230,7 +230,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary / pass-fail / key lines, you MUST pipe.
       Applies to: build, test, lint, install, docker, kubectl, terraform, find, ls, git/gh/glab (including `gh api`, merges, status), package managers, python/bun one-shots, curl/aws/cloud CLIs, compound scripts, CI/logs, and **any other ordinary command** not listed under NEVER below.
       Host PATH wrappers auto-compress **all subcommands** of wrapped binaries (no read-only allowlist) when terminal-to-agent and above threshold — still pipe `| distill` yourself so extraction is explicit. Same policy for primary, nested subagents, and cross-provider orchestration (Claude/Codex/Grok).
-    - NEVER pipe `| distill` when you need exact stdout from: \(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")); or git grep/show/cat-file/blame.
+    - NEVER auto-distill raw exact-output when you need every match/slice from: \(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")); or git grep/show/cat-file/blame.
+      Voluntary `rg … | distill "<question>"` (same for grep / git grep) is allowed when the last pipeline command is distill and you want an extractive answer instead of every match line.
       Also skip: GUI / interactive / TUI apps, non-pipable calls, patches/apply, hash/token copy, or RemoteCodeDistillService unavailable.
     - NEVER Distill skill content: Skill tool output and requested/returned SKILL.md bodies are a protected verbatim category — return them complete (no summary, recovery handle, truncation, or savings accounting).
     - Never call Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
@@ -246,6 +247,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - `git log --oneline -50 | distill "Summarize recent commits by theme."`
     - `python3 script.py 2>&1 | distill "What failed? Key errors only."`
     - `rg -n "func applyGraphify" Sources`  # skip distill — need every match line
+    - `rg -n "FAIL|error:" .build | distill "Which tests failed? Keep file:line and assertion text."`  # last command is distill — allowed
     - `sed -n '100,180p' Sources/Foo.swift`  # skip distill — need exact slice
 
     """
@@ -255,7 +257,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Distill is only for local command/tool-output reduction. It is not a conversation style or user command.
     Token Saver — Claude/Codex/Grok (primary, nested, subagents): large surveys → Graphify query-first when `$RC_GRAPHIFY_GRAPH_JSON` is set, else shell + PATH wrappers / `| distill`. Avoid flooding native multi-file read_file/grep (Grok/Codex cannot rewrite those; Claude PostToolUse helps but shell coverage is higher). Native reads only for small exact slices.
     MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary/pass-fail/key lines, you MUST pipe. Host PATH wrappers auto-compress all subcommands of wrapped binaries (incl. gh api; no read-only allowlist); still pipe yourself for an explicit extraction question. Applies primary + nested + cross-provider (Claude/Codex/Grok) whenever Token Saver is admitted.
-    NEVER pipe `| distill` only for exact-output (agent needs full stdout): \(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")); git grep/show/cat-file/blame; also patches/hashes/tokens, GUI/interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
+    NEVER auto-distill raw exact-output (need every line): \(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")); git grep/show/cat-file/blame. Voluntary `rg … | distill "<question>"` is allowed when the last pipeline command is distill and you want an extractive answer. Also skip patches/hashes/tokens, GUI/interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
     Omitting `| distill` on a non-exact, non-GUI shell command is a policy violation.
     NEVER Distill skill content: Skill tool output and requested/returned SKILL bodies must stay complete/verbatim (no summary, `[[rc:]]` handle, truncation, or savings accounting).
     Never invoke Node/tsx/npm/bun or a source-checkout `distill`.
@@ -2671,6 +2673,60 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     public func distillCLIURL() -> URL {
         cliBinDirectory.appendingPathComponent("distill")
+    }
+
+    /// Managed Grok PreToolUse hook that appends `| distill` on wrap-eligible shells.
+    /// Token Saver reconcile installs this; Token Saver off removes it.
+    public static let grokPreToolPipeHookFileName = "remotecode-token-saver-pretool-pipe.json"
+
+    public func grokHooksDirectory() -> URL {
+        homeDirectoryURL().appendingPathComponent(".grok/hooks", isDirectory: true)
+    }
+
+    public func grokPreToolPipeHookURL() -> URL {
+        grokHooksDirectory().appendingPathComponent(Self.grokPreToolPipeHookFileName)
+    }
+
+    public static func grokPreToolPipeHookCommand(distillPath: String) -> String {
+        "\(distillPath) hook pre-tool-pipe"
+    }
+
+    /// Install a trusted global Grok hook (`~/.grok/hooks/…`) so Token-Saver-admitted
+    /// Grok — Agent App, headless, nested, and standalone CLI — actually pipes
+    /// wrap-eligible `run_terminal_command` via PreToolUse `updatedInput`.
+    /// The hook binary re-checks live admission and fail-opens when Token Saver is off.
+    public func installGrokPreToolPipeHook() throws {
+        try fileManager.createDirectory(at: grokHooksDirectory(), withIntermediateDirectories: true)
+        let command = Self.grokPreToolPipeHookCommand(distillPath: distillCLIURL().path)
+        let payload: [String: Any] = [
+            "hooks": [
+                "PreToolUse": [
+                    [
+                        "matcher": "Bash|run_terminal_command|run_terminal_cmd",
+                        "hooks": [
+                            [
+                                "type": "command",
+                                "command": command,
+                                "timeout": 5,
+                            ] as [String: Any],
+                        ],
+                    ] as [String: Any],
+                ],
+            ] as [String: Any],
+        ]
+        let data = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        try data.write(to: grokPreToolPipeHookURL(), options: .atomic)
+    }
+
+    @discardableResult
+    public func uninstallGrokPreToolPipeHook() throws -> AgentSkillUninstallResult {
+        let url = grokPreToolPipeHookURL()
+        guard fileManager.fileExists(atPath: url.path) else { return .notPresent }
+        try fileManager.removeItem(at: url)
+        return .removed
     }
 
     /// PATH-reachable symlink that bridges the managed CLI into the shell (`~/.local/bin/distill`).

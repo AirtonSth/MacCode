@@ -198,8 +198,10 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             // Claude CLI command hooks take a shell command string; subcommand
             // args ride on the same string (no separate args field).
             let command = "\(distillPath) hook post-tool-use"
+            let prePipe = "\(distillPath) hook pre-tool-pipe"
             // 45s: nested advisors often compress multi-file Read/Grep payloads;
             // 10s caused silent fail-open (zero model-mode rows on large nested turns).
+            // PreToolUse rewrites wrap-eligible Bash to `| distill` (command rewrite).
             settings["hooks"] = [
                 "PostToolUse": [
                     [
@@ -209,6 +211,18 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
                                 "type": "command",
                                 "command": command,
                                 "timeout": 45
+                            ] as [String: Any]
+                        ]
+                    ] as [String: Any]
+                ],
+                "PreToolUse": [
+                    [
+                        "matcher": "Bash",
+                        "hooks": [
+                            [
+                                "type": "command",
+                                "command": prePipe,
+                                "timeout": 5
                             ] as [String: Any]
                         ]
                     ] as [String: Any]

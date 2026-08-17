@@ -374,6 +374,90 @@ final class DistillContentRouterTests: XCTestCase {
                       "failing test lines must remain verbatim")
     }
 
+    func test_testReportCrusher_elidesPassingXCTestLinesAndKeepsFailures() throws {
+        // WHY: Grok/Codex wrap `swift test`; the pytest-only crusher left XCTest
+        // transcripts uncompressed. Elide started/passed chatter, keep FAIL + file:line.
+        var cases = ""
+        for index in 1...12 {
+            cases += """
+            Test Case '-[AppShellTests.BotsWindowTests test_pass_\(index)]' started.
+            Test Case '-[AppShellTests.BotsWindowTests test_pass_\(index)]' passed (0.728 seconds).
+
+            """
+        }
+        let report = """
+        Test Suite 'Selected tests' started at 2026-08-15 02:49:27.000.
+        \(cases)Test Case '-[AppShellTests.BotsWindowTests test_billing]' started.
+        Test Case '-[AppShellTests.BotsWindowTests test_billing]' failed (0.012 seconds).
+        Tests/AppShellTests/BotsWindowTests.swift:88: error: -[AppShellTests.BotsWindowTests test_billing] : XCTAssertEqual failed: ("500") is not equal to ("404")
+        Test Suite 'BotsWindowTests' failed at 2026-08-15 02:49:27.096.
+         Executed 13 tests, with 1 failure (0 unexpected) in 0.728 (0.729 seconds)
+        """
+
+        XCTAssertTrue(TestReportCrusher.looksLikeTestReport(report))
+        let result = try XCTUnwrap(router.route(
+            report,
+            options: .init(allowElementDropping: true, reversibleHandle: "xc789")
+        ))
+        XCTAssertEqual(result.contentType, .testReport)
+        XCTAssertTrue(result.output.contains("xctest: 12 passing-test lines elided [[rc:xc789]]"))
+        XCTAssertTrue(result.output.contains("test_billing]' failed"))
+        XCTAssertTrue(
+            result.output.contains("Tests/AppShellTests/BotsWindowTests.swift:88"),
+            "WHY: file:line on the failing case must stay for the next agent action"
+        )
+        XCTAssertFalse(result.output.contains("test_pass_1]' passed"))
+        XCTAssertFalse(result.output.contains("test_pass_1]' started"))
+
+        let n5 = LiteralPreservation.guarded(original: report, compressed: result.output)
+        XCTAssertNil(n5.droppedLiteral, "WHY: eliding passing XCTest lines must not drop a pinned fail literal, got \(String(describing: n5.droppedLiteral))")
+        XCTAssertTrue(FaithfulnessGate.validate(original: report, compressed: result.output).accepted)
+        XCTAssertLessThan(TokenEstimator.estimate(result.output), TokenEstimator.estimate(report))
+    }
+
+    func test_buildProgressCrusher_elidesSPMCompileChatterAndKeepsDiagnostics() throws {
+        // WHY: wrap-eligible `swift test` / `build_and_run.sh` dumps are mostly
+        // `[N/M] Compiling` progress. Keep file:line warnings/errors.
+        var progress = ""
+        for index in 1...12 {
+            progress += "[\(index)/12] Compiling PersistenceTests File\(index).swift\n"
+        }
+        let report = """
+        Building for debugging...
+        \(progress)/Users/dev/macos-app/Sources/App.swift:12:8: error: cannot find 'missingValue' in scope
+        ** BUILD FAILED **
+        """
+        XCTAssertTrue(BuildProgressCrusher.looksLike(report))
+        let result = try XCTUnwrap(router.route(
+            report,
+            options: .init(allowElementDropping: true, reversibleHandle: "bld1")
+        ))
+        XCTAssertEqual(result.contentType, .buildOutput)
+        XCTAssertTrue(result.output.contains("spm: "))
+        XCTAssertTrue(result.output.contains("[[rc:bld1]]"))
+        XCTAssertTrue(result.output.contains("Sources/App.swift:12:8: error:"))
+        XCTAssertTrue(result.output.contains("** BUILD FAILED **"))
+        XCTAssertFalse(result.output.contains("Compiling PersistenceTests File1.swift"))
+        let n5 = LiteralPreservation.guarded(original: report, compressed: result.output)
+        XCTAssertNil(n5.droppedLiteral, "got \(String(describing: n5.droppedLiteral))")
+        XCTAssertTrue(FaithfulnessGate.validate(original: report, compressed: result.output).accepted)
+        XCTAssertLessThan(TokenEstimator.estimate(result.output), TokenEstimator.estimate(report))
+    }
+
+    func test_testReportCrusher_rejectsTruncatedXCTestTail() {
+        // WHY: `swift test | tail` keeps the Executed footer but drops earlier
+        // cases. Crushing that would hide failures the agent still needs.
+        let truncated = """
+        Test Case '-[AppShellTests.BotsWindowTests test_visibleDesk]' passed (0.000 seconds).
+        Test Suite 'Selected tests' passed at 2026-08-15 02:49:27.096.
+         Executed 18 tests, with 0 failures (0 unexpected) in 0.728 (0.729 seconds)
+        """
+        XCTAssertNil(
+            TestReportCrusher.crush(truncated, handle: "tail"),
+            "footer/case count mismatch must fail open"
+        )
+    }
+
     func test_testReportCrusher_rejectsSummaryMismatch() {
         let report = """
         tests/test_a.py::test_one PASSED
