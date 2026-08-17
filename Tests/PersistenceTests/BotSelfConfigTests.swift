@@ -257,6 +257,8 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["skill"], "skill is an advertised set_skill alias, not a set_settings key")
         XCTAssertNil(properties?["skill_id"], "skill_id is a set_skill key, not a set_settings key")
         XCTAssertNil(properties?["add_skill"], "add_skill is not a schema key")
+        XCTAssertNil(properties?["add"], "add is an advertised set_skill alias, not a set_settings key")
+        XCTAssertNil(properties?["set_skill"], "set_skill is not a set_settings key")
         XCTAssertNil(properties?["remove"], "remove is an advertised remove_skill alias, not a set_settings key")
         XCTAssertNil(properties?["remove_skill"], "remove_skill is not a set_settings key")
         XCTAssertNil(properties?["unbind"], "unbind is not a set_settings key")
@@ -1095,6 +1097,85 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.skills.first?.skillID, "weekly-account-health")
+    }
+
+    func test_setSettingsRejectsAdvertisedAdd_becauseStudioSaysAddSkill() throws {
+        // WHY: Studio already says Add. Compile already names set_skill
+        // / Studio Add. leftover Skills / skill / skill_id / add_skill
+        // already reject. leftover add still succeeded empty, so
+        // first-chat invented a persist. Reject the advertised name
+        // with Skills honesty pointing at set_skill. set_skill still
+        // persists Add. leftover Skills / Remove still reject. Name
+        // still persists. Schema does not grow an add write key. Dest
+        // title stays Skills.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["add"],
+            "schema does not grow an add write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "add": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Add": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "set_skill": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "add_skill": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "remove": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.removeHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Add reject must not persist a name")
+        XCTAssertEqual(still.skills.count, 0, "Add reject must not persist a binding")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let added = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+        ])
+        XCTAssertEqual(added.skills.first?.skillID, "weekly-account-health", "set_skill still owns Add")
+        XCTAssertEqual(added.skills.first?.enabled, true)
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.skills.first?.skillID, "weekly-account-health")
     }
 

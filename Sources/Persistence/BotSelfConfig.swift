@@ -693,11 +693,13 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedCorrectKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.correctHonesty)
         }
-        // Studio already says Skills. Compile already labels Skills.
-        // A leftover Skills / skill write used to return an empty
-        // success, so first-chat invented a persist. Schema does not
-        // grow a skills key. set_skill still persists Add. Dest
-        // title stays Skills.
+        // Studio already says Skills and Add. Compile already labels
+        // Skills and names set_skill / Studio Add. A leftover Skills /
+        // skill write used to return an empty success, so first-chat
+        // invented a persist. leftover add / set_skill still succeeded
+        // empty after add_skill rejected, so first-chat invented an
+        // Add persist. Schema does not grow a skills or add key.
+        // set_skill still persists Add. Dest title stays Skills.
         if arguments.keys.contains(where: Self.isAdvertisedSkillsKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.skillsHonesty)
         }
@@ -935,15 +937,19 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "correct_fact"
     }
 
-    /// skills is not a schema key. Studio / compile advertise the
-    /// name, so parse must fail loud instead of succeeding empty.
-    /// set_skill still persists Add. Schema does not grow a skills key.
+    /// skills is not a schema key. Studio / compile advertise Skills
+    /// and Add, so parse must fail loud instead of succeeding empty.
+    /// leftover add / set_skill are the same write — Studio Add and
+    /// the catalog name. set_skill still persists Add. Schema does
+    /// not grow a skills or add write key.
     static func isAdvertisedSkillsKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "skills"
             || normalized == "skill"
             || normalized == "skill_id"
             || normalized == "add_skill"
+            || normalized == "add"
+            || normalized == "set_skill"
     }
 
     /// remove is not a set_settings schema key. Studio / compile
