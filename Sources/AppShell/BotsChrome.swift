@@ -10,6 +10,8 @@ public enum BotsChrome {
         public static let agentic = "Agentic"
         public static let bots = "Bots"
         public static let newBot = "New Bot"
+        public static let activeBots = "Active Bots"
+        public static let scheduleTasks = "Schedule Tasks"
         public static let myBots = "My Bots"
         public static let botRoster = "BOT ROSTER"
         public static let search = "Search bots..."
@@ -52,6 +54,8 @@ public enum BotsChrome {
         Label.agentic,
         Label.bots,
         Label.newBot,
+        Label.activeBots,
+        Label.scheduleTasks,
         Label.myBots,
         Label.botRoster,
         Label.openChat,

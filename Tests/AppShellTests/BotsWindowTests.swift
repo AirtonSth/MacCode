@@ -22,6 +22,8 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.inspectorDrafts")
         UserDefaults.standard.removeObject(forKey: "bots.studioDraft")
         UserDefaults.standard.removeObject(forKey: "bots.searchText")
+        UserDefaults.standard.removeObject(forKey: "bots.deskRouting")
+        UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
     }
 
     override func tearDown() {
@@ -1175,7 +1177,7 @@ final class BotsWindowTests: XCTestCase {
         let afterPiper = vm.fleetReloadCountForTesting
         XCTAssertGreaterThan(afterPiper, 0)
         vm.beginCreate()
-        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.screen, .studio)
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).name, "New Agent")
         XCTAssertTrue(vm.fleet.contains(where: { $0.id == vm.selectedBotID }))
         XCTAssertTrue(vm.fleet.contains(where: { $0.id == piper.id }))
@@ -1334,6 +1336,24 @@ final class BotsWindowTests: XCTestCase {
         vm.openAttention()
         XCTAssertEqual(vm.screen, .studio)
         XCTAssertEqual(vm.selectedBotID, piper.id)
+    }
+
+    func test_openActiveBotsOpensNeedsYouBot_becauseBadgeAndClickMustAgree() throws {
+        // WHY: Active Bots replaced the attention bell. The badge counts
+        // working/needs-you teammates; the row must dest that teammate,
+        // not sit inert while the count is non-zero.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Please look at the failing test"))
+        XCTAssertGreaterThan(vm.activeBotCount, 0)
+        vm.openDesk(quinn)
+        XCTAssertEqual(vm.selectedBotID, quinn.id)
+        vm.openActiveBots()
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(vm.screen, .desk)
     }
 
     func test_searchKeepsSelectedVisible_becauseChatMustMatchTheRoster() throws {
@@ -2933,15 +2953,107 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(vm.isAutonomyActive, "P1a routines stay app-closed off")
     }
 
-    func test_beginCreateOpensDeskImmediately_becauseATeammateShouldNotRequireStudioFirst() throws {
+    func test_beginCreateOpensStudio_becauseNewBotIsAConfigureDest() throws {
+        // WHY: New Bot used to skip Studio and land on Chat. Users need
+        // Profile first so name, role, and provider are set before talking.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         vm.beginCreate()
 
-        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.screen, .studio)
+        XCTAssertEqual(vm.studioTab, .profile)
+        XCTAssertEqual(vm.studioDraft.botID, vm.selectedBotID)
         XCTAssertEqual(try context.botStore.list().count, 1)
         XCTAssertEqual(try context.botStore.list().first?.name, "New Agent")
         XCTAssertTrue(try context.threadRepo.list().isEmpty)
+    }
+
+    func test_deskRoutingSeedsFromPublishedRoute_becauseComposerStartsOnTheStudioDefault() throws {
+        // WHY: Desk must not invent Codex when Studio published Claude.
+        // The published route is the seed, not a later lock.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude, model: "opus")
+        vm.openDesk(bot)
+        XCTAssertEqual(vm.deskRunProvider, .claude)
+        XCTAssertEqual(vm.deskRunModel, "opus")
+        XCTAssertEqual(vm.deskRunPermissionMode, .supervised)
+        XCTAssertEqual(vm.resolvedProvider(for: bot), .claude)
+    }
+
+    func test_deskSendUsesComposerProvider_notPublishedRoute() throws {
+        // WHY: Bots were locked to the published revision provider. Desk
+        // must send with the composer chips so a teammate can use Codex
+        // after Studio published Claude.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude, model: "opus")
+        vm.openDesk(bot)
+        vm.setDeskProvider(.grok)
+        vm.setDeskRoutingMode(.auto)
+        vm.setDeskPermissionMode(.fullAccess)
+        XCTAssertEqual(vm.deskRunProvider, .grok)
+        XCTAssertEqual(vm.deskRunModel, BotsViewModel.defaultModel(for: .grok))
+        XCTAssertEqual(vm.deskRunPermissionMode, .fullAccess)
+        XCTAssertEqual(vm.resolvedProvider(for: bot), .claude)
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.source\")"))
+        XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.model\")"))
+        XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.permission\")"))
+        guard let start = source.range(of: "private func startSupervisedRun") else {
+            return XCTFail("startSupervisedRun must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n    private func followLinkedRun")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("provider: deskRouting.provider"))
+        XCTAssertTrue(slice.contains("permissionMode: deskRouting.permissionMode"))
+        XCTAssertFalse(
+            slice.contains("provider: revision.provider"),
+            "Desk send must not stay locked to the published Studio route"
+        )
+    }
+
+    func test_botMentionParserResolvesHandle_excludingOpenTeammate() throws {
+        // WHY: @ in Desk must pick another teammate. Mentioning yourself
+        // would loop the same run instead of starting a peer turn.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertEqual(
+            BotMentionParser.mentionedBots(in: "@quinn ping the inbox", bots: vm.bots, excluding: piper.id).map(\.id),
+            [quinn.id]
+        )
+        XCTAssertTrue(
+            BotMentionParser.mentionedBots(in: "@piper stay here", bots: vm.bots, excluding: piper.id).isEmpty
+        )
+        vm.composerText = "@q"
+        XCTAssertEqual(vm.botMentionSuggestions.map(\.id), [quinn.id])
+        vm.applyBotMention(quinn)
+        XCTAssertTrue(vm.composerText.contains("@\(quinn.handle)"))
+        XCTAssertNil(BotMentionParser.activeQuery(in: vm.composerText))
+    }
+
+    func test_sendWithMentionTargetsPeer_notOnlyHost() throws {
+        // WHY: "@quinn do X" from Piper's Desk must run Quinn and paint
+        // Messaged Quinn on Piper's transcript. A host-only send would
+        // never let teammates talk to each other.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "@quinn check WhatsApp"
+        XCTAssertTrue(vm.send())
+        XCTAssertEqual(vm.lastMentionedBotIDForTesting, quinn.id)
+        let outbound = try XCTUnwrap(vm.deskMessages.last)
+        XCTAssertEqual(outbound.role, .user)
+        XCTAssertEqual(outbound.peer?.direction, .messaged)
+        XCTAssertEqual(outbound.peer?.botID, quinn.id)
+        XCTAssertEqual(outbound.peer?.caption, "Messaged Quinn - CRM Controller - \(quinn.handle)")
+        XCTAssertTrue(outbound.text.contains("@quinn"))
     }
 
     func test_beginCreateTwiceAllocatesDistinctHandles_becauseNewAgentIsAPlaceholder() throws {
@@ -5052,7 +5164,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(sidebar.contains("title: \"Bots\""))
         XCTAssertTrue(sidebar.contains("BotsModeSwitcher"))
         XCTAssertTrue(
-            sidebar.contains("BotsRosterList(vm: botsVM, attachDeleteConfirmation: true)"),
+            sidebar.contains("attachDeleteConfirmation: true"),
             "sidebar roster is a sibling hosting view; Delete must attach confirm here"
         )
         XCTAssertTrue(bots.contains("bots.chrome.agentic"))
@@ -5288,10 +5400,79 @@ final class BotsWindowTests: XCTestCase {
 
         let scheduleTasks = try XCTUnwrap(sidebar.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
         let reportBug = try XCTUnwrap(sidebar.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
-        XCTAssertLessThan(scheduleTasks.lowerBound, reportBug.lowerBound)
+        XCTAssertLessThan(reportBug.lowerBound, scheduleTasks.lowerBound,
+                          "Report Bug is a header icon, not a dest row under Schedule Tasks")
         XCTAssertTrue(
             sidebar.contains("BotsModeSwitcher"),
             "Bots is entered from the Agentic/Bots switcher, not a dest row"
+        )
+    }
+
+    func test_botsRosterMenusMatchAgentic_becauseBotsChromeMirrorsWorkspaceActions() throws {
+        // WHY: Bots used a New Bot + bell strip. Agentic is New Workspace,
+        // Active Threads, Schedule Tasks. The Bots session must offer the
+        // same three-row menu so the mode switch does not change chrome.
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        let newBot = try XCTUnwrap(bots.range(of: "accessibilityIdentifier(\"bots.new\")"))
+        let activeBots = try XCTUnwrap(bots.range(of: "accessibilityIdentifier(\"bots.active\")"))
+        let scheduleTasks = try XCTUnwrap(bots.range(of: "accessibilityIdentifier(\"bots.scheduleTasks\")"))
+        XCTAssertLessThan(newBot.lowerBound, activeBots.lowerBound)
+        XCTAssertLessThan(activeBots.lowerBound, scheduleTasks.lowerBound)
+        XCTAssertTrue(bots.contains("SidebarActionRow("),
+                      "Bots action rows must reuse Agentic sidebar chrome")
+        XCTAssertTrue(bots.contains("BotsChrome.Label.activeBots"))
+        XCTAssertTrue(bots.contains("BotsChrome.Label.scheduleTasks"))
+        XCTAssertTrue(sidebar.contains("onOpenScheduledTasks: onOpenScheduledTasks"),
+                      "sidebar Bots roster must open the same Schedule Tasks dest")
+        XCTAssertFalse(bots.contains("bots.roster.attention"),
+                       "the attention bell is replaced by the Active Bots row")
+    }
+
+    func test_modeSwitcherSitsOnGlass_andBotSearchMatchesWorkspaceFilter() throws {
+        // WHY: opaque surfaceRaised / surfaceOverlay on Agentic | Bots punches
+        // a dark slab through the sidebar NSVisualEffectView. Search bots used
+        // the 44pt Bots hit target and sat taller than Filter workspaces.
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        guard let start = bots.range(of: "public struct BotsModeSwitcher") else {
+            return XCTFail("BotsModeSwitcher must exist")
+        }
+        let rest = bots[start.lowerBound...]
+        let end = rest.range(of: "\npublic struct BotsRosterList")?.lowerBound ?? rest.endIndex
+        let switcher = String(bots[start.lowerBound..<end])
+
+        XCTAssertFalse(
+            switcher.contains("DS.Palette.surfaceRaised"),
+            "mode switcher track must not paint an opaque raised slab on glass"
+        )
+        XCTAssertFalse(
+            switcher.contains("DS.Palette.surfaceOverlay"),
+            "selected segment must not use opaque surfaceOverlay on glass"
+        )
+        XCTAssertTrue(
+            switcher.contains(".background(DS.Palette.hover)"),
+            "mode switcher track must be a translucent hover wash so sidebar glass shows through"
+        )
+        XCTAssertTrue(
+            switcher.contains("selected ? Color.white.opacity(0.12) : Color.clear"),
+            "selected segment must be a frost wash, not a solid raised surface"
+        )
+        XCTAssertTrue(
+            bots.contains("SidebarSearchField("),
+            "Search bots must use the same SidebarSearchField as Filter workspaces"
+        )
+        XCTAssertTrue(
+            sidebar.contains("SidebarSearchField("),
+            "Filter workspaces must use the same SidebarSearchField as Search bots"
+        )
+        XCTAssertTrue(
+            sidebar.contains("placeholder: \"Filter workspaces\""),
+            "workspace filter keeps its own placeholder"
+        )
+        XCTAssertTrue(
+            bots.contains("placeholder: BotsChrome.Label.search"),
+            "bots filter keeps Search bots as the only copy difference"
         )
     }
 

@@ -125,8 +125,11 @@ final class AppIdentityNotificationTests: XCTestCase {
         let newWorkspace = try XCTUnwrap(source.range(of: "title: \"New Workspace\""))
         let updates = try XCTUnwrap(source.range(of: "title: vm.updateActionTitle"))
 
-        XCTAssertLessThan(account.lowerBound, settings.lowerBound,
-                          "logged-in account avatar must stay directly before Settings in the sidebar header")
+        let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
+        XCTAssertLessThan(account.lowerBound, reportBug.lowerBound,
+                          "logged-in account avatar must stay before Report Bug in the sidebar header")
+        XCTAssertLessThan(reportBug.lowerBound, settings.lowerBound,
+                          "Report Bug is the ladybug icon immediately left of the Settings cog")
         XCTAssertLessThan(settings.lowerBound, toggle.lowerBound,
                           "Settings must stay as the cog icon directly before the sidebar toggle")
         XCTAssertLessThan(newWorkspace.lowerBound, updates.lowerBound,

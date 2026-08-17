@@ -32,16 +32,19 @@ final class ScheduledTasksWindowTests: XCTestCase {
         let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
         let updateControl = try XCTUnwrap(source.range(of: "if vm.showsUpdateControl"))
 
+        XCTAssertLessThan(reportBug.lowerBound, newWorkspace.lowerBound,
+                          "Report Bug is a header icon, not a dest row under Schedule Tasks")
         XCTAssertLessThan(newWorkspace.lowerBound, activeThreads.lowerBound)
         XCTAssertLessThan(activeThreads.lowerBound, scheduleTasks.lowerBound)
-        XCTAssertLessThan(scheduleTasks.lowerBound, reportBug.lowerBound)
-        XCTAssertLessThan(reportBug.lowerBound, updateControl.lowerBound)
+        XCTAssertLessThan(scheduleTasks.lowerBound, updateControl.lowerBound)
     }
 
     func test_sidebarReportBugOpensMailtoToMaintainer_becauseBugReportsMustReachSupport() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("title: \"Report Bug\""),
-                      "sidebar must expose a Report Bug action under Schedule Tasks")
+        XCTAssertTrue(source.contains("accessibilityLabel(\"Report Bug\")"),
+                      "sidebar must expose Report Bug as a header icon")
+        XCTAssertTrue(source.contains(".help(\"Report a bug via email\")"),
+                      "the header ladybug must keep a tooltip")
         XCTAssertTrue(source.contains("samuelfajreldines@gmail.com"),
                       "Report Bug must address the maintainer mailbox")
         XCTAssertTrue(source.contains("mailto"),

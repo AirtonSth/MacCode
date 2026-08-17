@@ -2532,6 +2532,58 @@ public struct TokenSaverInstalledModelSizeCache: Equatable {
     }
 }
 
+/// Shared sidebar action row used by Agentic and Bots so the two
+/// modes paint the same chrome (height, type, badge).
+struct SidebarActionRow: View {
+    let symbol: String
+    let title: String
+    var isEmphasized: Bool = false
+    var isSelected: Bool = false
+    var badgeText: String? = nil
+    var badgeIsBlue: Bool = false
+
+    var body: some View {
+        let highlight = isEmphasized || isSelected
+        return HStack(spacing: DS.Space.md) {
+            Image(systemName: symbol)
+                .font(.system(size: 16, weight: highlight ? .semibold : .regular))
+                .frame(width: 20, height: 20)
+                .foregroundColor(isEmphasized ? DS.Palette.warning : (isSelected ? DS.Palette.accent : DS.Palette.text))
+            Text(title)
+                .font(DS.Font.body)
+                .fontWeight(highlight ? .semibold : .regular)
+                .foregroundColor(isEmphasized ? DS.Palette.warning : (isSelected ? DS.Palette.text : DS.Palette.text))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            if let badgeText {
+                Text(badgeText)
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, badgeText == "99+" ? 5 : 6)
+                    .frame(minWidth: 22, minHeight: 22)
+                    .background(Circle().fill(badgeIsBlue ? Color.blue : DS.Palette.danger))
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .frame(height: 42)
+        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .fill(
+                    isEmphasized
+                        ? DS.Palette.warning.opacity(0.16)
+                        : (isSelected ? DS.Palette.selection : Color.white.opacity(0.001))
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(isEmphasized ? DS.Palette.warning.opacity(0.55) : Color.clear,
+                              lineWidth: DS.Border.hairline)
+        )
+    }
+}
+
 public struct SidebarRootView: View {
     private enum TokenSaverUsageScope: String, CaseIterable {
         case currentSession
@@ -2609,6 +2661,18 @@ public struct SidebarRootView: View {
                 .accessibilityValue(accountSubtitle)
             }
 
+            Button(action: reportBug) {
+                Image(systemName: "ladybug")
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .frame(width: 28, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Report a bug via email")
+            .accessibilityLabel("Report Bug")
+            .accessibilityIdentifier("sidebar.reportBug")
+
             Button(action: onOpenSettings) {
                 Image(systemName: "gearshape")
                     .font(.system(size: 15, weight: .regular))
@@ -2653,19 +2717,24 @@ public struct SidebarRootView: View {
             .accessibilityIdentifier("sidebar.bots")
 
             if vm.isBotsSelected, let botsVM {
-                BotsRosterList(vm: botsVM, attachDeleteConfirmation: true)
+                BotsRosterList(
+                    vm: botsVM,
+                    attachDeleteConfirmation: true,
+                    isScheduledTasksSelected: vm.isScheduledTasksSelected,
+                    onOpenScheduledTasks: onOpenScheduledTasks
+                )
                     .transition(.opacity)
             } else {
             VStack(alignment: .leading, spacing: DS.Space.xxs) {
                 Button { vm.newWorkspace() } label: {
-                    sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
+                    SidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
                 }
                 .buttonStyle(.plain)
                 .help("Create new workspace")
                 .accessibilityIdentifier("sidebar.newWorkspace")
 
                 Button(action: onOpenActiveThreads) {
-                    sidebarActionRow(
+                    SidebarActionRow(
                         symbol: "bolt.horizontal.circle",
                         title: "Active Threads",
                         isSelected: vm.isActiveThreadsSelected,
@@ -2684,7 +2753,7 @@ public struct SidebarRootView: View {
                 .accessibilityAddTraits(vm.isActiveThreadsSelected ? .isSelected : [])
 
                 Button(action: onOpenScheduledTasks) {
-                    sidebarActionRow(
+                    SidebarActionRow(
                         symbol: "calendar.badge.clock",
                         title: "Schedule Tasks",
                         isSelected: vm.isScheduledTasksSelected
@@ -2695,16 +2764,9 @@ public struct SidebarRootView: View {
                 .accessibilityIdentifier("sidebar.scheduleTasks")
                 .accessibilityAddTraits(vm.isScheduledTasksSelected ? .isSelected : [])
 
-                Button(action: reportBug) {
-                    sidebarActionRow(symbol: "ladybug", title: "Report Bug")
-                }
-                .buttonStyle(.plain)
-                .help("Report a bug via email")
-                .accessibilityIdentifier("sidebar.reportBug")
-
                 if vm.showsUpdateControl {
                     Button { vm.checkForUpdates() } label: {
-                        sidebarActionRow(
+                        SidebarActionRow(
                             symbol: "arrow.down.circle",
                             title: vm.updateActionTitle,
                             isEmphasized: vm.updateActionHighlighted
@@ -2889,86 +2951,11 @@ public struct SidebarRootView: View {
     }
 
     private var workspaceFilterField: some View {
-        HStack(spacing: DS.Space.sm) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 12, weight: .regular))
-                .foregroundColor(DS.Palette.textTertiary)
-            NonAutoFocusTextField(
-                placeholder: "Filter workspaces",
-                text: $vm.filterText,
-                focusRequest: $filterFocusRequest,
-                accessibilityIdentifier: "sidebar.workspaceFilter"
-            )
-            .font(DS.Font.body)
-            .foregroundColor(DS.Palette.text)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            if !vm.filterText.isEmpty {
-                Button { vm.filterText = "" } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 12, weight: .regular))
-                        .foregroundColor(DS.Palette.textTertiary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Clear filter")
-            }
-        }
-        .padding(.horizontal, DS.Space.sm)
-        .frame(height: 30)
-        .background(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .fill(DS.Palette.surfaceRaised.opacity(0.6))
-                .overlay(
-                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                        .strokeBorder(DS.Palette.lineStrong.opacity(0.5), lineWidth: DS.Border.hairline)
-                )
-        )
-    }
-
-    private func sidebarActionRow(
-        symbol: String,
-        title: String,
-        isEmphasized: Bool = false,
-        isSelected: Bool = false,
-        badgeText: String? = nil,
-        badgeIsBlue: Bool = false
-    ) -> some View {
-        let highlight = isEmphasized || isSelected
-        return HStack(spacing: DS.Space.md) {
-            Image(systemName: symbol)
-                .font(.system(size: 16, weight: highlight ? .semibold : .regular))
-                .frame(width: 20, height: 20)
-                .foregroundColor(isEmphasized ? DS.Palette.warning : (isSelected ? DS.Palette.accent : DS.Palette.text))
-            Text(title)
-                .font(DS.Font.body)
-                .fontWeight(highlight ? .semibold : .regular)
-                .foregroundColor(isEmphasized ? DS.Palette.warning : (isSelected ? DS.Palette.text : DS.Palette.text))
-                .lineLimit(1)
-            Spacer(minLength: 0)
-            if let badgeText {
-                Text(badgeText)
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, badgeText == "99+" ? 5 : 6)
-                    .frame(minWidth: 22, minHeight: 22)
-                    .background(Circle().fill(badgeIsBlue ? Color.blue : DS.Palette.danger))
-                    .accessibilityHidden(true)
-            }
-        }
-        .padding(.horizontal, DS.Space.sm)
-        .frame(height: 42)
-        .contentShape(Rectangle())
-        .background(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .fill(
-                    isEmphasized
-                        ? DS.Palette.warning.opacity(0.16)
-                        : (isSelected ? DS.Palette.selection : Color.white.opacity(0.001))
-                )
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .strokeBorder(isEmphasized ? DS.Palette.warning.opacity(0.55) : Color.clear,
-                              lineWidth: DS.Border.hairline)
+        SidebarSearchField(
+            placeholder: "Filter workspaces",
+            text: $vm.filterText,
+            focusRequest: $filterFocusRequest,
+            accessibilityIdentifier: "sidebar.workspaceFilter"
         )
     }
 
@@ -5388,6 +5375,51 @@ private struct WorkspaceDropDelegate: DropDelegate {
             vm.dragScrollEdge = 0
         }
         return DropProposal(operation: .move)
+    }
+}
+
+/// Shared sidebar filter chrome. Workspaces and Bots use this so letter,
+/// height, padding, and the clear affordance cannot drift.
+struct SidebarSearchField: View {
+    let placeholder: String
+    @Binding var text: String
+    @Binding var focusRequest: Bool
+    let accessibilityIdentifier: String
+
+    var body: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundColor(DS.Palette.textTertiary)
+            NonAutoFocusTextField(
+                placeholder: placeholder,
+                text: $text,
+                focusRequest: $focusRequest,
+                accessibilityIdentifier: accessibilityIdentifier
+            )
+            .font(DS.Font.body)
+            .foregroundColor(DS.Palette.text)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if !text.isEmpty {
+                Button { text = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear filter")
+            }
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .frame(height: DS.Control.sidebarSearchHeight)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .fill(DS.Palette.surfaceRaised.opacity(0.6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                        .strokeBorder(DS.Palette.lineStrong.opacity(0.5), lineWidth: DS.Border.hairline)
+                )
+        )
     }
 }
 

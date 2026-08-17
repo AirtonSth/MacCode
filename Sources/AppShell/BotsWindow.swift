@@ -20,6 +20,35 @@ public struct BotQueuedFollowUp: Equatable, Identifiable, Codable {
     }
 }
 
+public struct BotDeskRouting: Equatable, Codable {
+    public var provider: AgentProvider
+    public var providerInstanceID: String
+    public var model: String
+    public var routingMode: AgentRoutingMode
+    public var permissionMode: AgentPermissionMode
+
+    public init(
+        provider: AgentProvider = .codex,
+        providerInstanceID: String = AgentProvider.codex.rawValue,
+        model: String = "",
+        routingMode: AgentRoutingMode = .auto,
+        permissionMode: AgentPermissionMode = .supervised
+    ) {
+        self.provider = provider
+        self.providerInstanceID = providerInstanceID
+        self.model = model
+        self.routingMode = routingMode
+        self.permissionMode = permissionMode
+    }
+
+    public func resolvedModel(defaultModel: (AgentProvider) -> String) -> String {
+        if routingMode == .auto || model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return defaultModel(provider)
+        }
+        return model
+    }
+}
+
 public struct BotComposerDraft: Equatable, Codable {
     public var text: String
     public var attachments: [AgentAttachment]
@@ -123,6 +152,52 @@ private struct BotStudioSupportSnapshot {
     var routines: [BotRoutine]
 }
 
+public struct BotDeskPeer: Equatable, Sendable {
+    public enum Direction: String, Sendable {
+        case messaged
+        case fromPeer
+    }
+
+    public var direction: Direction
+    public var botID: BotID
+    public var name: String
+    public var title: String
+    public var handle: String
+
+    public init(direction: Direction, bot: BotDefinition) {
+        self.direction = direction
+        self.botID = bot.id
+        self.name = bot.name
+        self.title = bot.title
+        self.handle = bot.handle
+    }
+
+    public init(direction: Direction, botID: BotID, name: String, title: String, handle: String) {
+        self.direction = direction
+        self.botID = botID
+        self.name = name
+        self.title = title
+        self.handle = handle
+    }
+
+    public var identityLine: String {
+        [name, title.isEmpty ? nil : title, handle]
+            .compactMap { $0 }
+            .joined(separator: " - ")
+    }
+
+    public var caption: String {
+        switch direction {
+        case .messaged: return "Messaged \(identityLine)"
+        case .fromPeer: return "Message from \(identityLine)"
+        }
+    }
+
+    public func groupCaption(count: Int) -> String {
+        "\(count) messages with \(identityLine)"
+    }
+}
+
 public struct BotDeskMessage: Identifiable, Equatable, Sendable {
     public enum Role: String, Sendable {
         case user
@@ -133,17 +208,20 @@ public struct BotDeskMessage: Identifiable, Equatable, Sendable {
     public let role: Role
     public let text: String
     public let createdAt: Date
+    public var peer: BotDeskPeer?
 
     public init(
         id: UUID = UUID(),
         role: Role,
         text: String,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        peer: BotDeskPeer? = nil
     ) {
         self.id = id
         self.role = role
         self.text = text
         self.createdAt = createdAt
+        self.peer = peer
     }
 }
 
@@ -364,6 +442,14 @@ public final class BotsViewModel: ObservableObject {
     @Published public var attachments: [AgentAttachment] = [] {
         didSet { persistComposerIfHydrated() }
     }
+    /// Per-send routing. Studio Default route seeds this; it does not lock it.
+    @Published public var deskRouting = BotDeskRouting() {
+        didSet { persistDeskRoutingIfHydrated() }
+    }
+    public private(set) var lastDeskRunProviderForTesting: AgentProvider?
+    public private(set) var lastDeskRunModelForTesting: String?
+    public private(set) var lastDeskRunPermissionForTesting: AgentPermissionMode?
+    public private(set) var lastMentionedBotIDForTesting: BotID?
     @Published public var isStopping = false
     @Published public private(set) var queuedFollowUps: [BotQueuedFollowUp] = []
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
@@ -492,6 +578,10 @@ public final class BotsViewModel: ObservableObject {
     private var composerDraftsByBot: [BotID: BotComposerDraft] = [:]
     private var composerHydrated = false
     private var isApplyingComposerDraft = false
+    private var deskRoutingHydrated = false
+    private var isApplyingDeskRouting = false
+    private var deskRoutingByBot: [BotID: BotDeskRouting] = [:]
+    private var peerTurnsByHost: [BotID: [BotDeskMessage]] = [:]
     private var inspectorDraftsByBot: [BotID: BotInspectorDraft] = [:]
     private var inspectorHydrated = false
     private var isApplyingInspectorDraft = false
@@ -515,6 +605,8 @@ public final class BotsViewModel: ObservableObject {
         restoreBrainPaneIfNeeded()
         restoreDeskSidePaneIfNeeded()
         restoreSearchTextIfNeeded()
+        restoreDeskRoutingIfNeeded()
+        restorePeerTurnsIfNeeded()
         reload()
         restoreScreenIfNeeded()
         studioDraftHydrated = true
@@ -523,6 +615,9 @@ public final class BotsViewModel: ObservableObject {
         }
         if !inspectorHydrated {
             applyInspectorDraft(for: selectedBotID)
+        }
+        if !deskRoutingHydrated {
+            applyDeskRouting(for: selectedBotID)
         }
         context.coordinator.addObserver(self)
     }
@@ -563,6 +658,34 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public var openAttentionCount: Int { attentionItems.count }
+
+    /// Working + needs-you teammates, for the Active Bots badge.
+    public var activeBotCount: Int {
+        bots.reduce(into: 0) { count, bot in
+            switch attentionState(for: bot) {
+            case .working, .needsAttention: count += 1
+            default: break
+            }
+        }
+    }
+
+    /// Dest to the first teammate that makes the Active Bots badge non-zero.
+    public func openActiveBots() {
+        if let item = destOpenAttentionItem() {
+            openAttention(item)
+            return
+        }
+        if let bot = bots.first(where: {
+            switch attentionState(for: $0) {
+            case .needsAttention, .working: return true
+            default: return false
+            }
+        }) {
+            openDesk(bot)
+            return
+        }
+        openAttention()
+    }
 
     public func attentionState(for bot: BotDefinition) -> BotAttentionState {
         let state = attentionStateByBot[bot.id] ?? .none
@@ -672,7 +795,8 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         do {
-            // Match the bar: create opens a teammate immediately; profile is optional.
+            // New Bot is a configure dest: persist the placeholder, then
+            // open Studio Profile so name/role/provider are set before Chat.
             // Hermes seeds SOUL.md on first run — do not start a soulless New Agent.
             let name = "New Agent"
             let bot = try create(
@@ -681,7 +805,7 @@ public final class BotsViewModel: ObservableObject {
                 description: "",
                 soul: BotStandingInstructions.fallback(name: name, title: "", description: "")
             )
-            openDesk(bot)
+            beginEdit(bot)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -1221,7 +1345,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     @discardableResult
-    public func send(_ text: String? = nil) -> Bool {
+    public func send(_ text: String? = nil, relayHop: Int = 0) -> Bool {
         let attached = attachments
         let message = (text ?? composerText).trimmingCharacters(in: .whitespacesAndNewlines)
         guard AgentChatTranscriptChrome.admitsSend(text: message, attachmentCount: attached.count) else { return false }
@@ -1230,12 +1354,17 @@ public final class BotsViewModel: ObservableObject {
         composerText = ""
         attachments = []
         lastSendStartedProviderRun = false
+        lastMentionedBotIDForTesting = nil
         if deskRunIsLive, text == nil {
             enqueueFollowUp(
                 BotQueuedFollowUp(text: message, attachments: attached),
                 botID: bot.id
             )
             return true
+        }
+        let peers = relayHop > 0 ? [] : mentionedBots(in: message)
+        if let peer = peers.first {
+            return sendMention(from: bot, to: peer, text: message, attachments: attached, relayHop: relayHop)
         }
         do {
             let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attached)
@@ -1281,6 +1410,81 @@ public final class BotsViewModel: ObservableObject {
                 }
             } else {
                 recordNeedsAttention(bot: bot, conversation: conversation, userText: message)
+            }
+            return true
+        } catch {
+            errorMessage = String(describing: error)
+            return false
+        }
+    }
+
+    @discardableResult
+    private func sendMention(
+        from host: BotDefinition,
+        to peer: BotDefinition,
+        text: String,
+        attachments: [AgentAttachment],
+        relayHop: Int
+    ) -> Bool {
+        lastMentionedBotIDForTesting = peer.id
+        let display = AgentChatTranscriptChrome.displayUserLine(text: text, attachments: attachments)
+        let outbound = BotDeskMessage(
+            role: .user,
+            text: display,
+            peer: BotDeskPeer(direction: .messaged, bot: peer)
+        )
+        do {
+            let hostConversation = try persistUserMessage(bot: host, text: display)
+            appendDeskMessage(outbound, botID: host.id)
+            rememberPeerTurn(outbound, hostID: host.id)
+            let peerConversation = try persistUserMessage(bot: peer, text: display, adoptSelection: false)
+            appendDeskMessage(
+                BotDeskMessage(role: .user, text: display),
+                botID: peer.id
+            )
+            let brain = destBrainInputs(for: peer)
+            guard let router = resolvedRouter(),
+                  let revision = try currentRevision(for: peer) else {
+                recordNeedsAttention(bot: peer, conversation: peerConversation, userText: text)
+                return true
+            }
+            beginDeskSendInFlight(for: host.id)
+            let relay = "\(host.name) (@\(host.handle)) asked you:\n\(text)"
+            Task { [weak self] in
+                guard let self else { return }
+                await Task.yield()
+                let started = await self.startSupervisedRun(
+                    bot: peer,
+                    revision: revision,
+                    conversation: peerConversation,
+                    userText: relay,
+                    attachments: attachments,
+                    memory: brain.memory,
+                    skills: brain.skills,
+                    routines: brain.routines,
+                    router: router,
+                    paintBotID: host.id
+                )
+                self.clearDeskSendInFlight(for: host.id)
+                if let runId = started {
+                    self.lastSendStartedProviderRun = true
+                    self.lastLinkedRunIDByBot[peer.id] = runId
+                    self.restoreDeskWorkLog(botID: host.id)
+                    await self.followLinkedRun(bot: peer, conversation: peerConversation, runId: runId)
+                    self.importPeerReply(from: peer, onto: host)
+                    if relayHop == 0 {
+                        await self.relayPeerReplyToHost(
+                            host: host,
+                            hostConversation: hostConversation,
+                            peer: peer,
+                            router: router
+                        )
+                    }
+                } else {
+                    self.deskSendInFlightStartedAt = nil
+                    self.recordNeedsAttention(bot: peer, conversation: peerConversation, userText: text)
+                }
+                _ = hostConversation
             }
             return true
         } catch {
@@ -1937,6 +2141,8 @@ public final class BotsViewModel: ObservableObject {
     private static let brainPaneDefaultsKey = "bots.brainPane"
     private static let queuedFollowUpsDefaultsKey = "bots.queuedFollowUps"
     private static let composerDraftsDefaultsKey = "bots.composerDrafts"
+    private static let deskRoutingDefaultsKey = "bots.deskRouting"
+    private static let peerTurnsDefaultsKey = "bots.peerTurns"
     private static let inspectorDraftsDefaultsKey = "bots.inspectorDrafts"
     private static let studioDraftDefaultsKey = "bots.studioDraft"
     private static let searchTextDefaultsKey = "bots.searchText"
@@ -2144,6 +2350,11 @@ public final class BotsViewModel: ObservableObject {
             } else {
                 applyInspectorDraft(for: id)
             }
+            if deskRoutingHydrated {
+                captureDeskRouting()
+            } else {
+                applyDeskRouting(for: id)
+            }
             return
         }
         if composerHydrated {
@@ -2152,9 +2363,13 @@ public final class BotsViewModel: ObservableObject {
         if inspectorHydrated {
             captureInspectorDraft()
         }
+        if deskRoutingHydrated {
+            captureDeskRouting()
+        }
         selectedBotID = id
         applyComposerDraft(for: id)
         applyInspectorDraft(for: id)
+        applyDeskRouting(for: id)
     }
 
     private func captureComposerDraft(for botID: BotID? = nil) {
@@ -2175,6 +2390,268 @@ public final class BotsViewModel: ObservableObject {
         attachments = draft?.liveAttachments ?? []
         isApplyingComposerDraft = false
         composerHydrated = true
+    }
+
+    public func setDeskProvider(_ provider: AgentProvider, instanceID: String? = nil) {
+        let instance = instanceID
+            ?? providers.first(where: { $0.provider == provider })?.id
+            ?? provider.rawValue
+        deskRouting.provider = provider
+        deskRouting.providerInstanceID = instance
+        if deskRouting.routingMode == .auto {
+            deskRouting.model = ""
+        } else if !deskModels.contains(where: { $0 == deskRouting.model }) {
+            deskRouting.model = Self.defaultModel(for: provider)
+        }
+    }
+
+    public func setDeskModel(_ model: String) {
+        deskRouting.model = model
+        deskRouting.routingMode = .manual
+    }
+
+    public func setDeskRoutingMode(_ mode: AgentRoutingMode) {
+        deskRouting.routingMode = mode
+        if mode == .auto {
+            deskRouting.model = ""
+        } else if deskRouting.model.isEmpty {
+            deskRouting.model = Self.defaultModel(for: deskRouting.provider)
+        }
+    }
+
+    public func setDeskPermissionMode(_ mode: AgentPermissionMode) {
+        deskRouting.permissionMode = mode
+    }
+
+    public var botMentionSuggestions: [BotDefinition] {
+        guard let query = BotMentionParser.activeQuery(in: composerText) else { return [] }
+        return BotMentionParser.suggestions(query: query, bots: bots, excluding: selectedBotID)
+    }
+
+    public func applyBotMention(_ bot: BotDefinition) {
+        composerText = BotMentionParser.applying(bot, to: composerText)
+    }
+
+    public func mentionedBots(in text: String) -> [BotDefinition] {
+        BotMentionParser.mentionedBots(in: text, bots: bots, excluding: selectedBotID)
+    }
+
+    public var deskRunProvider: AgentProvider { deskRouting.provider }
+
+    public var deskRunModel: String {
+        deskRouting.resolvedModel(defaultModel: Self.defaultModel(for:))
+    }
+
+    public var deskRunPermissionMode: AgentPermissionMode { deskRouting.permissionMode }
+
+    public var selectedDeskSnapshot: AgentProviderSnapshot? {
+        providers.first(where: { $0.id == deskRouting.providerInstanceID })
+            ?? providers.first(where: { $0.provider == deskRouting.provider })
+    }
+
+    public var deskModels: [String] {
+        selectedDeskSnapshot?.models.map(\.id) ?? []
+    }
+
+    public var deskPermissionModes: [AgentPermissionMode] {
+        selectedDeskSnapshot?.effectivePermissionModes ?? AgentPermissionMode.allCases
+    }
+
+    private func persistDeskRoutingIfHydrated() {
+        guard deskRoutingHydrated, !isApplyingDeskRouting else { return }
+        captureDeskRouting()
+    }
+
+    private func captureDeskRouting(for botID: BotID? = nil) {
+        guard let botID = botID ?? selectedBotID else { return }
+        deskRoutingByBot[botID] = deskRouting
+        persistDeskRouting()
+    }
+
+    private func applyDeskRouting(for botID: BotID?) {
+        isApplyingDeskRouting = true
+        if let botID, let saved = deskRoutingByBot[botID] {
+            deskRouting = saved
+        } else if let botID, let bot = bots.first(where: { $0.id == botID })
+                    ?? (try? botStore.get(id: botID)),
+                  let revision = cachedRevision(for: bot) {
+            deskRouting = BotDeskRouting(
+                provider: revision.provider,
+                providerInstanceID: revision.providerInstanceID,
+                model: revision.model,
+                routingMode: revision.model.isEmpty ? .auto : .manual,
+                permissionMode: .supervised
+            )
+        } else {
+            deskRouting = BotDeskRouting()
+        }
+        isApplyingDeskRouting = false
+        deskRoutingHydrated = true
+    }
+
+    private func persistDeskRouting() {
+        let payload = Dictionary(uniqueKeysWithValues: deskRoutingByBot.map {
+            ($0.key.value.uuidString.lowercased(), $0.value)
+        })
+        if payload.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.deskRoutingDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.deskRoutingDefaultsKey)
+        }
+    }
+
+    private func restoreDeskRoutingIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.deskRoutingDefaultsKey),
+              let payload = try? JSONDecoder().decode([String: BotDeskRouting].self, from: data)
+        else { return }
+        var restored: [BotID: BotDeskRouting] = [:]
+        for (raw, routing) in payload {
+            guard let uuid = UUID(uuidString: raw) else { continue }
+            restored[BotID(uuid)] = routing
+        }
+        deskRoutingByBot = restored
+    }
+
+    private func peerAttribution(forUserText text: String, hostID: BotID) -> BotDeskPeer? {
+        guard let peer = mentionedBots(in: text).first else { return nil }
+        return BotDeskPeer(direction: .messaged, bot: peer)
+    }
+
+    private func rememberPeerTurn(_ message: BotDeskMessage, hostID: BotID) {
+        var turns = peerTurnsByHost[hostID] ?? []
+        turns.removeAll { $0.id == message.id }
+        turns.append(message)
+        turns.sort { $0.createdAt < $1.createdAt }
+        peerTurnsByHost[hostID] = turns
+        persistPeerTurns()
+    }
+
+    private func mergePeerTurns(_ messages: [BotDeskMessage], hostID: BotID) -> [BotDeskMessage] {
+        let extras = peerTurnsByHost[hostID] ?? []
+        guard !extras.isEmpty else { return messages }
+        var merged = messages
+        for extra in extras where !merged.contains(where: { $0.id == extra.id || ($0.text == extra.text && $0.createdAt == extra.createdAt) }) {
+            merged.append(extra)
+        }
+        return merged.sorted { $0.createdAt < $1.createdAt }
+    }
+
+    private func relayPeerReplyToHost(
+        host: BotDefinition,
+        hostConversation: BotConversation,
+        peer: BotDefinition,
+        router: AppCommandRouter
+    ) async {
+        guard let reply = lastAssistantText(for: peer.id), !reply.isEmpty else { return }
+        guard let revision = try? currentRevision(for: host) else { return }
+        let brain = destBrainInputs(for: host)
+        beginDeskSendInFlight(for: host.id)
+        let started = await startSupervisedRun(
+            bot: host,
+            revision: revision,
+            conversation: hostConversation,
+            userText: "\(peer.name) (@\(peer.handle)) replied:\n\(reply)",
+            attachments: [],
+            memory: brain.memory,
+            skills: brain.skills,
+            routines: brain.routines,
+            router: router,
+            paintBotID: host.id
+        )
+        clearDeskSendInFlight(for: host.id)
+        if let runId = started {
+            lastSendStartedProviderRun = true
+            await followLinkedRun(bot: host, conversation: hostConversation, runId: runId)
+        }
+    }
+
+    private func importPeerReply(from peer: BotDefinition, onto host: BotDefinition) {
+        guard let reply = lastAssistantText(for: peer.id), !reply.isEmpty else { return }
+        let inbound = BotDeskMessage(
+            role: .assistant,
+            text: reply,
+            peer: BotDeskPeer(direction: .fromPeer, bot: peer)
+        )
+        appendDeskMessage(inbound, botID: host.id)
+        rememberPeerTurn(inbound, hostID: host.id)
+    }
+
+    private func lastAssistantText(for botID: BotID) -> String? {
+        let rows = botID == selectedBotID ? deskMessages : (messagesByBot[botID] ?? [])
+        return rows.last(where: {
+            $0.role == .assistant
+                && $0.text != BotsDeskFollowThrough.workingPlaceholder
+                && $0.text != BotsViewModel.assistantPlaceholder
+        })?.text
+    }
+
+    private struct PersistedPeerTurn: Codable {
+        var id: UUID
+        var role: String
+        var text: String
+        var createdAt: Date
+        var direction: String
+        var peerBotID: UUID
+        var name: String
+        var title: String
+        var handle: String
+    }
+
+    private func persistPeerTurns() {
+        var payload: [String: [PersistedPeerTurn]] = [:]
+        for (host, turns) in peerTurnsByHost {
+            payload[host.value.uuidString.lowercased()] = turns.compactMap { message in
+                guard let peer = message.peer else { return nil }
+                return PersistedPeerTurn(
+                    id: message.id,
+                    role: message.role.rawValue,
+                    text: message.text,
+                    createdAt: message.createdAt,
+                    direction: peer.direction.rawValue,
+                    peerBotID: peer.botID.value,
+                    name: peer.name,
+                    title: peer.title,
+                    handle: peer.handle
+                )
+            }
+        }
+        if payload.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.peerTurnsDefaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.peerTurnsDefaultsKey)
+        }
+    }
+
+    private func restorePeerTurnsIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.peerTurnsDefaultsKey),
+              let payload = try? JSONDecoder().decode([String: [PersistedPeerTurn]].self, from: data)
+        else { return }
+        var restored: [BotID: [BotDeskMessage]] = [:]
+        for (raw, turns) in payload {
+            guard let uuid = UUID(uuidString: raw) else { continue }
+            restored[BotID(uuid)] = turns.compactMap { turn in
+                guard let role = BotDeskMessage.Role(rawValue: turn.role),
+                      let direction = BotDeskPeer.Direction(rawValue: turn.direction) else { return nil }
+                return BotDeskMessage(
+                    id: turn.id,
+                    role: role,
+                    text: turn.text,
+                    createdAt: turn.createdAt,
+                    peer: BotDeskPeer(
+                        direction: direction,
+                        botID: BotID(turn.peerBotID),
+                        name: turn.name,
+                        title: turn.title,
+                        handle: turn.handle
+                    )
+                )
+            }
+        }
+        peerTurnsByHost = restored
     }
 
     private func persistComposerDrafts() {
@@ -2502,10 +2979,15 @@ public final class BotsViewModel: ObservableObject {
                 default:
                     return nil
                 }
-                return BotDeskMessage(role: role, text: text, createdAt: message.createdAt)
+                var bubble = BotDeskMessage(role: role, text: text, createdAt: message.createdAt)
+                if role == .user {
+                    bubble.peer = self.peerAttribution(forUserText: text, hostID: botID)
+                }
+                return bubble
             }
         }
         var visible = BotsDeskFollowThrough.visibleDeskMessages(cached: cached, persisted: persisted)
+        visible = mergePeerTurns(visible, hostID: botID)
         if visible.isEmpty, let conversation, !conversation.title.isEmpty {
             visible = [BotDeskMessage(role: .user, text: conversation.title, createdAt: conversation.createdAt)]
         }
@@ -2679,12 +3161,18 @@ public final class BotsViewModel: ObservableObject {
     }
 
     @discardableResult
-    private func persistUserMessage(bot: BotDefinition, text: String) throws -> BotConversation {
+    private func persistUserMessage(
+        bot: BotDefinition,
+        text: String,
+        adoptSelection: Bool = true
+    ) throws -> BotConversation {
         var conversation: BotConversation
         if let selected = selectedConversation, selected.botID == bot.id {
             conversation = selected
         } else if let existing = conversations.first(where: { $0.botID == bot.id }) {
             conversation = existing
+        } else if let cached = studioSupportByBot[bot.id]?.conversations.first {
+            conversation = cached
         } else {
             conversation = BotConversation(
                 botID: bot.id,
@@ -2699,7 +3187,11 @@ public final class BotsViewModel: ObservableObject {
         // Dest first. Persist used to listConversations after dest
         // painted the bubble. The upserted row is already dest state.
         try botStore.upsertConversation(conversation)
-        adoptWrittenConversation(conversation)
+        if adoptSelection {
+            adoptWrittenConversation(conversation)
+        } else {
+            patchStudioSupportConversation(conversation, botID: bot.id)
+        }
         return conversation
     }
 
@@ -2868,27 +3360,34 @@ public final class BotsViewModel: ObservableObject {
         memory: [BotMemoryItem],
         skills: [BotSkillBinding],
         routines: [BotRoutine] = [],
-        router: AppCommandRouter
+        router: AppCommandRouter,
+        paintBotID: BotID? = nil
     ) async -> AgentRunID? {
         let workspaceID = bot.workspaceID
             ?? context.state.window.selectedWorkspaceID
             ?? context.state.window.workspaces.first
-        let model = revision.model.isEmpty ? Self.defaultModel(for: revision.provider) : revision.model
+        let model = deskRunModel
+        lastDeskRunProviderForTesting = deskRouting.provider
+        lastDeskRunModelForTesting = model
+        lastDeskRunPermissionForTesting = deskRouting.permissionMode
         do {
             let thread: AgentThread
             if let linked = conversation.linkedAgentThreadID,
                let existing = try context.threadRepo.get(id: linked),
-               !threadBelongsToAnotherBot(linked, botID: bot.id) {
+               !threadBelongsToAnotherBot(linked, botID: bot.id),
+               existing.provider == deskRouting.provider,
+               existing.providerInstanceId == deskRouting.providerInstanceID {
                 thread = existing
             } else {
                 thread = try router.createAgentThread(
                     workspace: workspaceID,
                     title: conversation.title,
-                    provider: revision.provider,
+                    provider: deskRouting.provider,
                     model: model,
-                    permissionMode: .supervised,
+                    permissionMode: deskRouting.permissionMode,
                     reasoningEffort: revision.reasoningEffort,
-                    providerInstanceId: revision.providerInstanceID,
+                    providerInstanceId: deskRouting.providerInstanceID,
+                    runAsUser: AgentRunAsUser.current(),
                     surfaceID: nil,
                     routingConfiguration: nil,
                     quiet: true
@@ -2901,8 +3400,9 @@ public final class BotsViewModel: ObservableObject {
                 selectedConversation = linked
                 rememberStudioSupport(for: bot.id)
             }
-            if selectedBotID == bot.id, screen == .desk {
-                startDeskLiveTurnWatch(botID: bot.id, threadID: thread.id)
+            let paintID = paintBotID ?? bot.id
+            if selectedBotID == paintID, screen == .desk {
+                startDeskLiveTurnWatch(botID: paintID, threadID: thread.id)
             }
             var receipt = BotBrainCompiler.assemble(
                 bot: bot,
@@ -2923,11 +3423,11 @@ public final class BotsViewModel: ObservableObject {
             let result = try await router.sendAgentMessage(
                 thread: thread.id,
                 text: receipt.compiledPayload,
-                provider: revision.provider,
+                provider: deskRouting.provider,
                 model: model,
-                permissionMode: .supervised,
+                permissionMode: deskRouting.permissionMode,
                 reasoningEffort: revision.reasoningEffort,
-                providerInstanceId: revision.providerInstanceID,
+                providerInstanceId: deskRouting.providerInstanceID,
                 attachments: attachments
             )
             if let runId = result.runId {
@@ -3189,16 +3689,22 @@ public struct BotsModeSwitcher: View {
             )
         }
         .padding(2)
-        .background(DS.Palette.surfaceRaised)
+        // Glass track: the sidebar sits on NSVisualEffectView. An opaque
+        // surfaceRaised slab punches a dark block through that material.
+        .background(DS.Palette.hover)
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                .strokeBorder(DS.Palette.line.opacity(0.45), lineWidth: DS.Border.hairline)
+        )
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("bots.chrome.mode")
         .accessibilityLabel("Sidebar mode")
         .accessibilityValue(isBotsSelected ? BotsChrome.Label.bots : BotsChrome.Label.agentic)
     }
 
-    /// Native-feeling segmented control: recessed track, raised selected
-    /// segment, compact height (desktop control, not a touch target).
+    /// Native-feeling segmented control: recessed glass track, frosted
+    /// selected segment, compact height (desktop control, not a touch target).
     private func segment(
         title: String,
         symbol: String,
@@ -3216,12 +3722,8 @@ public struct BotsModeSwitcher: View {
             }
             .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
             .frame(maxWidth: .infinity, minHeight: 26)
-            .background(selected ? DS.Palette.surfaceOverlay : Color.clear)
+            .background(selected ? Color.white.opacity(0.12) : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .strokeBorder(selected ? DS.Palette.line : Color.clear, lineWidth: DS.Border.hairline)
-            )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -3237,41 +3739,67 @@ public struct BotsRosterList: View {
     /// Sidebar hosts the roster in a sibling NSHostingView from BotsRootView.
     /// Attach the delete confirm here so right-click Delete is not a silent latch.
     private let attachDeleteConfirmation: Bool
+    private let isScheduledTasksSelected: Bool
+    private let onOpenScheduledTasks: (() -> Void)?
+    @State private var searchFocusRequest = false
 
-    public init(vm: BotsViewModel, attachDeleteConfirmation: Bool = false) {
+    public init(
+        vm: BotsViewModel,
+        attachDeleteConfirmation: Bool = false,
+        isScheduledTasksSelected: Bool = false,
+        onOpenScheduledTasks: (() -> Void)? = nil
+    ) {
         self.vm = vm
         self.attachDeleteConfirmation = attachDeleteConfirmation
+        self.isScheduledTasksSelected = isScheduledTasksSelected
+        self.onOpenScheduledTasks = onOpenScheduledTasks
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: DS.Space.xs) {
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
                 Button(action: vm.beginCreate) {
-                    actionRow(symbol: "plus", title: BotsChrome.Label.newBot)
+                    SidebarActionRow(symbol: "person.badge.plus", title: BotsChrome.Label.newBot)
                 }
                 .buttonStyle(.plain)
                 .disabled(!vm.isControlPlaneActive)
                 .help("Create a named teammate")
                 .accessibilityIdentifier("bots.new")
-                Button(action: vm.openAttention) {
-                    Image(systemName: vm.openAttentionCount == 0 ? "bell" : "bell.badge")
-                        .font(.system(size: 14, weight: .regular))
-                        .foregroundColor(vm.openAttentionCount == 0 ? DS.Palette.textSecondary : DS.Palette.warning)
-                        .frame(width: BotsChrome.hitTarget, height: BotsChrome.hitTarget)
-                        .contentShape(Rectangle())
+
+                Button(action: vm.openActiveBots) {
+                    SidebarActionRow(
+                        symbol: "bolt.horizontal.circle",
+                        title: BotsChrome.Label.activeBots,
+                        badgeText: PetActiveThreadCountFormatter.badgeText(count: vm.activeBotCount),
+                        badgeIsBlue: true
+                    )
                 }
                 .buttonStyle(.plain)
                 .help(
-                    vm.openAttentionCount == 0
-                        ? "Attention"
-                        : "Attention \(vm.openAttentionCount)"
+                    vm.activeBotCount == 0
+                        ? BotsChrome.Label.activeBots
+                        : "\(BotsChrome.Label.activeBots) \(vm.activeBotCount)"
                 )
                 .accessibilityLabel(
-                    vm.openAttentionCount == 0
-                        ? "Attention"
-                        : "Attention \(vm.openAttentionCount)"
+                    vm.activeBotCount == 0
+                        ? BotsChrome.Label.activeBots
+                        : "\(BotsChrome.Label.activeBots) \(vm.activeBotCount)"
                 )
-                .accessibilityIdentifier("bots.roster.attention")
+                .accessibilityIdentifier("bots.active")
+
+                if let onOpenScheduledTasks {
+                    Button(action: onOpenScheduledTasks) {
+                        SidebarActionRow(
+                            symbol: "calendar.badge.clock",
+                            title: BotsChrome.Label.scheduleTasks,
+                            isSelected: isScheduledTasksSelected
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help("Create and manage scheduled Agent tasks")
+                    .accessibilityIdentifier("bots.scheduleTasks")
+                    .accessibilityAddTraits(isScheduledTasksSelected ? .isSelected : [])
+                }
             }
             .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.lg)
@@ -3290,26 +3818,11 @@ public struct BotsRosterList: View {
             .padding(.horizontal, DS.Space.lg)
             .padding(.bottom, DS.Space.sm)
 
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12, weight: .regular))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityHidden(true)
-                TextField(BotsChrome.Label.search, text: $vm.searchText)
-                    .textFieldStyle(.plain)
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                    .accessibilityLabel(BotsChrome.Label.search)
-            }
-            .padding(.horizontal, DS.Space.sm)
-            .frame(minHeight: BotsChrome.hitTarget)
-            .background(
-                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .fill(DS.Palette.surfaceRaised.opacity(0.6))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(DS.Palette.lineStrong.opacity(0.5), lineWidth: DS.Border.hairline)
-                    )
+            SidebarSearchField(
+                placeholder: BotsChrome.Label.search,
+                text: $vm.searchText,
+                focusRequest: $searchFocusRequest,
+                accessibilityIdentifier: "bots.roster.search"
             )
             .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.sm)
@@ -3334,27 +3847,6 @@ public struct BotsRosterList: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityIdentifier("bots.roster")
         .modifier(BotsDeleteConfirmation(vm: vm, enabled: attachDeleteConfirmation))
-    }
-
-    private func actionRow(symbol: String, title: String) -> some View {
-        HStack(spacing: DS.Space.md) {
-            Image(systemName: symbol)
-                .font(.system(size: 16, weight: .regular))
-                .frame(width: 20, height: 20)
-                .foregroundColor(DS.Palette.text)
-            Text(title)
-                .font(DS.Font.body)
-                .foregroundColor(DS.Palette.text)
-                .lineLimit(1)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, DS.Space.sm)
-        .frame(minHeight: BotsChrome.hitTarget)
-        .contentShape(Rectangle())
-        .background(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .fill(Color.white.opacity(0.001))
-        )
     }
 
     private func rosterStatusColor(_ state: BotAttentionState) -> Color {
@@ -3900,7 +4392,10 @@ public struct BotsRootView: View {
 
     private var studioProvider: some View {
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            studioSectionHeader(BotsChrome.Label.providerRouting, caption: BotRoute.fallbackOrderHonesty)
+            studioSectionHeader(
+                BotsChrome.Label.providerRouting,
+                caption: "\(BotRoute.fallbackOrderHonesty) Desk composer can pick a different provider and model per send."
+            )
             HStack(alignment: .top, spacing: DS.Space.xl) {
                 labeledField("Default route") {
                     Picker("Provider", selection: $vm.studioDraft.provider) {
@@ -4169,6 +4664,9 @@ public struct BotsRootView: View {
                 deskTimeline(bot)
                 if !vm.queuedFollowUps.isEmpty {
                     deskQueuedFollowUps
+                }
+                if !vm.botMentionSuggestions.isEmpty {
+                    botMentionPicker
                 }
                 composerBar(bot)
             }
@@ -4545,7 +5043,15 @@ public struct BotsRootView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.top, DS.Space.xl)
                     }
-                    ForEach(vm.deskTimeline) { item in
+                    ForEach(Array(vm.deskTimeline.enumerated()), id: \.element.id) { index, item in
+                        if let group = deskPeerGroupCaption(at: index) {
+                            Text(group)
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .frame(maxWidth: .infinity)
+                                .padding(.top, DS.Space.md)
+                                .accessibilityIdentifier("bots.desk.peer.group")
+                        }
                         switch item {
                         case .message(let message):
                             deskBubble(message, columnWidth: geo.size.width)
@@ -4577,22 +5083,55 @@ public struct BotsRootView: View {
     }
 
     private func deskBubble(_ message: BotDeskMessage, columnWidth: CGFloat) -> some View {
-        Group {
-            if message.role == .user {
-                AgentChatUserBubble(
-                    text: message.text,
-                    createdAt: message.createdAt,
-                    columnWidth: columnWidth,
-                    accessibilityIdentifier: "agent.userMessageBubble",
-                    roleIdentifier: "bots.desk.role.user"
-                )
-            } else {
-                AgentChatAssistantReply(
-                    text: message.text,
-                    roleIdentifier: "bots.desk.role.assistant"
+        VStack(alignment: .center, spacing: DS.Space.sm) {
+            if let peer = message.peer {
+                HStack(spacing: DS.Space.sm) {
+                    Spacer(minLength: 0)
+                    Text(peer.caption)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                    BotsAvatarView(name: peer.name, handle: peer.handle, size: 18)
+                }
+                .accessibilityIdentifier(
+                    message.peer?.direction == .messaged
+                        ? "bots.desk.peer.messaged"
+                        : "bots.desk.peer.from"
                 )
             }
+            Group {
+                if message.role == .user {
+                    AgentChatUserBubble(
+                        text: message.text,
+                        createdAt: message.createdAt,
+                        columnWidth: columnWidth,
+                        accessibilityIdentifier: "agent.userMessageBubble",
+                        roleIdentifier: "bots.desk.role.user"
+                    )
+                } else {
+                    AgentChatAssistantReply(
+                        text: message.text,
+                        roleIdentifier: "bots.desk.role.assistant"
+                    )
+                }
+            }
         }
+    }
+
+    private func deskPeerGroupCaption(at index: Int) -> String? {
+        let items = vm.deskTimeline
+        guard items.indices.contains(index),
+              case .message(let message) = items[index],
+              let peer = message.peer else { return nil }
+        if index > 0, case .message(let previous) = items[index - 1], previous.peer?.botID == peer.botID {
+            return nil
+        }
+        var count = 0
+        for later in items[index...] {
+            guard case .message(let next) = later, next.peer?.botID == peer.botID else { break }
+            count += 1
+        }
+        guard count >= 2 else { return nil }
+        return peer.groupCaption(count: count)
     }
 
     private func deskWorkLogRow(_ row: BotDeskWorkLogRow) -> some View {
@@ -4676,6 +5215,43 @@ public struct BotsRootView: View {
         .accessibilityIdentifier("bots.desk.queued")
     }
 
+    private var botMentionPicker: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(vm.botMentionSuggestions, id: \.id) { bot in
+                Button {
+                    vm.applyBotMention(bot)
+                } label: {
+                    HStack(spacing: DS.Space.md) {
+                        BotsAvatarView(name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol, size: 22)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(bot.name)
+                                .font(DS.Font.body)
+                                .foregroundColor(DS.Palette.text)
+                            Text("@\(bot.handle)")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.textTertiary)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, DS.Space.lg)
+                    .padding(.vertical, DS.Space.sm)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("bots.desk.mention.\(bot.handle)")
+            }
+        }
+        .background(DS.Palette.surfaceRaised.opacity(0.85))
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.bottom, DS.Space.sm)
+        .accessibilityIdentifier("bots.desk.mention")
+    }
+
     private func composerBar(_ bot: BotDefinition) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             AgentChatComposerBar(
@@ -4692,9 +5268,190 @@ public struct BotsRootView: View {
                 onAttach: { vm.addAttachments($0) },
                 onRemoveAttachment: { vm.removeAttachment($0) },
                 composerIdentifier: "bots.desk.composer",
-                sendIdentifier: "bots.desk.send"
+                sendIdentifier: "bots.desk.send",
+                leadingControls: AnyView(deskRoutingControls)
             )
         }
+    }
+
+    private var deskRoutingControls: some View {
+        HStack(spacing: DS.Space.sm) {
+            deskRunAsChip
+            deskSourceMenu
+            deskModelMenu
+            deskPermissionMenu
+            deskExecutionChip
+        }
+    }
+
+    private var deskRoutingLocked: Bool { vm.deskRunIsLive }
+
+    private var deskRunAsChip: some View {
+        let name = AgentRunAsUser.current().shortName
+        return deskChip(
+            icon: "lock.fill",
+            title: name,
+            identifier: "bots.desk.runAs",
+            help: "Provider processes run as macOS user \(name)"
+        )
+    }
+
+    private var deskSourceMenu: some View {
+        let entries = AgentSourceCapsulePresentation.menuEntries(
+            snapshots: vm.providers,
+            selectedSnapshotId: vm.deskRouting.providerInstanceID,
+            selectedProvider: vm.deskRouting.provider,
+            providerDisplayName: vm.providerChipTitle
+        )
+        let label = AgentSourceCapsulePresentation.capsuleLabel(
+            selected: vm.selectedDeskSnapshot,
+            fallbackProvider: vm.deskRouting.provider,
+            fallbackInstanceId: vm.deskRouting.providerInstanceID,
+            snapshots: vm.providers
+        )
+        return Menu {
+            ForEach(entries, id: \.id) { entry in
+                Button {
+                    if let snapshot = vm.providers.first(where: { $0.id == entry.id }) {
+                        vm.setDeskProvider(snapshot.provider, instanceID: snapshot.id)
+                    } else if let provider = AgentProvider(rawValue: entry.id) {
+                        vm.setDeskProvider(provider)
+                    }
+                } label: {
+                    if entry.isSelected { Image(systemName: "checkmark") }
+                    Text(entry.title)
+                }
+                .disabled(deskRoutingLocked)
+            }
+        } label: {
+            deskChipLabel(icon: "lock.fill", title: label, chevron: true)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(deskRoutingLocked)
+        .help("Choose which Claude, Codex, or Grok account runs this send")
+        .accessibilityLabel("Account \(label)")
+        .accessibilityIdentifier("bots.desk.source")
+    }
+
+    private var deskModelMenu: some View {
+        let auto = vm.deskRouting.routingMode == .auto
+        let title = auto ? "Auto" : (vm.deskRouting.model.isEmpty ? "Auto" : vm.deskRouting.model)
+        return Menu {
+            Button {
+                vm.setDeskRoutingMode(.auto)
+            } label: {
+                if auto { Image(systemName: "checkmark") }
+                Text("Auto")
+            }
+            .disabled(deskRoutingLocked)
+            let models = vm.deskModels
+            if !models.isEmpty { Divider() }
+            ForEach(models, id: \.self) { model in
+                Button {
+                    vm.setDeskModel(model)
+                } label: {
+                    if !auto && model == vm.deskRouting.model { Image(systemName: "checkmark") }
+                    Text(model)
+                }
+                .disabled(deskRoutingLocked)
+            }
+        } label: {
+            deskChipLabel(icon: nil, title: title, chevron: true)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(deskRoutingLocked)
+        .help("Model")
+        .accessibilityLabel("Model \(title)")
+        .accessibilityIdentifier("bots.desk.model")
+    }
+
+    private var deskPermissionMenu: some View {
+        let selected = vm.deskRouting.permissionMode
+        return Menu {
+            ForEach(vm.deskPermissionModes, id: \.self) { mode in
+                Button {
+                    vm.setDeskPermissionMode(mode)
+                } label: {
+                    if mode == selected { Image(systemName: "checkmark") }
+                    Text(deskPermissionTitle(mode))
+                }
+                .disabled(deskRoutingLocked)
+            }
+        } label: {
+            deskChipLabel(
+                icon: selected == .fullAccess ? "exclamationmark.shield.fill" : "lock.shield",
+                title: deskPermissionTitle(selected),
+                chevron: true,
+                tone: selected == .fullAccess ? DS.Palette.danger : DS.Palette.textSecondary
+            )
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(deskRoutingLocked)
+        .help("Permission mode")
+        .accessibilityLabel("Permission \(deskPermissionTitle(selected))")
+        .accessibilityIdentifier("bots.desk.permission")
+    }
+
+    private var deskExecutionChip: some View {
+        let title = vm.studioWorkspaceLabel == "None" ? "Local" : vm.studioWorkspaceLabel
+        return deskChip(
+            icon: "folder",
+            title: title,
+            identifier: "bots.desk.execution",
+            help: "Runs in the current workspace"
+        )
+    }
+
+    private func deskPermissionTitle(_ mode: AgentPermissionMode) -> String {
+        switch mode {
+        case .supervised: return "Supervised"
+        case .autoAcceptEdits: return "Auto-edit"
+        case .fullAccess: return "Full access"
+        }
+    }
+
+    private func deskChip(icon: String, title: String, identifier: String, help: String) -> some View {
+        deskChipLabel(icon: icon, title: title, chevron: false)
+            .help(help)
+            .accessibilityLabel(title)
+            .accessibilityIdentifier(identifier)
+    }
+
+    private func deskChipLabel(
+        icon: String?,
+        title: String,
+        chevron: Bool,
+        tone: Color = DS.Palette.textSecondary
+    ) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            if let icon {
+                Image(systemName: icon)
+                    .font(.system(size: 10))
+            }
+            Text(title)
+                .font(DS.Font.caption.weight(.medium))
+                .lineLimit(1)
+            if chevron {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+            }
+        }
+        .fixedSize()
+        .foregroundColor(tone)
+        .padding(.horizontal, DS.Space.sm)
+        .padding(.vertical, DS.Space.xs)
+        .background(tone == DS.Palette.danger ? tone.opacity(0.13) : DS.Palette.surfaceRaised)
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
     }
 
     // MARK: Memory

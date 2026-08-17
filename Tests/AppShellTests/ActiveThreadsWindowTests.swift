@@ -18,9 +18,10 @@ final class ActiveThreadsWindowTests: XCTestCase {
         let activeThreads = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.activeThreads\")"))
         let scheduleTasks = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
         let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
+        XCTAssertLessThan(reportBug.lowerBound, newWorkspace.lowerBound,
+                          "Report Bug is a header icon, not a dest row under Active Threads")
         XCTAssertLessThan(newWorkspace.lowerBound, activeThreads.lowerBound)
         XCTAssertLessThan(activeThreads.lowerBound, scheduleTasks.lowerBound)
-        XCTAssertLessThan(scheduleTasks.lowerBound, reportBug.lowerBound)
     }
 
     func test_sidebarActiveThreadsBadgeUsesPetFormatter_becauseCountMustMatchPetBlueBadge() throws {

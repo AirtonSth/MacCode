@@ -220,6 +220,7 @@ public struct AgentChatComposerBar: View {
     public let onRemoveAttachment: (AgentAttachment) -> Void
     public var composerIdentifier: String = "bots.desk.composer"
     public var sendIdentifier: String = "bots.desk.send"
+    public var leadingControls: AnyView?
 
     public init(
         text: Binding<String>,
@@ -235,7 +236,8 @@ public struct AgentChatComposerBar: View {
         onAttach: @escaping ([String]) -> Void = { _ in },
         onRemoveAttachment: @escaping (AgentAttachment) -> Void = { _ in },
         composerIdentifier: String = "bots.desk.composer",
-        sendIdentifier: String = "bots.desk.send"
+        sendIdentifier: String = "bots.desk.send",
+        leadingControls: AnyView? = nil
     ) {
         self._text = text
         self.attachments = attachments
@@ -251,6 +253,7 @@ public struct AgentChatComposerBar: View {
         self.onRemoveAttachment = onRemoveAttachment
         self.composerIdentifier = composerIdentifier
         self.sendIdentifier = sendIdentifier
+        self.leadingControls = leadingControls
     }
 
     public var body: some View {
@@ -296,6 +299,9 @@ public struct AgentChatComposerBar: View {
                 .help("Attach files")
                 .accessibilityLabel("Attach files")
                 .accessibilityIdentifier("agent.attach")
+                if let leadingControls {
+                    leadingControls
+                }
                 Spacer(minLength: 0)
                 if runActive {
                     stopButton

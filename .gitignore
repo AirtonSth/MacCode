@@ -2,6 +2,7 @@
 .swiftpm/
 .references/
 dist/
+.rc-autoloops/
 DerivedData/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/

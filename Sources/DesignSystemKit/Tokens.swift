@@ -120,6 +120,14 @@ public enum DS {
         public static let hairline: CGFloat = 1
     }
 
+    // MARK: Control sizes
+
+    public enum Control {
+        /// Sidebar search / filter field. Workspaces and Bots share this
+        /// so the two modes do not paint different-sized boxes.
+        public static let sidebarSearchHeight: CGFloat = 30
+    }
+
     // MARK: Resize dividers
 
     public enum ResizeDivider {

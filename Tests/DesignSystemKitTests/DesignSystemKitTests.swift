@@ -78,6 +78,17 @@ final class DSRadiusTests: XCTestCase {
     }
 }
 
+// MARK: - DS.Control
+
+final class DSControlTests: XCTestCase {
+
+    func test_sidebarSearchHeight_is30() {
+        // WHY: Workspaces filter and Search bots share this token so the
+        // Agentic | Bots sidebar modes cannot paint different-sized boxes.
+        XCTAssertEqual(DS.Control.sidebarSearchHeight, 30)
+    }
+}
+
 // MARK: - DS.Border
 
 final class DSBorderTests: XCTestCase {
