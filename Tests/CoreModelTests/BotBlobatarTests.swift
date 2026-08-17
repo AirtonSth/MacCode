@@ -30,4 +30,30 @@ final class BotBlobatarTests: XCTestCase {
         let shapes = (0..<40).map { BotBlobatar.figure(name: "seed-\($0)", spec: spec).resolvedShape }
         XCTAssertGreaterThan(Set(shapes).count, 1)
     }
+
+    func test_motionSampleIsDeterministic_becauseAReplayMustMatchTheLiveFace() {
+        // WHY: TimelineView re-samples time. The same instant has to
+        // draw the same breathe/blink or the face flickers.
+        let a = BotBlobatarMotion.sample(name: "Piper", time: 12.4, expression: .idle, amplitude: 1)
+        let b = BotBlobatarMotion.sample(name: "Piper", time: 12.4, expression: .idle, amplitude: 1)
+        XCTAssertEqual(a, b)
+        XCTAssertNotEqual(a, BotBlobatarMotion.still)
+    }
+
+    func test_motionPhaseDiffersByName_becauseARosterMustNotBreatheInUnison() {
+        // WHY: Seeded phase is what makes a grid a crowd instead of a
+        // drill team. Two names at the same clock must not match.
+        let a = BotBlobatarMotion.sample(name: "Piper", time: 8, expression: .idle, amplitude: 1)
+        let b = BotBlobatarMotion.sample(name: "Scout", time: 8, expression: .idle, amplitude: 1)
+        XCTAssertNotEqual(a.bobY, b.bobY)
+    }
+
+    func test_zeroAmplitudeIsStill_becauseReducedMotionAndFrozenTilesMustNotWiggle() {
+        // WHY: Picker tiles and prefers-reduced-motion gate on amplitude 0.
+        // A leftover sine would animate the editor grid.
+        XCTAssertEqual(
+            BotBlobatarMotion.sample(name: "Piper", time: 3, expression: .mad, amplitude: 0),
+            .still
+        )
+    }
 }

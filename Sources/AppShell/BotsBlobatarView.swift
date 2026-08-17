@@ -2,43 +2,87 @@ import SwiftUI
 import CoreModel
 import DesignSystemKit
 
-/// Frozen blobatar. Tiles stay still (bloub BotTile + frozenAt).
+/// Blobatar renderer. Picker tiles stay `.frozen` (bloub BotTile).
 public struct BotBlobatarView: View {
     public var name: String
     public var spec: BotBlobatarSpec
     public var size: CGFloat
+    public var motion: BotBlobatarMotionMode
 
-    public init(name: String, spec: BotBlobatarSpec, size: CGFloat) {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var hovering = false
+
+    public init(name: String, spec: BotBlobatarSpec, size: CGFloat, motion: BotBlobatarMotionMode = .frozen) {
         self.name = name
         self.spec = spec
         self.size = size
+        self.motion = motion
     }
 
     public var body: some View {
         let figure = BotBlobatar.figure(name: name, spec: spec)
-        Canvas { context, canvasSize in
-            let scale = min(canvasSize.width, canvasSize.height) / 100
-            let scaleOnly = CGAffineTransform(scaleX: scale, y: scale)
-            var transform = scaleOnly
-            if figure.bodyOffsetY != 0 {
-                transform = transform.translatedBy(x: 0, y: figure.bodyOffsetY)
-            }
-            if let plate = backgroundPath(figure) {
-                context.fill(Path(plate).applying(scaleOnly), with: .color(color(figure.palette.bg)))
-            }
-            let head = color(figure.palette.head)
-            for petal in figure.petals {
-                let rect = CGRect(x: petal.cx - petal.r, y: petal.cy - petal.r, width: petal.r * 2, height: petal.r * 2)
-                context.fill(Path(ellipseIn: rect).applying(transform), with: .color(head))
-            }
-            context.fill(bodyPath(figure).applying(transform), with: .color(head))
-            let eye = color(figure.palette.eye)
-            for capsule in figure.eyes {
-                context.fill(superellipse(capsule).applying(transform), with: .color(eye))
+        let paused = reduceMotion || motion == .frozen || (motion == .hover && !hovering)
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: paused)) { timeline in
+            let pose = paused
+                ? BotBlobatarMotion.still
+                : BotBlobatar.motion(
+                    name: name,
+                    time: timeline.date.timeIntervalSinceReferenceDate,
+                    expression: spec.expression,
+                    amplitude: 1
+                )
+            Canvas { context, canvasSize in
+                draw(figure: figure, motion: pose, in: context, canvasSize: canvasSize)
             }
         }
         .frame(width: size, height: size)
+        .onHover { hovering = $0 }
         .accessibilityHidden(true)
+    }
+
+    private func draw(
+        figure: BotBlobatarFigure,
+        motion: BotBlobatarMotion,
+        in context: GraphicsContext,
+        canvasSize: CGSize
+    ) {
+        let scale = min(canvasSize.width, canvasSize.height) / 100
+        let scaleOnly = CGAffineTransform(scaleX: scale, y: scale)
+        var body = scaleOnly
+        if figure.bodyOffsetY != 0 {
+            body = body.translatedBy(x: 0, y: figure.bodyOffsetY)
+        }
+        body = body
+            .translatedBy(x: 50 + motion.shakeX, y: 50 + motion.bobY + motion.shakeY)
+            .scaledBy(x: motion.breatheX, y: motion.breatheY)
+            .translatedBy(x: -50, y: -50)
+        if let plate = backgroundPath(figure) {
+            context.fill(Path(plate).applying(scaleOnly), with: .color(color(figure.palette.bg)))
+        }
+        let head = color(figure.palette.head)
+        for petal in figure.petals {
+            let rect = CGRect(x: petal.cx - petal.r, y: petal.cy - petal.r, width: petal.r * 2, height: petal.r * 2)
+            context.fill(Path(ellipseIn: rect).applying(body), with: .color(head))
+        }
+        context.fill(bodyPath(figure).applying(body), with: .color(head))
+        let ink = color(figure.palette.eye)
+        let glance = size >= 40 ? motion : BotBlobatarMotion(
+            breatheX: motion.breatheX,
+            breatheY: motion.breatheY,
+            bobY: motion.bobY,
+            blink: motion.blink,
+            glanceX: 0,
+            glanceY: 0,
+            shakeX: motion.shakeX,
+            shakeY: motion.shakeY
+        )
+        for capsule in figure.eyes {
+            var eye = body.translatedBy(x: glance.glanceX, y: glance.glanceY)
+            eye = eye.translatedBy(x: capsule.cx, y: capsule.cy)
+                .scaledBy(x: 1, y: glance.blink)
+                .translatedBy(x: -capsule.cx, y: -capsule.cy)
+            context.fill(superellipse(capsule).applying(eye), with: .color(ink))
+        }
     }
 
     private func backgroundPath(_ figure: BotBlobatarFigure) -> CGPath? {
@@ -209,7 +253,7 @@ struct BotBlobatarEditor: View {
     private func tile(label: String, selected: Bool, identifier: String, preview: BotBlobatarSpec, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             VStack(spacing: DS.Space.xs) {
-                BotBlobatarView(name: seed, spec: preview, size: 36)
+                BotBlobatarView(name: seed, spec: preview, size: 36, motion: .frozen)
                 Text(label)
                     .font(DS.Font.caption2)
                     .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
