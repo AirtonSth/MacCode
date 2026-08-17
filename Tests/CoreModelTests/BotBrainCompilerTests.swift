@@ -64,6 +64,8 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.compiledPayload, composed)
         XCTAssertEqual(receipt.payloadDigest, BotDigest.sha256Hex(composed))
         XCTAssertEqual(receipt.compilerVersion, ContextAssemblyReceipt.compilerVersion)
+        XCTAssertTrue(receipt.compiledPayload.contains("Memory:"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Trusted memory:"))
         XCTAssertTrue(receipt.compiledPayload.contains("Fact: Prefers dark mode"))
         XCTAssertTrue(receipt.compiledPayload.contains("Role: Scout"))
         XCTAssertFalse(receipt.compiledPayload.contains("You are Piper (@piper) — Scout"))
@@ -1001,7 +1003,8 @@ final class BotBrainCompilerTests: XCTestCase {
             memory: [live]
         )
         let key = BotBrainCompiler.mutateKey(live.id.value)
-        XCTAssertTrue(receipt.compiledPayload.contains("Trusted memory:"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Memory:"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Trusted memory:"))
         XCTAssertTrue(receipt.compiledPayload.contains("Fact: Prefers dark mode"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.memoryLine(live)))
         XCTAssertTrue(receipt.compiledPayload.contains(key))
@@ -1050,6 +1053,7 @@ final class BotBrainCompilerTests: XCTestCase {
             userText: "What do you remember?",
             memory: [forgotten]
         )
+        XCTAssertFalse(receipt.compiledPayload.contains("Memory:"))
         XCTAssertFalse(receipt.compiledPayload.contains("Trusted memory:"))
         XCTAssertFalse(receipt.compiledPayload.contains("Old secret"))
         XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(forgotten.id.value)))

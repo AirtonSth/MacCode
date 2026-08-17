@@ -1607,9 +1607,9 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_previewBrainIncludesAdvertisedMemoryMutateKey_becauseDestMustNotOmitForgetKeys() throws {
-        // WHY: Studio Memory already has Forget. Brain compile listed the
-        // fact without memory_id, so first-chat forget invented a UUID.
-        // Dest preview and compose must share the advertised key.
+        // WHY: Studio already says Memory. Compile headed facts with
+        // Trusted memory, so first-chat "what's in Memory?" invented a hop.
+        // Dest preview and compose must share the advertised heading.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
@@ -1620,6 +1620,8 @@ final class BotsWindowTests: XCTestCase {
         vm.composerText = "Forget the dark-mode fact"
         let preview = try XCTUnwrap(vm.previewBrain())
         let key = item.id.value.uuidString.lowercased()
+        XCTAssertTrue(preview.compiledPayload.contains("Memory:"))
+        XCTAssertFalse(preview.compiledPayload.contains("Trusted memory:"))
         XCTAssertTrue(preview.compiledPayload.contains("Fact: Prefers dark mode"))
         XCTAssertTrue(preview.compiledPayload.contains(key))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))

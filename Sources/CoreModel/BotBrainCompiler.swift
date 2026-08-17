@@ -227,7 +227,10 @@ public enum BotBrainCompiler {
         }
         let liveMemory = memory.filter { $0.forgottenAt == nil && $0.trusted }
         if !liveMemory.isEmpty {
-            lines.append("Trusted memory:")
+            // Studio already says Memory. Compile that name so first-chat
+            // "what's in Memory?" cannot invent a hop. Forgotten and
+            // untrusted stay out.
+            lines.append("Memory:")
             lines.append(contentsOf: liveMemory.map(Self.memoryLine))
         }
         let enabled = skills.filter(\.enabled).map(\.skillID).sorted()
