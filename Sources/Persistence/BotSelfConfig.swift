@@ -73,7 +73,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case saveRoutine:
             return "Create or update a routine's name, instruction, or when. Same path as Studio Save routine."
         case setRoutineEnabled:
-            return "Enable or disable one of this bot's routines."
+            return "Set a routine Active or Off. Same path as Studio Active."
         default:
             return name
         }

@@ -217,6 +217,21 @@ final class BotTypesTests: XCTestCase {
         )
     }
 
+    func test_admittedToolsNameRoutineActive_becauseStudioSaysActiveNotOnOrOff() {
+        // WHY: Studio already says Active and set_routine_enabled already
+        // persists that key. Tools said on or off, so first-chat "set this
+        // Active" invented a hop. Hermes agents persist the advertised
+        // toggle name. Schema key stays enabled.
+        let tools = BotStandingInstructions.admittedToolsText
+        XCTAssertTrue(tools.contains("set a routine Active or Off"))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.setRoutineEnabledTool))
+        XCTAssertFalse(tools.contains("on or off"), "advertised Active replaces leftover on/off")
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Active or Off"),
+            "tools layer owns Active"
+        )
+    }
+
     func test_controlPlaneFlags_failClosed_becauseLaterPhasesMustNotRunWithoutTheShippedSlice() {
         let defaults = BotControlPlaneFlags()
         XCTAssertTrue(defaults.isBotControlPlaneActive, "P1a ships the control plane on")

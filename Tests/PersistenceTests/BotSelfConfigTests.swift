@@ -572,6 +572,8 @@ final class BotSelfConfigTests: XCTestCase {
     func test_setRoutineEnabledCatalogDescribesActive_becauseThatIsTheStudioField() {
         // WHY: Schema key stays enabled. Description must name Active so
         // first-chat does not invent a hop.
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setRoutineEnabled)
+        XCTAssertEqual(description, "Set a routine Active or Off. Same path as Studio Active.")
         let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setRoutineEnabled)
         let properties = schema["properties"] as? [String: Any]
         XCTAssertNotNil(properties?["enabled"])

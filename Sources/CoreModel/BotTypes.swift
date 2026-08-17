@@ -282,7 +282,7 @@ public enum BotStandingInstructions {
         "When asked to remember a fact, call \(rememberFactTool). When asked to change your name, job, standing instructions, description, route, notifications, or avatar, call \(changeJobTool)."
 
     public static let generatedMutateLine =
-        "When asked to forget a fact, call \(forgetFactTool). When asked to correct a fact, call \(correctFactTool). When asked to add a skill or set it Enabled or Off, call \(setSkillTool). When asked to remove a skill, call \(removeSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to turn a routine on or off, call \(setRoutineEnabledTool)."
+        "When asked to forget a fact, call \(forgetFactTool). When asked to correct a fact, call \(correctFactTool). When asked to add a skill or set it Enabled or Off, call \(setSkillTool). When asked to remove a skill, call \(removeSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to set a routine Active or Off, call \(setRoutineEnabledTool)."
 
     public static let generatedBrowserLine =
         "When asked to open a website, call \(openBrowserTool). When asked what is open in that browser, call \(getBrowserTool). When asked to wait for a login, call \(waitLoginTool). That browser is this teammate's, not the user's."
