@@ -3,7 +3,8 @@ import CoreModel
 import DesignSystemKit
 
 /// Visible Bots chrome and Bots-only visual tokens.
-/// Mockups use a violet primary; global DS accent stays cyan for the rest of the shell.
+/// Bots surfaces speak the global DS language (accent, surfaces, radii);
+/// only per-bot avatar identity colors are local to Bots.
 public enum BotsChrome {
     public enum Label {
         public static let agentic = "Agentic"
@@ -26,6 +27,7 @@ public enum BotsChrome {
         public static let instructions = "Instructions"
         public static let configurationSummary = "Configuration summary"
         public static let security = "Security"
+        public static let notifications = "Notifications"
         public static let desktop = "Desktop"
         public static let brain = "Brain"
         public static let source = "Source"
@@ -35,10 +37,6 @@ public enum BotsChrome {
         public static let honesty = BotDesktopKind.logicalExecutionSpaceHonestyLabel
     }
 
-    /// Violet primary from the plan mockups (not the global DS cyan).
-    public static let primary = Color(hex: 0x7B5CFF)
-    public static let onPrimary = Color.white
-    public static let primarySoft = Color(hex: 0x7B5CFF).opacity(0.16)
     public static let hitTarget: CGFloat = 44
     public static let rosterWidth: CGFloat = 272
     public static let desktopPaneWidth: CGFloat = 340
@@ -70,6 +68,8 @@ public enum BotsChrome {
         Label.instructions,
         Label.configurationSummary,
         Label.security,
+        Label.notifications,
+        Label.desktop,
         Label.brain,
         Label.brainPreviewHonesty,
         Label.brainReceiptHonesty,
@@ -98,7 +98,7 @@ public enum BotsChrome {
 
     public static func statusTitle(for state: BotAttentionState) -> String {
         switch state {
-        case .working: return "Busy"
+        case .working: return "Working"
         case .needsAttention: return "Needs you"
         case .unreadActivity: return "Unread"
         case .none: return "Online"
@@ -109,11 +109,14 @@ public enum BotsChrome {
 public struct BotsAvatarView: View {
     public let name: String
     public let handle: String
+    /// Chosen SF Symbol avatar; nil falls back to name initials.
+    public var symbol: String?
     public var size: CGFloat = 36
 
-    public init(name: String, handle: String, size: CGFloat = 36) {
+    public init(name: String, handle: String, symbol: String? = nil, size: CGFloat = 36) {
         self.name = name
         self.handle = handle
+        self.symbol = symbol
         self.size = size
     }
 
@@ -122,26 +125,37 @@ public struct BotsAvatarView: View {
         ZStack {
             RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
                 .fill(ink)
-            Text(BotsChrome.initials(for: name))
-                .font(.system(size: max(11, size * 0.36), weight: .bold))
-                .foregroundColor(.white)
+            if let symbol {
+                Image(systemName: symbol)
+                    .font(.system(size: max(11, size * 0.42), weight: .semibold))
+                    .foregroundColor(.white)
+            } else {
+                Text(BotsChrome.initials(for: name))
+                    .font(.system(size: max(11, size * 0.36), weight: .bold))
+                    .foregroundColor(.white)
+            }
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
     }
 }
 
+/// DS primary button at the Bots 44pt hit target (DSPrimaryButtonStyle is shorter).
 public struct BotsPrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var hovering = false
     public init() {}
 
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(DS.Font.body.weight(.semibold))
-            .foregroundColor(BotsChrome.onPrimary)
+            .foregroundColor(DS.Palette.onAccent)
             .frame(minHeight: BotsChrome.hitTarget)
             .padding(.horizontal, DS.Space.xl)
-            .background(BotsChrome.primary.opacity(configuration.isPressed ? 0.82 : 1))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .background(DS.Palette.accent.opacity(configuration.isPressed ? 0.82 : 1))
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .opacity(DSButtonOpacity.effectiveOpacity(isEnabled: isEnabled, isHovering: hovering))
+            .onHover { hovering = $0 }
     }
 }
 
