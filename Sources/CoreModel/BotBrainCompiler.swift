@@ -141,8 +141,8 @@ public enum BotBrainCompiler {
 
     /// Studio already says Approval mode. Compile listed Permission, so
     /// first-chat "what's your Approval mode?" invented a hop. Desk always
-    /// launches supervised. Leftover permission_mode writes coerce, so
-    /// first-chat "set Approval mode to full access" invented a write.
+    /// launches supervised. Leftover permission_mode writes reject, so
+    /// first-chat "set Approval mode to full access" cannot invent a write.
     /// Hermes permission is host-pinned. Compile that so the model does
     /// not invent a persist. Dest Source title stays Permission.
     public static let approvalModeHostAssignedHonesty = "Host-assigned. Not a self-config write."

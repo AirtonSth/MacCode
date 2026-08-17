@@ -609,10 +609,11 @@ public struct BotSelfConfigService: Sendable {
             throw BotSelfConfigError.invalid(BotBrainCompiler.workspaceHostAssignedHonesty)
         }
         // Studio already says Approval mode. Compile already labels that
-        // honesty. A leftover Approval mode / approval write used to
-        // return an empty success, so first-chat invented a persist.
-        // Schema does not grow an approval_mode key. Leftover
-        // permission_mode still coerces. Dest title stays Permission.
+        // honesty. A leftover Approval mode / approval / permission_mode
+        // write used to coerce to supervised and return success, so
+        // first-chat invented a persist. Schema does not grow an
+        // approval_mode or permission_mode key. Leftover desktop_kind
+        // still coerces. Dest title stays Permission.
         if arguments.keys.contains(where: Self.isAdvertisedApprovalModeKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.approvalModeHostAssignedHonesty)
         }
@@ -628,7 +629,7 @@ public struct BotSelfConfigService: Sendable {
         // Allow once / Deny stay off. A leftover Approvals / allow_once
         // / deny write used to return an empty success, so first-chat
         // invented a persist. Schema does not grow an approvals key.
-        // Leftover permission_mode still coerces. Dest title stays
+        // Leftover permission_mode now rejects. Dest title stays
         // Permission.
         if arguments.keys.contains(where: Self.isAdvertisedApprovalsKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.approvalsHonesty)
@@ -637,7 +638,7 @@ public struct BotSelfConfigService: Sendable {
         // already labels they stay off. A leftover Host-brokered writes
         // / effects write used to return an empty success, so first-chat
         // invented a persist. Schema does not grow a host_brokered_writes
-        // or effects key. Leftover permission_mode still coerces. Dest
+        // or effects key. Leftover permission_mode now rejects. Dest
         // title stays Permission.
         if arguments.keys.contains(where: Self.isAdvertisedHostBrokeredWritesKey) {
             throw BotSelfConfigError.invalid(BotPermission.honestyLabel)
@@ -741,12 +742,6 @@ public struct BotSelfConfigService: Sendable {
                 patch.model = model
             }
         }
-        if let raw = arguments["permission_mode"] as? String {
-            guard let mode = AgentPermissionMode(rawValue: raw) else {
-                throw BotSelfConfigError.invalid("Unknown permission mode: \(raw)")
-            }
-            patch.permissionMode = mode
-        }
         if let raw = arguments["desktop_kind"] as? String {
             guard let kind = BotDesktopKind(rawValue: raw) else {
                 throw BotSelfConfigError.invalid("Unknown desktop kind: \(raw)")
@@ -788,12 +783,13 @@ public struct BotSelfConfigService: Sendable {
 
     /// approval_mode is not a schema key. Studio / compile advertise the
     /// name, so parse must fail loud instead of succeeding empty.
-    /// Leftover permission_mode stays a coerce path, not this reject.
+    /// Leftover permission_mode is the same host-assigned write.
     static func isAdvertisedApprovalModeKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "approval"
             || normalized == "approval_mode"
             || normalized == "permission"
+            || normalized == "permission_mode"
     }
 
     /// desktop is not a schema key. Studio / compile advertise the name,
@@ -806,8 +802,8 @@ public struct BotSelfConfigService: Sendable {
 
     /// approvals is not a schema key. Studio / compile advertise the
     /// name, so parse must fail loud instead of succeeding empty.
-    /// Leftover permission_mode and advertised Approval mode stay their
-    /// own paths, not this reject.
+    /// Leftover permission_mode and advertised Approval mode stay on
+    /// the Approval mode reject, not this path.
     static func isAdvertisedApprovalsKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "approvals"
@@ -818,7 +814,7 @@ public struct BotSelfConfigService: Sendable {
 
     /// host_brokered_writes is not a schema key. Studio / compile
     /// advertise the name, so parse must fail loud instead of succeeding
-    /// empty. Leftover permission_mode stays a coerce path, not this
+    /// empty. Leftover permission_mode stays on the Approval mode
     /// reject. Settings Effects is the same advertised field.
     static func isAdvertisedHostBrokeredWritesKey(_ key: String) -> Bool {
         let normalized = key.lowercased()
