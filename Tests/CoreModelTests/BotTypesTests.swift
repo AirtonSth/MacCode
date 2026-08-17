@@ -118,6 +118,7 @@ final class BotTypesTests: XCTestCase {
         // refresh the starter, but a written soul must stay untouched.
         let starter = BotStandingInstructions.fallback(name: "New Agent", title: "", description: "")
         XCTAssertFalse(starter.contains("You are"), "identity layer owns the name")
+        XCTAssertFalse(starter.contains("@"), "identity layer owns the handle")
         XCTAssertTrue(starter.contains(BotStandingInstructions.rememberFactTool))
         XCTAssertTrue(starter.contains(BotStandingInstructions.changeJobTool))
         XCTAssertTrue(starter.contains(BotStandingInstructions.forgetFactTool))

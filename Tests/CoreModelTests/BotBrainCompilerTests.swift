@@ -163,6 +163,7 @@ final class BotBrainCompilerTests: XCTestCase {
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "qual seu nome?")
         let composed = BotBrainCompiler.composeRunPrompt(bot: bot, revision: revision, userText: "qual seu nome?")
         XCTAssertEqual(receipt.compiledPayload, composed)
+        XCTAssertTrue(receipt.compiledPayload.contains("You are New Agent (@new-agent)."))
         XCTAssertTrue(receipt.compiledPayload.contains("Standing instructions:"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         let layer = receipt.layers.first { $0.kind == .soul }
@@ -219,7 +220,7 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Go")
-        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper — Reviews PRs."))
+        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper) — Reviews PRs."))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.rememberFactTool))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.forgetFactTool))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.setSkillTool))
@@ -263,6 +264,43 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .permission })?.reason,
             "Advertised supervised route. Leftover full-access kinds compile as supervised."
+        )
+    }
+
+    func test_handleHonestyCompilesForCustomSoul_becauseDeskAddressIsNotAnEscapeHatch() {
+        // WHY: Desk already shows @handle. Brain compile never sent it, so
+        // first-chat "what's your handle?" invented one. Handle is advertised
+        // identity — a written soul must not hide it.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's your handle?")
+        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper) — Scout."))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .identity })?.included, true)
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .identity })?.text, "You are Piper (@piper) — Scout.")
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .identity })?.reason,
+            "Name, handle, and role compile into the identity line."
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("@piper"),
+            "handle honesty is a compiler layer, not starter soul"
         )
     }
 
@@ -343,6 +381,7 @@ final class BotBrainCompilerTests: XCTestCase {
                 ),
             ]
         )
+        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper) — Scout."))
         XCTAssertTrue(receipt.compiledPayload.contains("Enabled routines (not while the app is closed):"))
         XCTAssertTrue(receipt.compiledPayload.contains("Morning scan (Weekdays 9:00): Scan overnight failures"))
         XCTAssertFalse(receipt.compiledPayload.contains("Nightly archive"))

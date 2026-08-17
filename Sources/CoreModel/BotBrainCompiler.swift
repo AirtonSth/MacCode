@@ -157,9 +157,8 @@ public enum BotBrainCompiler {
         routines: [BotRoutine] = []
     ) -> String {
         var lines: [String] = []
-        let job = [bot.name, revision.title].filter { !$0.isEmpty }.joined(separator: " — ")
-        if !job.isEmpty {
-            lines.append("You are \(job).")
+        if let identity = identityLine(name: bot.name, handle: bot.handle, title: revision.title) {
+            lines.append(identity)
         }
         lines.append("Working space: \(workingSpaceText(for: revision))")
         lines.append("Permission: \(BotPermission.honestyLabel)")
@@ -201,6 +200,23 @@ public enum BotBrainCompiler {
         revision.desktopKind.advertisedOrLogical.honestyLabel
     }
 
+    /// Desk already shows `@handle`. Compile it so first-chat "what's your handle?"
+    /// cannot invent one. Custom soul must not hide advertised identity.
+    static func identityLine(name: String, handle: String, title: String) -> String? {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let handle = handle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        var who = name
+        if !handle.isEmpty {
+            let tagged = "@\(handle)"
+            who = who.isEmpty ? tagged : "\(who) (\(tagged))"
+        }
+        if !title.isEmpty {
+            who = who.isEmpty ? title : "\(who) — \(title)"
+        }
+        return who.isEmpty ? nil : "You are \(who)."
+    }
+
     static func routineLine(_ routine: BotRoutine) -> String {
         let name = routine.definition.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let prompt = routine.definition.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -220,16 +236,15 @@ public enum BotBrainCompiler {
         routines: [BotRoutine]
     ) -> [BotContextLayer] {
         var layers: [BotContextLayer] = []
-        let job = [bot.name, revision.title].filter { !$0.isEmpty }.joined(separator: " — ")
-        if job.isEmpty {
+        if let identity = identityLine(name: bot.name, handle: bot.handle, title: revision.title) {
             layers.append(
                 BotContextLayer(
                     id: "identity",
                     kind: .identity,
                     title: "Identity",
-                    text: "",
-                    included: false,
-                    reason: "Name and role are empty."
+                    text: identity,
+                    included: true,
+                    reason: "Name, handle, and role compile into the identity line."
                 )
             )
         } else {
@@ -238,9 +253,9 @@ public enum BotBrainCompiler {
                     id: "identity",
                     kind: .identity,
                     title: "Identity",
-                    text: "You are \(job).",
-                    included: true,
-                    reason: "Name and role compile into the identity line."
+                    text: "",
+                    included: false,
+                    reason: "Name, handle, and role are empty."
                 )
             )
         }
