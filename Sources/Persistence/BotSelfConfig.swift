@@ -533,7 +533,11 @@ public struct BotSelfConfigService: Sendable {
         case BotSelfConfigCatalog.forgetMemory:
             return try forgetMemory(id: BotMemoryItemID(try Self.parseUUID(arguments["memory_id"], label: "memory_id")))
         case BotSelfConfigCatalog.correctMemory:
-            guard let content = Self.firstString(arguments, keys: ["content", "fact"]) else {
+            // Tools and Studio say Correct. Schema key stays content.
+            // set_settings leftover correct already rejects and points
+            // here, so first-chat retried correct on correct_memory.
+            // Accept that advertised name on the existing persist path.
+            guard let content = Self.firstString(arguments, keys: ["content", "fact", "correct", "correct_fact"]) else {
                 throw BotSelfConfigError.invalid("Memory content is required.")
             }
             return try correctMemory(

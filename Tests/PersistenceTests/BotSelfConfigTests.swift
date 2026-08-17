@@ -3624,8 +3624,83 @@ final class BotSelfConfigTests: XCTestCase {
         let properties = correctSchema["properties"] as? [String: Any]
         XCTAssertNotNil(properties?["content"])
         XCTAssertNil(properties?["fact"], "fact is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["correct"], "correct is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["correct_fact"], "correct_fact is an advertised alias, not a second schema key")
         let content = properties?["content"] as? [String: Any]
         XCTAssertEqual(content?["description"] as? String, "Fact. Same field as Studio Remember a fact.")
+    }
+
+    func test_correctMemoryAdvertisedCorrectPersists_becauseHonestySaysStudioCorrect() throws {
+        // WHY: set_settings leftover correct already rejects and points
+        // at bot_correct_memory ("Same path as Studio Correct"). Correct
+        // only read content / fact, so first-chat retried correct and
+        // invented a hop. Canonical content still wins. Schema does not
+        // grow a correct key. Dest title stays Memory.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let created = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers dark mode",
+        ])
+        let memoryID = try XCTUnwrap(created.memory.first?.id)
+
+        let fromCorrect = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "correct": "Prefers dusk",
+        ])
+        XCTAssertEqual(fromCorrect.memory.count, 1)
+        XCTAssertEqual(fromCorrect.memory.first?.id, memoryID, "correct keeps the id")
+        XCTAssertEqual(fromCorrect.memory.first?.content, "Prefers dusk", "correct persists")
+
+        let fromCorrectFact = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "correct_fact": "Prefers twilight",
+        ])
+        XCTAssertEqual(fromCorrectFact.memory.first?.content, "Prefers twilight", "correct_fact persists")
+        XCTAssertEqual(fromCorrectFact.memory.first?.id, memoryID)
+
+        let fromFact = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "fact": "Prefers dawn",
+        ])
+        XCTAssertEqual(fromFact.memory.first?.content, "Prefers dawn", "fact still persists")
+        XCTAssertEqual(fromFact.memory.first?.id, memoryID)
+
+        let contentWins = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
+            "memory_id": memoryID,
+            "content": "Prefers light mode",
+            "correct": "Ignored correct",
+            "correct_fact": "Ignored correct fact",
+            "fact": "Ignored fact",
+        ])
+        XCTAssertEqual(contentWins.memory.first?.content, "Prefers light mode", "content wins")
+        XCTAssertEqual(contentWins.memory.first?.id, memoryID)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "correct": "Must not persist",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.correctHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.memory.count, 1)
+        XCTAssertEqual(still.memory.first?.id, memoryID)
+        XCTAssertEqual(
+            still.memory.first?.content,
+            "Prefers light mode",
+            "leftover correct still rejects on set_settings"
+        )
+        let itemID = BotMemoryItemID(try XCTUnwrap(UUID(uuidString: memoryID)))
+        XCTAssertEqual(
+            try store.listMemoryRevisions(itemID: itemID).map(\.content),
+            [
+                "Prefers dark mode",
+                "Prefers dusk",
+                "Prefers twilight",
+                "Prefers dawn",
+                "Prefers light mode",
+            ]
+        )
     }
 
     func test_putMemoryAdvertisedRememberPersists_becauseHonestySaysRememberAFact() throws {
