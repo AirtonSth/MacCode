@@ -282,6 +282,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["url"], "url is a leftover bot_browser_open key, not a set_settings key")
         XCTAssertNil(properties?["last_website"], "last_website is an advertised compile name, not a set_settings key")
         XCTAssertNil(properties?["browser"], "browser is an advertised compile heading, not a set_settings key")
+        XCTAssertNil(properties?["open"], "open is an advertised bot_browser_open verb, not a set_settings key")
+        XCTAssertNil(properties?["open_website"], "open_website is an advertised bot_browser_open alias, not a set_settings key")
+        XCTAssertNil(properties?["bot_browser_open"], "bot_browser_open is the catalog name, not a set_settings key")
         XCTAssertNil(properties?["logical_execution_space"], "logical_execution_space is an advertised compile title, not a set_settings key")
         XCTAssertNil(properties?["logical_space"], "logical_space is an advertised Desktop pill, not a set_settings key")
         XCTAssertNil(properties?["same_macos_account"], "same_macos_account is advertised Desktop honesty, not a schema key")
@@ -1775,6 +1778,86 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Browser reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "Browser reject must not persist soul")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedOpen_becauseStudioSaysBotBrowserOpen() throws {
+        // WHY: Admitted tools already say open a website via
+        // bot_browser_open. leftover website / last_website / browser
+        // already reject. leftover open still succeeded empty, so
+        // first-chat invented a persist from the advertised open verb.
+        // Reject the advertised name with website honesty pointing at
+        // bot_browser_open. leftover website still rejects. leftover
+        // browser still rejects. bot_browser_open still persists
+        // Website. Name still persists. Schema does not grow an open
+        // write key. Dest title stays Browser.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["open"],
+            "schema does not grow an open write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "open": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "open website": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "bot_browser_open": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "website": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "browser": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "open reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "open reject must not persist soul")
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
         let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
