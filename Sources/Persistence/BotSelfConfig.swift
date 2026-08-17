@@ -71,7 +71,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case removeSkill:
             return "Remove a catalog skill from this bot. Same path as Studio Remove. Disable is not unbind."
         case saveRoutine:
-            return "Create or update a routine on this bot."
+            return "Create or update a routine's name, instruction, or when. Same path as Studio Save routine."
         case setRoutineEnabled:
             return "Enable or disable one of this bot's routines."
         default:
@@ -139,8 +139,8 @@ public enum BotSelfConfigCatalog: Sendable {
                 "type": "object",
                 "properties": botID.merging([
                     "name": ["type": "string"],
-                    "prompt": ["type": "string"],
-                    "schedule_note": ["type": "string"],
+                    "prompt": ["type": "string", "description": "Instruction. Same field as Studio Instruction."],
+                    "schedule_note": ["type": "string", "description": "When. Same field as Studio When."],
                     "routine_id": ["type": "string"],
                 ]) { _, new in new },
                 "required": ["name", "prompt"],
@@ -497,12 +497,13 @@ public struct BotSelfConfigService: Sendable {
             }
             return try removeSkill(skillID: skillID)
         case BotSelfConfigCatalog.saveRoutine:
+            // Tools and Studio say Instruction / When. Schema keys stay prompt / schedule_note.
             guard let name = arguments["name"] as? String,
-                  let prompt = arguments["prompt"] as? String else {
+                  let prompt = Self.firstString(arguments, keys: ["prompt", "instruction"]) else {
                 throw BotSelfConfigError.invalid("Routine name and instruction are required.")
             }
             let routineID = Self.parseOptionalUUID(arguments["routine_id"]).map(BotRoutineID.init)
-            let note = (arguments["schedule_note"] as? String) ?? ""
+            let note = Self.firstString(arguments, keys: ["schedule_note", "when"]) ?? ""
             return try saveRoutine(name: name, prompt: prompt, scheduleNote: note, id: routineID)
         case BotSelfConfigCatalog.setRoutineEnabled:
             return try setRoutineEnabled(

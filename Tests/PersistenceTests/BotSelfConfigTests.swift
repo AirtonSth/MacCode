@@ -357,6 +357,57 @@ final class BotSelfConfigTests: XCTestCase {
         }
     }
 
+    func test_saveRoutineAdvertisedNamesPersist_becauseStudioSaysInstructionAndWhen() throws {
+        // WHY: Tools and Studio say Instruction / When. Parse only read
+        // prompt / schedule_note, so first-chat "change the instruction"
+        // invented a hop or left the leftover prompt. Canonical keys
+        // still win. Schema does not grow a second pair of keys.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        let fromAdvertised = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "Morning",
+            "instruction": "Summarize overnight",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(fromAdvertised.routines.count, 1)
+        XCTAssertEqual(fromAdvertised.routines[0].prompt, "Summarize overnight")
+        XCTAssertEqual(fromAdvertised.routines[0].scheduleNote, "Weekdays 9:00")
+        let stored = try store.listRoutines(botID: bot.id)
+        XCTAssertEqual(stored.first?.definition.prompt, "Summarize overnight")
+        XCTAssertEqual(stored.first?.definition.scheduleNote, "Weekdays 9:00")
+
+        let promptWins = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "routine_id": fromAdvertised.routines[0].id,
+            "name": "Morning",
+            "prompt": "Scan PRs",
+            "instruction": "Ignored instruction",
+            "schedule_note": "Daily",
+            "when": "Ignored when",
+        ])
+        XCTAssertEqual(promptWins.routines[0].prompt, "Scan PRs", "prompt wins")
+        XCTAssertEqual(promptWins.routines[0].scheduleNote, "Daily", "schedule_note wins")
+    }
+
+    func test_saveRoutineCatalogDescribesInstructionAndWhen_becauseThoseAreTheStudioFields() {
+        // WHY: Schema key stays prompt / schedule_note. Description must
+        // name Instruction / When so first-chat does not invent a hop.
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.saveRoutine)
+        XCTAssertTrue(description.contains("instruction"))
+        XCTAssertTrue(description.contains("when"))
+        XCTAssertTrue(description.contains("Studio Save routine"))
+        let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.saveRoutine)
+        let properties = schema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["prompt"])
+        XCTAssertNotNil(properties?["schedule_note"])
+        XCTAssertNil(properties?["instruction"], "instruction is an advertised alias, not a second schema key")
+        XCTAssertNil(properties?["when"], "when is an advertised alias, not a second schema key")
+        let prompt = properties?["prompt"] as? [String: Any]
+        let when = properties?["schedule_note"] as? [String: Any]
+        XCTAssertEqual(prompt?["description"] as? String, "Instruction. Same field as Studio Instruction.")
+        XCTAssertEqual(when?["description"] as? String, "When. Same field as Studio When.")
+    }
+
     func test_leftoverPermissionSnapshotStaysSupervised_becauseFullAccessIsNotLive() throws {
         // WHY: Brain compile already treats leftover full_access as
         // supervised. get_settings still returned the raw leftover, so
