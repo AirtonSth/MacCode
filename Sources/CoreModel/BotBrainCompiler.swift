@@ -332,8 +332,11 @@ public enum BotBrainCompiler {
         id.uuidString.lowercased()
     }
 
+    /// Studio already says Remember a fact. Compile that name so first-chat
+    /// "what's the Fact?" cannot invent a hop. Forgotten and untrusted stay
+    /// out of the payload. Off-path tombstones still use this line in Source.
     static func memoryLine(_ item: BotMemoryItem) -> String {
-        "- \(item.content) [\(mutateKey(item.id.value))]"
+        "- Fact: \(item.content) [\(mutateKey(item.id.value))]"
     }
 
     /// Studio already says Instruction and When. Compile those names so

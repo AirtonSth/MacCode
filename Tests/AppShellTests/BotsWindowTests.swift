@@ -1619,7 +1619,7 @@ final class BotsWindowTests: XCTestCase {
         vm.composerText = "Forget the dark-mode fact"
         let preview = try XCTUnwrap(vm.previewBrain())
         let key = item.id.value.uuidString.lowercased()
-        XCTAssertTrue(preview.compiledPayload.contains("Prefers dark mode"))
+        XCTAssertTrue(preview.compiledPayload.contains("Fact: Prefers dark mode"))
         XCTAssertTrue(preview.compiledPayload.contains(key))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
         XCTAssertEqual(
