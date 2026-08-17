@@ -772,11 +772,10 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertFalse(BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotPermission.honestyLabel))
     }
 
-    func test_enabledRoutineCompilesAndDisabledStaysOut_becauseSchedulesAreAuthority() {
-        // WHY: Hermes/OpenClaw agents know their cron jobs. Studio Routines
-        // were owner-authored but Desk compile never mentioned them, so
-        // "what do you run in the morning?" invented work. Disabled rows
-        // and app-closed honesty must stay — P1a has no autonomy.
+    func test_activeRoutineCompilesAndOffStaysOut_becauseSchedulesAreAuthority() {
+        // WHY: Studio already says Active. Compile said Enabled routines, so
+        // first-chat "which are Active?" invented a hop. Hermes agents see
+        // the advertised toggle name. Off rows and app-closed honesty stay.
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
         let revision = BotRevision(
             botID: bot.id,
@@ -821,16 +820,21 @@ final class BotBrainCompilerTests: XCTestCase {
             ]
         )
         XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper) — Scout."))
-        XCTAssertTrue(receipt.compiledPayload.contains("Enabled routines (not while the app is closed):"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Active routines (not while the app is closed):"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Enabled routines"))
         XCTAssertTrue(receipt.compiledPayload.contains("Morning scan (Weekdays 9:00): Scan overnight failures"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(morning.id.value)))
         XCTAssertFalse(receipt.compiledPayload.contains("Nightly archive"))
         XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(off.id.value)))
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Morning scan") })?.included, true)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.text.contains("Morning scan") })?.reason,
+            "Active. Runs only while the app is open."
+        )
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Nightly archive") })?.included, false)
         XCTAssertEqual(
             receipt.layers.first(where: { $0.text.contains("Nightly archive") })?.reason,
-            "Disabled. Not injected."
+            "Off. Not injected."
         )
     }
 

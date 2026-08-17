@@ -231,7 +231,9 @@ public enum BotBrainCompiler {
         let liveRoutines = routines.filter(\.activation.isEnabled)
             .sorted { $0.definition.name.localizedCaseInsensitiveCompare($1.definition.name) == .orderedAscending }
         if !liveRoutines.isEmpty {
-            lines.append("Enabled routines (not while the app is closed):")
+            // Studio already says Active. Compile that name so first-chat
+            // "which are Active?" cannot invent a hop. Off stays out.
+            lines.append("Active routines (not while the app is closed):")
             lines.append(contentsOf: liveRoutines.map(Self.routineLine))
         }
         lines.append("User request:")
@@ -547,8 +549,8 @@ public enum BotBrainCompiler {
                     text: routineLine(routine),
                     included: routine.activation.isEnabled,
                     reason: routine.activation.isEnabled
-                        ? "Enabled. Runs only while the app is open."
-                        : "Disabled. Not injected."
+                        ? "Active. Runs only while the app is open."
+                        : "Off. Not injected."
                 )
             )
         }
