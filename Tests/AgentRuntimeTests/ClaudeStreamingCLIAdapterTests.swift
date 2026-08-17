@@ -1151,8 +1151,11 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         // fidelity-based predicate and the assertion was left behind.
         XCTAssertTrue(on.contains("MANDATORY default-pipe:"),
                       "Token Saver on: system prompt carries the `| distill` piping rule")
-        XCTAssertTrue(on.contains("NEVER pipe `| distill` only for exact-output"),
-                      "Token Saver on: system prompt carries the never-pipe rule for byte-exact output")
+        XCTAssertTrue(
+            on.contains("NEVER auto-distill raw exact-output")
+                || on.contains("NEVER pipe `| distill` only for exact-output"),
+            "Token Saver on: exact-output stays skip-by-default"
+        )
         XCTAssertTrue(on.contains(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")),
                       "Token Saver on: system prompt carries the canonical exact-output catalog")
 

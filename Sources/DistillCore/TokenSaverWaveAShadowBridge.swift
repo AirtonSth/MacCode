@@ -23,6 +23,7 @@ public enum TokenSaverWaveAShadowBridge {
     // Array-literal membership reallocated per call; share process-wide Set.
     private static let shellLikeToolNames: Set<String> = [
         "Bash", "bash", "Shell", "shell",
+        "run_terminal_command", "local_shell", "terminal",
     ]
 
     /// Exact-replay state is atomic per BindingID+tool — never cross-binding.

@@ -440,6 +440,24 @@ final class GrokACPProtocolTests: XCTestCase {
         ), "unverified agent versions must still reject images when advertisement is false")
     }
 
+    func test_sessionBootstrapDoesNotRegisterReadFileOutputRewrite() {
+        // WHY: ACP session/new only passes cwd + mcpServers. There is no hook
+        // channel that can replace native read_file bytes before Grok's model
+        // sees them. PostToolUse remains passive (stdout ignored).
+        let servers = GrokACPClient.sessionMCPServers()
+        let encoded = (try? JSONSerialization.data(withJSONObject: servers))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        XCTAssertFalse(encoded.contains("updatedToolOutput"))
+        XCTAssertFalse(encoded.contains("post-tool-use"))
+        let initParams = GrokACPClient.initializeParams(clientVersion: "test")
+        XCTAssertNil(initParams["hooks"])
+        XCTAssertFalse(
+            (try? JSONSerialization.data(withJSONObject: initParams))
+                .flatMap { String(data: $0, encoding: .utf8) }?
+                .contains("PostToolUse") ?? false
+        )
+    }
+
     func test_promptBlocksInjectTokenSaverSafetyABIExactlyOnceForGrokACP() throws {
         let request = AgentRunRequest(
             threadId: AgentThreadID(),

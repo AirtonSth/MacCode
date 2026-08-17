@@ -233,7 +233,92 @@ public struct ManagedDistillCLI: Sendable {
     /// already hold.
     private func hook(arguments: [String]) async -> RunResult {
         let emptyOK = Self.emptyJSONOK
-        guard arguments.first == "post-tool-use" else { return emptyOK }
+        switch arguments.first {
+        case "post-tool-use":
+            return await hookPostToolUse()
+        case "pre-tool-pipe":
+            return hookPreToolPipe()
+        default:
+            return emptyOK
+        }
+    }
+
+    /// Grok/Claude PreToolUse: rewrite wrap-eligible shell `command` to end with
+    /// `| <managed-distill> "<question>"`. Not PostToolUse output rewrite.
+    /// Fail-open `{}` on any skip so the original command runs unchanged.
+    func hookPreToolPipe(
+        processArguments: [String] = ProcessInfo.processInfo.arguments,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        homeDirectory: String = NSHomeDirectory(),
+        fileExists: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
+    ) -> RunResult {
+        let emptyOK = Self.emptyJSONOK
+        guard distillAdmission() else { return emptyOK }
+        guard let envelope = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] else {
+            return emptyOK
+        }
+        let event = Self.hookEventToken(envelope)
+        if !event.isEmpty, event != "pretooluse" {
+            return emptyOK
+        }
+        let toolName = Self.hookToolName(envelope)
+        guard let input = Self.hookToolInput(envelope),
+              let command = input["command"] as? String else {
+            return emptyOK
+        }
+        let distillPath = ShellDistillPipeAdmission.distillExecutablePath(
+            processArguments: processArguments,
+            environment: environment,
+            homeDirectory: homeDirectory
+        )
+        switch ShellDistillPipeAdmission.decide(
+            admitted: true,
+            toolName: toolName,
+            command: command,
+            distillExecutable: distillPath,
+            distillExists: fileExists(distillPath)
+        ) {
+        case .pipe(let rewritten):
+            var updated = input
+            updated["command"] = rewritten
+            let payload: [String: Any] = [
+                "hookSpecificOutput": [
+                    "hookEventName": "PreToolUse",
+                    "updatedInput": updated,
+                ] as [String: Any],
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+                return emptyOK
+            }
+            return RunResult(stdout: data, exitCode: 0)
+        default:
+            return emptyOK
+        }
+    }
+
+    private static func hookEventToken(_ envelope: [String: Any]) -> String {
+        let raw = (envelope["hookEventName"] as? String)
+            ?? (envelope["hook_event_name"] as? String)
+            ?? ""
+        return raw
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .lowercased()
+    }
+
+    private static func hookToolName(_ envelope: [String: Any]) -> String {
+        (envelope["toolName"] as? String)
+            ?? (envelope["tool_name"] as? String)
+            ?? ""
+    }
+
+    private static func hookToolInput(_ envelope: [String: Any]) -> [String: Any]? {
+        (envelope["toolInput"] as? [String: Any])
+            ?? (envelope["tool_input"] as? [String: Any])
+    }
+
+    private func hookPostToolUse() async -> RunResult {
+        let emptyOK = Self.emptyJSONOK
 
         guard let envelope = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] else {
             return emptyOK

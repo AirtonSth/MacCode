@@ -28,6 +28,21 @@ final class GrokRunnerArgsTests: XCTestCase {
         )
     }
 
+    func test_tokenSaverOnDoesNotRegisterGrokPostToolUseOutputRewrite() {
+        // WHY: harvest has 680 large Grok `read_file`s (~11.7M chars). Claude
+        // PostToolUse can replace Read via updatedToolOutput. Grok PostToolUse
+        // stdout is ignored (official hooks guide). Do not invent that hook.
+        let on = GrokRunner.buildArgs(req(environment: [
+            "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+            ClaudeRunner.tokenSaverPostToolUseEnvKey: "1",
+        ]))
+        // Prompt text may mention PostToolUse as a ceiling; argv must not
+        // register a Grok output-rewrite hook.
+        XCTAssertFalse(on.contains { $0 == "--settings" || $0.hasPrefix("--settings=") })
+        XCTAssertFalse(on.contains { $0.contains("hook post-tool-use") })
+        XCTAssertFalse(on.contains { $0.contains("updatedToolOutput") })
+    }
+
     func test_tokenSaverSafetyABIIsInjectedExactlyOnceForGrokHeadless() {
         let args = GrokRunner.buildArgs(req(environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]))
         let prompt = args[args.index(after: args.firstIndex(of: "-p")!)]

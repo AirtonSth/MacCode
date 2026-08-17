@@ -14,7 +14,7 @@ public enum LiteralPreservation {
     private static let regexes: [NSRegularExpression] = [
         #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#,                                  // file.ext:line (also covers JS `at fn (a.js:1:2)`)
         #"File "[^"\n]+", line \d+"#,                                      // Python traceback frame
-        #"/(?:[A-Za-z0-9._~+-]+/)+[A-Za-z0-9._~+-]+"#,                     // absolute path (I8.5: load-bearing, anti-hallucination)
+        #"/(?:[A-Za-z0-9._~+-]+/)+[A-Za-z0-9._~+-]+"#,                     // absolute path (keep: loosening this raises E4B adopt by dropping git/glab facts)
         #"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"#, // UUID
         #"\b[0-9a-f]{7,11}\b"#,                                             // short git SHA
         #"\b[0-9a-f]{12,}\b"#,                                            // hex hash / sha (>=12)

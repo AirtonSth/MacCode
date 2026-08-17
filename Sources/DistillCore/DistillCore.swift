@@ -1545,10 +1545,7 @@ public struct MLXDistillRuntime: DistillRuntime {
         } else {
             protocolOutput = restoredOutput
         }
-        guard Self.isUsefulOutput(protocolOutput, mode: request.mode) else {
-            return Self.fallbackOutput(for: request)
-        }
-        return Self.guardLossyProseOutput(protocolOutput, request: request)
+        return DistillAdopt.servedOutput(modelOutput: protocolOutput, request: request)
     }
 
     /// Collapses only an entire natural-language request repeated byte-for-byte
@@ -1682,20 +1679,24 @@ public struct MLXDistillRuntime: DistillRuntime {
         }
     }
 
-    /// N5 guard for the lossy prose modes (.longText/.watchSummary): if the model's
-    /// compression dropped a load-bearing literal (file:line, UUID, hash, long number,
-    /// diff change line) present in the input, reject it and return the input verbatim.
-    /// .commandOutput is exempt — it is contract extraction, not literal-preserving
-    /// compression. Wire rendering and natural-language generation are translation.
+    /// N5 guard: if the model's compression dropped a load-bearing literal
+    /// (file:line, UUID, hash, long number, diff change line) present in the
+    /// input, reject it and return the input verbatim.
+    ///
+    /// Tool-output Distill uses `.commandOutput`. Extractive contracts
+    /// (PASS/FAIL/JSON as asked) stay exempt; compression questions do not —
+    /// Grok must not be served a rewrite that dropped a path or error code.
+    /// Wire rendering and natural-language generation are translation.
     static func guardLossyProseOutput(_ output: String, request: DistillRequest) -> String {
         switch request.mode {
         case .longText, .watchSummary:
-            let literalGuarded = LiteralPreservation.guarded(original: request.input, compressed: output)
-            guard literalGuarded.droppedLiteral == nil else { return literalGuarded.output }
-            return FaithfulnessGate.validate(original: request.input, compressed: literalGuarded.output).accepted
-                ? literalGuarded.output
-                : request.input
-        case .commandOutput, .wireRenderEnglish, .naturalLanguage:
+            return n5LiteralAndFaithfulness(output, request: request)
+        case .commandOutput:
+            if isExtractiveCommandAnswer(output, request: request) {
+                return output
+            }
+            return n5LiteralAndFaithfulness(output, request: request)
+        case .wireRenderEnglish, .naturalLanguage:
             return output
         case .wireEncode:
             guard let frames = try? RCWireProtocol.parse(output),
@@ -1714,6 +1715,43 @@ public struct MLXDistillRuntime: DistillRuntime {
                 ? output
                 : request.input
         }
+    }
+
+    static func n5LiteralAndFaithfulness(_ output: String, request: DistillRequest) -> String {
+        let literalGuarded = LiteralPreservation.guarded(original: request.input, compressed: output)
+        guard literalGuarded.droppedLiteral == nil else { return literalGuarded.output }
+        return FaithfulnessGate.validate(original: request.input, compressed: literalGuarded.output).accepted
+            ? literalGuarded.output
+            : request.input
+    }
+
+    /// PASS/FAIL/SAFE/REVIEW/UNSAFE or raw JSON when the question asked for that
+    /// format — those answers are allowed to drop surrounding stdout.
+    ///
+    /// The question must contain the token as a whole word (`\bfail\b`). A
+    /// compression contract that says "failing test names" is not an extractive
+    /// PASS/FAIL ask and must still run N5.
+    static func isExtractiveCommandAnswer(_ output: String, request: DistillRequest) -> Bool {
+        let question = request.question ?? ""
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let first = trimmed.split(whereSeparator: \.isNewline).first.map { String($0) } ?? ""
+        let tokens = ["pass", "fail", "safe", "review", "unsafe"]
+        if tokens.contains(where: { token in questionHasWholeWord(question, token) }),
+           tokens.contains(where: { first.lowercased().hasPrefix($0) }) {
+            return true
+        }
+        if questionHasWholeWord(question, "json") {
+            return trimmed.hasPrefix("{") || trimmed.hasPrefix("[")
+        }
+        return false
+    }
+
+    static func questionHasWholeWord(_ question: String, _ token: String) -> Bool {
+        question.range(
+            of: "\\b\(NSRegularExpression.escapedPattern(for: token))\\b",
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
     }
 
     static func deterministicCommandOutput(
@@ -1735,113 +1773,12 @@ public struct MLXDistillRuntime: DistillRuntime {
         return LocalDistillRuntime.boundedCommandOutput(output, maxOutputCharacters: request.maxOutputCharacters)
     }
 
-    private static func systemInstructions(for mode: DistillMode) -> String {
-        switch mode {
-        case .wireEncode:
-            return """
-            Compress a software task in any human language into a compact English semantic brief for another AI agent.
-            Preserve negation, modality, ordering, conditions, commands, paths, URLs, IDs, hashes, numbers, units, errors, quotes, code, approvals, security warnings, and data-loss warnings verbatim.
-            Drop repetition, filler, hedging, and politeness. Never invent facts, aliases, tags, or a transport grammar.
-            Output only the compact English brief. Swift owns the RC Wire framing.
-            """
-        case .wireRenderEnglish:
-            return """
-            Render valid RC Wire v1 response frames as concise fluent prose in the trusted target language supplied by the host (default English).
-            Preserve every fact, negation, condition, command, path, URL, ID, hash, number, unit, error, quote, code span, approval, warning, outcome, evidence, risk, and question.
-            Do not invent facts or claim work that the frames do not report.
-            Return only the answer in that language. Never output RCW1 tags or explain the protocol.
-            """
-        case .naturalLanguage:
-            return """
-            Rewrite the supplied content as one concise natural-language English sentence.
-            Preserve exact facts, names, numbers, statuses, paths, commands, and warnings.
-            Return only the sentence.
-            """
-        case .commandOutput:
-            return """
-            You compress shell or command output for another model that will act on your answer.
-            Output ONLY the requested format. No preamble. No "Here is". No explanation unless the question asks for one.
-            If the question asks for JSON, return raw JSON only, no fences.
-            If the question asks for a list, one item per line, no bullets, no numbering.
-            If the question asks PASS/FAIL/SAFE/REVIEW/UNSAFE, output that token first on the same line, then the supporting detail.
-            Match the language of the question.
-            Never invent data not present in the output. If a field is missing, omit it or say so explicitly.
-            If the output is insufficient, reply only with "distill: Insufficient information to output anything." in the language of the question.
-            If the source is already shorter than your answer would be, reuse the source wording.
-            Keep prose answers to one sentence, max three short lines. Structured answers may be longer when the format requires it.
-            Never ask for more input.
-            """
-        case .longText, .watchSummary:
-            return """
-            You compress long text into concise plain language for another AI model.
-            Preserve every exact command, file path, file:line, error string, number, ID, status, and proof verbatim.
-            Drop filler, repetition, hedging, and politeness. Never invent facts. No preamble, no explanation, no markdown.
-            If the source is already shorter than your answer would be, reuse the source wording.
-            """
-        }
+    static func systemInstructions(for mode: DistillMode) -> String {
+        DistillPrompt.systemInstructions(for: mode)
     }
 
-    private static func prompt(for request: DistillRequest) -> String {
-        switch request.mode {
-        case .commandOutput:
-            let question = request.question?.nilIfEmpty ?? "Compress the command output. Return only the useful signal."
-            return """
-            /no_think
-            Command output:
-            \(fitInput(request.input))
-
-            Question: \(question)
-            """
-        case .longText:
-            return """
-            /no_think
-            Compress the following into concise plain language.
-            Preserve exact commands, paths, file:line, errors, numbers, IDs, and status verbatim.
-
-            \(fitInput(request.input))
-
-            OUTPUT:
-            """
-        case .watchSummary:
-            return """
-            /no_think
-            Summarize the relevant change in concise plain language.
-            Preserve exact commands, paths, file:line, errors, numbers, IDs verbatim.
-
-            \(fitInput(request.input))
-
-            OUTPUT:
-            """
-        case .wireEncode:
-            return """
-            /no_think
-            Compress this user task, in any language, into one compact English semantic brief.
-            Keep every protected literal and intent-critical condition verbatim.
-
-            \(request.input)
-
-            BRIEF:
-            """
-        case .wireRenderEnglish:
-            let language = wireRenderLanguageIdentifier(request.question)
-            return """
-            /no_think
-            Render these RC Wire v1 response frames in BCP-47 language \(language).
-
-            \(request.input)
-
-            ANSWER:
-            """
-        case .naturalLanguage:
-            return """
-            /no_think
-            Rewrite as one concise English sentence, preserving exact facts.
-
-            \(request.input)
-
-            SENTENCE:
-            """
-        }
+    static func prompt(for request: DistillRequest) -> String {
+        DistillPrompt.userPrompt(for: request)
     }
 
     private static func maxTokens(for request: DistillRequest) -> Int {

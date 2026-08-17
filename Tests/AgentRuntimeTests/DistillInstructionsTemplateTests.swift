@@ -63,9 +63,15 @@ final class DistillInstructionsTemplateTests: XCTestCase {
             "policy must apply to primary, subagent, and cross-provider shapes"
         )
         XCTAssertTrue(
-            t.contains("NEVER pipe `| distill` only for exact-output")
+            t.contains("NEVER auto-distill raw exact-output")
+                || t.contains("NEVER pipe `| distill` only for exact-output")
                 || t.contains("NEVER pipe `| distill` for exact-output"),
-            "the template must forbid compressing output the agent consumes byte-exactly"
+            "the template must forbid auto-compressing output the agent consumes byte-exactly"
+        )
+        XCTAssertTrue(
+            t.contains("last pipeline command is distill")
+                || t.contains("| distill \"<question>\""),
+            "WHY: voluntary rg | distill must stay admitted when last pipeline command is distill"
         )
         XCTAssertTrue(t.contains("rg, grep"),
                       "the never-pipe list must name the search tools whose exact stdout the agent needs")

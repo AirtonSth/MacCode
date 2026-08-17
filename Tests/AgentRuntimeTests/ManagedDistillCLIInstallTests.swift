@@ -90,6 +90,27 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         )
     }
 
+    func test_installGrokPreToolPipeHook_isRemovedWhenTokenSaverOff() throws {
+        let home = tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        try installer.installGrokPreToolPipeHook()
+        let url = installer.grokPreToolPipeHookURL()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        let hooks = try XCTUnwrap(object?["hooks"] as? [String: Any])
+        let pre = try XCTUnwrap(hooks["PreToolUse"] as? [[String: Any]])
+        XCTAssertEqual(pre.first?["matcher"] as? String, "Bash|run_terminal_command|run_terminal_cmd")
+        let handlers = try XCTUnwrap(pre.first?["hooks"] as? [[String: Any]])
+        XCTAssertEqual(
+            handlers.first?["command"] as? String,
+            AgentSkillInstaller.grokPreToolPipeHookCommand(distillPath: installer.distillCLIURL().path)
+        )
+        XCTAssertEqual(try installer.uninstallGrokPreToolPipeHook(), .removed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try installer.uninstallGrokPreToolPipeHook(), .notPresent)
+    }
+
     func test_installCommandWrappers_alwaysInstallsDistillBesideWrappers() throws {
         let home = tempHome()
         defer { try? FileManager.default.removeItem(at: home) }

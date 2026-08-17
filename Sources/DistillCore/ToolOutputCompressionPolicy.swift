@@ -143,8 +143,8 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         switch normalize(toolName) {
         case "grep", "glob":
             return .conservative
-        case "bash", "read":
-            // Read: extractive keep (skeleton/BERT); Bash: noise collapse. Neither is abstract rewrite.
+        case "bash", "read", "runterminalcommand", "shell", "terminal", "localshell":
+            // Read: extractive keep (skeleton/BERT); Bash/Grok/Codex shell: noise collapse.
             return .moderate
         case "webfetch":
             return .aggressive
@@ -180,14 +180,14 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         let suffix = context.isEmpty ? "" : " Context: \(context)."
         switch profile {
         case .conservative:
-            return "Compress search output without dropping any match line. Preserve paths, line numbers, matched text, and quoted strings verbatim; only collapse duplicate/context noise.\(suffix)"
+            return "Compress search output without dropping any match line. Preserve paths, line numbers, matched text, and quoted strings verbatim; only collapse duplicate/context noise. \(DistillPrompt.densityMarker) if every match line still fits.\(suffix)"
         case .moderate:
             if normalize(toolName) == "read" {
-                return "Compress file read output for the current task. Prefer signatures, exports, types, and task-relevant spans; elide large bodies only when a retrieve handle covers the original; preserve paths, line numbers, identifiers, and quoted strings verbatim.\(suffix)"
+                return "Compress file read output for the current task. Prefer signatures, exports, types, and task-relevant spans; elide large bodies only when a retrieve handle covers the original; preserve paths, line numbers, identifiers, and quoted strings verbatim. \(DistillPrompt.densityMarker) if those literals still fit.\(suffix)"
             }
-            return "Compress command output. Preserve exit codes, failing test names, errors, warnings, assertions, numbers, paths, and quoted strings verbatim; collapse repeated progress noise.\(suffix)"
+            return "Compress command output. Preserve exit codes, failing test names, errors, warnings, assertions, numbers, paths, and quoted strings verbatim; collapse repeated progress noise. \(DistillPrompt.densityMarker) if those literals still fit.\(suffix)"
         case .aggressive:
-            return "Compress fetched web content for the current task. Preserve URLs, titles, code, API signatures, numbers, and quoted strings verbatim; keep retrieve-worthy details explicit.\(suffix)"
+            return "Compress fetched web content for the current task. Preserve URLs, titles, code, API signatures, numbers, and quoted strings verbatim; keep retrieve-worthy details explicit. \(DistillPrompt.densityMarker) if those literals still fit.\(suffix)"
         case .passthrough:
             return "Pass through tool output unchanged.\(suffix)"
         }
@@ -221,27 +221,44 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
             .lowercased()
     }
 
+    /// Normalized names of provider shell tools whose `command=` is a user shell line.
+    /// Includes Grok `run_terminal_command` and Codex `local_shell` so exact-output
+    /// skip / last-pipe distill admit apply uniformly (hooks still cannot rewrite
+    /// Codex/Grok output; this gates policy + wrap-adjacent decisions).
+    public static let shellLikeNormalizedToolNames: Set<String> = [
+        "bash", "shell", "terminal", "runterminalcommand", "localshell",
+    ]
+
     /// True when this is a shell tool whose command string is exact-output family
     /// (rg/grep/sed/cat/…, git grep|show|cat-file|blame). Summary may be
     /// `command=rg -n foo` (hook args) or a raw shell line.
+    ///
+    /// Voluntary `rg … | distill "<question>"` is **not** exact-output: the last
+    /// pipeline command is distill. Raw `rg` without that last stage still skips.
     public func isExactOutputShellTool(toolName: String, toolArgumentsSummary: String?) -> Bool {
         let name = normalize(toolName)
-        guard name == "bash" || name == "shell" || name == "terminal" else { return false }
+        guard Self.shellLikeNormalizedToolNames.contains(name) else { return false }
         guard let summary = toolArgumentsSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
               !summary.isEmpty else {
             return false
         }
-        // Prefer `command=…` field from summarizeToolInput; else use full summary.
-        let command: String
-        if let range = summary.range(of: "command=") {
-            command = String(summary[range.upperBound...])
-                .components(separatedBy: " | ")
-                .first?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? summary
-        } else {
-            command = summary
+        return Self.shellCommandLooksExactOutput(Self.commandField(from: summary))
+    }
+
+    /// Pull `command=` from a `summarizeToolInput` line without treating a shell
+    /// pipe (`rg | distill`) as the field separator (` | path=` / ` | pattern=`).
+    public static func commandField(from summary: String) -> String {
+        let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let range = trimmed.range(of: "command=") else { return trimmed }
+        let rest = String(trimmed[range.upperBound...])
+        var end = rest.endIndex
+        for key in ["pattern", "path", "glob", "url"] {
+            let marker = " | \(key)="
+            if let hit = rest.range(of: marker), hit.lowerBound < end {
+                end = hit.lowerBound
+            }
         }
-        return Self.shellCommandLooksExactOutput(command)
+        return String(rest[..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // PERF: shellCommandLooksExactOutput runs on every bash/shell compress
@@ -400,8 +417,144 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         return nil
     }
 
+    /// Last `|` stage of a shell line (quote-aware). Nil when `command` is empty.
+    public static func lastPipelineSegment(_ command: String) -> String? {
+        pipeSegments(command).last
+    }
+
+    /// Last `&&` / `||` / `;` command inside the last `|` stage.
+    /// `cd foo && git status` → `git status`. `swift test | head` → `head`.
+    public static func lastChainSegment(_ command: String) -> String {
+        let lastPipe = lastPipelineSegment(command) ?? command
+        return chainSegments(lastPipe).last ?? lastPipe
+    }
+
+    /// Basename + args of the last chain command after stripping `env` / assignments.
+    public static func lastInvocation(_ command: String) -> (name: String, args: [String])? {
+        let tokens = strippingShellPrefixes(shellWords(lastChainSegment(command)))
+        guard let primaryRaw = tokens.first else { return nil }
+        let name = (unquotedShellToken(primaryRaw) as NSString).lastPathComponent.lowercased()
+        let args = tokens.dropFirst().map { unquotedShellToken($0) }
+        return (name, Array(args))
+    }
+
+    /// True when the last `|` stage (quote-aware) is the managed `distill` CLI.
+    /// Raw exact-output tools stay skipped; a voluntary pipe to distill is admitted.
+    public static func lastPipelineCommandIsVoluntaryDistill(_ command: String) -> Bool {
+        lastInvocation(command)?.name == "distill" && pipeSegments(command).count >= 2
+    }
+
+    /// Quote-aware split on `|` only (not `&&` / `;`). Used to detect last-pipe distill.
+    private static func pipeSegments(_ input: String) -> [String] {
+        var segments: [String] = []
+        var current = ""
+        var quote: Character?
+        var escaping = false
+        for character in input {
+            if escaping {
+                current.append(character)
+                escaping = false
+                continue
+            }
+            if let activeQuote = quote {
+                current.append(character)
+                if character == activeQuote {
+                    quote = nil
+                } else if activeQuote == "\"", character == "\\" {
+                    escaping = true
+                }
+                continue
+            }
+            if character == "'" || character == "\"" {
+                quote = character
+                current.append(character)
+            } else if character == "\\" {
+                escaping = true
+                current.append(character)
+            } else if character == "|" {
+                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { segments.append(trimmed) }
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { segments.append(trimmed) }
+        return segments
+    }
+
+    /// Quote-aware split on `&&` / `||` / `;` (not `|`).
+    private static func chainSegments(_ input: String) -> [String] {
+        var segments: [String] = []
+        var current = ""
+        var quote: Character?
+        var escaping = false
+        let characters = Array(input)
+        var index = 0
+        func flush() {
+            let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { segments.append(trimmed) }
+            current = ""
+        }
+        while index < characters.count {
+            let character = characters[index]
+            if escaping {
+                current.append(character)
+                escaping = false
+                index += 1
+                continue
+            }
+            if let activeQuote = quote {
+                current.append(character)
+                if character == activeQuote {
+                    quote = nil
+                } else if activeQuote == "\"", character == "\\" {
+                    escaping = true
+                }
+                index += 1
+                continue
+            }
+            if character == "'" || character == "\"" {
+                quote = character
+                current.append(character)
+                index += 1
+                continue
+            }
+            if character == "\\" {
+                escaping = true
+                current.append(character)
+                index += 1
+                continue
+            }
+            if character == ";" {
+                flush()
+                index += 1
+                continue
+            }
+            if character == "&", index + 1 < characters.count, characters[index + 1] == "&" {
+                flush()
+                index += 2
+                continue
+            }
+            if character == "|", index + 1 < characters.count, characters[index + 1] == "|" {
+                flush()
+                index += 2
+                continue
+            }
+            current.append(character)
+            index += 1
+        }
+        flush()
+        return segments
+    }
+
     /// Segment-aware check shared with wrapper intent: pipes/and chains may mix tools.
+    /// Last-pipeline `distill` wins: do not treat `rg … | distill "q"` as exact-output.
     public static func shellCommandLooksExactOutput(_ command: String) -> Bool {
+        if lastPipelineCommandIsVoluntaryDistill(command) {
+            return false
+        }
         let segments = command
             .components(separatedBy: shellSegmentSeparators)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }

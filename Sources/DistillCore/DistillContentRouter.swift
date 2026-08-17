@@ -184,9 +184,17 @@ public struct DistillContentRouter: Sendable {
             } else {
                 candidate = nil
             }
-        case .buildOutput, .searchResults:
-            // Build/search output often contains repeated progress or match rows.
-            // Reuse the reversible line-run compressor before falling through.
+        case .buildOutput:
+            if options.allowElementDropping,
+               let crushed = BuildProgressCrusher.crush(input, handle: options.reversibleHandle) {
+                candidate = DistillRouteResult(output: crushed, contentType: .buildOutput, lossless: false)
+            } else {
+                candidate = LogCollapser.collapse(input).map {
+                    DistillRouteResult(output: $0, contentType: .buildOutput, lossless: true)
+                }
+            }
+        case .searchResults:
+            // Search output often contains repeated match rows.
             candidate = LogCollapser.collapse(input).map { DistillRouteResult(output: $0, contentType: type, lossless: true) }
         case .sourceCode:
             if options.allowElementDropping, let handle = options.reversibleHandle {

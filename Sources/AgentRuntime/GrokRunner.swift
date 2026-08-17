@@ -58,6 +58,11 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     /// Builds `grok` argv for a one-shot headless turn. Pure + static for tests.
+    ///
+    /// Token Saver does **not** register a Grok PostToolUse output-rewrite hook
+    /// here. Official Grok hooks treat PostToolUse as passive (stdout ignored),
+    /// so native `read_file` cannot be compressed after the fact. Eligible
+    /// savings stay on PATH wrappers + PreToolUse `| distill` command rewrite.
     public static func buildArgs(_ request: AgentRunRequest, newSessionId: String? = nil) -> [String] {
         let providerPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
             request.providerPrompt,
