@@ -119,6 +119,7 @@ final class BotTypesTests: XCTestCase {
         let starter = BotStandingInstructions.fallback(name: "New Agent", title: "", description: "")
         XCTAssertFalse(starter.contains("You are"), "identity layer owns the name")
         XCTAssertFalse(starter.contains("@"), "identity layer owns the handle")
+        XCTAssertFalse(starter.contains("Route:"), "route layer owns the provider/model")
         XCTAssertTrue(starter.contains(BotStandingInstructions.rememberFactTool))
         XCTAssertTrue(starter.contains(BotStandingInstructions.changeJobTool))
         XCTAssertTrue(starter.contains(BotStandingInstructions.forgetFactTool))

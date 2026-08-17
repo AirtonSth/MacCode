@@ -304,6 +304,69 @@ final class BotBrainCompilerTests: XCTestCase {
         )
     }
 
+    func test_routeHonestyCompilesForCustomSoul_becauseDeskRouteIsNotAnEscapeHatch() {
+        // WHY: Desk already shows provider + model. Brain compile never sent
+        // them, so first-chat "what model are you?" invented a route. Route
+        // is advertised identity — a written soul must not hide it.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What model are you?")
+        XCTAssertTrue(receipt.compiledPayload.contains("Route: Claude · opus"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, true)
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.text, "Claude · opus")
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .route })?.reason,
+            "Advertised provider and model. Desk already shows this route."
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Route:"),
+            "route layer owns the provider/model"
+        )
+    }
+
+    func test_routeOmitsEmptyModel_becauseDeskHidesAnUnsetModelPill() {
+        // WHY: Desk modelLabel is hidden when the revision model is blank.
+        // Compile must not invent a default the owner never advertised.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .grok,
+            providerInstanceID: "grok",
+            model: "  ",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Hi")
+        XCTAssertTrue(receipt.compiledPayload.contains("Route: Grok"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Route: Grok ·"))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.text, "Grok")
+    }
+
     func test_permissionHonestyCompilesForCustomSoul_becauseRouteHonestyIsNotAnEscapeHatch() {
         // WHY: Working-space honesty is a RemoteCode layer. Permission is
         // the same class of advertised fact — a written soul must not hide

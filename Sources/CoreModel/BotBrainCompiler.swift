@@ -13,6 +13,7 @@ public struct BotContextLayer: Codable, Sendable, Equatable, Identifiable {
         case identity
         case desktop
         case permission
+        case route
         case description
         case soul
         case memory
@@ -162,6 +163,7 @@ public enum BotBrainCompiler {
         }
         lines.append("Working space: \(workingSpaceText(for: revision))")
         lines.append("Permission: \(BotPermission.honestyLabel)")
+        lines.append("Route: \(routeLine(provider: revision.provider, model: revision.model))")
         let description = revision.description.trimmingCharacters(in: .whitespacesAndNewlines)
         if !description.isEmpty {
             lines.append(description)
@@ -198,6 +200,23 @@ public enum BotBrainCompiler {
 
     static func workingSpaceText(for revision: BotRevision) -> String {
         revision.desktopKind.advertisedOrLogical.honestyLabel
+    }
+
+    /// Desk already shows provider + model. Compile them so first-chat
+    /// "what model are you?" cannot invent a route. Custom soul must not
+    /// hide advertised routing.
+    static func routeLine(provider: AgentProvider, model: String) -> String {
+        let title = providerTitle(provider)
+        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.isEmpty ? title : "\(title) · \(model)"
+    }
+
+    static func providerTitle(_ provider: AgentProvider) -> String {
+        switch provider {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        case .grok: return "Grok"
+        }
     }
 
     /// Desk already shows `@handle`. Compile it so first-chat "what's your handle?"
@@ -279,6 +298,17 @@ public enum BotBrainCompiler {
                 text: BotPermission.honestyLabel,
                 included: true,
                 reason: "Advertised supervised route. Leftover full-access kinds compile as supervised."
+            )
+        )
+
+        layers.append(
+            BotContextLayer(
+                id: "route",
+                kind: .route,
+                title: "Route",
+                text: routeLine(provider: revision.provider, model: revision.model),
+                included: true,
+                reason: "Advertised provider and model. Desk already shows this route."
             )
         )
 
