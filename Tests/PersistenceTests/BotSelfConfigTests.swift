@@ -276,6 +276,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["website"], "website is an advertised bot_browser_open alias, not a set_settings key")
         XCTAssertNil(properties?["url"], "url is a leftover bot_browser_open key, not a set_settings key")
         XCTAssertNil(properties?["last_website"], "last_website is an advertised compile name, not a set_settings key")
+        XCTAssertNil(properties?["browser"], "browser is an advertised compile heading, not a set_settings key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
@@ -1700,6 +1701,71 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertEqual(renamed.soul, "Own the inbox.")
+    }
+
+    func test_setSettingsRejectsAdvertisedBrowser_becauseStudioSaysBotBrowserOpen() throws {
+        // WHY: Studio dest title already says Browser. Compile already
+        // labels Browser. leftover website / url / last_website already
+        // reject. leftover browser still succeeded empty, so first-chat
+        // invented a persist from the compile heading. Reject the
+        // advertised name with website honesty pointing at
+        // bot_browser_open. bot_browser_open still persists Website.
+        // leftover website still rejects. Name still persists. Schema
+        // does not grow a browser write key. Dest title stays Browser.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["browser"],
+            "schema does not grow a browser write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "browser": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Browser": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "website": "https://example.com",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.websiteHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Browser reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Browser reject must not persist soul")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "instructions": "Own the inbox.",
+        ])
+        XCTAssertEqual(fromInstructions.soul, "Own the inbox.", "plural Instructions still persist")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.soul, "Own the inbox.")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
     }
 
     func test_setSettingsRejectsLeftoverPermissionMode_becauseStudioSaysItIsHostAssigned() throws {

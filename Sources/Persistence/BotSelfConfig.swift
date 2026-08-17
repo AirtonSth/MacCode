@@ -756,9 +756,12 @@ public struct BotSelfConfigService: Sendable {
         }
         // Studio already says last website. Compile already labels
         // Browser. A leftover website / url write used to return an
-        // empty success, so first-chat invented a persist. Schema does
-        // not grow a website key. bot_browser_open still persists
-        // Website. Dest title stays Browser.
+        // empty success, so first-chat invented a persist. leftover
+        // browser still succeeded empty after website rejected, so
+        // first-chat invented a persist from the compile heading.
+        // Schema does not grow a website or browser key.
+        // bot_browser_open still persists Website. Dest title stays
+        // Browser.
         if arguments.keys.contains(where: Self.isAdvertisedWebsiteKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.websiteHonesty)
         }
@@ -1015,14 +1018,17 @@ public struct BotSelfConfigService: Sendable {
     }
 
     /// website is not a schema key. Studio / compile advertise last
-    /// website, so parse must fail loud instead of succeeding empty.
-    /// bot_browser_open still persists Website. Schema does not grow a
-    /// website key. Leftover url / last_website are the same write.
+    /// website and label Browser, so parse must fail loud instead of
+    /// succeeding empty. bot_browser_open still persists Website.
+    /// Schema does not grow a website or browser write key. Leftover
+    /// url / last_website / browser are the same write — compile
+    /// heading Browser is the advertised dest title.
     static func isAdvertisedWebsiteKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "website"
             || normalized == "url"
             || normalized == "last_website"
+            || normalized == "browser"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {
