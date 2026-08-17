@@ -656,6 +656,16 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedSameMacOSAccountKey) {
             throw BotSelfConfigError.invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel)
         }
+        // Studio already says not isolated. Compile already labels
+        // that honesty. leftover desktop / same_macos_account already
+        // reject. leftover isolated still succeeded empty, so
+        // first-chat invented a persist from the advertised honesty
+        // phrase. Schema does not grow an isolated write key.
+        // leftover desktop still rejects. leftover same_macos_account
+        // still rejects. Name still persists. Dest title stays Desktop.
+        if arguments.keys.contains(where: Self.isAdvertisedIsolatedKey) {
+            throw BotSelfConfigError.invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+        }
         // Studio Security already says Approvals. Compile already labels
         // Allow once / Deny stay off. A leftover Approvals / allow_once
         // / deny write used to return an empty success, so first-chat
@@ -931,6 +941,18 @@ public struct BotSelfConfigService: Sendable {
         return normalized == "same_macos_account"
             || normalized == "macos_account"
             || normalized == "same_account"
+    }
+
+    /// isolated is not a schema write key. Studio / compile advertise
+    /// not isolated, so parse must fail loud instead of succeeding
+    /// empty. leftover desktop stays on the Desktop reject. leftover
+    /// same_macos_account stays on the Same macOS account reject.
+    /// Schema does not grow an isolated write key.
+    static func isAdvertisedIsolatedKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "isolated"
+            || normalized == "not_isolated"
+            || normalized == "isolated_desktop"
     }
 
     /// approvals is not a schema key. Studio / compile advertise the
