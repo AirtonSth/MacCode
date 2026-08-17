@@ -14,6 +14,7 @@ public struct BotContextLayer: Codable, Sendable, Equatable, Identifiable {
         case desktop
         case permission
         case route
+        case notifications
         case tools
         case description
         case soul
@@ -189,6 +190,7 @@ public enum BotBrainCompiler {
         }
         lines.append("Working space: \(workingSpaceText(for: revision, workspace: workspace))")
         lines.append("Permission: \(BotPermission.honestyLabel)")
+        lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
         lines.append("Route: \(routeLine(provider: revision.provider, model: revision.model))")
         lines.append(BotStandingInstructions.admittedToolsText)
         let description = revision.description.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -232,6 +234,15 @@ public enum BotBrainCompiler {
         let isolation = revision.desktopKind.advertisedOrLogical.honestyLabel
         let place = workspace?.placeLabel ?? ""
         return place.isEmpty ? isolation : "\(place). \(isolation)"
+    }
+
+    /// Studio already shows Notifications On/Off. Compile them so
+    /// first-chat "will you notify me?" cannot invent alerts. Custom soul
+    /// must not hide advertised notification power.
+    static func notificationsLine(enabled: Bool) -> String {
+        enabled
+            ? "On. Alerts stay on this Mac; not an isolated Desktop."
+            : "Off. This Mac will not alert the owner."
     }
 
     /// Desk already shows provider + model. Compile them so first-chat
@@ -343,6 +354,17 @@ public enum BotBrainCompiler {
                 text: BotPermission.honestyLabel,
                 included: true,
                 reason: "Advertised supervised route. Leftover full-access kinds compile as supervised."
+            )
+        )
+
+        layers.append(
+            BotContextLayer(
+                id: "notifications",
+                kind: .notifications,
+                title: "Notifications",
+                text: notificationsLine(enabled: bot.notificationsEnabled),
+                included: true,
+                reason: "Advertised notification toggle. Studio already shows On or Off."
             )
         )
 

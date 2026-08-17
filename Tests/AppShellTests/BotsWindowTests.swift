@@ -1528,6 +1528,42 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(piper.workspaceID, workspace.id)
     }
 
+    func test_previewBrainIncludesAdvertisedNotifications_becauseDestMustNotOmitAlerts() throws {
+        // WHY: Studio already shows Notifications On/Off. Brain compile never
+        // sent that toggle, so first-chat "will you notify me?" invented
+        // alerts. Dest preview and compose must share the advertised state.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "Will you notify me?"
+        let onPreview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(onPreview.compiledPayload.contains("Notifications: On. Alerts stay on this Mac; not an isolated Desktop."))
+        XCTAssertTrue(onPreview.compiledPayload.contains("Own the inbox."))
+        vm.openStudio(piper)
+        vm.studioDraft.notificationsEnabled = false
+        let draftPreview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(draftPreview.compiledPayload.contains("Notifications: Off. This Mac will not alert the owner."))
+        XCTAssertFalse(draftPreview.compiledPayload.contains("Notifications: On."))
+        _ = try vm.saveStudio()
+        vm.openDesk(try XCTUnwrap(vm.selectedBot))
+        vm.composerText = "Will you notify me?"
+        let offPreview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(offPreview.compiledPayload.contains("Notifications: Off. This Mac will not alert the owner."))
+        XCTAssertEqual(
+            offPreview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: try XCTUnwrap(vm.selectedBot),
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Will you notify me?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
     func test_previewBrainIncludesAdvertisedMemoryMutateKey_becauseDestMustNotOmitForgetKeys() throws {
         // WHY: Studio Memory already has Forget. Brain compile listed the
         // fact without memory_id, so first-chat forget invented a UUID.

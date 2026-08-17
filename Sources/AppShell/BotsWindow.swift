@@ -1387,7 +1387,11 @@ public final class BotsViewModel: ObservableObject {
     public func previewBrain(userText: String? = nil) -> ContextAssemblyReceipt? {
         let text = (userText ?? composerText)
         let request = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let bot = selectedBot ?? studioPreviewBot() else { return nil }
+        guard let selectedOrDraft = selectedBot ?? studioPreviewBot() else { return nil }
+        var bot = selectedOrDraft
+        if screen == .studio {
+            bot.notificationsEnabled = studioDraft.notificationsEnabled
+        }
         guard let revision = studioPreviewRevision(for: bot) ?? selectedRevision else { return nil }
         let memory = selectedBotID == bot.id
             ? memoryItems
@@ -1403,6 +1407,7 @@ public final class BotsViewModel: ObservableObject {
             }.joined(separator: ","),
             advertisedWorkspace?.placeLabel ?? "",
             selectedConversation?.id.value.uuidString ?? "",
+            bot.notificationsEnabled ? "n1" : "n0",
         ].joined(separator: "\u{1f}")
         if cachedPreviewBrainKey == key, let cached = cachedPreviewBrain {
             return cached

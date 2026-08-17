@@ -669,4 +669,73 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.text, BotBrainCompiler.memoryLine(forgotten))
     }
+
+    func test_notificationsHonestyCompilesForCustomSoul_becauseStudioToggleIsNotAnEscapeHatch() {
+        // WHY: Studio already shows Notifications On/Off. The model never
+        // saw it, so first-chat "will you notify me?" invented alerts. A
+        // written soul must not hide advertised notification power.
+        var bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        bot.notificationsEnabled = true
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Will you notify me?")
+        XCTAssertTrue(receipt.compiledPayload.contains("Notifications: \(BotBrainCompiler.notificationsLine(enabled: true))"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .notifications })?.included, true)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .notifications })?.text,
+            BotBrainCompiler.notificationsLine(enabled: true)
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Notifications:"),
+            "notifications honesty is a compiler layer, not starter soul"
+        )
+    }
+
+    func test_notificationsOffDoesNotCompileLiveAlerts_becauseOffMustStayOff() {
+        // WHY: Off is advertised. Compiling On copy when the toggle is Off
+        // would invent alerts the owner already turned off.
+        var bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        bot.notificationsEnabled = false
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Ping me when you are blocked")
+        XCTAssertTrue(receipt.compiledPayload.contains("Notifications: \(BotBrainCompiler.notificationsLine(enabled: false))"))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.notificationsLine(enabled: true)))
+        XCTAssertFalse(receipt.compiledPayload.contains("Notifications: On"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .notifications })?.text,
+            BotBrainCompiler.notificationsLine(enabled: false)
+        )
+    }
 }
