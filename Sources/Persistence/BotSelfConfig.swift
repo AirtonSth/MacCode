@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -633,6 +633,15 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedApprovalsKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.approvalsHonesty)
         }
+        // Studio Security already says Host-brokered writes. Compile
+        // already labels they stay off. A leftover Host-brokered writes
+        // / effects write used to return an empty success, so first-chat
+        // invented a persist. Schema does not grow a host_brokered_writes
+        // or effects key. Leftover permission_mode still coerces. Dest
+        // title stays Permission.
+        if arguments.keys.contains(where: Self.isAdvertisedHostBrokeredWritesKey) {
+            throw BotSelfConfigError.invalid(BotPermission.honestyLabel)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -736,6 +745,19 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "allow_once"
             || normalized == "deny"
             || normalized == "allow_once_/_deny"
+    }
+
+    /// host_brokered_writes is not a schema key. Studio / compile
+    /// advertise the name, so parse must fail loud instead of succeeding
+    /// empty. Leftover permission_mode stays a coerce path, not this
+    /// reject. Settings Effects is the same advertised field.
+    static func isAdvertisedHostBrokeredWritesKey(_ key: String) -> Bool {
+        let normalized = key.lowercased()
+            .replacingOccurrences(of: " ", with: "_")
+            .replacingOccurrences(of: "-", with: "_")
+        return normalized == "host_brokered_writes"
+            || normalized == "host_brokered"
+            || normalized == "effects"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {

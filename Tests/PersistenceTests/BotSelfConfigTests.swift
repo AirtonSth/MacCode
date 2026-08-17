@@ -236,11 +236,15 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["approvals"], "approvals is not a schema key")
         XCTAssertNil(properties?["allow_once"], "allow_once is not a schema key")
         XCTAssertNil(properties?["deny"], "deny is not a schema key")
+        XCTAssertNil(properties?["host_brokered_writes"], "host_brokered_writes is not a schema key")
+        XCTAssertNil(properties?["host_brokered"], "host_brokered is not a schema key")
+        XCTAssertNil(properties?["effects"], "effects is not a schema key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.approvalModeHostAssignedHonesty), "catalog names Approval mode host-assigned honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.approvalsHonesty), "catalog names Approvals honesty")
+        XCTAssertTrue(description.contains(BotPermission.honestyLabel), "catalog names Host-brokered writes honesty")
         XCTAssertTrue(description.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel), "catalog names Desktop isolation honesty")
     }
 
@@ -552,6 +556,69 @@ final class BotSelfConfigTests: XCTestCase {
         }
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Approvals reject must not persist a name")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let leftover = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+        ])
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+    }
+
+    func test_setSettingsRejectsAdvertisedHostBrokeredWrites_becauseStudioSaysTheyStayOff() throws {
+        // WHY: Studio Security already says Host-brokered writes. Compile
+        // already labels they stay off. set_settings still accepted
+        // Host-brokered writes / effects as an empty success, so
+        // first-chat "enable Effects" invented a persist. Reject the
+        // advertised name. Name still persists. Leftover permission_mode
+        // still coerces. Schema does not grow a host_brokered_writes key.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "host_brokered_writes": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "Host-brokered writes": "on",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Effects": true,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "host_brokered": "full_access",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotPermission.honestyLabel))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Host-brokered writes reject must not persist a name")
         XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
 
         let leftover = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
