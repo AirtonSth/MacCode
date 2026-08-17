@@ -82,7 +82,8 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(afterSet.soul, "Speak plainly.")
         XCTAssertEqual(afterSet.provider, AgentProvider.grok.rawValue)
         XCTAssertEqual(afterSet.model, "grok-4")
-        XCTAssertEqual(afterSet.permissionMode, AgentPermissionMode.fullAccess.rawValue)
+        // leftover full_access is not live — Desk launches supervised
+        XCTAssertEqual(afterSet.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertEqual(afterSet.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
         XCTAssertFalse(afterSet.notificationsEnabled)
         XCTAssertEqual(try store.get(id: bot.id)?.name, "Piper Prime")
@@ -165,5 +166,54 @@ final class BotSelfConfigTests: XCTestCase {
             store: store
         )
         XCTAssertEqual(try service.snapshot().id, bot.id.value.uuidString.lowercased())
+    }
+
+    func test_leftoverPermissionSnapshotStaysSupervised_becauseFullAccessIsNotLive() throws {
+        // WHY: Brain compile already treats leftover full_access as
+        // supervised. get_settings still returned the raw leftover, so
+        // first-chat "just write the file" via bot_get_settings invented
+        // unsupervised access. Hermes agents see advertised permission.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", soul: "Own the inbox.", provider: .claude)
+        let currentID = try XCTUnwrap(bot.currentRevisionID)
+        _ = try store.publish(
+            botID: bot.id,
+            expectedCurrentRevisionID: currentID,
+            draft: BotRevisionDraft(
+                name: "Piper",
+                title: "Scout",
+                description: "",
+                soul: "Own the inbox.",
+                provider: .claude,
+                providerInstanceID: "claude",
+                model: "opus",
+                permissionMode: .fullAccess
+            )
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let snapshot = try service.snapshot()
+        XCTAssertEqual(snapshot.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertNotEqual(snapshot.permissionMode, AgentPermissionMode.fullAccess.rawValue)
+        let stored = try XCTUnwrap(try store.getRevision(id: try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)))
+        XCTAssertEqual(stored.permissionMode, .fullAccess)
+    }
+
+    func test_setSettingsLeftoverPermissionDoesNotAdvertiseFullAccess() throws {
+        // WHY: Desk-admitted bot_set_settings used to persist leftover
+        // full_access and echo it back. The model then believed it had
+        // unsupervised writes. Apply must coerce like desktopKind.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let after = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+        ])
+        XCTAssertEqual(after.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertFalse(after.permissionMode.contains("full_access"))
+        let stored = try XCTUnwrap(try store.getRevision(id: try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)))
+        XCTAssertEqual(stored.permissionMode, .supervised)
+        let auto = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "permission_mode": AgentPermissionMode.autoAcceptEdits.rawValue,
+        ])
+        XCTAssertEqual(auto.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertFalse(auto.permissionMode.contains("auto_accept_edits"))
     }
 }

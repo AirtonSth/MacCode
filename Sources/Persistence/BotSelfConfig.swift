@@ -282,7 +282,7 @@ public struct BotSelfConfigService: Sendable {
             provider: (revision?.provider ?? .claude).rawValue,
             providerInstanceID: revision?.providerInstanceID ?? "",
             model: revision?.model ?? "",
-            permissionMode: (revision?.permissionMode ?? .supervised).rawValue,
+            permissionMode: BotPermission.advertisedOrSupervised(revision?.permissionMode ?? .supervised).rawValue,
             desktopKind: (revision?.desktopKind ?? .logicalExecutionSpace).advertisedOrLogical.rawValue,
             notificationsEnabled: bot.notificationsEnabled,
             memory: memory.map { .init(id: $0.id.value.uuidString.lowercased(), content: $0.content) },
@@ -311,6 +311,9 @@ public struct BotSelfConfigService: Sendable {
         let name = patch.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? current.name
         guard !name.isEmpty else { throw BotSelfConfigError.invalid("Name is required.") }
         let desktop = (patch.desktopKind ?? current.desktopKind).advertisedOrLogical
+        let permission = BotPermission.advertisedOrSupervised(
+            patch.permissionMode ?? current.permissionMode
+        )
         let draft = BotRevisionDraft(
             name: name,
             title: patch.title ?? current.title,
@@ -321,7 +324,7 @@ public struct BotSelfConfigService: Sendable {
             model: patch.model ?? current.model,
             reasoningEffort: current.reasoningEffort,
             compatibleRouteSet: current.compatibleRouteSet,
-            permissionMode: patch.permissionMode ?? current.permissionMode,
+            permissionMode: permission,
             desktopKind: desktop
         )
         _ = try store.publish(
