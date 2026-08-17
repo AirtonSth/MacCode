@@ -144,4 +144,44 @@ final class BotBrowserStoreTests: XCTestCase {
             XCTAssertEqual(error as? BotBrowserError, .crossBot)
         }
     }
+
+    func test_openAdvertisedWebsitePersists_becauseToolsSayWebsiteNotUrl() throws {
+        // WHY: Tools invite "open a website". Parse only read url, so
+        // first-chat "open this website" invented a hop or left the leftover
+        // tab. Canonical url still wins. Schema does not grow a second key.
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-bot-browser-website-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bot = BotID()
+        let service = BotBrowserService(
+            callerBotID: bot,
+            store: BotBrowserStore(appSupportDirectory: root)
+        )
+
+        let fromWebsite = try service.call(name: BotBrowserCatalog.open, arguments: [
+            "website": "https://login.example.test/in",
+        ])
+        XCTAssertEqual(fromWebsite["url"] as? String, "https://login.example.test/in", "Website persists")
+        XCTAssertEqual(try service.current()?.url, "https://login.example.test/in")
+
+        let urlWins = try service.call(name: BotBrowserCatalog.open, arguments: [
+            "url": "https://login.example.test/home",
+            "website": "https://ignored.example.test",
+        ])
+        XCTAssertEqual(urlWins["url"] as? String, "https://login.example.test/home", "url wins")
+        XCTAssertEqual(try service.current()?.url, "https://login.example.test/home")
+    }
+
+    func test_openCatalogDescribesWebsite_becauseThatIsTheAdvertisedField() {
+        // WHY: Schema key stays url. Description must name Website so
+        // first-chat does not invent a hop.
+        let description = BotBrowserCatalog.description(for: BotBrowserCatalog.open)
+        XCTAssertTrue(description.contains("website"))
+        let schema = BotBrowserCatalog.schema(for: BotBrowserCatalog.open)
+        let properties = schema["properties"] as? [String: Any]
+        XCTAssertNotNil(properties?["url"])
+        XCTAssertNil(properties?["website"], "website is an advertised alias, not a second schema key")
+        let url = properties?["url"] as? [String: Any]
+        XCTAssertEqual(url?["description"] as? String, "Website. Same field as the URL to open.")
+    }
 }
