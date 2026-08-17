@@ -283,6 +283,8 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["admitted_tools"], "admitted_tools is advertised dest title, not a schema write key")
         XCTAssertNil(properties?["tools"], "tools is leftover dest layer id, not a schema write key")
         XCTAssertNil(properties?["admitted"], "admitted is leftover dest title first word, not a schema write key")
+        XCTAssertNil(properties?["user_request"], "user_request is advertised dest title, not a schema write key")
+        XCTAssertNil(properties?["user_text"], "user_text is leftover compose name, not a schema write key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
@@ -301,6 +303,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(description.contains(BotBrainCompiler.whenHonesty), "catalog names When honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.activeHonesty), "catalog names Active honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.websiteHonesty), "catalog names Website honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.userRequestHonesty), "catalog names User request honesty")
     }
 
     func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
@@ -2286,6 +2289,75 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Admitted tools reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "Admitted tools reject must not persist soul")
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
+    }
+
+    func test_setSettingsRejectsAdvertisedUserRequest_becauseStudioSaysItIsThisTurn() throws {
+        // WHY: Studio dest title already says User request. Compile
+        // already labels User request. leftover admitted_tools already
+        // rejects. leftover user_request still succeeded empty, so
+        // first-chat invented a persist from the dest title. Reject
+        // the advertised name with this-turn honesty. leftover
+        // admitted_tools still rejects. bot_id still owns the caller
+        // check. Name still persists. Schema does not grow a
+        // user_request write key. Dest title stays User request.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["user_request"],
+            "schema does not grow a user_request write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "user_request": "Remember this turn as a setting.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.userRequestHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "User request": "Remember this turn as a setting.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.userRequestHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "user_text": "Remember this turn as a setting.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.userRequestHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "admitted_tools": "Invent a new tool.",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "User request reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "User request reject must not persist soul")
         XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 

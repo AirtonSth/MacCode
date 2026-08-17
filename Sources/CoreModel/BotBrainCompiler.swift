@@ -243,6 +243,15 @@ public enum BotBrainCompiler {
     public static let websiteHonesty =
         "Website: call \(BotStandingInstructions.openBrowserTool). Same path as last website. Not a set_settings write."
 
+    /// Studio dest title already says User request. Compile already
+    /// labels User request. A leftover user_request write on
+    /// set_settings used to return an empty success, so first-chat
+    /// invented a persist. The user request is this turn. Dest Source
+    /// title stays User request. Schema does not grow a user_request
+    /// write key.
+    public static let userRequestHonesty =
+        "User request is this turn. Not a set_settings write."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,

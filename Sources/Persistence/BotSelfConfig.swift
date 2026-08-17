@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.removeHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.removeHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty) \(BotBrainCompiler.userRequestHonesty)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -779,6 +779,15 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedAdmittedToolsKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.workspaceHostAssignedHonesty)
         }
+        // Studio dest title already says User request. Compile already
+        // labels User request. leftover admitted_tools already rejects.
+        // leftover user_request still succeeded empty, so first-chat
+        // invented a persist from the dest title. Schema does not grow
+        // a user_request write key. The user request is this turn.
+        // Name still persists. Dest title stays User request.
+        if arguments.keys.contains(where: Self.isAdvertisedUserRequestKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.userRequestHonesty)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -1063,6 +1072,17 @@ public struct BotSelfConfigService: Sendable {
         return normalized == "admitted_tools"
             || normalized == "tools"
             || normalized == "admitted"
+    }
+
+    /// user_request is not a schema write key. Studio / compile dest
+    /// title User request, so parse must fail loud instead of succeeding
+    /// empty. leftover user_text is the same write — compose argument
+    /// name. The user request is this turn. Schema does not grow a
+    /// user_request write key.
+    static func isAdvertisedUserRequestKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "user_request"
+            || normalized == "user_text"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {
