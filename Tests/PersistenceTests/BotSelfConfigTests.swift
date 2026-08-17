@@ -225,6 +225,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["fallback_order"], "fallback_order is not a schema key")
         XCTAssertNil(properties?["handle"], "handle is create-only, not a schema key")
         XCTAssertNil(properties?["id"], "id is leftover snapshot identity, not a schema write key")
+        XCTAssertNil(properties?["identity"], "identity is advertised dest title, not a schema write key")
         XCTAssertNil(properties?["workspace"], "workspace is host-assigned, not a schema key")
         XCTAssertNil(properties?["working_space"], "working_space is not a schema key")
         XCTAssertNil(properties?["cwd"], "cwd is not a schema key")
@@ -2161,6 +2162,68 @@ final class BotSelfConfigTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
         }
+    }
+
+    func test_setSettingsRejectsAdvertisedIdentity_becauseStudioSaysItIsHostAssigned() throws {
+        // WHY: Studio already dests Identity. Compile dest title is
+        // Identity. get_settings already says live identity. leftover
+        // snapshot id already rejects. leftover identity still succeeded
+        // empty, so first-chat invented a persist from the dest title.
+        // Reject the advertised name with host-assigned honesty. leftover
+        // id still rejects. bot_id still owns the caller check. Name
+        // still persists. Schema does not grow an identity write key.
+        // Dest title stays Identity.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["identity"],
+            "schema does not grow an identity write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "identity": "Piper Prime",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "Identity": "Piper Prime",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "id": bot.id.value.uuidString.lowercased(),
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Identity reject must not persist a name")
+        XCTAssertEqual(still.soul, "Be brief.", "Identity reject must not persist soul")
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID != beforeID, true)
     }
 
     func test_setSettingsRejectsSnapshotMemoryId_becauseStudioSaysRememberAFact() throws {

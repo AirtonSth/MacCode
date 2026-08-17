@@ -603,9 +603,12 @@ public struct BotSelfConfigService: Sendable {
         }
         // Snapshot still encodes leftover id. A leftover id write used
         // to return an empty success, so first-chat invented a persist
-        // from the last get_settings key. Schema does not grow an id
-        // write key. bot_id still owns the caller check. Name still
-        // persists. Dest title stays Identity.
+        // from the last get_settings key. leftover identity still
+        // succeeded empty after id rejected, so first-chat invented a
+        // persist from the dest title and get_settings "live identity".
+        // Schema does not grow an id or identity write key. bot_id still
+        // owns the caller check. Name still persists. Dest title stays
+        // Identity.
         if arguments.keys.contains(where: Self.isAdvertisedIdentityKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.workspaceHostAssignedHonesty)
         }
@@ -823,10 +826,13 @@ public struct BotSelfConfigService: Sendable {
 
     /// id is not a schema write key. Snapshot still encodes leftover
     /// id, so parse must fail loud instead of succeeding empty.
+    /// leftover identity is the same write — compile dest title Identity
+    /// and get_settings "live identity" are the advertised names.
     /// bot_id stays the caller-ownership argument.
     static func isAdvertisedIdentityKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "id"
+            || normalized == "identity"
     }
 
     /// workspace is not a schema key. Studio / compile advertise the
