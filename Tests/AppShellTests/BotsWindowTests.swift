@@ -4337,6 +4337,20 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.displayedDesktopKind, .logicalExecutionSpace)
     }
 
+    func test_avatarSymbolNameIsHuman_becauseStudioMustNotAnnounceSFSymbolPaths() {
+        XCTAssertEqual(
+            BotsChrome.avatarSymbolName("person.crop.circle"),
+            "Person",
+            "VoiceOver on an Avatar chip must say Person, not person.crop.circle"
+        )
+        for symbol in BotsChrome.avatarSymbols {
+            XCTAssertFalse(
+                BotsChrome.avatarSymbolName(symbol).contains("."),
+                "\(symbol) must not leak an SF Symbol path into the Avatar name"
+            )
+        }
+    }
+
     func test_botsOpensInMainContent_andSidebarSitsUnderScheduleTasks() throws {
         let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
         let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
@@ -4556,6 +4570,23 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(settings.contains("settings.bots.desktopRemote.toggle"))
         XCTAssertFalse(main.contains("SurfaceType.bot"))
         XCTAssertFalse(bots.contains("SurfaceType.bot"))
+        XCTAssertTrue(
+            BotsChrome.avatarSymbols.contains("person.crop.circle"),
+            "the Avatar picker must include the default symbol so a new Bot has a selected chip"
+        )
+        XCTAssertEqual(
+            Set(BotsChrome.avatarSymbols).count,
+            BotsChrome.avatarSymbols.count,
+            "duplicate chips would make the selected Avatar look like two choices"
+        )
+        XCTAssertTrue(
+            bots.contains("BotsChrome.avatarSymbols"),
+            "Studio Avatar must be a symbol picker, not a raw SF Symbol text field"
+        )
+        XCTAssertFalse(
+            bots.contains("studioField(placeholder: \"person.crop.circle\""),
+            "users must not type person.crop.circle to set an Avatar"
+        )
 
         let scheduleTasks = try XCTUnwrap(sidebar.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
         let reportBug = try XCTUnwrap(sidebar.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))

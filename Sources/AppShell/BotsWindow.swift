@@ -3662,8 +3662,8 @@ public struct BotsRootView: View {
                 studioField(placeholder: "piper", text: $vm.studioDraft.handle)
                     .disabled(!vm.studioDraft.isNew)
             }
-            studioFormRow("Avatar") {
-                studioField(placeholder: "person.crop.circle", text: $vm.studioDraft.avatarSymbol)
+            studioFormRow("Avatar", announceLabel: false) {
+                avatarSymbolPicker
             }
         }
         .dsPanel(padding: DS.Space.lg)
@@ -3672,6 +3672,29 @@ public struct BotsRootView: View {
 
     private var handleMatchesDerivedName: Bool {
         vm.studioDraft.handle == (BotHandle.derive(from: vm.studioDraft.name) ?? "")
+    }
+
+    private var avatarSymbolPicker: some View {
+        HStack(spacing: DS.Space.sm) {
+            ForEach(BotsChrome.avatarSymbols, id: \.self) { symbol in
+                let selected = vm.studioDraft.avatarSymbol == symbol
+                Button {
+                    vm.studioDraft.avatarSymbol = symbol
+                } label: {
+                    Image(systemName: symbol)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(selected ? BotsChrome.onPrimary : DS.Palette.text)
+                        .frame(width: BotsChrome.hitTarget, height: BotsChrome.hitTarget)
+                        .background(selected ? BotsChrome.primary : DS.Palette.surfaceRaised)
+                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(BotsChrome.avatarSymbolName(symbol))
+                .accessibilityAddTraits(selected ? .isSelected : [])
+                .accessibilityIdentifier("bots.studio.avatar.\(symbol)")
+            }
+        }
+        .accessibilityIdentifier("bots.studio.avatar")
     }
 
     private var studioProvider: some View {
@@ -3867,15 +3890,23 @@ public struct BotsRootView: View {
         }
     }
 
-    private func studioFormRow<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+    private func studioFormRow<Content: View>(
+        _ label: String,
+        announceLabel: Bool = true,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
         HStack(alignment: .center, spacing: DS.Space.lg) {
             Text(label)
                 .font(DS.Font.caption.weight(.medium))
                 .foregroundColor(DS.Palette.textSecondary)
                 .frame(width: 112, alignment: .leading)
                 .accessibilityHidden(true)
-            content()
-                .accessibilityLabel(label)
+            if announceLabel {
+                content()
+                    .accessibilityLabel(label)
+            } else {
+                content()
+            }
         }
         .frame(minHeight: BotsChrome.hitTarget)
     }
