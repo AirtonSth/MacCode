@@ -245,6 +245,12 @@ public enum BotBrainCompiler {
         // "what's your Default route?" cannot invent a hop. Dest Source
         // title stays Route.
         lines.append("Default route: \(routeLine(provider: revision.provider, model: revision.model))")
+        // Studio already says Model. Compile that name so first-chat
+        // "what's your Model?" cannot invent a hop. Empty stays omitted
+        // (Desk hides the pill). Dest Source title stays Route.
+        if let model = modelLine(revision.model) {
+            lines.append(model)
+        }
         lines.append(BotStandingInstructions.admittedToolsText)
         if let browser = browserLine(browser) {
             lines.append(browser)
@@ -348,6 +354,14 @@ public enum BotBrainCompiler {
         let title = BotRoute.advertisedTitle(for: provider)
         let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         return model.isEmpty ? title : "\(title) · \(model)"
+    }
+
+    /// Studio already says Model. Compile that name so first-chat
+    /// "what's your Model?" cannot invent a hop. Empty stays omitted
+    /// (Desk hides the pill). Dest Source title stays Route.
+    static func modelLine(_ model: String) -> String? {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : "Model: \(trimmed)"
     }
 
     /// Desk already shows `@handle`. Compile it so first-chat "what's your handle?"

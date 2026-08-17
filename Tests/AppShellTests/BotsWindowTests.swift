@@ -1817,6 +1817,35 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesAdvertisedModel_becauseDestMustNotInviteAHop() throws {
+        // WHY: Studio already says Model. Compile listed it unlabeled after
+        // · on Default route, so first-chat "what's your Model?" invented a
+        // hop. Dest preview and compose must share the advertised name.
+        // Empty stays out. Dest Source title stays Route.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "What's your Model?"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("Model: opus"))
+        XCTAssertTrue(preview.compiledPayload.contains("Default route: Claude · opus"))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .route })?.title, "Route")
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "What's your Model?",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
     func test_previewBrainIncludesAdvertisedSkills_becauseDestMustNotSayEnabledSkills() throws {
         // WHY: Studio already says Skills. Compile listed Enabled skills, so
         // first-chat "which Skills?" invented a hop. Dest preview and compose

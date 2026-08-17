@@ -898,6 +898,7 @@ final class BotBrainCompilerTests: XCTestCase {
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What model are you?")
         XCTAssertTrue(receipt.compiledPayload.contains("Default route: Claude · opus"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Model: opus"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, true)
@@ -911,6 +912,42 @@ final class BotBrainCompilerTests: XCTestCase {
             BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Default route:"),
             "route layer owns the provider/model"
         )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Model:"),
+            "route layer owns Model"
+        )
+    }
+
+    func test_modelHonestyCompilesForCustomSoul_becauseStudioModelIsNotAnEscapeHatch() {
+        // WHY: Studio already says Model. Compile listed it unlabeled after
+        // · on Default route, so first-chat "what's your Model?" invented a
+        // hop. Model is advertised identity — a written soul must not hide it.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's your Model?")
+        XCTAssertTrue(receipt.compiledPayload.contains("Model: opus"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Default route: Claude · opus"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.title, "Route")
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.text, "Claude · opus")
+        XCTAssertEqual(BotBrainCompiler.modelLine("opus"), "Model: opus")
+        XCTAssertNil(BotBrainCompiler.modelLine("  "))
     }
 
     func test_admittedToolsCompileForCustomSoul_becauseDeskToolsAreNotAnEscapeHatch() {
@@ -1042,6 +1079,7 @@ final class BotBrainCompilerTests: XCTestCase {
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Hi")
         XCTAssertTrue(receipt.compiledPayload.contains("Default route: Grok"))
         XCTAssertFalse(receipt.compiledPayload.contains("Default route: Grok ·"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Model:"), "Desk hides the pill")
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.text, "Grok")
     }
 
