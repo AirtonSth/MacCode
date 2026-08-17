@@ -95,12 +95,16 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         XCTAssertFalse(t.contains("O-first"))
         XCTAssertTrue(t.contains("not a conversation style or user command"),
                       "the surviving Distill policy must be tool-output-only")
+        XCTAssertTrue(
+            t.contains("[N]{fields}"),
+            "WHY: paid agents must be told TOON headers so they can read converted JSON arrays"
+        )
         // Retrieve half of the reversibility story (G2/N5).
         XCTAssertTrue(t.contains("distill retrieve <handle>"), "retrieve command documented")
         XCTAssertTrue(t.contains("[[rc:<handle>]]"), "handle marker documented so the agent knows how to recover originals")
         // F10: keep the always-loaded config block compact; examples live in SKILL.md.
         // Raised slightly after MANDATORY/cross-provider wording (still compact vs full skill).
-        XCTAssertLessThan(t.count, 2_600, "provider config must stay compact (skill-complete rule may add a few lines)")
+        XCTAssertLessThan(t.count, 2_900, "provider config must stay compact (skill-complete rule may add a few lines)")
         XCTAssertFalse(t.contains("bun test 2>&1 | distill"), "examples belong in the managed skill")
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("bun test 2>&1 | distill"))
         XCTAssertFalse(AgentSkillInstaller.distillSkillTemplate.contains("R0 micro"),

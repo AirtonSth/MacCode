@@ -312,7 +312,12 @@ final class DistillContentRouterTests: XCTestCase {
 
         let sections = result.output.components(separatedBy: "\n\n")
         XCTAssertEqual(sections.first, prose, "unrouted prose section stays byte-exact")
-        XCTAssertEqual(try canonical(json), try canonical(try XCTUnwrap(sections.last)))
+        let routedJSON = try XCTUnwrap(sections.last)
+        if let decoded = ToonCodec.decodeToJSON(routedJSON) {
+            XCTAssertTrue(ToonCodec.jsonModelEqual(json, decoded), "mixed JSON section may be TOON if it round-trips")
+        } else {
+            XCTAssertEqual(try canonical(json), try canonical(routedJSON))
+        }
         XCTAssertLessThan(result.output.count, input.count)
     }
 
@@ -594,7 +599,11 @@ final class DistillContentRouterTests: XCTestCase {
         let request = DistillRequest(mode: .longText, input: pretty)
         let output = try await LocalDistillRuntime().distill(request)
         XCTAssertFalse(output.hasPrefix("S "), "structured input must be routed, not line-prefixed summarized")
-        XCTAssertEqual(try canonical(pretty), try canonical(output), "routed output is the lossless minify")
+        if let decoded = ToonCodec.decodeToJSON(output) {
+            XCTAssertTrue(ToonCodec.jsonModelEqual(pretty, decoded), "longText JSON may be TOON when it beats minify")
+        } else {
+            XCTAssertEqual(try canonical(pretty), try canonical(output), "routed output is the lossless minify")
+        }
     }
 
     func test_localRuntime_leavesProseLongTextVerbatimWithoutLegacyDialect() async throws {

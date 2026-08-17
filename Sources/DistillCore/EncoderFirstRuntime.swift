@@ -54,7 +54,11 @@ public struct EncoderFirstRuntime: DistillRuntime {
             // instead. `.losslessOnly` so nothing needs a reversible handle; structure-dropping
             // formats (diff, source code) return nil here and fall through to BERT below.
             let routable = LocalDistillRuntime.splitLegacyCommandPayload(request.input).output
-            if let routed = DistillContentRouter().route(routable, options: .losslessOnly) {
+            let lossless = DistillRouterOptions(
+                allowElementDropping: false,
+                query: request.question
+            )
+            if let routed = DistillContentRouter().route(routable, options: lossless) {
                 return DistillStageResult(output: routed.output, stage: .deterministic)
             }
             // 2. BERT extractive selection for large, intent-less logs / code.
