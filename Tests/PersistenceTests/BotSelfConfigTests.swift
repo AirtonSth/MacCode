@@ -224,6 +224,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["fallback"], "fallback is not a schema key")
         XCTAssertNil(properties?["fallback_order"], "fallback_order is not a schema key")
         XCTAssertNil(properties?["handle"], "handle is create-only, not a schema key")
+        XCTAssertNil(properties?["id"], "id is leftover snapshot identity, not a schema write key")
         XCTAssertNil(properties?["workspace"], "workspace is host-assigned, not a schema key")
         XCTAssertNil(properties?["working_space"], "working_space is not a schema key")
         XCTAssertNil(properties?["cwd"], "cwd is not a schema key")
@@ -1589,6 +1590,78 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
+    }
+
+    func test_setSettingsRejectsSnapshotId_becauseStudioSaysIdentityIsHostAssigned() throws {
+        // WHY: Studio Identity is host-assigned. Compile already labels
+        // handle create-only. Snapshot still encodes leftover id, so
+        // first-chat that reused the last get_settings key invented a
+        // persist. Reject the snapshot key. bot_id still owns the
+        // caller check. Name still persists. leftover permissionMode
+        // and desktopKind still reject. Schema does not grow an id
+        // write key. Dest title stays Identity.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["id"] as? String, bot.id.value.uuidString.lowercased())
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["id"],
+            "schema does not grow an id write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "id": bot.id.value.uuidString.lowercased(),
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "id": UUID().uuidString.lowercased(),
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "id reject must not persist a name")
+        XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.id, bot.id.value.uuidString.lowercased())
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "permissionMode": AgentPermissionMode.fullAccess.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "desktopKind": BotDesktopKind.dedicatedLocalVM.rawValue,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        }
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
