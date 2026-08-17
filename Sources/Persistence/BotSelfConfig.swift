@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -703,6 +703,14 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedActiveKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.activeHonesty)
         }
+        // Studio already says last website. Compile already labels
+        // Browser. A leftover website / url write used to return an
+        // empty success, so first-chat invented a persist. Schema does
+        // not grow a website key. bot_browser_open still persists
+        // Website. Dest title stays Browser.
+        if arguments.keys.contains(where: Self.isAdvertisedWebsiteKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.websiteHonesty)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -892,6 +900,17 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "enabled"
             || normalized == "on"
             || normalized == "off"
+    }
+
+    /// website is not a schema key. Studio / compile advertise last
+    /// website, so parse must fail loud instead of succeeding empty.
+    /// bot_browser_open still persists Website. Schema does not grow a
+    /// website key. Leftover url / last_website are the same write.
+    static func isAdvertisedWebsiteKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "website"
+            || normalized == "url"
+            || normalized == "last_website"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {

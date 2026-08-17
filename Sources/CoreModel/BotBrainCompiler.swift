@@ -211,6 +211,14 @@ public enum BotBrainCompiler {
     public static let activeHonesty =
         "Active: call \(BotStandingInstructions.setRoutineEnabledTool). Same path as Studio Active. Not a set_settings write."
 
+    /// Studio already says last website. Compile already labels Browser.
+    /// A leftover website / url write on set_settings used to return an
+    /// empty success, so first-chat invented a persist. Hermes website
+    /// writes stay on bot_browser_open. Dest Source title stays Browser.
+    /// Schema does not grow a website key.
+    public static let websiteHonesty =
+        "Website: call \(BotStandingInstructions.openBrowserTool). Same path as last website. Not a set_settings write."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,
