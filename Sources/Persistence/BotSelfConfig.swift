@@ -667,11 +667,11 @@ public struct BotSelfConfigService: Sendable {
         // Studio already says Memory. Compile already labels Fact.
         // A leftover Memory / fact write used to return an empty
         // success, so first-chat invented a persist. Snapshot leftover
-        // memory_id used to return an empty success, so first-chat
-        // invented a persist from the last get_settings key. Schema
-        // does not grow a memory or memory_id write key. put_memory
-        // still persists Fact. forget/correct still own memory_id.
-        // Dest title stays Memory.
+        // memory_id / content used to return an empty success, so
+        // first-chat invented a persist from the last get_settings
+        // key. Schema does not grow a memory, memory_id, or content
+        // write key. put_memory still persists Fact. forget/correct
+        // still own memory_id. Dest title stays Memory.
         if arguments.keys.contains(where: Self.isAdvertisedMemoryKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.memoryHonesty)
         }
@@ -863,11 +863,11 @@ public struct BotSelfConfigService: Sendable {
 
     /// memory is not a schema key. Studio / compile advertise the
     /// name, so parse must fail loud instead of succeeding empty.
-    /// Snapshot leftover memory_id is the same write — get_settings
-    /// still encodes that leftover name, so parse must reject it
-    /// instead of succeeding empty. put_memory still persists Fact.
-    /// forget/correct still own memory_id. Schema does not grow a
-    /// memory or memory_id write key.
+    /// Snapshot leftover memory_id / content are the same write —
+    /// get_settings still encodes those leftover names, so parse
+    /// must reject them instead of succeeding empty. put_memory
+    /// still persists Fact. forget/correct still own memory_id.
+    /// Schema does not grow a memory, memory_id, or content write key.
     static func isAdvertisedMemoryKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "memory"
@@ -875,6 +875,7 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "remember"
             || normalized == "remember_a_fact"
             || normalized == "memory_id"
+            || normalized == "content"
     }
 
     /// skills is not a schema key. Studio / compile advertise the

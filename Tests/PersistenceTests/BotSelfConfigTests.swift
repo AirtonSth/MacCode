@@ -246,6 +246,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["remember"], "remember is not a schema key")
         XCTAssertNil(properties?["remember_a_fact"], "remember_a_fact is not a schema key")
         XCTAssertNil(properties?["memory_id"], "memory_id is leftover snapshot identity, not a set_settings key")
+        XCTAssertNil(properties?["content"], "content is leftover snapshot fact, not a set_settings key")
         XCTAssertNil(properties?["skills"], "skills is not a schema key")
         XCTAssertNil(properties?["skill"], "skill is an advertised set_skill alias, not a set_settings key")
         XCTAssertNil(properties?["skill_id"], "skill_id is a set_skill key, not a set_settings key")
@@ -1753,6 +1754,96 @@ final class BotSelfConfigTests: XCTestCase {
             "memory_id": memoryID,
         ])
         XCTAssertEqual(forgotten.memory.count, 0, "forget still owns memory_id")
+    }
+
+    func test_setSettingsRejectsSnapshotContent_becauseStudioSaysRememberAFact() throws {
+        // WHY: Studio already says Memory. Compile already labels Fact.
+        // Snapshot still encodes leftover content, so first-chat that
+        // reused the last get_settings key invented a persist. Reject
+        // the snapshot key. put_memory still persists Fact.
+        // leftover Memory / fact / memory_id still reject. leftover
+        // snapshot id still rejects. Name still persists. Schema does
+        // not grow a content write key. Dest title stays Memory.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "fact": "Prefers dark mode",
+        ])
+        let memoryID = try XCTUnwrap(remembered.memory.first?.id)
+        let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let json = try service.encodeSnapshot(try service.snapshot())
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        let memory = try XCTUnwrap(object["memory"] as? [[String: Any]])
+        XCTAssertEqual(memory.first?["content"] as? String, "Prefers dark mode")
+        XCTAssertEqual(memory.first?["memory_id"] as? String, memoryID)
+        XCTAssertNil(
+            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
+                .flatMap { $0 as? [String: Any] }?["content"],
+            "schema does not grow a content write key"
+        )
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "content": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "content": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "fact": "Prefers dark mode",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "memory_id": memoryID,
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "id": bot.id.value.uuidString.lowercased(),
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.workspaceHostAssignedHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "content reject must not persist a name")
+        XCTAssertEqual(still.memory.first?.id, memoryID)
+        XCTAssertEqual(still.memory.first?.content, "Prefers dark mode")
+        XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
+
+        let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "bot_id": bot.id.value.uuidString,
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
+        XCTAssertEqual(owned.memory.first?.content, "Prefers dark mode")
+
+        let viaContent = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+            "content": "Prefers light mode",
+        ])
+        XCTAssertEqual(viaContent.memory.last?.content, "Prefers light mode", "put_memory still owns content")
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {
