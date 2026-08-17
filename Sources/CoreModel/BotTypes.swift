@@ -164,9 +164,13 @@ public enum BotStandingInstructions {
     public static let generatedSignature =
         "Do not invent tools, files, accounts, or access you do not have."
 
-    /// Must stay identical to `BotSelfConfigCatalog.putMemory` / `setSettings`.
+    /// Must stay identical to `BotSelfConfigCatalog` mutate tools.
     public static let rememberFactTool = "bot_put_memory"
     public static let changeJobTool = "bot_set_settings"
+    public static let forgetFactTool = "bot_forget_memory"
+    public static let setSkillTool = "bot_set_skill"
+    public static let saveRoutineTool = "bot_save_routine"
+    public static let setRoutineEnabledTool = "bot_set_routine_enabled"
     /// Must stay identical to `BotBrowserCatalog.open` / `waitLogin`.
     public static let openBrowserTool = "bot_browser_open"
     public static let waitLoginTool = "bot_browser_wait_login"
@@ -174,12 +178,16 @@ public enum BotStandingInstructions {
     public static let generatedCapabilityLine =
         "When asked to remember a fact, call \(rememberFactTool). When asked to change your job or standing instructions, call \(changeJobTool)."
 
+    public static let generatedMutateLine =
+        "When asked to forget a fact, call \(forgetFactTool). When asked to enable or disable a skill, call \(setSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to turn a routine on or off, call \(setRoutineEnabledTool)."
+
     public static let generatedBrowserLine =
         "When asked to open a website, call \(openBrowserTool). When asked to wait for a login, call \(waitLoginTool). That browser is this teammate's, not the user's."
 
     public static func fallback(name _: String, title _: String, description _: String = "") -> String {
         [
             generatedCapabilityLine,
+            generatedMutateLine,
             generatedBrowserLine,
             "Do the job. Ask when blocked. Prefer concrete work over ceremony.",
             generatedSignature,

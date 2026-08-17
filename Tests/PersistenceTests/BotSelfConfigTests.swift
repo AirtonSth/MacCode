@@ -23,9 +23,18 @@ final class BotSelfConfigTests: XCTestCase {
         // name the server does not have.
         XCTAssertEqual(BotStandingInstructions.rememberFactTool, BotSelfConfigCatalog.putMemory)
         XCTAssertEqual(BotStandingInstructions.changeJobTool, BotSelfConfigCatalog.setSettings)
+        XCTAssertEqual(BotStandingInstructions.forgetFactTool, BotSelfConfigCatalog.forgetMemory)
+        XCTAssertEqual(BotStandingInstructions.setSkillTool, BotSelfConfigCatalog.setSkill)
+        XCTAssertEqual(BotStandingInstructions.saveRoutineTool, BotSelfConfigCatalog.saveRoutine)
+        XCTAssertEqual(BotStandingInstructions.setRoutineEnabledTool, BotSelfConfigCatalog.setRoutineEnabled)
         let starter = BotStandingInstructions.fallback(name: "Piper", title: "Scout")
         XCTAssertTrue(starter.contains(BotSelfConfigCatalog.putMemory))
         XCTAssertTrue(starter.contains(BotSelfConfigCatalog.setSettings))
+        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.forgetMemory))
+        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.setSkill))
+        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.saveRoutine))
+        XCTAssertTrue(starter.contains(BotSelfConfigCatalog.setRoutineEnabled))
+        XCTAssertFalse(starter.contains(BotSelfConfigCatalog.getSettings))
     }
 
     func test_callUsesLiveCatalogAndPersistsThroughPublish() throws {
