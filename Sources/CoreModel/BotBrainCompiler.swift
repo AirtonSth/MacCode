@@ -178,6 +178,14 @@ public enum BotBrainCompiler {
     public static let forgetHonesty =
         "Forget: call \(BotStandingInstructions.forgetFactTool). Same path as Studio Forget. Not a set_settings write."
 
+    /// Studio already says Correct. Compile already names bot_correct_memory.
+    /// A leftover Correct / correct write on set_settings used to return
+    /// an empty success, so first-chat invented a persist. Hermes memory
+    /// revisions stay on correct_memory. Dest Source title stays Memory.
+    /// Schema does not grow a correct key.
+    public static let correctHonesty =
+        "Correct: call \(BotStandingInstructions.correctFactTool). Same path as Studio Correct. Not a set_settings write."
+
     /// Studio already says Skills. Compile already labels Skills.
     /// A leftover Skills / skill write on set_settings used to return an
     /// empty success, so first-chat invented a persist. Hermes skill
