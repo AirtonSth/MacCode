@@ -113,7 +113,10 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.desktopKind.honestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
         XCTAssertTrue(receipt.compiledPayload.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
         XCTAssertFalse(receipt.compiledPayload.contains("Guest is not running"))
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .desktop })?.text, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .desktop })?.text,
+            "\(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.workspaceHostAssignedHonesty)"
+        )
     }
 
     func test_workingSpaceCompilesForCustomSoul_becauseIsolationHonestyIsNotAnEscapeHatch() {
@@ -178,14 +181,14 @@ final class BotBrainCompilerTests: XCTestCase {
             userText: "Which repo is this?",
             workspace: workspace
         )
-        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.workspaceHostAssignedHonesty)"))
         XCTAssertFalse(receipt.compiledPayload.contains("Working space:"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .desktop })?.included, true)
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .desktop })?.text,
-            "macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"
+            "macos-app (/tmp/macos-app). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.workspaceHostAssignedHonesty)"
         )
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("macos-app"),
@@ -221,12 +224,55 @@ final class BotBrainCompilerTests: XCTestCase {
             workspace: blank
         )
         XCTAssertEqual(blank.placeLabel, "")
-        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.workspaceHostAssignedHonesty)"))
         XCTAssertFalse(receipt.compiledPayload.contains("Workspace: None"))
         XCTAssertFalse(receipt.compiledPayload.contains("Working space:"))
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .desktop })?.text,
-            BotDesktopKind.logicalExecutionSpaceHonestyLabel
+            "\(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.workspaceHostAssignedHonesty)"
+        )
+    }
+
+    func test_workspaceHonestyNamesHostAssigned_becauseSetSettingsCannotPersistAFolder() {
+        // WHY: Studio already shows Workspace. Compile listed it next to
+        // Role/Route, so first-chat "use this Workspace" invented a
+        // set_settings write. Hermes workspace is host-pinned. Empty stays
+        // isolation-only plus this honesty. Dest Source title left.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let workspace = BotWorkspaceHonesty(name: "macos-app", cwd: "/tmp/macos-app")
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Use /tmp/other as your Workspace",
+            workspace: workspace
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.workspaceHostAssignedHonesty))
+        XCTAssertTrue(receipt.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app)."))
+        XCTAssertFalse(receipt.compiledPayload.contains("Working space:"))
+        XCTAssertFalse(
+            BotStandingInstructions.admittedToolsText.contains("Workspace"),
+            "tools must not advertise a workspace write"
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout")
+                .contains(BotBrainCompiler.workspaceHostAssignedHonesty),
+            "workspace honesty is a compiler layer, not starter soul"
         )
     }
 

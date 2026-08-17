@@ -128,6 +128,11 @@ public struct BotWorkspaceHonesty: Codable, Sendable, Equatable {
 
 /// Compiles Source Brain layers into the Effective payload sent to a provider.
 public enum BotBrainCompiler {
+    /// Studio already shows Workspace. set_settings cannot persist a folder,
+    /// so first-chat "use this Workspace" invented a write. Hermes workspace
+    /// is host-pinned. Compile that so the model does not invent a persist.
+    public static let workspaceHostAssignedHonesty = "Host-assigned. Not a self-config write."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,
@@ -200,7 +205,8 @@ public enum BotBrainCompiler {
         }
         // Studio already says Workspace. Compile that name so first-chat
         // "which Workspace?" cannot invent a hop. Isolation honesty stays
-        // on this line. Dest Source title stays Working space.
+        // on this line. Host-assigned honesty stays so first-chat cannot
+        // invent a set_settings write. Dest Source title stays Working space.
         lines.append("Workspace: \(workingSpaceText(for: revision, workspace: workspace))")
         lines.append("Permission: \(BotPermission.honestyLabel)")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
@@ -258,7 +264,8 @@ public enum BotBrainCompiler {
     ) -> String {
         let isolation = revision.desktopKind.advertisedOrLogical.honestyLabel
         let place = workspace?.placeLabel ?? ""
-        return place.isEmpty ? isolation : "\(place). \(isolation)"
+        let body = place.isEmpty ? isolation : "\(place). \(isolation)"
+        return "\(body) \(workspaceHostAssignedHonesty)"
     }
 
     /// Tools already persist last website. Compile it labeled so first-chat

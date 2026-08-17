@@ -1513,6 +1513,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(preview.compiledPayload.contains("Workspace: macos-app (/tmp/macos-app)."))
         XCTAssertFalse(preview.compiledPayload.contains("Working space:"))
         XCTAssertTrue(preview.compiledPayload.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel))
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.workspaceHostAssignedHonesty))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
         XCTAssertEqual(
             preview.compiledPayload,
