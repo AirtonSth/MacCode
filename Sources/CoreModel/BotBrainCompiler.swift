@@ -133,6 +133,12 @@ public enum BotBrainCompiler {
     /// is host-pinned. Compile that so the model does not invent a persist.
     public static let workspaceHostAssignedHonesty = "Host-assigned. Not a self-config write."
 
+    /// Studio Handle is create-only after first save. Compile already shows
+    /// @handle next to Role, so first-chat "change your handle" invented a
+    /// write. Hermes address is identity, not self-rewritable. Compile that
+    /// so the model does not invent a persist.
+    public static let handleCreateOnlyHonesty = "Handle is create-only. Not a self-config write."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,
@@ -306,6 +312,9 @@ public enum BotBrainCompiler {
 
     /// Desk already shows `@handle`. Compile it so first-chat "what's your handle?"
     /// cannot invent one. Custom soul must not hide advertised identity.
+    /// Studio Handle is create-only. Compile that honesty so first-chat
+    /// "change your handle" cannot invent a set_settings write. Empty
+    /// handle omits the suffix.
     /// Studio already says Role. Compile that name so first-chat "what's your
     /// Role?" cannot invent a hop. Empty Role stays omitted. Custom soul
     /// must not hide the advertised job.
@@ -330,6 +339,7 @@ public enum BotBrainCompiler {
         if !who.isEmpty {
             parts.append("You are \(who).")
         }
+        if !handle.isEmpty { parts.append(handleCreateOnlyHonesty) }
         if let role {
             parts.append("\(role).")
         }

@@ -1640,6 +1640,33 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_previewBrainIncludesAdvertisedHandleCreateOnlyHonesty_becauseDestMustNotInviteAWrite() throws {
+        // WHY: Studio Handle is create-only after first save. Compile already
+        // showed @handle next to Role, so first-chat "change your handle"
+        // invented a write. Dest preview and compose must share that honesty.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "Change your handle"
+        let preview = try XCTUnwrap(vm.previewBrain())
+        XCTAssertTrue(preview.compiledPayload.contains("@\(piper.handle)"))
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.handleCreateOnlyHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertEqual(
+            preview.compiledPayload,
+            BotsDeskFollowThrough.composeRunPrompt(
+                bot: piper,
+                revision: try XCTUnwrap(vm.selectedRevision),
+                userText: "Change your handle",
+                memory: vm.memoryItems,
+                skills: vm.skillBindings,
+                routines: vm.routines,
+                workspace: vm.advertisedWorkspace
+            )
+        )
+    }
+
     func test_previewBrainIncludesAdvertisedRole_becauseDestMustNotLeaveTheJobUnlabeled() throws {
         // WHY: Studio already says Role. Compile put the job unlabeled after
         // an em-dash, so first-chat "what's your Role?" invented a hop. Dest
