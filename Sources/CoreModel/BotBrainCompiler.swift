@@ -336,15 +336,18 @@ public enum BotBrainCompiler {
         "- \(item.content) [\(mutateKey(item.id.value))]"
     }
 
+    /// Studio already says Instruction and When. Compile those names so
+    /// first-chat "what's the Instruction?" cannot invent a hop. Empty
+    /// When stays omitted. Off stays out of this line.
     static func routineLine(_ routine: BotRoutine) -> String {
         let name = routine.definition.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let prompt = routine.definition.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let note = routine.definition.scheduleNote.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = mutateKey(routine.definition.id.value)
         if note.isEmpty {
-            return "- \(name): \(prompt) [\(key)]"
+            return "- \(name): Instruction: \(prompt) [\(key)]"
         }
-        return "- \(name) (\(note)): \(prompt) [\(key)]"
+        return "- \(name): Instruction: \(prompt). When: \(note) [\(key)]"
     }
 
     static func sourceLayers(

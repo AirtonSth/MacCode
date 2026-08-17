@@ -1653,7 +1653,7 @@ final class BotsWindowTests: XCTestCase {
         vm.setRoutineEnabled(id: id, enabled: true)
         vm.composerText = "What do you run?"
         let preview = try XCTUnwrap(vm.previewBrain())
-        XCTAssertTrue(preview.compiledPayload.contains("Morning scan (Weekdays 9:00): Scan overnight failures"))
+        XCTAssertTrue(preview.compiledPayload.contains("Morning scan: Instruction: Scan overnight failures. When: Weekdays 9:00"))
         XCTAssertTrue(preview.compiledPayload.contains("not while the app is closed"))
         XCTAssertEqual(
             preview.compiledPayload,

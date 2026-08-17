@@ -773,9 +773,10 @@ final class BotBrainCompilerTests: XCTestCase {
     }
 
     func test_activeRoutineCompilesAndOffStaysOut_becauseSchedulesAreAuthority() {
-        // WHY: Studio already says Active. Compile said Enabled routines, so
-        // first-chat "which are Active?" invented a hop. Hermes agents see
-        // the advertised toggle name. Off rows and app-closed honesty stay.
+        // WHY: Studio already says Active, Instruction, and When. Compile
+        // listed unlabeled prompt + parenthetical note, so first-chat
+        // "what's the Instruction?" invented a hop. Hermes agents see the
+        // advertised field names. Off rows and app-closed honesty stay.
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
         let revision = BotRevision(
             botID: bot.id,
@@ -799,6 +800,11 @@ final class BotBrainCompilerTests: XCTestCase {
             prompt: "Scan overnight failures",
             scheduleNote: "Weekdays 9:00"
         )
+        let sweep = BotRoutineDefinition(
+            botID: bot.id,
+            name: "Inbox sweep",
+            prompt: "Clear the inbox"
+        )
         let off = BotRoutineDefinition(
             botID: bot.id,
             name: "Nightly archive",
@@ -814,6 +820,10 @@ final class BotBrainCompilerTests: XCTestCase {
                     activation: BotRoutineActivation(routineID: morning.id, botID: bot.id, isEnabled: true)
                 ),
                 BotRoutine(
+                    definition: sweep,
+                    activation: BotRoutineActivation(routineID: sweep.id, botID: bot.id, isEnabled: true)
+                ),
+                BotRoutine(
                     definition: off,
                     activation: BotRoutineActivation(routineID: off.id, botID: bot.id, isEnabled: false)
                 ),
@@ -822,7 +832,10 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(receipt.compiledPayload.contains("You are Piper (@piper) — Scout."))
         XCTAssertTrue(receipt.compiledPayload.contains("Active routines (not while the app is closed):"))
         XCTAssertFalse(receipt.compiledPayload.contains("Enabled routines"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Morning scan (Weekdays 9:00): Scan overnight failures"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Morning scan: Instruction: Scan overnight failures. When: Weekdays 9:00"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Morning scan (Weekdays 9:00):"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Inbox sweep: Instruction: Clear the inbox"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Inbox sweep: Instruction: Clear the inbox. When:"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(morning.id.value)))
         XCTAssertFalse(receipt.compiledPayload.contains("Nightly archive"))
         XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(off.id.value)))
