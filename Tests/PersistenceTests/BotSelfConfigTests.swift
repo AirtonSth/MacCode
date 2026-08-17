@@ -246,6 +246,10 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["fact"], "fact is an advertised put_memory alias, not a set_settings key")
         XCTAssertNil(properties?["remember"], "remember is not a schema key")
         XCTAssertNil(properties?["remember_a_fact"], "remember_a_fact is not a schema key")
+        XCTAssertNil(properties?["skills"], "skills is not a schema key")
+        XCTAssertNil(properties?["skill"], "skill is an advertised set_skill alias, not a set_settings key")
+        XCTAssertNil(properties?["skill_id"], "skill_id is a set_skill key, not a set_settings key")
+        XCTAssertNil(properties?["add_skill"], "add_skill is not a schema key")
         XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
@@ -255,6 +259,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(description.contains(BotDesktopKind.logicalExecutionSpaceHonestyLabel), "catalog names Desktop isolation honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.testRunHonesty), "catalog names Test run honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.memoryHonesty), "catalog names Memory honesty")
+        XCTAssertTrue(description.contains(BotBrainCompiler.skillsHonesty), "catalog names Skills honesty")
     }
 
     func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
@@ -775,6 +780,78 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertEqual(renamed.memory.first?.content, "Prefers dark mode")
+    }
+
+    func test_setSettingsRejectsAdvertisedSkills_becauseStudioSaysAdd() throws {
+        // WHY: Studio already says Skills. Compile already labels Skills.
+        // set_settings still accepted Skills / skill as an empty success,
+        // so first-chat invented a persist. Reject the advertised name.
+        // set_skill still persists Add. Name still persists. Leftover
+        // permission_mode still coerces. Schema does not grow a skills
+        // key. Dest title stays Skills.
+        let bot = try store.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            model: "opus"
+        )
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "skills": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "skill": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "name": "Piper Prime",
+                "skill_id": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "add_skill": "weekly-account-health",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
+        }
+        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
+        XCTAssertEqual(still.name, "Piper", "Skills reject must not persist a name")
+        XCTAssertEqual(still.skills.count, 0, "Skills reject must not persist a binding")
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+
+        let added = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+            "skill_id": "weekly-account-health",
+        ])
+        XCTAssertEqual(added.skills.first?.skillID, "weekly-account-health")
+        XCTAssertEqual(added.skills.first?.enabled, true)
+
+        let leftover = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+        ])
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.name, "Piper")
+        XCTAssertEqual(leftover.skills.first?.skillID, "weekly-account-health")
+
+        let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+            "name": "Piper Prime",
+        ])
+        XCTAssertEqual(renamed.name, "Piper Prime")
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.skills.first?.skillID, "weekly-account-health")
     }
 
     func test_setSettingsAdvertisedAvatarPersists_becauseStudioSaysStarNotSFSymbol() throws {

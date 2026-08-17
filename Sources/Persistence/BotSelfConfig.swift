@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.skillsHonesty)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -658,6 +658,14 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedMemoryKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.memoryHonesty)
         }
+        // Studio already says Skills. Compile already labels Skills.
+        // A leftover Skills / skill write used to return an empty
+        // success, so first-chat invented a persist. Schema does not
+        // grow a skills key. set_skill still persists Add. Dest
+        // title stays Skills.
+        if arguments.keys.contains(where: Self.isAdvertisedSkillsKey) {
+            throw BotSelfConfigError.invalid(BotBrainCompiler.skillsHonesty)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -795,6 +803,17 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "fact"
             || normalized == "remember"
             || normalized == "remember_a_fact"
+    }
+
+    /// skills is not a schema key. Studio / compile advertise the
+    /// name, so parse must fail loud instead of succeeding empty.
+    /// set_skill still persists Add. Schema does not grow a skills key.
+    static func isAdvertisedSkillsKey(_ key: String) -> Bool {
+        let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
+        return normalized == "skills"
+            || normalized == "skill"
+            || normalized == "skill_id"
+            || normalized == "add_skill"
     }
 
     static func firstString(_ arguments: [String: Any], keys: [String]) -> String? {

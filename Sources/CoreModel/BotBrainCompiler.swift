@@ -170,6 +170,14 @@ public enum BotBrainCompiler {
     public static let memoryHonesty =
         "Memory: call \(BotStandingInstructions.rememberFactTool). Same path as Studio Remember a fact. Not a set_settings write."
 
+    /// Studio already says Skills. Compile already labels Skills.
+    /// A leftover Skills / skill write on set_settings used to return an
+    /// empty success, so first-chat invented a persist. Hermes skill
+    /// writes stay on set_skill. Dest Source title stays Skills. Schema
+    /// does not grow a skills key.
+    public static let skillsHonesty =
+        "Skills: call \(BotStandingInstructions.setSkillTool). Same path as Studio Add. Not a set_settings write."
+
     public static func assemble(
         bot: BotDefinition,
         revision: BotRevision,
