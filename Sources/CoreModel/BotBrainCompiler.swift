@@ -185,7 +185,12 @@ public enum BotBrainCompiler {
         workspace: BotWorkspaceHonesty? = nil
     ) -> String {
         var lines: [String] = []
-        if let identity = identityLine(name: bot.name, handle: bot.handle, title: revision.title) {
+        if let identity = identityLine(
+            name: bot.name,
+            handle: bot.handle,
+            title: revision.title,
+            avatarSymbol: bot.avatarSymbol
+        ) {
             lines.append(identity)
         }
         lines.append("Working space: \(workingSpaceText(for: revision, workspace: workspace))")
@@ -263,7 +268,14 @@ public enum BotBrainCompiler {
 
     /// Desk already shows `@handle`. Compile it so first-chat "what's your handle?"
     /// cannot invent one. Custom soul must not hide advertised identity.
-    static func identityLine(name: String, handle: String, title: String) -> String? {
+    /// Studio already picks Avatar. Compile the advertised chip so first-chat
+    /// "what's my avatar?" cannot invent a symbol. Leftover SF paths stay out.
+    static func identityLine(
+        name: String,
+        handle: String,
+        title: String,
+        avatarSymbol: String = ""
+    ) -> String? {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let handle = handle.trimmingCharacters(in: .whitespacesAndNewlines)
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -275,7 +287,22 @@ public enum BotBrainCompiler {
         if !title.isEmpty {
             who = who.isEmpty ? title : "\(who) — \(title)"
         }
-        return who.isEmpty ? nil : "You are \(who)."
+        let avatar = avatarLine(avatarSymbol)
+        if who.isEmpty {
+            return avatar.map { "\($0)." }
+        }
+        if let avatar {
+            return "You are \(who). \(avatar)."
+        }
+        return "You are \(who)."
+    }
+
+    /// Studio says Star / Person. Compile that name, never the SF Symbol.
+    static func avatarLine(_ symbol: String) -> String? {
+        guard let parsed = BotAvatar.parse(symbol) else { return nil }
+        let name = BotAvatar.advertisedName(for: parsed)
+        guard !name.contains(".") else { return nil }
+        return "Avatar: \(name)"
     }
 
     /// Desk forget/toggle tools require these keys. Snapshot already
@@ -310,7 +337,12 @@ public enum BotBrainCompiler {
         workspace: BotWorkspaceHonesty? = nil
     ) -> [BotContextLayer] {
         var layers: [BotContextLayer] = []
-        if let identity = identityLine(name: bot.name, handle: bot.handle, title: revision.title) {
+        if let identity = identityLine(
+            name: bot.name,
+            handle: bot.handle,
+            title: revision.title,
+            avatarSymbol: bot.avatarSymbol
+        ) {
             layers.append(
                 BotContextLayer(
                     id: "identity",
@@ -318,7 +350,7 @@ public enum BotBrainCompiler {
                     title: "Identity",
                     text: identity,
                     included: true,
-                    reason: "Name, handle, and role compile into the identity line."
+                    reason: "Name, handle, role, and avatar compile into the identity line."
                 )
             )
         } else {
@@ -329,7 +361,7 @@ public enum BotBrainCompiler {
                     title: "Identity",
                     text: "",
                     included: false,
-                    reason: "Name, handle, and role are empty."
+                    reason: "Name, handle, role, and avatar are empty."
                 )
             )
         }

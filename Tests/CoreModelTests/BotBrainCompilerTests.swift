@@ -375,14 +375,89 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .identity })?.included, true)
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .identity })?.text, "You are Piper (@piper) — Scout.")
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .identity })?.text,
+            "You are Piper (@piper) — Scout. Avatar: Person."
+        )
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .identity })?.reason,
-            "Name, handle, and role compile into the identity line."
+            "Name, handle, role, and avatar compile into the identity line."
         )
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("@piper"),
             "handle honesty is a compiler layer, not starter soul"
+        )
+    }
+
+    func test_avatarHonestyCompilesForCustomSoul_becauseStudioAvatarIsNotAnEscapeHatch() {
+        // WHY: Studio already picks Avatar and tools already persist it.
+        // Brain compile never sent the chip, so first-chat "what's my avatar?"
+        // invented a symbol. A written soul must not hide the advertised chip.
+        var bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        bot.avatarSymbol = "star.fill"
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's my avatar?")
+        XCTAssertTrue(receipt.compiledPayload.contains("Avatar: Star"), "Avatar: Star")
+        XCTAssertFalse(receipt.compiledPayload.contains("star.fill"), "leftover SF")
+        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .identity })?.included, true)
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .identity })?.text,
+            "You are Piper (@piper) — Scout. Avatar: Star."
+        )
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .identity })?.reason,
+            "Name, handle, role, and avatar compile into the identity line."
+        )
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Avatar:"),
+            "avatar honesty is a compiler layer, not starter soul"
+        )
+    }
+
+    func test_leftoverAvatarDoesNotCompileSFSymbol_becauseStudioNeverAdvertisedIt() {
+        // WHY: Leftover store symbols are not Studio chips. Compile must not
+        // teach the model an SF path the owner never picked.
+        var bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        bot.avatarSymbol = "bird"
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's my avatar?")
+        XCTAssertFalse(receipt.compiledPayload.contains("Avatar:"), "leftover avatar does not compile")
+        XCTAssertFalse(receipt.compiledPayload.contains("bird"))
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .identity })?.text,
+            "You are Piper (@piper) — Scout."
         )
     }
 
