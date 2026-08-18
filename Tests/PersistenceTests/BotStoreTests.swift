@@ -263,6 +263,36 @@ final class BotStoreTests: XCTestCase {
         )
     }
 
+    func test_saveRoutinePersistsScheduleRoutingAndRecurrence() throws {
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        var spec = BotScheduleSpec(
+            provider: .grok,
+            providerInstanceID: "grok",
+            model: "",
+            reasoningEffort: .medium,
+            routingMode: .auto,
+            frequency: .weekdays
+        )
+        spec.localTimeHour = 9
+        spec.localTimeMinute = 0
+        let definition = BotRoutineDefinition(
+            botID: bot.id,
+            name: "Morning scan",
+            prompt: "Scan overnight",
+            scheduleNote: spec.displayNote(),
+            scheduleSpecJSON: spec.encodedJSON()
+        )
+        try store.saveRoutine(definition)
+        let loaded = try XCTUnwrap(store.listRoutines(botID: bot.id).first?.definition)
+        XCTAssertEqual(loaded.scheduleNote, "Weekdays 09:00")
+        let decoded = try XCTUnwrap(loaded.scheduleSpec)
+        XCTAssertEqual(decoded.provider, .grok)
+        XCTAssertEqual(decoded.routingMode, .auto)
+        XCTAssertEqual(decoded.reasoningEffort, .medium)
+        XCTAssertEqual(decoded.frequency, .weekdays)
+        XCTAssertEqual(try decoded.makeRecurrence(), .weekdays(at: ScheduledLocalTime(hour: 9, minute: 0)!))
+    }
+
     func test_delete_tombstonesHandleSoReuseIsNotSilent() throws {
         let bot = try store.create(
             name: "Piper", title: "Scout", description: "", handle: "piper",

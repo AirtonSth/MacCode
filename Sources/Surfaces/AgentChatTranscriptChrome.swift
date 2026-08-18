@@ -150,7 +150,6 @@ public struct AgentChatUserBubble: View {
             .frame(maxWidth: bubbleMax, alignment: .trailing)
             .layoutPriority(1)
             .accessibilityIdentifier(roleIdentifier)
-            .accessibilityLabel("user")
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
@@ -165,6 +164,7 @@ public struct AgentChatUserBubble: View {
             .padding(.vertical, DS.Space.lg)
             .background(DS.Palette.surface)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .accessibilityLabel(text)
     }
 }
 
@@ -184,7 +184,7 @@ public struct AgentChatAssistantReply: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityIdentifier(roleIdentifier)
-                .accessibilityLabel("assistant")
+                .accessibilityLabel(text)
             HStack(spacing: DS.Space.xs) {
                 Button {
                     AgentChatTranscriptChrome.copyToPasteboard(text)

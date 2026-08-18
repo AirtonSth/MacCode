@@ -30,8 +30,9 @@ public enum Schema {
     /// winner selected_format rcs1, v74 owns content-free context-slot
     /// selection receipts for fresh-fallback seeds, and v75 owns Bot
     /// context-assembly receipts (bots branch used 72 before production
-    /// shipped Token Saver receipts at that number).
-    public static let currentVersion: Int = 75
+    /// shipped Token Saver receipts at that number), and v76 owns Bot
+    /// routine schedule spec (frequency, provider, model, reasoning).
+    public static let currentVersion: Int = 76
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1688,6 +1689,9 @@ public enum Schema {
             ON bot_context_receipts(bot_id, assembled_at DESC);
         CREATE INDEX IF NOT EXISTS idx_bot_context_receipts_conversation
             ON bot_context_receipts(conversation_id, assembled_at DESC);
+        """),
+        SchemaStep(76, """
+        ALTER TABLE bot_routine_definitions ADD COLUMN schedule_spec_json TEXT NOT NULL DEFAULT '';
         """),
     ]
 

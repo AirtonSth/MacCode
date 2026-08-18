@@ -126,6 +126,17 @@ public struct BotWorkspaceHonesty: Codable, Sendable, Equatable {
     }
 }
 
+/// One This-bot skill file admitted into the compile payload.
+public struct BotOwnedSkillText: Codable, Sendable, Equatable {
+    public var slug: String
+    public var body: String
+
+    public init(slug: String, body: String) {
+        self.slug = slug
+        self.body = body
+    }
+}
+
 /// Compiles Source Brain layers into the Effective payload sent to a provider.
 public enum BotBrainCompiler {
     /// Studio already shows Workspace. set_settings cannot persist a folder,
@@ -258,6 +269,7 @@ public enum BotBrainCompiler {
         userText: String,
         memory: [BotMemoryItem] = [],
         skills: [BotSkillBinding] = [],
+        ownedSkills: [BotOwnedSkillText] = [],
         routines: [BotRoutine] = [],
         workspace: BotWorkspaceHonesty? = nil,
         browser: BotBrowserTarget? = nil,
@@ -271,6 +283,7 @@ public enum BotBrainCompiler {
             userText: userText,
             memory: memory,
             skills: skills,
+            ownedSkills: ownedSkills,
             routines: routines,
             workspace: workspace,
             browser: browser
@@ -294,6 +307,7 @@ public enum BotBrainCompiler {
                 userText: userText,
                 memory: memory,
                 skills: skills,
+                ownedSkills: ownedSkills,
                 routines: routines,
                 workspace: workspace,
                 browser: browser
@@ -309,6 +323,7 @@ public enum BotBrainCompiler {
         userText: String,
         memory: [BotMemoryItem] = [],
         skills: [BotSkillBinding] = [],
+        ownedSkills: [BotOwnedSkillText] = [],
         routines: [BotRoutine] = [],
         workspace: BotWorkspaceHonesty? = nil,
         browser: BotBrowserTarget? = nil
@@ -372,6 +387,13 @@ public enum BotBrainCompiler {
             // Studio already says Skills. Compile that name so first-chat
             // "which Skills?" cannot invent a hop. Off stays out.
             lines.append("Skills: \(enabled.joined(separator: ", "))")
+        }
+        let owned = ownedSkills.filter { !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        if !owned.isEmpty {
+            lines.append("Bot skills:")
+            for skill in owned {
+                lines.append("### \(skill.slug)\n\(skill.body)")
+            }
         }
         let liveRoutines = routines.filter(\.activation.isEnabled)
             .sorted { $0.definition.name.localizedCaseInsensitiveCompare($1.definition.name) == .orderedAscending }
@@ -553,6 +575,7 @@ public enum BotBrainCompiler {
         userText: String,
         memory: [BotMemoryItem],
         skills: [BotSkillBinding],
+        ownedSkills: [BotOwnedSkillText] = [],
         routines: [BotRoutine],
         workspace: BotWorkspaceHonesty? = nil,
         browser: BotBrowserTarget? = nil
@@ -745,6 +768,20 @@ public enum BotBrainCompiler {
                     reason: binding.enabled
                         ? "Enabled catalog binding."
                         : "Disabled. Not injected."
+                )
+            )
+        }
+
+        for skill in ownedSkills {
+            let body = skill.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            layers.append(
+                BotContextLayer(
+                    id: "owned-skill-\(skill.slug)",
+                    kind: .skill,
+                    title: "Bot skill",
+                    text: body,
+                    included: !body.isEmpty,
+                    reason: body.isEmpty ? "Empty SKILL.md. Not injected." : "This-bot skill file."
                 )
             )
         }

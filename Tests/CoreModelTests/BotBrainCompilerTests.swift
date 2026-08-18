@@ -1612,4 +1612,50 @@ final class BotBrainCompilerTests: XCTestCase {
             BotBrainCompiler.notificationsLine(enabled: false)
         )
     }
+
+    func test_compileIncludesBotOwnedSkillFiles() {
+        // WHY: This-bot SKILL.md must reach the model. Installed Off binds
+        // stay ids-only and out of Skills:.
+        let bot = BotDefinition(
+            handle: "piper",
+            name: "Piper",
+            title: "Scout",
+            description: "Looks around"
+        )
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "Looks around",
+            soul: "Be brief.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let enabled = BotSkillBinding(botID: bot.id, skillID: "weekly-account-health", enabled: true)
+        let disabled = BotSkillBinding(botID: bot.id, skillID: "off-skill", enabled: false)
+        let owned = BotOwnedSkillText(slug: "weekly-invoice", body: "Invoice the week.")
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Do the invoice",
+            skills: [enabled, disabled],
+            ownedSkills: [owned]
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Bot skills:"))
+        XCTAssertTrue(receipt.compiledPayload.contains("### weekly-invoice"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Invoice the week."))
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.id == "owned-skill-weekly-invoice" })?.included,
+            true
+        )
+    }
 }

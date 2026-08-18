@@ -345,3 +345,26 @@ final class AdaptiveSidebarPolicyTests: XCTestCase {
         XCTAssertFalse(d.didChangeAutomatically)
     }
 }
+
+final class DSEmptyStateTests: XCTestCase {
+    func test_emptyStateIconIsHiddenFromVoiceOver_becauseSymbolNameIsNotTheMessage() throws {
+        // WHY: Computer Use heard puzzlepiece.extension on Skills empty state
+        // and Archive on Memory empty state. The SF icon is decoration.
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/DesignSystemKit/Components.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        guard let start = source.range(of: "public struct DSEmptyState"),
+              let end = source.range(of: "public enum DSResizeAxis") else {
+            return XCTFail("DSEmptyState body not found")
+        }
+        let body = String(source[start.lowerBound..<end.lowerBound])
+        XCTAssertTrue(body.contains("Image(systemName: icon)"))
+        XCTAssertTrue(
+            body.contains(".accessibilityHidden(true)"),
+            "DSEmptyState icon must be hidden so VoiceOver speaks title, not the SF Symbol"
+        )
+    }
+}

@@ -102,6 +102,22 @@ final class FilesRemoteUpdateDecisionTests: XCTestCase {
 
     // MARK: - Remote content update
 
+    func test_editEventIsRemote_missingDeviceIsLocalEcho() {
+        // WHY: FileEditSessionStore open/save/discard publish without
+        // updated_by_device. Treating that echo as remote made Studio Files
+        // say "Edited on another device" after a this-Mac New skill open.
+        XCTAssertFalse(filesEditEventIsRemote(updatedByDevice: nil),
+            "omitted device is the local session echo, not another device")
+        XCTAssertFalse(filesEditEventIsRemote(updatedByDevice: ""),
+            "empty device is the same as omitted")
+        XCTAssertFalse(filesEditEventIsRemote(updatedByDevice: "mac-local"),
+            "mac-local is this Mac")
+        XCTAssertTrue(filesEditEventIsRemote(updatedByDevice: "ios"),
+            "a present foreign device must stay remote")
+        XCTAssertTrue(filesEditEventIsRemote(updatedByDevice: "mac-host"),
+            "mac-host is a paired writer, not this editor")
+    }
+
     func test_remoteContentUpdate_cleanDraftAppliesRemoteText() {
         // WHY: when there are no unsaved local edits, a remote patch from iOS should update both
         // editor and preview immediately and must not show a conflict banner.

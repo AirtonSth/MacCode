@@ -1453,6 +1453,137 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.filteredActiveBotItems().isEmpty)
     }
 
+    func test_activeBotItemsClearWhenRunFinishes_becauseChipMustMatchFooter() throws {
+        // WHY: Computer Use saw Active chip "1" while the footer said
+        // "0 active" after a mention hop finished. The chip reads cached
+        // activeBotItems; the footer reads liveWorkingBots(). Follow-through
+        // must refresh that cache so chip, list, and footer agree.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        let live = BotConversation(botID: piper.id, title: "live turn", attentionState: .working)
+        try context.botStore.upsertConversation(live)
+        vm.reload()
+        vm.openActiveBots()
+        XCTAssertEqual(vm.screen, .activeBots)
+        XCTAssertEqual(vm.activeBotCount, 1)
+        XCTAssertEqual(vm.filteredActiveBotItems().map(\.botID), [piper.id])
+        XCTAssertEqual(vm.filteredActiveBotItems().count, vm.activeBotCount)
+
+        vm.applyFollowThroughForTests(bot: piper, conversation: live, status: .completed)
+        XCTAssertEqual(vm.attentionState(for: piper), .unreadActivity)
+        XCTAssertEqual(vm.activeBotCount, 0)
+        XCTAssertTrue(
+            vm.filteredActiveBotItems().isEmpty,
+            "Active chip/list must drop the finished bot without reopening the tab"
+        )
+        XCTAssertEqual(vm.filteredActiveBotItems().count, vm.activeBotCount)
+        XCTAssertEqual(vm.activeBotsFooterLine.hasPrefix("0 active"), true)
+    }
+
+    func test_staleWorkingConversationSettlesWhenLinkedRunIsTerminal() throws {
+        // WHY: Computer Use saw Piper Working + Active Bots 1 after the
+        // work log said Done and no provider process was alive. Persist
+        // working survived relaunch because didFinish only refreshed the
+        // chip from that stale flag. Reload must settle the row.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .grok)
+        let thread = AgentThread(title: "Night scan", provider: .grok, model: "grok-4.6")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .grok,
+            model: "grok-4.6",
+            status: .completed,
+            startedAt: Date().addingTimeInterval(-120),
+            finishedAt: Date().addingTimeInterval(-30)
+        )
+        try context.runRepo.upsert(run)
+        try context.botStore.upsertConversation(
+            BotConversation(
+                botID: piper.id,
+                title: "Night scan",
+                attentionState: .working,
+                linkedAgentThreadID: thread.id
+            )
+        )
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(piper)
+        XCTAssertEqual(reopened.deskWorkLog.first?.statusLabel, "Done")
+        XCTAssertNotEqual(reopened.attentionState(for: piper), .working)
+        XCTAssertEqual(reopened.activeBotCount, 0)
+        reopened.openActiveBots()
+        XCTAssertTrue(reopened.filteredActiveBotItems().isEmpty)
+        XCTAssertEqual(
+            try context.botStore.listConversations(botID: piper.id).first?.attentionState,
+            BotAttentionState.none
+        )
+    }
+
+    func test_didFinishAppliesFollowThrough_soActiveChipDrops() throws {
+        // WHY: followLinkedRun is cancelled on dest switch and process
+        // death. didFinish used to reload Active Bots without leaving
+        // .working, so the chip stayed at 1 after Done.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .grok)
+        let thread = AgentThread(title: "Night scan", provider: .grok, model: "grok-4.6")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .grok,
+            model: "grok-4.6",
+            status: .completed,
+            finishedAt: Date()
+        )
+        try context.runRepo.upsert(run)
+        try context.botStore.upsertConversation(
+            BotConversation(
+                botID: piper.id,
+                title: "Night scan",
+                attentionState: .working,
+                linkedAgentThreadID: thread.id
+            )
+        )
+        vm.adoptLinkedRunTerminalForTests(runId: run.id, threadId: thread.id)
+        XCTAssertNotEqual(vm.attentionState(for: piper), .working)
+        XCTAssertEqual(vm.activeBotCount, 0)
+        XCTAssertEqual(
+            try context.botStore.listConversations(botID: piper.id).first?.attentionState,
+            BotAttentionState.none
+        )
+    }
+
+    func test_workingConversationStaysLiveWhenLinkedRunIsRunning() throws {
+        // WHY: settle must not drop a teammate whose provider turn is
+        // still running. Only a terminal linked run clears Working.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .grok)
+        let thread = AgentThread(title: "Night scan", provider: .grok, model: "grok-4.6")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .grok,
+            model: "grok-4.6",
+            status: .running
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(
+                botID: piper.id,
+                title: "Night scan",
+                attentionState: .working,
+                linkedAgentThreadID: thread.id
+            )
+        )
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.attentionState(for: piper), .working)
+        XCTAssertEqual(vm.activeBotCount, 1)
+        XCTAssertEqual(vm.deskWorkLog.first?.statusLabel, "Working")
+    }
+
     func test_refreshPublishedIdentityPicksUpSelfConfigTitle() throws {
         // WHY: bot_set_settings publishes through a sidecar SQLite write.
         // Desk kept the stale name/title until remount. After a self-edit
@@ -1495,6 +1626,38 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.scheduleTasksSubtitle, "Automatic runs paused — turn Active on when you're back")
     }
 
+    func test_enabledTaskNextRunSaysSchedulerPaused_whenAutonomyIsOff_becauseOpenDoesNotMeanItRuns() throws {
+        // WHY: Computer Use saw Next run "While RemoteCode is open" while
+        // the global switch read Schedules paused. An enabled task is armed,
+        // not running, so Next run must say the scheduler is paused.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Check overnight failures"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.saveRoutine()
+        let id = try XCTUnwrap(vm.routines.first?.definition.id)
+        vm.setRoutineEnabled(id: id, enabled: true)
+        vm.openScheduleTasks()
+        XCTAssertFalse(vm.isAutonomyActive)
+        let armed = try XCTUnwrap(vm.scheduleTaskItems.first)
+        XCTAssertTrue(armed.isEnabled)
+        XCTAssertEqual(
+            armed.nextRunLabel(isAutonomyActive: vm.isAutonomyActive),
+            "Scheduler paused"
+        )
+        vm.setAutonomyActive(true)
+        XCTAssertEqual(
+            armed.nextRunLabel(isAutonomyActive: vm.isAutonomyActive),
+            "While RemoteCode is open"
+        )
+        vm.setRoutineEnabled(id: id, enabled: false)
+        let paused = try XCTUnwrap(vm.scheduleTaskItems.first)
+        XCTAssertEqual(paused.nextRunLabel(isAutonomyActive: true), "Paused")
+    }
+
     func test_botScheduleTasksFiltersAndToggle() throws {
         // WHY: All / Active / Paused must filter shipped routines, not a
         // decorative count, so the overview matches Agent Scheduled Tasks.
@@ -1522,6 +1685,223 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(Set(vm.scheduleTaskItems.map(\.name)), ["Live", "Paused"])
         vm.setAutonomyActive(true)
         XCTAssertTrue(vm.isAutonomyActive)
+    }
+
+    func test_botScheduleEditorCopiesAgentAppFrequencyAndRouting() throws {
+        // WHY: Bot Schedule Tasks used a free-text When field. Owners need
+        // the Agent App Frequency + Provider / Model Auto / Reasoning rows.
+        let source = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("bots.scheduleTasks.editor.frequency"))
+        XCTAssertTrue(source.contains("bots.scheduleTasks.editor.provider"))
+        XCTAssertTrue(source.contains("bots.scheduleTasks.editor.autoRouting"))
+        XCTAssertTrue(source.contains("bots.scheduleTasks.editor.reasoning"))
+        XCTAssertTrue(source.contains("struct BotScheduleSpecEditor"))
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.createScheduleTask()
+        var draft = try XCTUnwrap(vm.scheduleTaskDraft)
+        draft.name = "Morning scan"
+        draft.prompt = "Scan overnight"
+        draft.spec.provider = .grok
+        draft.spec.providerInstanceID = "grok"
+        draft.spec.routingMode = .auto
+        draft.spec.reasoningEffort = .medium
+        draft.spec.frequency = .daily
+        draft.spec.localTimeHour = 9
+        draft.spec.localTimeMinute = 0
+        vm.saveScheduleTask(draft)
+        let saved = try XCTUnwrap(vm.scheduleTaskItems.first)
+        let spec = try XCTUnwrap(BotScheduleSpec.decodeJSON(saved.scheduleSpecJSON))
+        XCTAssertEqual(spec.provider, .grok)
+        XCTAssertEqual(spec.routingMode, .auto)
+        XCTAssertEqual(spec.frequency, .daily)
+        XCTAssertEqual(saved.scheduleNote, "Daily 09:00")
+    }
+
+    func test_scheduleTaskEditorFieldsHaveVoiceOverNames_becauseVisualLabelIsNotTheControlName() throws {
+        // WHY: Computer Use / VoiceOver saw New Scheduled Task Name, When,
+        // and Instruction as unnamed fields. `labeled` painted a caption
+        // but never named the control. Studio `labeledField` already hides
+        // the caption and sets accessibilityLabel — this editor must too.
+        let source = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"),
+            encoding: .utf8
+        )
+        guard let start = source.range(of: "private func labeled<Content: View>") else {
+            return XCTFail("schedule editor labeled helper must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n}\n")?.upperBound ?? rest.endIndex
+        let helper = String(source[start.lowerBound..<end])
+        XCTAssertTrue(
+            helper.contains(".accessibilityHidden(true)"),
+            "visual Name/When/Instruction captions must not double-speak"
+        )
+        XCTAssertTrue(
+            helper.contains(".accessibilityLabel(title)"),
+            "Name, When, and Instruction must expose the caption as the control name"
+        )
+        XCTAssertTrue(
+            source.contains("Picker(\"\", selection: $draft.botID)"),
+            "Picker title must stay empty so VoiceOver does not speak Bot, Bot"
+        )
+    }
+
+    func test_botsSearchFieldsHaveVoiceOverNames_becausePlaceholderIsNotTheControlName() throws {
+        // WHY: Computer Use / VoiceOver saw Search bots and Search tasks as
+        // unnamed fields (AX label null). Placeholder is hint copy, not the
+        // control name. Name the field so VoiceOver can land on it.
+        let sidebar = try String(
+            contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"),
+            encoding: .utf8
+        )
+        let active = try String(
+            contentsOf: sourceURL("Sources/AppShell/ActiveBotsWindow.swift"),
+            encoding: .utf8
+        )
+        let schedule = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            sidebar.contains("setAccessibilityLabel(placeholder)"),
+            "Sidebar Search bots / Filter workspaces must expose the placeholder as the AX name"
+        )
+        XCTAssertTrue(
+            active.contains(".accessibilityLabel(\"Search bots\")"),
+            "Active Bots search must expose Search bots as the control name"
+        )
+        XCTAssertTrue(
+            schedule.contains(".accessibilityLabel(\"Search tasks\")"),
+            "Schedule Tasks search must expose Search tasks as the control name"
+        )
+    }
+
+    func test_studioRoutineActiveSwitchSaysActiveAndName_becauseTitleAloneHidesTheJob() throws {
+        // WHY: Computer Use / VoiceOver named the Studio Active switch
+        // "QA morning scan" only. The visible job is Active; the title
+        // is already a heading. Speak both so the switch is not just
+        // another copy of the task name.
+        let source = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"),
+            encoding: .utf8
+        )
+        guard let start = source.range(of: "private func routineRowBody") else {
+            return XCTFail("studio routine row must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "// MARK: Shared chrome")?.lowerBound ?? rest.endIndex
+        let body = String(source[start.lowerBound..<end])
+        XCTAssertTrue(
+            body.contains("Toggle(\"Active\""),
+            "the visible switch title stays Active"
+        )
+        XCTAssertTrue(
+            body.contains(".accessibilityLabel(\"Active, \\(routine.definition.name)\")"),
+            "VoiceOver must hear Active plus the routine name"
+        )
+        XCTAssertFalse(
+            body.contains(".accessibilityLabel(routine.definition.name)"),
+            "the switch must not reuse the heading as its only name"
+        )
+        XCTAssertTrue(
+            body.contains("Button(\"Edit\") { vm.editRoutine(routine) }"),
+            "existing Studio tasks must expose Edit, not only Test run"
+        )
+        XCTAssertTrue(
+            body.contains("accessibilityIdentifier(\"bots.routines.edit\")"),
+            "Edit must be a named control so Computer Use can open the dedicated editor"
+        )
+    }
+
+    func test_editScheduleTaskHydratesFrequencyFromNote_becauseEmptySpecMustNotBecomeDailyNow() throws {
+        // WHY: Bot-created routines persist When as "Weekdays 9:00" with
+        // empty schedule_spec_json. Fleet Edit used to open Daily at now,
+        // so Save replaced the visible weekdays 9:00 schedule.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        try context.botStore.saveRoutine(
+            BotRoutineDefinition(
+                botID: piper.id,
+                name: "QA morning scan",
+                prompt: "Check overnight failures and reply with one short status.",
+                scheduleNote: "Weekdays 9:00"
+            )
+        )
+        vm.openScheduleTasks()
+        let item = try XCTUnwrap(vm.scheduleTaskItems.first)
+        XCTAssertEqual(item.scheduleNote, "Weekdays 9:00")
+        XCTAssertTrue(item.scheduleSpecJSON.isEmpty)
+
+        vm.editScheduleTask(item)
+
+        let draft = try XCTUnwrap(vm.scheduleTaskDraft)
+        XCTAssertEqual(draft.name, "QA morning scan")
+        XCTAssertEqual(draft.spec.frequency, .weekdays)
+        XCTAssertEqual(draft.spec.localTimeHour, 9)
+        XCTAssertEqual(draft.spec.localTimeMinute, 0)
+    }
+
+    func test_studioEditRoutineOpensDedicatedEditor_becauseExistingTasksMustBeEditable() throws {
+        // WHY: Studio Schedule Tasks only created new rows. Existing tasks
+        // showed Test run and Active, so owners could not change name,
+        // instruction, or frequency. Edit must open the dedicated
+        // Edit Scheduled Task draft with the same id and saved spec.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(piper)
+        vm.routineName = "QA morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineSpec.provider = .grok
+        vm.routineSpec.providerInstanceID = "grok"
+        vm.routineSpec.routingMode = .auto
+        vm.routineSpec.frequency = .daily
+        vm.routineSpec.localTimeHour = 9
+        vm.routineSpec.localTimeMinute = 0
+        vm.saveRoutine()
+        let id = try XCTUnwrap(vm.routines.first?.definition.id)
+        vm.setRoutineEnabled(id: id, enabled: true)
+        let routine = try XCTUnwrap(vm.routines.first)
+        XCTAssertEqual(vm.screen, .studio)
+
+        vm.editRoutine(routine)
+
+        XCTAssertEqual(vm.screen, .scheduleTasks)
+        let draft = try XCTUnwrap(vm.scheduleTaskDraft)
+        XCTAssertFalse(draft.isNew)
+        XCTAssertEqual(draft.id, routine.definition.id)
+        XCTAssertEqual(draft.botID, piper.id)
+        XCTAssertEqual(draft.name, "QA morning scan")
+        XCTAssertEqual(draft.prompt, "Scan overnight failures")
+        XCTAssertTrue(draft.isEnabled)
+        XCTAssertEqual(draft.spec.provider, .grok)
+        XCTAssertEqual(draft.spec.routingMode, .auto)
+        XCTAssertEqual(draft.spec.frequency, .daily)
+        XCTAssertEqual(draft.spec.localTimeHour, 9)
+
+        var edited = draft
+        edited.name = "QA evening scan"
+        edited.prompt = "Scan the afternoon queue"
+        edited.spec.frequency = .weekdays
+        vm.saveScheduleTask(edited)
+
+        XCTAssertNil(vm.scheduleTaskDraft)
+        XCTAssertEqual(vm.scheduleTaskItems.map(\.name), ["QA evening scan"])
+        XCTAssertEqual(vm.scheduleTaskItems.count, 1)
+        XCTAssertEqual(vm.routines.map(\.definition.name), ["QA evening scan"])
+        XCTAssertEqual(vm.routines.count, 1)
+        let saved = try XCTUnwrap(vm.scheduleTaskItems.first)
+        XCTAssertEqual(saved.id, routine.definition.id)
+        XCTAssertEqual(saved.prompt, "Scan the afternoon queue")
+        XCTAssertEqual(saved.scheduleNote, "Weekdays 09:00")
+        let spec = try XCTUnwrap(BotScheduleSpec.decodeJSON(saved.scheduleSpecJSON))
+        XCTAssertEqual(spec.frequency, .weekdays)
     }
 
     func test_searchKeepsSelectedVisible_becauseChatMustMatchTheRoster() throws {
@@ -2432,8 +2812,9 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_brainPaneSurvivesRelaunch_becauseSelectedTabsAreUserWorkflowState() throws {
-        // WHY: Source vs Effective is a selected Brain pane. Relaunch used
-        // to drop Effective back to Source while inspectorTab stayed Brain.
+        // WHY: Source vs Effective is a selected Brain pane. The Brain tab
+        // is no longer user-facing, so leftover Brain persist remaps to
+        // Memory while the pane choice still survives for compile receipts.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
@@ -2441,8 +2822,172 @@ final class BotsWindowTests: XCTestCase {
         vm.inspectorTab = .brain
         vm.brainPane = .effective
         let reopened = BotsViewModel(context: context)
-        XCTAssertEqual(reopened.inspectorTab, .brain)
+        XCTAssertEqual(reopened.inspectorTab, .memory)
         XCTAssertEqual(reopened.brainPane, .effective)
+    }
+
+    func test_leftoverBrainStudioTabOpensProfile_becauseBrainIsNotUserFacing() throws {
+        // WHY: Brain is a compile inspector, not a Studio form. A leftover
+        // persist must not reopen a tab the owner can no longer reach.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        _ = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        UserDefaults.standard.set("brain", forKey: "bots.studioTab")
+        UserDefaults.standard.set("brain", forKey: "bots.inspectorTab")
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.studioTab, .profile)
+        XCTAssertEqual(reopened.inspectorTab, .memory)
+        XCTAssertFalse(BotStudioTab.brain.isUserFacing)
+        XCTAssertFalse(BotDeskInspectorTab.brain.isUserFacing)
+        XCTAssertTrue(BotStudioTab.files.isUserFacing)
+        XCTAssertEqual(
+            BotStudioTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["profile", "memory", "skills", "files", "routines", "security"]
+        )
+        XCTAssertEqual(
+            BotDeskInspectorTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["memory", "routines"]
+        )
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(
+            bots.contains("ForEach(BotStudioTab.allCases.filter(\\.isUserFacing))"),
+            "Brain stays on the enum for leftover persist; the Studio strip must not render it"
+        )
+        XCTAssertTrue(
+            bots.contains("ForEach(BotDeskInspectorTab.allCases.filter(\\.isUserFacing))"),
+            "Brain stays on the enum for leftover persist; the Desk inspector strip must not render it"
+        )
+    }
+
+    func test_soulFileSavePublishesSameRevisionAsStudioSave() throws {
+        // WHY: Files SOUL.md must not fork a second soul from Save Bot.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.beginEdit(bot)
+        let first = try XCTUnwrap(vm.selectedRevision?.revisionNumber)
+        vm.homeDraft = "Stand up for the brief."
+        vm.selectedHomePath = BotHome.soulName
+        vm.saveHomeFile()
+        let afterFiles = try XCTUnwrap(vm.selectedRevision)
+        XCTAssertEqual(afterFiles.soul, "Stand up for the brief.")
+        XCTAssertGreaterThan(afterFiles.revisionNumber, first)
+        let home = vm.botHome(for: try XCTUnwrap(vm.selectedBot))
+        XCTAssertEqual(try home.readSoul(), "Stand up for the brief.")
+        vm.studioDraft.soul = "Own the inbox."
+        _ = try vm.saveStudio()
+        XCTAssertEqual(try home.readSoul(), "Own the inbox.")
+        XCTAssertEqual(vm.selectedRevision?.soul, "Own the inbox.")
+
+        vm.attachHomeFilesSurface(for: try XCTUnwrap(vm.selectedBot))
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        let surfaceID = SurfaceID(bot.id.value)
+        let opened = try router.filesEditOpen(surface: surfaceID, path: BotHome.soulName)
+        let sessionID = try XCTUnwrap(opened.objectValue?["session_id"]?.stringValue)
+        let current = opened.objectValue?["content"]?.stringValue ?? ""
+        _ = try router.filesEditApplyPatch(
+            sessionID: sessionID,
+            baseDraftRevision: opened.objectValue?["draft_revision"]?.intValue ?? 1,
+            rangeLocation: 0,
+            rangeLength: (current as NSString).length,
+            replacement: "From FilesSurface.",
+            deviceID: "test"
+        )
+        _ = try router.filesEditSave(sessionID: sessionID)
+        XCTAssertEqual(vm.selectedRevision?.soul, "From FilesSurface.")
+        XCTAssertEqual(try home.readSoul(), "From FilesSurface.")
+        _ = try? router.filesEditClose(sessionID: sessionID)
+    }
+
+    func test_studioFilesSurfaceListsBotHomeNotAdvertisedWorkspace() throws {
+        // WHY: Studio Files used a custom list. Owners asked for the Agentic
+        // Files component. The model must list the exclusive bot home, not
+        // the advertised workspace cwd, so edits cannot leak into the project.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openStudio(bot)
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        defer { model.close() }
+        let home = vm.botHome(for: bot)
+        XCTAssertEqual(model.root, home.root.path)
+        XCTAssertTrue(model.root.contains("/bots/"))
+        XCTAssertTrue(model.root.contains(bot.id.value.uuidString.lowercased()))
+        model.loadDirectory("")
+        XCTAssertTrue(
+            Set(model.entries.map(\.name)).isSuperset(of: [
+                BotHome.identityName,
+                BotHome.descriptionName,
+                BotHome.soulName,
+                BotHome.memoryName,
+                BotHome.skillsDirectoryName,
+                BotHome.filesDirectoryName
+            ])
+        )
+    }
+
+    func test_studioFilesSurfaceLocksIdentityAndMemoryProjections() throws {
+        // WHY: IDENTITY.md and memory.md are generated projections. The
+        // Agentic Files editor would persist a handle rewrite unless the
+        // listing marks those rows read-only.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openStudio(bot)
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        defer { model.close() }
+        model.loadDirectory("")
+        let identity = try XCTUnwrap(model.entries.first { $0.name == BotHome.identityName })
+        let memory = try XCTUnwrap(model.entries.first { $0.name == BotHome.memoryName })
+        let soul = try XCTUnwrap(model.entries.first { $0.name == BotHome.soulName })
+        XCTAssertFalse(identity.isEditable)
+        XCTAssertFalse(memory.isEditable)
+        XCTAssertTrue(soul.isEditable)
+    }
+
+    func test_studioFilesOpenTabDoesNotMountWorkspacePane() throws {
+        // WHY: FilesViewModel "Open in New Tab" normally mounts a workspace
+        // Files pane. Bot home is not an advertised workspace, so the same
+        // control must stay inside Studio.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openStudio(bot)
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        defer { model.close() }
+        model.loadDirectory("")
+        let soul = try XCTUnwrap(model.entries.first { $0.name == BotHome.soulName })
+        model.openInNewTab(soul)
+        XCTAssertEqual(router.lastOpenTabPath, BotHome.soulName)
+        XCTAssertNil(model.errorText)
+    }
+
+    func test_openHomeFileRevealsOwnedSkillInStudioFiles() throws {
+        // WHY: Skills Open used to write homeDraft only. Studio Files now
+        // hosts FilesSurfaceRoot, so that path left the preview on
+        // "No file selected" instead of skills/<id>/SKILL.md.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openStudio(bot)
+        vm.thisBotSkillDraft = "night-scan"
+        vm.createThisBotSkill()
+        let path = "skills/night-scan/SKILL.md"
+        XCTAssertNil(vm.errorMessage, vm.errorMessage ?? "")
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        defer { model.close() }
+        XCTAssertEqual(model.selectedPath, path)
+        XCTAssertEqual(vm.studioTab, .files)
+
+        model.selectedEntry = nil
+        XCTAssertNil(model.selectedPath)
+        vm.openHomeFile(path)
+        XCTAssertEqual(vm.homeFilesModel?.selectedPath, path)
+        XCTAssertEqual(vm.homeFilesModel?.selectedEntry?.name, "SKILL.md")
     }
 
     func test_previewBrainReusesUnchangedAssembly_becauseBrainDestMustNotRecompile() throws {
@@ -3334,6 +3879,22 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.allSatisfy { $0.name == "New Agent" })
     }
 
+    func test_studioDescriptionAndInstructionsCaptionsContrastWhoVersusHow() throws {
+        // WHY: Description and Instructions sat unlabeled next to each
+        // other. Owners wrote job prose in the about field and identity
+        // into the soul. The captions must contrast who vs how.
+        XCTAssertTrue(BotsChrome.Label.descriptionCaption.hasPrefix("Who this teammate is"))
+        XCTAssertTrue(BotsChrome.Label.instructionsCaption.hasPrefix("How this teammate should work"))
+        XCTAssertTrue(BotsChrome.Label.descriptionCaption.contains("Empty stays out of the prompt"))
+        XCTAssertTrue(BotsChrome.Label.instructionsCaption.contains("Always sent"))
+        XCTAssertTrue(BotsChrome.Label.instructionsCaption.contains("Empty uses the built-in teammate default"))
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(bots.contains("BotsChrome.Label.descriptionCaption"))
+        XCTAssertTrue(bots.contains("BotsChrome.Label.instructionsCaption"))
+        XCTAssertTrue(bots.contains(".accessibilityHint(BotsChrome.Label.descriptionCaption)"))
+        XCTAssertTrue(bots.contains(".accessibilityHint(BotsChrome.Label.instructionsCaption)"))
+    }
+
     func test_beginCreateSeedsStandingInstructions_becauseHermesDoesNotStartSoulless() throws {
         // WHY: Live Studio/Desk New Agent compiled with "No standing
         // instructions." Hermes seeds SOUL.md; we persist the starter so
@@ -4220,6 +4781,63 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(reopened.routinePrompt, "Scan overnight")
         XCTAssertEqual(reopened.routineScheduleNote, "Weekdays 9:00")
         XCTAssertTrue(reopened.memoryItems.isEmpty, "relaunch must restore the draft, not save it")
+    }
+
+    func test_studioScheduleSpecStaysOnOwningBot_becauseFrequencyMustNotLeak() throws {
+        // WHY: Studio Schedule Tasks persist name/prompt/when-note per bot,
+        // but Frequency + Provider live on routineSpec, which stayed
+        // process-wide after the When field became BotScheduleSpecEditor.
+        // Quinn must not inherit Piper's weekdays/Grok row, and coming
+        // back must restore Piper's Frequency.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.beginEdit(piper)
+        vm.routineName = "QA morning scan"
+        vm.routinePrompt = "List failing tests from last night and name the file."
+        vm.routineSpec.frequency = .weekdays
+        vm.routineSpec.localTimeHour = 9
+        vm.routineSpec.localTimeMinute = 0
+        vm.routineSpec.provider = .grok
+        vm.beginEdit(quinn)
+        XCTAssertEqual(vm.routineName, "", "Quinn Studio must not inherit Piper's task name")
+        XCTAssertNotEqual(
+            vm.routineSpec.frequency,
+            .weekdays,
+            "Quinn must not inherit Piper's Frequency"
+        )
+        XCTAssertEqual(vm.routineSpec.frequency, .daily)
+        vm.routineSpec.frequency = .hourly
+        vm.beginEdit(piper)
+        XCTAssertEqual(vm.routineName, "QA morning scan")
+        XCTAssertEqual(vm.routineSpec.frequency, .weekdays)
+        XCTAssertEqual(vm.routineSpec.localTimeHour, 9)
+        XCTAssertEqual(vm.routineSpec.provider, .grok)
+        vm.beginEdit(quinn)
+        XCTAssertEqual(vm.routineSpec.frequency, .hourly)
+    }
+
+    func test_studioScheduleSpecSurvivesRelaunch_becauseFrequencyIsUserWork() throws {
+        // WHY: an unfinished Frequency pick is the same class of loss as
+        // an unsent task name. Relaunch must restore the spec, not the
+        // process-wide default Daily-at-now.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        vm.routineName = "QA morning scan"
+        vm.routinePrompt = "List failing tests from last night and name the file."
+        vm.routineSpec.frequency = .weekdays
+        vm.routineSpec.localTimeHour = 9
+        vm.routineSpec.localTimeMinute = 0
+        vm.routineSpec.provider = .grok
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.selectedBotID, bot.id)
+        XCTAssertEqual(reopened.routineName, "QA morning scan")
+        XCTAssertEqual(reopened.routineSpec.frequency, .weekdays)
+        XCTAssertEqual(reopened.routineSpec.localTimeHour, 9)
+        XCTAssertEqual(reopened.routineSpec.provider, .grok)
     }
 
     func test_savingInspectorFieldsClearsOnlyThatBotDraft_becauseSentFactsAreNotDrafts() throws {
@@ -5471,6 +6089,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.studio\")"))
         XCTAssertTrue(bots.contains("bots.studio.tab.profile"))
         XCTAssertTrue(bots.contains("bots.studio.tab.brain"))
+        XCTAssertTrue(
+            bots.contains("ForEach(BotStudioTab.allCases.filter(\\.isUserFacing))"),
+            "Brain stays on the enum for leftover persist; the Studio strip must not render it"
+        )
         XCTAssertTrue(bots.contains("bots.studio.tab.memory"))
         XCTAssertTrue(bots.contains("bots.studio.tab.skills"))
         XCTAssertTrue(bots.contains("bots.studio.tab.routines"))
@@ -5487,7 +6109,15 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(bots.contains("bots.home.goal"))
         XCTAssertTrue(bots.contains("accessibilityAddTraits(selected ? .isSelected : [])"))
         XCTAssertTrue(bots.contains("BotsChrome.hitTarget"))
-        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "memory", "skills", "routines", "security"])
+        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "memory", "skills", "files", "routines", "security"])
+        XCTAssertEqual(
+            BotStudioTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["profile", "memory", "skills", "files", "routines", "security"]
+        )
+        XCTAssertEqual(
+            BotDeskInspectorTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["memory", "routines"]
+        )
         XCTAssertTrue(chrome.contains(BotsChrome.Label.agentic))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.currentGoal))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.todaysActivity))
@@ -5500,7 +6130,19 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.studio.identity"))
         XCTAssertFalse(bots.contains("bots.studio.routing"))
         XCTAssertTrue(bots.contains("bots.studio.soul"))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.descriptionCaption))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.instructionsCaption))
+        XCTAssertTrue(bots.contains("BotsChrome.Label.descriptionCaption"))
+        XCTAssertTrue(bots.contains("BotsChrome.Label.instructionsCaption"))
         XCTAssertTrue(bots.contains("Empty uses the built-in teammate default"))
+        XCTAssertTrue(
+            BotsChrome.Label.descriptionCaption.contains("Who this teammate is"),
+            "Description must say who, not how"
+        )
+        XCTAssertTrue(
+            BotsChrome.Label.instructionsCaption.contains("How this teammate should work"),
+            "Instructions must say how, not who"
+        )
         XCTAssertTrue(bots.contains("refreshGeneratedStandingInstructions"))
         XCTAssertTrue(
             bots.contains(".accessibilityLabel(BotsChrome.Label.instructions)"),
@@ -5540,8 +6182,8 @@ final class BotsWindowTests: XCTestCase {
             "Studio Skills enable switch must name the catalog id, not sit unlabeled beside On"
         )
         XCTAssertTrue(
-            bots.contains(".accessibilityLabel(routine.definition.name)"),
-            "Routines Active switch must name the routine, not sit unlabeled beside Active"
+            bots.contains(".accessibilityLabel(\"Active, \\(routine.definition.name)\")"),
+            "Routines Active switch must say Active plus the routine name, not only the title"
         )
         XCTAssertTrue(
             bots.contains(
@@ -5621,6 +6263,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.inspector\")"))
         XCTAssertTrue(bots.contains("bots.studio.tab.brain"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.brain"))
+        XCTAssertTrue(
+            bots.contains("ForEach(BotDeskInspectorTab.allCases.filter(\\.isUserFacing))"),
+            "Brain stays on the enum for leftover persist; the Desk inspector strip must not render it"
+        )
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.memory"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.routines"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.brain"))

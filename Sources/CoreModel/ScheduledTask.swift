@@ -189,7 +189,7 @@ public struct ScheduledTaskRun: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
-public enum ScheduledTaskFrequency: String, Sendable, CaseIterable, Identifiable {
+public enum ScheduledTaskFrequency: String, Codable, Sendable, CaseIterable, Identifiable {
     case once
     case hourly
     case daily

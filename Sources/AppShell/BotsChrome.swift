@@ -22,10 +22,16 @@ public enum BotsChrome {
         public static let nextRoutine = "Next Routine"
         public static let memory = "Memory"
         public static let skills = "Skills"
+        public static let files = "Files"
         public static let routines = "Schedule Tasks"
         public static let approvals = "Approvals"
         public static let roleAndIdentity = "Role & Identity"
+        public static let description = "Description"
+        public static let descriptionCaption =
+            "Who this teammate is. A short about line. Empty stays out of the prompt."
         public static let instructions = "Instructions"
+        public static let instructionsCaption =
+            "How this teammate should work. Always sent. Empty uses the built-in teammate default. Write your own to replace it."
         public static let configurationSummary = "Configuration summary"
         public static let security = "Security"
         public static let notifications = "Notifications"
@@ -64,10 +70,14 @@ public enum BotsChrome {
         Label.nextRoutine,
         Label.memory,
         Label.skills,
+        Label.files,
         Label.routines,
         Label.approvals,
         Label.roleAndIdentity,
+        Label.description,
+        Label.descriptionCaption,
         Label.instructions,
+        Label.instructionsCaption,
         Label.configurationSummary,
         Label.security,
         Label.notifications,
