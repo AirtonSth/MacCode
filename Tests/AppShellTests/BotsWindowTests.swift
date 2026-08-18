@@ -1482,6 +1482,108 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.activeBotsFooterLine.hasPrefix("0 active"), true)
     }
 
+    func test_staleWorkingConversationSettlesWhenLinkedRunIsTerminal() throws {
+        // WHY: Computer Use saw Piper Working + Active Bots 1 after the
+        // work log said Done and no provider process was alive. Persist
+        // working survived relaunch because didFinish only refreshed the
+        // chip from that stale flag. Reload must settle the row.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .grok)
+        let thread = AgentThread(title: "Night scan", provider: .grok, model: "grok-4.6")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .grok,
+            model: "grok-4.6",
+            status: .completed,
+            startedAt: Date().addingTimeInterval(-120),
+            finishedAt: Date().addingTimeInterval(-30)
+        )
+        try context.runRepo.upsert(run)
+        try context.botStore.upsertConversation(
+            BotConversation(
+                botID: piper.id,
+                title: "Night scan",
+                attentionState: .working,
+                linkedAgentThreadID: thread.id
+            )
+        )
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(piper)
+        XCTAssertEqual(reopened.deskWorkLog.first?.statusLabel, "Done")
+        XCTAssertNotEqual(reopened.attentionState(for: piper), .working)
+        XCTAssertEqual(reopened.activeBotCount, 0)
+        reopened.openActiveBots()
+        XCTAssertTrue(reopened.filteredActiveBotItems().isEmpty)
+        XCTAssertEqual(
+            try context.botStore.listConversations(botID: piper.id).first?.attentionState,
+            BotAttentionState.none
+        )
+    }
+
+    func test_didFinishAppliesFollowThrough_soActiveChipDrops() throws {
+        // WHY: followLinkedRun is cancelled on dest switch and process
+        // death. didFinish used to reload Active Bots without leaving
+        // .working, so the chip stayed at 1 after Done.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .grok)
+        let thread = AgentThread(title: "Night scan", provider: .grok, model: "grok-4.6")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .grok,
+            model: "grok-4.6",
+            status: .completed,
+            finishedAt: Date()
+        )
+        try context.runRepo.upsert(run)
+        try context.botStore.upsertConversation(
+            BotConversation(
+                botID: piper.id,
+                title: "Night scan",
+                attentionState: .working,
+                linkedAgentThreadID: thread.id
+            )
+        )
+        vm.adoptLinkedRunTerminalForTests(runId: run.id, threadId: thread.id)
+        XCTAssertNotEqual(vm.attentionState(for: piper), .working)
+        XCTAssertEqual(vm.activeBotCount, 0)
+        XCTAssertEqual(
+            try context.botStore.listConversations(botID: piper.id).first?.attentionState,
+            BotAttentionState.none
+        )
+    }
+
+    func test_workingConversationStaysLiveWhenLinkedRunIsRunning() throws {
+        // WHY: settle must not drop a teammate whose provider turn is
+        // still running. Only a terminal linked run clears Working.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .grok)
+        let thread = AgentThread(title: "Night scan", provider: .grok, model: "grok-4.6")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .grok,
+            model: "grok-4.6",
+            status: .running
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(
+                botID: piper.id,
+                title: "Night scan",
+                attentionState: .working,
+                linkedAgentThreadID: thread.id
+            )
+        )
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.attentionState(for: piper), .working)
+        XCTAssertEqual(vm.activeBotCount, 1)
+        XCTAssertEqual(vm.deskWorkLog.first?.statusLabel, "Working")
+    }
+
     func test_refreshPublishedIdentityPicksUpSelfConfigTitle() throws {
         // WHY: bot_set_settings publishes through a sidecar SQLite write.
         // Desk kept the stale name/title until remount. After a self-edit

@@ -932,6 +932,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func reloadActiveBotsScreen() {
+        settleTerminalWorkingConversations()
         activeBotItems = liveWorkingBots().map { bot in
             ActiveBotScreenItem(
                 bot: bot,
@@ -1098,6 +1099,7 @@ public final class BotsViewModel: ObservableObject {
         // (listAttention) before dest dested Chat. Dest dests
         // this bubble first; dest dests inbox after dest dested Chat.
         reloadAttention()
+        settleTerminalWorkingConversations()
         if screen.resolvedDestination == .activeBots {
             reloadActiveBotsScreen()
         }
@@ -2683,6 +2685,9 @@ public final class BotsViewModel: ObservableObject {
         restoreDeskWorkLog(botID: id)
         restoreDeskLiveTurn(botID: id)
         reloadStudioSupport(id: id)
+        if let bot = bots.first(where: { $0.id == id }) {
+            settleTerminalWorkingConversation(bot: bot)
+        }
     }
 
     public func providerChipTitle(_ provider: AgentProvider) -> String {
@@ -4305,6 +4310,65 @@ public final class BotsViewModel: ObservableObject {
         BotsDeskFollowThrough.composeRunPrompt(bot: bot, revision: revision, userText: userText)
     }
 
+    /// Persist + chip used to stay Working after the linked run was Done.
+    /// Finish events and relaunch must settle that row, not just refresh
+    /// Active Bots from the stale attention flag.
+    private func adoptLinkedRunTerminal(runId: AgentRunID, threadId: AgentThreadID) {
+        guard let conversation = try? botStore.conversationLinked(to: threadId) else {
+            if screen == .desk,
+               let botID = selectedBotID,
+               selectedConversation?.linkedAgentThreadID == threadId {
+                restoreDeskWorkLog(botID: botID)
+                restoreDeskLiveTurn(botID: botID)
+            }
+            return
+        }
+        let bot = bots.first(where: { $0.id == conversation.botID })
+            ?? (try? botStore.get(id: conversation.botID))
+        let run = try? context.runRepo.get(id: runId)
+        if let bot {
+            applyFollowThrough(bot: bot, conversation: conversation, run: run)
+            return
+        }
+        reloadActiveBotsScreen()
+    }
+
+    private var isSettlingTerminalWorking = false
+
+    private func settleTerminalWorkingConversations() {
+        guard !isSettlingTerminalWorking else { return }
+        isSettlingTerminalWorking = true
+        defer { isSettlingTerminalWorking = false }
+        for bot in bots {
+            settleTerminalWorkingConversation(bot: bot)
+        }
+    }
+
+    private func settleTerminalWorkingConversation(bot: BotDefinition) {
+        guard let conversation = workingConversation(for: bot.id) else { return }
+        guard let threadID = conversation.linkedAgentThreadID else { return }
+        let activeIDs = activeThreadIDsOverrideForTesting
+            ?? context.coordinator.activeThreadIdsSnapshot()
+        if activeIDs.contains(threadID) { return }
+        guard let run = linkedRun(for: threadID, botID: bot.id),
+              BotsDeskFollowThrough.isTerminal(run.status) else { return }
+        applyFollowThrough(bot: bot, conversation: conversation, run: run)
+    }
+
+    private func workingConversation(for botID: BotID) -> BotConversation? {
+        if let hit = destConversations(botID: botID).first(where: { $0.attentionState == .working }) {
+            return hit
+        }
+        if let selected = selectedConversation, selected.botID == botID, selected.attentionState == .working {
+            return selected
+        }
+        return nil
+    }
+
+    func adoptLinkedRunTerminalForTests(runId: AgentRunID, threadId: AgentThreadID) {
+        adoptLinkedRunTerminal(runId: runId, threadId: threadId)
+    }
+
     func applyFollowThroughForTests(
         bot: BotDefinition,
         conversation: BotConversation,
@@ -4345,15 +4409,7 @@ extension BotsViewModel: AgentRunObserver {
         providerThreadId: String?
     ) {
         Task { @MainActor [weak self] in
-            guard let self else { return }
-            if let conversation = try? self.botStore.conversationLinked(to: threadId) {
-                self.reloadActiveBotsScreen()
-                self.refreshPublishedIdentity(for: conversation.botID)
-            }
-            guard self.screen == .desk, let botID = self.selectedBotID else { return }
-            guard self.selectedConversation?.linkedAgentThreadID == threadId else { return }
-            self.restoreDeskWorkLog(botID: botID)
-            self.restoreDeskLiveTurn(botID: botID)
+            self?.adoptLinkedRunTerminal(runId: runId, threadId: threadId)
         }
     }
 
@@ -4365,6 +4421,10 @@ extension BotsViewModel: AgentRunObserver {
     ) {
         Task { @MainActor [weak self] in
             guard let self else { return }
+            if BotsDeskFollowThrough.isTerminal(status) {
+                self.adoptLinkedRunTerminal(runId: runId, threadId: threadId)
+                return
+            }
             if let conversation = try? self.botStore.conversationLinked(to: threadId) {
                 self.reloadActiveBotsScreen()
                 self.refreshPublishedIdentity(for: conversation.botID)
@@ -4372,9 +4432,6 @@ extension BotsViewModel: AgentRunObserver {
             guard self.screen == .desk, let botID = self.selectedBotID else { return }
             guard self.selectedConversation?.linkedAgentThreadID == threadId else { return }
             self.restoreDeskWorkLog(botID: botID)
-            if BotsDeskFollowThrough.isTerminal(status) {
-                self.restoreDeskLiveTurn(botID: botID)
-            }
         }
     }
 }
