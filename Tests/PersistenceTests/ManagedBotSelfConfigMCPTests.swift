@@ -30,8 +30,8 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
             XCTAssertEqual(Set(names), Set(BotSelfConfigCatalog.toolNames))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.getSettings))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.setSettings))
-            XCTAssertTrue(names.contains(BotSelfConfigCatalog.putMemory))
-            XCTAssertTrue(names.contains(BotSelfConfigCatalog.setSkill))
+            XCTAssertTrue(names.contains(BotSelfConfigCatalog.writeHomeFile))
+            XCTAssertFalse(names.contains(BotSelfConfigCatalog.setSkill))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.saveRoutine))
         }
     }

@@ -192,6 +192,33 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func renameHandle(id: BotID, handle: String, now: Date = Date()) throws -> BotDefinition {
+        guard let normalized = BotHandle.normalize(handle) else { throw BotPublishError.handleEmpty }
+        return try db.transaction {
+            guard let bot = try loadBot(id: id, database: db), bot.deletedAt == nil else {
+                throw BotStoreError.notFound
+            }
+            if bot.handle == normalized { return bot }
+            try assertHandleAvailable(normalized, excluding: bot.handle, database: db)
+            let updateBot = try db.prepare(
+                "UPDATE bots SET handle = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL;"
+            )
+            defer { updateBot.reset() }
+            try updateBot.bind(1, normalized)
+            try updateBot.bind(2, string(now))
+            try updateBot.bind(3, id.value.uuidString.lowercased())
+            _ = try updateBot.step()
+            let dropOld = try db.prepare("DELETE FROM bot_handles WHERE bot_id = ? AND handle = ?;")
+            defer { dropOld.reset() }
+            try dropOld.bind(1, id.value.uuidString.lowercased())
+            try dropOld.bind(2, bot.handle)
+            _ = try dropOld.step()
+            try insertLiveHandle(normalized, botID: id, at: now, database: db)
+            guard let updated = try loadBot(id: id, database: db) else { throw BotStoreError.notFound }
+            return updated
+        }
+    }
+
     public func setPinned(id: BotID, pinned: Bool, now: Date = Date()) throws {
         try db.performSync { database in
             let statement = try database.prepare(
@@ -938,7 +965,12 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
-    private func assertHandleAvailable(_ handle: String, database: SQLiteDB) throws {
+    private func assertHandleAvailable(
+        _ handle: String,
+        excluding current: String? = nil,
+        database: SQLiteDB
+    ) throws {
+        if current == handle { return }
         if try handleIsTaken(handle, database: database) { throw BotPublishError.handleConflict }
     }
 

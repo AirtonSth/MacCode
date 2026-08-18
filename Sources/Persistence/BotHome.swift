@@ -9,14 +9,29 @@ public struct BotHome: Sendable {
     public static let identityName = "IDENTITY.md"
     public static let descriptionName = "DESCRIPTION.md"
     public static let soulName = "SOUL.md"
-    public static let memoryName = "memory.md"
+    public static let memoryName = "MEMORY.md"
+    public static let userMemoryName = "USER.md"
+    public static let legacyMemoryName = "memory.md"
+    public static let memoryDirectoryName = "memory"
     public static let skillsDirectoryName = "skills"
     public static let filesDirectoryName = "files"
 
-    public static let memoryProjectionHeader = """
-    # Memory projection
-    # Trusted facts from the store. Forget and Correct still go through Memory.
+    public static let memoryStarter = """
+    # Memory
+
+    Durable facts and standing decisions. Edit this file to remember or correct.
+    Daily notes go in memory/YYYY-MM-DD.md.
     """
+
+    public struct MemoryFile: Sendable, Equatable {
+        public var path: String
+        public var body: String
+
+        public init(path: String, body: String) {
+            self.path = path
+            self.body = body
+        }
+    }
 
     public init(root: URL) {
         self.root = root.standardizedFileURL
@@ -41,6 +56,10 @@ public struct BotHome: Sendable {
     public var descriptionURL: URL { root.appendingPathComponent(Self.descriptionName) }
     public var soulURL: URL { root.appendingPathComponent(Self.soulName) }
     public var memoryURL: URL { root.appendingPathComponent(Self.memoryName) }
+    public var userMemoryURL: URL { root.appendingPathComponent(Self.userMemoryName) }
+    public var memoryDirectoryURL: URL {
+        root.appendingPathComponent(Self.memoryDirectoryName, isDirectory: true)
+    }
     public var skillsURL: URL { root.appendingPathComponent(Self.skillsDirectoryName, isDirectory: true) }
     public var filesURL: URL { root.appendingPathComponent(Self.filesDirectoryName, isDirectory: true) }
 
@@ -49,11 +68,13 @@ public struct BotHome: Sendable {
         handle: String,
         title: String,
         description: String,
-        soul: String
+        soul: String,
+        legacyFacts: [String] = []
     ) throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: skillsURL, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: filesURL, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: memoryDirectoryURL, withIntermediateDirectories: true)
         try writeIdentity(name: name, handle: handle, title: title)
         if !FileManager.default.fileExists(atPath: descriptionURL.path) {
             try writeDescription(description)
@@ -61,8 +82,9 @@ public struct BotHome: Sendable {
         if !FileManager.default.fileExists(atPath: soulURL.path) {
             try writeSoul(soul)
         }
+        try migrateLegacyMemoryIfNeeded(legacyFacts: legacyFacts)
         if !FileManager.default.fileExists(atPath: memoryURL.path) {
-            try writeMemoryProjection(facts: [])
+            try writeAtomic(Self.memoryStarter + "\n", to: memoryURL)
         }
     }
 
@@ -85,14 +107,119 @@ public struct BotHome: Sendable {
         try writeAtomic(soul, to: soulURL)
     }
 
-    public func writeMemoryProjection(facts: [String]) throws {
-        var lines = [Self.memoryProjectionHeader]
-        for fact in facts {
-            let trimmed = fact.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            lines.append("- \(trimmed)")
+    /// One-time lift of leftover `memory.md` or store bullets into `MEMORY.md`.
+    /// Never overwrites an existing `MEMORY.md`.
+    public func migrateLegacyMemoryIfNeeded(legacyFacts: [String] = []) throws {
+        if FileManager.default.fileExists(atPath: memoryURL.path) { return }
+        let legacyURL = root.appendingPathComponent(Self.legacyMemoryName)
+        if FileManager.default.fileExists(atPath: legacyURL.path) {
+            let raw = try String(contentsOf: legacyURL, encoding: .utf8)
+            let body = Self.stripProjectionHeader(raw)
+            try writeAtomic(
+                body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? Self.memoryStarter + "\n"
+                    : body,
+                to: memoryURL
+            )
+            try FileManager.default.removeItem(at: legacyURL)
+            return
         }
+        let facts = legacyFacts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !facts.isEmpty else { return }
+        var lines = ["# Memory", ""]
+        lines.append(contentsOf: facts.map { "- \($0)" })
         try writeAtomic(lines.joined(separator: "\n") + "\n", to: memoryURL)
+    }
+
+    public func readBootstrapMemory(
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) throws -> [MemoryFile] {
+        var files: [MemoryFile] = []
+        for name in [Self.userMemoryName, Self.memoryName] {
+            if let file = try readMemoryFile(relativePath: name) {
+                files.append(file)
+            }
+        }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        let today = formatter.string(from: now)
+        let yesterdayDate = calendar.date(byAdding: .day, value: -1, to: now) ?? now
+        let yesterday = formatter.string(from: yesterdayDate)
+        for day in [today, yesterday] {
+            files.append(contentsOf: try dailyNotes(dayPrefix: day))
+        }
+        return files
+    }
+
+    public static func isWritableMemoryPath(_ relativePath: String) -> Bool {
+        let path = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path == memoryName || path == userMemoryName { return true }
+        let pattern = #"^memory/[0-9]{4}-[0-9]{2}-[0-9]{2}(?:-[A-Za-z0-9][A-Za-z0-9-]*)?\.md$"#
+        return path.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    public static func isWritableSkillPath(_ relativePath: String) -> Bool {
+        let path = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 3,
+              parts[0] == skillsDirectoryName,
+              parts[2] == "SKILL.md",
+              normalizeSkillSlug(parts[1]) == parts[1] else { return false }
+        return true
+    }
+
+    public static func isWritableHomePath(_ relativePath: String) -> Bool {
+        isWritableMemoryPath(relativePath) || isWritableSkillPath(relativePath)
+    }
+
+    public static func stripProjectionHeader(_ raw: String) -> String {
+        let lines = raw.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let kept = lines.filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return !trimmed.hasPrefix("# Memory projection")
+                && trimmed != "# Trusted facts from the store. Forget and Correct still go through Memory."
+        }
+        var body = kept.joined(separator: "\n")
+        while body.hasPrefix("\n") { body.removeFirst() }
+        return body
+    }
+
+    private func readMemoryFile(relativePath: String) throws -> MemoryFile? {
+        let url = try resolvedURL(relativePath)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let body = try String(contentsOf: url, encoding: .utf8)
+        guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return MemoryFile(path: relativePath, body: body)
+    }
+
+    private func dailyNotes(dayPrefix: String) throws -> [MemoryFile] {
+        guard FileManager.default.fileExists(atPath: memoryDirectoryURL.path) else { return [] }
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: memoryDirectoryURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )
+        return entries
+            .filter {
+                $0.pathExtension == "md"
+                    && ($0.deletingPathExtension().lastPathComponent == dayPrefix
+                        || $0.deletingPathExtension().lastPathComponent.hasPrefix(dayPrefix + "-"))
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .compactMap { url in
+                guard let body = try? String(contentsOf: url, encoding: .utf8),
+                      !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+                return MemoryFile(
+                    path: "\(Self.memoryDirectoryName)/\(url.lastPathComponent)",
+                    body: body
+                )
+            }
     }
 
     public func readSoul() throws -> String {
@@ -188,6 +315,18 @@ public struct BotHome: Sendable {
             try writeAtomic(body + "\n", to: skillFile)
         }
         return "\(Self.skillsDirectoryName)/\(normalized)/SKILL.md"
+    }
+
+    public func removeOwnedSkill(slug: String) throws {
+        let normalized = Self.normalizeSkillSlug(slug)
+        guard let normalized else {
+            throw BotHomeError.invalid("Skill id must be a catalog-style slug, not a path.")
+        }
+        let dir = skillsURL.appendingPathComponent(normalized, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: dir.path) else {
+            throw BotHomeError.invalid("Skill not found.")
+        }
+        try FileManager.default.removeItem(at: dir)
     }
 
     public static func normalizeSkillSlug(_ raw: String) -> String? {

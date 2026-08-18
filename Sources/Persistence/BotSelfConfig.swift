@@ -29,6 +29,7 @@ public enum BotSelfConfigCatalog: Sendable {
 
     public static let getSettings = "bot_get_settings"
     public static let setSettings = "bot_set_settings"
+    public static let writeHomeFile = "bot_write_home_file"
     public static let putMemory = "bot_put_memory"
     public static let forgetMemory = "bot_forget_memory"
     public static let correctMemory = "bot_correct_memory"
@@ -39,8 +40,8 @@ public enum BotSelfConfigCatalog: Sendable {
 
     public static var toolNames: [String] {
         [
-            getSettings, setSettings, putMemory, forgetMemory, correctMemory,
-            setSkill, removeSkill, saveRoutine, setRoutineEnabled,
+            getSettings, setSettings, writeHomeFile,
+            removeSkill, saveRoutine, setRoutineEnabled,
         ]
     }
 
@@ -60,16 +61,10 @@ public enum BotSelfConfigCatalog: Sendable {
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
             return "Publish this bot's own name, Role, Instructions, description, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.removeHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty) \(BotBrainCompiler.userRequestHonesty)"
-        case putMemory:
-            return "Remember a fact on this bot."
-        case forgetMemory:
-            return "Forget one of this bot's memory facts. Same path as Studio Forget."
-        case correctMemory:
-            return "Correct one of this bot's memory facts. Writes a new revision. Same path as Studio Correct."
-        case setSkill:
-            return "Add a catalog skill or turn it Enabled or Off. Same path as Studio Add. Disable is not unbind."
+        case writeHomeFile:
+            return "Write MEMORY.md, USER.md, memory/YYYY-MM-DD.md, or skills/<slug>/SKILL.md in this bot's Files. Edit the file to remember, forget, correct, or add a skill."
         case removeSkill:
-            return "Remove a catalog skill from this bot. Same path as Studio Remove. Disable is not unbind."
+            return "Delete skills/<slug>/SKILL.md. Same path as Files."
         case saveRoutine:
             return "Create or update a routine's name, instruction, or when. Same path as Studio Save routine."
         case setRoutineEnabled:
@@ -99,42 +94,27 @@ public enum BotSelfConfigCatalog: Sendable {
                     "avatar_symbol": ["type": "string", "description": "Avatar. Same field as Studio Avatar."],
                 ]) { _, new in new },
             ]
-        case putMemory:
+        case writeHomeFile:
             return [
                 "type": "object",
                 "properties": botID.merging([
-                    "content": ["type": "string", "description": "Fact. Same field as Studio Remember a fact."],
+                    "path": [
+                        "type": "string",
+                        "description": "MEMORY.md, USER.md, memory/YYYY-MM-DD.md, or skills/<slug>/SKILL.md. Same files as Studio Files.",
+                    ],
+                    "contents": [
+                        "type": "string",
+                        "description": "Full file body. Edit in place to remember, forget, correct, or add a skill.",
+                    ],
                 ]) { _, new in new },
-                "required": ["content"],
-            ]
-        case forgetMemory:
-            return [
-                "type": "object",
-                "properties": botID.merging(["memory_id": ["type": "string"]]) { _, new in new },
-                "required": ["memory_id"],
-            ]
-        case correctMemory:
-            return [
-                "type": "object",
-                "properties": botID.merging([
-                    "memory_id": ["type": "string"],
-                    "content": ["type": "string", "description": "Fact. Same field as Studio Remember a fact."],
-                ]) { _, new in new },
-                "required": ["memory_id", "content"],
-            ]
-        case setSkill:
-            return [
-                "type": "object",
-                "properties": botID.merging([
-                    "skill_id": ["type": "string", "description": "Catalog id. Same field as Studio Add."],
-                    "enabled": ["type": "boolean", "description": "Enabled. Omit to Add. Same field as Studio Skills."],
-                ]) { _, new in new },
-                "required": ["skill_id"],
+                "required": ["path", "contents"],
             ]
         case removeSkill:
             return [
                 "type": "object",
-                "properties": botID.merging(["skill_id": ["type": "string"]]) { _, new in new },
+                "properties": botID.merging([
+                    "skill_id": ["type": "string", "description": "Slug for skills/<slug>/SKILL.md."],
+                ]) { _, new in new },
                 "required": ["skill_id"],
             ]
         case saveRoutine:
@@ -209,7 +189,7 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
         // Tools require memory_id. Snapshot used to say id, which collided
         // with the bot id, so same-turn forget invented a hop.
         enum CodingKeys: String, CodingKey {
-            case id = "memory_id"
+            case id = "path"
             case content
         }
     }
@@ -291,17 +271,32 @@ public struct BotSelfConfigPatch: Equatable, Sendable {
 public struct BotSelfConfigService: Sendable {
     public let callerBotID: BotID
     public let store: BotStore
+    public let appSupportDirectory: URL
 
-    public init(callerBotID: BotID, store: BotStore) {
+    public init(callerBotID: BotID, store: BotStore, appSupportDirectory: URL? = nil) {
         self.callerBotID = callerBotID
         self.store = store
+        self.appSupportDirectory = appSupportDirectory ?? Self.resolvedAppSupportDirectory(botID: callerBotID)
     }
 
     public static func make(environment: [String: String], store: BotStore) throws -> BotSelfConfigService {
         guard let caller = callerID(from: environment) else {
             throw BotSelfConfigError.callerMissing
         }
-        return BotSelfConfigService(callerBotID: caller, store: store)
+        let override = environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let directory = override.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+        return BotSelfConfigService(callerBotID: caller, store: store, appSupportDirectory: directory)
+    }
+
+    static func resolvedAppSupportDirectory(botID: BotID) -> URL {
+        let env = ProcessInfo.processInfo.environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let env, !env.isEmpty {
+            return URL(fileURLWithPath: env, isDirectory: true)
+        }
+        return FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-bot-self-config-\(botID.value.uuidString.lowercased())", isDirectory: true)
     }
 
     public static func callerID(from environment: [String: String]) -> BotID? {
@@ -336,8 +331,8 @@ public struct BotSelfConfigService: Sendable {
             throw BotSelfConfigError.notFound
         }
         let revision = try bot.currentRevisionID.flatMap { try store.getRevision(id: $0) }
-        let memory = try store.listMemory(botID: callerBotID)
-        let skills = try store.listSkillBindings(botID: callerBotID)
+        let memory = (try? botHome(for: bot).readBootstrapMemory()) ?? []
+        let skills = (try? botHome(for: bot).listOwnedSkills()) ?? []
         let routines = try store.listRoutines(botID: callerBotID)
         return BotSelfConfigSnapshot(
             id: bot.id.value.uuidString.lowercased(),
@@ -353,8 +348,8 @@ public struct BotSelfConfigService: Sendable {
             permissionMode: BotPermission.advertisedOrSupervised(revision?.permissionMode ?? .supervised).rawValue,
             desktopKind: (revision?.desktopKind ?? .logicalExecutionSpace).advertisedOrLogical.rawValue,
             notificationsEnabled: bot.notificationsEnabled,
-            memory: memory.map { .init(id: $0.id.value.uuidString.lowercased(), content: $0.content) },
-            skills: skills.map { .init(skillID: $0.skillID, enabled: $0.enabled) },
+            memory: memory.map { .init(id: $0.path, content: $0.body) },
+            skills: skills.map { .init(skillID: $0.slug, enabled: true) },
             routines: routines.map {
                 .init(
                     id: $0.definition.id.value.uuidString.lowercased(),
@@ -423,58 +418,46 @@ public struct BotSelfConfigService: Sendable {
         return try snapshot()
     }
 
-    public func putMemory(content: String) throws -> BotSelfConfigSnapshot {
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw BotSelfConfigError.invalid("Memory content is required.") }
-        _ = try store.putMemory(
-            botID: callerBotID,
-            content: trimmed,
-            provenance: "bot-self-config",
-            trusted: true,
-            source: "self"
-        )
-        return try snapshot()
-    }
-
-    public func forgetMemory(id: BotMemoryItemID) throws -> BotSelfConfigSnapshot {
-        let items = try store.listMemory(botID: callerBotID, includeForgotten: true)
-        guard let item = items.first(where: { $0.id == id }) else {
+    public func writeHomeFile(path: String, contents: String) throws -> BotSelfConfigSnapshot {
+        guard let bot = try store.get(id: callerBotID), bot.deletedAt == nil else {
             throw BotSelfConfigError.notFound
         }
-        guard item.botID == callerBotID else { throw BotSelfConfigError.crossBot }
-        try store.forgetMemory(id: id)
-        return try snapshot()
-    }
-
-    public func correctMemory(id: BotMemoryItemID, content: String) throws -> BotSelfConfigSnapshot {
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw BotSelfConfigError.invalid("Memory content is required.") }
-        let items = try store.listMemory(botID: callerBotID, includeForgotten: true)
-        guard let item = items.first(where: { $0.id == id }) else {
-            throw BotSelfConfigError.notFound
+        guard BotHome.isWritableHomePath(path) else {
+            throw BotSelfConfigError.invalid(
+                BotHome.isWritableSkillPath(path) || path.hasPrefix("\(BotHome.skillsDirectoryName)/")
+                    ? BotBrainCompiler.skillsHonesty
+                    : BotBrainCompiler.memoryHonesty
+            )
         }
-        guard item.botID == callerBotID else { throw BotSelfConfigError.crossBot }
-        _ = try store.correctMemory(id: id, content: trimmed)
+        let home = botHome(for: bot)
+        try home.ensure(
+            name: bot.name,
+            handle: bot.handle,
+            title: bot.title,
+            description: bot.description,
+            soul: ""
+        )
+        try home.writeFile(relativePath: path, contents: contents)
         return try snapshot()
     }
 
-    public func setSkill(skillID: String, enabled: Bool) throws -> BotSelfConfigSnapshot {
-        try store.setSkillBinding(
-            BotSkillBinding(botID: callerBotID, skillID: skillID, enabled: enabled)
-        )
-        return try snapshot()
+    func botHome(for bot: BotDefinition) -> BotHome {
+        BotHome(appSupportDirectory: appSupportDirectory, bot: bot)
     }
 
     public func removeSkill(skillID: String) throws -> BotSelfConfigSnapshot {
-        let trimmed = skillID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !trimmed.contains("/") else {
-            throw BotStoreError.invalidRow("skill id must be a catalog id, not a path")
-        }
-        let existing = try store.listSkillBindings(botID: callerBotID)
-        guard existing.contains(where: { $0.skillID == trimmed }) else {
+        guard let bot = try store.get(id: callerBotID), bot.deletedAt == nil else {
             throw BotSelfConfigError.notFound
         }
-        try store.removeSkillBinding(botID: callerBotID, skillID: trimmed)
+        let trimmed = skillID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard BotHome.normalizeSkillSlug(trimmed) == trimmed else {
+            throw BotStoreError.invalidRow("skill id must be a catalog id, not a path")
+        }
+        do {
+            try botHome(for: bot).removeOwnedSkill(slug: trimmed)
+        } catch {
+            throw BotSelfConfigError.notFound
+        }
         return try snapshot()
     }
 
@@ -534,45 +517,20 @@ public struct BotSelfConfigService: Sendable {
             let patch = try Self.parsePatch(arguments)
             if patch.isEmpty { return try snapshot() }
             return try apply(patch)
-        case BotSelfConfigCatalog.putMemory:
-            // Tools and Studio say Remember a fact. Schema key stays content.
-            // set_settings leftover remember already rejects and points
-            // here, so first-chat retried remember on put_memory. Accept
-            // that advertised name on the existing persist path.
-            guard let content = Self.firstString(arguments, keys: ["content", "fact", "remember", "remember_a_fact"]) else {
-                throw BotSelfConfigError.invalid("Memory content is required.")
+        case BotSelfConfigCatalog.writeHomeFile:
+            guard let path = arguments["path"] as? String else {
+                throw BotSelfConfigError.invalid("path is required.")
             }
-            return try putMemory(content: content)
-        case BotSelfConfigCatalog.forgetMemory:
-            // Tools and Studio say Forget. Schema key stays memory_id.
-            // set_settings leftover forget already rejects and points
-            // here, so first-chat retried forget on forget_memory.
-            // Accept that advertised name on the existing persist path.
-            return try forgetMemory(id: BotMemoryItemID(try Self.parseUUID(
-                arguments["memory_id"] ?? arguments["forget"] ?? arguments["forget_memory"],
-                label: "memory_id"
-            )))
-        case BotSelfConfigCatalog.correctMemory:
-            // Tools and Studio say Correct. Schema key stays content.
-            // set_settings leftover correct already rejects and points
-            // here, so first-chat retried correct on correct_memory.
-            // Accept that advertised name on the existing persist path.
-            guard let content = Self.firstString(arguments, keys: ["content", "fact", "correct", "correct_fact"]) else {
-                throw BotSelfConfigError.invalid("Memory content is required.")
+            guard let contents = Self.firstString(arguments, keys: ["contents", "content"]) else {
+                throw BotSelfConfigError.invalid("contents is required.")
             }
-            return try correctMemory(
-                id: BotMemoryItemID(try Self.parseUUID(arguments["memory_id"], label: "memory_id")),
-                content: content
-            )
+            return try writeHomeFile(path: path, contents: contents)
+        case BotSelfConfigCatalog.putMemory,
+             BotSelfConfigCatalog.forgetMemory,
+             BotSelfConfigCatalog.correctMemory:
+            throw BotSelfConfigError.invalid(BotBrainCompiler.memoryHonesty)
         case BotSelfConfigCatalog.setSkill:
-            guard let skillID = arguments["skill_id"] as? String else {
-                throw BotSelfConfigError.invalid("skill_id is required.")
-            }
-            // Studio Add only sends the catalog id. Omit enabled to bind it Enabled.
-            let enabled = arguments["enabled"] == nil
-                ? true
-                : try Self.parseBool(arguments["enabled"], label: "enabled")
-            return try setSkill(skillID: skillID, enabled: enabled)
+            throw BotSelfConfigError.invalid(BotBrainCompiler.skillsHonesty)
         case BotSelfConfigCatalog.removeSkill:
             guard let skillID = arguments["skill_id"] as? String else {
                 throw BotSelfConfigError.invalid("skill_id is required.")
@@ -739,32 +697,20 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedTestRunKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.testRunHonesty)
         }
-        // Studio already says Memory. Compile already labels Fact.
-        // A leftover Memory / fact write used to return an empty
-        // success, so first-chat invented a persist. Snapshot leftover
-        // memory_id / content used to return an empty success, so
-        // first-chat invented a persist from the last get_settings
-        // key. Schema does not grow a memory, memory_id, or content
-        // write key. put_memory still persists Fact. forget/correct
-        // still own memory_id. Dest title stays Memory.
+        // Files already hold Memory. A leftover Memory / fact write used
+        // to return an empty success, so first-chat invented a persist.
+        // Schema does not grow a memory write key. write_home_file still
+        // persists MEMORY.md. Dest title stays Memory.
         if arguments.keys.contains(where: Self.isAdvertisedMemoryKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.memoryHonesty)
         }
-        // Studio already says Forget. Compile already names
-        // bot_forget_memory. A leftover Forget / forget write used to
-        // return an empty success, so first-chat invented a persist.
-        // Schema does not grow a forget key. forget_memory still
-        // persists Forget. leftover Memory / fact / memory_id still
-        // reject. Dest title stays Memory.
+        // Forget is a file edit. A leftover Forget write used to return
+        // an empty success, so first-chat invented a persist.
         if arguments.keys.contains(where: Self.isAdvertisedForgetKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.forgetHonesty)
         }
-        // Studio already says Correct. Compile already names
-        // bot_correct_memory. A leftover Correct / correct write used to
-        // return an empty success, so first-chat invented a persist.
-        // Schema does not grow a correct key. correct_memory still
-        // persists Correct. leftover Memory / fact / memory_id / forget
-        // still reject. Dest title stays Memory.
+        // Correct is a file edit. A leftover Correct write used to return
+        // an empty success, so first-chat invented a persist.
         if arguments.keys.contains(where: Self.isAdvertisedCorrectKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.correctHonesty)
         }
@@ -1055,13 +1001,12 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "last_test_run_requested_at"
     }
 
-    /// memory is not a schema key. Studio / compile advertise the
+    /// memory is not a schema key. Files / compile advertise the
     /// name, so parse must fail loud instead of succeeding empty.
     /// Snapshot leftover memory_id / content are the same write —
-    /// get_settings still encodes those leftover names, so parse
-    /// must reject them instead of succeeding empty. put_memory
-    /// still persists Fact. forget/correct still own memory_id.
-    /// Schema does not grow a memory, memory_id, or content write key.
+    /// get_settings used to encode those leftover names, so parse
+    /// must reject them instead of succeeding empty. write_home_file
+    /// still persists MEMORY.md. Schema does not grow a memory write key.
     static func isAdvertisedMemoryKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "memory"
@@ -1070,6 +1015,8 @@ public struct BotSelfConfigService: Sendable {
             || normalized == "remember_a_fact"
             || normalized == "memory_id"
             || normalized == "content"
+            || normalized == "path"
+            || normalized == "contents"
     }
 
     /// forget is not a set_settings schema key. Studio / compile

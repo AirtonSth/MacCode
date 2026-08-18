@@ -161,7 +161,7 @@ final class BotHomeFilesRouter: FilesSurfaceRouting {
     }
 
     static func isProjection(_ relativePath: String) -> Bool {
-        relativePath == BotHome.identityName || relativePath == BotHome.memoryName
+        relativePath == BotHome.identityName
     }
 
     static func rejectProjectionEdit(_ path: String) throws {

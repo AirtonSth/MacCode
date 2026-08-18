@@ -119,6 +119,55 @@ final class AgentSourceCapsulePresentationTests: XCTestCase {
         )
     }
 
+    func test_helpTextAndLockNoticeMatchTheAgentAppCopy() {
+        // WHY: Desk used to invent "Claude, Codex, or Grok" help while Agent App
+        // explained lock / unavailable / single-account. Shared strings.
+        XCTAssertEqual(
+            AgentSourceCapsulePresentation.helpText(
+                canSwitch: true,
+                runLocked: false,
+                providerLocked: false,
+                unavailableReason: nil
+            ),
+            "Choose which ChatGPT / Claude / Grok account runs this thread"
+        )
+        XCTAssertEqual(
+            AgentSourceCapsulePresentation.helpText(
+                canSwitch: false,
+                runLocked: true,
+                providerLocked: false,
+                unavailableReason: nil
+            ),
+            "Account is fixed while a run is active"
+        )
+        XCTAssertEqual(
+            AgentSourceCapsulePresentation.lockNotice(
+                runLocked: false,
+                providerLocked: true,
+                unavailableReason: nil,
+                entryCount: 3
+            )?.text,
+            "Account is fixed after the first message. Start a new thread to use a different account."
+        )
+        XCTAssertEqual(
+            AgentSourceCapsulePresentation.lockNotice(
+                runLocked: false,
+                providerLocked: false,
+                unavailableReason: nil,
+                entryCount: 1
+            )?.text,
+            "Only one account is available"
+        )
+        let warning = AgentSourceCapsulePresentation.lockNotice(
+            runLocked: false,
+            providerLocked: false,
+            unavailableReason: "Claude is not signed in",
+            entryCount: 2
+        )
+        XCTAssertEqual(warning?.text, "Claude is not signed in")
+        XCTAssertEqual(warning?.isWarning, true)
+    }
+
     func test_menuEntries_keepSelectedDisabledSnapshotVisible() {
         let personal = makeSnapshot(id: "codex-personal", provider: .codex, displayName: "Codex Personal", enabled: true)
         let work = makeSnapshot(id: "codex-work", provider: .codex, displayName: "Codex Work", enabled: false)

@@ -1,0 +1,603 @@
+import AppKit
+import CoreModel
+import DesignSystemKit
+import SwiftUI
+
+/// Shared composer chrome for Agent App and Bots Desk.
+///
+/// WHY: Desk reimplemented account / permission / run-as / model pills as
+/// `deskChipLabel`. Those controls are the same as Agent App and must paint
+/// from one component.
+
+// MARK: - Capsule shell
+
+public enum AgentComposerCapsuleStyle: Equatable {
+    case raised
+    case tinted(Color)
+}
+
+public struct AgentComposerCapsule<Content: View>: View {
+    public let style: AgentComposerCapsuleStyle
+    public let foreground: Color
+    public let content: Content
+
+    public init(
+        style: AgentComposerCapsuleStyle = .raised,
+        foreground: Color = DS.Palette.textSecondary,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.style = style
+        self.foreground = foreground
+        self.content = content()
+    }
+
+    public var body: some View {
+        content
+            .fixedSize()
+            .foregroundColor(foreground)
+            .padding(.horizontal, DS.Space.sm)
+            .padding(.vertical, DS.Space.xs)
+            .background(background)
+            .clipShape(Capsule())
+            .overlay(stroke)
+    }
+
+    private var background: Color {
+        switch style {
+        case .raised: return DS.Palette.surfaceRaised
+        case .tinted(let color): return color.opacity(0.13)
+        }
+    }
+
+    @ViewBuilder
+    private var stroke: some View {
+        switch style {
+        case .raised:
+            Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        case .tinted:
+            EmptyView()
+        }
+    }
+}
+
+public struct AgentComposerCapsuleLabel: View {
+    public let icon: String?
+    public let title: String
+    public let chevron: Bool
+
+    public init(icon: String?, title: String, chevron: Bool) {
+        self.icon = icon
+        self.title = title
+        self.chevron = chevron
+    }
+
+    public var body: some View {
+        HStack(spacing: DS.Space.xs) {
+            if let icon {
+                Image(systemName: icon)
+                    .font(.system(size: 10))
+            }
+            Text(title)
+                .font(DS.Font.caption.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if chevron {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+            }
+        }
+    }
+}
+
+public extension AgentPermissionMode {
+    var capsuleTint: Color {
+        switch self {
+        case .supervised: return DS.Palette.textSecondary
+        case .autoAcceptEdits: return DS.Palette.warning
+        case .fullAccess: return DS.Palette.danger
+        }
+    }
+
+    var capsuleIcon: String {
+        self == .fullAccess ? "exclamationmark.shield.fill" : "lock.shield"
+    }
+}
+
+// MARK: - Compact menu
+
+public struct AgentCompactMenuSection: View {
+    public let title: String
+
+    public init(_ title: String) {
+        self.title = title
+    }
+
+    public var body: some View {
+        Text(title)
+            .font(DS.Font.caption2.weight(.semibold))
+            .foregroundColor(DS.Palette.textTertiary)
+            .padding(.top, DS.Space.xs)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+public struct AgentCompactMenuRow: View {
+    public let title: String
+    public let selected: Bool
+    public let width: CGFloat?
+    public let action: () -> Void
+
+    public init(
+        _ title: String,
+        selected: Bool,
+        width: CGFloat? = nil,
+        action: @escaping () -> Void
+    ) {
+        self.title = title
+        self.selected = selected
+        self.width = width
+        self.action = action
+    }
+
+    public var body: some View {
+        Button(action: action) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 12)
+                    .opacity(selected ? 1 : 0)
+                Text(title)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.xs)
+            .padding(.vertical, DS.Space.xs)
+            .frame(width: width, alignment: .leading)
+            .background(selected ? DS.Palette.selection : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+public struct AgentCompactMenuDivider: View {
+    public let width: CGFloat?
+
+    public init(width: CGFloat? = nil) {
+        self.width = width
+    }
+
+    public var body: some View {
+        Rectangle()
+            .fill(DS.Palette.line)
+            .frame(height: DS.Border.hairline)
+            .padding(.vertical, DS.Space.xs)
+            .frame(width: width)
+    }
+}
+
+// MARK: - Source
+
+public struct AgentSourceCapsule: View {
+    public let label: String
+    public let entries: [AgentSourceCapsulePresentation.MenuEntry]
+    public let runLocked: Bool
+    public let providerLocked: Bool
+    public let unavailableReason: String?
+    public let rowWidth: CGFloat
+    public let accessibilityIdentifier: String
+    public let popoverIdentifier: String
+    @Binding public var isPresented: Bool
+    public let onSelect: (AgentSourceCapsulePresentation.MenuEntry) -> Void
+
+    public init(
+        label: String,
+        entries: [AgentSourceCapsulePresentation.MenuEntry],
+        runLocked: Bool,
+        providerLocked: Bool,
+        unavailableReason: String? = nil,
+        rowWidth: CGFloat = 220,
+        accessibilityIdentifier: String,
+        popoverIdentifier: String,
+        isPresented: Binding<Bool>,
+        onSelect: @escaping (AgentSourceCapsulePresentation.MenuEntry) -> Void
+    ) {
+        self.label = label
+        self.entries = entries
+        self.runLocked = runLocked
+        self.providerLocked = providerLocked
+        self.unavailableReason = unavailableReason
+        self.rowWidth = rowWidth
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.popoverIdentifier = popoverIdentifier
+        self._isPresented = isPresented
+        self.onSelect = onSelect
+    }
+
+    private var canSwitch: Bool {
+        AgentSourceCapsulePresentation.isInteractive(
+            enabledSourceCount: entries.count,
+            providerLocked: providerLocked,
+            runLocked: runLocked
+        )
+    }
+
+    private var helpText: String {
+        AgentSourceCapsulePresentation.helpText(
+            canSwitch: canSwitch,
+            runLocked: runLocked,
+            providerLocked: providerLocked,
+            unavailableReason: unavailableReason
+        )
+    }
+
+    public var body: some View {
+        Button {
+            isPresented.toggle()
+        } label: {
+            AgentComposerCapsule {
+                AgentComposerCapsuleLabel(
+                    icon: (providerLocked || runLocked) ? "lock.fill" : "person.crop.circle",
+                    title: label,
+                    chevron: true
+                )
+            }
+        }
+        .buttonStyle(.plain)
+        .help(helpText)
+        .accessibilityLabel("Account \(label)")
+        .accessibilityHint(AgentSourceCapsulePresentation.switchHint(canSwitch: canSwitch, helpText: helpText))
+        .accessibilityIdentifier(accessibilityIdentifier)
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            popover
+        }
+    }
+
+    private var popover: some View {
+        let notice = AgentSourceCapsulePresentation.lockNotice(
+            runLocked: runLocked,
+            providerLocked: providerLocked,
+            unavailableReason: unavailableReason,
+            entryCount: entries.count
+        )
+        return VStack(alignment: .leading, spacing: DS.Space.xs) {
+            if let notice {
+                Text(notice.text)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(notice.isWarning ? DS.Palette.warning : DS.Palette.textTertiary)
+                    .fixedSize(horizontal: notice.wraps ? false : true, vertical: notice.wraps)
+                    .frame(maxWidth: notice.wraps ? rowWidth : nil, alignment: .leading)
+            }
+            AgentCompactMenuSection("Account")
+            if entries.isEmpty {
+                Text("No accounts loaded")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            } else {
+                ForEach(entries, id: \.id) { entry in
+                    AgentCompactMenuRow(entry.title, selected: entry.isSelected, width: rowWidth) {
+                        guard canSwitch else { return }
+                        onSelect(entry)
+                        isPresented = false
+                    }
+                    .disabled(!canSwitch)
+                }
+            }
+        }
+        .padding(DS.Space.sm)
+        .background(DS.Palette.surfaceOverlay)
+        .fixedSize(horizontal: true, vertical: false)
+        .accessibilityIdentifier(popoverIdentifier)
+    }
+}
+
+// MARK: - Permission
+
+public struct AgentPermissionCapsule: View {
+    public let selected: AgentPermissionMode
+    public let modes: [AgentPermissionMode]
+    public let unavailableReason: (AgentPermissionMode) -> String?
+    public let disabled: Bool
+    public let help: String
+    public let accessibilityIdentifier: String
+    public let onSelect: (AgentPermissionMode) -> Void
+
+    public init(
+        selected: AgentPermissionMode,
+        modes: [AgentPermissionMode],
+        unavailableReason: @escaping (AgentPermissionMode) -> String? = { _ in nil },
+        disabled: Bool,
+        help: String = "Permission mode",
+        accessibilityIdentifier: String,
+        onSelect: @escaping (AgentPermissionMode) -> Void
+    ) {
+        self.selected = selected
+        self.modes = modes
+        self.unavailableReason = unavailableReason
+        self.disabled = disabled
+        self.help = help
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.onSelect = onSelect
+    }
+
+    public var body: some View {
+        Menu {
+            ForEach(modes, id: \.self) { mode in
+                Button {
+                    onSelect(mode)
+                } label: {
+                    if mode == selected { Image(systemName: "checkmark") }
+                    Text(mode.displayName)
+                }
+                .disabled(unavailableReason(mode) != nil)
+                .help(unavailableReason(mode) ?? mode.pickerHelpText)
+            }
+        } label: {
+            AgentComposerCapsule(style: .tinted(selected.capsuleTint), foreground: selected.capsuleTint) {
+                AgentComposerCapsuleLabel(
+                    icon: selected.capsuleIcon,
+                    title: selected.displayName,
+                    chevron: true
+                )
+            }
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(disabled)
+        .help(help)
+        .accessibilityLabel("Permission \(selected.displayName)")
+        .accessibilityIdentifier(accessibilityIdentifier)
+    }
+}
+
+// MARK: - Run as
+
+public enum AgentRunAsUserPresentation {
+    public static func isInteractive(userCount: Int, identityLocked: Bool, runLocked: Bool) -> Bool {
+        userCount > 1 && !identityLocked && !runLocked
+    }
+
+    public static func helpText(
+        interactive: Bool,
+        selected: AgentRunAsUser,
+        identityLocked: Bool,
+        runLocked: Bool
+    ) -> String {
+        if runLocked { return "macOS user is fixed while a run is active" }
+        if identityLocked {
+            return "macOS user is fixed after the first message. Start a new thread to run as a different user."
+        }
+        if !interactive {
+            return "Provider processes run as macOS user \(selected.shortName)"
+        }
+        return "Choose which macOS user executes Codex/Claude/Grok (like sudo -u)"
+    }
+}
+
+public struct AgentRunAsUserCapsule: View {
+    public let users: [AgentRunAsUser]
+    public let selected: AgentRunAsUser
+    public let runLocked: Bool
+    public let identityLocked: Bool
+    public let accessibilityIdentifier: String
+    public let onSelect: (AgentRunAsUser) -> Void
+    public let onAppear: (() -> Void)?
+
+    public init(
+        users: [AgentRunAsUser],
+        selected: AgentRunAsUser,
+        runLocked: Bool,
+        identityLocked: Bool,
+        accessibilityIdentifier: String,
+        onSelect: @escaping (AgentRunAsUser) -> Void,
+        onAppear: (() -> Void)? = nil
+    ) {
+        self.users = users
+        self.selected = selected
+        self.runLocked = runLocked
+        self.identityLocked = identityLocked
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.onSelect = onSelect
+        self.onAppear = onAppear
+    }
+
+    private var interactive: Bool {
+        AgentRunAsUserPresentation.isInteractive(
+            userCount: users.count,
+            identityLocked: identityLocked,
+            runLocked: runLocked
+        )
+    }
+
+    public var body: some View {
+        Group {
+            if interactive {
+                Menu {
+                    ForEach(users, id: \.id) { user in
+                        Button {
+                            onSelect(user)
+                        } label: {
+                            HStack {
+                                if user.uid == selected.uid {
+                                    Image(systemName: "checkmark")
+                                }
+                                Text(user.shortName)
+                                if let full = user.fullName, full != user.shortName {
+                                    Text("· \(full)")
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    capsule(chevron: true, locked: false)
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize()
+            } else {
+                capsule(chevron: false, locked: identityLocked)
+            }
+        }
+        .disabled(runLocked)
+        .help(AgentRunAsUserPresentation.helpText(
+            interactive: interactive,
+            selected: selected,
+            identityLocked: identityLocked,
+            runLocked: runLocked
+        ))
+        .accessibilityLabel("Run as macOS user \(selected.shortName)")
+        .accessibilityIdentifier(accessibilityIdentifier)
+        .onAppear { onAppear?() }
+    }
+
+    private func capsule(chevron: Bool, locked: Bool) -> some View {
+        AgentComposerCapsule {
+            AgentComposerCapsuleLabel(
+                icon: locked ? "lock.fill" : "person.fill",
+                title: selected.shortName,
+                chevron: chevron
+            )
+        }
+    }
+}
+
+// MARK: - Model pill
+
+public struct AgentModelPillPresentation: Equatable {
+    public let title: String
+    public let loading: Bool
+    public let effort: String?
+    public let serviceTier: String?
+    public let contextWindow: String?
+
+    public init(
+        title: String,
+        loading: Bool = false,
+        effort: String? = nil,
+        serviceTier: String? = nil,
+        contextWindow: String? = nil
+    ) {
+        self.title = title
+        self.loading = loading
+        self.effort = effort
+        self.serviceTier = serviceTier
+        self.contextWindow = contextWindow
+    }
+
+    public var isAuto: Bool {
+        title.caseInsensitiveCompare("Auto") == .orderedSame
+    }
+
+    public var accessibilityLabel: String {
+        if isAuto {
+            return loading ? "Auto model routing, loading" : "Auto model routing"
+        }
+        var parts = ["Model \(title)"]
+        if let effort { parts.append("effort \(effort)") }
+        if let serviceTier { parts.append("tier \(serviceTier)") }
+        return parts.joined(separator: ", ")
+    }
+}
+
+public struct AgentModelPillLabel: View {
+    public let presentation: AgentModelPillPresentation
+    public let width: CGFloat?
+
+    public init(presentation: AgentModelPillPresentation, width: CGFloat? = nil) {
+        self.presentation = presentation
+        self.width = width
+    }
+
+    public var body: some View {
+        HStack(spacing: DS.Space.xs) {
+            if presentation.loading {
+                ProgressView()
+                    .controlSize(.mini)
+                    .accessibilityHidden(true)
+            }
+            Text(presentation.title)
+                .font(DS.Font.caption.weight(.medium))
+                .foregroundColor(DS.Palette.text)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if let effort = presentation.effort {
+                Text("·").foregroundColor(DS.Palette.textTertiary)
+                Text(effort)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            if let tier = presentation.serviceTier {
+                Text("·").foregroundColor(DS.Palette.textTertiary)
+                Text(tier)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.warning)
+                    .lineLimit(1)
+            }
+            if let ctx = presentation.contextWindow {
+                Text("·").foregroundColor(DS.Palette.textTertiary)
+                Text(ctx)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+            }
+            Image(systemName: "chevron.down")
+                .font(.system(size: 7, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
+        }
+        .modifier(AgentModelPillWidth(width: width))
+        .padding(.horizontal, DS.Space.sm)
+        .padding(.vertical, DS.Space.xs)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+    }
+}
+
+private struct AgentModelPillWidth: ViewModifier {
+    let width: CGFloat?
+
+    func body(content: Content) -> some View {
+        if let width {
+            content.frame(width: width, alignment: .trailing)
+        } else {
+            content.fixedSize()
+        }
+    }
+}
+
+// MARK: - Queued header
+
+public struct AgentQueuedHeader: View {
+    public let count: Int
+    public let identifier: String
+
+    public init(count: Int, identifier: String) {
+        self.count = count
+        self.identifier = identifier
+    }
+
+    public var body: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "text.line.first.and.arrowtriangle.forward")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.accent)
+                .accessibilityHidden(true)
+            Text("Queued")
+                .font(DS.Font.caption.weight(.semibold))
+                .foregroundColor(DS.Palette.accent)
+            Text("\(count)")
+                .font(DS.Font.caption.monospacedDigit())
+                .foregroundColor(DS.Palette.textTertiary)
+            Spacer(minLength: 0)
+        }
+        .accessibilityIdentifier(identifier)
+    }
+}

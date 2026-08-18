@@ -21,26 +21,27 @@ final class BotSelfConfigTests: XCTestCase {
         // WHY: Generated soul must name the same tools the MCP catalog
         // exposes. A drift here means first-chat "remember this" calls a
         // name the server does not have.
-        XCTAssertEqual(BotStandingInstructions.rememberFactTool, BotSelfConfigCatalog.putMemory)
+        XCTAssertEqual(BotStandingInstructions.rememberFactTool, BotSelfConfigCatalog.writeHomeFile)
         XCTAssertEqual(BotStandingInstructions.changeJobTool, BotSelfConfigCatalog.setSettings)
-        XCTAssertEqual(BotStandingInstructions.forgetFactTool, BotSelfConfigCatalog.forgetMemory)
-        XCTAssertEqual(BotStandingInstructions.correctFactTool, BotSelfConfigCatalog.correctMemory)
+        XCTAssertEqual(BotStandingInstructions.forgetFactTool, BotSelfConfigCatalog.writeHomeFile)
+        XCTAssertEqual(BotStandingInstructions.correctFactTool, BotSelfConfigCatalog.writeHomeFile)
         XCTAssertEqual(BotStandingInstructions.setSkillTool, BotSelfConfigCatalog.setSkill)
         XCTAssertEqual(BotStandingInstructions.removeSkillTool, BotSelfConfigCatalog.removeSkill)
         XCTAssertEqual(BotStandingInstructions.saveRoutineTool, BotSelfConfigCatalog.saveRoutine)
         XCTAssertEqual(BotStandingInstructions.setRoutineEnabledTool, BotSelfConfigCatalog.setRoutineEnabled)
         let tools = BotStandingInstructions.admittedToolsText
-        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.putMemory))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.writeHomeFile))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSettings))
-        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.forgetMemory))
-        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.correctMemory))
-        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSkill))
+        XCTAssertFalse(tools.contains(BotSelfConfigCatalog.putMemory))
+        XCTAssertFalse(tools.contains(BotSelfConfigCatalog.forgetMemory))
+        XCTAssertFalse(tools.contains(BotSelfConfigCatalog.correctMemory))
+        XCTAssertFalse(tools.contains(BotSelfConfigCatalog.setSkill))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.removeSkill))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.saveRoutine))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setRoutineEnabled))
         XCTAssertFalse(tools.contains(BotSelfConfigCatalog.getSettings))
         XCTAssertFalse(
-            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.putMemory),
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.writeHomeFile),
             "tools layer owns self-config names"
         )
         XCTAssertFalse(
@@ -67,10 +68,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(Set(BotSelfConfigCatalog.toolNames), [
             BotSelfConfigCatalog.getSettings,
             BotSelfConfigCatalog.setSettings,
-            BotSelfConfigCatalog.putMemory,
-            BotSelfConfigCatalog.forgetMemory,
-            BotSelfConfigCatalog.correctMemory,
-            BotSelfConfigCatalog.setSkill,
+            BotSelfConfigCatalog.writeHomeFile,
             BotSelfConfigCatalog.removeSkill,
             BotSelfConfigCatalog.saveRoutine,
             BotSelfConfigCatalog.setRoutineEnabled,
@@ -101,24 +99,24 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(try store.get(id: bot.id)?.name, "Piper Prime")
         XCTAssertEqual(try store.get(id: bot.id)?.notificationsEnabled, false)
 
-        let withMemory = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers dark mode",
+        let withMemory = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers dark mode\n",
         ])
-        XCTAssertEqual(withMemory.memory.map(\.content), ["Prefers dark mode"])
-        let memoryID = try XCTUnwrap(withMemory.memory.first?.id)
+        XCTAssertTrue(withMemory.memory.contains(where: { $0.id == "MEMORY.md" && $0.content.contains("Prefers dark mode") }))
 
-        let corrected = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-            "memory_id": memoryID,
-            "content": "Prefers light mode",
+        let corrected = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers light mode\n",
         ])
-        XCTAssertEqual(corrected.memory.map(\.content), ["Prefers light mode"])
-        XCTAssertEqual(corrected.memory.first?.id, memoryID)
+        XCTAssertTrue(corrected.memory.contains(where: { $0.id == "MEMORY.md" && $0.content.contains("Prefers light mode") }))
+        XCTAssertFalse(corrected.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
 
-        let withSkill = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "weekly-account-health",
-            "enabled": true,
+        let withSkill = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "skills/weekly-invoice/SKILL.md",
+            "contents": "Invoice the week.\n",
         ])
-        XCTAssertEqual(withSkill.skills.map(\.skillID), ["weekly-account-health"])
+        XCTAssertEqual(withSkill.skills.map(\.skillID), ["weekly-invoice"])
         XCTAssertEqual(withSkill.skills.first?.enabled, true)
 
         let withRoutine = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
@@ -137,17 +135,19 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(enabled.routines.first?.enabled, true)
 
-        let forgotten = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
-            "memory_id": memoryID,
+        let forgotten = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "# Memory\n\n",
         ])
-        XCTAssertTrue(forgotten.memory.isEmpty)
+        XCTAssertTrue(forgotten.memory.contains(where: { $0.id == "MEMORY.md" }))
+        XCTAssertFalse(forgotten.memory.contains(where: { $0.content.contains("Prefers light mode") }))
 
         let reread = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(reread.name, "Piper Prime")
         XCTAssertEqual(reread.soul, "Speak plainly.")
         XCTAssertEqual(reread.provider, AgentProvider.grok.rawValue)
-        XCTAssertTrue(reread.memory.isEmpty)
-        XCTAssertEqual(reread.skills.first?.enabled, true)
+        XCTAssertFalse(reread.memory.contains(where: { $0.content.contains("Prefers light mode") }))
+        XCTAssertEqual(reread.skills.map(\.skillID), ["weekly-invoice"])
         XCTAssertEqual(reread.routines.first?.enabled, true)
     }
 
@@ -844,13 +844,17 @@ final class BotSelfConfigTests: XCTestCase {
         }
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Memory reject must not persist a name")
-        XCTAssertEqual(still.memory.count, 0, "Memory reject must not persist a fact")
+        XCTAssertFalse(
+            still.memory.contains(where: { $0.content.contains("Prefers dark mode") }),
+            "Memory reject must not persist a fact"
+        )
         XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
 
-        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "fact": "Prefers dark mode",
+        let remembered = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers dark mode\n",
         ])
-        XCTAssertEqual(remembered.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(remembered.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
@@ -862,14 +866,14 @@ final class BotSelfConfigTests: XCTestCase {
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
-        XCTAssertEqual(leftover.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(leftover.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
 
         let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
         XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
-        XCTAssertEqual(renamed.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(renamed.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
     }
 
     func test_setSettingsRejectsAdvertisedForget_becauseStudioSaysForgetMemory() throws {
@@ -890,8 +894,9 @@ final class BotSelfConfigTests: XCTestCase {
             model: "opus"
         )
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "fact": "Prefers dark mode",
+        let remembered = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers dark mode\n",
         ])
         let memoryID = try XCTUnwrap(remembered.memory.first?.id)
         let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
@@ -940,7 +945,7 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Forget reject must not persist a name")
         XCTAssertEqual(still.memory.first?.id, memoryID)
-        XCTAssertEqual(still.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(still.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
         let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
@@ -948,12 +953,16 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
-        XCTAssertEqual(owned.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(owned.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
 
-        let forgotten = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
-            "memory_id": memoryID,
+        let forgotten = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "# Memory\n\n",
         ])
-        XCTAssertEqual(forgotten.memory.count, 0, "forget_memory still owns Forget")
+        XCTAssertFalse(
+            forgotten.memory.contains(where: { $0.content.contains("Prefers dark mode") }),
+            "writing MEMORY.md still owns Forget"
+        )
     }
 
     func test_setSettingsRejectsAdvertisedCorrect_becauseStudioSaysCorrectMemory() throws {
@@ -974,8 +983,9 @@ final class BotSelfConfigTests: XCTestCase {
             model: "opus"
         )
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "fact": "Prefers dark mode",
+        let remembered = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers dark mode\n",
         ])
         let memoryID = try XCTUnwrap(remembered.memory.first?.id)
         let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
@@ -1031,7 +1041,7 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Correct reject must not persist a name")
         XCTAssertEqual(still.memory.first?.id, memoryID)
-        XCTAssertEqual(still.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(still.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
         let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
@@ -1039,14 +1049,17 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
-        XCTAssertEqual(owned.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(owned.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
 
-        let corrected = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-            "memory_id": memoryID,
-            "content": "Prefers light mode",
+        let corrected = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers light mode\n",
         ])
-        XCTAssertEqual(corrected.memory.first?.id, memoryID, "correct_memory keeps the same id")
-        XCTAssertEqual(corrected.memory.first?.content, "Prefers light mode", "correct_memory still owns Correct")
+        XCTAssertEqual(corrected.memory.first?.id, memoryID, "same file path")
+        XCTAssertTrue(
+            corrected.memory.contains(where: { $0.content.contains("Prefers light mode") }),
+            "writing MEMORY.md still owns Correct"
+        )
     }
 
     func test_setSettingsRejectsAdvertisedSkills_becauseStudioSaysAdd() throws {
@@ -2881,8 +2894,9 @@ final class BotSelfConfigTests: XCTestCase {
             model: "opus"
         )
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "fact": "Prefers dark mode",
+        let remembered = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers dark mode\n",
         ])
         let memoryID = try XCTUnwrap(remembered.memory.first?.id)
         let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
@@ -2891,8 +2905,9 @@ final class BotSelfConfigTests: XCTestCase {
             JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
         )
         let memory = try XCTUnwrap(object["memory"] as? [[String: Any]])
-        XCTAssertEqual(memory.first?["memory_id"] as? String, memoryID)
+        XCTAssertEqual(memory.first?["path"] as? String, memoryID)
         XCTAssertNil(memory.first?["id"], "nested id omitted")
+        XCTAssertNil(memory.first?["memory_id"], "store leftover memory_id omitted")
         XCTAssertNil(
             BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
                 .flatMap { $0 as? [String: Any] }?["memory_id"],
@@ -2931,7 +2946,7 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "memory_id reject must not persist a name")
         XCTAssertEqual(still.memory.first?.id, memoryID)
-        XCTAssertEqual(still.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(still.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
         let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
@@ -2939,18 +2954,19 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
-        XCTAssertEqual(owned.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(owned.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
 
-        let corrected = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-            "memory_id": memoryID,
-            "fact": "Prefers light mode",
+        let corrected = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers light mode\n",
         ])
-        XCTAssertEqual(corrected.memory.first?.content, "Prefers light mode", "correct still owns memory_id")
+        XCTAssertTrue(corrected.memory.contains(where: { $0.content.contains("Prefers light mode") }))
 
-        let forgotten = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
-            "memory_id": memoryID,
+        let forgotten = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "# Memory\n\n",
         ])
-        XCTAssertEqual(forgotten.memory.count, 0, "forget still owns memory_id")
+        XCTAssertFalse(forgotten.memory.contains(where: { $0.content.contains("Prefers light mode") }))
     }
 
     func test_setSettingsRejectsSnapshotContent_becauseStudioSaysRememberAFact() throws {
@@ -2970,8 +2986,9 @@ final class BotSelfConfigTests: XCTestCase {
             model: "opus"
         )
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "fact": "Prefers dark mode",
+        let remembered = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers dark mode\n",
         ])
         let memoryID = try XCTUnwrap(remembered.memory.first?.id)
         let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
@@ -2980,8 +2997,8 @@ final class BotSelfConfigTests: XCTestCase {
             JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
         )
         let memory = try XCTUnwrap(object["memory"] as? [[String: Any]])
-        XCTAssertEqual(memory.first?["content"] as? String, "Prefers dark mode")
-        XCTAssertEqual(memory.first?["memory_id"] as? String, memoryID)
+        XCTAssertTrue((memory.first?["content"] as? String)?.contains("Prefers dark mode") == true)
+        XCTAssertEqual(memory.first?["path"] as? String, memoryID)
         XCTAssertNil(
             BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)["properties"]
                 .flatMap { $0 as? [String: Any] }?["content"],
@@ -3027,7 +3044,7 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "content reject must not persist a name")
         XCTAssertEqual(still.memory.first?.id, memoryID)
-        XCTAssertEqual(still.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(still.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
         let owned = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
@@ -3035,12 +3052,13 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(owned.name, "Piper Prime", "bot_id still owns the caller check")
-        XCTAssertEqual(owned.memory.first?.content, "Prefers dark mode")
+        XCTAssertTrue(owned.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
 
-        let viaContent = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers light mode",
+        let viaContent = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers light mode\n",
         ])
-        XCTAssertEqual(viaContent.memory.last?.content, "Prefers light mode", "put_memory still owns content")
+        XCTAssertTrue(viaContent.memory.contains(where: { $0.content.contains("Prefers light mode") }))
     }
 
     func test_setSettingsRejectsSnapshotPrompt_becauseStudioSaysSaveRoutine() throws {
@@ -3680,369 +3698,84 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(skillID?["description"] as? String, "Catalog id. Same field as Studio Add.")
     }
 
-    func test_putMemoryAdvertisedFactPersists_becauseStudioSaysRememberAFact() throws {
-        // WHY: Tools and Studio say Remember a fact. Parse only read
-        // content, so first-chat "remember this fact" invented a hop or
-        // dropped the row. Canonical content still wins. Schema does not
-        // grow a second key.
+    func test_writeHomeFilePersistsOwnedSkillMarkdown() throws {
+        // WHY: Skills are the files. Catalog Add hid that path behind
+        // store bindings. write_home_file must persist SKILL.md and
+        // leftover set_skill must fail loud.
         let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-
-        let fromFact = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "fact": "Prefers dark mode",
+        let written = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "skills/weekly-invoice/SKILL.md",
+            "contents": "Invoice the week.\n",
         ])
-        XCTAssertEqual(fromFact.memory.map(\.content), ["Prefers dark mode"])
-        XCTAssertEqual(try store.listMemory(botID: bot.id).map(\.content), ["Prefers dark mode"])
-
-        let contentWins = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers light mode",
-            "fact": "Ignored fact",
-        ])
-        XCTAssertEqual(contentWins.memory.map(\.content), ["Prefers dark mode", "Prefers light mode"])
-        XCTAssertEqual(contentWins.memory.last?.content, "Prefers light mode", "content wins")
-
-        let memoryID = try XCTUnwrap(fromFact.memory.first?.id)
-        let corrected = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-            "memory_id": memoryID,
-            "fact": "Prefers dusk",
-        ])
-        XCTAssertEqual(corrected.memory.first(where: { $0.id == memoryID })?.content, "Prefers dusk")
-
-        let correctContentWins = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-            "memory_id": memoryID,
-            "content": "Prefers dawn",
-            "fact": "Ignored correction",
-        ])
-        XCTAssertEqual(
-            correctContentWins.memory.first(where: { $0.id == memoryID })?.content,
-            "Prefers dawn",
-            "content wins"
-        )
-    }
-
-    func test_putMemoryCatalogDescribesFact_becauseThatIsTheStudioField() {
-        // WHY: Schema key stays content. Description must name Fact so
-        // first-chat does not invent a hop.
-        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.putMemory)
-        XCTAssertTrue(description.contains("fact"))
-        let putSchema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.putMemory)
-        let putProperties = putSchema["properties"] as? [String: Any]
-        XCTAssertNotNil(putProperties?["content"])
-        XCTAssertNil(putProperties?["fact"], "fact is an advertised alias, not a second schema key")
-        XCTAssertNil(putProperties?["remember"], "remember is an advertised alias, not a second schema key")
-        XCTAssertNil(putProperties?["remember_a_fact"], "remember_a_fact is an advertised alias, not a second schema key")
-        let putContent = putProperties?["content"] as? [String: Any]
-        XCTAssertEqual(putContent?["description"] as? String, "Fact. Same field as Studio Remember a fact.")
-
-        let correctSchema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.correctMemory)
-        let properties = correctSchema["properties"] as? [String: Any]
-        XCTAssertNotNil(properties?["content"])
-        XCTAssertNil(properties?["fact"], "fact is an advertised alias, not a second schema key")
-        XCTAssertNil(properties?["correct"], "correct is an advertised alias, not a second schema key")
-        XCTAssertNil(properties?["correct_fact"], "correct_fact is an advertised alias, not a second schema key")
-        let content = properties?["content"] as? [String: Any]
-        XCTAssertEqual(content?["description"] as? String, "Fact. Same field as Studio Remember a fact.")
-
-        let forgetSchema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.forgetMemory)
-        let forgetProperties = forgetSchema["properties"] as? [String: Any]
-        XCTAssertNotNil(forgetProperties?["memory_id"])
-        XCTAssertNil(forgetProperties?["forget"], "forget is an advertised forget_memory alias, not a second schema key")
-        XCTAssertNil(forgetProperties?["forget_memory"], "forget_memory is an advertised alias, not a second schema key")
-        XCTAssertEqual(forgetSchema["required"] as? [String], ["memory_id"])
-        let forgetDescription = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.forgetMemory)
-        XCTAssertTrue(forgetDescription.contains("Forget"), "Same path as Studio Forget")
-    }
-
-    func test_correctMemoryAdvertisedCorrectPersists_becauseHonestySaysStudioCorrect() throws {
-        // WHY: set_settings leftover correct already rejects and points
-        // at bot_correct_memory ("Same path as Studio Correct"). Correct
-        // only read content / fact, so first-chat retried correct and
-        // invented a hop. Canonical content still wins. Schema does not
-        // grow a correct key. Dest title stays Memory.
-        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
-        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let created = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers dark mode",
-        ])
-        let memoryID = try XCTUnwrap(created.memory.first?.id)
-
-        let fromCorrect = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-            "memory_id": memoryID,
-            "correct": "Prefers dusk",
-        ])
-        XCTAssertEqual(fromCorrect.memory.count, 1)
-        XCTAssertEqual(fromCorrect.memory.first?.id, memoryID, "correct keeps the id")
-        XCTAssertEqual(fromCorrect.memory.first?.content, "Prefers dusk", "correct persists")
-
-        let fromCorrectFact = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-            "memory_id": memoryID,
-            "correct_fact": "Prefers twilight",
-        ])
-        XCTAssertEqual(fromCorrectFact.memory.first?.content, "Prefers twilight", "correct_fact persists")
-        XCTAssertEqual(fromCorrectFact.memory.first?.id, memoryID)
-
-        let fromFact = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-            "memory_id": memoryID,
-            "fact": "Prefers dawn",
-        ])
-        XCTAssertEqual(fromFact.memory.first?.content, "Prefers dawn", "fact still persists")
-        XCTAssertEqual(fromFact.memory.first?.id, memoryID)
-
-        let contentWins = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-            "memory_id": memoryID,
-            "content": "Prefers light mode",
-            "correct": "Ignored correct",
-            "correct_fact": "Ignored correct fact",
-            "fact": "Ignored fact",
-        ])
-        XCTAssertEqual(contentWins.memory.first?.content, "Prefers light mode", "content wins")
-        XCTAssertEqual(contentWins.memory.first?.id, memoryID)
-
+        XCTAssertEqual(written.skills.map(\.skillID), ["weekly-invoice"])
+        let home = BotHome(appSupportDirectory: service.appSupportDirectory, bot: bot)
+        XCTAssertTrue(try home.listOwnedSkills().contains(where: { $0.slug == "weekly-invoice" }))
         XCTAssertThrowsError(
-            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "correct": "Must not persist",
+            try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
+                "skill_id": "weekly-account-health",
             ])
         ) { error in
-            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.correctHonesty))
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.skillsHonesty))
         }
-        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(still.memory.count, 1)
-        XCTAssertEqual(still.memory.first?.id, memoryID)
-        XCTAssertEqual(
-            still.memory.first?.content,
-            "Prefers light mode",
-            "leftover correct still rejects on set_settings"
-        )
-        let itemID = BotMemoryItemID(try XCTUnwrap(UUID(uuidString: memoryID)))
-        XCTAssertEqual(
-            try store.listMemoryRevisions(itemID: itemID).map(\.content),
-            [
-                "Prefers dark mode",
-                "Prefers dusk",
-                "Prefers twilight",
-                "Prefers dawn",
-                "Prefers light mode",
-            ]
-        )
+        let removed = try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
+            "skill_id": "weekly-invoice",
+        ])
+        XCTAssertTrue(removed.skills.isEmpty)
+        XCTAssertTrue(try home.listOwnedSkills().isEmpty)
     }
 
-    func test_forgetMemoryAdvertisedForgetPersists_becauseHonestySaysStudioForget() throws {
-        // WHY: set_settings leftover forget already rejects and points
-        // at bot_forget_memory ("Same path as Studio Forget"). Forget
-        // only read memory_id, so first-chat retried forget and
-        // invented a hop. Canonical memory_id still wins. Schema does
-        // not grow a forget key. Dest title stays Memory.
+    func test_writeHomeFilePersistsMemoryMarkdown() throws {
+        // WHY: Memory is the files. put/forget/correct hid that path
+        // behind store IDs. write_home_file must persist MEMORY.md and
+        // today's daily note, and leftover CRUD names must fail loud.
         let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let first = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers dark mode",
+        let durable = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers dark mode\n",
         ])
-        let firstID = try XCTUnwrap(first.memory.first?.id)
-
-        let fromForget = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
-            "forget": firstID,
+        XCTAssertTrue(durable.memory.contains(where: { $0.id == "MEMORY.md" && $0.content.contains("Prefers dark mode") }))
+        let daily = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "memory/2026-08-18.md",
+            "contents": "Shipped the overnight brief.\n",
         ])
-        XCTAssertTrue(fromForget.memory.isEmpty, "forget persists")
-        XCTAssertTrue(try store.listMemory(botID: bot.id).isEmpty)
-        XCTAssertEqual(
-            try store.listMemory(botID: bot.id, includeForgotten: true).first?.id.value.uuidString.lowercased(),
-            firstID.lowercased()
-        )
-
-        let second = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers dusk",
-        ])
-        let secondID = try XCTUnwrap(second.memory.first?.id)
-        let fromForgetMemory = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
-            "forget_memory": secondID,
-        ])
-        XCTAssertTrue(fromForgetMemory.memory.isEmpty, "forget_memory persists")
-        XCTAssertTrue(try store.listMemory(botID: bot.id).isEmpty)
-
-        let third = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers dawn",
-        ])
-        let thirdID = try XCTUnwrap(third.memory.first?.id)
-        let fourth = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers light mode",
-        ])
-        let fourthID = try XCTUnwrap(fourth.memory.first(where: { $0.content == "Prefers light mode" })?.id)
-        let memoryIDWins = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
-            "memory_id": thirdID,
-            "forget": fourthID,
-            "forget_memory": fourthID,
-        ])
-        XCTAssertEqual(memoryIDWins.memory.map(\.id), [fourthID], "memory_id wins")
-        XCTAssertEqual(memoryIDWins.memory.first?.content, "Prefers light mode")
-
+        XCTAssertTrue(daily.memory.contains(where: { $0.id == "memory/2026-08-18.md" }))
         XCTAssertThrowsError(
-            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "forget": fourthID,
-            ])
-        ) { error in
-            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.forgetHonesty))
-        }
-        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(still.memory.count, 1)
-        XCTAssertEqual(still.memory.first?.id, fourthID)
-        XCTAssertEqual(
-            still.memory.first?.content,
-            "Prefers light mode",
-            "leftover forget still rejects on set_settings"
-        )
-        XCTAssertNil(
-            BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.forgetMemory)["properties"]
-                .flatMap { $0 as? [String: Any] }?["forget"],
-            "forget is an advertised forget_memory alias, not a second schema key"
-        )
-    }
-
-    func test_putMemoryAdvertisedRememberPersists_becauseHonestySaysRememberAFact() throws {
-        // WHY: set_settings leftover remember already rejects and points
-        // at bot_put_memory ("Same path as Studio Remember a fact"). Put
-        // only read content / fact, so first-chat retried remember and
-        // invented a hop. Canonical content still wins. Schema does not
-        // grow a remember key. Dest title stays Memory.
-        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
-        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-
-        let fromRemember = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "remember": "Prefers dark mode",
-        ])
-        XCTAssertEqual(fromRemember.memory.map(\.content), ["Prefers dark mode"], "remember persists")
-        XCTAssertEqual(try store.listMemory(botID: bot.id).map(\.content), ["Prefers dark mode"])
-
-        let fromRememberAFact = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "remember_a_fact": "Prefers dusk",
-        ])
-        XCTAssertEqual(fromRememberAFact.memory.last?.content, "Prefers dusk", "remember_a_fact persists")
-
-        let contentWins = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers light mode",
-            "remember": "Ignored remember",
-            "remember_a_fact": "Ignored remember a fact",
-        ])
-        XCTAssertEqual(contentWins.memory.last?.content, "Prefers light mode", "content wins")
-
-        XCTAssertThrowsError(
-            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "remember": "Must not persist",
+            try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+                "path": "IDENTITY.md",
+                "contents": "stolen",
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
         }
-        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(still.memory.map(\.content), [
-            "Prefers dark mode",
-            "Prefers dusk",
-            "Prefers light mode",
-        ], "leftover remember still rejects on set_settings")
-    }
-
-    func test_leftoverPermissionSnapshotStaysSupervised_becauseFullAccessIsNotLive() throws {
-        // WHY: Brain compile already treats leftover full_access as
-        // supervised. get_settings still returned the raw leftover, so
-        // first-chat "just write the file" via bot_get_settings invented
-        // unsupervised access. Hermes agents see advertised permission.
-        let bot = try store.create(name: "Piper", title: "Scout", description: "", soul: "Own the inbox.", provider: .claude)
-        let currentID = try XCTUnwrap(bot.currentRevisionID)
-        _ = try store.publish(
-            botID: bot.id,
-            expectedCurrentRevisionID: currentID,
-            draft: BotRevisionDraft(
-                name: "Piper",
-                title: "Scout",
-                description: "",
-                soul: "Own the inbox.",
-                provider: .claude,
-                providerInstanceID: "claude",
-                model: "opus",
-                permissionMode: .fullAccess
-            )
-        )
-        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let snapshot = try service.snapshot()
-        XCTAssertEqual(snapshot.permissionMode, AgentPermissionMode.supervised.rawValue)
-        XCTAssertNotEqual(snapshot.permissionMode, AgentPermissionMode.fullAccess.rawValue)
-        let stored = try XCTUnwrap(try store.getRevision(id: try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)))
-        XCTAssertEqual(stored.permissionMode, .fullAccess)
-    }
-
-    func test_setSettingsLeftoverPermissionDoesNotAdvertiseFullAccess() throws {
-        // WHY: Desk-admitted bot_set_settings used to persist leftover
-        // full_access and echo it back. The model then believed it had
-        // unsupervised writes. Leftover permission_mode now rejects.
-        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
-        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
         XCTAssertThrowsError(
-            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+            try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
+                "content": "Prefers dark mode",
             ])
         ) { error in
-            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
         }
-        let stored = try XCTUnwrap(try store.getRevision(id: try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)))
-        XCTAssertEqual(stored.permissionMode, .supervised)
         XCTAssertThrowsError(
-            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.autoAcceptEdits.rawValue,
+            try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
+                "memory_id": UUID().uuidString,
             ])
         ) { error in
-            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
         }
-        let after = try service.snapshot()
-        XCTAssertEqual(after.permissionMode, AgentPermissionMode.supervised.rawValue)
-        XCTAssertFalse(after.permissionMode.contains("full_access"))
-        XCTAssertFalse(after.permissionMode.contains("auto_accept_edits"))
-    }
-
-    func test_correctMemoryKeepsId_becauseStudioCorrectDoesNotMintANewFact() throws {
-        // WHY: Studio Correct writes a revision on the same fact.
-        // Tools never named that path, so first-chat "correct this"
-        // invented forget+put and lost the id. Hermes agents update
-        // memory in place.
-        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
-        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let created = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers dark mode",
-        ])
-        let memoryID = try XCTUnwrap(created.memory.first?.id)
-        let after = try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-            "memory_id": memoryID,
-            "content": "Prefers light mode",
-        ])
-        XCTAssertEqual(after.memory.count, 1)
-        XCTAssertEqual(after.memory.first?.id, memoryID)
-        XCTAssertEqual(after.memory.first?.content, "Prefers light mode")
-        let itemID = BotMemoryItemID(try XCTUnwrap(UUID(uuidString: memoryID)))
-        let revisions = try store.listMemoryRevisions(itemID: itemID)
-        XCTAssertEqual(revisions.map(\.content), ["Prefers dark mode", "Prefers light mode"])
-    }
-
-    func test_correctMemoryRejectedWhenForgotten_becauseTombstonesAreNotRewritable() throws {
-        // WHY: Studio Correct cannot rewrite a forgotten fact. The new
-        // tool must fail the same way instead of minting a live row.
-        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
-        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let created = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Old secret",
-        ])
-        let memoryID = try XCTUnwrap(created.memory.first?.id)
-        _ = try service.call(name: BotSelfConfigCatalog.forgetMemory, arguments: [
-            "memory_id": memoryID,
-        ])
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.correctMemory, arguments: [
-                "memory_id": memoryID,
-                "content": "Still secret",
+                "memory_id": UUID().uuidString,
+                "content": "Prefers light mode",
             ])
         ) { error in
-            XCTAssertEqual(
-                error as? BotStoreError,
-                .invalidRow("forgotten memory cannot be rewritten")
-            )
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.memoryHonesty))
         }
-        XCTAssertTrue(try service.snapshot().memory.isEmpty)
+        XCTAssertFalse(BotSelfConfigCatalog.toolNames.contains(BotSelfConfigCatalog.putMemory))
+        XCTAssertTrue(BotSelfConfigCatalog.toolNames.contains(BotSelfConfigCatalog.writeHomeFile))
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.writeHomeFile)
+        XCTAssertTrue(description.contains("MEMORY.md"))
+        XCTAssertTrue(description.contains("memory/YYYY-MM-DD.md"))
     }
 
     func test_removeSkillDropsBinding_becauseDisableIsNotUnbind() throws {
@@ -4105,8 +3838,9 @@ final class BotSelfConfigTests: XCTestCase {
         // reuse the key the last write returned. Canonical Swift fields stay.
         let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let remembered = try service.call(name: BotSelfConfigCatalog.putMemory, arguments: [
-            "content": "Prefers dark mode",
+        let remembered = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "MEMORY.md",
+            "contents": "- Prefers dark mode\n",
         ])
         _ = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
             "skill_id": "weekly-account-health",
@@ -4123,9 +3857,9 @@ final class BotSelfConfigTests: XCTestCase {
         )
         XCTAssertEqual(object["id"] as? String, bot.id.value.uuidString.lowercased())
         let memory = try XCTUnwrap(object["memory"] as? [[String: Any]])
-        XCTAssertEqual(memory.first?["memory_id"] as? String, remembered.memory.first?.id, "memory_id persists")
+        XCTAssertEqual(memory.first?["path"] as? String, remembered.memory.first?.id, "path persists")
         XCTAssertNil(memory.first?["id"], "nested id omitted")
-        XCTAssertEqual(memory.first?["content"] as? String, "Prefers dark mode")
+        XCTAssertTrue((memory.first?["content"] as? String)?.contains("Prefers dark mode") == true)
         let skills = try XCTUnwrap(object["skills"] as? [[String: Any]])
         XCTAssertEqual(skills.first?["skill_id"] as? String, "weekly-account-health", "skill_id persists")
         XCTAssertNil(skills.first?["skillID"])

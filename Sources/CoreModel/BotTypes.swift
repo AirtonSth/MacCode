@@ -276,10 +276,11 @@ public enum BotStandingInstructions {
         "Do not invent tools, files, accounts, or access you do not have."
 
     /// Must stay identical to `BotSelfConfigCatalog` mutate tools.
-    public static let rememberFactTool = "bot_put_memory"
+    public static let writeMemoryFileTool = "bot_write_home_file"
+    public static let rememberFactTool = writeMemoryFileTool
     public static let changeJobTool = "bot_set_settings"
-    public static let forgetFactTool = "bot_forget_memory"
-    public static let correctFactTool = "bot_correct_memory"
+    public static let forgetFactTool = writeMemoryFileTool
+    public static let correctFactTool = writeMemoryFileTool
     public static let setSkillTool = "bot_set_skill"
     public static let removeSkillTool = "bot_remove_skill"
     public static let saveRoutineTool = "bot_save_routine"
@@ -290,10 +291,10 @@ public enum BotStandingInstructions {
     public static let waitLoginTool = "bot_browser_wait_login"
 
     public static let generatedCapabilityLine =
-        "When asked to remember a fact, call \(rememberFactTool). When asked to change your name, Role, Instructions, description, notifications, or avatar, call \(changeJobTool)."
+        "When asked to remember, forget, or correct a fact, write MEMORY.md or memory/YYYY-MM-DD.md with \(writeMemoryFileTool). When asked to change your name, Role, Instructions, description, notifications, or avatar, call \(changeJobTool)."
 
     public static let generatedMutateLine =
-        "When asked to forget a fact, call \(forgetFactTool). When asked to correct a fact, call \(correctFactTool). When asked to add a skill or set it Enabled or Off, call \(setSkillTool). When asked to remove a skill, call \(removeSkillTool). When asked to create or change a routine, call \(saveRoutineTool). When asked to set a routine Active or Off, call \(setRoutineEnabledTool)."
+        "When asked to add, correct, or create a skill, write skills/<slug>/SKILL.md with \(writeMemoryFileTool). When asked to remove a skill, call \(removeSkillTool) to delete that file. When asked to create or change a routine, call \(saveRoutineTool). When asked to set a routine Active or Off, call \(setRoutineEnabledTool)."
 
     public static let generatedBrowserLine =
         "When asked to open a website, call \(openBrowserTool). When asked what is open in that browser, call \(getBrowserTool). When asked to wait for a login, call \(waitLoginTool). That browser is this teammate's, not the user's."
@@ -815,6 +816,17 @@ extension BotHandle {
         out = out.trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
         if out.count > maxLength { out = String(out.prefix(maxLength)) }
         return normalize(out)
+    }
+
+    /// True while Studio should keep rewriting the slug from the name.
+    /// Unique suffixes from create (`new-agent-19`) still follow "New Agent".
+    public static func shouldFollowName(handle: String, name: String) -> Bool {
+        let stored = normalize(handle) ?? handle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let derived = derive(from: name) else { return stored.isEmpty }
+        if stored == derived { return true }
+        guard stored.hasPrefix(derived + "-") else { return false }
+        let suffix = stored.dropFirst(derived.count + 1)
+        return !suffix.isEmpty && suffix.allSatisfy(\.isNumber)
     }
 }
 

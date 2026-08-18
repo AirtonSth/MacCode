@@ -16,6 +16,17 @@ final class BotTypesTests: XCTestCase {
         XCTAssertNil(BotHandle.normalize(String(repeating: "a", count: 33)), "handles longer than 32 break directory labels")
     }
 
+    func test_slugFollowsNameUntilOwnerDefinesIt() {
+        // WHY: Studio Slug tracks the name (CEO -> ceo) until the owner
+        // types a custom slug. Unique New Agent suffixes must still follow.
+        XCTAssertEqual(BotHandle.derive(from: "CEO"), "ceo")
+        XCTAssertEqual(BotHandle.derive(from: "@Piper"), "piper")
+        XCTAssertTrue(BotHandle.shouldFollowName(handle: "ceo", name: "CEO"))
+        XCTAssertTrue(BotHandle.shouldFollowName(handle: "new-agent-19", name: "New Agent"))
+        XCTAssertFalse(BotHandle.shouldFollowName(handle: "boss", name: "CEO"))
+        XCTAssertFalse(BotHandle.shouldFollowName(handle: "piper", name: "Scout"))
+    }
+
     func test_revisionDigest_isStableAcrossRouteOrder_becauseRepublishMustNotDriftWithoutContentChange() {
         let botID = BotID(UUID(uuidString: "00000000-0000-4000-8000-0000000000aa")!)
         let first = BotRevision.digest(
@@ -113,6 +124,42 @@ final class BotTypesTests: XCTestCase {
         XCTAssertEqual(leftover.advertisedOrLogical, .logicalExecutionSpace)
     }
 
+    func test_standingToolsNameWriteSkillFiles() {
+        // WHY: First-chat "add a skill" used to call bot_set_skill and
+        // hide the files. The tools layer must name skills/<slug>/SKILL.md.
+        let tools = BotStandingInstructions.admittedToolsText
+        XCTAssertTrue(tools.contains("skills/<slug>/SKILL.md"))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.writeMemoryFileTool))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.removeSkillTool))
+        XCTAssertFalse(tools.contains("bot_set_skill"))
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout")
+                .contains("SKILL.md"),
+            "tools layer owns skill file names"
+        )
+    }
+
+    func test_standingToolsNameWriteMemoryFiles() {
+        // WHY: First-chat "remember this" used to call bot_put_memory and
+        // hide the files. The tools layer must name the markdown paths.
+        let tools = BotStandingInstructions.admittedToolsText
+        XCTAssertEqual(
+            BotStandingInstructions.rememberFactTool,
+            BotStandingInstructions.writeMemoryFileTool
+        )
+        XCTAssertTrue(tools.contains("bot_write_home_file"))
+        XCTAssertTrue(tools.contains("MEMORY.md"))
+        XCTAssertTrue(tools.contains("memory/YYYY-MM-DD.md"))
+        XCTAssertFalse(tools.contains("bot_put_memory"))
+        XCTAssertFalse(tools.contains("bot_forget_memory"))
+        XCTAssertFalse(tools.contains("bot_correct_memory"))
+        XCTAssertFalse(
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout")
+                .contains("MEMORY.md"),
+            "tools layer owns memory file names"
+        )
+    }
+
     func test_standingInstructionsFallback_keepsCustomSoulAsEscapeHatch() {
         // WHY: Hermes never overwrites a user SOUL.md. Role auto-config may
         // refresh the starter, but a written soul must stay untouched.
@@ -134,11 +181,12 @@ final class BotTypesTests: XCTestCase {
         XCTAssertFalse(starter.contains(BotStandingInstructions.removeSkillTool), "tools layer owns remove")
         XCTAssertFalse(starter.contains(BotStandingInstructions.openBrowserTool), "tools layer owns browser")
         XCTAssertFalse(starter.contains("bot_get_settings"), "compile already injects live settings")
+        XCTAssertTrue(tools.contains(BotStandingInstructions.writeMemoryFileTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.rememberFactTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.changeJobTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.forgetFactTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.correctFactTool))
-        XCTAssertTrue(tools.contains(BotStandingInstructions.setSkillTool))
+        XCTAssertFalse(tools.contains(BotStandingInstructions.setSkillTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.removeSkillTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.saveRoutineTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.setRoutineEnabledTool))
@@ -250,10 +298,10 @@ final class BotTypesTests: XCTestCase {
         // binding. Tools only said enable or disable, so first-chat
         // "add this skill" invented a hop. Hermes agents add in place.
         let tools = BotStandingInstructions.admittedToolsText
-        XCTAssertTrue(tools.contains("add a skill"))
-        XCTAssertTrue(tools.contains(BotStandingInstructions.setSkillTool))
+        XCTAssertTrue(tools.contains("skills/<slug>/SKILL.md"))
+        XCTAssertFalse(tools.contains(BotStandingInstructions.setSkillTool))
         XCTAssertFalse(
-            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("add a skill"),
+            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("SKILL.md"),
             "tools layer owns add"
         )
     }

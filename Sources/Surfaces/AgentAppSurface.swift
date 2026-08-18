@@ -269,43 +269,6 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
     }
 }
 
-public enum AgentModelPopoverTransition: Equatable {
-    case none
-    case fadeAndSlide
-}
-
-public struct AgentModelPopoverPresentation: Equatable {
-    public static let autoDisclaimer = "Remote Code will automatically orchestrate the model to maximize quality while using the fewest tokens."
-    public static let autoStatus = "Orchestration active"
-    public static let autoAccessibilityLabel = "Automatic model routing"
-    public static let autoAccessibilityHint = "Turns automatic model routing on or off."
-
-    public let mode: AgentRoutingMode
-    public let reduceMotion: Bool
-    public let autoRoutingLoading: Bool
-
-    public init(mode: AgentRoutingMode, reduceMotion: Bool, autoRoutingLoading: Bool = false) {
-        self.mode = mode
-        self.reduceMotion = reduceMotion
-        self.autoRoutingLoading = autoRoutingLoading
-    }
-
-    public var showsModelControls: Bool { mode != .auto }
-    public var showsReasoningControls: Bool { mode != .auto }
-    public var showsServiceTierControls: Bool { mode != .auto }
-    public var showsDisclaimer: Bool { mode == .auto }
-    public var showsAutoLoadingIndicator: Bool { autoRoutingLoading }
-    public var autoToggleEnabled: Bool { !autoRoutingLoading }
-    public var transition: AgentModelPopoverTransition {
-        reduceMotion ? .none : .fadeAndSlide
-    }
-    public var accessibilityLabel: String { Self.autoAccessibilityLabel }
-    public var accessibilityValue: String { mode == .auto ? "On" : "Off" }
-    public var accessibilityHint: String { Self.autoAccessibilityHint }
-    public var disclaimer: String { Self.autoDisclaimer }
-
-}
-
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var threads: [AgentThread] = [] { didSet { filteredThreadsCache = nil } }
@@ -2420,13 +2383,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func permissionModeUnavailableReason(_ mode: AgentPermissionMode) -> String? {
         guard !supportedPermissionModesForSelectedProvider.contains(mode) else { return nil }
-        let label: String
-        switch mode {
-        case .supervised: label = "Supervised"
-        case .autoAcceptEdits: label = "Auto-edit"
-        case .fullAccess: label = "Full access"
-        }
-        return "\(providerDisplayName(provider)) does not support \(label) for this session."
+        return "\(providerDisplayName(provider)) does not support \(mode.displayName) for this session."
     }
 
     public var threadForkUnavailableReason: String? {
@@ -12198,36 +12155,22 @@ public struct AgentAppView: View {
     private var autoRoutingPillLoading: Bool {
         vm.routingMode == .auto && autoRoutingPrerequisitesLoading
     }
-    private var permissionLabel: String {
-        switch vm.permissionMode {
-        case .supervised: return "Supervised"
-        case .autoAcceptEdits: return "Auto-edit"
-        case .fullAccess: return "Full access"
-        }
-    }
-    private var permissionTone: Color {
-        switch vm.permissionMode {
-        case .supervised: return DS.Palette.textSecondary
-        case .autoAcceptEdits: return DS.Palette.warning
-        case .fullAccess: return DS.Palette.danger
-        }
-    }
     private var effortLabel: String { vm.reasoningEffort.displayName }
     private var serviceTierLabel: String { vm.serviceTier == .fast ? "Fast" : "Auto" }
     /// P3: VoiceOver label for the model picker pill that reads as structured
     /// text rather than the raw concatenated visual tokens.
+    private var modelPillPresentation: AgentModelPillPresentation {
+        AgentModelPillPresentation(
+            title: modelLabel,
+            loading: autoRoutingPillLoading,
+            effort: (vm.routingMode == .manual && vm.supportsReasoningForSelectedModel) ? effortLabel : nil,
+            serviceTier: (vm.routingMode == .manual && vm.serviceTier == .fast) ? serviceTierLabel : nil,
+            contextWindow: vm.routingMode == .manual ? vm.selectedModelContextWindowLabel : nil
+        )
+    }
+
     private var modelMenuAccessibilityLabel: String {
-        if vm.routingMode == .auto {
-            return autoRoutingPillLoading ? "Auto model routing, loading" : "Auto model routing"
-        }
-        var parts = ["Model \(modelLabel)"]
-        if vm.supportsReasoningForSelectedModel {
-            parts.append("effort \(effortLabel)")
-        }
-        if vm.serviceTier == .fast {
-            parts.append("tier Fast")
-        }
-        return parts.joined(separator: ", ")
+        modelPillPresentation.accessibilityLabel
     }
 
     private var threadRailIntent: AdaptiveSidebarIntent {
@@ -14994,21 +14937,7 @@ public struct AgentAppView: View {
         // message already drained) must not show an empty "Queued 0" header.
         if !vm.queuedMessages.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
-                // UX-MAC_AGENT-019: emphasize the Queued header (accent) so it's
-                // clear new sends are queuing behind the active turn.
-                HStack(spacing: DS.Space.sm) {
-                    Image(systemName: "text.line.first.and.arrowtriangle.forward")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(DS.Palette.accent)
-                    Text("Queued")
-                        .font(DS.Font.caption.weight(.semibold))
-                        .foregroundColor(DS.Palette.accent)
-                    Text("\(vm.queuedMessages.count)")
-                        .font(DS.Font.caption.monospacedDigit())
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Spacer(minLength: 0)
-                }
-                .accessibilityIdentifier("agent.queued.header")
+                AgentQueuedHeader(count: vm.queuedMessages.count, identifier: "agent.queued.header")
                 if let message = vm.queueStatusMessage {
                     HStack(spacing: DS.Space.sm) {
                         Text(message)
@@ -15707,34 +15636,16 @@ public struct AgentAppView: View {
     }
 
     private var permissionMenu: some View {
-        Menu {
-            Button("Supervised") { vm.setPermissionMode(.supervised) }
-                .disabled(!vm.supportedPermissionModesForSelectedProvider.contains(.supervised))
-                .help(vm.permissionModeUnavailableReason(.supervised) ?? "Ask before tool actions")
-            Button("Auto-edit") { vm.setPermissionMode(.autoAcceptEdits) }
-                .disabled(!vm.supportedPermissionModesForSelectedProvider.contains(.autoAcceptEdits))
-                .help(vm.permissionModeUnavailableReason(.autoAcceptEdits) ?? "Apply edits without asking")
-            Button("Full access") { vm.setPermissionMode(.fullAccess) }
-                .disabled(!vm.supportedPermissionModesForSelectedProvider.contains(.fullAccess))
-                .help(vm.permissionModeUnavailableReason(.fullAccess) ?? "Run tools without asking")
-        } label: {
-            HStack(spacing: DS.Space.xs) {
-                Image(systemName: vm.permissionMode == .fullAccess ? "exclamationmark.shield.fill" : "lock.shield")
-                    .font(.system(size: 10))
-                Text(permissionLabel).font(DS.Font.caption.weight(.medium)).lineLimit(1)
-                Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
-            }
-            .fixedSize()
-            .foregroundColor(permissionTone)
-            .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-            .background(permissionTone.opacity(0.13))
-            .clipShape(Capsule())
-        }
-        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
-        .disabled(vm.activeRunConfigurationLocked || !vm.selectedProviderCanRun)
-        .help(vm.providerExecutionUnavailableReason
-            ?? (vm.activeRunConfigurationLocked ? "Permission is fixed for the active run" : "Permission mode"))
-        .accessibilityIdentifier("agent.permission.menu")
+        AgentPermissionCapsule(
+            selected: vm.permissionMode,
+            modes: AgentPermissionMode.allCases,
+            unavailableReason: { vm.permissionModeUnavailableReason($0) },
+            disabled: vm.activeRunConfigurationLocked || !vm.selectedProviderCanRun,
+            help: vm.providerExecutionUnavailableReason
+                ?? (vm.activeRunConfigurationLocked ? "Permission is fixed for the active run" : "Permission mode"),
+            accessibilityIdentifier: "agent.permission.menu",
+            onSelect: { vm.setPermissionMode($0) }
+        )
     }
 
     private var executionMenu: some View {
@@ -15774,20 +15685,13 @@ public struct AgentAppView: View {
                 }
             }
         } label: {
-            HStack(spacing: DS.Space.xs) {
-                Image(systemName: vm.executionMode == .worktree ? "arrow.triangle.branch" : "folder")
-                    .font(.system(size: 10))
-                Text(vm.executionMode == .worktree ? "Worktree" : "Local")
-                    .font(DS.Font.caption.weight(.medium))
-                    .lineLimit(1)
-                Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
+            AgentComposerCapsule {
+                AgentComposerCapsuleLabel(
+                    icon: vm.executionMode == .worktree ? "arrow.triangle.branch" : "folder",
+                    title: vm.executionMode == .worktree ? "Worktree" : "Local",
+                    chevron: true
+                )
             }
-            .fixedSize()
-            .foregroundColor(DS.Palette.textSecondary)
-            .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-            .background(DS.Palette.surfaceRaised)
-            .clipShape(Capsule())
-            .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
         }
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
         .disabled(vm.executionLocked || !vm.selectedProviderCanRun)
@@ -15800,83 +15704,15 @@ public struct AgentAppView: View {
     private var runAsUserMenu: some View {
         let users = vm.availableRunAsUsers.isEmpty ? MacOSLocalUserCatalog.listEligibleUsers() : vm.availableRunAsUsers
         let selected = vm.runAsUser ?? AgentRunAsUser.current()
-        let interactive = users.count > 1
-            && !vm.providerLocked
-            && !vm.selectedThreadRunIsStartingOrRunning
-        let label = selected.shortName
-        return Group {
-            if interactive {
-                Menu {
-                    ForEach(users, id: \.id) { user in
-                        Button {
-                            vm.setRunAsUser(user)
-                        } label: {
-                            HStack {
-                                if user.uid == selected.uid {
-                                    Image(systemName: "checkmark")
-                                }
-                                Text(user.shortName)
-                                if let full = user.fullName, full != user.shortName {
-                                    Text("· \(full)")
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                        }
-                    }
-                } label: {
-                    runAsUserCapsuleLabel(label: label, showChevron: true, locked: false)
-                }
-                .menuStyle(.button)
-                .buttonStyle(.plain)
-                .menuIndicator(.hidden)
-                .fixedSize()
-            } else {
-                runAsUserCapsuleLabel(
-                    label: label,
-                    showChevron: false,
-                    locked: vm.providerLocked
-                )
-            }
-        }
-        .disabled(vm.selectedThreadRunIsStartingOrRunning)
-        .help(runAsUserHelpText(interactive: interactive, selected: selected))
-        .accessibilityLabel("Run as macOS user \(label)")
-        .accessibilityIdentifier("agent.runAsUser.menu")
-        .onAppear { vm.refreshAvailableRunAsUsers() }
-    }
-
-    private func runAsUserHelpText(interactive: Bool, selected: AgentRunAsUser) -> String {
-        if vm.selectedThreadRunIsStartingOrRunning {
-            return "macOS user is fixed while a run is active"
-        }
-        if vm.providerLocked {
-            return "macOS user is fixed after the first message. Start a new thread to run as a different user."
-        }
-        if !interactive {
-            return "Provider processes run as macOS user \(selected.shortName)"
-        }
-        return "Choose which macOS user executes Codex/Claude/Grok (like sudo -u)"
-    }
-
-    private func runAsUserCapsuleLabel(label: String, showChevron: Bool, locked: Bool) -> some View {
-        HStack(spacing: DS.Space.xs) {
-            Image(systemName: locked ? "lock.fill" : "person.fill")
-                .font(.system(size: 10))
-            Text(label)
-                .font(DS.Font.caption.weight(.medium))
-                .lineLimit(1)
-                .truncationMode(.tail)
-            if showChevron {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .semibold))
-            }
-        }
-        .fixedSize()
-        .foregroundColor(DS.Palette.textSecondary)
-        .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(Capsule())
-        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+        return AgentRunAsUserCapsule(
+            users: users,
+            selected: selected,
+            runLocked: vm.selectedThreadRunIsStartingOrRunning,
+            identityLocked: vm.providerLocked,
+            accessibilityIdentifier: "agent.runAsUser.menu",
+            onSelect: { vm.setRunAsUser($0) },
+            onAppear: { vm.refreshAvailableRunAsUsers() }
+        )
     }
 
     /// Dedicated provider-instance source capsule (CODEX_HOME isolation).
@@ -15887,28 +15723,18 @@ public struct AgentAppView: View {
     /// `Menu` that collapses to a static label when locked made "click does
     /// nothing" the common report after the first message — fail loud instead.
     private var sourceMenu: some View {
-        let canSwitch = sourceCanSwitch
-        let label = sourceCapsuleLabel
-        let helpText = sourceCapsuleHelpText(canSwitch: canSwitch)
-        return Button {
-            showSourceOptions.toggle()
-        } label: {
-            sourceCapsuleLabelView(
-                label: label,
-                showChevron: true,
-                locked: vm.providerLocked || vm.selectedThreadRunIsStartingOrRunning
-            )
-        }
-        .buttonStyle(.plain)
-        .help(helpText)
-        .accessibilityLabel("Account \(label)")
-        .accessibilityHint(canSwitch
-            ? "Choose which ChatGPT, Claude, or Grok account runs this thread"
-            : helpText)
-        .accessibilityIdentifier("agent.source.menu")
-        .popover(isPresented: $showSourceOptions, arrowEdge: .bottom) {
-            sourceOptionsPopover
-        }
+        AgentSourceCapsule(
+            label: sourceCapsuleLabel,
+            entries: sourceMenuEntries,
+            runLocked: vm.selectedThreadRunIsStartingOrRunning,
+            providerLocked: vm.providerLocked,
+            unavailableReason: vm.providerExecutionUnavailableReason,
+            rowWidth: compactModelMenuWidth,
+            accessibilityIdentifier: "agent.source.menu",
+            popoverIdentifier: "agent.source.popover",
+            isPresented: $showSourceOptions,
+            onSelect: selectSourceMenuEntry
+        )
     }
 
     private var sourceCanSwitch: Bool {
@@ -15920,55 +15746,6 @@ public struct AgentAppView: View {
             // the menu open to pick a working account.
             runLocked: vm.selectedThreadRunIsStartingOrRunning
         )
-    }
-
-    private var sourceOptionsPopover: some View {
-        let canSwitch = sourceCanSwitch
-        let entries = sourceMenuEntries
-        return VStack(alignment: .leading, spacing: DS.Space.xs) {
-            if vm.selectedThreadRunIsStartingOrRunning {
-                Text("Account is fixed while a run is active")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .fixedSize(horizontal: true, vertical: false)
-            } else if vm.providerLocked {
-                Text("Account is fixed after the first message. Start a new thread to use a different account.")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: compactModelMenuWidth, alignment: .leading)
-            } else if let reason = vm.providerExecutionUnavailableReason {
-                Text(reason)
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.warning)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: compactModelMenuWidth, alignment: .leading)
-            } else if entries.count <= 1 {
-                Text("Only one account is available")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .fixedSize(horizontal: true, vertical: false)
-            }
-
-            compactMenuSection("Account")
-            if entries.isEmpty {
-                Text("No accounts loaded")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-            } else {
-                ForEach(entries, id: \.id) { entry in
-                    compactMenuRow(entry.title, selected: entry.isSelected) {
-                        selectSourceMenuEntry(entry)
-                        showSourceOptions = false
-                    }
-                    .disabled(!canSwitch)
-                }
-            }
-        }
-        .padding(DS.Space.sm)
-        .background(DS.Palette.surfaceOverlay)
-        .fixedSize(horizontal: true, vertical: false)
-        .accessibilityIdentifier("agent.source.popover")
     }
 
     private var sourceCapsuleLabel: String {
@@ -16004,48 +15781,11 @@ public struct AgentAppView: View {
         }
     }
 
-    private func sourceCapsuleHelpText(canSwitch: Bool) -> String {
-        if vm.selectedThreadRunIsStartingOrRunning {
-            return "Account is fixed while a run is active"
-        }
-        if vm.providerLocked {
-            return "Account is fixed after the first message. Start a new thread to use a different account."
-        }
-        if let reason = vm.providerExecutionUnavailableReason {
-            return reason
-        }
-        if !canSwitch {
-            return "Account / source for this agent run"
-        }
-        return "Choose which ChatGPT / Claude / Grok account runs this thread"
-    }
-
-    private func sourceCapsuleLabelView(label: String, showChevron: Bool, locked: Bool) -> some View {
-        HStack(spacing: DS.Space.xs) {
-            Image(systemName: locked ? "lock.fill" : "person.crop.circle")
-                .font(.system(size: 10))
-            Text(label)
-                .font(DS.Font.caption.weight(.medium))
-                .lineLimit(1)
-                .truncationMode(.tail)
-            if showChevron {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .semibold))
-            }
-        }
-        .fixedSize()
-        .foregroundColor(DS.Palette.textSecondary)
-        .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(Capsule())
-        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-    }
-
     private var modelMenu: some View {
         Button {
             showModelOptions.toggle()
         } label: {
-            modelMenuLabel
+            AgentModelPillLabel(presentation: modelPillPresentation, width: currentModelMenuLabelWidth)
         }
         .buttonStyle(.plain)
         // P3: expose a meaningful VoiceOver label instead of the raw concatenated
@@ -16077,51 +15817,18 @@ public struct AgentAppView: View {
         // while running; the retry and recovery rows are excluded.
         let running = vm.selectedThreadRunIsStartingOrRunning
         let configurationLocked = running || !vm.selectedProviderCanRun
-        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let presentation = AgentModelPopoverPresentation(
+        let presentation = AgentModelPopoverPresentation.current(
             mode: vm.routingMode,
-            reduceMotion: reduceMotion,
             autoRoutingLoading: autoRoutingPrerequisitesLoading
         )
-        return VStack(alignment: .leading, spacing: DS.Space.md) {
-            HStack(spacing: DS.Space.md) {
-                Text("Model")
-                    .font(DS.Font.caption.weight(.medium))
-                    .foregroundColor(DS.Palette.text)
-                Spacer(minLength: DS.Space.xxl)
-                Text("Auto")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.text)
-                if presentation.showsAutoLoadingIndicator {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel("Loading automatic routing")
-                        .accessibilityIdentifier("agent.model.auto.loading")
-                }
-                Toggle("", isOn: Binding(
-                    get: { vm.routingMode == .auto },
-                    set: { _ = vm.setAutoModelRoutingEnabled($0) }
-                ))
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .tint(DS.Palette.success)
-                .disabled(running || !presentation.autoToggleEnabled)
-                .accessibilityLabel(presentation.accessibilityLabel)
-                .accessibilityValue(presentation.accessibilityValue)
-                .accessibilityHint(presentation.accessibilityHint)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityHidden(true)
-            }
-            Divider()
-                .accessibilityIdentifier("agent.model.auto.divider")
-            if presentation.showsDisclaimer {
-                autoRoutingCard(presentation: presentation)
-                    .transition(presentation.transition == .fadeAndSlide
-                        ? .opacity.combined(with: .move(edge: .top))
-                        : .identity)
-            } else {
+        return AgentModelPopoverChrome(
+            presentation: presentation,
+            autoEnabled: Binding(
+                get: { vm.routingMode == .auto },
+                set: { _ = vm.setAutoModelRoutingEnabled($0) }
+            ),
+            toggleDisabled: running || !presentation.autoToggleEnabled
+        ) {
             // UX-MAC_AGENT-016: readable while running; mutation rows disable below.
             if running {
                 Text("Read-only while running")
@@ -16274,147 +15981,20 @@ public struct AgentAppView: View {
                     dismiss: { vm.dismissProviderRecoveryStatusMessage() }
                 )
             }
-            }
         }
-        .animation(
-            presentation.transition == .fadeAndSlide
-                ? .easeInOut(duration: 0.2)
-                : nil,
-            value: vm.routingMode
-        )
-        .padding(DS.Space.sm)
-        .background(DS.Palette.surfaceOverlay)
-        .fixedSize(horizontal: true, vertical: false)
         .accessibilityIdentifier("agent.model.popover")
     }
 
-    private func autoRoutingCard(presentation: AgentModelPopoverPresentation) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.lg) {
-            ZStack {
-                Ellipse()
-                    .stroke(
-                        LinearGradient(
-                            colors: [DS.Palette.accent, DS.Palette.success],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        ),
-                        lineWidth: 1.5
-                    )
-                    .frame(width: 40, height: 20)
-                    .rotationEffect(.degrees(-12))
-                Image(systemName: "sparkles")
-                    .font(.system(size: 19, weight: .medium))
-                    .foregroundStyle(DS.Palette.text)
-            }
-            .frame(width: 48, height: 48)
-
-            VStack(alignment: .leading, spacing: DS.Space.md) {
-                Text(presentation.disclaimer)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.text)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: DS.Space.xs) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(DS.Palette.success)
-                    Text(AgentModelPopoverPresentation.autoStatus)
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textSecondary)
-                }
-            }
-        }
-        .padding(DS.Space.lg)
-        .frame(width: 360, alignment: .leading)
-        .background(
-            LinearGradient(
-                colors: [DS.Palette.surfaceRaised, DS.Palette.success.opacity(0.12)],
-                startPoint: .leading,
-                endPoint: .bottomTrailing
-            )
-        )
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
-                .strokeBorder(DS.Palette.accent.opacity(0.22), lineWidth: DS.Border.hairline)
-        )
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("agent.model.auto.card")
-    }
-
-    private var modelMenuLabel: some View {
-        HStack(spacing: DS.Space.xs) {
-            if autoRoutingPillLoading {
-                ProgressView()
-                    .controlSize(.mini)
-                    .accessibilityHidden(true)
-            }
-            Text(modelLabel).font(DS.Font.caption.weight(.medium)).foregroundColor(DS.Palette.text)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            if vm.routingMode == .manual && vm.supportsReasoningForSelectedModel {
-                Text("·").foregroundColor(DS.Palette.textTertiary)
-                Text(effortLabel).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            if vm.routingMode == .manual && vm.serviceTier == .fast {
-                Text("·").foregroundColor(DS.Palette.textTertiary)
-                Text(serviceTierLabel).font(DS.Font.caption).foregroundColor(DS.Palette.warning)
-                    .lineLimit(1)
-            }
-            // IMP-MAC_AGENT-014: surface the model's context window on the pill so
-            // the active limit is visible at a glance without opening the popover.
-            if vm.routingMode == .manual, let ctx = vm.selectedModelContextWindowLabel {
-                Text("·").foregroundColor(DS.Palette.textTertiary)
-                Text(ctx).font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(1)
-            }
-            Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
-                .foregroundColor(DS.Palette.textTertiary)
-        }
-        .frame(width: currentModelMenuLabelWidth, alignment: .trailing)
-        .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(Capsule())
-        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-    }
-
     private func compactMenuSection(_ title: String) -> some View {
-        Text(title)
-            .font(DS.Font.caption2.weight(.semibold))
-            .foregroundColor(DS.Palette.textTertiary)
-            .padding(.top, DS.Space.xs)
-            .fixedSize(horizontal: true, vertical: false)
+        AgentCompactMenuSection(title)
     }
 
     private func compactMenuRow(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10, weight: .semibold))
-                    .frame(width: 12)
-                    .opacity(selected ? 1 : 0)
-                Text(title)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.text)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, DS.Space.xs)
-            .padding(.vertical, DS.Space.xs)
-            .frame(width: compactModelMenuWidth, alignment: .leading)
-            .background(selected ? DS.Palette.selection : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-        }
-        .buttonStyle(.plain)
+        AgentCompactMenuRow(title, selected: selected, width: compactModelMenuWidth, action: action)
     }
 
     private var compactMenuDivider: some View {
-        Rectangle()
-            .fill(DS.Palette.line)
-            .frame(height: DS.Border.hairline)
-            .padding(.vertical, DS.Space.xs)
-            .frame(width: compactModelMenuWidth)
+        AgentCompactMenuDivider(width: compactModelMenuWidth)
     }
 
     // UX-MAC_AGENT-013: inline custom-model field, no blocking modal. Validates
@@ -18315,6 +17895,58 @@ public enum AgentSourceCapsulePresentation {
         return entries
     }
 
+    public static func helpText(
+        canSwitch: Bool,
+        runLocked: Bool,
+        providerLocked: Bool,
+        unavailableReason: String?
+    ) -> String {
+        if runLocked { return "Account is fixed while a run is active" }
+        if providerLocked {
+            return "Account is fixed after the first message. Start a new thread to use a different account."
+        }
+        if let unavailableReason, !unavailableReason.isEmpty { return unavailableReason }
+        if !canSwitch { return "Account / source for this agent run" }
+        return "Choose which ChatGPT / Claude / Grok account runs this thread"
+    }
+
+    public static func switchHint(canSwitch: Bool, helpText: String) -> String {
+        canSwitch
+            ? "Choose which ChatGPT, Claude, or Grok account runs this thread"
+            : helpText
+    }
+
+    public struct LockNotice: Equatable {
+        public let text: String
+        public let isWarning: Bool
+        public let wraps: Bool
+    }
+
+    public static func lockNotice(
+        runLocked: Bool,
+        providerLocked: Bool,
+        unavailableReason: String?,
+        entryCount: Int
+    ) -> LockNotice? {
+        if runLocked {
+            return LockNotice(text: "Account is fixed while a run is active", isWarning: false, wraps: false)
+        }
+        if providerLocked {
+            return LockNotice(
+                text: "Account is fixed after the first message. Start a new thread to use a different account.",
+                isWarning: false,
+                wraps: true
+            )
+        }
+        if let unavailableReason, !unavailableReason.isEmpty {
+            return LockNotice(text: unavailableReason, isWarning: true, wraps: true)
+        }
+        if entryCount <= 1 {
+            return LockNotice(text: "Only one account is available", isWarning: false, wraps: false)
+        }
+        return nil
+    }
+
     private static func primaryLabel(
         selected: AgentProviderSnapshot?,
         fallbackProvider: AgentProvider,
@@ -18545,25 +18177,6 @@ private struct TabColorMenuLabel: View {
         }
         image.isTemplate = false
         return image
-    }
-}
-
-// F34: effort semantics are non-obvious — especially "Ultracode" vs "Max" vs
-// "Extra High" — so the picker rows carry tooltips that spell out what each
-// level buys (and costs) before the user commits to it. Ultracode is not a
-// plain effort value: it is xhigh effort plus standing workflow orchestration
-// (see AgentReasoningEffort.claudeSupportedCases).
-extension AgentReasoningEffort {
-    var pickerHelpText: String {
-        switch self {
-        case .minimal: return "Fastest — minimal reasoning"
-        case .low: return "Light reasoning for simple tasks"
-        case .medium: return "Balanced reasoning (default)"
-        case .high: return "Deeper reasoning for harder tasks"
-        case .xhigh: return "Very deep reasoning for hard problems"
-        case .max: return "Deepest reasoning the model supports — slowest, most tokens"
-        case .ultracode: return "Extra High effort + autonomous workflow orchestration"
-        }
     }
 }
 

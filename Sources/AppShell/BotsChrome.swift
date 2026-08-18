@@ -17,11 +17,12 @@ public enum BotsChrome {
         public static let search = "Search bots..."
         public static let openChat = "Open Chat"
         public static let saveBot = "Save Bot"
+        public static let unsavedNewBotConfirmTitle = "Don't save this Bot?"
+        public static let unsavedNewBotConfirmMessage = "This teammate has not been saved."
+        public static let unsavedNewBotDontSave = "Don't Save"
         public static let currentGoal = "Current Goal"
         public static let todaysActivity = "Today's Activity"
         public static let nextRoutine = "Next Routine"
-        public static let memory = "Memory"
-        public static let skills = "Skills"
         public static let files = "Files"
         public static let routines = "Schedule Tasks"
         public static let approvals = "Approvals"
@@ -32,7 +33,6 @@ public enum BotsChrome {
         public static let instructions = "Instructions"
         public static let instructionsCaption =
             "How this teammate should work. Always sent. Empty uses the built-in teammate default. Write your own to replace it."
-        public static let configurationSummary = "Configuration summary"
         public static let security = "Security"
         public static let notifications = "Notifications"
         public static let desktop = "Desktop"
@@ -47,6 +47,8 @@ public enum BotsChrome {
     public static let hitTarget: CGFloat = 44
     public static let rosterWidth: CGFloat = 272
     public static let desktopPaneWidth: CGFloat = 340
+    public static let desktopPaneMinWidth: CGFloat = 240
+    public static let desktopPaneMaxWidth: CGFloat = 560
 
     /// Leftover SF chips. Studio Avatar is the blobatar composer.
     public static let avatarSymbols: [String] = BotAvatar.advertisedSymbols
@@ -65,11 +67,12 @@ public enum BotsChrome {
         Label.botRoster,
         Label.openChat,
         Label.saveBot,
+        Label.unsavedNewBotConfirmTitle,
+        Label.unsavedNewBotConfirmMessage,
+        Label.unsavedNewBotDontSave,
         Label.currentGoal,
         Label.todaysActivity,
         Label.nextRoutine,
-        Label.memory,
-        Label.skills,
         Label.files,
         Label.routines,
         Label.approvals,
@@ -78,7 +81,6 @@ public enum BotsChrome {
         Label.descriptionCaption,
         Label.instructions,
         Label.instructionsCaption,
-        Label.configurationSummary,
         Label.security,
         Label.notifications,
         Label.desktop,
@@ -88,17 +90,38 @@ public enum BotsChrome {
         Label.honesty,
     ]
 
-    public static func avatarColor(for handle: String) -> Color {
-        let palette: [Color] = [
-            Color(hex: 0x7B5CFF),
-            Color(hex: 0x3B82F6),
-            Color(hex: 0xF59E0B),
-            Color(hex: 0x22C55E),
-            Color(hex: 0xEC4899),
-            Color(hex: 0x06B6D4),
+    public static func avatarHex(for handle: String) -> UInt32 {
+        let palette: [UInt32] = [
+            0x7B5CFF,
+            0x3B82F6,
+            0xF59E0B,
+            0x22C55E,
+            0xEC4899,
+            0x06B6D4,
         ]
         let index = abs(handle.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }) % palette.count
         return palette[index]
+    }
+
+    public static func avatarColor(for handle: String) -> Color {
+        Color(hex: avatarHex(for: handle))
+    }
+
+    /// Painted avatar ink. Blobatar uses the figure head; leftover SF chips
+    /// keep the handle swatch so roster highlight matches the glyph.
+    public static func identityHex(name: String, handle: String, symbol: String) -> UInt32 {
+        if let spec = BotBlobatarSpec.parse(symbol) {
+            return BotBlobatar.figure(
+                name: name.isEmpty ? handle : name,
+                spec: spec,
+                handle: handle
+            ).palette.head
+        }
+        return avatarHex(for: handle)
+    }
+
+    public static func identityColor(name: String, handle: String, symbol: String) -> Color {
+        Color(hex: identityHex(name: name, handle: handle, symbol: symbol))
     }
 
     public static func initials(for name: String) -> String {
@@ -124,12 +147,20 @@ public struct BotsAvatarView: View {
     /// Chosen SF Symbol avatar; nil falls back to name initials.
     public var symbol: String?
     public var size: CGFloat = 36
+    public var attention: BotAttentionState = .none
 
-    public init(name: String, handle: String, symbol: String? = nil, size: CGFloat = 36) {
+    public init(
+        name: String,
+        handle: String,
+        symbol: String? = nil,
+        size: CGFloat = 36,
+        attention: BotAttentionState = .none
+    ) {
         self.name = name
         self.handle = handle
         self.symbol = symbol
         self.size = size
+        self.attention = attention
     }
 
     public var body: some View {
@@ -137,7 +168,7 @@ public struct BotsAvatarView: View {
             if let symbol, let spec = BotBlobatarSpec.parse(symbol) {
                 BotBlobatarView(
                     name: name.isEmpty ? handle : name,
-                    spec: spec,
+                    spec: spec.liveFaced(attention: attention),
                     size: size,
                     motion: .always,
                     handle: handle

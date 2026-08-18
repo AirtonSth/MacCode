@@ -137,6 +137,17 @@ public struct BotOwnedSkillText: Codable, Sendable, Equatable {
     }
 }
 
+/// One memory markdown file admitted into the compile payload.
+public struct BotMemoryFileText: Codable, Sendable, Equatable {
+    public var path: String
+    public var body: String
+
+    public init(path: String, body: String) {
+        self.path = path
+        self.body = body
+    }
+}
+
 /// Compiles Source Brain layers into the Effective payload sent to a provider.
 public enum BotBrainCompiler {
     /// Studio already shows Workspace. set_settings cannot persist a folder,
@@ -173,29 +184,21 @@ public enum BotBrainCompiler {
     public static let testRunHonesty =
         "Test run: do the Instruction now. Does not set Active. \(BotRoutineCopy.testRunHonestyCaption)"
 
-    /// Studio already says Memory and Remember a fact. Compile already
-    /// labels Memory / Fact. A leftover Memory / fact write on
+    /// Memory lives in Files. A leftover Memory / fact write on
     /// set_settings used to return an empty success, so first-chat
-    /// invented a persist. Hermes memory writes stay on put_memory.
-    /// Dest Source title stays Memory. Schema does not grow a memory key.
+    /// invented a persist. Hermes memory writes stay on MEMORY.md
+    /// and memory/YYYY-MM-DD.md. Dest Source title stays Memory.
+    /// Schema does not grow a memory key.
     public static let memoryHonesty =
-        "Memory: call \(BotStandingInstructions.rememberFactTool). Same path as Studio Remember a fact. Not a set_settings write."
+        "Memory: write MEMORY.md for durable facts or memory/YYYY-MM-DD.md for today. Edit those files to forget or correct. Same path as Files. Not a set_settings write."
 
-    /// Studio already says Forget. Compile already names bot_forget_memory.
-    /// A leftover Forget / forget write on set_settings used to return an
-    /// empty success, so first-chat invented a persist. Hermes memory
-    /// deletes stay on forget_memory. Dest Source title stays Memory.
-    /// Schema does not grow a forget key.
-    public static let forgetHonesty =
-        "Forget: call \(BotStandingInstructions.forgetFactTool). Same path as Studio Forget. Not a set_settings write."
+    /// Forget is the same file write as Memory. Leftover Forget keys
+    /// still reject on set_settings so first-chat cannot invent a persist.
+    public static let forgetHonesty = memoryHonesty
 
-    /// Studio already says Correct. Compile already names bot_correct_memory.
-    /// A leftover Correct / correct write on set_settings used to return
-    /// an empty success, so first-chat invented a persist. Hermes memory
-    /// revisions stay on correct_memory. Dest Source title stays Memory.
-    /// Schema does not grow a correct key.
-    public static let correctHonesty =
-        "Correct: call \(BotStandingInstructions.correctFactTool). Same path as Studio Correct. Not a set_settings write."
+    /// Correct is the same file write as Memory. Leftover Correct keys
+    /// still reject on set_settings so first-chat cannot invent a persist.
+    public static let correctHonesty = memoryHonesty
 
     /// Studio already says Skills. Compile already labels Skills.
     /// A leftover Skills / skill write on set_settings used to return an
@@ -203,15 +206,12 @@ public enum BotBrainCompiler {
     /// writes stay on set_skill. Dest Source title stays Skills. Schema
     /// does not grow a skills key.
     public static let skillsHonesty =
-        "Skills: call \(BotStandingInstructions.setSkillTool). Same path as Studio Add. Not a set_settings write."
+        "Skills: write skills/<slug>/SKILL.md. Edit that file to add or correct. Same path as Files. Not a set_settings write."
 
-    /// Studio already says Remove. Compile already names bot_remove_skill.
-    /// A leftover Remove / remove write on set_settings used to return
-    /// an empty success, so first-chat invented a persist. Hermes skill
-    /// unbinds stay on remove_skill. Dest Source title stays Skills.
-    /// Schema does not grow a remove key.
+    /// Remove is a file delete. Leftover Remove keys still reject on
+    /// set_settings so first-chat cannot invent a persist.
     public static let removeHonesty =
-        "Remove: call \(BotStandingInstructions.removeSkillTool). Same path as Studio Remove. Not a set_settings write."
+        "Remove: delete skills/<slug>/SKILL.md. Same path as Files. Not a set_settings write."
 
     /// Studio already says Routines. Compile already labels Routines.
     /// A leftover Routines / routine write on set_settings used to return
@@ -267,7 +267,7 @@ public enum BotBrainCompiler {
         bot: BotDefinition,
         revision: BotRevision,
         userText: String,
-        memory: [BotMemoryItem] = [],
+        memoryFiles: [BotMemoryFileText] = [],
         skills: [BotSkillBinding] = [],
         ownedSkills: [BotOwnedSkillText] = [],
         routines: [BotRoutine] = [],
@@ -281,7 +281,7 @@ public enum BotBrainCompiler {
             bot: bot,
             revision: revision,
             userText: userText,
-            memory: memory,
+            memoryFiles: memoryFiles,
             skills: skills,
             ownedSkills: ownedSkills,
             routines: routines,
@@ -305,7 +305,7 @@ public enum BotBrainCompiler {
                 bot: bot,
                 revision: revision,
                 userText: userText,
-                memory: memory,
+                memoryFiles: memoryFiles,
                 skills: skills,
                 ownedSkills: ownedSkills,
                 routines: routines,
@@ -321,7 +321,7 @@ public enum BotBrainCompiler {
         bot: BotDefinition,
         revision: BotRevision,
         userText: String,
-        memory: [BotMemoryItem] = [],
+        memoryFiles: [BotMemoryFileText] = [],
         skills: [BotSkillBinding] = [],
         ownedSkills: [BotOwnedSkillText] = [],
         routines: [BotRoutine] = [],
@@ -374,25 +374,22 @@ public enum BotBrainCompiler {
             lines.append("Instructions:")
             lines.append(soul)
         }
-        let liveMemory = memory.filter { $0.forgottenAt == nil && $0.trusted }
-        if !liveMemory.isEmpty {
-            // Studio already says Memory. Compile that name so first-chat
-            // "what's in Memory?" cannot invent a hop. Forgotten and
-            // untrusted stay out.
-            lines.append("Memory:")
-            lines.append(contentsOf: liveMemory.map(Self.memoryLine))
+        let liveMemory = memoryFiles.filter {
+            !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
-        let enabled = skills.filter(\.enabled).map(\.skillID).sorted()
-        if !enabled.isEmpty {
-            // Studio already says Skills. Compile that name so first-chat
-            // "which Skills?" cannot invent a hop. Off stays out.
-            lines.append("Skills: \(enabled.joined(separator: ", "))")
+        if !liveMemory.isEmpty {
+            // Files already hold Memory. Compile that name so first-chat
+            // "what's in Memory?" cannot invent a hop. Empty files stay out.
+            lines.append("Memory:")
+            lines.append(contentsOf: liveMemory.map(Self.memoryFileLine))
         }
         let owned = ownedSkills.filter { !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         if !owned.isEmpty {
-            lines.append("Bot skills:")
+            // Files already hold Skills. Compile that name so first-chat
+            // "which Skills?" cannot invent a hop. Empty files stay out.
+            lines.append("Skills:")
             for skill in owned {
-                lines.append("### \(skill.slug)\n\(skill.body)")
+                lines.append("### skills/\(skill.slug)/SKILL.md\n\(skill.body)")
             }
         }
         let liveRoutines = routines.filter(\.activation.isEnabled)
@@ -545,11 +542,10 @@ public enum BotBrainCompiler {
         id.uuidString.lowercased()
     }
 
-    /// Studio already says Remember a fact. Compile that name so first-chat
-    /// "what's the Fact?" cannot invent a hop. Forgotten and untrusted stay
-    /// out of the payload. Off-path tombstones still use this line in Source.
-    static func memoryLine(_ item: BotMemoryItem) -> String {
-        "- Fact: \(item.content) [\(mutateKey(item.id.value))]"
+    /// Files already hold Memory. Compile path + body so first-chat
+    /// "what's in Memory?" cannot invent a hop. Empty files stay out.
+    static func memoryFileLine(_ file: BotMemoryFileText) -> String {
+        "### \(file.path)\n\(file.body)"
     }
 
     /// Studio already says Instruction and When. Compile those names so
@@ -573,7 +569,7 @@ public enum BotBrainCompiler {
         bot: BotDefinition,
         revision: BotRevision,
         userText: String,
-        memory: [BotMemoryItem],
+        memoryFiles: [BotMemoryFileText],
         skills: [BotSkillBinding],
         ownedSkills: [BotOwnedSkillText] = [],
         routines: [BotRoutine],
@@ -734,25 +730,16 @@ public enum BotBrainCompiler {
             )
         )
 
-        for item in memory {
-            let forgotten = item.forgottenAt != nil
-            let included = !forgotten && item.trusted
-            let reason: String
-            if forgotten {
-                reason = "Forgotten. Tombstone stays out of the payload."
-            } else if !item.trusted {
-                reason = "Untrusted candidate. Not authority until review."
-            } else {
-                reason = "Trusted and not forgotten."
-            }
+        for file in memoryFiles {
+            let body = file.body.trimmingCharacters(in: .whitespacesAndNewlines)
             layers.append(
                 BotContextLayer(
-                    id: "memory-\(item.id.value.uuidString.lowercased())",
+                    id: "memory-\(file.path)",
                     kind: .memory,
                     title: "Memory",
-                    text: memoryLine(item),
-                    included: included,
-                    reason: reason
+                    text: memoryFileLine(file),
+                    included: !body.isEmpty,
+                    reason: body.isEmpty ? "Empty memory file. Not injected." : "Memory file."
                 )
             )
         }
@@ -764,10 +751,8 @@ public enum BotBrainCompiler {
                     kind: .skill,
                     title: "Skill",
                     text: binding.skillID,
-                    included: binding.enabled,
-                    reason: binding.enabled
-                        ? "Enabled catalog binding."
-                        : "Disabled. Not injected."
+                    included: false,
+                    reason: "Leftover catalog binding. Skills are files."
                 )
             )
         }
@@ -778,10 +763,10 @@ public enum BotBrainCompiler {
                 BotContextLayer(
                     id: "owned-skill-\(skill.slug)",
                     kind: .skill,
-                    title: "Bot skill",
-                    text: body,
+                    title: "Skill",
+                    text: "### skills/\(skill.slug)/SKILL.md\n\(skill.body)",
                     included: !body.isEmpty,
-                    reason: body.isEmpty ? "Empty SKILL.md. Not injected." : "This-bot skill file."
+                    reason: body.isEmpty ? "Empty SKILL.md. Not injected." : "Skill file."
                 )
             )
         }

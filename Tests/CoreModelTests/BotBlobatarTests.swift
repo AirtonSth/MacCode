@@ -79,6 +79,16 @@ final class BotBlobatarTests: XCTestCase {
         XCTAssertNotEqual(a.bobY, b.bobY)
     }
 
+    func test_liveExpressionFollowsAttention() {
+        // WHY: Studio no longer picks a face. Working, waiting, and
+        // blocked must read as different expressions so the creature
+        // reacts to what is happening.
+        XCTAssertEqual(BotBlobatarExpression.live(for: .none), .idle)
+        XCTAssertEqual(BotBlobatarExpression.live(for: .working), .happy)
+        XCTAssertEqual(BotBlobatarExpression.live(for: .unreadActivity), .sad)
+        XCTAssertEqual(BotBlobatarExpression.live(for: .needsAttention), .mad)
+    }
+
     func test_zeroAmplitudeIsStill_becauseReducedMotionAndFrozenTilesMustNotWiggle() {
         // WHY: Picker tiles and prefers-reduced-motion gate on amplitude 0.
         // A leftover sine would animate the editor grid.
