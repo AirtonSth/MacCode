@@ -86,24 +86,42 @@ public struct BotInspectorDraft: Equatable, Codable {
     public var routineName: String
     public var routinePrompt: String
     public var routineScheduleNote: String
+    public var routineSpec: BotScheduleSpec?
 
     public init(
         memoryDraft: String = "",
         skillDraft: String = "",
         routineName: String = "",
         routinePrompt: String = "",
-        routineScheduleNote: String = ""
+        routineScheduleNote: String = "",
+        routineSpec: BotScheduleSpec? = nil
     ) {
         self.memoryDraft = memoryDraft
         self.skillDraft = skillDraft
         self.routineName = routineName
         self.routinePrompt = routinePrompt
         self.routineScheduleNote = routineScheduleNote
+        self.routineSpec = routineSpec
     }
 
     public var isEmpty: Bool {
-        [memoryDraft, skillDraft, routineName, routinePrompt, routineScheduleNote]
+        let textsEmpty = [memoryDraft, skillDraft, routineName, routinePrompt, routineScheduleNote]
             .allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return textsEmpty && routineSpec == nil
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case memoryDraft, skillDraft, routineName, routinePrompt, routineScheduleNote, routineSpec
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        memoryDraft = try container.decodeIfPresent(String.self, forKey: .memoryDraft) ?? ""
+        skillDraft = try container.decodeIfPresent(String.self, forKey: .skillDraft) ?? ""
+        routineName = try container.decodeIfPresent(String.self, forKey: .routineName) ?? ""
+        routinePrompt = try container.decodeIfPresent(String.self, forKey: .routinePrompt) ?? ""
+        routineScheduleNote = try container.decodeIfPresent(String.self, forKey: .routineScheduleNote) ?? ""
+        routineSpec = try container.decodeIfPresent(BotScheduleSpec.self, forKey: .routineSpec)
     }
 }
 
@@ -600,7 +618,9 @@ public final class BotsViewModel: ObservableObject {
     @Published public var routineScheduleNote: String = "" {
         didSet { persistInspectorIfHydrated() }
     }
-    @Published public var routineSpec = BotScheduleSpec()
+    @Published public var routineSpec = BotScheduleSpec() {
+        didSet { persistInspectorIfHydrated() }
+    }
     @Published public var errorMessage: String?
     @Published public private(set) var providers: [AgentProviderSnapshot] = []
     @Published public private(set) var isControlPlaneActive = true
@@ -3380,7 +3400,8 @@ public final class BotsViewModel: ObservableObject {
             skillDraft: skillDraft,
             routineName: routineName,
             routinePrompt: routinePrompt,
-            routineScheduleNote: routineScheduleNote
+            routineScheduleNote: routineScheduleNote,
+            routineSpec: routineSpec
         )
         if draft.isEmpty {
             inspectorDraftsByBot[botID] = nil
@@ -3398,6 +3419,7 @@ public final class BotsViewModel: ObservableObject {
         routineName = draft.routineName
         routinePrompt = draft.routinePrompt
         routineScheduleNote = draft.routineScheduleNote
+        routineSpec = draft.routineSpec ?? BotScheduleSpec()
         isApplyingInspectorDraft = false
         inspectorHydrated = true
     }

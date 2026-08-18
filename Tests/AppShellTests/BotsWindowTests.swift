@@ -4783,6 +4783,63 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(reopened.memoryItems.isEmpty, "relaunch must restore the draft, not save it")
     }
 
+    func test_studioScheduleSpecStaysOnOwningBot_becauseFrequencyMustNotLeak() throws {
+        // WHY: Studio Schedule Tasks persist name/prompt/when-note per bot,
+        // but Frequency + Provider live on routineSpec, which stayed
+        // process-wide after the When field became BotScheduleSpecEditor.
+        // Quinn must not inherit Piper's weekdays/Grok row, and coming
+        // back must restore Piper's Frequency.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.beginEdit(piper)
+        vm.routineName = "QA morning scan"
+        vm.routinePrompt = "List failing tests from last night and name the file."
+        vm.routineSpec.frequency = .weekdays
+        vm.routineSpec.localTimeHour = 9
+        vm.routineSpec.localTimeMinute = 0
+        vm.routineSpec.provider = .grok
+        vm.beginEdit(quinn)
+        XCTAssertEqual(vm.routineName, "", "Quinn Studio must not inherit Piper's task name")
+        XCTAssertNotEqual(
+            vm.routineSpec.frequency,
+            .weekdays,
+            "Quinn must not inherit Piper's Frequency"
+        )
+        XCTAssertEqual(vm.routineSpec.frequency, .daily)
+        vm.routineSpec.frequency = .hourly
+        vm.beginEdit(piper)
+        XCTAssertEqual(vm.routineName, "QA morning scan")
+        XCTAssertEqual(vm.routineSpec.frequency, .weekdays)
+        XCTAssertEqual(vm.routineSpec.localTimeHour, 9)
+        XCTAssertEqual(vm.routineSpec.provider, .grok)
+        vm.beginEdit(quinn)
+        XCTAssertEqual(vm.routineSpec.frequency, .hourly)
+    }
+
+    func test_studioScheduleSpecSurvivesRelaunch_becauseFrequencyIsUserWork() throws {
+        // WHY: an unfinished Frequency pick is the same class of loss as
+        // an unsent task name. Relaunch must restore the spec, not the
+        // process-wide default Daily-at-now.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        vm.routineName = "QA morning scan"
+        vm.routinePrompt = "List failing tests from last night and name the file."
+        vm.routineSpec.frequency = .weekdays
+        vm.routineSpec.localTimeHour = 9
+        vm.routineSpec.localTimeMinute = 0
+        vm.routineSpec.provider = .grok
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.selectedBotID, bot.id)
+        XCTAssertEqual(reopened.routineName, "QA morning scan")
+        XCTAssertEqual(reopened.routineSpec.frequency, .weekdays)
+        XCTAssertEqual(reopened.routineSpec.localTimeHour, 9)
+        XCTAssertEqual(reopened.routineSpec.provider, .grok)
+    }
+
     func test_savingInspectorFieldsClearsOnlyThatBotDraft_becauseSentFactsAreNotDrafts() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
