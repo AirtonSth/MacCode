@@ -150,6 +150,35 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         )
     }
 
+    func test_assistantReplyVoiceOverSpeaksMessage_becauseRoleLabelHidTheReply() throws {
+        // WHY: Computer Use on Desk saw assistant replies as AXTextArea
+        // label `assistant` while the value was the message. VoiceOver
+        // speaks the label first, so the role hid the reply. Name the
+        // markdown body with the message text; keep Copy message.
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: "Sources/Surfaces/AgentChatTranscriptChrome.swift"),
+            encoding: .utf8
+        )
+        guard let start = source.range(of: "public struct AgentChatAssistantReply") else {
+            return XCTFail("AgentChatAssistantReply must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\npublic struct AgentChatComposerBar")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertFalse(
+            slice.contains(".accessibilityLabel(\"assistant\")"),
+            "reply body must not be named assistant"
+        )
+        XCTAssertTrue(
+            slice.contains(".accessibilityLabel(text)"),
+            "reply body must expose the message as the VoiceOver name"
+        )
+        XCTAssertTrue(
+            slice.contains(".accessibilityLabel(\"Copy message\")"),
+            "copy control must stay Copy message after the role label is gone"
+        )
+    }
+
     func test_assistantCopyMatchesUserCopyChrome_becauseTenPointIconIsInvisibleOnDesk() throws {
         // WHY: Desk assistant Copy message painted at 10x12.5 while the
         // user bubble already frames the same glyph at 18x18. Users cannot

@@ -184,7 +184,7 @@ public struct AgentChatAssistantReply: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityIdentifier(roleIdentifier)
-                .accessibilityLabel("assistant")
+                .accessibilityLabel(text)
             HStack(spacing: DS.Space.xs) {
                 Button {
                     AgentChatTranscriptChrome.copyToPasteboard(text)
