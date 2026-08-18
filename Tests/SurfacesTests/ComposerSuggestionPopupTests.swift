@@ -78,6 +78,9 @@ final class ComposerSuggestionPopupTests: XCTestCase {
         XCTAssertEqual(out.map(\.kind), [.bot])
         XCTAssertEqual(out.map(\.insertText), ["@quinn "])
         XCTAssertEqual(out.first?.title, "Quinn")
+        XCTAssertEqual(out.first?.botHandle, "quinn")
+        XCTAssertEqual(out.first?.botName, "Quinn")
+        XCTAssertEqual(out.first?.botAvatarSymbol, quinn.avatarSymbol)
         XCTAssertTrue(out.first?.subtitle.contains("@quinn") == true)
         let empty = AgentComposerSuggestions.suggestions(
             for: "@",

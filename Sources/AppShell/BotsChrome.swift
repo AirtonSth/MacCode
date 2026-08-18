@@ -141,66 +141,6 @@ public enum BotsChrome {
     }
 }
 
-public struct BotsAvatarView: View {
-    public let name: String
-    public let handle: String
-    /// Chosen SF Symbol avatar; nil falls back to name initials.
-    public var symbol: String?
-    public var size: CGFloat = 36
-    public var attention: BotAttentionState = .none
-
-    public init(
-        name: String,
-        handle: String,
-        symbol: String? = nil,
-        size: CGFloat = 36,
-        attention: BotAttentionState = .none
-    ) {
-        self.name = name
-        self.handle = handle
-        self.symbol = symbol
-        self.size = size
-        self.attention = attention
-    }
-
-    public var body: some View {
-        Group {
-            if let symbol, let spec = BotBlobatarSpec.parse(symbol) {
-                BotBlobatarView(
-                    name: name.isEmpty ? handle : name,
-                    spec: spec.liveFaced(attention: attention),
-                    size: size,
-                    motion: .always,
-                    handle: handle
-                )
-            } else {
-                symbolFallback
-            }
-        }
-        .accessibilityHidden(true)
-    }
-
-    @ViewBuilder
-    private var symbolFallback: some View {
-        let ink = BotsChrome.avatarColor(for: handle)
-        ZStack {
-            RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
-                .fill(ink)
-            if let symbol {
-                Image(systemName: symbol)
-                    .font(.system(size: max(11, size * 0.42), weight: .semibold))
-                    .foregroundColor(.white)
-            } else {
-                Text(BotsChrome.initials(for: name))
-                    .font(.system(size: max(11, size * 0.36), weight: .bold))
-                    .foregroundColor(.white)
-            }
-        }
-        .frame(width: size, height: size)
-        .accessibilityHidden(true)
-    }
-}
-
 /// DS primary button at the Bots 44pt hit target (DSPrimaryButtonStyle is shorter).
 public struct BotsPrimaryButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled

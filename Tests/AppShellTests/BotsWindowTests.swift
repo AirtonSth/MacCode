@@ -4269,6 +4269,31 @@ final class BotsWindowTests: XCTestCase {
         vm.applyBotMention(quinn)
         XCTAssertTrue(vm.composerText.contains("@\(quinn.handle)"))
         XCTAssertNil(BotMentionParser.activeQuery(in: vm.composerText))
+        vm.composerText = "@q"
+        XCTAssertEqual(vm.composerSuggestions.first?.botHandle, quinn.handle)
+        XCTAssertEqual(vm.composerSuggestions.first?.botAvatarSymbol, quinn.avatarSymbol)
+    }
+
+    func test_deskComposerListsProviderSkills_becauseDeskMustMatchAgentAppSlash() throws {
+        // WHY: Desk used a TextField with no AgentComposerSuggestions. Agent
+        // App `/sam` lists provider skills. Same catalog must feed Desk.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        vm.openDesk(piper)
+        vm.replaceProvidersForTests([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [],
+                slashCommands: ["/goal"],
+                skills: ["sam-work", "sam-codex-advisor"]
+            )
+        ])
+        vm.composerText = "/sam"
+        let inserts = vm.composerSuggestions.map { $0.insertText.trimmingCharacters(in: .whitespaces) }
+        XCTAssertTrue(inserts.contains("/sam-work"))
+        XCTAssertTrue(inserts.contains("/sam-codex-advisor"))
+        XCTAssertTrue(vm.composerSuggestions.contains { $0.kind == .skill })
     }
 
     func test_sendWithMentionTargetsPeer_notOnlyHost() throws {
