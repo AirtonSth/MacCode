@@ -121,6 +121,35 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         )
     }
 
+    func test_userBubbleVoiceOverSpeaksMessage_becauseRoleLabelHidThePrompt() throws {
+        // WHY: Computer Use on Desk saw user bubbles as AXStaticText value
+        // `user` and the copy control as AXButton `user`. The parent
+        // accessibilityLabel("user") overwrote the prompt. Name the bubble
+        // with the message text; keep Copy message on the button.
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: "Sources/Surfaces/AgentChatTranscriptChrome.swift"),
+            encoding: .utf8
+        )
+        guard let start = source.range(of: "public struct AgentChatUserBubble") else {
+            return XCTFail("AgentChatUserBubble must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\npublic struct AgentChatAssistantReply")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertFalse(
+            slice.contains(".accessibilityLabel(\"user\")"),
+            "parent must not name the whole bubble user"
+        )
+        XCTAssertTrue(
+            slice.contains(".accessibilityLabel(text)"),
+            "bubble body must expose the prompt as the VoiceOver name"
+        )
+        XCTAssertTrue(
+            slice.contains(".accessibilityLabel(\"Copy message\")"),
+            "copy control must stay Copy message after the role label is gone"
+        )
+    }
+
     func test_assistantCopyMatchesUserCopyChrome_becauseTenPointIconIsInvisibleOnDesk() throws {
         // WHY: Desk assistant Copy message painted at 10x12.5 while the
         // user bubble already frames the same glyph at 18x18. Users cannot
