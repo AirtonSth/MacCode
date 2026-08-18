@@ -238,6 +238,7 @@ public struct BotScheduleTasksRootView: View {
             TextField("Search tasks", text: $vm.scheduleTaskSearchText)
                 .textFieldStyle(.plain)
                 .foregroundColor(DS.Palette.text)
+                .accessibilityLabel("Search tasks")
                 .accessibilityIdentifier("bots.scheduleTasks.search")
         }
         .padding(.horizontal, DS.Space.lg)

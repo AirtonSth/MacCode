@@ -183,6 +183,7 @@ public struct ActiveBotsRootView: View {
             TextField("Search bots", text: $vm.activeBotsSearchText)
                 .textFieldStyle(.plain)
                 .foregroundColor(DS.Palette.text)
+                .accessibilityLabel("Search bots")
                 .accessibilityIdentifier("activeBots.search")
         }
         .padding(.horizontal, DS.Space.lg)

@@ -5391,6 +5391,7 @@ struct SidebarSearchField: View {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 12, weight: .regular))
                 .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityHidden(true)
             NonAutoFocusTextField(
                 placeholder: placeholder,
                 text: $text,
@@ -5446,6 +5447,7 @@ private struct NonAutoFocusTextField: NSViewRepresentable {
             attributes: [.foregroundColor: NSColor(DS.Palette.textTertiary)]
         )
         field.setAccessibilityIdentifier(accessibilityIdentifier)
+        field.setAccessibilityLabel(placeholder)
         return field
     }
 
@@ -5454,6 +5456,7 @@ private struct NonAutoFocusTextField: NSViewRepresentable {
         context.coordinator.focusRequest = $focusRequest
         field.placeholderString = placeholder
         field.setAccessibilityIdentifier(accessibilityIdentifier)
+        field.setAccessibilityLabel(placeholder)
         if field.stringValue != text {
             field.stringValue = text
         }

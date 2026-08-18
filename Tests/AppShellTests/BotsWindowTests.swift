@@ -1582,6 +1582,36 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_botsSearchFieldsHaveVoiceOverNames_becausePlaceholderIsNotTheControlName() throws {
+        // WHY: Computer Use / VoiceOver saw Search bots and Search tasks as
+        // unnamed fields (AX label null). Placeholder is hint copy, not the
+        // control name. Name the field so VoiceOver can land on it.
+        let sidebar = try String(
+            contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"),
+            encoding: .utf8
+        )
+        let active = try String(
+            contentsOf: sourceURL("Sources/AppShell/ActiveBotsWindow.swift"),
+            encoding: .utf8
+        )
+        let schedule = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            sidebar.contains("setAccessibilityLabel(placeholder)"),
+            "Sidebar Search bots / Filter workspaces must expose the placeholder as the AX name"
+        )
+        XCTAssertTrue(
+            active.contains(".accessibilityLabel(\"Search bots\")"),
+            "Active Bots search must expose Search bots as the control name"
+        )
+        XCTAssertTrue(
+            schedule.contains(".accessibilityLabel(\"Search tasks\")"),
+            "Schedule Tasks search must expose Search tasks as the control name"
+        )
+    }
+
     func test_searchKeepsSelectedVisible_becauseChatMustMatchTheRoster() throws {
         // WHY: searching "copy" hid the open teammate while Desk still painted
         // their chat. Keep the selected row in the list so dest and roster agree.
