@@ -4325,6 +4325,85 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(vm.composerText.contains("/sam more"))
     }
 
+    func test_createDeskThreadStartsEmptyConversation() throws {
+        // WHY: Desk had no + thread. Agent App can start a blank thread
+        // before the first send.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.conversations.isEmpty)
+        vm.createDeskThread()
+        XCTAssertEqual(vm.conversations.count, 1)
+        XCTAssertEqual(vm.selectedConversation?.title, "New thread")
+        XCTAssertTrue(vm.deskMessages.isEmpty)
+        XCTAssertEqual(try context.botStore.listConversations(botID: piper.id).count, 1)
+    }
+
+    func test_mentionCreatesNewPeerConversation() throws {
+        // WHY: @quinn used to reuse Quinn's first dest row. A second
+        // mention must be its own thread.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("@quinn first ping"))
+        XCTAssertTrue(vm.send("@quinn second ping"))
+        let peerThreads = try context.botStore.listConversations(botID: quinn.id)
+        XCTAssertEqual(peerThreads.count, 2)
+        XCTAssertEqual(try context.botStore.listConversations(botID: piper.id).count, 1)
+        XCTAssertEqual(Set(peerThreads.map(\.id)).count, 2)
+    }
+
+    func test_agentAppMentionCreatesNewPeerConversation() async throws {
+        // WHY: Agent App @quinn must open a dest thread, not pile onto
+        // Quinn's already-open dest conversation.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let quinn = try vm.create(name: "Quinn", title: "CRM", provider: .claude)
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("already on dest"))
+        XCTAssertEqual(try context.botStore.listConversations(botID: quinn.id).count, 1)
+        _ = await vm.runMentionedPrompt(peer: quinn, text: "@quinn from agent app")
+        XCTAssertEqual(try context.botStore.listConversations(botID: quinn.id).count, 2)
+    }
+
+    func test_selectDeskThreadRestoresThatConversation() throws {
+        // WHY: dest cache was per-bot. Switching threads must not keep
+        // the previous transcript.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("ALPHA"))
+        let first = try XCTUnwrap(vm.selectedConversation)
+        vm.createDeskThread()
+        XCTAssertTrue(vm.send("BRAVO"))
+        let second = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertNotEqual(first.id, second.id)
+        vm.selectDeskThread(first.id)
+        XCTAssertEqual(vm.selectedConversation?.id, first.id)
+        XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("ALPHA") })
+        XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("BRAVO") })
+        vm.selectDeskThread(second.id)
+        XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("BRAVO") })
+        XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("ALPHA") })
+    }
+
+    func test_sendContinuesSelectedConversation() throws {
+        // WHY: two ordinary sends on one dest thread must stay one row.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("first"))
+        XCTAssertTrue(vm.send("second"))
+        XCTAssertEqual(try context.botStore.listConversations(botID: piper.id).count, 1)
+        XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("first") })
+        XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("second") })
+    }
+
     func test_sendWithMentionTargetsPeer_notOnlyHost() throws {
         // WHY: "@quinn do X" from Piper's Desk must run Quinn and paint
         // Messaged Quinn on Piper's transcript. A host-only send would

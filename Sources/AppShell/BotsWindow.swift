@@ -662,6 +662,8 @@ public final class BotsViewModel: ObservableObject {
     private let botStore: BotStore
     private let settingsStore: SettingsStore
     private var messagesByBot: [BotID: [BotDeskMessage]] = [:]
+    private var messagesConversationIDByBot: [BotID: BotConversationID] = [:]
+    private var selectedConversationByBot: [BotID: BotConversationID] = [:]
     private var attentionStateByBot: [BotID: BotAttentionState] = [:]
     private var lastPreviewByBot: [BotID: String] = [:]
     private var lastUpdatedByBot: [BotID: Date] = [:]
@@ -1378,6 +1380,31 @@ public final class BotsViewModel: ObservableObject {
         deskTimelineRejoinToken &+= 1
     }
 
+    public func createDeskThread() {
+        guard let bot = selectedBot else { return }
+        let conversation = BotConversation(botID: bot.id, title: "New thread")
+        do {
+            try botStore.upsertConversation(conversation)
+        } catch {
+            errorMessage = String(describing: error)
+            return
+        }
+        conversations.removeAll { $0.id == conversation.id }
+        conversations.insert(conversation, at: 0)
+        selectDeskThread(conversation.id)
+    }
+
+    public func selectDeskThread(_ id: BotConversationID) {
+        guard let conversation = conversations.first(where: { $0.id == id }) else { return }
+        selectedConversation = conversation
+        selectedConversationByBot[conversation.botID] = conversation.id
+        rememberStudioSupport(for: conversation.botID)
+        restoreDeskMessages(botID: conversation.botID)
+        restoreDeskWorkLog(botID: conversation.botID)
+        restoreDeskLiveTurn(botID: conversation.botID)
+        deskTimelineRejoinToken &+= 1
+    }
+
     public func openInNewWindow(_ bot: BotDefinition) {
         guard !presentsAsDetachedWindow else { return }
         router?.openBotInNewWindow(bot.id)
@@ -1885,7 +1912,7 @@ public final class BotsViewModel: ObservableObject {
         do {
             let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attached)
             let conversation = try persistUserMessage(bot: bot, text: display)
-            appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: bot.id)
+            appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: bot.id, conversationID: conversation.id)
             // Dest first. Send used to listMemory/listSkillBindings
             // after dest painted the bubble. Snapshot dest cache here
             // so dest does not reread the brain.
@@ -1951,12 +1978,18 @@ public final class BotsViewModel: ObservableObject {
         )
         do {
             let hostConversation = try persistUserMessage(bot: host, text: display)
-            appendDeskMessage(outbound, botID: host.id)
+            appendDeskMessage(outbound, botID: host.id, conversationID: hostConversation.id)
             rememberPeerTurn(outbound, hostID: host.id)
-            let peerConversation = try persistUserMessage(bot: peer, text: display, adoptSelection: false)
+            let peerConversation = try persistUserMessage(
+                bot: peer,
+                text: display,
+                adoptSelection: false,
+                createNew: true
+            )
             appendDeskMessage(
                 BotDeskMessage(role: .user, text: display),
-                botID: peer.id
+                botID: peer.id,
+                conversationID: peerConversation.id
             )
             let brain = destBrainInputs(for: peer)
             guard let router = resolvedRouter(),
@@ -2017,8 +2050,17 @@ public final class BotsViewModel: ObservableObject {
         let display = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !display.isEmpty else { return nil }
         do {
-            let conversation = try persistUserMessage(bot: peer, text: display, adoptSelection: false)
-            appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: peer.id)
+            let conversation = try persistUserMessage(
+                bot: peer,
+                text: display,
+                adoptSelection: false,
+                createNew: true
+            )
+            appendDeskMessage(
+                BotDeskMessage(role: .user, text: display),
+                botID: peer.id,
+                conversationID: conversation.id
+            )
             let brain = destBrainInputs(for: peer)
             guard let router = resolvedRouter(),
                   let revision = try currentRevision(for: peer) else {
@@ -2717,7 +2759,18 @@ public final class BotsViewModel: ObservableObject {
         do {
             conversationListCountForTesting += 1
             conversations = try botStore.listConversations(botID: id)
-            selectedConversation = conversations.first
+            if let remembered = selectedConversationByBot[id],
+               let found = conversations.first(where: { $0.id == remembered }) {
+                selectedConversation = found
+            } else if let selected = selectedConversation, selected.botID == id,
+                      conversations.contains(where: { $0.id == selected.id }) {
+                selectedConversation = conversations.first(where: { $0.id == selected.id })
+            } else {
+                selectedConversation = conversations.first
+            }
+            if let selected = selectedConversation {
+                selectedConversationByBot[id] = selected.id
+            }
             if let bot = try botStore.get(id: id) {
                 selectedRevision = try currentRevision(for: bot)
             } else {
@@ -3516,7 +3569,7 @@ public final class BotsViewModel: ObservableObject {
             text: reply,
             peer: BotDeskPeer(direction: .fromPeer, bot: peer)
         )
-        appendDeskMessage(inbound, botID: host.id)
+        appendDeskMessage(inbound, botID: host.id, conversationID: destConversation(for: host.id)?.id)
         rememberPeerTurn(inbound, hostID: host.id)
     }
 
@@ -3915,6 +3968,9 @@ public final class BotsViewModel: ObservableObject {
         if let selected = selectedConversation, selected.botID == botID {
             return selected
         }
+        if selectedBotID != botID, let started = lastStartedConversationByBot[botID] {
+            return started
+        }
         if let snapshot = studioSupportByBot[botID] {
             if let selected = snapshot.selectedConversation, selected.botID == botID {
                 return selected
@@ -3939,8 +3995,11 @@ public final class BotsViewModel: ObservableObject {
         lastDeskRestoreStudioSupportCountForTesting = studioSupportReloadCountForTesting
         lastDeskRestoreAttentionListCountForTesting = attentionListCountForTesting
         lastDeskRestoreConversationListCountForTesting = conversationListCountForTesting
-        let cached = messagesByBot[botID] ?? []
         let conversation = conversationForBot(botID)
+        var cached = messagesByBot[botID] ?? []
+        if messagesConversationIDByBot[botID] != conversation?.id {
+            cached = []
+        }
         // Dest first. First paint dest used to dest dest thread
         // (listRecent) before dest dested Chat. Dest dests dest
         // title now; dest dests dest thread after dest dested Chat.
@@ -3972,10 +4031,11 @@ public final class BotsViewModel: ObservableObject {
         }
         var visible = BotsDeskFollowThrough.visibleDeskMessages(cached: cached, persisted: persisted)
         visible = mergePeerTurns(visible, hostID: botID)
-        if visible.isEmpty, let conversation, !conversation.title.isEmpty {
+        if visible.isEmpty, let conversation, Self.shouldDestTitleAsBubble(conversation.title) {
             visible = [BotDeskMessage(role: .user, text: conversation.title, createdAt: conversation.createdAt)]
         }
         messagesByBot[botID] = visible
+        messagesConversationIDByBot[botID] = conversation?.id
         if selectedBotID == botID {
             deskMessages = visible
         }
@@ -4000,7 +4060,7 @@ public final class BotsViewModel: ObservableObject {
             messagesByBot[botID] = cached
             return
         }
-        guard let conversation, !conversation.title.isEmpty else { return }
+        guard let conversation, Self.shouldDestTitleAsBubble(conversation.title) else { return }
         let dest = [
             BotDeskMessage(role: .user, text: conversation.title, createdAt: conversation.createdAt)
         ]
@@ -4137,11 +4197,27 @@ public final class BotsViewModel: ObservableObject {
         return finished
     }
 
-    private func appendDeskMessage(_ message: BotDeskMessage, botID: BotID) {
-        if selectedBotID == botID {
+    private func appendDeskMessage(
+        _ message: BotDeskMessage,
+        botID: BotID,
+        conversationID: BotConversationID? = nil
+    ) {
+        let threadID = conversationID
+            ?? (selectedBotID == botID ? selectedConversation?.id : nil)
+            ?? messagesConversationIDByBot[botID]
+        if let threadID, messagesConversationIDByBot[botID] != threadID {
+            messagesByBot[botID] = [message]
+            messagesConversationIDByBot[botID] = threadID
+        } else {
+            messagesByBot[botID, default: []].append(message)
+            if let threadID {
+                messagesConversationIDByBot[botID] = threadID
+            }
+        }
+        if selectedBotID == botID,
+           threadID == nil || threadID == selectedConversation?.id {
             deskMessages.append(message)
         }
-        messagesByBot[botID, default: []].append(message)
         lastPreviewByBot[botID] = message.text
         lastUpdatedByBot[botID] = message.createdAt
     }
@@ -4150,22 +4226,28 @@ public final class BotsViewModel: ObservableObject {
     private func persistUserMessage(
         bot: BotDefinition,
         text: String,
-        adoptSelection: Bool = true
+        adoptSelection: Bool = true,
+        createNew: Bool = false
     ) throws -> BotConversation {
         var conversation: BotConversation
-        if let selected = selectedConversation, selected.botID == bot.id {
+        if createNew {
+            conversation = BotConversation(
+                botID: bot.id,
+                title: Self.titleFromFirstMessage(text)
+            )
+        } else if let selected = selectedConversation, selected.botID == bot.id {
             conversation = selected
-        } else if let existing = conversations.first(where: { $0.botID == bot.id }) {
-            conversation = existing
-        } else if let cached = studioSupportByBot[bot.id]?.conversations.first {
-            conversation = cached
+        } else if let rememberedID = selectedConversationByBot[bot.id],
+                  let remembered = destConversations(botID: bot.id).first(where: { $0.id == rememberedID }) {
+            conversation = remembered
         } else {
             conversation = BotConversation(
                 botID: bot.id,
                 title: Self.titleFromFirstMessage(text)
             )
         }
-        if conversation.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if conversation.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || conversation.title == "New thread" {
             conversation.title = Self.titleFromFirstMessage(text)
         }
         conversation.updatedAt = Date()
@@ -4177,6 +4259,10 @@ public final class BotsViewModel: ObservableObject {
             adoptWrittenConversation(conversation)
         } else {
             patchStudioSupportConversation(conversation, botID: bot.id)
+            if selectedBotID == bot.id {
+                conversations.removeAll { $0.id == conversation.id }
+                conversations.insert(conversation, at: 0)
+            }
         }
         return conversation
     }
@@ -4185,6 +4271,7 @@ public final class BotsViewModel: ObservableObject {
     /// this thread. Patch it locally so dest does not reread threads.
     private func adoptWrittenConversation(_ conversation: BotConversation) {
         selectedConversation = conversation
+        selectedConversationByBot[conversation.botID] = conversation.id
         conversations.removeAll { $0.id == conversation.id }
         conversations.insert(conversation, at: 0)
         rememberStudioSupport(for: conversation.botID)
@@ -4287,7 +4374,8 @@ public final class BotsViewModel: ObservableObject {
             try botStore.upsertAttention(item)
             appendDeskMessage(
                 BotDeskMessage(role: .assistant, text: Self.assistantPlaceholder),
-                botID: bot.id
+                botID: bot.id,
+                conversationID: next.id
             )
             adoptWrittenAttention(item)
             applyAttentionState(
@@ -4605,6 +4693,11 @@ public final class BotsViewModel: ObservableObject {
         let flags = settingsStore.load().botControlPlaneFlags
         if requested.isSelectable(flags: flags) { return requested }
         return .logicalExecutionSpace
+    }
+
+    private static func shouldDestTitleAsBubble(_ title: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed != "New thread"
     }
 
     private static func titleFromFirstMessage(_ text: String) -> String {
@@ -5777,6 +5870,9 @@ public struct BotsRootView: View {
 
     private func deskChat(_ bot: BotDefinition) -> some View {
         HStack(spacing: 0) {
+            deskThreadRail
+                .frame(width: 220)
+            Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
             VStack(spacing: 0) {
                 deskTimeline(bot)
                 if !vm.queuedFollowUps.isEmpty {
@@ -6274,6 +6370,84 @@ public struct BotsRootView: View {
         default:
             return .neutral
         }
+    }
+
+    private var deskThreadRail: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            DSSectionHeader(
+                vm.conversations.contains(where: { $0.attentionState == .working })
+                    ? "Threads · active"
+                    : "Threads",
+                trailing: AnyView(
+                    DSIconButton("plus", help: "New thread") {
+                        vm.createDeskThread()
+                    }
+                    .accessibilityIdentifier("bots.desk.thread.new")
+                )
+            )
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            if vm.conversations.isEmpty {
+                DSEmptyState(
+                    icon: "bubble.left.and.bubble.right",
+                    title: "No threads",
+                    subtitle: "Start a conversation or mention this teammate."
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        ForEach(vm.conversations, id: \.id) { conversation in
+                            deskThreadRow(conversation)
+                        }
+                    }
+                    .padding(DS.Space.sm)
+                }
+            }
+        }
+        .background(DS.Palette.surface)
+        .accessibilityIdentifier("bots.desk.threads")
+    }
+
+    private func deskThreadRow(_ conversation: BotConversation) -> some View {
+        let selected = vm.selectedConversation?.id == conversation.id
+        let running = conversation.attentionState == .working
+        return Button {
+            vm.selectDeskThread(conversation.id)
+        } label: {
+            HStack(spacing: DS.Space.md) {
+                if running {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .frame(width: 8, height: 8)
+                        .accessibilityLabel("Working")
+                } else if conversation.unread || conversation.attentionState == .unreadActivity {
+                    Circle()
+                        .fill(DS.Palette.accent)
+                        .frame(width: 7, height: 7)
+                        .accessibilityLabel("Unread")
+                } else {
+                    Color.clear.frame(width: 8, height: 8)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(conversation.title.isEmpty ? "New thread" : conversation.title)
+                        .font(DS.Font.bodyDense.weight(conversation.unread ? .semibold : .regular))
+                        .foregroundColor(DS.Palette.text)
+                        .lineLimit(1)
+                    Text(AgentChatTranscriptChrome.relativeTimestamp(conversation.updatedAt))
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.md)
+            .padding(.vertical, DS.Space.sm)
+            .background(selected ? DS.Palette.selection : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("bots.desk.thread.row.\(conversation.id.value.uuidString)")
     }
 
     private var deskQueuedFollowUps: some View {
