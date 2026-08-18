@@ -225,6 +225,16 @@ public struct AgentChatComposerBar: View {
     public var onApplySuggestion: ((AgentComposerSuggestion) -> Void)?
     public var onCursorMoved: ((Int) -> Void)?
     public var suggestionIdentifier: String = "bots.desk.suggestion.popup"
+    public var focusTick: Int = 0
+    public var onPreviousHistory: () -> Bool = { false }
+    public var onNextHistory: () -> Bool = { false }
+    public var onTextEdited: () -> Void = {}
+    public var header: AnyView?
+    public var showsAttach: Bool = true
+    public var attachmentChipPrefix: String = "bots.desk.attachment."
+    public var attachmentsIdentifier: String = "bots.desk.attachments"
+    public var runStatusCaption: String?
+    public var onFileDrop: (([String]) -> Void)?
 
     @State private var editorHeight: CGFloat = AgentComposerTextEditor.minHeight
     @State private var suggestionSelectedIndex: Int?
@@ -249,7 +259,17 @@ public struct AgentChatComposerBar: View {
         suggestions: [AgentComposerSuggestion] = [],
         onApplySuggestion: ((AgentComposerSuggestion) -> Void)? = nil,
         onCursorMoved: ((Int) -> Void)? = nil,
-        suggestionIdentifier: String = "bots.desk.suggestion.popup"
+        suggestionIdentifier: String = "bots.desk.suggestion.popup",
+        focusTick: Int = 0,
+        onPreviousHistory: @escaping () -> Bool = { false },
+        onNextHistory: @escaping () -> Bool = { false },
+        onTextEdited: @escaping () -> Void = {},
+        header: AnyView? = nil,
+        showsAttach: Bool = true,
+        attachmentChipPrefix: String = "bots.desk.attachment.",
+        attachmentsIdentifier: String = "bots.desk.attachments",
+        runStatusCaption: String? = nil,
+        onFileDrop: (([String]) -> Void)? = nil
     ) {
         self._text = text
         self.attachments = attachments
@@ -270,40 +290,51 @@ public struct AgentChatComposerBar: View {
         self.onApplySuggestion = onApplySuggestion
         self.onCursorMoved = onCursorMoved
         self.suggestionIdentifier = suggestionIdentifier
+        self.focusTick = focusTick
+        self.onPreviousHistory = onPreviousHistory
+        self.onNextHistory = onNextHistory
+        self.onTextEdited = onTextEdited
+        self.header = header
+        self.showsAttach = showsAttach
+        self.attachmentChipPrefix = attachmentChipPrefix
+        self.attachmentsIdentifier = attachmentsIdentifier
+        self.runStatusCaption = runStatusCaption
+        self.onFileDrop = onFileDrop
     }
 
     public var body: some View {
         VStack(spacing: 0) {
+            if let header {
+                header
+            }
             if let workingLabel {
-                HStack {
-                    DSPill(workingLabel, tone: .accent)
-                        .help(workingLabel)
-                        .accessibilityIdentifier("agent.workingPhase")
-                        .accessibilityLabel(workingLabel)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.top, DS.Space.sm)
-                .accessibilityIdentifier("bots.desk.workingPhase")
+                AgentChatWorkingPill(label: workingLabel, identifier: "agent.workingPhase")
+                    .accessibilityIdentifier("bots.desk.workingPhase")
             }
             if !attachments.isEmpty {
-                attachmentChips
-                    .padding(.horizontal, DS.Space.lg)
-                    .padding(.top, DS.Space.md)
+                AgentChatAttachmentChips(
+                    attachments: attachments,
+                    onRemove: onRemoveAttachment,
+                    chipIdentifierPrefix: attachmentChipPrefix,
+                    stripIdentifier: attachmentsIdentifier
+                )
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.top, DS.Space.md)
             }
             AgentComposerTextEditor(
                 text: $text,
                 height: $editorHeight,
-                focusTick: 0,
+                focusTick: focusTick,
                 placeholder: placeholder,
                 accessibilityIdentifier: composerIdentifier,
                 onSend: onSend,
-                onPreviousHistory: { false },
-                onNextHistory: { false },
+                onPreviousHistory: onPreviousHistory,
+                onNextHistory: onNextHistory,
                 onTextEdited: {
                     suggestionPopupDismissed = false
+                    onTextEdited()
                 },
-                onFileDrop: onAttach,
+                onFileDrop: onFileDrop ?? onAttach,
                 onCursorMoved: { offset in onCursorMoved?(offset) },
                 onCaretRectChanged: { _ in },
                 popupIsOpen: {
@@ -351,23 +382,31 @@ public struct AgentChatComposerBar: View {
                 )
             }
             HStack(spacing: DS.Space.sm) {
-                Button(action: pickAttachments) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 13, weight: .medium))
-                        .frame(width: 26, height: 26)
-                        .contentShape(Rectangle())
+                if showsAttach {
+                    Button(action: pickAttachments) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 13, weight: .medium))
+                            .frame(width: 26, height: 26)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!attachEnabled)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .help("Attach files")
+                    .accessibilityLabel("Attach files")
+                    .accessibilityIdentifier("agent.attach")
                 }
-                .buttonStyle(.plain)
-                .disabled(!attachEnabled)
-                .foregroundColor(DS.Palette.textSecondary)
-                .help("Attach files")
-                .accessibilityLabel("Attach files")
-                .accessibilityIdentifier("agent.attach")
                 if let leadingControls {
                     leadingControls
                 }
                 Spacer(minLength: 0)
                 if runActive {
+                    if let runStatusCaption {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .accessibilityLabel(runStatusCaption)
+                    }
                     stopButton
                     Rectangle()
                         .fill(DS.Palette.line)
@@ -450,42 +489,6 @@ public struct AgentChatComposerBar: View {
         .help(isStopping
               ? "Still stopping — click again to force-stop the provider"
               : "Stop running agent")
-    }
-
-    private var attachmentChips: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: DS.Space.sm) {
-                ForEach(attachments, id: \.self) { attachment in
-                    HStack(spacing: DS.Space.xs) {
-                        if AgentChatTranscriptChrome.isImagePath(attachment.path),
-                           let img = NSImage(contentsOfFile: attachment.path) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 18, height: 18)
-                                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                        } else {
-                            Image(systemName: AgentChatTranscriptChrome.isImagePath(attachment.path) ? "photo" : "doc")
-                                .font(.system(size: 9))
-                        }
-                        Text(attachment.displayName)
-                            .font(DS.Font.caption2).lineLimit(1)
-                        Button { onRemoveAttachment(attachment) } label: {
-                            Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Remove \(attachment.displayName)")
-                    }
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .padding(.horizontal, DS.Space.sm).padding(.vertical, 3)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(Capsule())
-                    .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-                    .accessibilityIdentifier("bots.desk.attachment.\(attachment.displayName)")
-                }
-            }
-        }
-        .accessibilityIdentifier("bots.desk.attachments")
     }
 
     private func applyHighlightedSuggestion() {

@@ -6408,61 +6408,32 @@ public struct BotsRootView: View {
     }
 
     private func deskThreadRow(_ conversation: BotConversation) -> some View {
-        let selected = vm.selectedConversation?.id == conversation.id
-        let running = conversation.attentionState == .working
-        return Button {
-            vm.selectDeskThread(conversation.id)
-        } label: {
-            HStack(spacing: DS.Space.md) {
-                if running {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .frame(width: 8, height: 8)
-                        .accessibilityLabel("Working")
-                } else if conversation.unread || conversation.attentionState == .unreadActivity {
-                    Circle()
-                        .fill(DS.Palette.accent)
-                        .frame(width: 7, height: 7)
-                        .accessibilityLabel("Unread")
-                } else {
-                    Color.clear.frame(width: 8, height: 8)
-                }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(conversation.title.isEmpty ? "New thread" : conversation.title)
-                        .font(DS.Font.bodyDense.weight(conversation.unread ? .semibold : .regular))
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(1)
-                    Text(AgentChatTranscriptChrome.relativeTimestamp(conversation.updatedAt))
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, DS.Space.md)
-            .padding(.vertical, DS.Space.sm)
-            .background(selected ? DS.Palette.selection : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("bots.desk.thread.row.\(conversation.id.value.uuidString)")
+        let unread = conversation.unread || conversation.attentionState == .unreadActivity
+        let status: AgentChatThreadStatusMark = conversation.attentionState == .working
+            ? .running
+            : (unread ? .unread : .hidden)
+        return AgentChatThreadRow(
+            title: conversation.title.isEmpty ? "New thread" : conversation.title,
+            subtitle: AgentChatTranscriptChrome.relativeTimestamp(conversation.updatedAt),
+            unread: false,
+            selected: vm.selectedConversation?.id == conversation.id,
+            status: status,
+            identifier: "bots.desk.thread.row.\(conversation.id.value.uuidString)",
+            onSelect: { vm.selectDeskThread(conversation.id) }
+        )
     }
 
     private var deskQueuedFollowUps: some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             AgentQueuedHeader(count: vm.queuedFollowUps.count, identifier: "bots.desk.queued.header")
             ForEach(vm.queuedFollowUps) { item in
-                HStack(alignment: .top, spacing: DS.Space.md) {
-                    Text(AgentChatTranscriptChrome.displayUserLine(
+                AgentQueuedRow(
+                    text: AgentChatTranscriptChrome.displayUserLine(
                         text: item.text,
                         attachments: item.attachments
-                    ))
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                    .lineLimit(3)
-                    Spacer(minLength: DS.Space.sm)
+                    ),
+                    identifier: "bots.desk.queued.row"
+                ) {
                     Button("Remove") { vm.removeQueuedFollowUp(item) }
                         .buttonStyle(.plain)
                         .font(DS.Font.caption.weight(.medium))
@@ -6476,49 +6447,6 @@ public struct BotsRootView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(DS.Palette.bg)
         .accessibilityIdentifier("bots.desk.queued")
-    }
-
-    private var botMentionPicker: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(vm.botMentionSuggestions, id: \.id) { bot in
-                Button {
-                    vm.applyBotMention(bot)
-                } label: {
-                    HStack(spacing: DS.Space.md) {
-                        BotsAvatarView(
-                            name: bot.name,
-                            handle: bot.handle,
-                            symbol: bot.avatarSymbol,
-                            size: 22,
-                            attention: vm.attentionState(for: bot)
-                        )
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(bot.name)
-                                .font(DS.Font.body)
-                                .foregroundColor(DS.Palette.text)
-                            Text("@\(bot.handle)")
-                                .font(DS.Font.caption)
-                                .foregroundColor(DS.Palette.textTertiary)
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.horizontal, DS.Space.lg)
-                    .padding(.vertical, DS.Space.sm)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("bots.desk.mention.\(bot.handle)")
-            }
-        }
-        .background(DS.Palette.surfaceRaised.opacity(0.85))
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-        )
-        .padding(.horizontal, DS.Space.lg)
-        .padding(.bottom, DS.Space.sm)
-        .accessibilityIdentifier("bots.desk.mention")
     }
 
     private func composerBar(_ bot: BotDefinition) -> some View {
