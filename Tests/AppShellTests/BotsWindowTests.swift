@@ -1524,6 +1524,38 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.scheduleTasksSubtitle, "Automatic runs paused — turn Active on when you're back")
     }
 
+    func test_enabledTaskNextRunSaysSchedulerPaused_whenAutonomyIsOff_becauseOpenDoesNotMeanItRuns() throws {
+        // WHY: Computer Use saw Next run "While RemoteCode is open" while
+        // the global switch read Schedules paused. An enabled task is armed,
+        // not running, so Next run must say the scheduler is paused.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Check overnight failures"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.saveRoutine()
+        let id = try XCTUnwrap(vm.routines.first?.definition.id)
+        vm.setRoutineEnabled(id: id, enabled: true)
+        vm.openScheduleTasks()
+        XCTAssertFalse(vm.isAutonomyActive)
+        let armed = try XCTUnwrap(vm.scheduleTaskItems.first)
+        XCTAssertTrue(armed.isEnabled)
+        XCTAssertEqual(
+            armed.nextRunLabel(isAutonomyActive: vm.isAutonomyActive),
+            "Scheduler paused"
+        )
+        vm.setAutonomyActive(true)
+        XCTAssertEqual(
+            armed.nextRunLabel(isAutonomyActive: vm.isAutonomyActive),
+            "While RemoteCode is open"
+        )
+        vm.setRoutineEnabled(id: id, enabled: false)
+        let paused = try XCTUnwrap(vm.scheduleTaskItems.first)
+        XCTAssertEqual(paused.nextRunLabel(isAutonomyActive: true), "Paused")
+    }
+
     func test_botScheduleTasksFiltersAndToggle() throws {
         // WHY: All / Active / Paused must filter shipped routines, not a
         // decorative count, so the overview matches Agent Scheduled Tasks.

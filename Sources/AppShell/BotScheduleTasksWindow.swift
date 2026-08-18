@@ -24,6 +24,14 @@ public struct BotScheduleTaskItem: Identifiable, Equatable {
         self.botHandle = bot.handle
         self.lastTestRunRequestedAt = routine.activation.lastTestRunRequestedAt
     }
+
+    /// Next run is when this task would actually fire, not whether it is armed.
+    /// An enabled task still does not run while global autonomy is paused.
+    public func nextRunLabel(isAutonomyActive: Bool) -> String {
+        if !isEnabled { return "Paused" }
+        if !isAutonomyActive { return "Scheduler paused" }
+        return "While RemoteCode is open"
+    }
 }
 
 public struct BotScheduleTaskDraft: Identifiable, Equatable {
@@ -131,6 +139,7 @@ public struct BotScheduleTasksRootView: View {
                         ForEach(vm.scheduleTaskItems) { item in
                             BotScheduleTaskCard(
                                 item: item,
+                                isAutonomyActive: vm.isAutonomyActive,
                                 onOpen: { vm.editScheduleTask(item) },
                                 onToggle: { vm.setRoutineEnabled(id: item.id, enabled: !item.isEnabled) },
                                 onRunNow: { vm.requestRoutineTestRun(id: item.id) },
@@ -284,6 +293,7 @@ public struct BotScheduleTasksRootView: View {
 
 private struct BotScheduleTaskCard: View {
     let item: BotScheduleTaskItem
+    let isAutonomyActive: Bool
     let onOpen: () -> Void
     let onToggle: () -> Void
     let onRunNow: () -> Void
@@ -339,7 +349,7 @@ private struct BotScheduleTaskCard: View {
                     Text("Next run")
                         .font(DS.Font.caption2)
                         .foregroundColor(DS.Palette.textTertiary)
-                    Text(item.isEnabled ? "While RemoteCode is open" : "Paused")
+                    Text(item.nextRunLabel(isAutonomyActive: isAutonomyActive))
                         .font(DS.Font.caption.weight(.medium))
                         .foregroundColor(DS.Palette.text)
                         .lineLimit(2)
