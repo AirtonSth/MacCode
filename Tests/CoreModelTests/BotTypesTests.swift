@@ -114,6 +114,18 @@ final class BotTypesTests: XCTestCase {
             "Managed remote Mac must not be selectable even if a leftover persist flag is on"
         )
         XCTAssertEqual(
+            BotDesktopKind.logicalExecutionSpace.displayTitle,
+            "macOS with the default macOS browser"
+        )
+        XCTAssertEqual(
+            BotDesktopKind.botOwnedBrowser.displayTitle,
+            "macOS with the bot's own browser"
+        )
+        XCTAssertEqual(
+            BotDesktopKind.dockerDesktop.displayTitle,
+            "Docker with GUI"
+        )
+        XCTAssertEqual(
             BotDesktopKind.advertisedKinds,
             [.logicalExecutionSpace, .botOwnedBrowser, .dockerDesktop]
         )

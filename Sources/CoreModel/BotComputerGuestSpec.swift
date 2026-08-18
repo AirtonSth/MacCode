@@ -67,6 +67,12 @@ public enum BotComputerGuestSpec {
     public static func validateScreenURL(_ url: URL) throws {
         guard url.host == "127.0.0.1" else { throw BotComputerGuestError.invalidScreenURL }
     }
+
+    /// Desk/Studio viewer entry. Refuse any host that is not loopback.
+    public static func viewerURL(_ url: URL) throws -> URL {
+        try validateScreenURL(url)
+        return url
+    }
 }
 
 public struct BotComputerContainerCreateOptions: Equatable, Sendable {

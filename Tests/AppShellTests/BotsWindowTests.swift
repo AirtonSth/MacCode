@@ -4812,6 +4812,58 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, 1)
     }
 
+    func test_thisMacRuntimesPersistWhenDockerIsUnavailable() throws {
+        // WHY: this-Mac create/save/send must work with Docker forced off.
+        // Docker-with-GUI Save/Send must be refused without a PNG.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.dockerGuestReadyOverrideForTesting = false
+        vm.computerGuestService = nil
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .logicalExecutionSpace
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .logicalExecutionSpace)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("use the default browser"))
+
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .botOwnedBrowser
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .botOwnedBrowser)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("use my own browser"))
+
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .dockerDesktop
+        XCTAssertThrowsError(try vm.saveStudio())
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .botOwnedBrowser)
+        vm.desktopKindOverrideForTesting = .dockerDesktop
+        XCTAssertFalse(vm.send("open the linux screen"))
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+    }
+
+    func test_leftoverDedicatedLocalVMDoesNotBecomeDockerWhenGuestReady() throws {
+        // WHY: leftover Dedicated local VM must stay leftover. A passing
+        // probe must not rewrite it into Docker with GUI.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(piper)
+        vm.dockerGuestReadyOverrideForTesting = true
+        vm.studioDraft.desktopKind = .dedicatedLocalVM
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .logicalExecutionSpace)
+        XCTAssertNotEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
+        XCTAssertFalse(
+            BotDesktopKind.dedicatedLocalVM.isSelectable(
+                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true),
+                guestReady: true
+            )
+        )
+    }
+
     func test_studioSavesBotOwnedAndDockerWhenReady() throws {
         // WHY: the owner must persist this Mac bot browser without Docker,
         // and Docker desktop only after the radio is enabled.

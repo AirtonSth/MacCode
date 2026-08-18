@@ -103,11 +103,11 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
     public var displayTitle: String {
         switch self {
         case .logicalExecutionSpace:
-            return "This Mac · default browser"
+            return "macOS with the default macOS browser"
         case .botOwnedBrowser:
-            return "This Mac · bot browser"
+            return "macOS with the bot's own browser"
         case .dockerDesktop:
-            return "Docker desktop"
+            return "Docker with GUI"
         case .dedicatedLocalVM:
             return "Dedicated local VM"
         case .managedRemoteMac:
@@ -153,6 +153,52 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
         case .dedicatedLocalVM, .managedRemoteMac:
             return false
         }
+    }
+}
+
+/// What a published desktop kind may drive on the next send.
+public struct BotDesktopAdmission: Equatable, Sendable {
+    public let kind: BotDesktopKind
+    public let allowsHostDefaultBrowser: Bool
+    public let allowsBotOwnedBrowser: Bool
+    public let allowsGuestComputer: Bool
+    public let allowsMacOSHarness: Bool
+
+    public static func forPublished(_ kind: BotDesktopKind) -> BotDesktopAdmission {
+        switch kind.advertisedOrLogical {
+        case .botOwnedBrowser:
+            return BotDesktopAdmission(
+                kind: .botOwnedBrowser,
+                allowsHostDefaultBrowser: false,
+                allowsBotOwnedBrowser: true,
+                allowsGuestComputer: false,
+                allowsMacOSHarness: false
+            )
+        case .dockerDesktop:
+            return BotDesktopAdmission(
+                kind: .dockerDesktop,
+                allowsHostDefaultBrowser: false,
+                allowsBotOwnedBrowser: false,
+                allowsGuestComputer: true,
+                allowsMacOSHarness: false
+            )
+        case .logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac:
+            return BotDesktopAdmission(
+                kind: .logicalExecutionSpace,
+                allowsHostDefaultBrowser: true,
+                allowsBotOwnedBrowser: true,
+                allowsGuestComputer: false,
+                allowsMacOSHarness: true
+            )
+        }
+    }
+
+    public static func requireSend(kind: BotDesktopKind, guestReady: Bool) throws -> BotDesktopAdmission {
+        let admission = forPublished(kind)
+        if admission.kind == .dockerDesktop && !guestReady {
+            throw BotComputerGuestError.notReady
+        }
+        return admission
     }
 }
 
@@ -352,37 +398,26 @@ public enum BotStandingInstructions {
     public static let admittedToolsText = admittedToolsText(for: .logicalExecutionSpace)
 
     public static func admittedToolsText(for kind: BotDesktopKind) -> String {
-        let live = kind.advertisedOrLogical
-        switch live {
-        case .botOwnedBrowser:
-            return [
-                generatedCapabilityLine,
-                generatedMutateLine,
-                generatedBrowserLine,
-                generatedWebLine,
-                generatedRecallLine,
-                generatedAskLine,
-            ].joined(separator: "\n")
-        case .dockerDesktop:
-            return [
-                generatedCapabilityLine,
-                generatedMutateLine,
-                generatedGuestComputerLine,
-                generatedWebLine,
-                generatedRecallLine,
-                generatedAskLine,
-            ].joined(separator: "\n")
-        case .logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac:
-            return [
-                generatedCapabilityLine,
-                generatedMutateLine,
-                generatedBrowserLine,
-                generatedWebLine,
-                generatedRecallLine,
-                generatedAskLine,
-                generatedMacOSHarnessLine,
-            ].joined(separator: "\n")
+        let admission = BotDesktopAdmission.forPublished(kind)
+        var lines = [
+            generatedCapabilityLine,
+            generatedMutateLine,
+        ]
+        if admission.allowsGuestComputer {
+            lines.append(generatedGuestComputerLine)
         }
+        if admission.allowsBotOwnedBrowser {
+            lines.append(generatedBrowserLine)
+        }
+        lines.append(contentsOf: [
+            generatedWebLine,
+            generatedRecallLine,
+            generatedAskLine,
+        ])
+        if admission.allowsMacOSHarness {
+            lines.append(generatedMacOSHarnessLine)
+        }
+        return lines.joined(separator: "\n")
     }
 
     public static func fallback(name _: String, title _: String, description _: String = "") -> String {

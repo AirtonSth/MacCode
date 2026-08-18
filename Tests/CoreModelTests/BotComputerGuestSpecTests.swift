@@ -37,5 +37,8 @@ final class BotComputerGuestSpecTests: XCTestCase {
         let url = try BotComputerGuestSpec.screenURL(hostPort: 49152, token: "abc")
         XCTAssertEqual(url.host, "127.0.0.1")
         XCTAssertThrowsError(try BotComputerGuestSpec.validateScreenURL(URL(string: "http://0.0.0.0:6080/")!))
+        XCTAssertThrowsError(try BotComputerGuestSpec.viewerURL(URL(string: "http://0.0.0.0:6080/")!))
+        let loopback = try BotComputerGuestSpec.viewerURL(url)
+        XCTAssertEqual(loopback.host, "127.0.0.1")
     }
 }
