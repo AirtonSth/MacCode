@@ -915,6 +915,13 @@ struct FilesRemoteContentUpdate: Equatable {
     let remoteEditConflict: Bool
 }
 
+/// Local FileEditSessionStore open/save/discard echos omit `updated_by_device`.
+/// Missing or `mac-local` is this Mac. Any other present device is remote.
+func filesEditEventIsRemote(updatedByDevice: String?) -> Bool {
+    guard let updatedByDevice, !updatedByDevice.isEmpty else { return false }
+    return updatedByDevice != "mac-local"
+}
+
 func filesRemoteContentUpdate(
     localDirty: Bool,
     draftText: String,
@@ -1495,7 +1502,10 @@ final class FilesViewModel: ObservableObject {
             setSyncLabel(isDirty ? "Unsaved" : "Up to date", revision: state["revision"]?.intValue ?? 0)
         case "files.edit.opened", "files.edit.patch_applied", "files.edit.saved", "files.edit.discarded":
             guard payload["surface_id"]?.stringValue == surfaceID.value.uuidString else { return }
-            applyEditPayload(payload, remote: payload["updated_by_device"]?.stringValue != "mac-local")
+            applyEditPayload(
+                payload,
+                remote: filesEditEventIsRemote(updatedByDevice: payload["updated_by_device"]?.stringValue)
+            )
         case "files.edit.conflict":
             guard payload["surface_id"]?.stringValue == surfaceID.value.uuidString else { return }
             conflictActive = true
