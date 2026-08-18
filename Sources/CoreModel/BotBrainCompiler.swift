@@ -354,7 +354,7 @@ public enum BotBrainCompiler {
         // title stays Permission.
         lines.append("Approval mode: \(approvalModeText())")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
-        lines.append(BotStandingInstructions.admittedToolsText)
+        lines.append(BotStandingInstructions.admittedToolsText(for: revision.desktopKind))
         if let browser = browserLine(browser) {
             lines.append(browser)
         }
@@ -692,7 +692,7 @@ public enum BotBrainCompiler {
                 id: "tools",
                 kind: .tools,
                 title: "Admitted tools",
-                text: BotStandingInstructions.admittedToolsText,
+                text: BotStandingInstructions.admittedToolsText(for: revision.desktopKind),
                 included: true,
                 reason: "Desk-admitted tools. Custom soul must not hide them."
             )

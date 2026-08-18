@@ -4821,7 +4821,7 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(
             vm.desktopHonestyLabel,
-            "Same macOS account; not isolated. Not a dedicated Desktop."
+            BotDesktopKind.logicalExecutionSpaceHonestyLabel
         )
         XCTAssertTrue(
             BotDesktopKind.logicalExecutionSpaceHonestyLabel.lowercased().contains("not isolated")
@@ -6521,7 +6521,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
         XCTAssertEqual(saved.notificationsEnabled, false)
         XCTAssertEqual(vm.studioRouteLabel, "Grok")
-        XCTAssertEqual(vm.studioDesktopSummary, "Logical execution space")
+        XCTAssertEqual(vm.studioDesktopSummary, BotDesktopKind.logicalExecutionSpace.displayTitle)
         XCTAssertEqual(vm.studioApprovalLabel, "Supervised")
     }
 
@@ -6774,7 +6774,7 @@ final class BotsWindowTests: XCTestCase {
         vm.beginEdit(bot)
         vm.studioDraft.desktopKind = .dedicatedLocalVM
         XCTAssertEqual(vm.displayedDesktopKind, .logicalExecutionSpace)
-        XCTAssertEqual(vm.studioDesktopSummary, "Logical execution space")
+        XCTAssertEqual(vm.studioDesktopSummary, BotDesktopKind.logicalExecutionSpace.displayTitle)
         XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
 
         let saved = try vm.saveStudio()
@@ -6855,7 +6855,7 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
         XCTAssertEqual(vm.displayedDesktopKind, .logicalExecutionSpace)
-        XCTAssertEqual(vm.studioDesktopSummary, "Logical execution space")
+        XCTAssertEqual(vm.studioDesktopSummary, BotDesktopKind.logicalExecutionSpace.displayTitle)
     }
 
     func test_studioDoesNotPersistManagedRemoteMac_becauseItIsNotAdvertised() throws {

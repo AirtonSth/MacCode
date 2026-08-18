@@ -107,6 +107,45 @@ final class BotBrainCompilerTests: XCTestCase {
         )
     }
 
+    func test_desktopKindsAdmitDifferentTools_becauseTheOwnerPicksTheBrowser() {
+        // WHY: this Mac default browser must keep macos-harness. Bot browser
+        // must not send HID to the owner's Chrome. Docker must not fall back
+        // to this Mac.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        func revision(_ kind: BotDesktopKind) -> BotRevision {
+            BotRevision(
+                botID: bot.id,
+                revisionNumber: 1,
+                name: "Piper",
+                title: "Scout",
+                description: "",
+                soul: "",
+                provider: .claude,
+                providerInstanceID: "claude",
+                model: "opus",
+                reasoningEffort: .medium,
+                compatibleRouteSet: ["default"],
+                permissionMode: .supervised,
+                desktopKind: kind,
+                digest: "x"
+            )
+        }
+        let host = BotBrainCompiler.assemble(bot: bot, revision: revision(.logicalExecutionSpace), userText: "Hi")
+        XCTAssertTrue(host.compiledPayload.contains(BotStandingInstructions.macosHarnessTool))
+        XCTAssertTrue(host.compiledPayload.contains(BotStandingInstructions.openBrowserTool))
+
+        let owned = BotBrainCompiler.assemble(bot: bot, revision: revision(.botOwnedBrowser), userText: "Hi")
+        XCTAssertFalse(owned.compiledPayload.contains(BotStandingInstructions.macosHarnessTool))
+        XCTAssertTrue(owned.compiledPayload.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertTrue(owned.compiledPayload.contains(BotDesktopKind.botOwnedBrowser.displayTitle))
+
+        let docker = BotBrainCompiler.assemble(bot: bot, revision: revision(.dockerDesktop), userText: "Hi")
+        XCTAssertFalse(docker.compiledPayload.contains(BotStandingInstructions.generatedMacOSHarnessLine))
+        XCTAssertFalse(docker.compiledPayload.contains(BotStandingInstructions.generatedBrowserLine))
+        XCTAssertTrue(docker.compiledPayload.contains(BotStandingInstructions.computerObserveTool))
+        XCTAssertTrue(docker.compiledPayload.contains(BotDesktopKind.dockerDesktop.displayTitle))
+    }
+
     func test_workingSpaceCompilesForCustomSoul_becauseIsolationHonestyIsNotAnEscapeHatch() {
         // WHY: Studio already shows desktop honesty to the owner. The model
         // never saw it, so "are you isolated?" invented a VM. A written soul

@@ -4763,10 +4763,35 @@ public final class BotsViewModel: ObservableObject {
         deskSendInFlightBotID = nil
     }
 
+    public var dockerDesktopSelectable: Bool {
+        BotDesktopKind.dockerDesktop.isSelectable(
+            flags: settingsStore.load().botControlPlaneFlags,
+            guestReady: dockerGuestReady
+        )
+    }
+
+    public var dockerDesktopStatus: String? {
+        if dockerDesktopSelectable { return nil }
+        return dockerGuestProbeReason ?? "Guest is proving the screen…"
+    }
+
+    /// Machine probe. Tests inject a ready/not-ready override.
+    public var dockerGuestReadyOverrideForTesting: Bool?
+    public var dockerGuestProbeReason: String?
+
+    public var dockerGuestReady: Bool {
+        dockerGuestReadyOverrideForTesting ?? false
+    }
+
     private func resolvedDesktopKind(_ requested: BotDesktopKind) -> BotDesktopKind {
         let flags = settingsStore.load().botControlPlaneFlags
-        if requested.isSelectable(flags: flags) { return requested }
-        return .logicalExecutionSpace
+        if requested.isSelectable(flags: flags, guestReady: dockerGuestReady) {
+            return requested
+        }
+        if requested == .dockerDesktop, selectedRevision?.desktopKind == .dockerDesktop {
+            return .dockerDesktop
+        }
+        return requested.advertisedOrLogical == .botOwnedBrowser ? .botOwnedBrowser : .logicalExecutionSpace
     }
 
     private static func shouldDestTitleAsBubble(_ title: String) -> Bool {
@@ -5710,9 +5735,22 @@ public struct BotsRootView: View {
             studioSectionHeader(BotsChrome.Label.desktop)
             desktopOption(
                 kind: .logicalExecutionSpace,
-                title: "Logical execution space",
+                title: BotDesktopKind.logicalExecutionSpace.displayTitle,
                 enabled: true,
                 identifier: "bots.studio.desktop.logical"
+            )
+            desktopOption(
+                kind: .botOwnedBrowser,
+                title: BotDesktopKind.botOwnedBrowser.displayTitle,
+                enabled: true,
+                identifier: "bots.studio.desktop.botBrowser"
+            )
+            desktopOption(
+                kind: .dockerDesktop,
+                title: BotDesktopKind.dockerDesktop.displayTitle,
+                enabled: vm.dockerDesktopSelectable,
+                status: vm.dockerDesktopStatus,
+                identifier: "bots.studio.desktop.docker"
             )
             Text(vm.desktopHonestyLabel)
                 .font(DS.Font.caption)
