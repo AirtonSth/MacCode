@@ -1706,6 +1706,71 @@ final class BotsWindowTests: XCTestCase {
             body.contains(".accessibilityLabel(routine.definition.name)"),
             "the switch must not reuse the heading as its only name"
         )
+        XCTAssertTrue(
+            body.contains("Button(\"Edit\") { vm.editRoutine(routine) }"),
+            "existing Studio tasks must expose Edit, not only Test run"
+        )
+        XCTAssertTrue(
+            body.contains("accessibilityIdentifier(\"bots.routines.edit\")"),
+            "Edit must be a named control so Computer Use can open the dedicated editor"
+        )
+    }
+
+    func test_studioEditRoutineOpensDedicatedEditor_becauseExistingTasksMustBeEditable() throws {
+        // WHY: Studio Schedule Tasks only created new rows. Existing tasks
+        // showed Test run and Active, so owners could not change name,
+        // instruction, or frequency. Edit must open the dedicated
+        // Edit Scheduled Task draft with the same id and saved spec.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(piper)
+        vm.routineName = "QA morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineSpec.provider = .grok
+        vm.routineSpec.providerInstanceID = "grok"
+        vm.routineSpec.routingMode = .auto
+        vm.routineSpec.frequency = .daily
+        vm.routineSpec.localTimeHour = 9
+        vm.routineSpec.localTimeMinute = 0
+        vm.saveRoutine()
+        let id = try XCTUnwrap(vm.routines.first?.definition.id)
+        vm.setRoutineEnabled(id: id, enabled: true)
+        let routine = try XCTUnwrap(vm.routines.first)
+        XCTAssertEqual(vm.screen, .studio)
+
+        vm.editRoutine(routine)
+
+        XCTAssertEqual(vm.screen, .scheduleTasks)
+        let draft = try XCTUnwrap(vm.scheduleTaskDraft)
+        XCTAssertFalse(draft.isNew)
+        XCTAssertEqual(draft.id, routine.definition.id)
+        XCTAssertEqual(draft.botID, piper.id)
+        XCTAssertEqual(draft.name, "QA morning scan")
+        XCTAssertEqual(draft.prompt, "Scan overnight failures")
+        XCTAssertTrue(draft.isEnabled)
+        XCTAssertEqual(draft.spec.provider, .grok)
+        XCTAssertEqual(draft.spec.routingMode, .auto)
+        XCTAssertEqual(draft.spec.frequency, .daily)
+        XCTAssertEqual(draft.spec.localTimeHour, 9)
+
+        var edited = draft
+        edited.name = "QA evening scan"
+        edited.prompt = "Scan the afternoon queue"
+        edited.spec.frequency = .weekdays
+        vm.saveScheduleTask(edited)
+
+        XCTAssertNil(vm.scheduleTaskDraft)
+        XCTAssertEqual(vm.scheduleTaskItems.map(\.name), ["QA evening scan"])
+        XCTAssertEqual(vm.scheduleTaskItems.count, 1)
+        XCTAssertEqual(vm.routines.map(\.definition.name), ["QA evening scan"])
+        XCTAssertEqual(vm.routines.count, 1)
+        let saved = try XCTUnwrap(vm.scheduleTaskItems.first)
+        XCTAssertEqual(saved.id, routine.definition.id)
+        XCTAssertEqual(saved.prompt, "Scan the afternoon queue")
+        XCTAssertEqual(saved.scheduleNote, "Weekdays 09:00")
+        let spec = try XCTUnwrap(BotScheduleSpec.decodeJSON(saved.scheduleSpecJSON))
+        XCTAssertEqual(spec.frequency, .weekdays)
     }
 
     func test_searchKeepsSelectedVisible_becauseChatMustMatchTheRoster() throws {
@@ -2682,6 +2747,116 @@ final class BotsWindowTests: XCTestCase {
         _ = try vm.saveStudio()
         XCTAssertEqual(try home.readSoul(), "Own the inbox.")
         XCTAssertEqual(vm.selectedRevision?.soul, "Own the inbox.")
+
+        vm.attachHomeFilesSurface(for: try XCTUnwrap(vm.selectedBot))
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        let surfaceID = SurfaceID(bot.id.value)
+        let opened = try router.filesEditOpen(surface: surfaceID, path: BotHome.soulName)
+        let sessionID = try XCTUnwrap(opened.objectValue?["session_id"]?.stringValue)
+        let current = opened.objectValue?["content"]?.stringValue ?? ""
+        _ = try router.filesEditApplyPatch(
+            sessionID: sessionID,
+            baseDraftRevision: opened.objectValue?["draft_revision"]?.intValue ?? 1,
+            rangeLocation: 0,
+            rangeLength: (current as NSString).length,
+            replacement: "From FilesSurface.",
+            deviceID: "test"
+        )
+        _ = try router.filesEditSave(sessionID: sessionID)
+        XCTAssertEqual(vm.selectedRevision?.soul, "From FilesSurface.")
+        XCTAssertEqual(try home.readSoul(), "From FilesSurface.")
+        _ = try? router.filesEditClose(sessionID: sessionID)
+    }
+
+    func test_studioFilesSurfaceListsBotHomeNotAdvertisedWorkspace() throws {
+        // WHY: Studio Files used a custom list. Owners asked for the Agentic
+        // Files component. The model must list the exclusive bot home, not
+        // the advertised workspace cwd, so edits cannot leak into the project.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openStudio(bot)
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        defer { model.close() }
+        let home = vm.botHome(for: bot)
+        XCTAssertEqual(model.root, home.root.path)
+        XCTAssertTrue(model.root.contains("/bots/"))
+        XCTAssertTrue(model.root.contains(bot.id.value.uuidString.lowercased()))
+        model.loadDirectory("")
+        XCTAssertTrue(
+            Set(model.entries.map(\.name)).isSuperset(of: [
+                BotHome.identityName,
+                BotHome.descriptionName,
+                BotHome.soulName,
+                BotHome.memoryName,
+                BotHome.skillsDirectoryName,
+                BotHome.filesDirectoryName
+            ])
+        )
+    }
+
+    func test_studioFilesSurfaceLocksIdentityAndMemoryProjections() throws {
+        // WHY: IDENTITY.md and memory.md are generated projections. The
+        // Agentic Files editor would persist a handle rewrite unless the
+        // listing marks those rows read-only.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openStudio(bot)
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        defer { model.close() }
+        model.loadDirectory("")
+        let identity = try XCTUnwrap(model.entries.first { $0.name == BotHome.identityName })
+        let memory = try XCTUnwrap(model.entries.first { $0.name == BotHome.memoryName })
+        let soul = try XCTUnwrap(model.entries.first { $0.name == BotHome.soulName })
+        XCTAssertFalse(identity.isEditable)
+        XCTAssertFalse(memory.isEditable)
+        XCTAssertTrue(soul.isEditable)
+    }
+
+    func test_studioFilesOpenTabDoesNotMountWorkspacePane() throws {
+        // WHY: FilesViewModel "Open in New Tab" normally mounts a workspace
+        // Files pane. Bot home is not an advertised workspace, so the same
+        // control must stay inside Studio.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openStudio(bot)
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        defer { model.close() }
+        model.loadDirectory("")
+        let soul = try XCTUnwrap(model.entries.first { $0.name == BotHome.soulName })
+        model.openInNewTab(soul)
+        XCTAssertEqual(router.lastOpenTabPath, BotHome.soulName)
+        XCTAssertNil(model.errorText)
+    }
+
+    func test_openHomeFileRevealsOwnedSkillInStudioFiles() throws {
+        // WHY: Skills Open used to write homeDraft only. Studio Files now
+        // hosts FilesSurfaceRoot, so that path left the preview on
+        // "No file selected" instead of skills/<id>/SKILL.md.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openStudio(bot)
+        vm.thisBotSkillDraft = "night-scan"
+        vm.createThisBotSkill()
+        let path = "skills/night-scan/SKILL.md"
+        XCTAssertNil(vm.errorMessage, vm.errorMessage ?? "")
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        defer { model.close() }
+        XCTAssertEqual(model.selectedPath, path)
+        XCTAssertEqual(vm.studioTab, .files)
+
+        model.selectedEntry = nil
+        XCTAssertNil(model.selectedPath)
+        vm.openHomeFile(path)
+        XCTAssertEqual(vm.homeFilesModel?.selectedPath, path)
+        XCTAssertEqual(vm.homeFilesModel?.selectedEntry?.name, "SKILL.md")
     }
 
     func test_previewBrainReusesUnchangedAssembly_becauseBrainDestMustNotRecompile() throws {

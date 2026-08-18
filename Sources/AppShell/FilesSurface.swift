@@ -1668,7 +1668,8 @@ final class FilesViewModel: ObservableObject {
     }
 }
 
-private struct FilesSurfaceRoot: View {
+/// Shared Files UI. Agent App panes and Studio bot home both host this view.
+struct FilesSurfaceRoot: View {
     @ObservedObject var model: FilesViewModel
     @AppStorage("files.sidebar.width.v2") private var sidebarWidth: Double = 260
     @AppStorage("files.sidebar.intent.v1") private var sidebarIntentRaw = AdaptiveSidebarIntent.auto.rawValue

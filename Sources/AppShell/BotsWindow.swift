@@ -588,6 +588,8 @@ public final class BotsViewModel: ObservableObject {
     @Published public var selectedHomePath: String?
     @Published public var homeDraft: String = ""
     @Published public private(set) var homeOriginal: String = ""
+    @Published private(set) var homeFilesModel: FilesViewModel?
+    private var homeFilesRouter: BotHomeFilesRouter?
     @Published public var thisBotSkillDraft: String = ""
     @Published public var routineName: String = "" {
         didSet { persistInspectorIfHydrated() }
@@ -801,6 +803,17 @@ public final class BotsViewModel: ObservableObject {
 
     public func editScheduleTask(_ item: BotScheduleTaskItem) {
         scheduleTaskDraft = BotScheduleTaskDraft(item: item)
+    }
+
+    /// Studio and the Desk inspector only listed Test run / Active.
+    /// Open the same Edit Scheduled Task screen the fleet dest already uses.
+    public func editRoutine(_ routine: BotRoutine) {
+        guard let bot = bots.first(where: { $0.id == routine.definition.botID }) else {
+            errorMessage = "Pick a bot for this scheduled task."
+            return
+        }
+        editScheduleTask(BotScheduleTaskItem(routine: routine, bot: bot))
+        openScheduleTasks()
     }
 
     public func saveScheduleTask(_ draft: BotScheduleTaskDraft) {
@@ -1970,6 +1983,8 @@ public final class BotsViewModel: ObservableObject {
             selectedHomePath = relativePath
             homeDraft = text
             homeOriginal = text
+            attachHomeFilesSurface(for: bot)
+            homeFilesModel?.reveal(relativePath: relativePath)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -2023,6 +2038,44 @@ public final class BotsViewModel: ObservableObject {
             studioTab = .files
         } catch {
             errorMessage = String(describing: error)
+        }
+    }
+
+    public func attachHomeFilesSurface(for bot: BotDefinition) {
+        let home = botHome(for: bot)
+        ensureBotHome(bot, revision: selectedRevision)
+        if let model = homeFilesModel, model.root == home.root.path {
+            return
+        }
+        homeFilesModel?.close()
+        let workspaceID = WorkspaceID(bot.id.value)
+        let router = BotHomeFilesRouter(root: home.root.path, workspaceID: workspaceID)
+        router.onDidSave = { [weak self] path, content in
+            self?.publishHomeFileIfNeeded(relativePath: path, contents: content)
+        }
+        homeFilesRouter = router
+        let model = FilesViewModel(
+            surfaceID: SurfaceID(bot.id.value),
+            workspaceID: workspaceID,
+            root: home.root.path,
+            router: router
+        )
+        homeFilesModel = model
+        model.loadInitialState()
+    }
+
+    var homeFilesRouterForTesting: BotHomeFilesRouter? { homeFilesRouter }
+
+    public func publishHomeFileIfNeeded(relativePath: String, contents: String) {
+        switch relativePath {
+        case BotHome.soulName:
+            studioDraft.soul = contents
+            _ = try? saveStudio()
+        case BotHome.descriptionName:
+            studioDraft.description = contents
+            _ = try? saveStudio()
+        default:
+            break
         }
     }
 
@@ -4807,7 +4860,7 @@ public struct BotsRootView: View {
                 case .skills:
                     studioPage { skillsTab }
                 case .files:
-                    studioPage { filesTab }
+                    filesTab
                 case .routines:
                     studioPage { routinesTab }
                 case .security:
@@ -6278,65 +6331,27 @@ public struct BotsRootView: View {
     }
 
     private var filesTab: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xxl) {
-            studioSectionHeader(
-                BotsChrome.Label.files,
-                caption: "This teammate’s exclusive folder. SOUL.md and Description publish like Save Bot. Identity and memory.md are projections."
-            )
-            HStack(alignment: .top, spacing: DS.Space.xl) {
-                VStack(alignment: .leading, spacing: DS.Space.sm) {
-                    ForEach(vm.homeFiles, id: \.self) { path in
-                        Button {
-                            vm.openHomeFile(path)
-                        } label: {
-                            Text(path)
-                                .font(DS.Font.caption.monospaced())
-                                .foregroundColor(vm.selectedHomePath == path ? DS.Palette.onAccent : DS.Palette.text)
-                                .padding(.horizontal, DS.Space.md)
-                                .padding(.vertical, DS.Space.sm)
-                                .background(vm.selectedHomePath == path ? DS.Palette.accent : Color.clear)
-                                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityIdentifier("bots.studio.files.row.\(path)")
-                    }
-                }
-                .frame(minWidth: 200, alignment: .leading)
-                VStack(alignment: .leading, spacing: DS.Space.md) {
-                    if let path = vm.selectedHomePath {
-                        Text(path)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                        studioMultiline(text: $vm.homeDraft, minHeight: 240)
-                            .accessibilityLabel("Bot file")
-                            .accessibilityIdentifier("bots.studio.files.editor")
-                        HStack {
-                            Spacer()
-                            Button("Discard") { vm.discardHomeFile() }
-                                .buttonStyle(DSSecondaryButtonStyle())
-                                .disabled(vm.homeDraft == vm.homeOriginal)
-                                .accessibilityIdentifier("bots.studio.files.discard")
-                            Button("Save") { vm.saveHomeFile() }
-                                .buttonStyle(BotsPrimaryButtonStyle())
-                                .disabled(vm.homeDraft == vm.homeOriginal)
-                                .accessibilityIdentifier("bots.studio.files.save")
-                        }
-                    } else {
-                        Text("Select a file in this bot’s home.")
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textTertiary)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+        Group {
+            if let model = vm.homeFilesModel {
+                FilesSurfaceRoot(model: model)
+            } else {
+                studioEmptyState(
+                    icon: "folder",
+                    title: "Bot files",
+                    subtitle: "This teammate’s exclusive folder."
+                )
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityIdentifier("bots.studio.files")
         .onAppear {
             if let bot = vm.selectedBot {
-                vm.ensureBotHome(bot, revision: vm.selectedRevision)
-                if vm.selectedHomePath == nil, let first = vm.homeFiles.first {
-                    vm.openHomeFile(first)
-                }
+                vm.attachHomeFilesSurface(for: bot)
+            }
+        }
+        .onChange(of: vm.selectedBotID) { _ in
+            if let bot = vm.selectedBot {
+                vm.attachHomeFilesSurface(for: bot)
             }
         }
     }
@@ -6474,10 +6489,20 @@ public struct BotsRootView: View {
     private func routineRowBody(_ routine: BotRoutine) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             HStack(spacing: DS.Space.lg) {
-                Text(routine.definition.name)
-                    .font(DS.Font.bodyStrong)
-                    .foregroundColor(DS.Palette.text)
-                Spacer(minLength: DS.Space.lg)
+                Button {
+                    vm.editRoutine(routine)
+                } label: {
+                    Text(routine.definition.name)
+                        .font(DS.Font.bodyStrong)
+                        .foregroundColor(DS.Palette.text)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Edit \(routine.definition.name)")
+                Button("Edit") { vm.editRoutine(routine) }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("bots.routines.edit")
                 Button("Test run") { vm.requestRoutineTestRun(id: routine.definition.id) }
                     .buttonStyle(DSSecondaryButtonStyle())
                     .accessibilityIdentifier("bots.routines.test")
