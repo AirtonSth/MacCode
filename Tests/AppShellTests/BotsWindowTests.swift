@@ -1644,6 +1644,35 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_studioRoutineActiveSwitchSaysActiveAndName_becauseTitleAloneHidesTheJob() throws {
+        // WHY: Computer Use / VoiceOver named the Studio Active switch
+        // "QA morning scan" only. The visible job is Active; the title
+        // is already a heading. Speak both so the switch is not just
+        // another copy of the task name.
+        let source = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"),
+            encoding: .utf8
+        )
+        guard let start = source.range(of: "private func routineRowBody") else {
+            return XCTFail("studio routine row must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "// MARK: Shared chrome")?.lowerBound ?? rest.endIndex
+        let body = String(source[start.lowerBound..<end])
+        XCTAssertTrue(
+            body.contains("Toggle(\"Active\""),
+            "the visible switch title stays Active"
+        )
+        XCTAssertTrue(
+            body.contains(".accessibilityLabel(\"Active, \\(routine.definition.name)\")"),
+            "VoiceOver must hear Active plus the routine name"
+        )
+        XCTAssertFalse(
+            body.contains(".accessibilityLabel(routine.definition.name)"),
+            "the switch must not reuse the heading as its only name"
+        )
+    }
+
     func test_searchKeepsSelectedVisible_becauseChatMustMatchTheRoster() throws {
         // WHY: searching "copy" hid the open teammate while Desk still painted
         // their chat. Keep the selected row in the list so dest and roster agree.
@@ -5660,8 +5689,8 @@ final class BotsWindowTests: XCTestCase {
             "Studio Skills enable switch must name the catalog id, not sit unlabeled beside On"
         )
         XCTAssertTrue(
-            bots.contains(".accessibilityLabel(routine.definition.name)"),
-            "Routines Active switch must name the routine, not sit unlabeled beside Active"
+            bots.contains(".accessibilityLabel(\"Active, \\(routine.definition.name)\")"),
+            "Routines Active switch must say Active plus the routine name, not only the title"
         )
         XCTAssertTrue(
             bots.contains(

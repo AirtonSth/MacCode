@@ -6186,7 +6186,7 @@ public struct BotsRootView: View {
                 .toggleStyle(.switch)
                 .labelsHidden()
                 .controlSize(.small)
-                .accessibilityLabel(routine.definition.name)
+                .accessibilityLabel("Active, \(routine.definition.name)")
                 .accessibilityIdentifier("bots.routines.active")
             }
             Text(routine.definition.prompt)
