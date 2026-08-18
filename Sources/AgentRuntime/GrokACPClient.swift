@@ -622,10 +622,26 @@ public final class GrokACPClient: @unchecked Sendable {
         )
     }
 
+    /// ACP `session/new` cwd must be an existing absolute path. Empty or
+    /// relative values (workspace-less bot threads falling through to
+    /// `FileManager.default.currentDirectoryPath`) are `-32602 Invalid params`
+    /// (`Path is not absolute`).
+    public static func resolvedSessionCwd(
+        _ cwd: String,
+        home: String = FileManager.default.homeDirectoryForCurrentUser.path,
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> String {
+        let trimmed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("/"), fileExists(trimmed) {
+            return trimmed
+        }
+        return home
+    }
+
     func newSession(cwd: String) async throws -> GrokACPSessionOpenResult {
         let result = try await requestJSONObject(
             method: "session/new",
-            params: ["cwd": cwd, "mcpServers": Self.sessionMCPServers()],
+            params: ["cwd": Self.resolvedSessionCwd(cwd), "mcpServers": Self.sessionMCPServers()],
             timeout: 20
         )
         return try Self.openResult(result, fallbackSessionId: nil)
@@ -641,7 +657,7 @@ public final class GrokACPClient: @unchecked Sendable {
     ) async throws -> GrokACPSessionOpenResult {
         var params: JSONObject = [
             "sessionId": sessionId,
-            "cwd": cwd,
+            "cwd": Self.resolvedSessionCwd(cwd),
             "mcpServers": Self.sessionMCPServers(),
         ]
         if noReplay {

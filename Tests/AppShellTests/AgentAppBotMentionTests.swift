@@ -1,4 +1,5 @@
 import XCTest
+import AgentRuntime
 import CoreModel
 @testable import AppShell
 @testable import Persistence
@@ -64,5 +65,85 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertTrue(source.contains("configureAgentAppBotMentions"))
         XCTAssertTrue(source.contains("runMentionedPrompt"))
         XCTAssertTrue(source.contains("presentBotPeerMessage"))
+    }
+
+    func test_agentAppDispatchStartsPeerAndPaintsReply() async throws {
+        // WHY: Agent App used to stub dispatch. The shipped router must
+        // start the mentioned bot and persist Message from on this thread.
+        let (router, botsVM, surface, quinn, threadId, ctx) = try makeWiredMentionSurface(
+            peerReply: "PONG from Quinn"
+        )
+        await router.dispatchAgentAppBotMentions(
+            peers: [quinn],
+            text: "@\(quinn.handle) check WhatsApp",
+            threadId: threadId,
+            onto: surface
+        )
+        XCTAssertEqual(botsVM.lastMentionedBotIDForTesting, quinn.id)
+        XCTAssertTrue(
+            botsVM.supervisedRunBotIDsForTesting.contains(quinn.id),
+            "Agent App mention must start the peer provider run"
+        )
+        let stored = try ctx.messageRepo.listRecent(threadId: threadId, limit: 16)
+        let inbound = try XCTUnwrap(stored.last(where: { $0.role == .assistant }))
+        let parsed = try XCTUnwrap(BotPeerTranscript.parse(inbound.content))
+        XCTAssertTrue(parsed.caption.contains("Message from Quinn"))
+        XCTAssertTrue(parsed.body.contains("PONG from Quinn"))
+    }
+
+    func test_agentAppHopOmitsMentionToken() async throws {
+        // WHY: hop-1 must feed the Agent thread the peer reply without
+        // `@handle`, or dispatchBotMentions would loop.
+        let (router, _, surface, quinn, threadId, _) = try makeWiredMentionSurface(
+            peerReply: "inbox is clear"
+        )
+        await router.dispatchAgentAppBotMentions(
+            peers: [quinn],
+            text: "@\(quinn.handle) what is in the inbox?",
+            threadId: threadId,
+            onto: surface
+        )
+        let hop = try XCTUnwrap(router.lastAgentAppHopTextForTesting)
+        XCTAssertEqual(
+            hop,
+            BotPeerTranscript.hostHopPrompt(peerName: quinn.name, reply: "inbox is clear")
+        )
+        XCTAssertFalse(BotPeerTranscript.containsMentionToken(hop, handle: quinn.handle))
+        XCTAssertFalse(hop.contains("@\(quinn.handle)"))
+    }
+
+    private func makeWiredMentionSurface(
+        peerReply: String
+    ) throws -> (
+        router: AppCommandRouter,
+        botsVM: BotsViewModel,
+        surface: AgentAppSurface,
+        quinn: BotDefinition,
+        threadId: AgentThreadID,
+        ctx: AppContext
+    ) {
+        let dir = NSTemporaryDirectory() + "RC2AgentMentionLive-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let fake = FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: peerReply))
+        ctx.coordinator.replaceProvider(.claude, runner: fake)
+        ctx.coordinator.replaceProvider(.codex, runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: peerReply)))
+        ctx.coordinator.replaceProvider(.grok, runner: FakeProviderRunner(provider: .grok, scenario: .simpleAssistant(reply: peerReply)))
+        let botsVM = BotsViewModel(context: ctx, router: router)
+        router.botsViewModel = botsVM
+        let quinn = try botsVM.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        botsVM.setDeskProvider(.claude)
+        let surface = AgentAppSurface(
+            workspaceID: WorkspaceID(),
+            cwd: dir,
+            coordinator: ctx.coordinator,
+            threadRepo: ctx.threadRepo,
+            messageRepo: ctx.messageRepo
+        )
+        surface.viewModel.mentionableBotsProvider = { botsVM.bots }
+        surface.viewModel.createThread(title: "Mention thread")
+        let threadId = try XCTUnwrap(surface.viewModel.selectedThreadId)
+        return (router, botsVM, surface, quinn, threadId, ctx)
     }
 }

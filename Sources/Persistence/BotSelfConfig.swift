@@ -59,7 +59,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case getSettings:
             return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, Default route, Model, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.removeHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty) \(BotBrainCompiler.userRequestHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.removeHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty) \(BotBrainCompiler.userRequestHonesty)"
         case putMemory:
             return "Remember a fact on this bot."
         case forgetMemory:
@@ -92,9 +92,9 @@ public enum BotSelfConfigCatalog: Sendable {
                     "title": ["type": "string", "description": "Role / job. Same field as Studio Role."],
                     "description": ["type": "string"],
                     "soul": ["type": "string", "description": "Instructions. Same field as Studio Instructions."],
-                    "provider": ["type": "string", "description": "Default route. Claude, Codex, or Grok. Same field as Studio Default route."],
+                    "provider": ["type": "string", "description": "Optional first-send seed. Not a Studio setting."],
                     "provider_instance_id": ["type": "string"],
-                    "model": ["type": "string", "description": "Model. Same field as Studio Model."],
+                    "model": ["type": "string", "description": "Optional first-send seed. Not a Studio setting."],
                     "notifications_enabled": ["type": "boolean", "description": "Notifications On/Off."],
                     "avatar_symbol": ["type": "string", "description": "Avatar. Same field as Studio Avatar."],
                 ]) { _, new in new },

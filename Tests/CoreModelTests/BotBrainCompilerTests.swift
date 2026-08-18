@@ -903,6 +903,34 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertFalse(receipt.compiledPayload.contains("session"))
     }
 
+    func test_compileOmitsDefaultRoute() {
+        // WHY: Studio no longer publishes a provider. Compiling Default
+        // route would lock the teammate to Claude/Codex/Grok in every
+        // provider turn.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Hi")
+        XCTAssertFalse(receipt.compiledPayload.contains("Default route:"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Model: opus"))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, false)
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.macosHarnessTool))
+    }
+
     func test_routeHonestyCompilesForCustomSoul_becauseDeskRouteIsNotAnEscapeHatch() {
         // WHY: Studio already says Default route. Compile listed Route, so
         // first-chat "what's your Default route?" invented a hop. Default
@@ -925,21 +953,11 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What model are you?")
-        XCTAssertTrue(receipt.compiledPayload.contains("Default route: Claude · opus"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Model: opus"))
-        XCTAssertTrue(receipt.compiledPayload.contains(BotRoute.fallbackOrderHonesty))
+        XCTAssertFalse(receipt.compiledPayload.contains("Default route:"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Model: opus"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, true)
-        XCTAssertEqual(
-            receipt.layers.first(where: { $0.kind == .route })?.text,
-            "Claude · opus. \(BotRoute.fallbackOrderHonesty)"
-        )
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.title, "Route")
-        XCTAssertEqual(
-            receipt.layers.first(where: { $0.kind == .route })?.reason,
-            "Advertised provider and model. Desk already shows this route."
-        )
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, false)
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Default route:"),
             "route layer owns the provider/model"
@@ -972,16 +990,11 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's your Model?")
-        XCTAssertTrue(receipt.compiledPayload.contains("Model: opus"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Default route: Claude · opus"))
-        XCTAssertTrue(receipt.compiledPayload.contains(BotRoute.fallbackOrderHonesty))
+        XCTAssertFalse(receipt.compiledPayload.contains("Model: opus"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Default route:"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.title, "Route")
-        XCTAssertEqual(
-            receipt.layers.first(where: { $0.kind == .route })?.text,
-            "Claude · opus. \(BotRoute.fallbackOrderHonesty)"
-        )
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, false)
         XCTAssertEqual(BotBrainCompiler.modelLine("opus"), "Model: opus")
         XCTAssertNil(BotBrainCompiler.modelLine("  "))
     }
@@ -1013,7 +1026,7 @@ final class BotBrainCompilerTests: XCTestCase {
             revision: revision,
             userText: "If Claude is down use Grok"
         )
-        XCTAssertTrue(receipt.compiledPayload.contains("Default route: Claude · opus. \(BotRoute.fallbackOrderHonesty)"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Default route:"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains("bot_set_fallback"))
         XCTAssertFalse(receipt.compiledPayload.contains("compatibleRouteSet"))
@@ -1026,11 +1039,7 @@ final class BotBrainCompilerTests: XCTestCase {
             "compiler layer owns Fallback order"
         )
         XCTAssertFalse(receipt.layers.contains { $0.title == "Fallback" })
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.title, "Route")
-        XCTAssertEqual(
-            receipt.layers.first(where: { $0.kind == .route })?.text,
-            "Claude · opus. \(BotRoute.fallbackOrderHonesty)"
-        )
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, false)
     }
 
     func test_admittedToolsCompileForCustomSoul_becauseDeskToolsAreNotAnEscapeHatch() {
@@ -1094,7 +1103,7 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Change your description")
-        XCTAssertTrue(receipt.compiledPayload.contains("name, Role, Instructions, description, Default route, Model, notifications, or avatar"))
+        XCTAssertTrue(receipt.compiledPayload.contains("name, Role, Instructions, description, notifications, or avatar"))
         XCTAssertFalse(receipt.compiledPayload.contains("job, standing instructions"), "leftover job is not advertised")
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.changeJobTool))
         XCTAssertTrue(receipt.compiledPayload.contains("Description: Looks around"))
@@ -1160,13 +1169,9 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Hi")
-        XCTAssertTrue(receipt.compiledPayload.contains("Default route: Grok. \(BotRoute.fallbackOrderHonesty)"))
-        XCTAssertFalse(receipt.compiledPayload.contains("Default route: Grok ·"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Default route:"))
         XCTAssertFalse(receipt.compiledPayload.contains("Model:"), "Desk hides the pill")
-        XCTAssertEqual(
-            receipt.layers.first(where: { $0.kind == .route })?.text,
-            "Grok. \(BotRoute.fallbackOrderHonesty)"
-        )
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, false)
     }
 
     func test_permissionHonestyCompilesForCustomSoul_becauseRouteHonestyIsNotAnEscapeHatch() {

@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 public enum BotBrowserMCPAdmit: Sendable {
     public static let serverName = BotBrowserCatalog.serverName
@@ -15,17 +16,18 @@ public enum BotBrowserMCPAdmit: Sendable {
         command: String,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: Any] {
-        var server: [String: Any] = [
-            "name": serverName,
-            "command": command,
-            "args": [cliArgument],
-        ]
+        var extra: [String: String] = [:]
         if let botID = environment[BotBrowserCatalog.callerEnvironmentKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !botID.isEmpty {
-            server["env"] = [BotBrowserCatalog.callerEnvironmentKey: botID]
+            extra[BotBrowserCatalog.callerEnvironmentKey] = botID
         }
-        return server
+        return GrokACPMcpServer.stdio(
+            name: serverName,
+            command: command,
+            args: [cliArgument],
+            extraEnv: extra
+        )
     }
 
     public static func admitClaude(existing: [String: Any], command: String) -> [String: Any] {

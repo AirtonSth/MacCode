@@ -216,7 +216,8 @@ final class BotTypesTests: XCTestCase {
         // a hop. Hermes agents persist the advertised name.
         let tools = BotStandingInstructions.admittedToolsText
         XCTAssertTrue(tools.contains(BotStandingInstructions.changeJobTool))
-        XCTAssertTrue(tools.contains("name, Role, Instructions, description, Default route, Model, notifications, or avatar"))
+        XCTAssertTrue(tools.contains("name, Role, Instructions, description, notifications, or avatar"))
+        XCTAssertFalse(tools.contains("Default route"), "Studio no longer publishes a route")
         XCTAssertFalse(tools.contains("job, standing instructions"), "leftover job is not advertised")
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")

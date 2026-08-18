@@ -22,10 +22,9 @@ public enum BotsChrome {
         public static let nextRoutine = "Next Routine"
         public static let memory = "Memory"
         public static let skills = "Skills"
-        public static let routines = "Routines"
+        public static let routines = "Schedule Tasks"
         public static let approvals = "Approvals"
         public static let roleAndIdentity = "Role & Identity"
-        public static let providerRouting = "Provider routing"
         public static let instructions = "Instructions"
         public static let configurationSummary = "Configuration summary"
         public static let security = "Security"
@@ -68,7 +67,6 @@ public enum BotsChrome {
         Label.routines,
         Label.approvals,
         Label.roleAndIdentity,
-        Label.providerRouting,
         Label.instructions,
         Label.configurationSummary,
         Label.security,

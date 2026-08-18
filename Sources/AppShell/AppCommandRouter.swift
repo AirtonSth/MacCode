@@ -300,6 +300,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
     public weak var botsViewModel: BotsViewModel?
+    public private(set) var lastAgentAppHopTextForTesting: String?
     var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
     var providerSignInTerminalInputSenderForTests: ((SurfaceID, String) -> TerminalInputStatus)?
     var terminalRestartRuntimePreparerForTesting: ((WorkspaceID, String, SurfaceID) -> TerminalPreparedPTYRuntime?)?
@@ -2473,7 +2474,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func dispatchAgentAppBotMentions(
+    func dispatchAgentAppBotMentions(
         peers: [BotDefinition],
         text: String,
         threadId: AgentThreadID,
@@ -2482,12 +2483,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let agent else { return }
         // sam-goal: hop-1 only. A follow-up that still contains @handle
         // would loop. Upgrade: multi-hop with an explicit hop budget.
+        lastAgentAppHopTextForTesting = nil
         for peer in peers {
             guard let reply = await botsViewModel?.runMentionedPrompt(peer: peer, text: text),
                   !reply.isEmpty else { continue }
             agent.viewModel.presentBotPeerMessage(peer: peer, text: reply, threadId: threadId)
+            let hop = BotPeerTranscript.hostHopPrompt(peerName: peer.name, reply: reply)
+            lastAgentAppHopTextForTesting = hop
             await agent.viewModel.sendBotPeerFollowUp(
-                text: "\(peer.name) replied:\n\(reply)",
+                text: hop,
                 threadId: threadId
             )
         }
@@ -4226,7 +4230,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func prepareAgentExecutionCwd(thread: inout AgentThread) throws -> String {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? FileManager.default.currentDirectoryPath
-        guard thread.executionMode == .worktree else { return workspaceCwd }
+        let cwd = GrokACPClient.resolvedSessionCwd(workspaceCwd)
+        guard thread.executionMode == .worktree else { return cwd }
         if let path = thread.worktreePath, FileManager.default.fileExists(atPath: path) {
             return path
         }

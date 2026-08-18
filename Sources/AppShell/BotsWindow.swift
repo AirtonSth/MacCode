@@ -301,6 +301,8 @@ public enum BotsScreen: String, Equatable {
     case studio
     case desk
     case attention
+    case activeBots
+    case scheduleTasks
 
     /// Home/fleet and the old Attention full-screen are not destinations.
     /// Leftover persist remaps them to Chat.
@@ -308,6 +310,10 @@ public enum BotsScreen: String, Equatable {
         switch self {
         case .studio:
             return .studio
+        case .activeBots:
+            return .activeBots
+        case .scheduleTasks:
+            return .scheduleTasks
         case .desk, .fleet, .attention:
             return .desk
         }
@@ -434,8 +440,18 @@ public final class BotsViewModel: ObservableObject {
                 return
             }
             persistScreen()
+            router?.windowController?.refreshBotsChromeTitle()
         }
     }
+    @Published public var activeBotsTab: ActiveBotsTab = .active
+    @Published public var activeBotsSearchText: String = ""
+    @Published public private(set) var activeBotItems: [ActiveBotScreenItem] = []
+    @Published public private(set) var finishedBotItems: [FinishedBotScreenItem] = []
+    @Published public var scheduleTaskSearchText: String = "" { didSet { applyScheduleTaskFilters() } }
+    @Published public var scheduleTaskStatusFilter: ScheduledTaskStatusFilter = .all { didSet { applyScheduleTaskFilters() } }
+    @Published public private(set) var scheduleTaskItems: [BotScheduleTaskItem] = []
+    @Published public private(set) var scheduleTaskFilterCounts: (all: Int, active: Int, paused: Int) = (0, 0, 0)
+    @Published public var scheduleTaskDraft: BotScheduleTaskDraft?
     @Published public var inspectorTab: BotDeskInspectorTab = .memory {
         didSet { persistInspectorTab() }
     }
@@ -464,6 +480,10 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var lastDeskRunPermissionForTesting: AgentPermissionMode?
     public private(set) var lastDeskRunReasoningForTesting: AgentReasoningEffort?
     public private(set) var lastMentionedBotIDForTesting: BotID?
+    public var activeThreadIDsOverrideForTesting: Set<AgentThreadID>?
+    public private(set) var lastHopUserTextForTesting: String?
+    public private(set) var lastSupervisedRunUserTextForTesting: String?
+    public private(set) var supervisedRunBotIDsForTesting: [BotID] = []
     @Published public var isStopping = false
     @Published public private(set) var queuedFollowUps: [BotQueuedFollowUp] = []
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
@@ -586,6 +606,7 @@ public final class BotsViewModel: ObservableObject {
     private var lastPreviewByBot: [BotID: String] = [:]
     private var lastUpdatedByBot: [BotID: Date] = [:]
     private var lastLinkedRunIDByBot: [BotID: AgentRunID] = [:]
+    private var lastStartedConversationByBot: [BotID: BotConversation] = [:]
     private var liveTimelineByBot: [BotID: AssistantTimelineState] = [:]
     private var liveStreamCountByBot: [BotID: Int] = [:]
     private var queuedFollowUpsByBot: [BotID: [BotQueuedFollowUp]] = [:]
@@ -673,32 +694,262 @@ public final class BotsViewModel: ObservableObject {
 
     public var openAttentionCount: Int { attentionItems.count }
 
-    /// Working + needs-you teammates, for the Active Bots badge.
-    public var activeBotCount: Int {
-        bots.reduce(into: 0) { count, bot in
-            switch attentionState(for: bot) {
-            case .working, .needsAttention: count += 1
-            default: break
-            }
+    public var chromeTitle: String {
+        switch screen.resolvedDestination {
+        case .activeBots: return BotsChrome.Label.activeBots
+        case .scheduleTasks: return BotsChrome.Label.scheduleTasks
+        default: return BotsChrome.Label.bots
         }
     }
 
-    /// Dest to the first teammate that makes the Active Bots badge non-zero.
-    public func openActiveBots() {
-        if let item = destOpenAttentionItem() {
-            openAttention(item)
-            return
+    /// Bots that are actually running — same idea as Active Threads.
+    /// Needs-you is not a live run.
+    public var activeBotCount: Int { liveWorkingBots().count }
+
+    public var activeBotsFooterLine: String {
+        let activeLabel = activeBotCount == 1 ? "1 active" : "\(activeBotCount) active"
+        let finishedLabel = finishedBotItems.count == 1
+            ? "1 recent finished"
+            : "\(finishedBotItems.count) recent finished"
+        return "\(activeLabel) · \(finishedLabel)"
+    }
+
+    public var activeBotsSubtitle: String {
+        if activeBotCount == 0 {
+            return "No bots running right now"
         }
-        if let bot = bots.first(where: {
-            switch attentionState(for: $0) {
-            case .needsAttention, .working: return true
-            default: return false
+        return activeBotCount == 1
+            ? "1 bot is running"
+            : "\(activeBotCount) bots are running"
+    }
+
+    public func filteredActiveBotItems() -> [ActiveBotScreenItem] {
+        filterActiveBotSearch(activeBotItems)
+    }
+
+    public func filteredFinishedBotItems() -> [FinishedBotScreenItem] {
+        let query = activeBotsSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return finishedBotItems }
+        return finishedBotItems.filter {
+            $0.title.lowercased().contains(query) || $0.detail.lowercased().contains(query)
+        }
+    }
+
+    private func filterActiveBotSearch(_ items: [ActiveBotScreenItem]) -> [ActiveBotScreenItem] {
+        let query = activeBotsSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return items }
+        return items.filter {
+            $0.title.lowercased().contains(query)
+                || $0.handle.lowercased().contains(query)
+                || $0.detail.lowercased().contains(query)
+                || ($0.preview?.lowercased().contains(query) ?? false)
+        }
+    }
+
+    public func openScheduleTasks() {
+        screen = .scheduleTasks
+        reloadScheduleTasks()
+    }
+
+    public func reloadScheduleTasks() {
+        let rows: [BotScheduleTaskItem] = bots.flatMap { bot in
+            ((try? botStore.listRoutines(botID: bot.id)) ?? []).map { routine in
+                BotScheduleTaskItem(routine: routine, bot: bot)
             }
-        }) {
-            openDesk(bot)
+        }
+        .sorted { lhs, rhs in
+            if lhs.isEnabled != rhs.isEnabled { return lhs.isEnabled && !rhs.isEnabled }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+        scheduleTaskSource = rows
+        applyScheduleTaskFilters()
+    }
+
+    public func createScheduleTask() {
+        guard let bot = selectedBot ?? bots.first else {
+            errorMessage = "Create a bot before adding a scheduled task."
             return
         }
-        openAttention()
+        scheduleTaskDraft = BotScheduleTaskDraft(botID: bot.id)
+    }
+
+    public func editScheduleTask(_ item: BotScheduleTaskItem) {
+        scheduleTaskDraft = BotScheduleTaskDraft(item: item)
+    }
+
+    public func saveScheduleTask(_ draft: BotScheduleTaskDraft) {
+        let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = draft.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !prompt.isEmpty else {
+            errorMessage = "Task name and instruction are required."
+            return
+        }
+        guard bots.contains(where: { $0.id == draft.botID }) else {
+            errorMessage = "Pick a bot for this scheduled task."
+            return
+        }
+        do {
+            let definition = BotRoutineDefinition(
+                id: draft.id,
+                botID: draft.botID,
+                name: name,
+                prompt: prompt,
+                scheduleNote: draft.scheduleNote
+            )
+            try botStore.saveRoutine(definition)
+            try botStore.setRoutineEnabled(id: definition.id, enabled: draft.isEnabled)
+            if selectedBotID == draft.botID {
+                adoptWrittenRoutine(definition)
+                adoptEnabledRoutine(id: definition.id, enabled: draft.isEnabled)
+            }
+            scheduleTaskDraft = nil
+            reloadScheduleTasks()
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public func deleteScheduleTask(_ item: BotScheduleTaskItem) {
+        do {
+            try botStore.deleteRoutine(id: item.id)
+            if selectedBotID == item.botID {
+                routines.removeAll { $0.definition.id == item.id }
+            }
+            reloadScheduleTasks()
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public func setAutonomyActive(_ on: Bool) {
+        settingsStore.update { $0.botsAutonomyEnabled = on }
+        refreshFlags()
+    }
+
+    public var scheduleTasksFooterLine: String {
+        let all = scheduleTaskFilterCounts.all
+        let active = scheduleTaskFilterCounts.active
+        let tasks = all == 1 ? "1 task" : "\(all) tasks"
+        let live = active == 1 ? "1 active" : "\(active) active"
+        return "\(tasks) · \(live)"
+    }
+
+    public var scheduleTasksSubtitle: String {
+        if isAutonomyActive {
+            return "Automate recurring bot work"
+        }
+        return "Automatic runs paused — turn Active on when you're back"
+    }
+
+    private var scheduleTaskSource: [BotScheduleTaskItem] = []
+
+    private func applyScheduleTaskFilters() {
+        let query = scheduleTaskSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let searched: [BotScheduleTaskItem]
+        if query.isEmpty {
+            searched = scheduleTaskSource
+        } else {
+            searched = scheduleTaskSource.filter { item in
+                item.name.lowercased().contains(query)
+                    || item.botName.lowercased().contains(query)
+                    || item.prompt.lowercased().contains(query)
+                    || item.scheduleNote.lowercased().contains(query)
+            }
+        }
+        scheduleTaskFilterCounts = (
+            all: searched.count,
+            active: searched.filter(\.isEnabled).count,
+            paused: searched.filter { !$0.isEnabled }.count
+        )
+        switch scheduleTaskStatusFilter {
+        case .all:
+            scheduleTaskItems = searched
+        case .active:
+            scheduleTaskItems = searched.filter(\.isEnabled)
+        case .paused:
+            scheduleTaskItems = searched.filter { !$0.isEnabled }
+        }
+    }
+
+    /// Dest to the Active Bots overview (Active / Last Finished), not a desk.
+    public func openActiveBots() {
+        screen = .activeBots
+        reloadActiveBotsScreen()
+    }
+
+    public func openActiveBotItem(_ item: ActiveBotScreenItem) {
+        if let bot = bots.first(where: { $0.id == item.botID }) ?? (try? botStore.get(id: item.botID)) {
+            openDesk(bot)
+        }
+    }
+
+    public func openFinishedBotItem(_ item: FinishedBotScreenItem) {
+        if let bot = bots.first(where: { $0.id == item.botID }) ?? (try? botStore.get(id: item.botID)) {
+            openDesk(bot)
+        }
+    }
+
+    public func reloadActiveBotsScreen() {
+        activeBotItems = liveWorkingBots().map { bot in
+            ActiveBotScreenItem(
+                bot: bot,
+                preview: rosterPreview(for: bot),
+                providerName: PetActiveThreadProjector.providerLabel(
+                    resolvedProvider(for: bot) ?? deskRouting.provider
+                ),
+                startedAt: startedAtForLiveBot(bot)
+            )
+        }
+        reloadFinishedBots()
+    }
+
+    public func liveWorkingBots() -> [BotDefinition] {
+        var seen = Set<BotID>()
+        var result: [BotDefinition] = []
+        for bot in bots {
+            if attentionState(for: bot) == .working {
+                seen.insert(bot.id)
+                result.append(bot)
+            }
+        }
+        let activeThreadIDs = activeThreadIDsOverrideForTesting
+            ?? context.coordinator.activeThreadIdsSnapshot()
+        for threadID in activeThreadIDs {
+            guard let conversation = try? botStore.conversationLinked(to: threadID) else { continue }
+            guard !seen.contains(conversation.botID) else { continue }
+            guard let bot = bots.first(where: { $0.id == conversation.botID }) else { continue }
+            seen.insert(bot.id)
+            result.append(bot)
+        }
+        return result
+    }
+
+    private func startedAtForLiveBot(_ bot: BotDefinition) -> Date? {
+        if let stamped = lastUpdatedByBot[bot.id] { return stamped }
+        return (try? botStore.listConversations(botID: bot.id))?.first?.updatedAt
+    }
+
+    private func reloadFinishedBots() {
+        let runs = (try? context.runRepo.listRecentFinished(limit: 200)) ?? []
+        var items: [FinishedBotScreenItem] = []
+        var seen = Set<AgentRunID>()
+        for run in runs {
+            guard items.count < 50 else { break }
+            guard !seen.contains(run.id) else { continue }
+            guard let conversation = try? botStore.conversationLinked(to: run.threadId) else { continue }
+            let bot = bots.first(where: { $0.id == conversation.botID })
+                ?? (try? botStore.get(id: conversation.botID))
+            guard let bot else { continue }
+            seen.insert(run.id)
+            items.append(
+                FinishedBotScreenItem(
+                    run: run,
+                    bot: bot,
+                    conversationTitle: conversation.title
+                )
+            )
+        }
+        finishedBotItems = items
     }
 
     public func attentionState(for bot: BotDefinition) -> BotAttentionState {
@@ -805,6 +1056,12 @@ public final class BotsViewModel: ObservableObject {
         // (listAttention) before dest dested Chat. Dest dests
         // this bubble first; dest dests inbox after dest dested Chat.
         reloadAttention()
+        if screen.resolvedDestination == .activeBots {
+            reloadActiveBotsScreen()
+        }
+        if screen.resolvedDestination == .scheduleTasks {
+            reloadScheduleTasks()
+        }
         Task { [weak self] in
             guard let self else { return }
             if let router = self.resolvedRouter() {
@@ -837,12 +1094,13 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func beginEdit(_ bot: BotDefinition) {
-        loadStudioDraft(bot)
+        let fresh = refreshPublishedIdentity(for: bot.id) ?? bot
+        loadStudioDraft(fresh)
         studioTab = .profile
         screen = .studio
         persistSelection()
         leaveDeskLiveWatch()
-        reloadStudioSupport(id: bot.id)
+        reloadStudioSupport(id: fresh.id)
     }
 
     /// Keep the starter soul aligned with Role & Identity until the user writes their own.
@@ -857,11 +1115,12 @@ public final class BotsViewModel: ObservableObject {
 
     /// Studio is a dest. Keep the last selected tab; Edit still opens Profile.
     public func openStudio(_ bot: BotDefinition) {
-        loadStudioDraft(bot)
+        let fresh = refreshPublishedIdentity(for: bot.id) ?? bot
+        loadStudioDraft(fresh)
         screen = .studio
         persistSelection()
         leaveDeskLiveWatch()
-        reloadStudioSupport(id: bot.id)
+        reloadStudioSupport(id: fresh.id)
     }
 
     private func loadStudioDraft(_ bot: BotDefinition) {
@@ -912,6 +1171,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func openDesk(_ bot: BotDefinition) {
+        _ = refreshPublishedIdentity(for: bot.id)
         adoptSelectedBot(bot.id)
         screen = .desk
         persistSelection()
@@ -1380,6 +1640,9 @@ public final class BotsViewModel: ObservableObject {
         attachments = []
         lastSendStartedProviderRun = false
         lastMentionedBotIDForTesting = nil
+        lastHopUserTextForTesting = nil
+        lastSupervisedRunUserTextForTesting = nil
+        supervisedRunBotIDsForTesting = []
         if deskRunIsLive, text == nil {
             enqueueFollowUp(
                 BotQueuedFollowUp(text: message, attachments: attached),
@@ -1474,7 +1737,7 @@ public final class BotsViewModel: ObservableObject {
                 return true
             }
             beginDeskSendInFlight(for: host.id)
-            let relay = "\(host.name) (@\(host.handle)) asked you:\n\(text)"
+            let relay = BotPeerTranscript.peerAskPrompt(hostName: host.name, text: text)
             Task { [weak self] in
                 guard let self else { return }
                 await Task.yield()
@@ -1487,15 +1750,15 @@ public final class BotsViewModel: ObservableObject {
                     memory: brain.memory,
                     skills: brain.skills,
                     routines: brain.routines,
-                    router: router,
-                    paintBotID: host.id
+                    router: router
                 )
                 self.clearDeskSendInFlight(for: host.id)
                 if let runId = started {
                     self.lastSendStartedProviderRun = true
                     self.lastLinkedRunIDByBot[peer.id] = runId
                     self.restoreDeskWorkLog(botID: host.id)
-                    await self.followLinkedRun(bot: peer, conversation: peerConversation, runId: runId)
+                    let peerLive = self.lastStartedConversationByBot[peer.id] ?? peerConversation
+                    await self.followLinkedRun(bot: peer, conversation: peerLive, runId: runId)
                     self.importPeerReply(from: peer, onto: host)
                     if relayHop == 0 {
                         await self.relayPeerReplyToHost(
@@ -1551,7 +1814,8 @@ public final class BotsViewModel: ObservableObject {
                 return nil
             }
             lastLinkedRunIDByBot[peer.id] = runId
-            await followLinkedRun(bot: peer, conversation: conversation, runId: runId)
+            let peerLive = lastStartedConversationByBot[peer.id] ?? conversation
+            await followLinkedRun(bot: peer, conversation: peerLive, runId: runId)
             return lastAssistantText(for: peer.id)
         } catch {
             errorMessage = String(describing: error)
@@ -1808,31 +2072,35 @@ public final class BotsViewModel: ObservableObject {
             // reread every schedule.
             try botStore.setRoutineEnabled(id: id, enabled: enabled)
             adoptEnabledRoutine(id: id, enabled: enabled)
+            if let index = scheduleTaskSource.firstIndex(where: { $0.id == id }) {
+                scheduleTaskSource[index].isEnabled = enabled
+                applyScheduleTaskFilters()
+            }
         } catch {
             errorMessage = String(describing: error)
         }
     }
 
     public func requestRoutineTestRun(id: BotRoutineID) {
-        guard let routine = routines.first(where: { $0.definition.id == id }) else { return }
-        let instruction = routine.definition.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let routine = routines.first(where: { $0.definition.id == id })
+        let fleetItem = scheduleTaskSource.first(where: { $0.id == id })
+        let instruction = (routine?.definition.prompt ?? fleetItem?.prompt)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !instruction.isEmpty else {
-            errorMessage = "Routine instruction is required."
+            errorMessage = "Task instruction is required."
             return
         }
+        let botID = routine?.definition.botID ?? fleetItem?.botID
         do {
             // Dest first. Test run used to listRoutines after the store
             // stamped last_test_run_requested_at. Patch it locally so
             // dest does not reread every schedule.
             try botStore.requestRoutineTestRun(id: id)
             adoptTestRunRequested(id: id)
-            // Acknowledge the click (user bubble / Loading…) before dest
-            // reload. Studio Test run used to openDesk first, so first
-            // feedback waited on mark-read and transcript restore.
-            let sent = send(instruction)
-            if sent, let bot = selectedBot, screen != .desk {
+            if let botID, let bot = bots.first(where: { $0.id == botID }) {
                 openDesk(bot)
             }
+            _ = send(instruction)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -2391,6 +2659,35 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// Re-read a bot after `bot_set_settings` (or any out-of-process publish).
+    /// Studio Save already calls `adoptPublishedRevision`; Desk keeps a stale
+    /// `bots` row until this runs.
+    @discardableResult
+    public func refreshPublishedIdentity(for botID: BotID) -> BotDefinition? {
+        guard let fresh = try? botStore.get(id: botID), fresh.deletedAt == nil else { return nil }
+        let current = bots.first(where: { $0.id == botID })
+        let unchanged = current?.currentRevisionID == fresh.currentRevisionID
+            && current?.name == fresh.name
+            && current?.title == fresh.title
+            && current?.description == fresh.description
+            && current?.avatarSymbol == fresh.avatarSymbol
+            && current?.notificationsEnabled == fresh.notificationsEnabled
+        if !unchanged {
+            rememberFleetBot(fresh)
+            if let revisionID = fresh.currentRevisionID,
+               let revision = try? botStore.getRevision(id: revisionID) {
+                revisionByID[revisionID] = revision
+                if selectedBotID == botID {
+                    selectedRevision = revision
+                    if screen != .studio {
+                        rememberStudioSupport(for: botID)
+                    }
+                }
+            }
+        }
+        return fresh
+    }
+
     /// Save dest used to force-reload studio support after publish.
     /// The revision is already the row; dest must not reread inspector.
     private func adoptPublishedRevision(_ revision: BotRevision, bot: BotDefinition) {
@@ -2669,17 +2966,18 @@ public final class BotsViewModel: ObservableObject {
         guard let revision = try? currentRevision(for: host) else { return }
         let brain = destBrainInputs(for: host)
         beginDeskSendInFlight(for: host.id)
+        let hop = BotPeerTranscript.hostHopPrompt(peerName: peer.name, reply: reply)
+        lastHopUserTextForTesting = hop
         let started = await startSupervisedRun(
             bot: host,
             revision: revision,
             conversation: hostConversation,
-            userText: "\(peer.name) (@\(peer.handle)) replied:\n\(reply)",
+            userText: hop,
             attachments: [],
             memory: brain.memory,
             skills: brain.skills,
             routines: brain.routines,
-            router: router,
-            paintBotID: host.id
+            router: router
         )
         clearDeskSendInFlight(for: host.id)
         if let runId = started {
@@ -2701,11 +2999,31 @@ public final class BotsViewModel: ObservableObject {
 
     private func lastAssistantText(for botID: BotID) -> String? {
         let rows = botID == selectedBotID ? deskMessages : (messagesByBot[botID] ?? [])
-        return rows.last(where: {
+        if let text = rows.last(where: {
             $0.role == .assistant
                 && $0.text != BotsDeskFollowThrough.workingPlaceholder
                 && $0.text != BotsViewModel.assistantPlaceholder
-        })?.text
+        })?.text, !text.isEmpty {
+            return text
+        }
+        let threadID = conversationForBot(botID)?.linkedAgentThreadID
+            ?? lastStartedConversationByBot[botID]?.linkedAgentThreadID
+        guard let threadID,
+              let stored = try? context.messageRepo.listRecent(threadId: threadID, limit: 80),
+              let last = stored.last(where: {
+                  $0.role == .assistant && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+              }) else {
+            return nil
+        }
+        return last.content
+    }
+
+    public func lastAssistantTextForTesting(botID: BotID) -> String? {
+        lastAssistantText(for: botID)
+    }
+
+    public func deskTranscriptForTesting(botID: BotID) -> [BotDeskMessage] {
+        botID == selectedBotID ? deskMessages : (messagesByBot[botID] ?? [])
     }
 
     private struct PersistedPeerTurn: Codable {
@@ -2906,6 +3224,12 @@ public final class BotsViewModel: ObservableObject {
             let tab = studioTab
             beginEdit(bot)
             studioTab = tab
+        case .activeBots:
+            screen = .activeBots
+            reloadActiveBotsScreen()
+        case .scheduleTasks:
+            screen = .scheduleTasks
+            reloadScheduleTasks()
         case .desk, .fleet, .attention:
             if selectionMatches, let bot = selectedBot {
                 openDesk(bot)
@@ -3222,10 +3546,12 @@ public final class BotsViewModel: ObservableObject {
                 if count != lastCount {
                     lastCount = count
                     self.applyDeskLiveReplay(botID: botID, threadID: threadID, force: true)
+                    self.refreshPublishedIdentity(for: botID)
                 }
                 let run = self.linkedRun(for: threadID, botID: botID)
                 if let run, BotsDeskFollowThrough.isTerminal(run.status) {
                     self.applyDeskLiveReplay(botID: botID, threadID: threadID, force: true)
+                    self.refreshPublishedIdentity(for: botID)
                     return
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
@@ -3472,6 +3798,30 @@ public final class BotsViewModel: ObservableObject {
         return (memory, skills, listedRoutines)
     }
 
+    /// Live turns must flip attention to working on first send and on
+    /// reuse. Otherwise Active Bots only sees the first brand-new thread.
+    @discardableResult
+    private func persistWorkingConversation(_ conversation: BotConversation) throws -> BotConversation {
+        var working = conversation
+        working.attentionState = .working
+        working.updatedAt = Date()
+        try botStore.upsertConversation(working)
+        lastStartedConversationByBot[working.botID] = working
+        if selectedBotID == working.botID {
+            adoptWrittenConversation(working)
+        } else {
+            patchStudioSupportConversation(working, botID: working.botID)
+        }
+        applyAttentionState(
+            for: working.botID,
+            conversations: destConversations(botID: working.botID, patched: working)
+        )
+        if screen == .activeBots {
+            reloadActiveBotsScreen()
+        }
+        return working
+    }
+
     private func startSupervisedRun(
         bot: BotDefinition,
         revision: BotRevision,
@@ -3481,8 +3831,7 @@ public final class BotsViewModel: ObservableObject {
         memory: [BotMemoryItem],
         skills: [BotSkillBinding],
         routines: [BotRoutine] = [],
-        router: AppCommandRouter,
-        paintBotID: BotID? = nil
+        router: AppCommandRouter
     ) async -> AgentRunID? {
         // Bots are not a workspace tab. Do not bind the turn to a folder
         // or worktree — Local execution only.
@@ -3500,6 +3849,7 @@ public final class BotsViewModel: ObservableObject {
                existing.provider == deskRouting.provider,
                existing.providerInstanceId == deskRouting.providerInstanceID {
                 thread = existing
+                try persistWorkingConversation(conversation)
             } else {
                 thread = try router.createAgentThread(
                     workspace: nil,
@@ -3516,15 +3866,12 @@ public final class BotsViewModel: ObservableObject {
                 )
                 var linked = conversation
                 linked.linkedAgentThreadID = thread.id
-                linked.attentionState = .working
-                linked.updatedAt = Date()
-                try botStore.upsertConversation(linked)
-                selectedConversation = linked
-                rememberStudioSupport(for: bot.id)
+                try persistWorkingConversation(linked)
             }
-            let paintID = paintBotID ?? bot.id
-            if selectedBotID == paintID, screen == .desk {
-                startDeskLiveTurnWatch(botID: paintID, threadID: thread.id)
+            lastSupervisedRunUserTextForTesting = userText
+            supervisedRunBotIDsForTesting.append(bot.id)
+            if selectedBotID == bot.id, screen == .desk {
+                startDeskLiveTurnWatch(botID: bot.id, threadID: thread.id)
             }
             var receipt = BotBrainCompiler.assemble(
                 bot: bot,
@@ -3571,9 +3918,11 @@ public final class BotsViewModel: ObservableObject {
         conversation: BotConversation,
         runId: AgentRunID
     ) async {
-        let threadID = conversation.linkedAgentThreadID
-            ?? selectedConversation?.linkedAgentThreadID
-        if let threadID {
+        let live = lastStartedConversationByBot[bot.id] ?? conversation
+        let threadID = live.linkedAgentThreadID
+            ?? (bot.id == selectedBotID ? selectedConversation?.linkedAgentThreadID : nil)
+            ?? conversationForBot(bot.id)?.linkedAgentThreadID
+        if let threadID, selectedBotID == bot.id, screen == .desk {
             startDeskLiveTurnWatch(botID: bot.id, threadID: threadID)
         }
         for _ in 0..<120 {
@@ -3636,6 +3985,7 @@ public final class BotsViewModel: ObservableObject {
         }
         restoreDeskWorkLog(botID: bot.id, preferredRun: run)
         restoreDeskLiveTurn(botID: bot.id)
+        refreshPublishedIdentity(for: bot.id)
         let status = run?.status ?? .interrupted
         let viewingDesk = isViewing(bot.id)
         next.attentionState = BotsDeskFollowThrough.conversationState(for: status, viewingDesk: viewingDesk)
@@ -3751,7 +4101,12 @@ extension BotsViewModel: AgentRunObserver {
         providerThreadId: String?
     ) {
         Task { @MainActor [weak self] in
-            guard let self, self.screen == .desk, let botID = self.selectedBotID else { return }
+            guard let self else { return }
+            if let conversation = try? self.botStore.conversationLinked(to: threadId) {
+                self.reloadActiveBotsScreen()
+                self.refreshPublishedIdentity(for: conversation.botID)
+            }
+            guard self.screen == .desk, let botID = self.selectedBotID else { return }
             guard self.selectedConversation?.linkedAgentThreadID == threadId else { return }
             self.restoreDeskWorkLog(botID: botID)
             self.restoreDeskLiveTurn(botID: botID)
@@ -3765,7 +4120,12 @@ extension BotsViewModel: AgentRunObserver {
         threadId: AgentThreadID
     ) {
         Task { @MainActor [weak self] in
-            guard let self, self.screen == .desk, let botID = self.selectedBotID else { return }
+            guard let self else { return }
+            if let conversation = try? self.botStore.conversationLinked(to: threadId) {
+                self.reloadActiveBotsScreen()
+                self.refreshPublishedIdentity(for: conversation.botID)
+            }
+            guard self.screen == .desk, let botID = self.selectedBotID else { return }
             guard self.selectedConversation?.linkedAgentThreadID == threadId else { return }
             self.restoreDeskWorkLog(botID: botID)
             if BotsDeskFollowThrough.isTerminal(status) {
@@ -3861,8 +4221,6 @@ public struct BotsRosterList: View {
     /// Sidebar hosts the roster in a sibling NSHostingView from BotsRootView.
     /// Attach the delete confirm here so right-click Delete is not a silent latch.
     private let attachDeleteConfirmation: Bool
-    private let isScheduledTasksSelected: Bool
-    private let onOpenScheduledTasks: (() -> Void)?
     @State private var searchFocusRequest = false
 
     public init(
@@ -3873,8 +4231,8 @@ public struct BotsRosterList: View {
     ) {
         self.vm = vm
         self.attachDeleteConfirmation = attachDeleteConfirmation
-        self.isScheduledTasksSelected = isScheduledTasksSelected
-        self.onOpenScheduledTasks = onOpenScheduledTasks
+        _ = isScheduledTasksSelected
+        _ = onOpenScheduledTasks
     }
 
     public var body: some View {
@@ -3892,6 +4250,7 @@ public struct BotsRosterList: View {
                     SidebarActionRow(
                         symbol: "bolt.horizontal.circle",
                         title: BotsChrome.Label.activeBots,
+                        isSelected: vm.screen.resolvedDestination == .activeBots,
                         badgeText: PetActiveThreadCountFormatter.badgeText(count: vm.activeBotCount),
                         badgeIsBlue: true
                     )
@@ -3908,20 +4267,19 @@ public struct BotsRosterList: View {
                         : "\(BotsChrome.Label.activeBots) \(vm.activeBotCount)"
                 )
                 .accessibilityIdentifier("bots.active")
+                .accessibilityAddTraits(vm.screen.resolvedDestination == .activeBots ? .isSelected : [])
 
-                if let onOpenScheduledTasks {
-                    Button(action: onOpenScheduledTasks) {
-                        SidebarActionRow(
-                            symbol: "calendar.badge.clock",
-                            title: BotsChrome.Label.scheduleTasks,
-                            isSelected: isScheduledTasksSelected
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .help("Create and manage scheduled Agent tasks")
-                    .accessibilityIdentifier("bots.scheduleTasks")
-                    .accessibilityAddTraits(isScheduledTasksSelected ? .isSelected : [])
+                Button(action: vm.openScheduleTasks) {
+                    SidebarActionRow(
+                        symbol: "calendar.badge.clock",
+                        title: BotsChrome.Label.scheduleTasks,
+                        isSelected: vm.screen.resolvedDestination == .scheduleTasks
+                    )
                 }
+                .buttonStyle(.plain)
+                .help("Create and manage scheduled bot tasks")
+                .accessibilityIdentifier("bots.scheduleTasks")
+                .accessibilityAddTraits(vm.screen.resolvedDestination == .scheduleTasks ? .isSelected : [])
             }
             .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.lg)
@@ -3981,6 +4339,8 @@ public struct BotsRosterList: View {
 
     private func rosterRow(_ bot: BotDefinition) -> some View {
         let selected = vm.selectedBotID == bot.id
+            && vm.screen.resolvedDestination != .activeBots
+            && vm.screen.resolvedDestination != .scheduleTasks
         let state = vm.attentionState(for: bot)
         let preview = vm.rosterPreview(for: bot)
         return Button {
@@ -4018,12 +4378,7 @@ public struct BotsRosterList: View {
                         .foregroundColor(DS.Palette.textTertiary)
                         .accessibilityHidden(true)
                 }
-                if let provider = vm.providerLabel(for: bot) {
-                    Text(provider)
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                }
+
             }
             .padding(.horizontal, DS.Space.sm)
             .frame(minHeight: BotsChrome.hitTarget)
@@ -4160,6 +4515,12 @@ public struct BotsRootView: View {
                 switch vm.screen.resolvedDestination {
                 case .studio:
                     studioScreen
+                        .transition(.opacity)
+                case .activeBots:
+                    ActiveBotsRootView(vm: vm)
+                        .transition(.opacity)
+                case .scheduleTasks:
+                    BotScheduleTasksRootView(vm: vm)
                         .transition(.opacity)
                 case .desk, .fleet, .attention:
                     deskScreen
@@ -4413,8 +4774,6 @@ public struct BotsRootView: View {
             VStack(alignment: .leading, spacing: DS.Space.huge) {
                 studioIdentity
                 studioRule
-                studioProvider
-                studioRule
                 studioSoul
                 studioRule
                 studioNotifications
@@ -4483,37 +4842,6 @@ public struct BotsRootView: View {
 
     private var handleMatchesDerivedName: Bool {
         vm.studioDraft.handle == (BotHandle.derive(from: vm.studioDraft.name) ?? "")
-    }
-
-    private var studioProvider: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xl) {
-            studioSectionHeader(
-                BotsChrome.Label.providerRouting,
-                caption: "\(BotRoute.fallbackOrderHonesty) Desk composer can pick a different provider and model per send."
-            )
-            HStack(alignment: .top, spacing: DS.Space.xl) {
-                labeledField("Default route") {
-                    Picker("Provider", selection: $vm.studioDraft.provider) {
-                        Text("Claude").tag(AgentProvider.claude)
-                        Text("Codex").tag(AgentProvider.codex)
-                        Text("Grok").tag(AgentProvider.grok)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(maxWidth: 320, alignment: .leading)
-                    .onChange(of: vm.studioDraft.provider) { provider in
-                        vm.applyDefaultModel(for: provider)
-                    }
-                    .accessibilityIdentifier("bots.studio.provider")
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                labeledField("Model") {
-                    studioField(placeholder: "Model id", text: $vm.studioDraft.model)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
-        .accessibilityIdentifier("bots.studio.routing")
     }
 
     private var studioSoul: some View {
@@ -4658,7 +4986,7 @@ public struct BotsRootView: View {
                 studioSummaryRow("Desktop", vm.studioDesktopSummary)
                 studioSummaryRow("Memory", "\(vm.liveMemoryCount) facts")
                 studioSummaryRow("Skills", "\(vm.enabledSkillCount) enabled")
-                studioSummaryRow("Routines", "\(vm.enabledRoutineCount) · no app-closed runs")
+                studioSummaryRow("Schedule Tasks", "\(vm.enabledRoutineCount) · no app-closed runs")
             }
         }
         .accessibilityIdentifier("bots.studio.summary")
@@ -4715,18 +5043,6 @@ public struct BotsRootView: View {
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.textTertiary)
                         .accessibilityIdentifier("bots.desk.handle")
-                    if let provider = vm.providerLabel(for: bot) {
-                        Text(provider)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .accessibilityIdentifier("bots.desk.provider")
-                    }
-                    if let model = vm.modelLabel(for: bot) {
-                        Text(model)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .accessibilityIdentifier("bots.desk.model")
-                    }
                     Text(vm.permissionLabel(for: bot))
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.textTertiary)
@@ -5105,13 +5421,13 @@ public struct BotsRootView: View {
                     studioField(placeholder: "Weekdays 9:00", text: $vm.routineScheduleNote)
                         .accessibilityIdentifier("bots.routines.when")
                 }
-                Button("Save routine") { vm.saveRoutine() }
+                Button("Save task") { vm.saveRoutine() }
                     .buttonStyle(BotsPrimaryButtonStyle())
                     .accessibilityIdentifier("bots.routines.save")
                 if vm.routines.isEmpty {
                     DSEmptyState(
                         icon: "clock.arrow.2.circlepath",
-                        title: "No routines yet",
+                        title: "No scheduled tasks",
                         subtitle: "Name an instruction and when it should run."
                     )
                     .frame(maxWidth: .infinity)
@@ -5812,7 +6128,7 @@ public struct BotsRootView: View {
                     studioMultiline(text: $vm.routinePrompt, minHeight: 72, maxHeight: 140)
                         .accessibilityIdentifier("bots.routines.instruction")
                 }
-                Button("Save routine") { vm.saveRoutine() }
+                Button("Save task") { vm.saveRoutine() }
                     .buttonStyle(BotsPrimaryButtonStyle())
                     .accessibilityIdentifier("bots.routines.save")
             }
@@ -5820,7 +6136,7 @@ public struct BotsRootView: View {
             if vm.routines.isEmpty {
                 studioEmptyState(
                     icon: "clock.arrow.2.circlepath",
-                    title: "No routines yet",
+                    title: "No scheduled tasks",
                     subtitle: "Name an instruction and when it should run."
                 )
             } else {

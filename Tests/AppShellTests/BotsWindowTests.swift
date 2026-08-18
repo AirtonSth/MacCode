@@ -1,5 +1,6 @@
 import XCTest
 import CoreModel
+import AgentRuntime
 @testable import AppShell
 @testable import Persistence
 import Surfaces
@@ -1338,22 +1339,189 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.selectedBotID, piper.id)
     }
 
-    func test_openActiveBotsOpensNeedsYouBot_becauseBadgeAndClickMustAgree() throws {
-        // WHY: Active Bots replaced the attention bell. The badge counts
-        // working/needs-you teammates; the row must dest that teammate,
-        // not sit inert while the count is non-zero.
+    func test_activeBotCountCountsWorkingOnly_notNeedsYou() throws {
+        // WHY: Active Threads counts live runs. Active Bots used to mix
+        // working + needs-you, so the badge said 2 while only one bot ran.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
         vm.openDesk(piper)
-        XCTAssertTrue(vm.send("Please look at the failing test"))
-        XCTAssertGreaterThan(vm.activeBotCount, 0)
-        vm.openDesk(quinn)
-        XCTAssertEqual(vm.selectedBotID, quinn.id)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "live turn", attentionState: .working)
+        )
+        try context.botStore.upsertAttention(
+            BotAttentionItem(botID: quinn.id, kind: .approval, title: "Need you")
+        )
+        vm.reload()
+        XCTAssertEqual(vm.attentionState(for: piper), .working)
+        XCTAssertEqual(vm.attentionState(for: quinn), .needsAttention)
+        XCTAssertEqual(vm.activeBotCount, 1)
+        XCTAssertEqual(vm.liveWorkingBots().map(\.id), [piper.id])
+    }
+
+    func test_openActiveBotsOpensActiveBotsScreen() throws {
+        // WHY: Active Threads opens an overview. Active Bots must not jump
+        // to a needs-you Desk when the user asked for the live roster.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "live turn", attentionState: .working)
+        )
+        vm.reload()
         vm.openActiveBots()
-        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(vm.screen, .activeBots)
+        XCTAssertEqual(vm.activeBotItems.map(\.botID), [piper.id])
+        XCTAssertEqual(vm.activeBotsSubtitle, "1 bot is running")
+    }
+
+    func test_openActiveBotItemOpensDesk() throws {
+        // WHY: a row on the Active Bots screen must dest that teammate's
+        // Desk, same as opening an Active Threads row dests the thread.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "live turn", attentionState: .working)
+        )
+        vm.reload()
+        vm.openActiveBots()
+        let item = try XCTUnwrap(vm.activeBotItems.first)
+        vm.openActiveBotItem(item)
         XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+    }
+
+    func test_liveWorkingBotsIncludesLinkedActiveRun() throws {
+        // WHY: Active Threads counts coordinator live threads. A bot whose
+        // conversation is not flagged .working must still appear when its
+        // linked agent thread is actually running.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let idle = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.botStore.upsertConversation(
+            BotConversation(
+                botID: piper.id,
+                title: "Standup",
+                attentionState: .none,
+                linkedAgentThreadID: thread.id
+            )
+        )
+        vm.reload()
+        XCTAssertEqual(vm.attentionState(for: piper), .none)
+        XCTAssertTrue(vm.liveWorkingBots().isEmpty)
+        vm.activeThreadIDsOverrideForTesting = [thread.id]
+        XCTAssertEqual(vm.liveWorkingBots().map(\.id), [piper.id])
+        XCTAssertFalse(vm.liveWorkingBots().contains(where: { $0.id == idle.id }))
+        XCTAssertEqual(vm.activeBotCount, 1)
+        vm.openActiveBots()
+        XCTAssertEqual(vm.activeBotItems.map(\.botID), [piper.id])
+        XCTAssertEqual(vm.activeBotItems.first?.nextRunLabel, "Running now")
+        XCTAssertNotEqual(vm.activeBotItems.first?.lastTriggeredLabel, "")
+    }
+
+    func test_activeBotsSearchFiltersLiveRoster() throws {
+        // WHY: Scheduled Tasks search hides non-matches. Active Bots must
+        // filter the live roster the same way, not keep showing every runner.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        let piperThread = AgentThread(title: "Piper live", provider: .claude, model: "opus")
+        let quinnThread = AgentThread(title: "Quinn live", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(piperThread)
+        try context.threadRepo.upsert(quinnThread)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "live turn", linkedAgentThreadID: piperThread.id)
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: quinn.id, title: "other turn", linkedAgentThreadID: quinnThread.id)
+        )
+        vm.activeThreadIDsOverrideForTesting = [piperThread.id, quinnThread.id]
+        vm.reload()
+        vm.openActiveBots()
+        XCTAssertEqual(Set(vm.filteredActiveBotItems().map(\.botID)), [piper.id, quinn.id])
+        vm.activeBotsSearchText = "piper"
+        XCTAssertEqual(vm.filteredActiveBotItems().map(\.botID), [piper.id])
+        vm.activeBotsSearchText = "no-such-bot"
+        XCTAssertTrue(vm.filteredActiveBotItems().isEmpty)
+    }
+
+    func test_refreshPublishedIdentityPicksUpSelfConfigTitle() throws {
+        // WHY: bot_set_settings publishes through a sidecar SQLite write.
+        // Desk kept the stale name/title until remount. After a self-edit
+        // the header and roster must show the new identity without relaunch.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "CEO", title: "", provider: .grok)
+        vm.openDesk(bot)
+        XCTAssertEqual(vm.selectedBot?.title, "")
+        let service = BotSelfConfigService(callerBotID: bot.id, store: context.botStore)
+        _ = try service.apply(BotSelfConfigPatch(title: "CEO da empresa"))
+        XCTAssertEqual(vm.selectedBot?.title, "", "in-memory roster stays stale until refresh")
+        let fresh = try XCTUnwrap(vm.refreshPublishedIdentity(for: bot.id))
+        XCTAssertEqual(fresh.title, "CEO da empresa")
+        XCTAssertEqual(vm.selectedBot?.title, "CEO da empresa")
+        XCTAssertEqual(vm.selectedRevision?.title, "CEO da empresa")
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(
+            source.contains("refreshPublishedIdentity(for: botID)"),
+            "live desk watch must refresh identity when the turn streams or finishes"
+        )
+    }
+
+    func test_openScheduleTasksOpensBotsScheduleScreen() throws {
+        // WHY: Bots Schedule Tasks used to open Agent scheduled tasks.
+        // The row must dest the bots routines overview instead.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Check overnight failures"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.saveRoutine()
+        vm.setRoutineEnabled(id: try XCTUnwrap(vm.routines.first?.definition.id), enabled: true)
+        vm.openScheduleTasks()
+        XCTAssertEqual(vm.screen, .scheduleTasks)
+        XCTAssertEqual(vm.scheduleTaskItems.map(\.name), ["Morning scan"])
+        XCTAssertEqual(vm.scheduleTaskFilterCounts.active, 1)
+        XCTAssertEqual(vm.scheduleTasksSubtitle, "Automatic runs paused — turn Active on when you're back")
+    }
+
+    func test_botScheduleTasksFiltersAndToggle() throws {
+        // WHY: All / Active / Paused must filter shipped routines, not a
+        // decorative count, so the overview matches Agent Scheduled Tasks.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        vm.routineName = "Live"
+        vm.routinePrompt = "Ping"
+        vm.saveRoutine()
+        let liveID = try XCTUnwrap(vm.routines.first?.definition.id)
+        vm.setRoutineEnabled(id: liveID, enabled: true)
+        vm.routineName = "Paused"
+        vm.routinePrompt = "Wait"
+        vm.saveRoutine()
+        vm.openScheduleTasks()
+        XCTAssertEqual(vm.scheduleTaskFilterCounts.all, 2)
+        XCTAssertEqual(vm.scheduleTaskFilterCounts.active, 1)
+        XCTAssertEqual(vm.scheduleTaskFilterCounts.paused, 1)
+        vm.scheduleTaskStatusFilter = .paused
+        XCTAssertEqual(vm.scheduleTaskItems.map(\.name), ["Paused"])
+        let paused = try XCTUnwrap(vm.scheduleTaskItems.first)
+        vm.setRoutineEnabled(id: paused.id, enabled: true)
+        vm.scheduleTaskStatusFilter = .active
+        XCTAssertEqual(Set(vm.scheduleTaskItems.map(\.name)), ["Live", "Paused"])
+        vm.setAutonomyActive(true)
+        XCTAssertTrue(vm.isAutonomyActive)
     }
 
     func test_searchKeepsSelectedVisible_becauseChatMustMatchTheRoster() throws {
@@ -1849,11 +2017,10 @@ final class BotsWindowTests: XCTestCase {
         vm.openDesk(piper)
         vm.composerText = "What's your Model?"
         let preview = try XCTUnwrap(vm.previewBrain())
-        XCTAssertTrue(preview.compiledPayload.contains("Model: opus"))
-        XCTAssertTrue(preview.compiledPayload.contains("Default route: Claude · opus"))
-        XCTAssertTrue(preview.compiledPayload.contains(BotRoute.fallbackOrderHonesty))
+        XCTAssertFalse(preview.compiledPayload.contains("Model: opus"))
+        XCTAssertFalse(preview.compiledPayload.contains("Default route:"))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
-        XCTAssertEqual(preview.layers.first(where: { $0.kind == .route })?.title, "Route")
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .route })?.included, false)
         XCTAssertEqual(
             preview.compiledPayload,
             BotsDeskFollowThrough.composeRunPrompt(
@@ -1880,12 +2047,11 @@ final class BotsWindowTests: XCTestCase {
         vm.openDesk(piper)
         vm.composerText = "If Claude is down use Grok"
         let preview = try XCTUnwrap(vm.previewBrain())
-        XCTAssertTrue(preview.compiledPayload.contains(BotRoute.fallbackOrderHonesty))
-        XCTAssertTrue(preview.compiledPayload.contains("Default route: Claude · opus. \(BotRoute.fallbackOrderHonesty)"))
+        XCTAssertFalse(preview.compiledPayload.contains("Default route:"))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(preview.compiledPayload.contains("bot_set_fallback"))
         XCTAssertFalse(preview.layers.contains { $0.title == "Fallback" })
-        XCTAssertEqual(preview.layers.first(where: { $0.kind == .route })?.title, "Route")
+        XCTAssertEqual(preview.layers.first(where: { $0.kind == .route })?.included, false)
         XCTAssertEqual(
             preview.compiledPayload,
             BotsDeskFollowThrough.composeRunPrompt(
@@ -3023,6 +3189,25 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_codexDeskSendSharesWorkspaceLessStartContract() throws {
+        // WHY: Codex Desk send uses the same create/send helpers as Grok.
+        // Workspace stays unbound; execution cwd is sanitized by the shared
+        // resolver so Codex does not inherit an empty/relative currentDirectory.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude, model: "opus")
+        vm.openDesk(bot)
+        vm.setDeskProvider(.codex)
+        vm.setDeskRoutingMode(.manual)
+        vm.setDeskPermissionMode(.supervised)
+        XCTAssertEqual(vm.deskRunProvider, .codex)
+        let routerSource = try String(contentsOf: sourceURL("Sources/AppShell/AppCommandRouter.swift"), encoding: .utf8)
+        XCTAssertTrue(routerSource.contains("GrokACPClient.resolvedSessionCwd(workspaceCwd)"))
+        let empty = GrokACPClient.resolvedSessionCwd("", home: "/Users/fixture", fileExists: { _ in false })
+        XCTAssertEqual(empty, "/Users/fixture")
+        XCTAssertTrue(empty.hasPrefix("/"))
+    }
+
     func test_deskHeaderFollowsComposerRoute() throws {
         // WHY: the identity row used to keep Studio's published Claude/opus
         // after the footer switched to Grok. The live send route must show.
@@ -3030,16 +3215,16 @@ final class BotsWindowTests: XCTestCase {
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude, model: "opus")
         vm.openDesk(bot)
-        XCTAssertEqual(vm.providerLabel(for: bot), "Claude")
-        XCTAssertEqual(vm.modelLabel(for: bot), "opus")
         vm.setDeskProvider(.grok)
         vm.setDeskRoutingMode(.manual)
         vm.setDeskModel(BotsViewModel.defaultModel(for: .grok))
         vm.setDeskPermissionMode(.fullAccess)
-        XCTAssertEqual(vm.providerLabel(for: bot), "Grok")
-        XCTAssertEqual(vm.modelLabel(for: bot), BotsViewModel.defaultModel(for: .grok))
+        XCTAssertEqual(vm.deskRunProvider, .grok)
+        XCTAssertEqual(vm.deskRunModel, BotsViewModel.defaultModel(for: .grok))
         XCTAssertEqual(vm.permissionLabel(for: bot), "Full access")
         XCTAssertEqual(vm.resolvedProvider(for: bot), .claude)
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertFalse(source.contains("bots.desk.provider"))
     }
 
     func test_botMentionParserResolvesHandle_excludingOpenTeammate() throws {
@@ -3082,6 +3267,46 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(outbound.peer?.botID, quinn.id)
         XCTAssertEqual(outbound.peer?.caption, "Messaged Quinn - CRM Controller - \(quinn.handle)")
         XCTAssertTrue(outbound.text.contains("@quinn"))
+    }
+
+    func test_sendWithMentionStartsPeerProviderRun() async throws {
+        // WHY: parse-only tests passed while the mentioned bot never started.
+        // Shipped send() must attempt a provider run on the peer bot id.
+        let (vm, piper, quinn) = try makeMentionPair(peerReply: "PONG from Quinn")
+        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp and reply PONG"))
+        XCTAssertEqual(vm.lastMentionedBotIDForTesting, quinn.id)
+        let outbound = try XCTUnwrap(vm.deskTranscriptForTesting(botID: piper.id).last)
+        XCTAssertEqual(outbound.peer?.direction, .messaged)
+        XCTAssertEqual(outbound.peer?.botID, quinn.id)
+
+        let startedPeer = await waitUntil(timeout: 8) {
+            vm.supervisedRunBotIDsForTesting.contains(quinn.id) && vm.lastSendStartedProviderRun
+        }
+        XCTAssertTrue(startedPeer, "peer provider start must be attempted for \(quinn.handle)")
+        XCTAssertEqual(vm.supervisedRunBotIDsForTesting.first, quinn.id)
+        XCTAssertTrue(vm.lastSendStartedProviderRun)
+    }
+
+    func test_hopRelayOmitsMentionToken() async throws {
+        // WHY: hop used to embed (@handle). Mention-send would loop, or
+        // lastAssistantText was empty and the host never saw the reply.
+        let (vm, piper, quinn) = try makeMentionPair(peerReply: "inbox is clear")
+        XCTAssertTrue(vm.send("@\(quinn.handle) what is in the inbox?"))
+        let hopped = await waitUntil(timeout: 8) { vm.lastHopUserTextForTesting != nil }
+        XCTAssertTrue(hopped, "hop-1 must run after the peer assistant reply")
+        let hop = try XCTUnwrap(vm.lastHopUserTextForTesting)
+        XCTAssertEqual(
+            hop,
+            BotPeerTranscript.hostHopPrompt(peerName: quinn.name, reply: "inbox is clear")
+        )
+        XCTAssertTrue(hop.contains("inbox is clear"))
+        XCTAssertFalse(BotPeerTranscript.containsMentionToken(hop, handle: quinn.handle))
+        XCTAssertFalse(hop.contains("@\(quinn.handle)"))
+        XCTAssertTrue(vm.supervisedRunBotIDsForTesting.contains(piper.id), "hop must start the host, not mention-send")
+        let imported = vm.deskTranscriptForTesting(botID: piper.id).contains {
+            $0.role == .assistant && $0.peer?.direction == .fromPeer && $0.text.contains("inbox is clear")
+        }
+        XCTAssertTrue(imported, "host desk must show the Message from peer reply")
     }
 
     func test_runMentionedPromptTargetsPeerFromAgentApp() async throws {
@@ -3561,8 +3786,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).name, "Piper")
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).handle, "piper")
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).title, "Scout")
-        XCTAssertEqual(vm.providerLabel(for: bot), "Claude")
-        XCTAssertEqual(vm.modelLabel(for: bot), "opus")
         XCTAssertEqual(vm.permissionLabel(for: bot), "Supervised")
         XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
     }
@@ -5148,22 +5371,17 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
-    func test_studioProviderPickerHidesTitle_becauseDefaultRouteAlreadyLabelsTheRow() throws {
-        // WHY: The Profile row is already "Default route". A visible
-        // Picker title "Provider" looks like leftover chrome beside
-        // Claude/Codex/Grok. Scheduled Tasks already hides the same title.
+    func test_studioProfileHasNoProviderRouting() throws {
+        // WHY: a published Default route locked teammates to one provider.
+        // Studio Profile is identity + instructions. Account is the Desk
+        // composer, per send.
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        guard let start = source.range(of: "private var studioProvider") else {
-            return XCTFail("studioProvider must exist")
-        }
-        let rest = source[start.lowerBound...]
-        let end = rest.range(of: "\n    private var studioSoul")?.lowerBound ?? rest.endIndex
-        let slice = String(source[start.lowerBound..<end])
-        XCTAssertTrue(slice.contains("Picker(\"Provider\""))
-        XCTAssertTrue(
-            slice.contains(".labelsHidden()"),
-            "Default route already names the row; Provider must not paint beside the segments"
-        )
+        XCTAssertFalse(source.contains("private var studioProvider"))
+        XCTAssertFalse(source.contains("bots.studio.provider"))
+        XCTAssertFalse(source.contains("bots.studio.routing"))
+        XCTAssertFalse(source.contains("BotsChrome.Label.providerRouting"))
+        let chrome = try String(contentsOf: sourceURL("Sources/AppShell/BotsChrome.swift"), encoding: .utf8)
+        XCTAssertFalse(chrome.contains("Provider routing"))
     }
 
     func test_avatarSymbolNameIsHuman_becauseStudioMustNotAnnounceSFSymbolPaths() {
@@ -5280,7 +5498,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(chrome.contains(BotsChrome.Label.instructions))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.security))
         XCTAssertTrue(bots.contains("bots.studio.identity"))
-        XCTAssertTrue(bots.contains("bots.studio.routing"))
+        XCTAssertFalse(bots.contains("bots.studio.routing"))
         XCTAssertTrue(bots.contains("bots.studio.soul"))
         XCTAssertTrue(bots.contains("Empty uses the built-in teammate default"))
         XCTAssertTrue(bots.contains("refreshGeneratedStandingInstructions"))
@@ -5344,9 +5562,9 @@ final class BotsWindowTests: XCTestCase {
             bots.contains("BotsChrome.Label.roleAndIdentity") || chrome.contains("Role & Identity"),
             "Studio Profile header must use the Role & Identity token"
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             bots.contains("BotsChrome.Label.providerRouting") || chrome.contains("Provider routing"),
-            "Studio routing header must use the Provider routing token"
+            "Studio must not mention a published provider"
         )
         XCTAssertTrue(
             bots.contains("BotsChrome.Label.configurationSummary") || chrome.contains("Configuration summary"),
@@ -5395,7 +5613,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.name\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.handle\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.job\")"))
-        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.provider\")"))
+        XCTAssertFalse(bots.contains("accessibilityIdentifier(\"bots.desk.provider\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.model\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.permission\")"))
         XCTAssertTrue(bots.contains("bots.desk.role.user"))
@@ -5481,8 +5699,8 @@ final class BotsWindowTests: XCTestCase {
                       "Bots action rows must reuse Agentic sidebar chrome")
         XCTAssertTrue(bots.contains("BotsChrome.Label.activeBots"))
         XCTAssertTrue(bots.contains("BotsChrome.Label.scheduleTasks"))
-        XCTAssertTrue(sidebar.contains("onOpenScheduledTasks: onOpenScheduledTasks"),
-                      "sidebar Bots roster must open the same Schedule Tasks dest")
+        XCTAssertTrue(bots.contains("vm.openScheduleTasks"),
+                      "Bots Schedule Tasks must open the bots routines overview, not Agent dest")
         XCTAssertFalse(bots.contains("bots.roster.attention"),
                        "the attention bell is replaced by the Active Bots row")
     }
@@ -5623,6 +5841,31 @@ final class BotsWindowTests: XCTestCase {
 
     private func makeContext() throws -> AppContext {
         try AppContext(channel: .debug, appSupportOverride: directory)
+    }
+
+    private func makeMentionPair(peerReply: String) throws -> (BotsViewModel, BotDefinition, BotDefinition) {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        context.coordinator.replaceProvider(
+            .claude,
+            runner: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: peerReply))
+        )
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.claude)
+        return (vm, piper, quinn)
+    }
+
+    private func waitUntil(timeout: TimeInterval, _ predicate: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if predicate() { return true }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return predicate()
     }
 
     private func sourceURL(_ relative: String) -> URL {

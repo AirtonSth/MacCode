@@ -192,7 +192,7 @@ final class BotSelfConfigTests: XCTestCase {
         // The MCP schema still invited those writes, so first-chat
         // "set full access" invented live unsupervised power.
         let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setSettings)
-        XCTAssertTrue(description.contains("name, Role, Instructions, description, Default route, Model, notifications, or avatar"))
+        XCTAssertTrue(description.contains("name, Role, Instructions, description, notifications, or avatar"))
         XCTAssertFalse(description.contains("job, standing instructions"), "leftover job is not advertised")
         XCTAssertFalse(description.contains("permission"))
         XCTAssertFalse(description.contains("desktop"))
@@ -207,7 +207,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["permission_mode"])
         XCTAssertNil(properties?["desktop_kind"])
         let provider = properties?["provider"] as? [String: Any]
-        XCTAssertEqual(provider?["description"] as? String, "Default route. Claude, Codex, or Grok. Same field as Studio Default route.")
+        XCTAssertEqual(provider?["description"] as? String, "Optional first-send seed. Not a Studio setting.")
         let title = properties?["title"] as? [String: Any]
         let soul = properties?["soul"] as? [String: Any]
         let model = properties?["model"] as? [String: Any]
@@ -215,7 +215,7 @@ final class BotSelfConfigTests: XCTestCase {
         let avatar = properties?["avatar_symbol"] as? [String: Any]
         XCTAssertEqual(title?["description"] as? String, "Role / job. Same field as Studio Role.")
         XCTAssertEqual(soul?["description"] as? String, "Instructions. Same field as Studio Instructions.")
-        XCTAssertEqual(model?["description"] as? String, "Model. Same field as Studio Model.")
+        XCTAssertEqual(model?["description"] as? String, "Optional first-send seed. Not a Studio setting.")
         XCTAssertEqual(notify?["description"] as? String, "Notifications On/Off.")
         XCTAssertEqual(avatar?["description"] as? String, "Avatar. Same field as Studio Avatar.")
         XCTAssertNil(properties?["notifications"], "notifications is an advertised alias, not a second schema key")

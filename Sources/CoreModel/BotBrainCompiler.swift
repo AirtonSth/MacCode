@@ -339,18 +339,6 @@ public enum BotBrainCompiler {
         // title stays Permission.
         lines.append("Approval mode: \(approvalModeText())")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
-        // Studio already says Default route. Compile that name so first-chat
-        // "what's your Default route?" cannot invent a hop. Studio already
-        // says Fallback order is not shipped. Compile that honesty so
-        // first-chat "if Claude is down use Grok" cannot invent a second
-        // route. Dest Source title stays Route.
-        lines.append("Default route: \(routeLine(provider: revision.provider, model: revision.model))")
-        // Studio already says Model. Compile that name so first-chat
-        // "what's your Model?" cannot invent a hop. Empty stays omitted
-        // (Desk hides the pill). Dest Source title stays Route.
-        if let model = modelLine(revision.model) {
-            lines.append(model)
-        }
         lines.append(BotStandingInstructions.admittedToolsText)
         if let browser = browserLine(browser) {
             lines.append(browser)
@@ -648,9 +636,9 @@ public enum BotBrainCompiler {
                 id: "route",
                 kind: .route,
                 title: "Route",
-                text: routeLine(provider: revision.provider, model: revision.model),
-                included: true,
-                reason: "Advertised provider and model. Desk already shows this route."
+                text: "",
+                included: false,
+                reason: "Desk composer chooses the account per send. Studio no longer publishes a route."
             )
         )
 

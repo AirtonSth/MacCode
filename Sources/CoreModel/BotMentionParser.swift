@@ -127,4 +127,23 @@ public enum BotPeerTranscript {
             .joined(separator: " - ")
         return "Messaged \(identity)"
     }
+
+    /// Prompt the mentioned bot actually runs. No `@handle` so this cannot
+    /// re-enter Desk mention send if a later caller routes it through `send`.
+    public static func peerAskPrompt(hostName: String, text: String) -> String {
+        "\(hostName) asked you:\n\(text)"
+    }
+
+    /// Hop-1 host follow-up. Must include the peer reply and must not
+    /// contain `@<handle>` or mention-send will loop.
+    public static func hostHopPrompt(peerName: String, reply: String) -> String {
+        "\(peerName) replied:\n\(reply)"
+    }
+
+    public static func containsMentionToken(_ text: String, handle: String) -> Bool {
+        let needle = BotHandle.normalize(handle) ?? handle.lowercased()
+        return BotMentionParser.mentionTokens(in: text).contains { token in
+            (BotHandle.normalize(token) ?? token.lowercased()) == needle
+        }
+    }
 }

@@ -27,7 +27,7 @@ final class BotSelfConfigMCPAdmitTests: XCTestCase {
         )
     }
 
-    func test_admitGrokACPPreservesLeftoverAndIsIdempotent() {
+    func test_admitGrokACPPreservesLeftoverAndIsIdempotent() throws {
         let leftover: [Any] = [["name": "user-linear", "command": "npx"]]
         let first = BotSelfConfigMCPAdmit.admitGrokACP(
             existing: leftover,
@@ -46,9 +46,14 @@ final class BotSelfConfigMCPAdmitTests: XCTestCase {
         let ours = second.compactMap { $0 as? [String: Any] }.first {
             $0["name"] as? String == BotSelfConfigMCPAdmit.serverName
         }
+        let env = try XCTUnwrap(ours?["env"] as? [[String: String]])
         XCTAssertEqual(
-            (ours?["env"] as? [String: String])?[BotSelfConfigCatalog.callerEnvironmentKey],
-            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            env,
+            [["name": BotSelfConfigCatalog.callerEnvironmentKey, "value": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]]
         )
+        let emptyEnv = first.compactMap { $0 as? [String: Any] }.first {
+            $0["name"] as? String == BotSelfConfigMCPAdmit.serverName
+        }
+        XCTAssertEqual(emptyEnv?["env"] as? [[String: String]], [])
     }
 }

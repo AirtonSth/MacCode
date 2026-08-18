@@ -35,4 +35,15 @@ final class ComputerUseMCPAdmitTests: XCTestCase {
         XCTAssertEqual(names.filter { $0 == ComputerUseMCPAdmit.serverName }.count, 1)
         XCTAssertTrue(names.contains("user-linear"))
     }
+
+    func test_admitGrokACPIncludesRequiredEnvArray() {
+        // WHY: live grok 1.0.4 session/new rejects stdio MCP objects that omit
+        // env or send a {KEY:value} dict (`untagged enum McpServer`).
+        let admitted = ComputerUseMCPAdmit.admitGrokACP(existing: [], command: "/bin/svc")
+        let ours = admitted.compactMap { $0 as? [String: Any] }.first {
+            $0["name"] as? String == ComputerUseMCPAdmit.serverName
+        }
+        XCTAssertEqual(ours?["env"] as? [[String: String]], [])
+        XCTAssertTrue(GrokACPMcpServer.envIsACPArray(ours?["env"]))
+    }
 }

@@ -690,6 +690,20 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func deleteRoutine(id: BotRoutineID) throws {
+        try db.transaction {
+            let key = id.value.uuidString.lowercased()
+            let activation = try db.prepare("DELETE FROM bot_routine_activations WHERE routine_id = ?;")
+            defer { activation.reset() }
+            try activation.bind(1, key)
+            _ = try activation.step()
+            let definition = try db.prepare("DELETE FROM bot_routine_definitions WHERE id = ?;")
+            defer { definition.reset() }
+            try definition.bind(1, key)
+            _ = try definition.step()
+        }
+    }
+
     public func requestRoutineTestRun(id: BotRoutineID, now: Date = Date()) throws {
         try db.performSync { database in
             let statement = try database.prepare("""

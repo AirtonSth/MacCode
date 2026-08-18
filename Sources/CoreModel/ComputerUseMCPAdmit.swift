@@ -17,11 +17,7 @@ public enum ComputerUseMCPAdmit: Sendable {
     }
 
     public static func grokACPServer(command: String) -> [String: Any] {
-        [
-            "name": serverName,
-            "command": command,
-            "args": [cliArgument],
-        ]
+        GrokACPMcpServer.stdio(name: serverName, command: command, args: [cliArgument])
     }
 
     /// Claude `mcpServers` map. User keys stay; our key is upserted.

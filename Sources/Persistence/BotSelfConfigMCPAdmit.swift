@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 /// Merge the bot self-config MCP into provider configs without replacing
 /// leftover / user-authored servers. Does not bake a bot id — the calling
@@ -21,17 +22,18 @@ public enum BotSelfConfigMCPAdmit: Sendable {
         command: String,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: Any] {
-        var server: [String: Any] = [
-            "name": serverName,
-            "command": command,
-            "args": [cliArgument],
-        ]
+        var extra: [String: String] = [:]
         if let botID = environment[BotSelfConfigCatalog.callerEnvironmentKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !botID.isEmpty {
-            server["env"] = [BotSelfConfigCatalog.callerEnvironmentKey: botID]
+            extra[BotSelfConfigCatalog.callerEnvironmentKey] = botID
         }
-        return server
+        return GrokACPMcpServer.stdio(
+            name: serverName,
+            command: command,
+            args: [cliArgument],
+            extraEnv: extra
+        )
     }
 
     public static func admitClaude(existing: [String: Any], command: String) -> [String: Any] {

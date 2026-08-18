@@ -1,6 +1,7 @@
 import XCTest
 @testable import AgentRuntime
 import CoreModel
+import Persistence
 
 final class GrokACPProtocolTests: XCTestCase {
     func test_launchArgumentsAreExactlyNoLeaderStdioWithNoDuplication() {
@@ -1330,6 +1331,62 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertTrue(
             adapterSource.contains("noReplay: shouldStartPrompt"),
             "Adapter must pass noReplay:true only on load+prompt path"
+        )
+    }
+
+    /// WHY: Image #1 Bot Desk Grok send died on session/new Invalid params.
+    /// Live grok 1.0.4 accepted empty mcpServers and rejected bot MCP objects
+    /// that omitted env or used a dict. The shipped session/new builder must
+    /// emit the stdio shape that succeeded live: env as [{name,value}].
+    func test_sessionMCPServersMatchLiveGrokMcpServerSchema() throws {
+        let servers = GrokACPClient.sessionMCPServers(
+            existing: [],
+            command: "/tmp/RemoteCodeDistillService",
+            environment: [BotSelfConfigCatalog.callerEnvironmentKey: "bot-desk-1"]
+        )
+        XCTAssertFalse(servers.isEmpty, "Desk Grok sessions still admit bot MCP servers")
+        for item in servers {
+            let object = try XCTUnwrap(item as? [String: Any], "mcpServers entries must be objects")
+            XCTAssertNotNil(object["name"] as? String)
+            XCTAssertNotNil(object["command"] as? String)
+            XCTAssertNotNil(object["args"] as? [String])
+            XCTAssertTrue(
+                GrokACPMcpServer.envIsACPArray(object["env"]),
+                "live grok rejects missing env and {KEY:value} dicts: \(object)"
+            )
+            XCTAssertFalse(object["env"] is [String: String], "env must not be a string dictionary")
+        }
+        let encoded = try JSONSerialization.data(withJSONObject: servers)
+        let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [[String: Any]])
+        XCTAssertEqual(parsed.count, servers.count)
+        let selfConfig = try XCTUnwrap(parsed.first { ($0["name"] as? String) == BotSelfConfigMCPAdmit.serverName })
+        let env = try XCTUnwrap(selfConfig["env"] as? [[String: String]])
+        XCTAssertTrue(env.contains { $0["name"] == BotSelfConfigCatalog.callerEnvironmentKey && $0["value"] == "bot-desk-1" })
+        XCTAssertFalse(
+            GrokACPClient.sessionMCPServers().contains { item in
+                (item as? [String: Any])?["name"] as? String == ComputerUseMCPAdmit.serverName
+            },
+            "Grok sessions must not re-admit remotecode-computer-use"
+        )
+    }
+
+    /// WHY: workspace-less bot threads fall through to currentDirectoryPath,
+    /// which can be empty. Live grok session/new then returns
+    /// Invalid params / Path is not absolute.
+    func test_resolvedSessionCwdRejectsEmptyAndRelative() {
+        let home = "/Users/fixture"
+        XCTAssertEqual(GrokACPClient.resolvedSessionCwd("", home: home, fileExists: { _ in false }), home)
+        XCTAssertEqual(GrokACPClient.resolvedSessionCwd("   ", home: home, fileExists: { _ in false }), home)
+        XCTAssertEqual(GrokACPClient.resolvedSessionCwd("relative", home: home, fileExists: { _ in true }), home)
+        XCTAssertEqual(GrokACPClient.resolvedSessionCwd("/", home: home, fileExists: { $0 == "/" }), "/")
+        XCTAssertEqual(
+            GrokACPClient.resolvedSessionCwd("/missing", home: home, fileExists: { $0 == "/" }),
+            home
+        )
+        let existing = "/Users/fixture/proj"
+        XCTAssertEqual(
+            GrokACPClient.resolvedSessionCwd(existing, home: home, fileExists: { $0 == existing }),
+            existing
         )
     }
 }

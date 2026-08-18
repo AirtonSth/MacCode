@@ -594,6 +594,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 	        ])
 	    }
 
+    func refreshBotsChromeTitle() {
+        guard shellContentMode == .bots else { return }
+        updateCollapsedWorkspaceHeader()
+    }
+
 	    private func updateCollapsedWorkspaceHeader() {
             // Schedule Tasks is a shell destination, not a workspace — title and
             // header must not keep the last workspace name.
@@ -614,9 +619,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
                 return
             }
             if shellContentMode == .bots {
-                collapsedWorkspaceLabel.stringValue = "Bots"
-                visibleWorkspaceLabel.stringValue = "Bots"
-                window.title = "Bots"
+                let title = sidebar.botsViewModel.chromeTitle
+                collapsedWorkspaceLabel.stringValue = title
+                visibleWorkspaceLabel.stringValue = title
+                window.title = title
                 visibleFinderButton.isHidden = true
                 visibleNewWindowButton.isHidden = true
                 return
