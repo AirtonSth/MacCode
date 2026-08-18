@@ -9865,11 +9865,6 @@ public struct AgentAppView: View {
     // IMP-MAC_AGENT-010: highlights the transcript while a file drag hovers it.
     @State private var timelineDropTargeted = false
 
-    @State private var composerEditorHeight: CGFloat = AgentComposerTextEditor.minHeight
-    // macos:32: suggestion popup state. selection nil == nothing highlighted;
-    // dismissed == user pressed Esc for the current token.
-    @State private var suggestionSelectedIndex: Int? = nil
-    @State private var suggestionPopupDismissed = false
     @AppStorage("agent.threadRail.intent.v1") private var threadRailIntentRaw = AdaptiveSidebarIntent.auto.rawValue
     @AppStorage("agent.planSidebar.intent.v1") private var planSidebarIntentRaw = AdaptiveSidebarIntent.auto.rawValue
     @State private var showThreadRail = true
@@ -11823,25 +11818,31 @@ public struct AgentAppView: View {
             let selected = vm.selectedThreadId == t.id
             let multiSelected = selectedThreadIds.contains(t.id)
             let running = vm.isThreadStartingOrRunning(t.id)
-            let showLeadingStatus = t.pinned || t.status == .failed || !t.hasUnread || running
-            Button { selectThreadRow(t) } label: {
-                HStack(spacing: DS.Space.md) {
-                    if running {
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                            .font(.system(size: 8, weight: .semibold))
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .frame(width: 8, height: 8)
-                            .accessibilityLabel("Running")
-                            .accessibilityIdentifier("agent.thread.row.running.\(t.id.value.uuidString)")
-                    } else if showLeadingStatus {
-                        Image(systemName: t.pinned ? "pin.fill" : "circle.fill")
-                            .font(.system(size: t.pinned ? 9 : 7, weight: .semibold))
-                            .foregroundColor(TabColor.from(t.color).map { Color(hex: $0.hex) }
-                                             ?? (t.status == .failed ? DS.Palette.danger : DS.Palette.textTertiary))
-                            .frame(width: 8, height: 8)
-                    } else {
-                        Color.clear.frame(width: 8, height: 8)
-                    }
+            let markColor = TabColor.from(t.color).map { Color(hex: $0.hex) }
+                ?? (t.status == .failed ? DS.Palette.danger : DS.Palette.textTertiary)
+            let status: AgentChatThreadStatusMark = {
+                if running { return .running }
+                if t.pinned { return .symbol(name: "pin.fill", color: markColor, size: 9) }
+                if t.status == .failed { return .symbol(name: "circle.fill", color: DS.Palette.danger, size: 7) }
+                if !t.hasUnread { return .symbol(name: "circle.fill", color: markColor, size: 7) }
+                return .hidden
+            }()
+            AgentChatThreadRow(
+                title: AgentThreadTitle.display(t.title),
+                subtitle: AgentThreadRailRowCopy.subtitle(
+                    provider: t.provider,
+                    model: t.model,
+                    updatedAt: t.updatedAt,
+                    now: vm.currentTime()
+                ),
+                unread: t.hasUnread,
+                selected: selected || multiSelected,
+                status: status,
+                identifier: "agent.thread.row.\(t.id.value.uuidString)",
+                unreadIdentifier: "agent.thread.row.unread.\(t.id.value.uuidString)",
+                runningIdentifier: "agent.thread.row.running.\(t.id.value.uuidString)",
+                onSelect: { selectThreadRow(t) },
+                leading: {
                     Text(AgentThreadRailRowCopy.monogram(for: t.provider))
                         .font(.system(size: 9, weight: .bold, design: .rounded))
                         .foregroundColor(DS.Palette.textSecondary)
@@ -11849,23 +11850,8 @@ public struct AgentAppView: View {
                         .background(DS.Palette.surfaceRaised)
                         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                         .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(AgentThreadTitle.display(t.title)).font(DS.Font.bodyDense.weight(t.hasUnread ? .semibold : .regular))
-                            .foregroundColor(DS.Palette.text).lineLimit(1)
-                        Text(AgentThreadRailRowCopy.subtitle(
-                            provider: t.provider,
-                            model: t.model,
-                            updatedAt: t.updatedAt,
-                            now: vm.currentTime()
-                        ))
-                            .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
-                    }
-                    Spacer(minLength: 0)
-                    if t.hasUnread {
-                        Circle().fill(DS.Palette.accent).frame(width: 7, height: 7)
-                            .accessibilityLabel("Unread activity")
-                            .accessibilityIdentifier("agent.thread.row.unread.\(t.id.value.uuidString)")
-                    }
+                },
+                trailing: {
                     if AgentThreadRowPresentation.showsSelectionCheck(
                         threadStatus: t.status,
                         selected: selected,
@@ -11877,15 +11863,8 @@ public struct AgentAppView: View {
                             .foregroundColor(DS.Palette.accent)
                     }
                 }
-                .padding(.horizontal, DS.Space.md)
-                .padding(.vertical, DS.Space.sm)
-                .background((selected || multiSelected) ? DS.Palette.selection : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
+            )
             .help(t.title)
-            .accessibilityIdentifier("agent.thread.row.\(t.id.value.uuidString)")
             .overlay(alignment: .trailing) {
                 if running {
                     Button {
@@ -15050,77 +15029,69 @@ public struct AgentAppView: View {
         message.attachments.map(\.displayName).joined(separator: ", ")
     }
 
-    // Unified Codex-style composer card: changed-files strip → editor →
-    // toolbar (attach · permission · model·effort · send/stop).
+    // Shared composer card. Git strip and extra capsules stay Agent App slots.
     private var composer: some View {
-        VStack(spacing: 0) {
-            if let s = vm.gitSummary, !s.files.isEmpty { changedFilesStrip(s) }
-            if !vm.attachments.isEmpty {
-                attachmentChips
-                    .padding(.horizontal, DS.Space.lg)
-                    .padding(.top, DS.Space.md)
+        AgentChatComposerBar(
+            text: Binding(get: { vm.prompt }, set: { vm.prompt = $0 }),
+            attachments: vm.attachments,
+            placeholder: vm.composerPlaceholder,
+            sendEnabled: !sendIdleDisabled && AgentComposerChromePresentation.shows(.sendStop, mode: composerChromeMode),
+            runActive: vm.selectedThreadIsStoppableBusy,
+            isStopping: vm.isStopping,
+            attachEnabled: vm.selectedProviderCanRun && !(vm.selectedProviderSnapshot.map {
+                !$0.effectiveCapabilities.supportsAttachments
+            } ?? false),
+            onSend: { Task { await vm.send() } },
+            onStop: { vm.stop() },
+            onAttach: { vm.addAttachments($0) },
+            onRemoveAttachment: { vm.removeAttachment($0) },
+            composerIdentifier: "agent.composer.input",
+            sendIdentifier: "agent.composer.send",
+            leadingControls: AnyView(composerLeadingControls),
+            suggestions: vm.composerSuggestions,
+            onApplySuggestion: { suggestion in
+                vm.applyComposerSuggestion(suggestion)
+            },
+            onCursorMoved: { vm.composerCursorOffset = $0 },
+            suggestionIdentifier: "agent.suggestion.popup",
+            focusTick: vm.focusTick,
+            onPreviousHistory: { vm.recallPreviousPrompt() },
+            onNextHistory: { vm.recallNextPrompt() },
+            onTextEdited: { vm.promptWasEdited() },
+            header: composerHeader,
+            showsAttach: AgentComposerChromePresentation.shows(.attach, mode: composerChromeMode),
+            attachmentChipPrefix: "agent.attachment.",
+            attachmentsIdentifier: "agent.attachments",
+            runStatusCaption: vm.selectedThreadIsStoppableBusy
+                ? (vm.selectedThreadIsPreparingRun ? "Preparing" : "Running")
+                : nil,
+            onFileDrop: { vm.insertDroppedFilePaths($0) }
+        )
+    }
+
+    private var composerHeader: AnyView? {
+        guard let s = vm.gitSummary, !s.files.isEmpty else { return nil }
+        return AnyView(changedFilesStrip(s))
+    }
+
+    private var composerLeadingControls: some View {
+        HStack(spacing: DS.Space.sm) {
+            if AgentComposerChromePresentation.shows(.runAsUser, mode: composerChromeMode) {
+                runAsUserMenu
             }
-            AgentComposerTextEditor(
-                text: Binding(get: { vm.prompt }, set: { vm.prompt = $0 }),
-                height: $composerEditorHeight,
-                focusTick: vm.focusTick,
-                placeholder: vm.composerPlaceholder,
-                accessibilityIdentifier: "agent.composer.input",
-                onSend: { Task { await vm.send() } },
-                onPreviousHistory: { vm.recallPreviousPrompt() },
-                onNextHistory: { vm.recallNextPrompt() },
-                onTextEdited: {
-                    vm.promptWasEdited()
-                    // macos:32: a real keystroke that changes the token re-opens a
-                    // popup the user had dismissed for the previous token.
-                    suggestionPopupDismissed = false
-                },
-                onFileDrop: { paths in vm.insertDroppedFilePaths(paths) },
-                onCursorMoved: { offset in vm.composerCursorOffset = offset },
-                onCaretRectChanged: { _ in },
-                popupIsOpen: {
-                    ComposerSuggestionNavigation.isOpen(
-                        count: vm.composerSuggestions.count,
-                        dismissed: suggestionPopupDismissed
-                    )
-                },
-                onPopupNavUp: {
-                    suggestionSelectedIndex = ComposerSuggestionNavigation.moveUp(
-                        selected: suggestionSelectedIndex,
-                        count: vm.composerSuggestions.count
-                    )
-                },
-                onPopupNavDown: {
-                    suggestionSelectedIndex = ComposerSuggestionNavigation.moveDown(
-                        selected: suggestionSelectedIndex,
-                        count: vm.composerSuggestions.count
-                    )
-                },
-                onPopupApply: { applyHighlightedSuggestion() },
-                onPopupDismiss: { suggestionPopupDismissed = true }
-            )
-            .frame(height: composerEditorHeight)
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.top, DS.Space.sm)
-            .padding(.bottom, DS.Space.xs)
-            .accessibilityIdentifier("agent.composer.input")
-            // macos:32: reset selection + un-dismiss whenever the suggestion set
-            // changes identity/count (new token, or token edited into a new list).
-            .onChange(of: vm.composerSuggestions.map(\.id)) { _ in
-                suggestionSelectedIndex = ComposerSuggestionNavigation.reset()
+            if AgentComposerChromePresentation.shows(.source, mode: composerChromeMode) {
+                sourceMenu
             }
-            // WHY: inline panel between editor and toolbar. A caret-overlay on the
-            // editor painted *under* the toolbar sibling and mixed with pills when
-            // the popup opened downward. Owning layout space avoids z-order fights.
-            suggestionPopup
-            composerToolbar
+            if AgentComposerChromePresentation.shows(.model, mode: composerChromeMode) {
+                modelMenu
+            }
+            if AgentComposerChromePresentation.shows(.permission, mode: composerChromeMode) {
+                permissionMenu
+            }
+            if AgentComposerChromePresentation.shows(.execution, mode: composerChromeMode) {
+                executionMenu
+            }
         }
-        .background(DS.Palette.surface)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
-            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-        .padding(DS.Space.lg)
-        .background(DS.Palette.bg)
     }
 
     private func changedFilesStrip(_ s: GitSummary) -> some View {
@@ -15160,56 +15131,6 @@ public struct AgentAppView: View {
             rows.append("… \(s.files.count - maxRows) more")
         }
         return rows.joined(separator: "\n")
-    }
-
-    private var composerToolbar: some View {
-        compactComposerToolbar
-            .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.sm)
-    }
-
-    private var compactComposerToolbar: some View {
-        HStack(spacing: DS.Space.sm) {
-            if AgentComposerChromePresentation.shows(.attach, mode: composerChromeMode) {
-                attachmentButton
-            }
-            // Power-only: run-as, source, permission, execution.
-            if AgentComposerChromePresentation.shows(.runAsUser, mode: composerChromeMode) {
-                // macOS user that will execute the agent (sudo -u). Distinct from
-                // provider-instance Source (CODEX_HOME / personal-vs-work CLI config).
-                runAsUserMenu
-            }
-            if AgentComposerChromePresentation.shows(.source, mode: composerChromeMode) {
-                // Provider instance / CLI identity (not OS user).
-                sourceMenu
-            }
-            if AgentComposerChromePresentation.shows(.model, mode: composerChromeMode) {
-                modelMenu
-            }
-            if AgentComposerChromePresentation.shows(.permission, mode: composerChromeMode) {
-                permissionMenu
-            }
-            if AgentComposerChromePresentation.shows(.execution, mode: composerChromeMode) {
-                executionMenu
-            }
-            Spacer(minLength: DS.Space.xs)
-            if vm.selectedThreadIsStoppableBusy {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityLabel(vm.selectedThreadIsPreparingRun ? "Preparing" : "Running")
-                stopButton
-                // UX-MAC_AGENT-007: separate the red Stop circle from the accent
-                // Queue circle so the two adjacent buttons don't read as one
-                // ambiguous control.
-                Rectangle()
-                    .fill(DS.Palette.line)
-                    .frame(width: DS.Border.hairline, height: 18)
-                    .padding(.horizontal, DS.Space.xxs)
-            }
-            if AgentComposerChromePresentation.shows(.sendStop, mode: composerChromeMode) {
-                sendStopButton
-            }
-        }
     }
 
     // MARK: System status strip + working phase strip
@@ -15363,54 +15284,6 @@ public struct AgentAppView: View {
         } else {
             DSPill(vm.status.rawValue, tone: statusTone(vm.status))
                 .accessibilityIdentifier("agent.status.pill")
-        }
-    }
-
-    private var attachmentButton: some View {
-        Button(action: pickAttachments) {
-            Image(systemName: "plus")
-                .font(.system(size: 13, weight: .medium))
-                .frame(width: 26, height: 26)
-        }
-        .buttonStyle(.plain)
-        .disabled(!vm.selectedProviderCanRun || (vm.selectedProviderSnapshot.map {
-            !$0.effectiveCapabilities.supportsAttachments
-        } ?? false))
-        .foregroundColor(DS.Palette.textSecondary)
-        .help("Attach files").accessibilityLabel("Attach files")
-        .accessibilityIdentifier("agent.attach")
-    }
-
-    // macos:32: applies the currently highlighted suggestion (or the first when
-    // nothing is highlighted yet, e.g. user pressed Return right after typing the
-    // token without arrowing). Reads vm state live, then resets popup state.
-    private func applyHighlightedSuggestion() {
-        let suggestions = vm.composerSuggestions
-        guard !suggestions.isEmpty else { return }
-        let index = suggestionSelectedIndex ?? 0
-        guard suggestions.indices.contains(index) else { return }
-        vm.applyComposerSuggestion(suggestions[index])
-        suggestionSelectedIndex = ComposerSuggestionNavigation.reset()
-        suggestionPopupDismissed = true
-    }
-
-    // macos:32: keyboard-navigable suggestion panel. Sits between the editor and
-    // the composer toolbar so slash/skill rows never paint under attach/model/
-    // permission pills (caret-overlay + place-below collided with that toolbar).
-    @ViewBuilder
-    private var suggestionPopup: some View {
-        let suggestions = vm.composerSuggestions
-        if ComposerSuggestionNavigation.isOpen(count: suggestions.count, dismissed: suggestionPopupDismissed) {
-            AgentComposerSuggestionPanel(
-                suggestions: suggestions,
-                highlightedIndex: suggestionSelectedIndex,
-                identifier: "agent.suggestion.popup",
-                onSelect: { suggestion in
-                    vm.applyComposerSuggestion(suggestion)
-                    suggestionPopupDismissed = true
-                }
-            )
-            .transition(.opacity.combined(with: .move(edge: .bottom)))
         }
     }
 
@@ -15884,112 +15757,6 @@ public struct AgentAppView: View {
     private static func measureCurrentModelMenuLabel(_ label: String) -> CGFloat {
         let font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
         return (label as NSString).size(withAttributes: [.font: font]).width
-    }
-
-    private var sendStopButton: some View {
-        let runActive = vm.selectedThreadRunIsStartingOrRunning
-        return Button {
-            Task { await vm.send() }
-        } label: {
-            ZStack {
-                Circle()
-                    .fill(sendIdleDisabled ? DS.Palette.surfaceRaised : DS.Palette.accent)
-                    .frame(width: 28, height: 28)
-                Image(systemName: runActive ? "text.line.first.and.arrowtriangle.forward" : "arrow.up")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundColor(sendIdleDisabled ? DS.Palette.textTertiary : DS.Palette.onAccent)
-            }
-        }
-        .buttonStyle(.plain)
-        .disabled(sendIdleDisabled)
-        .keyboardShortcut(.return, modifiers: [.command])
-        .accessibilityLabel(runActive ? "Queue message" : "Send")
-        .accessibilityIdentifier("agent.composer.send")
-        .help(runActive ? "Queue message for this thread" : "Send prompt")
-    }
-
-    private var stopButton: some View {
-        let btnState = AgentAppViewModel.stopButtonState(
-            runActive: vm.selectedThreadRunIsStartingOrRunning,
-            isStopping: vm.isStopping
-        )
-        // Keep clickable while Stopping so a second click force-stops; do not
-        // latch the control disabled forever if soft cancel stalls.
-        return Button { vm.stop() } label: {
-            ZStack {
-                Circle()
-                    .fill(btnState == .stopping ? DS.Palette.surfaceRaised : DS.Palette.danger)
-                    .frame(width: 28, height: 28)
-                if btnState == .stopping {
-                    ProgressView()
-                        .controlSize(.mini)
-                        .tint(DS.Palette.textSecondary)
-                } else {
-                    Image(systemName: "stop.fill")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(DS.Palette.bg)
-                }
-            }
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(btnState == .stopping ? "Force stop running agent" : "Stop running agent")
-        .accessibilityIdentifier("agent.composer.stop")
-        .help(btnState == .stopping
-              ? "Still stopping — click again to force-stop the provider"
-              : "Stop running agent")
-    }
-
-    // P3: thumbnail for image attachments; falls back to doc icon for non-images.
-    @ViewBuilder private func attachmentChipLeadingContent(_ path: String) -> some View {
-        if Self.isImageAttachment(path), let img = NSImage(contentsOfFile: path) {
-            Image(nsImage: img)
-                .resizable()
-                .scaledToFill()
-                .frame(width: 18, height: 18)
-                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-        } else {
-            Image(systemName: Self.isImagePath(path) ? "photo" : "doc")
-                .font(.system(size: 9))
-        }
-    }
-
-    private var attachmentChips: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: DS.Space.sm) {
-                ForEach(vm.attachments, id: \.self) { attachment in
-                    HStack(spacing: DS.Space.xs) {
-                        // P3: render thumbnail for image files; icon+name for others.
-                        attachmentChipLeadingContent(attachment.path)
-                        Text(attachment.displayName)
-                            .font(DS.Font.caption2).lineLimit(1)
-                        Button { vm.removeAttachment(attachment) } label: {
-                            Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(Self.attachmentRemovalAccessibilityLabel(path: attachment.displayName))
-                        .help(Self.attachmentRemovalAccessibilityLabel(path: attachment.displayName))
-                    }
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .padding(.horizontal, DS.Space.sm).padding(.vertical, 3)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(Capsule())
-                    .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-                }
-            }
-        }
-    }
-
-    private func pickAttachments() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        // P2: directories are rejected at send time by AgentAttachmentResolver;
-        // disallow them at pick time so the error surfaces immediately instead
-        // of silently after the run starts.
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = true
-        if panel.runModal() == .OK {
-            vm.addAttachments(panel.urls.map { $0.path })
-        }
     }
 
     // IMP-MAC_AGENT-010: resolve dropped item providers to file paths and
