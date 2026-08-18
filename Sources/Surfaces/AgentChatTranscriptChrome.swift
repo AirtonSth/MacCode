@@ -221,6 +221,14 @@ public struct AgentChatComposerBar: View {
     public var composerIdentifier: String = "bots.desk.composer"
     public var sendIdentifier: String = "bots.desk.send"
     public var leadingControls: AnyView?
+    public var suggestions: [AgentComposerSuggestion] = []
+    public var onApplySuggestion: ((AgentComposerSuggestion) -> Void)?
+    public var onCursorMoved: ((Int) -> Void)?
+    public var suggestionIdentifier: String = "bots.desk.suggestion.popup"
+
+    @State private var editorHeight: CGFloat = AgentComposerTextEditor.minHeight
+    @State private var suggestionSelectedIndex: Int?
+    @State private var suggestionPopupDismissed = false
 
     public init(
         text: Binding<String>,
@@ -237,7 +245,11 @@ public struct AgentChatComposerBar: View {
         onRemoveAttachment: @escaping (AgentAttachment) -> Void = { _ in },
         composerIdentifier: String = "bots.desk.composer",
         sendIdentifier: String = "bots.desk.send",
-        leadingControls: AnyView? = nil
+        leadingControls: AnyView? = nil,
+        suggestions: [AgentComposerSuggestion] = [],
+        onApplySuggestion: ((AgentComposerSuggestion) -> Void)? = nil,
+        onCursorMoved: ((Int) -> Void)? = nil,
+        suggestionIdentifier: String = "bots.desk.suggestion.popup"
     ) {
         self._text = text
         self.attachments = attachments
@@ -254,6 +266,10 @@ public struct AgentChatComposerBar: View {
         self.composerIdentifier = composerIdentifier
         self.sendIdentifier = sendIdentifier
         self.leadingControls = leadingControls
+        self.suggestions = suggestions
+        self.onApplySuggestion = onApplySuggestion
+        self.onCursorMoved = onCursorMoved
+        self.suggestionIdentifier = suggestionIdentifier
     }
 
     public var body: some View {
@@ -275,17 +291,65 @@ public struct AgentChatComposerBar: View {
                     .padding(.horizontal, DS.Space.lg)
                     .padding(.top, DS.Space.md)
             }
-            TextField(placeholder, text: $text, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...8)
-                .font(.system(size: 13))
-                .foregroundColor(DS.Palette.text)
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.top, DS.Space.sm)
-                .padding(.bottom, DS.Space.xs)
-                .accessibilityLabel(placeholder)
-                .accessibilityIdentifier(composerIdentifier)
-                .onSubmit(onSend)
+            AgentComposerTextEditor(
+                text: $text,
+                height: $editorHeight,
+                focusTick: 0,
+                placeholder: placeholder,
+                accessibilityIdentifier: composerIdentifier,
+                onSend: onSend,
+                onPreviousHistory: { false },
+                onNextHistory: { false },
+                onTextEdited: {
+                    suggestionPopupDismissed = false
+                },
+                onFileDrop: onAttach,
+                onCursorMoved: { offset in onCursorMoved?(offset) },
+                onCaretRectChanged: { _ in },
+                popupIsOpen: {
+                    ComposerSuggestionNavigation.isOpen(
+                        count: suggestions.count,
+                        dismissed: suggestionPopupDismissed
+                    )
+                },
+                onPopupNavUp: {
+                    suggestionSelectedIndex = ComposerSuggestionNavigation.moveUp(
+                        selected: suggestionSelectedIndex,
+                        count: suggestions.count
+                    )
+                },
+                onPopupNavDown: {
+                    suggestionSelectedIndex = ComposerSuggestionNavigation.moveDown(
+                        selected: suggestionSelectedIndex,
+                        count: suggestions.count
+                    )
+                },
+                onPopupApply: { applyHighlightedSuggestion() },
+                onPopupDismiss: { suggestionPopupDismissed = true }
+            )
+            .frame(height: editorHeight)
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.top, DS.Space.sm)
+            .padding(.bottom, DS.Space.xs)
+            .accessibilityLabel(placeholder)
+            .accessibilityIdentifier(composerIdentifier)
+            .onChange(of: suggestions.map(\.id)) { _ in
+                suggestionSelectedIndex = ComposerSuggestionNavigation.reset()
+            }
+            if ComposerSuggestionNavigation.isOpen(
+                count: suggestions.count,
+                dismissed: suggestionPopupDismissed
+            ) {
+                AgentComposerSuggestionPanel(
+                    suggestions: suggestions,
+                    highlightedIndex: suggestionSelectedIndex,
+                    identifier: suggestionIdentifier,
+                    onSelect: { suggestion in
+                        onApplySuggestion?(suggestion)
+                        suggestionPopupDismissed = true
+                    }
+                )
+            }
             HStack(spacing: DS.Space.sm) {
                 Button(action: pickAttachments) {
                     Image(systemName: "plus")
@@ -422,6 +486,15 @@ public struct AgentChatComposerBar: View {
             }
         }
         .accessibilityIdentifier("bots.desk.attachments")
+    }
+
+    private func applyHighlightedSuggestion() {
+        guard !suggestions.isEmpty else { return }
+        let index = suggestionSelectedIndex ?? 0
+        guard suggestions.indices.contains(index) else { return }
+        onApplySuggestion?(suggestions[index])
+        suggestionSelectedIndex = ComposerSuggestionNavigation.reset()
+        suggestionPopupDismissed = true
     }
 
     private func pickAttachments() {

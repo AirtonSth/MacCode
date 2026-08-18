@@ -4296,6 +4296,35 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.composerSuggestions.contains { $0.kind == .skill })
     }
 
+    func test_deskApplyComposerSuggestionUsesCursorOffset() throws {
+        // WHY: Desk used to apply at endIndex. Mid-prompt `/sam` must
+        // replace that token, not the word after the caret.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        vm.openDesk(piper)
+        vm.replaceProvidersForTests([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [],
+                slashCommands: ["/goal"],
+                skills: ["sam-work", "sam-codex-advisor"]
+            )
+        ])
+        vm.composerText = "hello /sam more"
+        vm.composerCursorOffset = nil
+        XCTAssertTrue(
+            vm.composerSuggestions.isEmpty,
+            "nil cursor still anchors at the last token (`more`)"
+        )
+        vm.composerCursorOffset = ("hello /sam" as NSString).length
+        let skill = try XCTUnwrap(vm.composerSuggestions.first { $0.kind == .skill })
+        vm.applyComposerSuggestion(skill)
+        XCTAssertTrue(vm.composerText.hasPrefix("hello \(skill.insertText.trimmingCharacters(in: .whitespaces))"))
+        XCTAssertTrue(vm.composerText.contains("more"))
+        XCTAssertFalse(vm.composerText.contains("/sam more"))
+    }
+
     func test_sendWithMentionTargetsPeer_notOnlyHost() throws {
         // WHY: "@quinn do X" from Piper's Desk must run Quinn and paint
         // Messaged Quinn on Piper's transcript. A host-only send would

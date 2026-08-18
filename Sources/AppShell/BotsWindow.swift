@@ -510,6 +510,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public var composerText: String = "" {
         didSet { persistComposerIfHydrated() }
     }
+    @Published public var composerCursorOffset: Int? = nil
     @Published public var attachments: [AgentAttachment] = [] {
         didSet { persistComposerIfHydrated() }
     }
@@ -1863,6 +1864,7 @@ public final class BotsViewModel: ObservableObject {
         guard let bot = selectedBot else { return false }
         lastSendAcknowledgedOnScreenForTesting = screen
         composerText = ""
+        composerCursorOffset = nil
         attachments = []
         lastSendStartedProviderRun = false
         lastMentionedBotIDForTesting = nil
@@ -3230,6 +3232,7 @@ public final class BotsViewModel: ObservableObject {
         let draft = botID.flatMap { composerDraftsByBot[$0] }
         isApplyingComposerDraft = true
         composerText = draft?.text ?? ""
+        composerCursorOffset = nil
         attachments = draft?.liveAttachments ?? []
         isApplyingComposerDraft = false
         composerHydrated = true
@@ -3297,6 +3300,7 @@ public final class BotsViewModel: ObservableObject {
         let isClaude = snapshot?.provider == .claude || deskRouting.provider == .claude
         return AgentComposerSuggestions.suggestions(
             for: composerText,
+            cursorOffset: composerCursorOffset,
             snapshot: snapshot,
             localSlashCommands: [],
             extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
@@ -3312,7 +3316,7 @@ public final class BotsViewModel: ObservableObject {
     public func applyComposerSuggestion(_ suggestion: AgentComposerSuggestion) {
         composerText = AgentComposerSuggestions.replacingActiveToken(
             in: composerText,
-            cursorOffset: nil,
+            cursorOffset: composerCursorOffset,
             with: suggestion.insertText
         )
     }
@@ -5778,14 +5782,6 @@ public struct BotsRootView: View {
                 if !vm.queuedFollowUps.isEmpty {
                     deskQueuedFollowUps
                 }
-                if !vm.composerSuggestions.isEmpty {
-                    AgentComposerSuggestionPanel(
-                        suggestions: vm.composerSuggestions,
-                        highlightedIndex: 0,
-                        identifier: "bots.desk.suggestion.popup",
-                        onSelect: { vm.applyComposerSuggestion($0) }
-                    )
-                }
                 composerBar(bot)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -6368,7 +6364,11 @@ public struct BotsRootView: View {
                 onRemoveAttachment: { vm.removeAttachment($0) },
                 composerIdentifier: "bots.desk.composer",
                 sendIdentifier: "bots.desk.send",
-                leadingControls: AnyView(deskRoutingControls)
+                leadingControls: AnyView(deskRoutingControls),
+                suggestions: vm.composerSuggestions,
+                onApplySuggestion: { vm.applyComposerSuggestion($0) },
+                onCursorMoved: { vm.composerCursorOffset = $0 },
+                suggestionIdentifier: "bots.desk.suggestion.popup"
             )
         }
     }
