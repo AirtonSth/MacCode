@@ -93,19 +93,28 @@ public struct AgentChatUserBubble: View {
     public var columnWidth: CGFloat = 10_000
     public var accessibilityIdentifier: String = "agent.userMessageBubble"
     public var roleIdentifier: String = "bots.desk.role.user"
+    public var copyIdentifier: String? = nil
+    public var header: AnyView? = nil
+    public var belowBubble: AnyView? = nil
 
     public init(
         text: String,
         createdAt: Date,
         columnWidth: CGFloat = 10_000,
         accessibilityIdentifier: String = "agent.userMessageBubble",
-        roleIdentifier: String = "bots.desk.role.user"
+        roleIdentifier: String = "bots.desk.role.user",
+        copyIdentifier: String? = nil,
+        header: AnyView? = nil,
+        belowBubble: AnyView? = nil
     ) {
         self.text = text
         self.createdAt = createdAt
         self.columnWidth = columnWidth
         self.accessibilityIdentifier = accessibilityIdentifier
         self.roleIdentifier = roleIdentifier
+        self.copyIdentifier = copyIdentifier
+        self.header = header
+        self.belowBubble = belowBubble
     }
 
     public var body: some View {
@@ -114,6 +123,9 @@ public struct AgentChatUserBubble: View {
         HStack(alignment: .top, spacing: 0) {
             Spacer(minLength: AgentChatTranscriptChrome.userMessageBubbleLeadingGutter)
             VStack(alignment: .trailing, spacing: DS.Space.xs) {
+                if let header {
+                    header
+                }
                 ViewThatFits(in: .horizontal) {
                     bubbleLabel
                         .fixedSize(horizontal: true, vertical: true)
@@ -123,6 +135,10 @@ public struct AgentChatUserBubble: View {
                 }
                 .frame(maxWidth: bubbleMax, alignment: .trailing)
                 .accessibilityIdentifier(accessibilityIdentifier)
+                if let belowBubble {
+                    belowBubble
+                        .frame(maxWidth: bubbleMax, alignment: .trailing)
+                }
                 HStack(spacing: DS.Space.xs) {
                     Button {
                         AgentChatTranscriptChrome.copyToPasteboard(text)
@@ -135,6 +151,7 @@ public struct AgentChatUserBubble: View {
                     .buttonStyle(.plain)
                     .foregroundColor(DS.Palette.textTertiary)
                     .accessibilityLabel("Copy message")
+                    .accessibilityIdentifier(copyIdentifier ?? "agent.userMessage.copy")
                     .help("Copy message")
                     Text(AgentChatTranscriptChrome.relativeTimestamp(createdAt))
                         .font(DS.Font.caption2)
@@ -171,20 +188,33 @@ public struct AgentChatUserBubble: View {
 public struct AgentChatAssistantReply: View {
     public let text: String
     public var roleIdentifier: String = "bots.desk.role.assistant"
+    public var copyIdentifier: String? = nil
+    public var content: AnyView? = nil
 
-    public init(text: String, roleIdentifier: String = "bots.desk.role.assistant") {
+    public init(
+        text: String,
+        roleIdentifier: String = "bots.desk.role.assistant",
+        copyIdentifier: String? = nil,
+        content: AnyView? = nil
+    ) {
         self.text = text
         self.roleIdentifier = roleIdentifier
+        self.copyIdentifier = copyIdentifier
+        self.content = content
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.xs) {
-            AgentMessageMarkdownView(text: text)
-                .foregroundColor(DS.Palette.text)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityIdentifier(roleIdentifier)
-                .accessibilityLabel(text)
+            if let content {
+                content
+            } else {
+                AgentMessageMarkdownView(text: text)
+                    .foregroundColor(DS.Palette.text)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier(roleIdentifier)
+                    .accessibilityLabel(text)
+            }
             HStack(spacing: DS.Space.xs) {
                 Button {
                     AgentChatTranscriptChrome.copyToPasteboard(text)
@@ -197,6 +227,7 @@ public struct AgentChatAssistantReply: View {
                 .buttonStyle(.plain)
                 .foregroundColor(DS.Palette.textTertiary)
                 .accessibilityLabel("Copy message")
+                .accessibilityIdentifier(copyIdentifier ?? "agent.assistantMessage.copy")
                 .help("Copy message")
             }
             .frame(maxWidth: .infinity, alignment: .leading)

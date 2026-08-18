@@ -1,5 +1,6 @@
 import CoreModel
 import DesignSystemKit
+import Surfaces
 import SwiftUI
 
 public struct BotScheduleTaskItem: Identifiable, Equatable {
@@ -162,124 +163,54 @@ public struct BotScheduleTasksRootView: View {
     }
 
     private var autonomyControl: some View {
-        let active = vm.isAutonomyActive
-        let tone = active ? DS.Palette.success : DS.Palette.warning
-        return HStack(spacing: DS.Space.md) {
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: active ? "bolt.fill" : "pause.fill")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(tone)
-                    .frame(width: 22, height: 22)
-                    .background(tone.opacity(0.16))
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(active ? "Active" : "Paused")
-                        .font(DS.Font.captionStrong)
-                        .foregroundColor(DS.Palette.text)
-                    Text(active ? "Schedules on" : "Travel pause")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                }
-            }
-            .accessibilityHidden(true)
-            Toggle(isOn: Binding(
-                get: { vm.isAutonomyActive },
-                set: { vm.setAutonomyActive($0) }
-            )) {
-                Text("Active")
-            }
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .tint(DS.Palette.success)
-            .accessibilityIdentifier("bots.scheduleTasks.globalActive")
-            .accessibilityLabel(active ? "Schedules active" : "Schedules paused")
-        }
-        .padding(.leading, DS.Space.lg)
-        .padding(.trailing, DS.Space.md)
-        .padding(.vertical, DS.Space.sm)
-        .background(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .fill(DS.Palette.surfaceRaised)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .strokeBorder(active ? tone.opacity(0.45) : DS.Palette.line, lineWidth: DS.Border.hairline)
+        AgentKillSwitchControl(
+            isActive: vm.isAutonomyActive,
+            identifier: "bots.scheduleTasks.globalActive",
+            accessibilityLabel: vm.isAutonomyActive ? "Schedules active" : "Schedules paused",
+            onChange: { vm.setAutonomyActive($0) }
         )
     }
 
     private var filterChips: some View {
         HStack(spacing: DS.Space.sm) {
-            filterChip(.all, count: vm.scheduleTaskFilterCounts.all)
-            filterChip(.active, count: vm.scheduleTaskFilterCounts.active)
-            filterChip(.paused, count: vm.scheduleTaskFilterCounts.paused)
+            AgentListFilterChip(
+                title: ScheduledTaskStatusFilter.all.rawValue,
+                count: vm.scheduleTaskFilterCounts.all,
+                selected: vm.scheduleTaskStatusFilter == .all,
+                identifier: "bots.scheduleTasks.filter.all"
+            ) { vm.scheduleTaskStatusFilter = .all }
+            AgentListFilterChip(
+                title: ScheduledTaskStatusFilter.active.rawValue,
+                count: vm.scheduleTaskFilterCounts.active,
+                selected: vm.scheduleTaskStatusFilter == .active,
+                identifier: "bots.scheduleTasks.filter.active"
+            ) { vm.scheduleTaskStatusFilter = .active }
+            AgentListFilterChip(
+                title: ScheduledTaskStatusFilter.paused.rawValue,
+                count: vm.scheduleTaskFilterCounts.paused,
+                selected: vm.scheduleTaskStatusFilter == .paused,
+                identifier: "bots.scheduleTasks.filter.paused"
+            ) { vm.scheduleTaskStatusFilter = .paused }
         }
         .accessibilityIdentifier("bots.scheduleTasks.statusFilter")
     }
 
-    private func filterChip(_ filter: ScheduledTaskStatusFilter, count: Int) -> some View {
-        let selected = vm.scheduleTaskStatusFilter == filter
-        return Button {
-            vm.scheduleTaskStatusFilter = filter
-        } label: {
-            HStack(spacing: DS.Space.xs) {
-                Text(filter.rawValue)
-                    .font(DS.Font.caption.weight(.semibold))
-                Text("\(count)")
-                    .font(DS.Font.caption2.weight(.bold))
-                    .opacity(selected ? 0.9 : 0.7)
-            }
-            .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.vertical, DS.Space.sm)
-            .background(selected ? DS.Palette.accent : DS.Palette.surfaceRaised)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .strokeBorder(selected ? Color.clear : DS.Palette.line, lineWidth: DS.Border.hairline)
-            )
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-        .accessibilityIdentifier("bots.scheduleTasks.filter.\(filter.rawValue.lowercased())")
-    }
-
     private var searchField: some View {
-        HStack(spacing: DS.Space.sm) {
-            Image(systemName: "magnifyingglass")
-                .foregroundColor(DS.Palette.textTertiary)
-                .accessibilityHidden(true)
-            TextField("Search tasks", text: $vm.scheduleTaskSearchText)
-                .textFieldStyle(.plain)
-                .foregroundColor(DS.Palette.text)
-                .accessibilityLabel("Search tasks")
-                .accessibilityIdentifier("bots.scheduleTasks.search")
-        }
-        .padding(.horizontal, DS.Space.lg)
-        .padding(.vertical, DS.Space.md)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        AgentListSearchField(
+            text: $vm.scheduleTaskSearchText,
+            placeholder: "Search tasks",
+            identifier: "bots.scheduleTasks.search",
+            accessibilityLabel: "Search tasks"
         )
+        .accessibilityLabel("Search tasks")
     }
 
     private var footerBar: some View {
-        HStack(spacing: DS.Space.md) {
-            Text(vm.scheduleTasksFooterLine)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-            DSPill(
-                vm.isAutonomyActive ? "Scheduler online" : "Scheduler paused",
-                tone: vm.isAutonomyActive ? .success : .warning
-            )
-            .accessibilityHidden(true)
-            Spacer(minLength: DS.Space.md)
-        }
-        .padding(.horizontal, DS.Space.xxl)
-        .frame(height: 40)
-        .background(DS.Palette.surface)
+        AgentListFooterBar(
+            caption: vm.scheduleTasksFooterLine,
+            pillTitle: vm.isAutonomyActive ? "Scheduler online" : "Scheduler paused",
+            pillTone: vm.isAutonomyActive ? .success : .warning
+        )
         .accessibilityLabel(vm.scheduleTasksFooterLine)
     }
 
@@ -308,61 +239,29 @@ private struct BotScheduleTaskCard: View {
     let onDelete: () -> Void
 
     var body: some View {
-        Button(action: onOpen) {
+        AgentOverviewCard(
+            icon: "calendar.badge.clock",
+            iconColor: DS.Palette.accent,
+            title: item.name,
+            subtitle: "\(item.botName) · @\(item.botHandle)",
+            identifier: "bots.scheduleTasks.task.\(item.id.value.uuidString.lowercased())",
+            onOpen: onOpen
+        ) {
+            if item.isEnabled {
+                DSPill("Active", tone: .success)
+            } else {
+                DSPill("Paused", tone: .neutral)
+            }
+        } meta: {
             HStack(alignment: .center, spacing: DS.Space.xl) {
-                Image(systemName: "calendar.badge.clock")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(DS.Palette.accent)
-                    .frame(width: 44, height: 44)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                    )
-                    .accessibilityHidden(true)
-
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    HStack(spacing: DS.Space.sm) {
-                        Text(item.name)
-                            .font(DS.Font.body.weight(.semibold))
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(1)
-                        if item.isEnabled {
-                            DSPill("Active", tone: .success)
-                        } else {
-                            DSPill("Paused", tone: .neutral)
-                        }
-                    }
-                    Text("\(item.botName) · @\(item.botHandle)")
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Schedule")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(item.scheduleNote.isEmpty ? "When noted in the task" : item.scheduleNote)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(2)
-                }
-                .frame(width: 140, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Next run")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(item.nextRunLabel(isAutonomyActive: isAutonomyActive))
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(2)
-                }
-                .frame(width: 140, alignment: .leading)
-
+                AgentOverviewMetaColumn(
+                    title: "Schedule",
+                    value: item.scheduleNote.isEmpty ? "When noted in the task" : item.scheduleNote
+                )
+                AgentOverviewMetaColumn(
+                    title: "Next run",
+                    value: item.nextRunLabel(isAutonomyActive: isAutonomyActive)
+                )
                 HStack(spacing: DS.Space.xs) {
                     Image(systemName: "clock")
                         .font(.system(size: 11, weight: .semibold))
@@ -373,35 +272,24 @@ private struct BotScheduleTaskCard: View {
                         .monospacedDigit()
                 }
                 .frame(width: 44, alignment: .trailing)
-
-                Menu {
-                    Button(item.isEnabled ? "Pause" : "Resume", action: onToggle)
-                    Button("Run Now", action: onRunNow)
-                    Button("Edit", action: onEdit)
-                    Divider()
-                    Button("Delete", role: .destructive, action: onDelete)
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .menuStyle(.borderlessButton)
-                .accessibilityLabel("Task actions")
             }
-            .padding(.horizontal, DS.Space.xl)
-            .padding(.vertical, DS.Space.lg)
-            .background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-            )
-            .contentShape(Rectangle())
+        } trailing: {
+            Menu {
+                Button(item.isEnabled ? "Pause" : "Resume", action: onToggle)
+                Button("Run Now", action: onRunNow)
+                Button("Edit", action: onEdit)
+                Divider()
+                Button("Delete", role: .destructive, action: onDelete)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel("Task actions")
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("bots.scheduleTasks.task.\(item.id.value.uuidString.lowercased())")
     }
 }
 
@@ -519,25 +407,15 @@ struct BotScheduleSpecEditor: View {
     @Binding var spec: BotScheduleSpec
     let providers: [AgentProviderSnapshot]
     let providersLoading: Bool
+    @State private var showSourceOptions = false
+    @State private var showModelOptions = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.xxl) {
             editorGroup("Details") {
                 formRow("Provider") {
-                    Picker("Provider", selection: $spec.provider) {
-                        ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
-                    }
-                    .labelsHidden()
-                    .onChange(of: spec.provider) { _, provider in
-                        if let snapshot = snapshots(for: provider).first {
-                            spec.providerInstanceID = snapshot.id
-                            spec.model = snapshot.models.first?.id ?? ""
-                            spec.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .medium
-                        } else {
-                            spec.providerInstanceID = provider.rawValue
-                        }
-                    }
-                    .accessibilityIdentifier("bots.scheduleTasks.editor.provider")
+                    specSourceCapsule
+                        .accessibilityIdentifier("bots.scheduleTasks.editor.provider")
                 }
                 formRow("Model routing") {
                     HStack(spacing: DS.Space.sm) {
@@ -565,24 +443,16 @@ struct BotScheduleSpecEditor: View {
                     }
                 } else {
                     formRow("Model") {
-                        Picker("Model", selection: $spec.model) {
-                            ForEach(models, id: \.id) {
-                                Text($0.label).tag($0.id)
-                            }
-                            if !spec.model.isEmpty,
-                               !models.contains(where: { $0.id == spec.model }) {
-                                Text(spec.model).tag(spec.model)
-                            }
+                        Button {
+                            showModelOptions.toggle()
+                        } label: {
+                            AgentModelPillLabel(presentation: specModelPillPresentation)
                         }
-                        .labelsHidden()
+                        .buttonStyle(.plain)
                         .accessibilityIdentifier("bots.scheduleTasks.editor.model")
-                    }
-                    formRow("Reasoning") {
-                        Picker("Reasoning", selection: $spec.reasoningEffort) {
-                            ForEach(AgentReasoningEffort.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                        .popover(isPresented: $showModelOptions, arrowEdge: .bottom) {
+                            specModelPopover
                         }
-                        .labelsHidden()
-                        .accessibilityIdentifier("bots.scheduleTasks.editor.reasoning")
                     }
                 }
             }
@@ -621,6 +491,95 @@ struct BotScheduleSpecEditor: View {
 
     private func snapshots(for provider: AgentProvider) -> [AgentProviderSnapshot] {
         providers.filter { $0.provider == provider }
+    }
+
+    private var specSourceCapsule: some View {
+        AgentSourceCapsule(
+            label: AgentSourceCapsulePresentation.capsuleLabel(
+                selected: providers.first(where: {
+                    $0.id == spec.providerInstanceID && $0.provider == spec.provider
+                }) ?? snapshots(for: spec.provider).first,
+                fallbackProvider: spec.provider,
+                fallbackInstanceId: spec.providerInstanceID,
+                snapshots: providers
+            ),
+            entries: AgentSourceCapsulePresentation.menuEntries(
+                snapshots: providers,
+                selectedSnapshotId: spec.providerInstanceID,
+                selectedProvider: spec.provider,
+                providerDisplayName: { $0.rawValue.capitalized }
+            ),
+            runLocked: false,
+            providerLocked: false,
+            accessibilityIdentifier: "bots.scheduleTasks.editor.provider",
+            popoverIdentifier: "bots.scheduleTasks.editor.source.popover",
+            isPresented: $showSourceOptions,
+            onSelect: { selectSpecSource($0) }
+        )
+    }
+
+    private var specModelPillPresentation: AgentModelPillPresentation {
+        let title = models.first(where: { $0.id == spec.model })?.label
+            ?? (spec.model.isEmpty ? "Model" : spec.model)
+        return AgentModelPillPresentation(
+            title: title,
+            effort: spec.reasoningEffort.displayName
+        )
+    }
+
+    private var specModelPopover: some View {
+        AgentModelPopoverChrome(
+            presentation: AgentModelPopoverPresentation.current(mode: spec.routingMode),
+            autoEnabled: Binding(
+                get: { spec.routingMode == .auto },
+                set: { spec.routingMode = $0 ? .auto : .manual }
+            ),
+            toggleDisabled: false
+        ) {
+            AgentCompactMenuSection("Model")
+            ForEach(models, id: \.id) { model in
+                AgentCompactMenuRow(model.label, selected: model.id == spec.model) {
+                    spec.model = model.id
+                    if let effort = model.supportedReasoningEfforts.first {
+                        spec.reasoningEffort = effort
+                    }
+                    showModelOptions = false
+                }
+            }
+            if !spec.model.isEmpty, !models.contains(where: { $0.id == spec.model }) {
+                AgentCompactMenuRow(spec.model, selected: true) {
+                    showModelOptions = false
+                }
+            }
+            AgentCompactMenuDivider()
+            AgentCompactMenuSection("Reasoning")
+            ForEach(AgentReasoningEffort.allCases, id: \.self) { effort in
+                AgentCompactMenuRow(effort.displayName, selected: effort == spec.reasoningEffort) {
+                    spec.reasoningEffort = effort
+                    showModelOptions = false
+                }
+            }
+        }
+        .accessibilityIdentifier("bots.scheduleTasks.editor.reasoning")
+    }
+
+    private func selectSpecSource(_ entry: AgentSourceCapsulePresentation.MenuEntry) {
+        if let snapshot = providers.first(where: { $0.id == entry.id }) {
+            spec.provider = snapshot.provider
+            spec.providerInstanceID = snapshot.id
+            spec.model = snapshot.models.first?.id ?? ""
+            spec.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .medium
+            return
+        }
+        guard let provider = AgentProvider(rawValue: entry.id) else { return }
+        spec.provider = provider
+        if let snapshot = snapshots(for: provider).first {
+            spec.providerInstanceID = snapshot.id
+            spec.model = snapshot.models.first?.id ?? ""
+            spec.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .medium
+        } else {
+            spec.providerInstanceID = provider.rawValue
+        }
     }
 
     @ViewBuilder

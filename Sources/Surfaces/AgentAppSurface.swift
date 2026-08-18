@@ -12378,10 +12378,14 @@ public struct AgentAppView: View {
                                     .id("agent.emptyConversation")
                             }
                             if vm.selectedThreadRunIsStartingOrRunning {
-                                workingStatus
-                                    .id("agent.workingStatus")
+                                AgentChatWorkingStatusStrip(
+                                    startedAt: vm.runStartedAt ?? Date(),
+                                    isStopping: vm.isStopping,
+                                    onStop: { vm.stop() }
+                                )
+                                .id("agent.workingStatus")
                             } else if vm.selectedThreadIsPreparingRun {
-                                loadingStatus
+                                AgentChatLoadingStatusStrip()
                                     .id("agent.loadingStatus")
                             }
                             if let err = vm.timeline.error {
@@ -13038,81 +13042,6 @@ public struct AgentAppView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // "Loading…" + hairline, for the window between the user's bubble appearing
-    // and the run existing. No elapsed timer (nothing has started yet) and no
-    // Stop (there is no run to stop) — deliberately quieter than workingStatus,
-    // so the swap to "Working for Xs" reads as progress rather than a reset.
-    private var loadingStatus: some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            HStack(spacing: DS.Space.sm) {
-                ProgressView()
-                    .controlSize(.small)
-                    .accessibilityLabel("Loading")
-                Text("Loading…")
-                    .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
-                    .accessibilityIdentifier("agent.loading.status")
-            }
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    // Cat-themed "… for 2m 21s" + hairline, while a run is in flight.
-    // Activity phrase rotates every 15s (AgentWorkingCatCopy); a11y stays
-    // "Working for …" for VoiceOver / UI tests.
-    private var workingStatus: some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            // PERF-MAC_AGENT-004: tick every second for the first minute, then
-            // every 5 seconds, so a long run doesn't force 600 re-evaluations.
-            // Cat phrase only needs a change every 15s; the 1s/5s schedule still
-            // keeps the elapsed counter accurate.
-            TimelineView(ElapsedTickSchedule(start: vm.runStartedAt ?? Date())) { _ in
-                let seconds = workingElapsedSeconds
-                let seed = workingCatSeed
-                HStack(spacing: DS.Space.sm) {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel("Running")
-                    Text(AgentWorkingCatCopy.statusLabel(elapsedSeconds: seconds, seed: seed))
-                        .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
-                        .accessibilityLabel(AgentWorkingCatCopy.accessibilityLabel(elapsedSeconds: seconds))
-                        .accessibilityIdentifier("agent.workingStatus")
-                    // UX-MAC_AGENT-008: inline Stop where the user looks when a
-                    // run is taking too long, plus the Esc hint.
-                    let inlineState = AgentAppViewModel.stopButtonState(
-                        runActive: vm.selectedThreadRunIsStartingOrRunning,
-                        isStopping: vm.isStopping
-                    )
-                    Button(inlineState == .stopping ? "Stopping… (click to force)" : "Stop") { vm.stop() }
-                        .buttonStyle(.plain)
-                        .font(DS.Font.body.weight(.medium))
-                        .foregroundColor(DS.Palette.danger)
-                        .help(inlineState == .stopping
-                              ? "Still stopping — click again to force-stop the provider"
-                              : "Stop running agent (press Esc to interrupt)")
-                        .accessibilityIdentifier("agent.working.stop")
-                }
-            }
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var workingElapsedSeconds: Int {
-        let now = vm.currentTime()
-        return max(0, Int(now.timeIntervalSince(vm.runStartedAt ?? now)))
-    }
-
-    /// Stable per-run seed so post-Working phrases shuffle differently each run.
-    private var workingCatSeed: UInt64 {
-        let start = vm.runStartedAt ?? Date()
-        return UInt64(max(0, start.timeIntervalSince1970 * 1000))
-    }
-
-    private var elapsedString: String {
-        AgentWorkingStripPresentation.formatElapsed(workingElapsedSeconds)
-    }
-
     private func copyToPasteboard(_ s: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(s, forType: .string)
@@ -13601,21 +13530,6 @@ public struct AgentAppView: View {
         collapseAllWorkDisclosures()
     }
 
-    /// Shared chrome for user prompt bubbles (text + padding + fill). Sized by
-    /// the caller so short prompts hug and long prompts wrap without clipping.
-    @ViewBuilder
-    private func userMessageBubbleLabel(_ displayText: String) -> some View {
-        Text(displayText)
-            .font(.system(size: 13))
-            .foregroundColor(DS.Palette.text)
-            .multilineTextAlignment(.leading)
-            .textSelection(.enabled)
-            .padding(.horizontal, DS.Space.xl)
-            .padding(.vertical, DS.Space.lg)
-            .background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-    }
-
     @ViewBuilder
     private func messageRow(_ msg: AgentMessage, columnWidth: CGFloat = 10_000) -> some View {
         switch msg.role {
@@ -13629,41 +13543,28 @@ public struct AgentAppView: View {
                 wireRequest: wireRequest,
                 mode: tokenSaverDisplayMode(for: displayIdentifier, messageId: msg.id)
             )
-            // Cap width against the live column so the bubble wraps instead of
-            // painting past the timeline edge. Height is content-driven — never
-            // a fixed frame and never a line-count truncate/"Show more" gate.
-            let bubbleMax = Self.userMessageBubbleWidthCap(columnWidth: columnWidth)
-            let textMax = max(0, bubbleMax - (DS.Space.xl * 2))
-            HStack(alignment: .top, spacing: 0) {
-                Spacer(minLength: Self.userMessageBubbleLeadingGutter)
-                VStack(alignment: .trailing, spacing: DS.Space.xs) {
-                    if let caption = Self.messagedCaption(
-                        in: displayText,
-                        bots: vm.mentionableBotsProvider()
-                    ) {
-                        Text(caption)
+            let caption = Self.messagedCaption(
+                in: displayText,
+                bots: vm.mentionableBotsProvider()
+            )
+            AgentChatUserBubble(
+                text: displayText,
+                createdAt: msg.createdAt,
+                columnWidth: columnWidth,
+                accessibilityIdentifier: "agent.userMessageBubble",
+                roleIdentifier: "agent.role.user",
+                copyIdentifier: "agent.userMessage.copy.\(msg.id.value.uuidString)",
+                header: caption.map { text in
+                    AnyView(
+                        Text(text)
                             .font(DS.Font.caption)
                             .foregroundColor(DS.Palette.textTertiary)
                             .accessibilityIdentifier("agent.peer.messaged")
-                    }
-                    // WHY: SwiftUI Text (not NSTextView) so short prompts hug content
-                    // and long prompts wrap. No lineLimit / no fixed height — full
-                    // prompt always visible and height grows with content.
-                    //
-                    // ViewThatFits: prefer horizontal hug for short prompts ("oi"),
-                    // fall back to a width-capped wrap for long prompts / URLs.
-                    // The old fixedSize(horizontal: true) + outer maxWidth clip
-                    // cropped long unbroken URLs so only a mid-string slice showed.
-                    ViewThatFits(in: .horizontal) {
-                        userMessageBubbleLabel(displayText)
-                            .fixedSize(horizontal: true, vertical: true)
-                        userMessageBubbleLabel(displayText)
-                            .frame(maxWidth: textMax, alignment: .leading)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(maxWidth: bubbleMax, alignment: .trailing)
-                    .accessibilityIdentifier("agent.userMessageBubble")
-                    if hasWireTranslation, let wireRequest {
+                    )
+                },
+                belowBubble: {
+                    guard hasWireTranslation, let wireRequest else { return nil }
+                    return AnyView(
                         tokenSaverDisplayControl(
                             identifierSuffix: displayIdentifier,
                             messageId: msg.id,
@@ -13672,37 +13573,9 @@ public struct AgentAppView: View {
                             allowsRequestOnlyRCW1: true,
                             alignment: .trailing
                         )
-                        .frame(maxWidth: bubbleMax, alignment: .trailing)
-                    }
-                    // UX-MAC_AGENT-017: subtle relative timestamp so long threads
-                    // show when each message was sent. Keep meta inside the bubble
-                    // column so copy + relative time never spill past the pane.
-                    HStack(spacing: DS.Space.xs) {
-                        Button { copyToPasteboard(displayText) } label: {
-                            Image(systemName: "doc.on.doc")
-                                .font(.system(size: 11, weight: .regular))
-                                .frame(width: 18, height: 18)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .accessibilityLabel("Copy message")
-                        .accessibilityIdentifier("agent.userMessage.copy.\(msg.id.value.uuidString)")
-                        .help("Copy message")
-                        Text(Self.relativeTimestamp(msg.createdAt))
-                            .font(DS.Font.caption2)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: true)
-                            .help(Self.absoluteTimestamp(msg.createdAt))
-                    }
-                    .fixedSize(horizontal: true, vertical: true)
-                    .frame(maxWidth: bubbleMax, alignment: .trailing)
-                }
-                .frame(maxWidth: bubbleMax, alignment: .trailing)
-                .layoutPriority(1)
-            }
-            .frame(maxWidth: .infinity, alignment: .trailing)
+                    )
+                }()
+            )
         case .assistant:
             if !hiddenPersistedAssistantMessageIDs.contains(msg.id) {
                 if msg.content.isEmpty {
@@ -13718,47 +13591,69 @@ public struct AgentAppView: View {
                         wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)
                     )
                     let displayKey = Self.tokenSaverMessageDisplayKey(msg.id.value.uuidString)
-                    VStack(alignment: .leading, spacing: DS.Space.xs) {
-                        if showBadge, let original = vm.tokenSaverOriginalText(for: msg.id) {
-                            let request = vm.tokenSaverWireRequestText(for: msg.id)
-                            tokenSaverContent(
-                                translated: msg.content,
+                    if showBadge, let original = vm.tokenSaverOriginalText(for: msg.id) {
+                        let request = vm.tokenSaverWireRequestText(for: msg.id)
+                        AgentChatAssistantReply(
+                            text: Self.tokenSaverCopyText(
+                                translated: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content),
                                 original: original,
                                 request: request,
-                                identifierSuffix: displayKey,
-                                displayKey: displayKey,
-                                messageId: msg.id,
-                                retryMessageId: msg.id
-                            )
-                            assistantCopyBar(
-                                text: Self.tokenSaverCopyText(
-                                    translated: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content),
+                                mode: tokenSaverDisplayMode(for: displayKey, messageId: msg.id)
+                            ),
+                            roleIdentifier: "agent.role.assistant",
+                            copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
+                            content: AnyView(
+                                tokenSaverContent(
+                                    translated: msg.content,
                                     original: original,
                                     request: request,
-                                    mode: tokenSaverDisplayMode(for: displayKey, messageId: msg.id)
-                                ),
-                                identifierSuffix: msg.id.value.uuidString
+                                    identifierSuffix: displayKey,
+                                    displayKey: displayKey,
+                                    messageId: msg.id,
+                                    retryMessageId: msg.id
+                                )
                             )
-                        } else {
-                            if showBadge {
-                                Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
-                                    .font(DS.Font.caption2)
-                                    .foregroundColor(DS.Palette.textTertiary)
-                                    .accessibilityLabel("Token Saver optimized this reply")
-                                    .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(msg.id.value.uuidString)")
-                            }
-                            if let parsed = BotPeerTranscript.parse(msg.content) {
-                                Text(parsed.caption)
-                                    .font(DS.Font.caption)
-                                    .foregroundColor(DS.Palette.textTertiary)
-                                    .accessibilityIdentifier("agent.peer.from")
-                                assistantProse(parsed.body)
-                                assistantCopyBar(text: parsed.body, identifierSuffix: msg.id.value.uuidString)
-                            } else {
-                                assistantProse(msg.content)
-                                assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content), identifierSuffix: msg.id.value.uuidString)
-                            }
-                        }
+                        )
+                    } else if let parsed = BotPeerTranscript.parse(msg.content) {
+                        AgentChatAssistantReply(
+                            text: parsed.body,
+                            roleIdentifier: "agent.role.assistant",
+                            copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
+                            content: AnyView(
+                                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                                    if showBadge {
+                                        Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
+                                            .font(DS.Font.caption2)
+                                            .foregroundColor(DS.Palette.textTertiary)
+                                            .accessibilityLabel("Token Saver optimized this reply")
+                                            .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(msg.id.value.uuidString)")
+                                    }
+                                    Text(parsed.caption)
+                                        .font(DS.Font.caption)
+                                        .foregroundColor(DS.Palette.textTertiary)
+                                        .accessibilityIdentifier("agent.peer.from")
+                                    assistantProse(parsed.body)
+                                }
+                            )
+                        )
+                    } else {
+                        AgentChatAssistantReply(
+                            text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content),
+                            roleIdentifier: "agent.role.assistant",
+                            copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
+                            content: showBadge
+                                ? AnyView(
+                                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                                        Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
+                                            .font(DS.Font.caption2)
+                                            .foregroundColor(DS.Palette.textTertiary)
+                                            .accessibilityLabel("Token Saver optimized this reply")
+                                            .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(msg.id.value.uuidString)")
+                                        assistantProse(msg.content)
+                                    }
+                                )
+                                : nil
+                        )
                     }
                 }
             }
@@ -13964,84 +13859,65 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
-        // F2: all the per-turn derivation (renderableItems, final-id split, block
-        // grouping, plan filtering) is computed once here and memoized for finished
-        // turns, instead of re-running on every body pass.
         let inputs = turnRenderInputs(for: turn)
-        let blocks = inputs.visibleBlocks
         let durableFinalMessageId = vm.tokenSaverMessageId(forRCW1TurnId: turn.turnId)
-        VStack(alignment: .leading, spacing: DS.Space.xl) {
-            // Finished turns and live turns both fold settled work into one
-            // disclosure so follow-ups read as chat (answer + compact work), not
-            // a re-expanded command dump of the whole turn.
-            // Work so far owns every non-final step (live + finished). Outside = final only.
-            if inputs.completedWorkBlockCount > 0 {
-                completedWorkDisclosure(
-                    turn: turn,
-                    blocks: inputs.completedWorkBlocks,
-                    workBlockCount: inputs.completedWorkBlockCount,
-                    live: !turn.finished,
-                    durableFinalMessageId: durableFinalMessageId
-                )
-            }
-            // Full access: no plan review card — plans auto-implement without Approve.
-            if !vm.suppressesProposedPlanReview {
-                ForEach(inputs.turnPlans) { plan in
-                    proposedPlanRow(plan)
-                }
-            }
-            // Final assistant item rows (finished only). Live leaves this empty by composition.
-            ForEach(blocks) { block in
-                switch block {
-                case .item(let item):
-                    itemRow(
-                        item,
-                        durableFinalMessageId: Self.durableFinalMessageId(
-                            for: item,
-                            in: turn,
-                            candidate: durableFinalMessageId
-                        )
-                    )
-                case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
-                }
-            }
-            // Only show the turn's final text if no assistant-message item
-            // already rendered it (prevents the answer showing twice).
-            if let final = turn.finalAssistantMessage, inputs.shouldRenderFinal {
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    if let messageId = durableFinalMessageId,
-                       let original = vm.tokenSaverOriginalText(for: messageId) {
-                        let displayKey = Self.tokenSaverMessageDisplayKey(
-                            messageId.value.uuidString
-                        )
-                        let request = vm.tokenSaverWireRequestText(for: messageId)
-                        tokenSaverContent(
-                            translated: final,
-                            original: original,
-                            request: request,
-                            identifierSuffix: displayKey,
-                            displayKey: displayKey,
-                            messageId: messageId,
-                            retryMessageId: messageId,
-                            cacheMarkdown: turn.finished
-                        )
-                        assistantCopyBar(
-                            text: Self.tokenSaverCopyText(
-                                translated: BackgroundAwaitContinuation.strippingAwaitingMarker(final),
-                                original: original,
-                                request: request,
-                                mode: tokenSaverDisplayMode(for: displayKey, messageId: messageId)
-                            ),
-                            identifierSuffix: turn.turnId
-                        )
-                    } else {
-                        assistantProse(final, cacheMarkdown: turn.finished)
-                        assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(final), identifierSuffix: turn.turnId)
+        AgentChatLiveTurnView(
+            turn: turn,
+            live: !turn.finished,
+            hideAssistantOutput: false,
+            renderFinal: { final in
+                AnyView(agentTurnFinal(final, turn: turn, durableFinalMessageId: durableFinalMessageId))
+            },
+            afterWork: vm.suppressesProposedPlanReview
+                ? nil
+                : AnyView(
+                    ForEach(inputs.turnPlans) { plan in
+                        proposedPlanRow(plan)
                     }
-                }
-            }
+                )
+        )
+    }
+
+    @ViewBuilder
+    private func agentTurnFinal(
+        _ final: String,
+        turn: AssistantTurnSnapshot,
+        durableFinalMessageId: AgentMessageID?
+    ) -> some View {
+        if let messageId = durableFinalMessageId,
+           let original = vm.tokenSaverOriginalText(for: messageId) {
+            let displayKey = Self.tokenSaverMessageDisplayKey(messageId.value.uuidString)
+            let request = vm.tokenSaverWireRequestText(for: messageId)
+            AgentChatAssistantReply(
+                text: Self.tokenSaverCopyText(
+                    translated: BackgroundAwaitContinuation.strippingAwaitingMarker(final),
+                    original: original,
+                    request: request,
+                    mode: tokenSaverDisplayMode(for: displayKey, messageId: messageId)
+                ),
+                roleIdentifier: "agent.role.assistant",
+                copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
+                content: AnyView(
+                    tokenSaverContent(
+                        translated: final,
+                        original: original,
+                        request: request,
+                        identifierSuffix: displayKey,
+                        displayKey: displayKey,
+                        messageId: messageId,
+                        retryMessageId: messageId,
+                        cacheMarkdown: turn.finished
+                    )
+                )
+            )
+        } else {
+            AgentChatAssistantReply(
+                text: BackgroundAwaitContinuation.strippingAwaitingMarker(final),
+                roleIdentifier: "agent.role.assistant",
+                copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
+                content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
+            )
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -14916,12 +14792,16 @@ public struct AgentAppView: View {
     }
 
     private func queuedMessageRow(_ message: AgentQueuedMessage) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            HStack(alignment: .top, spacing: DS.Space.sm) {
+        AgentQueuedRow(
+            text: message.text.isEmpty ? attachmentSummary(message) : message.text,
+            identifier: "agent.queued.row.\(message.id.value.uuidString)",
+            leading: AnyView(
                 Text("#\(message.position)")
                     .font(DS.Font.caption.monospacedDigit().weight(.semibold))
                     .foregroundColor(DS.Palette.textSecondary)
                     .frame(width: 28, alignment: .leading)
+            ),
+            detail: AnyView(
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     if vm.editingQueuedMessage?.id == message.id {
                         TextEditor(text: $vm.queuedMessageDraft)
@@ -14932,12 +14812,6 @@ public struct AgentAppView: View {
                             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
                             .accessibilityLabel("Edit queued message \(message.position)")
                             .accessibilityIdentifier("agent.queued.editor.\(message.id.value.uuidString)")
-                    } else {
-                        Text(message.text.isEmpty ? attachmentSummary(message) : message.text)
-                            .font(DS.Font.body)
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
                     }
                     if !message.attachments.isEmpty {
                         Label("\(message.attachments.count) attachment\(message.attachments.count == 1 ? "" : "s")", systemImage: "paperclip")
@@ -14954,7 +14828,9 @@ public struct AgentAppView: View {
                             )
                     }
                 }
-                Spacer(minLength: DS.Space.sm)
+            )
+        ) {
+            HStack(spacing: DS.Space.sm) {
                 if vm.editingQueuedMessage?.id == message.id {
                     Button("Save") { vm.saveQueuedMessageEdit() }
                         .buttonStyle(.borderedProminent)
@@ -14981,11 +14857,11 @@ public struct AgentAppView: View {
                     } label: {
                         Image(systemName: "pencil")
                     }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .disabled((message.durableState ?? .queued) != .queued)
-                        .accessibilityLabel("Edit queued message \(message.position)")
-                        .accessibilityIdentifier("agent.queued.edit.\(message.id.value.uuidString)")
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled((message.durableState ?? .queued) != .queued)
+                    .accessibilityLabel("Edit queued message \(message.position)")
+                    .accessibilityIdentifier("agent.queued.edit.\(message.id.value.uuidString)")
                     Button {
                         if message.durableState == .prepared {
                             queuedMessagePendingCancel = message
@@ -15022,7 +14898,6 @@ public struct AgentAppView: View {
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
             .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-        .accessibilityIdentifier("agent.queued.row.\(message.id.value.uuidString)")
     }
 
     private func attachmentSummary(_ message: AgentQueuedMessage) -> String {
@@ -15277,13 +15152,21 @@ public struct AgentAppView: View {
                 case .idle: return .neutral
                 }
             }()
-            DSPill(label, tone: tone)
-                .help(phase.accessibilityLabel)
-                .accessibilityIdentifier("agent.workingPhase")
-                .accessibilityLabel(phase.accessibilityLabel)
+            AgentChatWorkingPill(
+                label: label,
+                identifier: "agent.workingPhase",
+                tone: tone,
+                help: phase.accessibilityLabel,
+                accessibilityLabelText: phase.accessibilityLabel,
+                padded: false
+            )
         } else {
-            DSPill(vm.status.rawValue, tone: statusTone(vm.status))
-                .accessibilityIdentifier("agent.status.pill")
+            AgentChatWorkingPill(
+                label: vm.status.rawValue,
+                identifier: "agent.status.pill",
+                tone: statusTone(vm.status),
+                padded: false
+            )
         }
     }
 

@@ -200,4 +200,27 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
             "assistant Copy must not stay a 10pt leftover icon"
         )
     }
+
+    func test_agentAppMountsSharedTranscriptChrome_becausePrivateTwinsDrift() throws {
+        // WHY: dest already extracted loading/working/pill/bubble/reply/live
+        // turn/queue. Agent App painting private twins is how those controls
+        // diverged (10pt copy, header DSPill, leftover workingStatus).
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: "Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        for token in [
+            "AgentChatLoadingStatusStrip(",
+            "AgentChatWorkingStatusStrip(",
+            "AgentChatWorkingPill(",
+            "AgentChatUserBubble(",
+            "AgentChatAssistantReply(",
+            "AgentChatLiveTurnView(",
+            "AgentQueuedRow(",
+        ] {
+            XCTAssertTrue(source.contains(token), "Agent App must mount \(token)")
+        }
+        XCTAssertFalse(source.contains("private var loadingStatus"))
+        XCTAssertFalse(source.contains("private var workingStatus"))
+    }
 }

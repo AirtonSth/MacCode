@@ -707,6 +707,8 @@ public struct AgentChatLiveTurnView: View {
     public let turn: AssistantTurnSnapshot
     public let live: Bool
     public let hideAssistantOutput: Bool
+    public var renderFinal: ((String) -> AnyView)?
+    public var afterWork: AnyView?
 
     @State private var userExpanded: Set<String> = []
     @State private var userCollapsedLive: Set<String> = []
@@ -714,10 +716,18 @@ public struct AgentChatLiveTurnView: View {
     @State private var expandedTools: Set<String> = []
     @State private var expandedToolGroups: Set<String> = []
 
-    public init(turn: AssistantTurnSnapshot, live: Bool, hideAssistantOutput: Bool = false) {
+    public init(
+        turn: AssistantTurnSnapshot,
+        live: Bool,
+        hideAssistantOutput: Bool = false,
+        renderFinal: ((String) -> AnyView)? = nil,
+        afterWork: AnyView? = nil
+    ) {
         self.turn = turn
         self.live = live
         self.hideAssistantOutput = hideAssistantOutput
+        self.renderFinal = renderFinal
+        self.afterWork = afterWork
     }
 
     public var body: some View {
@@ -754,6 +764,9 @@ public struct AgentChatLiveTurnView: View {
                     expandedToolGroups: $expandedToolGroups
                 )
             }
+            if let afterWork {
+                afterWork
+            }
             if !hideAssistantOutput {
                 ForEach(composition.outside) { item in
                     AgentChatLiveItemRow(
@@ -764,7 +777,11 @@ public struct AgentChatLiveTurnView: View {
                 }
                 if AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn),
                    let final = turn.finalAssistantMessage {
-                    AgentChatAssistantReply(text: final)
+                    if let renderFinal {
+                        renderFinal(final)
+                    } else {
+                        AgentChatAssistantReply(text: final)
+                    }
                 }
             }
         }

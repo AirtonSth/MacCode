@@ -2,6 +2,7 @@ import AppKit
 import CoreModel
 import DesignSystemKit
 import Persistence
+import Surfaces
 import SwiftUI
 
 // MARK: - View model
@@ -260,40 +261,20 @@ public struct ActiveThreadsRootView: View {
     private var tabBar: some View {
         HStack(spacing: DS.Space.md) {
             ForEach(ActiveThreadsViewModel.Tab.allCases, id: \.self) { tab in
-                let selected = vm.selectedTab == tab
                 let count: Int = {
                     switch tab {
                     case .active: return vm.activeCount
                     case .lastFinished: return vm.finishedCount
                     }
                 }()
-                Button {
+                AgentListFilterChip(
+                    title: tab.title,
+                    count: count,
+                    selected: vm.selectedTab == tab,
+                    identifier: "activeThreads.tab.\(tab.rawValue)"
+                ) {
                     vm.selectedTab = tab
-                } label: {
-                    HStack(spacing: DS.Space.xs) {
-                        Text(tab.title)
-                            .font(DS.Font.body.weight(selected ? .semibold : .regular))
-                        Text("\(count)")
-                            .font(DS.Font.caption.weight(.medium))
-                            .monospacedDigit()
-                            .foregroundColor(selected ? DS.Palette.accent : DS.Palette.textTertiary)
-                    }
-                    .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
-                    .padding(.horizontal, DS.Space.md)
-                    .padding(.vertical, DS.Space.sm)
-                    .background(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .fill(selected ? DS.Palette.selection : Color.clear)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(selected ? DS.Palette.accent.opacity(0.35) : DS.Palette.line,
-                                          lineWidth: DS.Border.hairline)
-                    )
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("activeThreads.tab.\(tab.rawValue)")
-                .accessibilityAddTraits(selected ? .isSelected : [])
             }
             Spacer(minLength: 0)
         }
@@ -364,23 +345,11 @@ public struct ActiveThreadsRootView: View {
     }
 
     private var footerBar: some View {
-        HStack(spacing: DS.Space.md) {
-            Text(vm.footerLine)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-            if vm.activeCount > 0 {
-                DSPill("Live", tone: .warning)
-                    .accessibilityHidden(true)
-            } else {
-                DSPill("Idle", tone: .neutral)
-                    .accessibilityHidden(true)
-            }
-            Spacer(minLength: DS.Space.md)
-        }
-        .padding(.horizontal, DS.Space.xxl)
-        .frame(height: 40)
-        .background(DS.Palette.surface)
-        .accessibilityElement(children: .combine)
+        AgentListFooterBar(
+            caption: vm.footerLine,
+            pillTitle: vm.activeCount > 0 ? "Live" : "Idle",
+            pillTone: vm.activeCount > 0 ? .warning : .neutral
+        )
         .accessibilityLabel(vm.footerLine)
     }
 }
@@ -392,57 +361,26 @@ private struct ActiveThreadCard: View {
     let onOpen: () -> Void
 
     var body: some View {
-        Button(action: onOpen) {
-            HStack(alignment: .center, spacing: DS.Space.xl) {
-                Image(systemName: "bolt.horizontal.circle.fill")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(Color.blue)
-                    .frame(width: 44, height: 44)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                    )
-                    .accessibilityHidden(true)
-
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    HStack(spacing: DS.Space.sm) {
-                        Text(item.title)
-                            .font(DS.Font.body.weight(.semibold))
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(1)
-                        DSPill("Running", tone: .warning)
-                    }
-                    Text(item.detail ?? item.workspaceName ?? "Agent")
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                    if let preview = item.lastUpdatePreview, !preview.isEmpty {
-                        Text(preview)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .lineLimit(2)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-            }
-            .padding(.horizontal, DS.Space.xl)
-            .padding(.vertical, DS.Space.lg)
-            .background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-            )
-            .contentShape(Rectangle())
+        AgentOverviewCard(
+            icon: "bolt.horizontal.circle.fill",
+            iconColor: Color.blue,
+            title: item.title,
+            subtitle: item.detail ?? item.workspaceName ?? "Agent",
+            preview: {
+                guard let preview = item.lastUpdatePreview, !preview.isEmpty else { return nil }
+                return preview
+            }(),
+            identifier: "activeThreads.active.\(item.threadID.value.uuidString.lowercased())",
+            onOpen: onOpen
+        ) {
+            DSPill("Running", tone: .warning)
+        } meta: {
+            EmptyView()
+        } trailing: {
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("activeThreads.active.\(item.threadID.value.uuidString.lowercased())")
     }
 }
 
@@ -451,63 +389,27 @@ private struct FinishedThreadCard: View {
     let onOpen: () -> Void
 
     var body: some View {
-        Button(action: onOpen) {
-            HStack(alignment: .center, spacing: DS.Space.xl) {
-                Image(systemName: statusIcon)
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(statusColor)
-                    .frame(width: 44, height: 44)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                    )
-                    .accessibilityHidden(true)
-
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    HStack(spacing: DS.Space.sm) {
-                        Text(item.title)
-                            .font(DS.Font.body.weight(.semibold))
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(1)
-                        statusPill
-                    }
-                    Text(item.detail)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("Finished")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(finishedLabel)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.trailing)
-                }
-                .frame(width: 140, alignment: .trailing)
-
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-            }
-            .padding(.horizontal, DS.Space.xl)
-            .padding(.vertical, DS.Space.lg)
-            .background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        AgentOverviewCard(
+            icon: statusIcon,
+            iconColor: statusColor,
+            title: item.title,
+            subtitle: item.detail,
+            identifier: "activeThreads.finished.\(item.runID.value.uuidString.lowercased())",
+            onOpen: onOpen
+        ) {
+            statusPill
+        } meta: {
+            AgentOverviewMetaColumn(
+                title: "Finished",
+                value: finishedLabel,
+                alignment: .trailing,
+                multilineTextAlignment: .trailing
             )
-            .contentShape(Rectangle())
+        } trailing: {
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("activeThreads.finished.\(item.runID.value.uuidString.lowercased())")
     }
 
     private var finishedLabel: String {
