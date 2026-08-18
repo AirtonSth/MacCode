@@ -37,11 +37,15 @@ public enum BotSelfConfigCatalog: Sendable {
     public static let removeSkill = "bot_remove_skill"
     public static let saveRoutine = "bot_save_routine"
     public static let setRoutineEnabled = "bot_set_routine_enabled"
+    public static let skillView = "bot_skill_view"
+    public static let recall = "bot_recall"
+    public static let askUser = "bot_ask_user"
 
     public static var toolNames: [String] {
         [
             getSettings, setSettings, writeHomeFile,
             removeSkill, saveRoutine, setRoutineEnabled,
+            skillView, recall, askUser,
         ]
     }
 
@@ -62,13 +66,19 @@ public enum BotSelfConfigCatalog: Sendable {
         case setSettings:
             return "Publish this bot's own name, Role, Instructions, description, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.removeHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty) \(BotBrainCompiler.userRequestHonesty)"
         case writeHomeFile:
-            return "Write MEMORY.md, USER.md, memory/YYYY-MM-DD.md, or skills/<slug>/SKILL.md in this bot's Files. Edit the file to remember, forget, correct, or add a skill."
+            return "Write MEMORY.md, USER.md, SOUL.md, memory/YYYY-MM-DD.md, or skills/<slug>/SKILL.md in this bot's Files. Edit the file to remember, forget, correct, add a skill, or update Instructions."
         case removeSkill:
             return "Delete skills/<slug>/SKILL.md. Same path as Files."
         case saveRoutine:
             return "Create or update a routine's name, instruction, or when. Same path as Studio Save routine."
         case setRoutineEnabled:
             return "Set a routine Active or Off. Same path as Studio Active."
+        case skillView:
+            return "Read skills/<slug>/SKILL.md for this bot."
+        case recall:
+            return "Search this bot's MEMORY.md, USER.md, daily notes, and linked conversation text."
+        case askUser:
+            return "Ask the user a question and end the turn. Do not wait inside this tool."
         default:
             return name
         }
@@ -100,7 +110,7 @@ public enum BotSelfConfigCatalog: Sendable {
                 "properties": botID.merging([
                     "path": [
                         "type": "string",
-                        "description": "MEMORY.md, USER.md, memory/YYYY-MM-DD.md, or skills/<slug>/SKILL.md. Same files as Studio Files.",
+                        "description": "MEMORY.md, USER.md, SOUL.md, memory/YYYY-MM-DD.md, or skills/<slug>/SKILL.md. Same files as Studio Files.",
                     ],
                     "contents": [
                         "type": "string",
@@ -136,6 +146,31 @@ public enum BotSelfConfigCatalog: Sendable {
                     "enabled": ["type": "boolean", "description": "Active. Same field as Studio Active."],
                 ]) { _, new in new },
                 "required": ["routine_id", "enabled"],
+            ]
+        case skillView:
+            return [
+                "type": "object",
+                "properties": botID.merging([
+                    "skill_id": ["type": "string", "description": "Slug for skills/<slug>/SKILL.md."],
+                ]) { _, new in new },
+                "required": ["skill_id"],
+            ]
+        case recall:
+            return [
+                "type": "object",
+                "properties": botID.merging([
+                    "query": ["type": "string"],
+                    "scope": ["type": "string", "description": "memory, conversations, or both."],
+                ]) { _, new in new },
+                "required": ["query"],
+            ]
+        case askUser:
+            return [
+                "type": "object",
+                "properties": botID.merging([
+                    "question": ["type": "string"],
+                ]) { _, new in new },
+                "required": ["question"],
             ]
         default:
             return ["type": "object", "properties": [String: Any]()]
@@ -438,7 +473,132 @@ public struct BotSelfConfigService: Sendable {
             soul: ""
         )
         try home.writeFile(relativePath: path, contents: contents)
+        if BotHome.isWritableHomePath(path),
+           path.trimmingCharacters(in: .whitespacesAndNewlines) == BotHome.soulName {
+            return try apply(BotSelfConfigPatch(soul: contents))
+        }
         return try snapshot()
+    }
+
+    public func viewSkill(skillID: String) throws -> [String: Any] {
+        guard let bot = try store.get(id: callerBotID), bot.deletedAt == nil else {
+            throw BotSelfConfigError.notFound
+        }
+        guard let slug = BotHome.normalizeSkillSlug(skillID) else {
+            throw BotSelfConfigError.invalid("Skill id must be a catalog-style slug, not a path.")
+        }
+        let home = botHome(for: bot)
+        let path = "\(BotHome.skillsDirectoryName)/\(slug)/SKILL.md"
+        let body = try home.readFile(relativePath: path)
+        return [
+            "skill_id": slug,
+            "path": path,
+            "body": body,
+        ]
+    }
+
+    public func recall(query: String, scope: String) throws -> [String: Any] {
+        guard let bot = try store.get(id: callerBotID), bot.deletedAt == nil else {
+            throw BotSelfConfigError.notFound
+        }
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { throw BotSelfConfigError.invalid("query is required.") }
+        let wanted = scope.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let includeMemory = wanted.isEmpty || wanted == "both" || wanted == "memory"
+        let includeConversations = wanted.isEmpty || wanted == "both" || wanted == "conversations"
+        var hits: [[String: String]] = []
+        if includeMemory {
+            let home = botHome(for: bot)
+            let files = (try? home.readBootstrapMemory()) ?? []
+            for file in files {
+                if file.body.localizedCaseInsensitiveContains(needle) {
+                    hits.append([
+                        "source": file.path,
+                        "snippet": Self.snippet(in: file.body, matching: needle),
+                    ])
+                }
+            }
+        }
+        if includeConversations {
+            hits.append(contentsOf: try store.searchLinkedMessages(botID: callerBotID, query: needle, limit: 12))
+        }
+        return [
+            "query": needle,
+            "scope": includeMemory && includeConversations ? "both" : (includeMemory ? "memory" : "conversations"),
+            "hits": hits,
+        ]
+    }
+
+    public func askUser(question: String) throws -> [String: Any] {
+        guard let bot = try store.get(id: callerBotID), bot.deletedAt == nil else {
+            throw BotSelfConfigError.notFound
+        }
+        let text = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { throw BotSelfConfigError.invalid("question is required.") }
+        let conversation = try store.listConversations(botID: callerBotID).first
+        let item = BotAttentionItem(
+            botID: callerBotID,
+            conversationID: conversation?.id,
+            kind: .question,
+            title: "Needs you",
+            detail: text
+        )
+        try store.upsertAttention(item)
+        if var next = conversation {
+            next.attentionState = .needsAttention
+            next.unread = true
+            next.updatedAt = Date()
+            try store.upsertConversation(next)
+        }
+        return [
+            "asked": true,
+            "question": text,
+            "attention_id": item.id.value.uuidString.lowercased(),
+            "next": "End this turn. The user will answer in the next message.",
+        ]
+    }
+
+    public func invoke(name: String, arguments: [String: Any] = [:]) throws -> [String: Any] {
+        try assertOwn(Self.parseOptionalBotID(arguments["bot_id"]))
+        switch name {
+        case BotSelfConfigCatalog.skillView:
+            guard let skillID = arguments["skill_id"] as? String else {
+                throw BotSelfConfigError.invalid("skill_id is required.")
+            }
+            return try viewSkill(skillID: skillID)
+        case BotSelfConfigCatalog.recall:
+            guard let query = arguments["query"] as? String else {
+                throw BotSelfConfigError.invalid("query is required.")
+            }
+            return try recall(query: query, scope: arguments["scope"] as? String ?? "both")
+        case BotSelfConfigCatalog.askUser:
+            guard let question = arguments["question"] as? String else {
+                throw BotSelfConfigError.invalid("question is required.")
+            }
+            return try askUser(question: question)
+        default:
+            let snapshot = try call(name: name, arguments: arguments)
+            return try Self.snapshotObject(snapshot)
+        }
+    }
+
+    static func snapshotObject(_ snapshot: BotSelfConfigSnapshot) throws -> [String: Any] {
+        let data = try JSONEncoder().encode(snapshot)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw BotSelfConfigError.invalid("Could not encode settings.")
+        }
+        return object
+    }
+
+    static func snippet(in body: String, matching needle: String, radius: Int = 160) -> String {
+        let folded = body as NSString
+        let range = folded.range(of: needle, options: [.caseInsensitive])
+        guard range.location != NSNotFound else {
+            return String(body.prefix(radius))
+        }
+        let start = max(0, range.location - radius / 2)
+        let end = min(folded.length, range.location + range.length + radius / 2)
+        return folded.substring(with: NSRange(location: start, length: end - start))
     }
 
     func botHome(for bot: BotDefinition) -> BotHome {

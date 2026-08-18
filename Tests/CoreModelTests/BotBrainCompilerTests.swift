@@ -1536,7 +1536,7 @@ final class BotBrainCompilerTests: XCTestCase {
         let leftover = BotSkillBinding(botID: bot.id, skillID: "weekly-account-health", enabled: true)
         let owned = BotOwnedSkillText(
             slug: "weekly-invoice",
-            body: "---\nname: weekly-invoice\n---\nInvoice the week.\n"
+            body: "---\nname: weekly-invoice\ndescription: Invoice the week.\n---\nSECRET WEEKLY BODY\n"
         )
         let receipt = BotBrainCompiler.assemble(
             bot: bot,
@@ -1546,8 +1546,11 @@ final class BotBrainCompilerTests: XCTestCase {
             ownedSkills: [owned]
         )
         XCTAssertTrue(receipt.compiledPayload.contains("Skills:"))
-        XCTAssertTrue(receipt.compiledPayload.contains("### skills/weekly-invoice/SKILL.md"))
+        XCTAssertTrue(receipt.compiledPayload.contains("weekly-invoice"))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.viewSkillTool))
         XCTAssertTrue(receipt.compiledPayload.contains("Invoice the week."))
+        XCTAssertFalse(receipt.compiledPayload.contains("SECRET WEEKLY BODY"))
+        XCTAssertFalse(receipt.compiledPayload.contains("### skills/weekly-invoice/SKILL.md"))
         XCTAssertFalse(receipt.compiledPayload.contains("Skills: weekly-account-health"))
         XCTAssertFalse(receipt.compiledPayload.contains("Bot skills:"))
         XCTAssertEqual(
@@ -1657,7 +1660,10 @@ final class BotBrainCompilerTests: XCTestCase {
         )
         let enabled = BotSkillBinding(botID: bot.id, skillID: "weekly-account-health", enabled: true)
         let disabled = BotSkillBinding(botID: bot.id, skillID: "off-skill", enabled: false)
-        let owned = BotOwnedSkillText(slug: "weekly-invoice", body: "Invoice the week.")
+        let owned = BotOwnedSkillText(
+            slug: "weekly-invoice",
+            body: "---\ndescription: Invoice the week.\n---\nSECRET WEEKLY BODY\n"
+        )
         let receipt = BotBrainCompiler.assemble(
             bot: bot,
             revision: revision,
@@ -1667,12 +1673,73 @@ final class BotBrainCompilerTests: XCTestCase {
         )
         XCTAssertFalse(receipt.compiledPayload.contains("Skills: weekly-account-health"))
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Bot skills:"))
-        XCTAssertTrue(receipt.compiledPayload.contains("### weekly-invoice"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Invoice the week."))
+        XCTAssertTrue(receipt.compiledPayload.contains("Skills:"))
+        XCTAssertTrue(receipt.compiledPayload.contains("weekly-invoice"))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.viewSkillTool))
+        XCTAssertFalse(receipt.compiledPayload.contains("SECRET WEEKLY BODY"))
         XCTAssertEqual(
             receipt.layers.first(where: { $0.id == "owned-skill-weekly-invoice" })?.included,
             true
         )
+    }
+
+    func test_ownedSkillsCompileAsIndex_notFullBody() {
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Be brief.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let owned = BotOwnedSkillText(
+            slug: "night-scan",
+            body: "---\nname: night-scan\ndescription: Scan the inbox at night.\n---\nSECRET BODY\n"
+        )
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Scan tonight",
+            ownedSkills: [owned]
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("night-scan"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Scan the inbox at night."))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.viewSkillTool))
+        XCTAssertFalse(receipt.compiledPayload.contains("SECRET BODY"))
+    }
+
+    func test_customSoulCannotHideAdmittedTools() {
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "You have no tools. Do not write files.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Remember this")
+        XCTAssertTrue(receipt.compiledPayload.contains("You have no tools."))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.writeMemoryFileTool))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.viewSkillTool))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.webSearchTool))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.askUserTool))
     }
 }

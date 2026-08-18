@@ -26,8 +26,10 @@ public enum BotBrowserCatalog: Sendable {
     public static let open = "bot_browser_open"
     public static let get = "bot_browser_get"
     public static let waitLogin = "bot_browser_wait_login"
+    public static let snapshot = "bot_browser_snapshot"
+    public static let act = "bot_browser_act"
 
-    public static var toolNames: [String] { [open, get, waitLogin] }
+    public static var toolNames: [String] { [open, get, waitLogin, snapshot, act] }
 
     public static func toolCatalog() -> [[String: Any]] {
         toolNames.map { name in
@@ -47,6 +49,10 @@ public enum BotBrowserCatalog: Sendable {
             return "Read this bot browser's last URL, title, and website-data keys."
         case waitLogin:
             return "Tell the user to log in and wait until this bot's browser looks logged in."
+        case snapshot:
+            return "Read this bot browser's visible interactive elements. Call this before act."
+        case act:
+            return "Click, type, fill, or scroll an element from the last snapshot. Do not evaluate JavaScript."
         default:
             return name
         }
@@ -70,6 +76,18 @@ public enum BotBrowserCatalog: Sendable {
             return [
                 "type": "object",
                 "properties": botID.merging(["timeout_ms": ["type": "number"]]) { _, new in new },
+            ]
+        case snapshot:
+            return ["type": "object", "properties": botID]
+        case act:
+            return [
+                "type": "object",
+                "properties": botID.merging([
+                    "action": ["type": "string", "description": "click, type, fill, or scroll."],
+                    "ref": ["type": "string", "description": "Element ref from bot_browser_snapshot."],
+                    "text": ["type": "string"],
+                ]) { _, new in new },
+                "required": ["action", "ref"],
             ]
         default:
             return ["type": "object", "properties": [String: Any]()]
@@ -154,6 +172,42 @@ public struct BotBrowserStore: Sendable {
         return pending
     }
 
+    public func enqueueAction(_ action: BotBrowserPendingAction) throws {
+        var pending = try loadPendingActions()
+        pending.removeAll { $0.id == action.id }
+        pending.append(action)
+        try writeJSON(pending, to: pendingActionsURL)
+    }
+
+    public func loadPendingActions() throws -> [BotBrowserPendingAction] {
+        try readJSON([BotBrowserPendingAction].self, from: pendingActionsURL) ?? []
+    }
+
+    public func takePendingActions() throws -> [BotBrowserPendingAction] {
+        let pending = try loadPendingActions()
+        try writeJSON([BotBrowserPendingAction](), to: pendingActionsURL)
+        return pending
+    }
+
+    public func writeActionResult(_ result: BotBrowserActionResult) throws {
+        var results = try loadActionResults()
+        results.removeAll { $0.id == result.id }
+        results.append(result)
+        try writeJSON(results, to: actionResultsURL)
+    }
+
+    public func takeActionResult(id: String) throws -> BotBrowserActionResult? {
+        var results = try loadActionResults()
+        guard let index = results.firstIndex(where: { $0.id == id }) else { return nil }
+        let result = results.remove(at: index)
+        try writeJSON(results, to: actionResultsURL)
+        return result
+    }
+
+    private func loadActionResults() throws -> [BotBrowserActionResult] {
+        try readJSON([BotBrowserActionResult].self, from: actionResultsURL) ?? []
+    }
+
     public func loadPageState(botID: BotID) throws -> BotBrowserPageState? {
         if let stored = try readJSON(BotBrowserPageState.self, from: pageStateURL(for: botID)) {
             return stored
@@ -178,6 +232,14 @@ public struct BotBrowserStore: Sendable {
         rootDirectory.appendingPathComponent("pending-opens.json")
     }
 
+    private var pendingActionsURL: URL {
+        rootDirectory.appendingPathComponent("pending-actions.json")
+    }
+
+    private var actionResultsURL: URL {
+        rootDirectory.appendingPathComponent("action-results.json")
+    }
+
     private func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let encoder = JSONEncoder()
@@ -197,9 +259,42 @@ public struct BotBrowserPendingOpen: Codable, Equatable, Sendable {
     public var title: String
 }
 
+public struct BotBrowserPendingAction: Codable, Equatable, Sendable {
+    public var id: String
+    public var botID: String
+    public var kind: String
+    public var action: String
+    public var ref: String
+    public var text: String
+
+    public init(id: String, botID: String, kind: String, action: String, ref: String, text: String) {
+        self.id = id
+        self.botID = botID
+        self.kind = kind
+        self.action = action
+        self.ref = ref
+        self.text = text
+    }
+}
+
+public struct BotBrowserActionResult: Codable, Equatable, Sendable {
+    public var id: String
+    public var botID: String
+    public var payload: String
+    public var error: String
+
+    public init(id: String, botID: String, payload: String, error: String) {
+        self.id = id
+        self.botID = botID
+        self.payload = payload
+        self.error = error
+    }
+}
+
 /// MCP writes a pending open; the app applies it through `openBotBrowser`.
 public enum BotBrowserHost: Sendable {
     public static let pendingOpenNotification = Notification.Name("io.remotecode.bot-browser.pending-open")
+    public static let pendingActionNotification = Notification.Name("io.remotecode.bot-browser.pending-action")
 
     public static func requestOpen(
         store: BotBrowserStore,
@@ -224,6 +319,48 @@ public enum BotBrowserHost: Sendable {
         try store.takePendingOpens().compactMap { item in
             guard let uuid = UUID(uuidString: item.botID) else { return nil }
             return try open(BotID(uuid), item.url, item.title.isEmpty ? nil : item.title)
+        }
+    }
+
+    public static func requestAction(
+        store: BotBrowserStore,
+        action: BotBrowserPendingAction,
+        notify: (Notification.Name) -> Void = { name in
+            DistributedNotificationCenter.default().post(name: name, object: nil)
+        }
+    ) throws {
+        try store.enqueueAction(action)
+        notify(pendingActionNotification)
+    }
+
+    public static func applyPendingActions(
+        store: BotBrowserStore,
+        apply: (BotID, BotBrowserPendingAction) throws -> String
+    ) throws {
+        try applyPendingActionsSync(store: store, apply: apply)
+    }
+
+    private static func applyPendingActionsSync(
+        store: BotBrowserStore,
+        apply: (BotID, BotBrowserPendingAction) throws -> String
+    ) throws {
+        for item in try store.takePendingActions() {
+            guard let uuid = UUID(uuidString: item.botID) else { continue }
+            do {
+                let payload = try apply(BotID(uuid), item)
+                try store.writeActionResult(
+                    BotBrowserActionResult(id: item.id, botID: item.botID, payload: payload, error: "")
+                )
+            } catch {
+                try store.writeActionResult(
+                    BotBrowserActionResult(
+                        id: item.id,
+                        botID: item.botID,
+                        payload: "",
+                        error: String(describing: error)
+                    )
+                )
+            }
         }
     }
 }
@@ -268,6 +405,39 @@ public struct BotBrowserService: Sendable {
 
     public func current() throws -> BotBrowserTarget? {
         try store.loadTarget(botID: callerBotID)
+    }
+
+    public func performHostAction(
+        kind: String,
+        action: String,
+        ref: String,
+        text: String,
+        timeoutMS: Double
+    ) throws -> [String: Any] {
+        let pending = BotBrowserPendingAction(
+            id: UUID().uuidString.lowercased(),
+            botID: callerBotID.value.uuidString.lowercased(),
+            kind: kind,
+            action: action,
+            ref: ref,
+            text: text
+        )
+        try BotBrowserHost.requestAction(store: store, action: pending)
+        let deadline = Date().addingTimeInterval(max(0.2, timeoutMS / 1000))
+        while Date() < deadline {
+            if let result = try store.takeActionResult(id: pending.id) {
+                if !result.error.isEmpty {
+                    throw BotBrowserError.invalid(result.error)
+                }
+                if let data = result.payload.data(using: .utf8),
+                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    return object
+                }
+                return ["payload": result.payload]
+            }
+            Thread.sleep(forTimeInterval: 0.03)
+        }
+        throw BotBrowserError.invalid("Bot browser is not available. Open a website first while RemoteCode is running.")
     }
 
     public func waitLogin(page: BotBrowserPageState? = nil) throws -> BotBrowserLoginWait.Result {
@@ -315,6 +485,33 @@ public struct BotBrowserService: Sendable {
                 "user_message": result.userMessage ?? "",
                 "url": result.url,
             ]
+        case BotBrowserCatalog.snapshot:
+            return try performHostAction(
+                kind: BotBrowserCatalog.snapshot,
+                action: "",
+                ref: "",
+                text: "",
+                timeoutMS: 8_000
+            )
+        case BotBrowserCatalog.act:
+            let action = (arguments["action"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() ?? ""
+            let allowed = Set(["click", "type", "fill", "scroll"])
+            guard allowed.contains(action) else {
+                throw BotBrowserError.invalid("action must be click, type, fill, or scroll.")
+            }
+            guard let ref = (arguments["ref"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !ref.isEmpty else {
+                throw BotBrowserError.invalid("ref is required.")
+            }
+            return try performHostAction(
+                kind: BotBrowserCatalog.act,
+                action: action,
+                ref: ref,
+                text: arguments["text"] as? String ?? "",
+                timeoutMS: 8_000
+            )
         default:
             throw BotBrowserError.invalid("unknown tool: \(name)")
         }

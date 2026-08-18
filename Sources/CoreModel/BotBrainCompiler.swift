@@ -385,12 +385,10 @@ public enum BotBrainCompiler {
         }
         let owned = ownedSkills.filter { !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         if !owned.isEmpty {
-            // Files already hold Skills. Compile that name so first-chat
-            // "which Skills?" cannot invent a hop. Empty files stay out.
+            // Files already hold Skills. Compile an index so first-chat
+            // "which Skills?" cannot invent a hop. Bodies load via bot_skill_view.
             lines.append("Skills:")
-            for skill in owned {
-                lines.append("### skills/\(skill.slug)/SKILL.md\n\(skill.body)")
-            }
+            lines.append(contentsOf: owned.map(Self.skillIndexLine))
         }
         let liveRoutines = routines.filter(\.activation.isEnabled)
             .sorted { $0.definition.name.localizedCaseInsensitiveCompare($1.definition.name) == .orderedAscending }
@@ -546,6 +544,34 @@ public enum BotBrainCompiler {
     /// "what's in Memory?" cannot invent a hop. Empty files stay out.
     static func memoryFileLine(_ file: BotMemoryFileText) -> String {
         "### \(file.path)\n\(file.body)"
+    }
+
+    static func skillIndexLine(_ skill: BotOwnedSkillText) -> String {
+        let description = skillDescription(skill.body)
+        return "- \(skill.slug): \(description). Call \(BotStandingInstructions.viewSkillTool) to read skills/\(skill.slug)/SKILL.md."
+    }
+
+    static func skillDescription(_ body: String) -> String {
+        let lines = body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var inFrontmatter = false
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed == "---" {
+                inFrontmatter.toggle()
+                continue
+            }
+            if inFrontmatter, trimmed.lowercased().hasPrefix("description:") {
+                let value = trimmed.dropFirst("description:".count).trimmingCharacters(in: .whitespaces)
+                if !value.isEmpty { return value }
+            }
+        }
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") || trimmed == "---" { continue }
+            if trimmed.lowercased().hasPrefix("name:") { continue }
+            return trimmed
+        }
+        return "Skill for this teammate."
     }
 
     /// Studio already says Instruction and When. Compile those names so
@@ -764,9 +790,9 @@ public enum BotBrainCompiler {
                     id: "owned-skill-\(skill.slug)",
                     kind: .skill,
                     title: "Skill",
-                    text: "### skills/\(skill.slug)/SKILL.md\n\(skill.body)",
+                    text: skillIndexLine(skill),
                     included: !body.isEmpty,
-                    reason: body.isEmpty ? "Empty SKILL.md. Not injected." : "Skill file."
+                    reason: body.isEmpty ? "Empty SKILL.md. Not injected." : "Skill index. Call bot_skill_view for the body."
                 )
             )
         }

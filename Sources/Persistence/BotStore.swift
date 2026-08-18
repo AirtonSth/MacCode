@@ -466,6 +466,41 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func searchLinkedMessages(botID: BotID, query: String, limit: Int) throws -> [[String: String]] {
+        let escaped = query
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        return try db.performSync { database in
+            let statement = try database.prepare("""
+                SELECT m.thread_id, m.role, m.content, m.created_at
+                FROM agent_messages m
+                INNER JOIN bot_conversations c
+                    ON c.linked_agent_thread_id = m.thread_id
+                WHERE c.bot_id = ?
+                  AND m.content LIKE ? ESCAPE '\\'
+                ORDER BY m.created_at DESC
+                LIMIT ?;
+                """)
+            defer { statement.reset() }
+            try statement.bind(1, botID.value.uuidString.lowercased())
+            try statement.bind(2, "%\(escaped)%")
+            try statement.bind(3, Int64(max(1, min(limit, 20))))
+            var hits: [[String: String]] = []
+            while try statement.step() {
+                let content = statement.columnText(2) ?? ""
+                hits.append([
+                    "source": "conversation",
+                    "thread_id": statement.columnText(0) ?? "",
+                    "role": statement.columnText(1) ?? "",
+                    "snippet": BotSelfConfigService.snippet(in: content, matching: query),
+                    "created_at": statement.columnText(3) ?? "",
+                ])
+            }
+            return hits
+        }
+    }
+
     public func listConversations(botID: BotID) throws -> [BotConversation] {
         try db.performSync { database in
             let statement = try database.prepare(

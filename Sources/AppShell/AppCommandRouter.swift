@@ -6012,6 +6012,70 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return found
     }
 
+    /// Drain MCP pending snapshot/act commands onto this bot's WKWebView.
+    public func reconcileBotBrowserActions() async {
+        guard let ctx = context else { return }
+        let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
+        let pending = (try? store.takePendingActions()) ?? []
+        for item in pending {
+            guard let uuid = UUID(uuidString: item.botID) else { continue }
+            let botID = BotID(uuid)
+            do {
+                let payload = try await performBotBrowserPendingAction(botID: botID, action: item)
+                try store.writeActionResult(
+                    BotBrowserActionResult(id: item.id, botID: item.botID, payload: payload, error: "")
+                )
+            } catch {
+                try? store.writeActionResult(
+                    BotBrowserActionResult(
+                        id: item.id,
+                        botID: item.botID,
+                        payload: "",
+                        error: String(describing: error)
+                    )
+                )
+            }
+        }
+    }
+
+    private func performBotBrowserPendingAction(
+        botID: BotID,
+        action: BotBrowserPendingAction
+    ) async throws -> String {
+        guard let ctx = context else {
+            throw BotBrowserError.invalid("Bot browser is not available.")
+        }
+        let bot = try ctx.botStore.get(id: botID)
+        let workspace = bot?.workspaceID
+            ?? ctx.state.workspaces.keys.sorted { $0.value.uuidString < $1.value.uuidString }.first
+        guard let workspace,
+              let surface = botBrowserSurface(botID: botID, workspace: workspace) else {
+            throw BotBrowserError.invalid("Open a website first.")
+        }
+        if action.kind == BotBrowserCatalog.snapshot {
+            return try await browserSnapshot(surface: surface.id)
+        }
+        let json = try await browserAction(
+            surface: surface.id,
+            kind: action.action,
+            ref: action.ref,
+            value: action.text.isEmpty ? nil : action.text
+        )
+        if action.action == "click" || action.action == "scroll",
+           let browser = SurfaceRegistry.shared.surface(surface.id) as? BrowserSurface {
+            let url = browser.currentURL()
+            let title = browser.currentTitle()
+            if !url.isEmpty {
+                persistBrowserNavigation(surfaceID: surface.id, url: url, title: title)
+                let fields = BotBrowserHostState.makePayload(surfaceID: surface.id, url: url, title: title)
+                var payload: [String: JSONValue] = [:]
+                for (key, value) in fields { payload[key] = .string(value) }
+                EventBus.shared.publish(kind: BotBrowserHostState.eventKind, payload: .object(payload))
+            }
+        }
+        return json
+    }
+
     /// Drain MCP pending opens through the same `openBotBrowser` path tests drive.
     @discardableResult
     public func reconcileBotBrowserOpens() throws -> [BotBrowserTarget] {

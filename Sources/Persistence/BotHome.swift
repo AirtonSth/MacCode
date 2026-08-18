@@ -175,7 +175,8 @@ public struct BotHome: Sendable {
     }
 
     public static func isWritableHomePath(_ relativePath: String) -> Bool {
-        isWritableMemoryPath(relativePath) || isWritableSkillPath(relativePath)
+        let path = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        return path == soulName || isWritableMemoryPath(relativePath) || isWritableSkillPath(relativePath)
     }
 
     public static func stripProjectionHeader(_ raw: String) -> String {

@@ -10,10 +10,17 @@ final class BotBrowserStoreTests: XCTestCase {
         XCTAssertEqual(BotStandingInstructions.openBrowserTool, BotBrowserCatalog.open)
         XCTAssertEqual(BotStandingInstructions.getBrowserTool, BotBrowserCatalog.get)
         XCTAssertEqual(BotStandingInstructions.waitLoginTool, BotBrowserCatalog.waitLogin)
+        XCTAssertEqual(BotStandingInstructions.snapshotBrowserTool, BotBrowserCatalog.snapshot)
+        XCTAssertEqual(BotStandingInstructions.actBrowserTool, BotBrowserCatalog.act)
+        XCTAssertEqual(BotStandingInstructions.webSearchTool, "bot_web_search")
+        XCTAssertEqual(BotStandingInstructions.webFetchTool, "bot_web_fetch")
         let tools = BotStandingInstructions.admittedToolsText
         XCTAssertTrue(tools.contains(BotBrowserCatalog.open))
         XCTAssertTrue(tools.contains(BotBrowserCatalog.get))
         XCTAssertTrue(tools.contains(BotBrowserCatalog.waitLogin))
+        XCTAssertTrue(tools.contains(BotBrowserCatalog.snapshot))
+        XCTAssertTrue(tools.contains(BotBrowserCatalog.act))
+        XCTAssertFalse(tools.contains("bot_browser_evaluate"))
         XCTAssertTrue(tools.contains("teammate's"))
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotBrowserCatalog.open),
@@ -72,6 +79,28 @@ final class BotBrowserStoreTests: XCTestCase {
         XCTAssertEqual(restored.url, opened.url)
         XCTAssertEqual(restored.title, opened.title)
         XCTAssertEqual(try BotBrowserService(callerBotID: bot, store: again).current()?.url, opened.url)
+    }
+
+    func test_snapshotMailboxRoundTrip() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-bot-browser-act-\(UUID().uuidString)", isDirectory: true)
+        let store = BotBrowserStore(appSupportDirectory: root)
+        let bot = BotID()
+        let pending = BotBrowserPendingAction(
+            id: "act-1",
+            botID: bot.value.uuidString.lowercased(),
+            kind: BotBrowserCatalog.snapshot,
+            action: "",
+            ref: "",
+            text: ""
+        )
+        try store.enqueueAction(pending)
+        try BotBrowserHost.applyPendingActions(store: store) { _, _ in
+            "{\"url\":\"https://example.com\",\"elements\":[]}"
+        }
+        let result = try XCTUnwrap(try store.takeActionResult(id: "act-1"))
+        XCTAssertTrue(result.payload.contains("example.com"))
+        XCTAssertEqual(result.error, "")
     }
 
     func test_requestOpenEnqueuesPendingAndApplyCallsOpener() throws {

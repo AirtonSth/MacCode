@@ -49,9 +49,9 @@ public struct ManagedBotSelfConfigMCP: Sendable {
             do {
                 let store = try storeFactory(environment)
                 let service = try BotSelfConfigService.make(environment: environment, store: store)
-                let snapshot = try service.call(name: name, arguments: arguments)
+                let object = try service.invoke(name: name, arguments: arguments)
                 return reply(id: id, result: [
-                    "content": [["type": "text", "text": try service.encodeSnapshot(snapshot)]],
+                    "content": [["type": "text", "text": encode(object) ?? "{}"]],
                     "isError": false,
                 ])
             } catch {

@@ -1984,6 +1984,13 @@ public final class AppContext {
                     "RemoteCode: installBotBrowserMCP before agent turn failed: \(error.localizedDescription)"
                 )
             }
+            do {
+                try installer.installBotWebMCP()
+            } catch {
+                NSLog(
+                    "RemoteCode: installBotWebMCP before agent turn failed: \(error.localizedDescription)"
+                )
+            }
             let managedBin = installer.managedCLIBinURL.path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
@@ -2102,6 +2109,13 @@ public final class AppContext {
         } catch {
             NSLog(
                 "RemoteCode: installBotBrowserMCP before subagent env failed: \(error.localizedDescription)"
+            )
+        }
+        do {
+            try installer.installBotWebMCP()
+        } catch {
+            NSLog(
+                "RemoteCode: installBotWebMCP before subagent env failed: \(error.localizedDescription)"
             )
         }
         let managedBin = installer.managedCLIBinURL.path
@@ -2586,6 +2600,13 @@ public final class AppContext {
         ) { [weak self] _ in
             try? self?.router?.reconcileBotBrowserOpens()
         }
+        DistributedNotificationCenter.default().addObserver(
+            forName: BotBrowserHost.pendingActionNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { await self?.router?.reconcileBotBrowserActions() }
+        }
     }
 
     func reconcileComputerUseMCP() {
@@ -2604,6 +2625,11 @@ public final class AppContext {
             try installer.installBotBrowserMCP()
         } catch {
             NSLog("RemoteCode: installBotBrowserMCP failed: \(error.localizedDescription)")
+        }
+        do {
+            try installer.installBotWebMCP()
+        } catch {
+            NSLog("RemoteCode: installBotWebMCP failed: \(error.localizedDescription)")
         }
     }
 

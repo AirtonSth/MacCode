@@ -121,6 +121,13 @@ final class BotHomeTests: XCTestCase {
         XCTAssertFalse(identity.contains("@stolen"))
     }
 
+    func test_identityPathIsNotWritableHomePath() {
+        XCTAssertFalse(BotHome.isWritableHomePath("IDENTITY.md"))
+        XCTAssertFalse(BotHome.isWritableHomePath("DESCRIPTION.md"))
+        XCTAssertTrue(BotHome.isWritableHomePath("SOUL.md"))
+        XCTAssertTrue(BotHome.isWritableHomePath("MEMORY.md"))
+    }
+
     func test_thisBotSkillIsASkillMarkdownFile() throws {
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
         let home = BotHome(appSupportDirectory: directory, bot: bot)

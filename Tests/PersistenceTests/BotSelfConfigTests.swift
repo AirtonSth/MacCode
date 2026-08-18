@@ -39,6 +39,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.removeSkill))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.saveRoutine))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setRoutineEnabled))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.skillView))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.recall))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.askUser))
         XCTAssertFalse(tools.contains(BotSelfConfigCatalog.getSettings))
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(BotSelfConfigCatalog.writeHomeFile),
@@ -72,6 +75,9 @@ final class BotSelfConfigTests: XCTestCase {
             BotSelfConfigCatalog.removeSkill,
             BotSelfConfigCatalog.saveRoutine,
             BotSelfConfigCatalog.setRoutineEnabled,
+            BotSelfConfigCatalog.skillView,
+            BotSelfConfigCatalog.recall,
+            BotSelfConfigCatalog.askUser,
         ])
 
         let before = try service.call(name: BotSelfConfigCatalog.getSettings)
@@ -1113,8 +1119,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(still.skills.count, 0, "Skills reject must not persist a binding")
         XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
 
-        let added = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "weekly-account-health",
+        let added = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "skills/weekly-account-health/SKILL.md",
+            "contents": "Do the weekly health scan.\n",
         ])
         XCTAssertEqual(added.skills.first?.skillID, "weekly-account-health")
         XCTAssertEqual(added.skills.first?.enabled, true)
@@ -1205,10 +1212,11 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(still.skills.count, 0, "Add reject must not persist a binding")
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
-        let added = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "weekly-account-health",
+        let added = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "skills/weekly-account-health/SKILL.md",
+            "contents": "Do the weekly health scan.\n",
         ])
-        XCTAssertEqual(added.skills.first?.skillID, "weekly-account-health", "set_skill still owns Add")
+        XCTAssertEqual(added.skills.first?.skillID, "weekly-account-health", "write_home_file owns Add")
         XCTAssertEqual(added.skills.first?.enabled, true)
 
         let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
@@ -1236,8 +1244,9 @@ final class BotSelfConfigTests: XCTestCase {
             model: "opus"
         )
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let added = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "weekly-account-health",
+        let added = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "skills/weekly-account-health/SKILL.md",
+            "contents": "Do the weekly health scan.\n",
         ])
         XCTAssertEqual(added.skills.first?.skillID, "weekly-account-health")
         let beforeID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
@@ -3644,58 +3653,23 @@ final class BotSelfConfigTests: XCTestCase {
     }
 
     func test_setSkillAdvertisedAddPersists_becauseStudioAddOnlySendsTheCatalogId() throws {
-        // WHY: Studio Add already binds via setSkillBinding(enabled: true).
-        // Tools required enabled, so first-chat "add this skill" invented a
-        // hop or a fake add tool. Omit enabled to Add it Enabled. Advertised
-        // Enabled token persists. Explicit Off still disables. Canonical
-        // enabled still wins.
         let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-
-        let fromAdd = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "weekly-account-health",
+        let fromAdd = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "skills/weekly-account-health/SKILL.md",
+            "contents": "Do the weekly health scan.\n",
         ])
         XCTAssertEqual(fromAdd.skills.map(\.skillID), ["weekly-account-health"], "Add persists")
         XCTAssertEqual(fromAdd.skills.first?.enabled, true, "Add persists")
-        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, true)
-
-        let fromEnabledToken = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "weekly-account-health",
-            "enabled": "Enabled",
-        ])
-        XCTAssertEqual(fromEnabledToken.skills.first?.enabled, true, "advertised Enabled token persists")
-        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, true)
-
-        let fromOff = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "weekly-account-health",
-            "enabled": "Off",
-        ])
-        XCTAssertEqual(fromOff.skills.first?.enabled, false, "Off persists")
-        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, false)
-
-        let enabledWins = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "weekly-account-health",
-            "enabled": true,
-        ])
-        XCTAssertEqual(enabledWins.skills.first?.enabled, true, "enabled wins")
-        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).first?.enabled, true)
     }
 
     func test_setSkillCatalogDescribesAdd_becauseThatIsTheStudioPath() {
-        // WHY: Schema does not grow an add tool. Description must name Add
-        // so first-chat does not invent a hop. enabled stays optional.
-        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.setSkill)
-        XCTAssertTrue(description.contains("Add"), "Same path as Studio Add")
-        let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSkill)
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.skillView)
+        XCTAssertTrue(description.contains("SKILL.md"))
+        let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.skillView)
         let properties = schema["properties"] as? [String: Any]
         XCTAssertNotNil(properties?["skill_id"])
-        XCTAssertNotNil(properties?["enabled"])
-        XCTAssertNil(properties?["add"], "add is advertised on set_skill, not a second schema key")
         XCTAssertEqual(schema["required"] as? [String], ["skill_id"])
-        let enabled = properties?["enabled"] as? [String: Any]
-        XCTAssertEqual(enabled?["description"] as? String, "Enabled. Omit to Add. Same field as Studio Skills.")
-        let skillID = properties?["skill_id"] as? [String: Any]
-        XCTAssertEqual(skillID?["description"] as? String, "Catalog id. Same field as Studio Add.")
     }
 
     func test_writeHomeFilePersistsOwnedSkillMarkdown() throws {
@@ -3785,25 +3759,18 @@ final class BotSelfConfigTests: XCTestCase {
         // Hermes agents unbind in place.
         let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        _ = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "keep-me",
-            "enabled": true,
+        _ = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "skills/keep-me/SKILL.md",
+            "contents": "Keep.\n",
         ])
-        _ = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "drop-me",
-            "enabled": true,
+        _ = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "skills/drop-me/SKILL.md",
+            "contents": "Drop.\n",
         ])
-        let disabled = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "drop-me",
-            "enabled": false,
-        ])
-        XCTAssertEqual(Set(disabled.skills.map(\.skillID)), ["keep-me", "drop-me"])
-        XCTAssertEqual(disabled.skills.first(where: { $0.skillID == "drop-me" })?.enabled, false)
         let removed = try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
             "skill_id": "drop-me",
         ])
         XCTAssertEqual(removed.skills.map(\.skillID), ["keep-me"])
-        XCTAssertEqual(try store.listSkillBindings(botID: bot.id).map(\.skillID), ["keep-me"])
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.removeSkill, arguments: [
                 "skill_id": "drop-me",
@@ -3842,9 +3809,9 @@ final class BotSelfConfigTests: XCTestCase {
             "path": "MEMORY.md",
             "contents": "- Prefers dark mode\n",
         ])
-        _ = try service.call(name: BotSelfConfigCatalog.setSkill, arguments: [
-            "skill_id": "weekly-account-health",
-            "enabled": true,
+        _ = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "skills/weekly-account-health/SKILL.md",
+            "contents": "Do the weekly health scan.\n",
         ])
         _ = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
             "name": "Morning",
@@ -3901,5 +3868,141 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(object["desktop_kind"], "leftover desktop stays unnamed")
         XCTAssertEqual(try store.get(id: bot.id)?.notificationsEnabled, false)
         XCTAssertEqual(try store.getRevision(id: try XCTUnwrap(store.get(id: bot.id)?.currentRevisionID))?.providerInstanceID, "claude-work")
+    }
+
+    func test_writeSoulFilePublishesRevision() throws {
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", soul: "Old soul.", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let after = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "SOUL.md",
+            "contents": "Do the job better.\n",
+        ])
+        XCTAssertEqual(after.soul, "Do the job better.\n")
+        XCTAssertEqual(
+            try store.getRevision(id: try XCTUnwrap(store.get(id: bot.id)?.currentRevisionID))?.soul,
+            "Do the job better.\n"
+        )
+    }
+
+    func test_recallReturnsOnlyCallerHomeAndLinkedThread() throws {
+        let piper = try store.create(name: "Piper", title: "Scout", description: "", soul: "Be brief.", provider: .claude)
+        let quinn = try store.create(name: "Quinn", title: "Editor", description: "", soul: "Edit.", provider: .claude)
+        let appSupport = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-recall-\(UUID().uuidString)", isDirectory: true)
+        let piperHome = BotHome(appSupportDirectory: appSupport, bot: piper)
+        try piperHome.ensure(
+            name: piper.name,
+            handle: piper.handle,
+            title: piper.title,
+            description: "",
+            soul: ""
+        )
+        try piperHome.writeFile(relativePath: "MEMORY.md", contents: "Piper remembers the indigo vault.\n")
+        let quinnHome = BotHome(appSupportDirectory: appSupport, bot: quinn)
+        try quinnHome.ensure(name: quinn.name, handle: quinn.handle, title: quinn.title, description: "", soul: "")
+        try quinnHome.writeFile(relativePath: "MEMORY.md", contents: "Quinn remembers the indigo vault.\n")
+
+        let piperThread = UUID()
+        let quinnThread = UUID()
+        try insertThread(id: piperThread, title: "Piper chat")
+        try insertThread(id: quinnThread, title: "Quinn chat")
+        try insertMessage(thread: piperThread, role: "user", content: "indigo vault from piper thread")
+        try insertMessage(thread: quinnThread, role: "user", content: "indigo vault from quinn thread")
+        try store.upsertConversation(
+            BotConversation(
+                botID: piper.id,
+                title: "Desk",
+                linkedAgentThreadID: AgentThreadID(piperThread)
+            )
+        )
+        try store.upsertConversation(
+            BotConversation(
+                botID: quinn.id,
+                title: "Desk",
+                linkedAgentThreadID: AgentThreadID(quinnThread)
+            )
+        )
+
+        let piperService = BotSelfConfigService(
+            callerBotID: piper.id,
+            store: store,
+            appSupportDirectory: appSupport
+        )
+        let hits = try piperService.invoke(
+            name: BotSelfConfigCatalog.recall,
+            arguments: ["query": "indigo vault"]
+        )
+        let rows = try XCTUnwrap(hits["hits"] as? [[String: String]])
+        XCTAssertTrue(rows.contains { $0["source"] == "MEMORY.md" })
+        XCTAssertTrue(rows.contains { ($0["snippet"] ?? "").contains("piper thread") })
+        XCTAssertFalse(rows.contains { ($0["snippet"] ?? "").contains("quinn thread") })
+    }
+
+    func test_askUserWritesQuestionAndReturns() throws {
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        try store.upsertConversation(BotConversation(botID: bot.id, title: "Desk"))
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let result = try service.invoke(
+            name: BotSelfConfigCatalog.askUser,
+            arguments: ["question": "Which repo?"]
+        )
+        XCTAssertEqual(result["asked"] as? Bool, true)
+        XCTAssertEqual(result["question"] as? String, "Which repo?")
+        XCTAssertNotNil(result["next"] as? String)
+        let items = try store.listAttention()
+        XCTAssertTrue(items.contains { $0.botID == bot.id && $0.detail == "Which repo?" && $0.kind == .question })
+    }
+
+    func test_skillViewReturnsCallerBodyOnly() throws {
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        _ = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
+            "path": "skills/weekly-invoice/SKILL.md",
+            "contents": "Invoice the week.\n",
+        ])
+        let viewed = try service.invoke(
+            name: BotSelfConfigCatalog.skillView,
+            arguments: ["skill_id": "weekly-invoice"]
+        )
+        XCTAssertEqual(viewed["body"] as? String, "Invoice the week.\n")
+        XCTAssertThrowsError(
+            try service.invoke(
+                name: BotSelfConfigCatalog.skillView,
+                arguments: ["bot_id": BotID().value.uuidString, "skill_id": "weekly-invoice"]
+            )
+        )
+    }
+
+    private func insertThread(id: UUID, title: String) throws {
+        try db.performSync { database in
+            let statement = try database.prepare("""
+                INSERT INTO agent_threads(
+                    id, title, provider, model, status, created_at, updated_at
+                ) VALUES(?, ?, 'claude', 'opus', 'idle', ?, ?);
+                """)
+            defer { statement.reset() }
+            let now = ISO8601DateFormatter().string(from: Date())
+            try statement.bind(1, id.uuidString.lowercased())
+            try statement.bind(2, title)
+            try statement.bind(3, now)
+            try statement.bind(4, now)
+            _ = try statement.step()
+        }
+    }
+
+    private func insertMessage(thread: UUID, role: String, content: String) throws {
+        try db.performSync { database in
+            let statement = try database.prepare("""
+                INSERT INTO agent_messages(id, thread_id, role, content, created_at)
+                VALUES(?, ?, ?, ?, ?);
+                """)
+            defer { statement.reset() }
+            try statement.bind(1, UUID().uuidString.lowercased())
+            try statement.bind(2, thread.uuidString.lowercased())
+            try statement.bind(3, role)
+            try statement.bind(4, content)
+            try statement.bind(5, ISO8601DateFormatter().string(from: Date()))
+            _ = try statement.step()
+        }
     }
 }
