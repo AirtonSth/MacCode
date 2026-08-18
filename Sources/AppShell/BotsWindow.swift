@@ -1642,6 +1642,14 @@ public final class BotsViewModel: ObservableObject {
             errorMessage = "Slug is empty or invalid."
             throw BotPublishError.handleEmpty
         }
+        if studioDraft.desktopKind == .dockerDesktop,
+           !BotDesktopKind.dockerDesktop.isSelectable(
+            flags: settingsStore.load().botControlPlaneFlags,
+            guestReady: dockerGuestReady
+           ) {
+            errorMessage = "Docker desktop is not ready."
+            throw BotComputerGuestError.notReady
+        }
         let desktop = resolvedDesktopKind(studioDraft.desktopKind)
         let soul = BotStandingInstructions.resolved(
             name: name,
@@ -4801,17 +4809,19 @@ public final class BotsViewModel: ObservableObject {
     public func admitDesktopSend(bot: BotDefinition) throws {
         let kind = desktopKindOverrideForTesting
             ?? resolvedDesktopKind(selectedRevision?.desktopKind ?? .logicalExecutionSpace)
-        guard kind == .dockerDesktop else { return }
-        if dockerGuestReadyOverrideForTesting == false {
-            throw BotComputerGuestError.notReady
+        let ready: Bool
+        if let dockerGuestReadyOverrideForTesting {
+            ready = dockerGuestReadyOverrideForTesting
+        } else if kind == .dockerDesktop, dockerGuestReadyOverrideForTesting == nil {
+            guard let service = computerGuestService else {
+                throw BotComputerGuestError.notReady
+            }
+            _ = try service.provision(botID: bot.id)
+            ready = true
+        } else {
+            ready = dockerGuestReady
         }
-        if dockerGuestReadyOverrideForTesting == true {
-            return
-        }
-        guard let service = computerGuestService else {
-            throw BotComputerGuestError.notReady
-        }
-        _ = try service.provision(botID: bot.id)
+        _ = try BotDesktopAdmission.requireSend(kind: kind, guestReady: ready)
     }
 
     public func refreshDockerGuestProbe() {
