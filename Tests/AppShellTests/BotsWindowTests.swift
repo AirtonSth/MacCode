@@ -4856,6 +4856,103 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
     }
 
+    func test_petOpenBotsDesk_destsThatBotsDesk() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(try router.openBotsDesk(botID: piper.id))
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertFalse(try router.openBotsDesk(botID: BotID()))
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+    }
+
+    func test_petProjectsDestAttention_andHidesDisabledBots() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let muted = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude, notificationsEnabled: false)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        let conversation = try XCTUnwrap(vm.selectedConversation)
+        vm.openDesk(muted)
+        vm.applyFollowThroughForTests(bot: piper, conversation: conversation, status: .completed)
+        let dest = PetDestAttentionSnapshot(
+            bots: try context.botStore.list(),
+            conversations: try context.botStore.listConversations(
+                attentionStates: [.unreadActivity, .needsAttention]
+            ),
+            attention: try context.botStore.listAttention(),
+            linkedThreadIDs: try context.botStore.listLinkedAgentThreadIDs()
+        )
+        let items = PetAttentionStore.projectDest(dest)
+        XCTAssertTrue(items.contains { $0.route == .botsDesk(botID: piper.id) })
+        XCTAssertFalse(items.contains { $0.route == .botsDesk(botID: muted.id) })
+        XCTAssertFalse(items.contains { $0.title.localizedCaseInsensitiveContains("from piper") })
+    }
+
+    func test_petMarkReadFollowsDestLedger() throws {
+        let context = try makeContext()
+        let store = PetAttentionStore(
+            threadRepository: context.threadRepo,
+            callbackRepository: context.providerPendingCallbackRepo,
+            notificationRepository: NotificationRepository(db: context.db),
+            destLookup: {
+                PetDestAttentionSnapshot(
+                    bots: try context.botStore.list(),
+                    conversations: try context.botStore.listConversations(
+                        attentionStates: [.unreadActivity, .needsAttention]
+                    ),
+                    attention: try context.botStore.listAttention(),
+                    linkedThreadIDs: try context.botStore.listLinkedAgentThreadIDs()
+                )
+            },
+            markBotConversationViewed: { id in
+                guard var conversation = try context.botStore.conversation(id: id) else { return }
+                conversation.unread = false
+                conversation.attentionState = .none
+                try context.botStore.upsertConversation(conversation)
+            }
+        )
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        // Dest unread is the dest ledger. send() without a router writes a
+        // leftover dest question and would hide this completed row.
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Brief", unread: true, attentionState: .unreadActivity)
+        )
+        let item = try XCTUnwrap(try store.refresh().items.first { $0.route == .botsDesk(botID: piper.id) })
+        XCTAssertEqual(item.classification, .completed)
+        XCTAssertEqual(try store.openAndMarkRead(itemID: item.id) { _ in true }, .marked)
+        XCTAssertTrue(try store.refresh().items.filter { $0.route == .botsDesk(botID: piper.id) }.isEmpty)
+    }
+
+    func test_deskTimelineUsesSharedAgentAppScrollContainer_becauseChatMustFollowTheSamePin() throws {
+        // WHY: Desk used a plain ScrollView. Agent App pin/FAB/BOTTOM lived
+        // only in AgentAppSurface, so send did not auto-scroll. Same control
+        // must be one shared container.
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(bots.range(of: "private func deskTimeline"))
+        let rest = bots[start.lowerBound...]
+        let end = rest.range(of: "\n    private func deskBubble")?.lowerBound ?? rest.endIndex
+        let slice = String(bots[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("AgentChatTimelineScrollContainer("))
+        XCTAssertTrue(slice.contains("deskTimelineRejoinToken"))
+        XCTAssertTrue(slice.contains("\"bots.desk.scrollToBottom\""))
+        XCTAssertFalse(slice.contains("ScrollView {"))
+        let agent = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
+        XCTAssertTrue(agent.contains("AgentChatTimelineScrollContainer("))
+        XCTAssertFalse(agent.contains("private struct TimelineScrollFollower"))
+        let chrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatTimelineChrome.swift"), encoding: .utf8)
+        XCTAssertTrue(chrome.contains("struct AgentChatTimelineScrollFollower"))
+        XCTAssertTrue(chrome.contains("Scroll to latest message"))
+    }
+
     func test_deskTimelineUsesUserAssistantLabelsAndTimestamps() {
         // WHY: Grok Desk is a conversation log. A bubble without a time or
         // speaker turns the teammate into a generic agent transcript.

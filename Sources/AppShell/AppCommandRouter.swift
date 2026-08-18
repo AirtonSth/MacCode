@@ -2407,6 +2407,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return surface.descriptor
     }
 
+    @discardableResult
+    public func openBotsDesk(botID: BotID) throws -> Bool {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        windowController?.show()
+        windowController?.presentBotsInMainContent()
+        windowController?.flushPendingRefresh()
+        guard let vm = botsViewModel else { return false }
+        guard let bot = vm.bots.first(where: { $0.id == botID }) else { return false }
+        vm.openDesk(bot)
+        windowController?.flushPendingRefresh()
+        guard vm.selectedBotID == botID, vm.screen == .desk else { return false }
+        guard let destination = windowController?.window else { return true }
+        return destination.isVisible && destination.isMiniaturized == false
+    }
+
     /// Prefer the currently focused Agent App tab, then layout order. This makes
     /// an explicit deep link deterministic without changing any sibling surface.
     private func preferredAgentAppSurface(in workspaceID: WorkspaceID) -> AgentAppSurface? {

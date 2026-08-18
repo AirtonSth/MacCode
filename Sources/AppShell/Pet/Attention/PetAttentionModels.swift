@@ -89,12 +89,14 @@ public enum PetAttentionRoute: Sendable, Equatable {
     case surface(surfaceID: SurfaceID, workspaceID: WorkspaceID?)
     case workspace(workspaceID: WorkspaceID)
     case settings(PetSettingsRoute)
+    case botsDesk(botID: BotID)
 }
 
 public enum PetAttentionSource: Sendable, Equatable {
     case callback(threadID: AgentThreadID, requestID: String, kind: PetAttentionCallbackKind)
     case agentThread(threadID: AgentThreadID)
     case notification(id: String)
+    case bot(botID: BotID, conversationID: BotConversationID?, attentionItemID: BotAttentionItemID?)
 }
 
 public struct PetAttentionItem: Sendable, Equatable, Identifiable {
@@ -132,6 +134,25 @@ public struct PetAttentionItem: Sendable, Equatable, Identifiable {
     }
 }
 
+public struct PetDestAttentionSnapshot: Sendable, Equatable {
+    public let bots: [BotDefinition]
+    public let conversations: [BotConversation]
+    public let attention: [BotAttentionItem]
+    public let linkedThreadIDs: Set<AgentThreadID>
+
+    public init(
+        bots: [BotDefinition],
+        conversations: [BotConversation],
+        attention: [BotAttentionItem],
+        linkedThreadIDs: Set<AgentThreadID> = []
+    ) {
+        self.bots = bots
+        self.conversations = conversations
+        self.attention = attention
+        self.linkedThreadIDs = linkedThreadIDs
+    }
+}
+
 public struct PetAttentionSnapshot: Sendable, Equatable {
     public let items: [PetAttentionItem]
 
@@ -165,7 +186,8 @@ public struct PetActiveThreadItem: Sendable, Equatable, Identifiable {
         threadTitle: String? = nil,
         startedAt: Date? = nil,
         lastUpdatePreview: String? = nil,
-        now: Date = Date()
+        now: Date = Date(),
+        route: PetAttentionRoute? = nil
     ) {
         self.id = "active:\(threadID.value.uuidString)"
         self.threadID = threadID
@@ -183,7 +205,7 @@ public struct PetActiveThreadItem: Sendable, Equatable, Identifiable {
         self.title = presentation.title
         self.detail = presentation.detail
         self.lastUpdatePreview = PetAttentionRedactor.safeContextLabel(lastUpdatePreview)
-        self.route = .agentThread(threadID: threadID, workspaceID: workspaceID)
+        self.route = route ?? .agentThread(threadID: threadID, workspaceID: workspaceID)
     }
 }
 

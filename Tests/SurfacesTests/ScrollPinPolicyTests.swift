@@ -316,13 +316,12 @@ final class ScrollPinPolicyTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let source = try String(
-            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentChatTimelineChrome.swift"),
             encoding: .utf8
         )
-        let start = try XCTUnwrap(source.range(of: "private struct TimelineScrollFollower"))
+        let start = try XCTUnwrap(source.range(of: "struct AgentChatTimelineScrollFollower"))
         let tail = source[start.lowerBound...]
-        let end = try XCTUnwrap(tail.range(of: "// PERF-MAC_AGENT-004"))
-        let follower = String(tail[..<end.lowerBound])
+        let follower = String(tail)
 
         XCTAssertFalse(follower.contains("layoutSubtreeIfNeeded()"))
         XCTAssertFalse(follower.contains("updateConstraintsForSubtreeIfNeeded()"))

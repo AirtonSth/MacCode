@@ -3,6 +3,7 @@ import AgentRuntime
 import CoreModel
 import DesignSystemKit
 import Persistence
+import SocketServer
 import Surfaces
 import SwiftUI
 
@@ -535,6 +536,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var deskStreamEventCount = 0
     @Published public private(set) var deskSendInFlight = false
     @Published public private(set) var deskSendInFlightStartedAt: Date?
+    @Published public private(set) var deskTimelineRejoinToken = 0
     /// Owner of the in-flight send so roster switch does not paint Loading on the wrong desk.
     private var deskSendInFlightBotID: BotID?
     /// Test seam: how many times Desk actually decoded stream events.
@@ -1372,6 +1374,7 @@ public final class BotsViewModel: ObservableObject {
         reloadSelectedBot(id: bot.id)
         syncQueuedFollowUps()
         drainQueuedFollowUp()
+        deskTimelineRejoinToken &+= 1
     }
 
     public func openInNewWindow(_ bot: BotDefinition) {
@@ -1414,6 +1417,7 @@ public final class BotsViewModel: ObservableObject {
             }
             applyAttentionState(for: botID, conversations: items)
             rememberStudioSupportConversations(botID: botID, conversations: items)
+            Self.publishDestAttentionChanged()
         } catch {
             errorMessage = String(describing: error)
         }
@@ -1497,6 +1501,7 @@ public final class BotsViewModel: ObservableObject {
             // store marked this row read. Drop it locally.
             try botStore.acknowledgeAttention(id: item.id)
             dropAcknowledgedAttention(item.id)
+            Self.publishDestAttentionChanged()
         } catch {
             errorMessage = String(describing: error)
         }
@@ -4256,9 +4261,14 @@ public final class BotsViewModel: ObservableObject {
                 for: bot.id,
                 conversations: destConversations(botID: bot.id, patched: next)
             )
+            Self.publishDestAttentionChanged()
         } catch {
             errorMessage = String(describing: error)
         }
+    }
+
+    static func publishDestAttentionChanged() {
+        EventBus.shared.publish(kind: "bots.attention.changed", payload: .object([:]))
     }
 
     private func currentRevision(for bot: BotDefinition) throws -> BotRevision? {
@@ -4531,6 +4541,7 @@ public final class BotsViewModel: ObservableObject {
                 for: bot.id,
                 conversations: destConversations(botID: bot.id, patched: next)
             )
+            Self.publishDestAttentionChanged()
         } catch {
             errorMessage = String(describing: error)
         }
@@ -4548,6 +4559,7 @@ public final class BotsViewModel: ObservableObject {
         deskSendInFlightBotID = botID
         deskSendInFlight = true
         deskSendInFlightStartedAt = Date()
+        deskTimelineRejoinToken &+= 1
     }
 
     private func clearDeskSendInFlight(for botID: BotID) {
@@ -6087,53 +6099,59 @@ public struct BotsRootView: View {
     }
 
     private func deskTimeline(_ bot: BotDefinition) -> some View {
-        GeometryReader { geo in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: DS.Space.xl) {
-                    if vm.deskTimeline.isEmpty {
-                        Text("Message \(bot.name) to give it a first task.")
-                            .font(DS.Font.body)
+        AgentChatTimelineScrollContainer(
+            rejoinToken: vm.deskTimelineRejoinToken,
+            followToken: vm.deskTimeline.count
+                &+ (vm.deskShowsLoading ? 1 : 0)
+                &+ (vm.deskRunIsLive ? 2 : 0)
+                &+ vm.deskLiveTimeline.turns.reduce(0) { $0 &+ $1.items.count },
+            scrollToBottomIdentifier: "bots.desk.scrollToBottom",
+            accessibilityIdentifier: "bots.desk.timeline",
+            horizontalPadding: DS.Space.xxl,
+            verticalPadding: DS.Space.xl,
+            columnGutter: AgentChatTranscriptChrome.userMessageBubbleLeadingGutter
+        ) { columnWidth in
+            LazyVStack(alignment: .leading, spacing: DS.Space.xl) {
+                if vm.deskTimeline.isEmpty {
+                    Text("Message \(bot.name) to give it a first task.")
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, DS.Space.xl)
+                }
+                ForEach(Array(vm.deskTimeline.enumerated()), id: \.element.id) { index, item in
+                    if let group = deskPeerGroupCaption(at: index) {
+                        Text(group)
+                            .font(DS.Font.caption)
                             .foregroundColor(DS.Palette.textTertiary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, DS.Space.xl)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, DS.Space.md)
+                            .accessibilityIdentifier("bots.desk.peer.group")
                     }
-                    ForEach(Array(vm.deskTimeline.enumerated()), id: \.element.id) { index, item in
-                        if let group = deskPeerGroupCaption(at: index) {
-                            Text(group)
-                                .font(DS.Font.caption)
-                                .foregroundColor(DS.Palette.textTertiary)
-                                .frame(maxWidth: .infinity)
-                                .padding(.top, DS.Space.md)
-                                .accessibilityIdentifier("bots.desk.peer.group")
-                        }
-                        switch item {
-                        case .message(let message):
-                            deskBubble(message, columnWidth: geo.size.width)
-                        case .workLog(let row):
-                            deskWorkLogRow(row)
-                        case .liveTurn(let turn, let hideAssistantOutput):
-                            AgentChatLiveTurnView(
-                                turn: turn,
-                                live: vm.deskRunIsLive && !turn.finished,
-                                hideAssistantOutput: hideAssistantOutput
-                            )
-                        }
-                    }
-                    if vm.deskShowsLoading {
-                        AgentChatLoadingStatusStrip()
-                    } else if vm.deskRunIsLive, let started = vm.deskWorkingStartedAt() {
-                        AgentChatWorkingStatusStrip(
-                            startedAt: started,
-                            isStopping: vm.isStopping,
-                            onStop: { vm.stopDeskRun() }
+                    switch item {
+                    case .message(let message):
+                        deskBubble(message, columnWidth: columnWidth)
+                    case .workLog(let row):
+                        deskWorkLogRow(row)
+                    case .liveTurn(let turn, let hideAssistantOutput):
+                        AgentChatLiveTurnView(
+                            turn: turn,
+                            live: vm.deskRunIsLive && !turn.finished,
+                            hideAssistantOutput: hideAssistantOutput
                         )
                     }
                 }
-                .padding(.horizontal, DS.Space.xxl)
-                .padding(.vertical, DS.Space.xl)
+                if vm.deskShowsLoading {
+                    AgentChatLoadingStatusStrip()
+                } else if vm.deskRunIsLive, let started = vm.deskWorkingStartedAt() {
+                    AgentChatWorkingStatusStrip(
+                        startedAt: started,
+                        isStopping: vm.isStopping,
+                        onStop: { vm.stopDeskRun() }
+                    )
+                }
             }
         }
-        .accessibilityIdentifier("bots.desk.timeline")
     }
 
     private func deskBubble(_ message: BotDeskMessage, columnWidth: CGFloat) -> some View {

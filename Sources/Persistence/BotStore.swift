@@ -411,6 +411,33 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func listLinkedAgentThreadIDs() throws -> Set<AgentThreadID> {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                "SELECT linked_agent_thread_id FROM bot_conversations WHERE linked_agent_thread_id IS NOT NULL;"
+            )
+            defer { statement.reset() }
+            var ids = Set<AgentThreadID>()
+            while try statement.step() {
+                guard let raw = statement.columnText(0),
+                      let uuid = UUID(uuidString: raw) else { continue }
+                ids.insert(AgentThreadID(uuid))
+            }
+            return ids
+        }
+    }
+
+    public func conversation(id: BotConversationID) throws -> BotConversation? {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                Self.conversationSelect + " WHERE id = ? LIMIT 1;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, id.value.uuidString.lowercased())
+            return try statement.step() ? try decodeConversation(statement) : nil
+        }
+    }
+
     public func conversationLinked(to threadID: AgentThreadID) throws -> BotConversation? {
         try db.performSync { database in
             let statement = try database.prepare(
@@ -419,6 +446,23 @@ public final class BotStore: @unchecked Sendable {
             defer { statement.reset() }
             try statement.bind(1, threadID.value.uuidString.lowercased())
             return try statement.step() ? try decodeConversation(statement) : nil
+        }
+    }
+
+    public func listConversations(attentionStates: [BotAttentionState]) throws -> [BotConversation] {
+        guard !attentionStates.isEmpty else { return [] }
+        return try db.performSync { database in
+            let marks = Array(repeating: "?", count: attentionStates.count).joined(separator: ",")
+            let statement = try database.prepare(
+                Self.conversationSelect + " WHERE attention_state IN (\(marks)) ORDER BY updated_at DESC;"
+            )
+            defer { statement.reset() }
+            for (index, state) in attentionStates.enumerated() {
+                try statement.bind(Int32(index + 1), state.rawValue)
+            }
+            var result: [BotConversation] = []
+            while try statement.step() { result.append(try decodeConversation(statement)) }
+            return result
         }
     }
 
