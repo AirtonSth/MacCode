@@ -5131,15 +5131,10 @@ public struct SidebarRootView: View {
                 Spacer(minLength: 0)
                 if busy {
                     let busyLabel = vm.busyTooltip(for: ws) ?? "Workspace busy"
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.7)
-                        .frame(width: 16, height: 16)
-                        // UX-SIDEBAR-P3-BUSYTIP: use the per-workspace busy
-                        // source description instead of the generic label so
-                        // VoiceOver and tooltip convey agent-run vs terminal.
-                        .help(busyLabel)
-                        .accessibilityLabel(busyLabel)
+                    // UX-SIDEBAR-P3-BUSYTIP: use the per-workspace busy
+                    // source description instead of the generic label so
+                    // VoiceOver and tooltip convey agent-run vs terminal.
+                    DSBusySpinner(label: busyLabel)
                 } else if vm.completedWorkspaces.contains(ws.id) {
                     // UX-SIDEBAR-COMPLETED-DOT: the action finished — a small success
                     // dot takes the spinner's slot until the user opens the workspace.

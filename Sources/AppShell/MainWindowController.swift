@@ -198,6 +198,35 @@ public extension Notification.Name {
     static let rc2SidebarVisibility = Notification.Name("rc2.sidebarVisibility")
 }
 
+/// Hide/show motion for the shell sidebar. dest dest dest inspector, dest dest dest
+/// thread rail, and Files use DS.Motion.standard (0.22s ease-out). The
+/// AppKit split must match that — dest dest dest is full-bleed, so a snapped
+/// 34pt header inset is obvious.
+public enum ShellSidebarToggleMotion {
+    public static let duration: TimeInterval = 0.22
+    public static let restingMinCoordinate: CGFloat = 180
+
+    public static func dividerPosition(collapsed: Bool, expandedWidth: CGFloat) -> CGFloat {
+        collapsed ? 0 : expandedWidth
+    }
+
+    public static func minDividerCoordinate(animatingToggle: Bool) -> CGFloat {
+        animatingToggle ? 0 : restingMinCoordinate
+    }
+
+    public static func splitTopInset(collapsed: Bool, headerHeight: CGFloat) -> CGFloat {
+        collapsed ? headerHeight : 0
+    }
+
+    public static func workspaceContentTopInset(
+        collapsed: Bool,
+        hidesVisibleHeader: Bool,
+        headerHeight: CGFloat
+    ) -> CGFloat {
+        (collapsed || hidesVisibleHeader) ? 0 : headerHeight
+    }
+}
+
 @MainActor
 public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitViewDelegate, PaneKeyboardResizeHandling {
     public let window: NSWindow
@@ -236,6 +265,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// One DispatchWorkItem replaces the previous on each tick; only the
     /// item that survives the 0.3 s idle period actually calls settingsRepo.
     private var sidebarWidthDebounceItem: DispatchWorkItem?
+    /// True while the sidebar divider is sliding. Min width drops to 0 and
+    /// resize persistence must not record the in-flight width.
+    private var isAnimatingSidebarToggle = false
+    private var sidebarToggleGeneration = 0
+    private var headerVisibilityAnimated = false
     /// PERF-MAC_SHELL_WINDOW-004: coalesce refreshFromState calls per
     /// runloop tick. Multiple requests arriving within one tick (e.g. an
     /// agent event burst) share one scheduled async flush instead of each
@@ -354,22 +388,42 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 
     @objc private func handleToggleSidebar() {
         sidebarCollapsed.toggle()
+        sidebarToggleGeneration += 1
+        let generation = sidebarToggleGeneration
         shellLog.debug("sidebar.toggle collapsed=\(self.sidebarCollapsed, privacy: .public)")
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
-            ctx.allowsImplicitAnimation = true
-            ctx.completionHandler = { [weak self] in
-                guard let self else { return }
-                self.split.adjustSubviews()
-                self.window.contentView?.layoutSubtreeIfNeeded()
-            }
-            sidebar.view.isHidden = sidebarCollapsed
-            updateCollapsedWorkspaceHeader()
-            if !sidebarCollapsed {
-                split.setPosition(sidebarWidth, ofDividerAt: 0)
-            }
-            window.contentView?.layoutSubtreeIfNeeded()
+        if sidebarCollapsed, sidebar.view.frame.width > 1 {
+            sidebarWidth = sidebar.view.frame.width
         }
+        isAnimatingSidebarToggle = true
+        headerVisibilityAnimated = true
+        if !sidebarCollapsed {
+            sidebar.view.isHidden = false
+            split.setPosition(0, ofDividerAt: 0)
+        }
+        let targetWidth = ShellSidebarToggleMotion.dividerPosition(
+            collapsed: sidebarCollapsed,
+            expandedWidth: sidebarWidth
+        )
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = ShellSidebarToggleMotion.duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            ctx.allowsImplicitAnimation = true
+            split.animator().setPosition(targetWidth, ofDividerAt: 0)
+            updateCollapsedWorkspaceHeader()
+        }, completionHandler: { [weak self] in
+            guard let self, generation == self.sidebarToggleGeneration else { return }
+            self.isAnimatingSidebarToggle = false
+            if self.sidebarCollapsed {
+                self.sidebar.view.isHidden = true
+            }
+            if !self.sidebarCollapsed {
+                self.collapsedWorkspaceHeader.isHidden = true
+                self.collapsedWorkspaceHeader.alphaValue = 1
+            }
+            self.split.adjustSubviews()
+            self.window.contentView?.layoutSubtreeIfNeeded()
+        })
+        headerVisibilityAnimated = false
         NotificationCenter.default.post(
             name: .rc2SidebarVisibility, object: nil,
             userInfo: ["collapsed": sidebarCollapsed])
@@ -598,9 +652,37 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         private func applyWorkspaceHeaderVisibility() {
             let hideVisible = sidebarCollapsed || shellContentMode == .bots
             visibleWorkspaceHeader.isHidden = hideVisible
-            collapsedWorkspaceHeader.isHidden = !sidebarCollapsed
-            splitTopConstraint?.constant = sidebarCollapsed ? collapsedHeaderHeight : 0
-            workspaceContentTopConstraint?.constant = hideVisible ? 0 : collapsedHeaderHeight
+            let showCollapsed = sidebarCollapsed
+            if headerVisibilityAnimated {
+                if showCollapsed {
+                    if collapsedWorkspaceHeader.isHidden {
+                        collapsedWorkspaceHeader.alphaValue = 0
+                        collapsedWorkspaceHeader.isHidden = false
+                    }
+                    collapsedWorkspaceHeader.animator().alphaValue = 1
+                } else if !collapsedWorkspaceHeader.isHidden {
+                    collapsedWorkspaceHeader.animator().alphaValue = 0
+                }
+            } else {
+                collapsedWorkspaceHeader.isHidden = !showCollapsed
+                collapsedWorkspaceHeader.alphaValue = 1
+            }
+            let splitTop = ShellSidebarToggleMotion.splitTopInset(
+                collapsed: sidebarCollapsed,
+                headerHeight: collapsedHeaderHeight
+            )
+            let contentTop = ShellSidebarToggleMotion.workspaceContentTopInset(
+                collapsed: sidebarCollapsed,
+                hidesVisibleHeader: shellContentMode == .bots,
+                headerHeight: collapsedHeaderHeight
+            )
+            if headerVisibilityAnimated {
+                splitTopConstraint?.animator().constant = splitTop
+                workspaceContentTopConstraint?.animator().constant = contentTop
+            } else {
+                splitTopConstraint?.constant = splitTop
+                workspaceContentTopConstraint?.constant = contentTop
+            }
         }
 
 	    private func updateCollapsedWorkspaceHeader() {
@@ -1492,7 +1574,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     // MARK: NSSplitViewDelegate
     public func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
         guard splitView === split, dividerIndex == 0 else { return proposedMinimumPosition }
-        return 180
+        return ShellSidebarToggleMotion.minDividerCoordinate(
+            animatingToggle: isAnimatingSidebarToggle
+        )
     }
 
     public func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
@@ -1511,7 +1595,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             applyInitialSidebarWidthIfNeeded()
             return
         }
-        guard !isApplyingInitialSidebarWidth, !sidebarCollapsed else { return }
+        guard !isApplyingInitialSidebarWidth, !sidebarCollapsed, !isAnimatingSidebarToggle else { return }
         let currentSplitWidth = splitView.bounds.width
         let sidebarFrameWidth = sidebar.view.frame.width
         if let lastSplitBoundsWidth,

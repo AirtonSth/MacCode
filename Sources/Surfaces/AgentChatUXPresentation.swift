@@ -1297,6 +1297,41 @@ public enum AgentThreadRailRowCopy {
     }
 }
 
+// MARK: - Shared thread-rail chrome copy
+
+/// One header/search/clear-all contract for Agent App and dest.
+/// Surfaces mount the same chrome; they must not fork this copy.
+public enum AgentChatThreadRailCopy {
+    public static let emptyTitle = "No threads"
+    public static let emptyIcon = "bubble.left.and.bubble.right"
+    public static let searchPlaceholder = "Search threads"
+    public static let clearAllTitle = "Clear All"
+    public static let hideHelp = "Hide threads"
+    public static let showHelp = "Show threads"
+    public static let newHelp = "New thread"
+    public static let clearSearchLabel = "Clear search"
+    public static let clearAllHelp = "Delete all threads"
+
+    public static func headerTitle(activeCount: Int) -> String {
+        activeCount > 0 ? "Threads · \(activeCount) active" : "Threads"
+    }
+
+    public static func noMatchText(query: String) -> String {
+        "No threads match \"\(query)\""
+    }
+
+    public static func showsClearAll(isEmpty: Bool) -> Bool {
+        !isEmpty
+    }
+
+    public static func matches(title: String, extra: String = "", query: String) -> Bool {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return true }
+        return title.localizedCaseInsensitiveContains(q)
+            || extra.localizedCaseInsensitiveContains(q)
+    }
+}
+
 // MARK: - Empty starters (shared copy)
 
 public struct AgentEmptyConversationStarter: Sendable, Equatable, Identifiable {

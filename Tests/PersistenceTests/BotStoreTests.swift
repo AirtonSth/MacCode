@@ -146,6 +146,19 @@ final class BotStoreTests: XCTestCase {
         XCTAssertEqual(try store.getRevision(id: firstID)?.description, "v1")
     }
 
+    func test_deleteConversations_dropsOnlyThatBot_becauseClearAllIsPerTeammate() throws {
+        // WHY: dest Clear All must erase this teammate's dest threads and
+        // leave every other bot's conversations on disk.
+        let piper = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let quinn = try store.create(name: "Quinn", title: "CRM", description: "", provider: .grok)
+        try store.upsertConversation(BotConversation(botID: piper.id, title: "Standup"))
+        try store.upsertConversation(BotConversation(botID: piper.id, title: "Follow-up"))
+        try store.upsertConversation(BotConversation(botID: quinn.id, title: "Inbox"))
+        try store.deleteConversations(botID: piper.id)
+        XCTAssertEqual(try store.listConversations(botID: piper.id).count, 0)
+        XCTAssertEqual(try store.listConversations(botID: quinn.id).map(\.title), ["Inbox"])
+    }
+
     func test_duplicate_copiesProfileAndRoutinesButNotMemoryOrConversations() throws {
         let bot = try store.create(
             name: "Piper", title: "Scout", description: "Looks around",

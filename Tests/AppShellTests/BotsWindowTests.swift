@@ -27,6 +27,8 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.deskRouting")
         UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
         UserDefaults.standard.removeObject(forKey: "bots.unpublishedNewBotIDs")
+        UserDefaults.standard.removeObject(forKey: "bots.deskThreadRail")
+        UserDefaults.standard.removeObject(forKey: "bots.deskThreadRailWidth")
     }
 
     override func tearDown() {
@@ -624,6 +626,56 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(slice.contains("maxWidth: 420"))
     }
 
+    func test_deskThreadRailResizesLikeAgentApp_becauseClearAllMustStayOneLine() throws {
+        // WHY: dest dest dest dest fixed the rail at 220/320. Agent App
+        // drags 320–360. dest dest dest dest must persist that range so
+        // hide + Clear All + + stay on one line.
+        XCTAssertEqual(BotsChrome.clampedThreadRailWidth(200), BotsChrome.threadRailMinWidth)
+        XCTAssertEqual(BotsChrome.clampedThreadRailWidth(400), BotsChrome.threadRailMaxWidth)
+        XCTAssertEqual(BotsChrome.clampedThreadRailWidth(340), 340)
+
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        XCTAssertEqual(vm.deskThreadRailWidth, BotsChrome.threadRailWidth)
+        vm.resizeDeskThreadRail(by: 40)
+        XCTAssertEqual(vm.deskThreadRailWidth, 360)
+        vm.resizeDeskThreadRail(by: 80)
+        XCTAssertEqual(vm.deskThreadRailWidth, BotsChrome.threadRailMaxWidth)
+        vm.resizeDeskThreadRail(by: -1000)
+        XCTAssertEqual(vm.deskThreadRailWidth, BotsChrome.threadRailMinWidth)
+
+        UserDefaults.standard.set(340.0, forKey: "bots.deskThreadRailWidth")
+        let restored = BotsViewModel(context: context)
+        XCTAssertEqual(restored.deskThreadRailWidth, 340)
+
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private func deskChat") else {
+            return XCTFail("desk chat must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private func deskDesktopPane")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("Resize threads"))
+        XCTAssertTrue(slice.contains("resizeDeskThreadRail(by: delta)"))
+        XCTAssertTrue(slice.contains(".frame(width: vm.deskThreadRailWidth)"))
+        XCTAssertFalse(slice.contains("BotsChrome.threadRailWidth)"))
+    }
+
+    func test_hiddenDeskThreadRailOmitsHeaderPlus_becauseNewThreadLivesOnTheRail() throws {
+        // WHY: Agent App keeps a collapsed +. dest dest dest dest header
+        // already has identity + Studio. Hide must only restore the rail.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private func deskHeader") else {
+            return XCTFail("desk header must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private func deskChat")?.lowerBound ?? rest.endIndex
+        let header = String(source[start.lowerBound..<end])
+        XCTAssertTrue(header.contains("bots.desk.thread.show"))
+        XCTAssertFalse(header.contains("bots.desk.thread.new.collapsed"))
+        XCTAssertFalse(header.contains("AgentChatThreadRailCopy.newHelp"))
+    }
+
     func test_deskHeaderIsToolbarSized_becauseTheShellTitlebarAlreadyWentAway() throws {
         // WHY: Removing the shell "Bots" bar left Desk in the titlebar
         // inset with title2 + xl padding. That read as a second titlebar.
@@ -709,8 +761,22 @@ final class BotsWindowTests: XCTestCase {
             "Bots must drop the visible workspace header, not only when the sidebar is collapsed"
         )
         XCTAssertTrue(
-            main.contains("workspaceContentTopConstraint?.constant = hideVisible ? 0 : collapsedHeaderHeight"),
+            main.contains("workspaceContentTopInset("),
             "hiding the bar without collapsing the inset leaves a 34pt gap"
+        )
+        XCTAssertEqual(
+            ShellSidebarToggleMotion.workspaceContentTopInset(
+                collapsed: false,
+                hidesVisibleHeader: true,
+                headerHeight: 34
+            ),
+            0,
+            "open dest dest dest is full-bleed; dest dest dest already owns the title"
+        )
+        XCTAssertEqual(
+            ShellSidebarToggleMotion.splitTopInset(collapsed: true, headerHeight: 34),
+            34,
+            "collapsed dest dest still needs the 34pt bar so the sidebar toggle remains reachable"
         )
     }
 
@@ -1085,6 +1151,33 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(
             slice.contains("DS.Palette.accent"),
             "the leading bar must follow the avatar, not the app accent"
+        )
+    }
+
+    func test_rosterShowsWorkspaceBusySpinner_becauseWorkingMustMatchAgentic() throws {
+        // WHY: dest dest Working used the same green avatar dot as Online.
+        // Agentic workspaces put a 16pt ProgressView on the trailing edge.
+        // dest dest must mount that same spinner while the teammate works.
+        XCTAssertTrue(BotsChrome.rosterShowsBusySpinner(for: .working))
+        XCTAssertFalse(BotsChrome.rosterShowsBusySpinner(for: .none))
+        XCTAssertFalse(BotsChrome.rosterShowsBusySpinner(for: .needsAttention))
+        XCTAssertFalse(BotsChrome.rosterShowsBusySpinner(for: .unreadActivity))
+
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private func rosterRow") else {
+            return XCTFail("roster row must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private func ")?.lowerBound ?? rest.endIndex
+        let row = String(source[start.lowerBound..<end])
+        XCTAssertTrue(row.contains("DSBusySpinner("), "dest dest roster must reuse the workspace busy spinner")
+        XCTAssertTrue(row.contains("BotsChrome.rosterShowsBusySpinner"))
+        XCTAssertTrue(row.contains("bots.roster.busy"))
+
+        let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertTrue(
+            sidebar.contains("DSBusySpinner("),
+            "Agentic workspace rows must own the same DSBusySpinner type"
         )
     }
 
@@ -4389,6 +4482,94 @@ final class BotsWindowTests: XCTestCase {
         vm.selectDeskThread(second.id)
         XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("BRAVO") })
         XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("ALPHA") })
+    }
+
+    func test_deskThreadRailMountsSharedAgentChrome_becauseDestMustNotForkTheRail() throws {
+        // WHY: dest asked for Agent App threads. A lookalike dest
+        // header would drift from toggle, Clear All, search, and +.
+        let dest = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let agent = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
+        let chrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatSharedChrome.swift"), encoding: .utf8)
+        XCTAssertTrue(chrome.contains("public struct AgentChatThreadRail"))
+        XCTAssertTrue(dest.contains("AgentChatThreadRail("))
+        XCTAssertTrue(agent.contains("AgentChatThreadRail("))
+        XCTAssertTrue(dest.contains("bots.desk.thread.clearAll"))
+        XCTAssertTrue(dest.contains("bots.desk.thread.hide"))
+        XCTAssertTrue(dest.contains("bots.desk.thread.search"))
+        XCTAssertTrue(dest.contains("bots.desk.thread.new"))
+    }
+
+    func test_deskThreadSearchFiltersConversations_becauseRailMustReuseAgentSearch() throws {
+        // WHY: dest rail copies Agent App search. Typing a title must hide
+        // other dest threads so the user can find one conversation.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Standup notes"))
+        vm.createDeskThread()
+        XCTAssertTrue(vm.send("Invoice follow-up"))
+        XCTAssertEqual(vm.conversations.count, 2)
+        vm.deskThreadSearchQuery = "stand"
+        XCTAssertEqual(vm.filteredDeskConversations.map(\.title), ["Standup notes"])
+        vm.deskThreadSearchQuery = "auth"
+        XCTAssertTrue(vm.filteredDeskConversations.isEmpty)
+        vm.deskThreadSearchQuery = ""
+        XCTAssertEqual(vm.filteredDeskConversations.count, 2)
+    }
+
+    func test_deskThreadRailVisibilityPersists_becauseClosingRemoteCodeMustRestoreTheChoice() throws {
+        // WHY: user workflow state must survive reopen. Hide dest threads
+        // must come back hidden.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        XCTAssertTrue(vm.isDeskThreadRailVisible)
+        vm.isDeskThreadRailVisible = false
+        let restored = BotsViewModel(context: context)
+        XCTAssertFalse(restored.isDeskThreadRailVisible)
+    }
+
+    func test_clearAllDeskThreadsDeletesOnlyThatBot_becauseClearAllMustNotWipeTheFleet() throws {
+        // WHY: dest Clear All is this teammate's dest list, not every bot
+        // and not Agent App workspace threads.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        let quinn = try vm.create(name: "Quinn", title: "CRM", provider: .claude)
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("Quinn inbox"))
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Piper first"))
+        vm.createDeskThread()
+        XCTAssertTrue(vm.send("Piper second"))
+        XCTAssertEqual(try context.botStore.listConversations(botID: piper.id).count, 2)
+        XCTAssertEqual(try context.botStore.listConversations(botID: quinn.id).count, 1)
+        vm.clearAllDeskThreads()
+        XCTAssertTrue(vm.conversations.isEmpty)
+        XCTAssertNil(vm.selectedConversation)
+        XCTAssertTrue(vm.deskMessages.isEmpty)
+        XCTAssertEqual(try context.botStore.listConversations(botID: piper.id).count, 0)
+        XCTAssertEqual(try context.botStore.listConversations(botID: quinn.id).count, 1)
+        XCTAssertEqual(try context.botStore.listConversations(botID: quinn.id).first?.title, "Quinn inbox")
+    }
+
+    func test_clearAllDeskThreadsLeavesEmptyRail_becausePlusStartsTheNextConversation() throws {
+        // WHY: after Clear All, dest should match Agent App empty state so
+        // send/create can start a new thread.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("old work"))
+        vm.clearAllDeskThreads()
+        XCTAssertTrue(vm.conversations.isEmpty)
+        vm.createDeskThread()
+        XCTAssertEqual(vm.conversations.count, 1)
+        XCTAssertEqual(vm.selectedConversation?.title, "New thread")
+        XCTAssertTrue(vm.deskMessages.isEmpty)
+        XCTAssertTrue(vm.send("fresh start"))
+        XCTAssertEqual(try context.botStore.listConversations(botID: piper.id).count, 1)
+        XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("fresh start") })
     }
 
     func test_sendContinuesSelectedConversation() throws {

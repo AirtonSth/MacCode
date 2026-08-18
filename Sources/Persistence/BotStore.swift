@@ -514,6 +514,15 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func deleteConversations(botID: BotID) throws {
+        try db.performSync { database in
+            let statement = try database.prepare("DELETE FROM bot_conversations WHERE bot_id = ?;")
+            defer { statement.reset() }
+            try statement.bind(1, botID.value.uuidString.lowercased())
+            _ = try statement.step()
+        }
+    }
+
     public func upsertConversation(_ conversation: BotConversation) throws {
         try db.performSync { database in
             guard let bot = try loadBot(id: conversation.botID, database: database), bot.deletedAt == nil else {

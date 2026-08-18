@@ -680,4 +680,32 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertEqual(AgentEmptyConversationStarters.all.count, 4)
         XCTAssertFalse(AgentEmptyConversationStarters.all[0].prompt.isEmpty)
     }
+
+    func test_threadRailCopy_headerSearchAndClearAll_matchAgentAppChrome() throws {
+        // WHY: dest and Agent App must share one rail chrome. Header,
+        // search match, and Clear All visibility cannot drift per surface.
+        XCTAssertEqual(AgentChatThreadRailCopy.headerTitle(activeCount: 0), "Threads")
+        XCTAssertEqual(AgentChatThreadRailCopy.headerTitle(activeCount: 2), "Threads · 2 active")
+        XCTAssertEqual(AgentChatThreadRailCopy.searchPlaceholder, "Search threads")
+        XCTAssertEqual(AgentChatThreadRailCopy.clearAllTitle, "Clear All")
+        XCTAssertTrue(AgentChatThreadRailCopy.matches(title: "Standup notes", query: "stand"))
+        XCTAssertTrue(AgentChatThreadRailCopy.matches(title: "oi", extra: "grok-4.6", query: "grok"))
+        XCTAssertFalse(AgentChatThreadRailCopy.matches(title: "Standup", query: "auth"))
+        XCTAssertTrue(AgentChatThreadRailCopy.matches(title: "Standup", query: "  "))
+        XCTAssertEqual(AgentChatThreadRailCopy.noMatchText(query: "auth"), "No threads match \"auth\"")
+        XCTAssertTrue(AgentChatThreadRailCopy.showsClearAll(isEmpty: false))
+        XCTAssertFalse(AgentChatThreadRailCopy.showsClearAll(isEmpty: true))
+
+        let chrome = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentChatSharedChrome.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(chrome.contains(".lineLimit(1)"))
+        XCTAssertTrue(chrome.contains(".fixedSize(horizontal: true, vertical: false)"))
+        XCTAssertTrue(chrome.contains("headerControlSpacing"))
+    }
 }

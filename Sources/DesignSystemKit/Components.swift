@@ -290,6 +290,27 @@ public struct DSEmptyState: View {
     }
 }
 
+/// Trailing busy spinner used by Agentic workspace rows and dest dest roster.
+public struct DSBusySpinner: View {
+    public let label: String
+    public var identifier: String?
+
+    public init(label: String, identifier: String? = nil) {
+        self.label = label
+        self.identifier = identifier
+    }
+
+    public var body: some View {
+        ProgressView()
+            .controlSize(.small)
+            .scaleEffect(0.7)
+            .frame(width: 16, height: 16)
+            .help(label)
+            .accessibilityLabel(label)
+            .accessibilityIdentifier(identifier ?? "ds.busy.spinner")
+    }
+}
+
 // MARK: - Resize dividers
 
 public enum DSResizeAxis {

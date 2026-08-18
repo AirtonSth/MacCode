@@ -1081,7 +1081,7 @@ final class PaneActionTests: XCTestCase {
 
         NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
         controller.window.contentView?.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+        RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
 
         let content = try XCTUnwrap(controller.window.contentView)
         let buttons = visibleSubviews(of: content).compactMap { $0 as? NSButton }
@@ -1116,8 +1116,10 @@ final class PaneActionTests: XCTestCase {
 
         NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
         controller.window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
         NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
         controller.window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
 
         let content = try XCTUnwrap(controller.window.contentView)
         let split = try XCTUnwrap(allSubviews(of: content).first { $0 is NSSplitView } as? NSSplitView)

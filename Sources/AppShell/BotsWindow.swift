@@ -502,6 +502,14 @@ public final class BotsViewModel: ObservableObject {
     @Published public var deskSidePaneWidth: CGFloat = BotsChrome.desktopPaneWidth {
         didSet { persistDeskSidePaneWidth() }
     }
+    /// Dest thread rail is collapsible. Same hide/show as Agent App.
+    @Published public var isDeskThreadRailVisible: Bool = true {
+        didSet { persistDeskThreadRail() }
+    }
+    @Published public var deskThreadRailWidth: CGFloat = BotsChrome.threadRailWidth {
+        didSet { persistDeskThreadRailWidth() }
+    }
+    @Published public var deskThreadSearchQuery: String = ""
     /// Detached Desk windows hide the pop-out control so they do not nest.
     public var presentsAsDetachedWindow: Bool = false
     @Published public var studioDraft = BotStudioDraft() {
@@ -702,6 +710,8 @@ public final class BotsViewModel: ObservableObject {
         restoreBrainPaneIfNeeded()
         restoreDeskSidePaneIfNeeded()
         restoreDeskSidePaneWidthIfNeeded()
+        restoreDeskThreadRailIfNeeded()
+        restoreDeskThreadRailWidthIfNeeded()
         restoreSearchTextIfNeeded()
         restoreDeskRoutingIfNeeded()
         restorePeerTurnsIfNeeded()
@@ -1382,6 +1392,9 @@ public final class BotsViewModel: ObservableObject {
 
     public func createDeskThread() {
         guard let bot = selectedBot else { return }
+        if !isDeskThreadRailVisible {
+            isDeskThreadRailVisible = true
+        }
         let conversation = BotConversation(botID: bot.id, title: "New thread")
         do {
             try botStore.upsertConversation(conversation)
@@ -1392,6 +1405,40 @@ public final class BotsViewModel: ObservableObject {
         conversations.removeAll { $0.id == conversation.id }
         conversations.insert(conversation, at: 0)
         selectDeskThread(conversation.id)
+    }
+
+    public var filteredDeskConversations: [BotConversation] {
+        conversations.filter {
+            AgentChatThreadRailCopy.matches(title: $0.title, query: deskThreadSearchQuery)
+        }
+    }
+
+    public var deskThreadActiveCount: Int {
+        conversations.filter { $0.attentionState == .working }.count
+    }
+
+    public func clearAllDeskThreads() {
+        guard let bot = selectedBot else { return }
+        if deskRunIsLive {
+            stopDeskRun()
+        }
+        do {
+            try botStore.deleteConversations(botID: bot.id)
+        } catch {
+            errorMessage = String(describing: error)
+            return
+        }
+        conversations = []
+        selectedConversation = nil
+        selectedConversationByBot[bot.id] = nil
+        lastStartedConversationByBot[bot.id] = nil
+        messagesByBot[bot.id] = []
+        messagesConversationIDByBot[bot.id] = nil
+        deskMessages = []
+        deskThreadSearchQuery = ""
+        rememberStudioSupport(for: bot.id)
+        applyAttentionState(for: bot.id, conversations: [])
+        deskTimelineRejoinToken &+= 1
     }
 
     public func selectDeskThread(_ id: BotConversationID) {
@@ -2948,6 +2995,8 @@ public final class BotsViewModel: ObservableObject {
     private static let studioTabDefaultsKey = "bots.studioTab"
     private static let deskSidePaneDefaultsKey = "bots.deskSidePane"
     private static let deskSidePaneWidthDefaultsKey = "bots.deskSidePaneWidth"
+    private static let deskThreadRailDefaultsKey = "bots.deskThreadRail"
+    private static let deskThreadRailWidthDefaultsKey = "bots.deskThreadRailWidth"
     private static let showHiddenDefaultsKey = "bots.showHidden"
     private static let brainPaneDefaultsKey = "bots.brainPane"
     private static let queuedFollowUpsDefaultsKey = "bots.queuedFollowUps"
@@ -3006,6 +3055,31 @@ public final class BotsViewModel: ObservableObject {
             BotsChrome.desktopPaneMaxWidth,
             max(BotsChrome.desktopPaneMinWidth, CGFloat(stored))
         )
+    }
+
+    private func persistDeskThreadRail() {
+        UserDefaults.standard.set(isDeskThreadRailVisible, forKey: Self.deskThreadRailDefaultsKey)
+    }
+
+    private func restoreDeskThreadRailIfNeeded() {
+        guard UserDefaults.standard.object(forKey: Self.deskThreadRailDefaultsKey) != nil else { return }
+        isDeskThreadRailVisible = UserDefaults.standard.bool(forKey: Self.deskThreadRailDefaultsKey)
+    }
+
+    public func resizeDeskThreadRail(by delta: CGFloat) {
+        let next = BotsChrome.clampedThreadRailWidth(deskThreadRailWidth + delta)
+        guard next != deskThreadRailWidth else { return }
+        deskThreadRailWidth = next
+    }
+
+    private func persistDeskThreadRailWidth() {
+        UserDefaults.standard.set(Double(deskThreadRailWidth), forKey: Self.deskThreadRailWidthDefaultsKey)
+    }
+
+    private func restoreDeskThreadRailWidthIfNeeded() {
+        let stored = UserDefaults.standard.double(forKey: Self.deskThreadRailWidthDefaultsKey)
+        guard stored > 0 else { return }
+        deskThreadRailWidth = BotsChrome.clampedThreadRailWidth(CGFloat(stored))
     }
 
     private func markUnpublishedNewBot(_ id: BotID) {
@@ -5080,6 +5154,12 @@ public struct BotsRosterList: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
+                if BotsChrome.rosterShowsBusySpinner(for: state) {
+                    DSBusySpinner(
+                        label: BotsChrome.statusTitle(for: .working),
+                        identifier: "bots.roster.busy.\(bot.handle)"
+                    )
+                }
                 if bot.pinned {
                     Image(systemName: "pin.fill")
                         .font(.system(size: 9, weight: .semibold))
@@ -5234,6 +5314,7 @@ public struct BotsRootView: View {
     private let embedsRosterRail: Bool
     @State private var showDeskModelOptions = false
     @State private var showDeskSourceOptions = false
+    @State private var pendingClearAllDeskThreads = false
 
     public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
         self.vm = vm
@@ -5799,6 +5880,14 @@ public struct BotsRootView: View {
     /// Desk is chat, so this stays a 44pt chrome strip.
     private func deskHeader(_ bot: BotDefinition) -> some View {
         HStack(spacing: DS.Space.md) {
+            if !vm.isDeskThreadRailVisible {
+                DSIconButton("sidebar.left", help: AgentChatThreadRailCopy.showHelp) {
+                    withAnimation(DS.Motion.standard) {
+                        vm.isDeskThreadRailVisible = true
+                    }
+                }
+                .accessibilityIdentifier("bots.desk.thread.show")
+            }
             Button {
                 vm.openStudio(bot)
             } label: {
@@ -5870,9 +5959,14 @@ public struct BotsRootView: View {
 
     private func deskChat(_ bot: BotDefinition) -> some View {
         HStack(spacing: 0) {
-            deskThreadRail
-                .frame(width: 220)
-            Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
+            if vm.isDeskThreadRailVisible {
+                deskThreadRail
+                    .frame(width: vm.deskThreadRailWidth)
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+                DSResizeDivider(axis: .vertical, help: "Resize threads") { delta in
+                    vm.resizeDeskThreadRail(by: delta)
+                }
+            }
             VStack(spacing: 0) {
                 deskTimeline(bot)
                 if !vm.queuedFollowUps.isEmpty {
@@ -5896,6 +5990,19 @@ public struct BotsRootView: View {
             }
         }
         .animation(DS.Motion.standard, value: vm.isDeskSidePaneVisible)
+        .animation(DS.Motion.standard, value: vm.isDeskThreadRailVisible)
+        .confirmationDialog(
+            "Clear all threads?",
+            isPresented: $pendingClearAllDeskThreads,
+            titleVisibility: .visible
+        ) {
+            Button(AgentChatThreadRailCopy.clearAllTitle, role: .destructive) {
+                vm.clearAllDeskThreads()
+            }
+            Button("Cancel", role: .cancel) { pendingClearAllDeskThreads = false }
+        } message: {
+            Text("Deletes every thread for this teammate. A live run will be stopped first. This cannot be undone.")
+        }
     }
 
     /// One quiet row. A decorative preview told the reader nothing a
@@ -6373,38 +6480,34 @@ public struct BotsRootView: View {
     }
 
     private var deskThreadRail: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            DSSectionHeader(
-                vm.conversations.contains(where: { $0.attentionState == .working })
-                    ? "Threads · active"
-                    : "Threads",
-                trailing: AnyView(
-                    DSIconButton("plus", help: "New thread") {
-                        vm.createDeskThread()
-                    }
-                    .accessibilityIdentifier("bots.desk.thread.new")
-                )
-            )
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            if vm.conversations.isEmpty {
-                DSEmptyState(
-                    icon: "bubble.left.and.bubble.right",
-                    title: "No threads",
-                    subtitle: "Start a conversation or mention this teammate."
-                )
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
-                        ForEach(vm.conversations, id: \.id) { conversation in
-                            deskThreadRow(conversation)
-                        }
-                    }
-                    .padding(DS.Space.sm)
+        AgentChatThreadRail(
+            title: AgentChatThreadRailCopy.headerTitle(activeCount: vm.deskThreadActiveCount),
+            isEmpty: vm.conversations.isEmpty,
+            emptySubtitle: "Start a conversation or mention this teammate.",
+            searchQuery: $vm.deskThreadSearchQuery,
+            hasSearchMatches: !vm.filteredDeskConversations.isEmpty,
+            identifier: "bots.desk.threads",
+            hideIdentifier: "bots.desk.thread.hide",
+            clearAllIdentifier: "bots.desk.thread.clearAll",
+            newIdentifier: "bots.desk.thread.new",
+            searchIdentifier: "bots.desk.thread.search",
+            onHide: {
+                withAnimation(DS.Motion.standard) {
+                    vm.isDeskThreadRailVisible = false
                 }
+            },
+            onClearAll: { pendingClearAllDeskThreads = true },
+            onNew: { vm.createDeskThread() }
+        ) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    ForEach(vm.filteredDeskConversations, id: \.id) { conversation in
+                        deskThreadRow(conversation)
+                    }
+                }
+                .padding(DS.Space.sm)
             }
         }
-        .background(DS.Palette.surface)
-        .accessibilityIdentifier("bots.desk.threads")
     }
 
     private func deskThreadRow(_ conversation: BotConversation) -> some View {

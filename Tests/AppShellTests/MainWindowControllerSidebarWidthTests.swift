@@ -104,4 +104,30 @@ final class MainWindowControllerSidebarWidthTests: XCTestCase {
                        "A non-numeric stored value ('not-a-number') must fall back to defaultSidebarWidth " +
                        "instead of crashing or producing NaN  -  corrupt settings must not break the layout")
     }
+
+    func test_sidebarToggleMotion_matchesOtherChrome_becauseBotsJumpWasASnap() {
+        // WHY: dest dest dest inspector / dest dest dest thread rail slide in 0.22s
+        // ease-out. The shell sidebar used 0.18s + isHidden + layout flush,
+        // so dest dest dest jumped 34pt. The divider must slide to 0 and
+        // min-width must yield during that slide.
+        XCTAssertEqual(ShellSidebarToggleMotion.duration, 0.22, accuracy: 0.001)
+        XCTAssertEqual(
+            ShellSidebarToggleMotion.dividerPosition(collapsed: true, expandedWidth: 272),
+            0
+        )
+        XCTAssertEqual(
+            ShellSidebarToggleMotion.dividerPosition(collapsed: false, expandedWidth: 272),
+            272
+        )
+        XCTAssertEqual(ShellSidebarToggleMotion.minDividerCoordinate(animatingToggle: true), 0)
+        XCTAssertEqual(ShellSidebarToggleMotion.minDividerCoordinate(animatingToggle: false), 180)
+        XCTAssertEqual(
+            ShellSidebarToggleMotion.workspaceContentTopInset(
+                collapsed: false,
+                hidesVisibleHeader: false,
+                headerHeight: 34
+            ),
+            34
+        )
+    }
 }

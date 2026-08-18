@@ -276,3 +276,143 @@ public struct AgentChatWorkingPill: View {
         }
     }
 }
+
+/// Shared thread rail chrome. Agent App and dest mount this so hide,
+/// Clear All, +, and search stay one control.
+public struct AgentChatThreadRail<Content: View>: View {
+    public let title: String
+    public let isEmpty: Bool
+    public let emptySubtitle: String
+    @Binding public var searchQuery: String
+    public let hasSearchMatches: Bool
+    public let onHide: () -> Void
+    public let onClearAll: () -> Void
+    public let onNew: () -> Void
+    public var identifier: String
+    public var hideIdentifier: String
+    public var clearAllIdentifier: String
+    public var newIdentifier: String
+    public var searchIdentifier: String
+    public var newHelp: String = AgentChatThreadRailCopy.newHelp
+    public var showsTrailingHairline: Bool = false
+    public var content: Content
+
+    public init(
+        title: String,
+        isEmpty: Bool,
+        emptySubtitle: String,
+        searchQuery: Binding<String>,
+        hasSearchMatches: Bool,
+        identifier: String,
+        hideIdentifier: String,
+        clearAllIdentifier: String,
+        newIdentifier: String,
+        searchIdentifier: String,
+        newHelp: String = AgentChatThreadRailCopy.newHelp,
+        showsTrailingHairline: Bool = false,
+        onHide: @escaping () -> Void,
+        onClearAll: @escaping () -> Void,
+        onNew: @escaping () -> Void,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        self.isEmpty = isEmpty
+        self.emptySubtitle = emptySubtitle
+        self._searchQuery = searchQuery
+        self.hasSearchMatches = hasSearchMatches
+        self.identifier = identifier
+        self.hideIdentifier = hideIdentifier
+        self.clearAllIdentifier = clearAllIdentifier
+        self.newIdentifier = newIdentifier
+        self.searchIdentifier = searchIdentifier
+        self.newHelp = newHelp
+        self.showsTrailingHairline = showsTrailingHairline
+        self.onHide = onHide
+        self.onClearAll = onClearAll
+        self.onNew = onNew
+        self.content = content()
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            DSSectionHeaderG(title) {
+                HStack(spacing: Self.headerControlSpacing) {
+                    hideButton
+                    if AgentChatThreadRailCopy.showsClearAll(isEmpty: isEmpty) {
+                        Button(AgentChatThreadRailCopy.clearAllTitle, action: onClearAll)
+                            .buttonStyle(.plain)
+                            .font(DS.Font.caption.weight(.medium))
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .accessibilityIdentifier(clearAllIdentifier)
+                            .help(AgentChatThreadRailCopy.clearAllHelp)
+                    }
+                    DSIconButton("plus", help: newHelp, action: onNew)
+                        .accessibilityIdentifier(newIdentifier)
+                }
+                .fixedSize(horizontal: true, vertical: false)
+            }
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            if isEmpty {
+                DSEmptyState(
+                    icon: AgentChatThreadRailCopy.emptyIcon,
+                    title: AgentChatThreadRailCopy.emptyTitle,
+                    subtitle: emptySubtitle
+                )
+            } else {
+                searchBar
+                if hasSearchMatches {
+                    content
+                } else {
+                    Text(AgentChatThreadRailCopy.noMatchText(query: searchQuery))
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .padding(DS.Space.sm)
+                }
+            }
+        }
+        .background(DS.Palette.surface)
+        .accessibilityIdentifier(identifier)
+        .overlay(alignment: .trailing) {
+            if showsTrailingHairline {
+                Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
+            }
+        }
+    }
+
+    /// DSIconButton lays out at 44pt; pack the glyphs like dest dest dest / workspace
+    /// header icons so "Clear All" stays one line.
+    private static var headerControlSpacing: CGFloat {
+        DS.Space.xs - (DSIconButton.hitTargetSize - DSIconButton.visualSize.width)
+    }
+
+    private var hideButton: some View {
+        DSIconButton("sidebar.left", help: AgentChatThreadRailCopy.hideHelp, action: onHide)
+            .accessibilityIdentifier(hideIdentifier)
+    }
+
+    private var searchBar: some View {
+        HStack(spacing: DS.Space.xs) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .regular))
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityHidden(true)
+            TextField(AgentChatThreadRailCopy.searchPlaceholder, text: $searchQuery)
+                .textFieldStyle(.plain)
+                .font(DS.Font.caption)
+                .accessibilityIdentifier(searchIdentifier)
+            if !searchQuery.isEmpty {
+                Button { searchQuery = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(AgentChatThreadRailCopy.clearSearchLabel)
+            }
+        }
+        .padding(.horizontal, DS.Space.md)
+        .padding(.vertical, DS.Space.xs)
+    }
+}

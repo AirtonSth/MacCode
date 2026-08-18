@@ -11727,86 +11727,48 @@ public struct AgentAppView: View {
     // MARK: Thread rail
 
     private var threadRail: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            DSSectionHeader(vm.activeThreadCount > 0 ? "Threads · \(vm.activeThreadCount) active" : "Threads",
-                            trailing: AnyView(
-                HStack(spacing: DS.Space.xs) {
-                    DSIconButton("sidebar.left", help: "Hide threads") {
-                        threadRailIntent = .forcedHidden
-                        showThreadRail = false
-                    }
-                    if !vm.threads.isEmpty {
-                        Button("Clear All") { pendingClearAllThreads = true }
-                            .buttonStyle(.plain)
-                            .font(DS.Font.caption.weight(.medium))
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .accessibilityIdentifier("agent.thread.clearAll")
-                            .help("Delete all threads in this workspace")
-                    }
-                    DSIconButton("plus", help: "New thread (⌘N)") { vm.createThread(title: "New thread") }
-                        .accessibilityIdentifier("agent.thread.new")
-                }
-            ))
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            if vm.threads.isEmpty {
-                DSEmptyState(icon: "bubble.left.and.bubble.right",
-                             title: "No threads",
-                             subtitle: Self.emptyThreadSubtitle)
-            } else {
-                HStack(spacing: DS.Space.xs) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 11, weight: .regular))
-                        .foregroundColor(DS.Palette.textTertiary)
-                    TextField("Search threads", text: $vm.threadSearchQuery)
-                        .textFieldStyle(.plain)
-                        .font(DS.Font.caption)
-                        .accessibilityIdentifier("agent.thread.search")
-                    if !vm.threadSearchQuery.isEmpty {
-                        Button { vm.threadSearchQuery = "" } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 11, weight: .regular))
-                                .foregroundColor(DS.Palette.textTertiary)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Clear search")
-                    }
-                }
-                .padding(.horizontal, DS.Space.md)
-                .padding(.vertical, DS.Space.xs)
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
-                        if vm.filteredThreads.isEmpty {
-                            Text("No threads match \"\(vm.threadSearchQuery)\"")
-                                .font(DS.Font.caption)
-                                .foregroundColor(DS.Palette.textTertiary)
-                                .padding(DS.Space.sm)
-                        } else {
-                            ForEach(vm.filteredThreads, id: \.id) { t in threadRow(t) }
-                        }
-                    }.padding(DS.Space.sm)
-                }
-                .focusable()
-                .onMoveCommand { direction in
-                    let delta: Int
-                    switch direction {
-                    case .up:   delta = -1
-                    case .down: delta = 1
-                    default: return
-                    }
-                    let threads = vm.filteredThreads
-                    let current = threads.firstIndex(where: { $0.id == vm.selectedThreadId })
-                    guard let next = AgentThreadRailKeyboardNav.moveThreadSelection(
-                        current: current,
-                        direction: delta,
-                        count: threads.count
-                    ) else { return }
-                    vm.selectThread(threads[next].id)
-                }
+        AgentChatThreadRail(
+            title: AgentChatThreadRailCopy.headerTitle(activeCount: vm.activeThreadCount),
+            isEmpty: vm.threads.isEmpty,
+            emptySubtitle: Self.emptyThreadSubtitle,
+            searchQuery: $vm.threadSearchQuery,
+            hasSearchMatches: !vm.filteredThreads.isEmpty,
+            identifier: "agent.thread.rail",
+            hideIdentifier: "agent.thread.hide",
+            clearAllIdentifier: "agent.thread.clearAll",
+            newIdentifier: "agent.thread.new",
+            searchIdentifier: "agent.thread.search",
+            newHelp: "New thread (⌘N)",
+            showsTrailingHairline: true,
+            onHide: {
+                threadRailIntent = .forcedHidden
+                showThreadRail = false
+            },
+            onClearAll: { pendingClearAllThreads = true },
+            onNew: { vm.createThread(title: "New thread") }
+        ) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    ForEach(vm.filteredThreads, id: \.id) { t in threadRow(t) }
+                }.padding(DS.Space.sm)
             }
-        }
-        .background(DS.Palette.surface)
-        .overlay(alignment: .trailing) {
-            Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
+            .focusable()
+            .onMoveCommand { direction in
+                let delta: Int
+                switch direction {
+                case .up:   delta = -1
+                case .down: delta = 1
+                default: return
+                }
+                let threads = vm.filteredThreads
+                let current = threads.firstIndex(where: { $0.id == vm.selectedThreadId })
+                guard let next = AgentThreadRailKeyboardNav.moveThreadSelection(
+                    current: current,
+                    direction: delta,
+                    count: threads.count
+                ) else { return }
+                vm.selectThread(threads[next].id)
+            }
         }
     }
 
@@ -12002,7 +11964,7 @@ public struct AgentAppView: View {
     private var header: some View {
         HStack(spacing: DS.Space.sm) {
             if !showThreadRail {
-                DSIconButton("sidebar.left", help: "Show threads") {
+                DSIconButton("sidebar.left", help: AgentChatThreadRailCopy.showHelp) {
                     threadRailIntent = .forcedVisible
                     showThreadRail = true
                 }

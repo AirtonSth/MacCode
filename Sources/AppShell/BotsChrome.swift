@@ -46,6 +46,9 @@ public enum BotsChrome {
 
     public static let hitTarget: CGFloat = 44
     public static let rosterWidth: CGFloat = 272
+    public static let threadRailWidth: CGFloat = 320
+    public static let threadRailMinWidth: CGFloat = 320
+    public static let threadRailMaxWidth: CGFloat = 360
     public static let desktopPaneWidth: CGFloat = 340
     public static let desktopPaneMinWidth: CGFloat = 240
     public static let desktopPaneMaxWidth: CGFloat = 560
@@ -138,6 +141,14 @@ public enum BotsChrome {
         case .unreadActivity: return "Unread"
         case .none: return "Online"
         }
+    }
+
+    public static func rosterShowsBusySpinner(for state: BotAttentionState) -> Bool {
+        state == .working
+    }
+
+    public static func clampedThreadRailWidth(_ width: CGFloat) -> CGFloat {
+        min(threadRailMaxWidth, max(threadRailMinWidth, width))
     }
 }
 
