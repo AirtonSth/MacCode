@@ -277,6 +277,7 @@ public struct DSEmptyState: View {
             Image(systemName: icon)
                 .font(.system(size: 30, weight: .light))
                 .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityHidden(true)
             Text(title).font(DS.Font.title3).foregroundColor(DS.Palette.textSecondary)
             Text(subtitle)
                 .font(DS.Font.bodyDense)
