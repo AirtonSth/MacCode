@@ -8,6 +8,7 @@ public struct BotScheduleTaskItem: Identifiable, Equatable {
     public var name: String
     public var prompt: String
     public var scheduleNote: String
+    public var scheduleSpecJSON: String
     public var isEnabled: Bool
     public var botName: String
     public var botHandle: String
@@ -19,6 +20,7 @@ public struct BotScheduleTaskItem: Identifiable, Equatable {
         self.name = routine.definition.name
         self.prompt = routine.definition.prompt
         self.scheduleNote = routine.definition.scheduleNote
+        self.scheduleSpecJSON = routine.definition.scheduleSpecJSON
         self.isEnabled = routine.activation.isEnabled
         self.botName = bot.name
         self.botHandle = bot.handle
@@ -40,6 +42,7 @@ public struct BotScheduleTaskDraft: Identifiable, Equatable {
     public var name: String
     public var prompt: String
     public var scheduleNote: String
+    public var spec: BotScheduleSpec
     public var isEnabled: Bool
     public var isNew: Bool
 
@@ -49,6 +52,7 @@ public struct BotScheduleTaskDraft: Identifiable, Equatable {
         self.name = ""
         self.prompt = ""
         self.scheduleNote = ""
+        self.spec = BotScheduleSpec()
         self.isEnabled = true
         self.isNew = true
     }
@@ -59,6 +63,9 @@ public struct BotScheduleTaskDraft: Identifiable, Equatable {
         self.name = item.name
         self.prompt = item.prompt
         self.scheduleNote = item.scheduleNote
+        self.spec = item.scheduleSpecJSON.isEmpty
+            ? BotScheduleSpec()
+            : (BotScheduleSpec.decodeJSON(item.scheduleSpecJSON) ?? BotScheduleSpec())
         self.isEnabled = item.isEnabled
         self.isNew = false
     }
@@ -284,6 +291,8 @@ public struct BotScheduleTasksRootView: View {
             BotScheduleTaskEditorView(
                 draft: draft,
                 bots: vm.fleet,
+                providers: vm.providers,
+                providersLoading: false,
                 onBack: { vm.scheduleTaskDraft = nil },
                 onSave: { vm.saveScheduleTask($0) }
             )
@@ -401,17 +410,23 @@ private struct BotScheduleTaskCard: View {
 private struct BotScheduleTaskEditorView: View {
     @State private var draft: BotScheduleTaskDraft
     let bots: [BotDefinition]
+    let providers: [AgentProviderSnapshot]
+    let providersLoading: Bool
     let onBack: () -> Void
     let onSave: (BotScheduleTaskDraft) -> Void
 
     init(
         draft: BotScheduleTaskDraft,
         bots: [BotDefinition],
+        providers: [AgentProviderSnapshot],
+        providersLoading: Bool,
         onBack: @escaping () -> Void,
         onSave: @escaping (BotScheduleTaskDraft) -> Void
     ) {
         self._draft = State(initialValue: draft)
         self.bots = bots
+        self.providers = providers
+        self.providersLoading = providersLoading
         self.onBack = onBack
         self.onSave = onSave
     }
@@ -458,17 +473,17 @@ private struct BotScheduleTaskEditorView: View {
                             .textFieldStyle(.plain)
                             .accessibilityIdentifier("bots.scheduleTasks.editor.name")
                     }
-                    labeled("When") {
-                        TextField("Weekdays 9:00", text: $draft.scheduleNote)
-                            .textFieldStyle(.plain)
-                            .accessibilityIdentifier("bots.scheduleTasks.editor.when")
-                    }
                     labeled("Instruction") {
                         TextEditor(text: $draft.prompt)
                             .font(DS.Font.body)
                             .frame(minHeight: 140)
                             .accessibilityIdentifier("bots.scheduleTasks.editor.instruction")
                     }
+                    BotScheduleSpecEditor(
+                        spec: $draft.spec,
+                        providers: providers,
+                        providersLoading: providersLoading
+                    )
                     Toggle("Active", isOn: $draft.isEnabled)
                         .accessibilityIdentifier("bots.scheduleTasks.editor.active")
                     Text(BotRoutineCopy.testRunHonestyCaption)
@@ -477,7 +492,7 @@ private struct BotScheduleTaskEditorView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(DS.Space.xxl)
-                .frame(maxWidth: 720, alignment: .leading)
+                .frame(maxWidth: 920, alignment: .leading)
             }
         }
     }
@@ -499,4 +514,233 @@ private struct BotScheduleTaskEditorView: View {
                 )
         }
     }
+}
+
+/// Same Frequency + Provider / Model (Auto) / Reasoning rows as Agent App Schedule Tasks.
+struct BotScheduleSpecEditor: View {
+    @Binding var spec: BotScheduleSpec
+    let providers: [AgentProviderSnapshot]
+    let providersLoading: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xxl) {
+            editorGroup("Details") {
+                formRow("Provider") {
+                    Picker("Provider", selection: $spec.provider) {
+                        ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
+                    }
+                    .labelsHidden()
+                    .onChange(of: spec.provider) { _, provider in
+                        if let snapshot = snapshots(for: provider).first {
+                            spec.providerInstanceID = snapshot.id
+                            spec.model = snapshot.models.first?.id ?? ""
+                            spec.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .medium
+                        } else {
+                            spec.providerInstanceID = provider.rawValue
+                        }
+                    }
+                    .accessibilityIdentifier("bots.scheduleTasks.editor.provider")
+                }
+                formRow("Model routing") {
+                    HStack(spacing: DS.Space.sm) {
+                        if providersLoading {
+                            ProgressView()
+                                .controlSize(.small)
+                                .accessibilityLabel("Loading providers")
+                        }
+                        Toggle("Auto", isOn: Binding(
+                            get: { spec.routingMode == .auto },
+                            set: { spec.routingMode = $0 ? .auto : .manual }
+                        ))
+                        .toggleStyle(.switch)
+                        .tint(DS.Palette.success)
+                        .accessibilityIdentifier("bots.scheduleTasks.editor.autoRouting")
+                    }
+                }
+                if spec.routingMode == .auto {
+                    formRow("Model") {
+                        Text("Auto selects the best model for the selected provider at run time.")
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .multilineTextAlignment(.trailing)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    formRow("Model") {
+                        Picker("Model", selection: $spec.model) {
+                            ForEach(models, id: \.id) {
+                                Text($0.label).tag($0.id)
+                            }
+                            if !spec.model.isEmpty,
+                               !models.contains(where: { $0.id == spec.model }) {
+                                Text(spec.model).tag(spec.model)
+                            }
+                        }
+                        .labelsHidden()
+                        .accessibilityIdentifier("bots.scheduleTasks.editor.model")
+                    }
+                    formRow("Reasoning") {
+                        Picker("Reasoning", selection: $spec.reasoningEffort) {
+                            ForEach(AgentReasoningEffort.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                        }
+                        .labelsHidden()
+                        .accessibilityIdentifier("bots.scheduleTasks.editor.reasoning")
+                    }
+                }
+            }
+
+            editorGroup("Frequency") {
+                formRow("Repeat") {
+                    Picker("Frequency", selection: $spec.frequency) {
+                        ForEach(ScheduledTaskFrequency.allCases) { Text($0.displayName).tag($0) }
+                    }
+                    .labelsHidden()
+                    .accessibilityIdentifier("bots.scheduleTasks.editor.frequency")
+                }
+                scheduleControls
+                formRow("Time zone") {
+                    Picker("Time zone", selection: $spec.timeZoneIdentifier) {
+                        ForEach(Self.commonTimeZones, id: \.self) {
+                            Text($0.replacingOccurrences(of: "_", with: " ")).tag($0)
+                        }
+                        if !Self.commonTimeZones.contains(spec.timeZoneIdentifier) {
+                            Text(spec.timeZoneIdentifier).tag(spec.timeZoneIdentifier)
+                        }
+                    }
+                    .labelsHidden()
+                    .accessibilityIdentifier("bots.scheduleTasks.editor.timeZone")
+                }
+            }
+        }
+        .accessibilityIdentifier("bots.scheduleTasks.editor.spec")
+    }
+
+    private var models: [AgentModelDescriptor] {
+        providers.first { $0.provider == spec.provider && $0.id == spec.providerInstanceID }?.models
+            ?? snapshots(for: spec.provider).first?.models
+            ?? []
+    }
+
+    private func snapshots(for provider: AgentProvider) -> [AgentProviderSnapshot] {
+        providers.filter { $0.provider == provider }
+    }
+
+    @ViewBuilder
+    private var scheduleControls: some View {
+        switch spec.frequency {
+        case .once:
+            formRow("At") {
+                DatePicker("Run at", selection: $spec.scheduledDate)
+                    .labelsHidden()
+                    .datePickerStyle(.compact)
+            }
+        case .hourly:
+            formRow("Interval") {
+                Stepper("Every \(spec.intervalHours)h", value: $spec.intervalHours, in: 1...24)
+                    .foregroundColor(DS.Palette.text)
+            }
+        case .daily, .weekdays:
+            formRow("At") {
+                DatePicker("Local time", selection: Binding(
+                    get: { spec.localTime },
+                    set: { spec.localTime = $0 }
+                ), displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+            }
+        case .weekly:
+            formRow("At") {
+                DatePicker("Local time", selection: Binding(
+                    get: { spec.localTime },
+                    set: { spec.localTime = $0 }
+                ), displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+            }
+            formRow("Days") {
+                HStack(spacing: DS.Space.xs) {
+                    ForEach(ScheduledWeekday.allCases, id: \.self) { day in
+                        Toggle(dayLabel(day), isOn: Binding(
+                            get: { spec.weekdaySet.contains(day) },
+                            set: { enabled in
+                                var days = spec.weekdaySet
+                                if enabled { days.insert(day) } else { days.remove(day) }
+                                spec.weekdaySet = days
+                            }
+                        ))
+                        .toggleStyle(.button)
+                        .font(DS.Font.caption.weight(.semibold))
+                    }
+                }
+            }
+        case .monthly:
+            formRow("Day") {
+                Stepper("Day \(spec.monthlyDay)", value: $spec.monthlyDay, in: 1...28)
+                    .foregroundColor(DS.Palette.text)
+            }
+            formRow("At") {
+                DatePicker("Local time", selection: Binding(
+                    get: { spec.localTime },
+                    set: { spec.localTime = $0 }
+                ), displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+            }
+        }
+    }
+
+    private func editorGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title)
+                .font(DS.Font.caption.weight(.semibold))
+                .foregroundColor(DS.Palette.textSecondary)
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.vertical, DS.Space.md)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
+        .accessibilityIdentifier("bots.scheduleTasks.editorSection.\(title)")
+    }
+
+    private func formRow<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(spacing: 0) {
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            HStack {
+                Text(label)
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                Spacer(minLength: DS.Space.lg)
+                content()
+                    .frame(minWidth: 160, alignment: .trailing)
+            }
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.vertical, DS.Space.md)
+        }
+    }
+
+    private func dayLabel(_ day: ScheduledWeekday) -> String {
+        switch day {
+        case .sunday: return "S"
+        case .monday: return "M"
+        case .tuesday: return "T"
+        case .wednesday: return "W"
+        case .thursday: return "T"
+        case .friday: return "F"
+        case .saturday: return "S"
+        }
+    }
+
+    private static let commonTimeZones: [String] = [
+        TimeZone.current.identifier,
+        "UTC",
+        "America/New_York",
+        "America/Los_Angeles",
+        "America/Sao_Paulo",
+        "Europe/London",
+        "Europe/Berlin",
+        "Asia/Tokyo",
+    ]
 }

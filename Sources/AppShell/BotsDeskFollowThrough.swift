@@ -230,6 +230,7 @@ enum BotsDeskFollowThrough {
         userText: String,
         memory: [BotMemoryItem] = [],
         skills: [BotSkillBinding] = [],
+        ownedSkills: [BotOwnedSkillText] = [],
         routines: [BotRoutine] = [],
         workspace: BotWorkspaceHonesty? = nil,
         browser: BotBrowserTarget? = nil
@@ -240,6 +241,7 @@ enum BotsDeskFollowThrough {
             userText: userText,
             memory: memory,
             skills: skills,
+            ownedSkills: ownedSkills,
             routines: routines,
             workspace: workspace,
             browser: browser

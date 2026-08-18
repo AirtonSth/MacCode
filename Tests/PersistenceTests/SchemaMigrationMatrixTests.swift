@@ -460,9 +460,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             72,
             73,
             74,
-            75
+            75,
+            76
         ])
-        XCTAssertEqual(Schema.currentVersion, 75)
+        XCTAssertEqual(Schema.currentVersion, 76)
         XCTAssertFalse(
             Schema.steps.contains { (63...66).contains($0.version) },
             "schema versions 63-66 are retired and must never be reused"
@@ -489,7 +490,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
 
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(Schema.currentVersion, 75)
+        XCTAssertEqual(Schema.currentVersion, 76)
 
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 0,
                        "v72 must not backfill historical winners")
@@ -570,10 +571,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.steps.filter { $0.version == 71 }.count, 1,
             "HEAD/origin production last published step is 71"
         )
-        XCTAssertEqual(Schema.currentVersion, 75)
+        XCTAssertEqual(Schema.currentVersion, 76)
         XCTAssertEqual(
-            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75],
-            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts"
+            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76],
+            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec"
         )
         let v72 = try XCTUnwrap(Schema.steps.first { $0.version == 72 })
         XCTAssertTrue(v72.sql.contains("CHECK(format IN ('human', 'rcw1', 'rcs1'))"))

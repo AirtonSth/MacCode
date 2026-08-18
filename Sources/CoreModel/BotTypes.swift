@@ -693,6 +693,7 @@ public struct BotRoutineDefinition: Codable, Sendable, Equatable {
     public var name: String
     public var prompt: String
     public var scheduleNote: String
+    public var scheduleSpecJSON: String
     public var createdAt: Date
     public var updatedAt: Date
 
@@ -702,6 +703,7 @@ public struct BotRoutineDefinition: Codable, Sendable, Equatable {
         name: String,
         prompt: String,
         scheduleNote: String = "",
+        scheduleSpecJSON: String = "",
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -710,8 +712,13 @@ public struct BotRoutineDefinition: Codable, Sendable, Equatable {
         self.name = name
         self.prompt = prompt
         self.scheduleNote = scheduleNote
+        self.scheduleSpecJSON = scheduleSpecJSON
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    public var scheduleSpec: BotScheduleSpec? {
+        BotScheduleSpec.decodeJSON(scheduleSpecJSON)
     }
 }
 

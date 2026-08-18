@@ -321,11 +321,19 @@ public enum BotsScreen: String, Equatable {
 }
 
 public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
+    /// Compile inspector. Not user-facing — leftover persist remaps to Memory.
     case brain
     case memory
     case routines
 
     public var id: String { rawValue }
+
+    public var isUserFacing: Bool {
+        switch self {
+        case .brain: return false
+        case .memory, .routines: return true
+        }
+    }
 
     public var title: String {
         switch self {
@@ -346,9 +354,11 @@ public enum BotDeskInspectorTab: String, CaseIterable, Identifiable {
 
 public enum BotStudioTab: String, CaseIterable, Identifiable {
     case profile
+    /// Compile inspector. Not user-facing — leftover persist remaps to Profile.
     case brain
     case memory
     case skills
+    case files
     case routines
     /// Security also hosts the read-only Desktop honesty card — both were
     /// tiny read-only panels, so one tab keeps the strip simple.
@@ -356,12 +366,20 @@ public enum BotStudioTab: String, CaseIterable, Identifiable {
 
     public var id: String { rawValue }
 
+    public var isUserFacing: Bool {
+        switch self {
+        case .brain: return false
+        case .profile, .memory, .skills, .files, .routines, .security: return true
+        }
+    }
+
     public var title: String {
         switch self {
         case .profile: return "Profile"
         case .brain: return BotsChrome.Label.brain
         case .memory: return BotsChrome.Label.memory
         case .skills: return BotsChrome.Label.skills
+        case .files: return BotsChrome.Label.files
         case .routines: return BotsChrome.Label.routines
         case .security: return BotsChrome.Label.security
         }
@@ -373,6 +391,7 @@ public enum BotStudioTab: String, CaseIterable, Identifiable {
         case .brain: return "bots.studio.tab.brain"
         case .memory: return "bots.studio.tab.memory"
         case .skills: return "bots.studio.tab.skills"
+        case .files: return "bots.studio.tab.files"
         case .routines: return "bots.studio.tab.routines"
         case .security: return "bots.studio.tab.security"
         }
@@ -384,6 +403,7 @@ public enum BotStudioTab: String, CaseIterable, Identifiable {
         case .brain: return "brain.head.profile"
         case .memory: return "archivebox"
         case .skills: return "puzzlepiece.extension"
+        case .files: return "folder"
         case .routines: return "clock.arrow.2.circlepath"
         case .security: return "lock.shield"
         }
@@ -564,6 +584,11 @@ public final class BotsViewModel: ObservableObject {
     @Published public var skillDraft: String = "" {
         didSet { persistInspectorIfHydrated() }
     }
+    @Published public private(set) var homeFiles: [String] = []
+    @Published public var selectedHomePath: String?
+    @Published public var homeDraft: String = ""
+    @Published public private(set) var homeOriginal: String = ""
+    @Published public var thisBotSkillDraft: String = ""
     @Published public var routineName: String = "" {
         didSet { persistInspectorIfHydrated() }
     }
@@ -573,6 +598,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public var routineScheduleNote: String = "" {
         didSet { persistInspectorIfHydrated() }
     }
+    @Published public var routineSpec = BotScheduleSpec()
     @Published public var errorMessage: String?
     @Published public private(set) var providers: [AgentProviderSnapshot] = []
     @Published public private(set) var isControlPlaneActive = true
@@ -789,12 +815,15 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         do {
+            let spec = draft.spec
+            _ = try spec.makeRecurrence()
             let definition = BotRoutineDefinition(
                 id: draft.id,
                 botID: draft.botID,
                 name: name,
                 prompt: prompt,
-                scheduleNote: draft.scheduleNote
+                scheduleNote: spec.displayNote(),
+                scheduleSpecJSON: spec.encodedJSON()
             )
             try botStore.saveRoutine(definition)
             try botStore.setRoutineEnabled(id: definition.id, enabled: draft.isEnabled)
@@ -1098,6 +1127,7 @@ public final class BotsViewModel: ObservableObject {
         loadStudioDraft(fresh)
         studioTab = .profile
         screen = .studio
+        ensureBotHome(fresh, revision: selectedRevision)
         persistSelection()
         leaveDeskLiveWatch()
         reloadStudioSupport(id: fresh.id)
@@ -1342,6 +1372,7 @@ public final class BotsViewModel: ObservableObject {
         // Dest first. Create used to reloadFleet (every teammate's
         // conversations + recent messages) before Chat could paint.
         adoptCreatedBot(bot)
+        ensureBotHome(bot)
         return bot
     }
 
@@ -1400,6 +1431,7 @@ public final class BotsViewModel: ObservableObject {
             saved.currentRevisionID = published.id
             saved.updatedAt = Date()
             adoptPublishedRevision(published, bot: saved)
+            syncPublishedHome(saved, revision: published)
             screen = .studio
             return saved
         }
@@ -1864,6 +1896,136 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    public func botHome(for bot: BotDefinition) -> BotHome {
+        BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot)
+    }
+
+    public func ensureBotHome(_ bot: BotDefinition, revision: BotRevision? = nil) {
+        let home = botHome(for: bot)
+        let publishedSoul = bot.currentRevisionID.flatMap { try? botStore.getRevision(id: $0) }?.soul
+        let soul = revision?.soul ?? publishedSoul ?? studioDraft.soul
+        let description = revision?.description ?? bot.description
+        try? home.ensure(
+            name: bot.name,
+            handle: bot.handle,
+            title: revision?.title ?? bot.title,
+            description: description,
+            soul: soul
+        )
+        try? home.writeIdentity(name: bot.name, handle: bot.handle, title: revision?.title ?? bot.title)
+        projectMemory(bot)
+        refreshHomeFiles(for: bot)
+    }
+
+    public func syncPublishedHome(_ bot: BotDefinition, revision: BotRevision) {
+        let home = botHome(for: bot)
+        try? home.ensure(
+            name: revision.name,
+            handle: bot.handle,
+            title: revision.title,
+            description: revision.description,
+            soul: revision.soul
+        )
+        try? home.writeIdentity(name: revision.name, handle: bot.handle, title: revision.title)
+        try? home.writeDescription(revision.description)
+        try? home.writeSoul(revision.soul)
+        projectMemory(bot)
+        refreshHomeFiles(for: bot)
+    }
+
+    public func projectMemory(_ bot: BotDefinition) {
+        let facts = memoryItems
+            .filter { $0.botID == bot.id && $0.forgottenAt == nil && $0.trusted }
+            .map(\.content)
+        try? botHome(for: bot).writeMemoryProjection(facts: facts)
+    }
+
+    public func ownedSkillTexts(for bot: BotDefinition) -> [BotOwnedSkillText] {
+        ((try? botHome(for: bot).listOwnedSkills()) ?? []).map {
+            BotOwnedSkillText(slug: $0.slug, body: $0.body)
+        }
+    }
+
+    public func refreshHomeFiles(for bot: BotDefinition? = nil) {
+        guard let bot = bot ?? selectedBot else {
+            homeFiles = []
+            return
+        }
+        homeFiles = (try? botHome(for: bot).listRelativePaths()) ?? []
+        if let path = selectedHomePath, !homeFiles.contains(path) {
+            selectedHomePath = homeFiles.first
+            if let selectedHomePath {
+                openHomeFile(selectedHomePath)
+            } else {
+                homeDraft = ""
+                homeOriginal = ""
+            }
+        }
+    }
+
+    public func openHomeFile(_ relativePath: String) {
+        guard let bot = selectedBot else { return }
+        do {
+            let text = try botHome(for: bot).readFile(relativePath: relativePath)
+            selectedHomePath = relativePath
+            homeDraft = text
+            homeOriginal = text
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public func discardHomeFile() {
+        homeDraft = homeOriginal
+    }
+
+    public func saveHomeFile() {
+        guard let bot = selectedBot, let path = selectedHomePath else { return }
+        do {
+            let home = botHome(for: bot)
+            switch path {
+            case BotHome.identityName:
+                try home.writeIdentity(name: bot.name, handle: bot.handle, title: selectedRevision?.title ?? bot.title)
+                homeDraft = try home.readIdentity()
+                homeOriginal = homeDraft
+            case BotHome.soulName:
+                studioDraft.soul = homeDraft
+                _ = try saveStudio()
+                homeDraft = try home.readSoul()
+                homeOriginal = homeDraft
+            case BotHome.descriptionName:
+                studioDraft.description = homeDraft
+                _ = try saveStudio()
+                homeDraft = try home.readDescription()
+                homeOriginal = homeDraft
+            case BotHome.memoryName:
+                projectMemory(bot)
+                homeDraft = try home.readFile(relativePath: path)
+                homeOriginal = homeDraft
+            default:
+                try home.writeFile(relativePath: path, contents: homeDraft)
+                homeOriginal = homeDraft
+            }
+            refreshHomeFiles(for: bot)
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public func createThisBotSkill() {
+        guard let bot = selectedBot else { return }
+        do {
+            ensureBotHome(bot, revision: selectedRevision)
+            let path = try botHome(for: bot).createOwnedSkill(slug: thisBotSkillDraft)
+            thisBotSkillDraft = ""
+            refreshHomeFiles(for: bot)
+            openHomeFile(path)
+            studioTab = .files
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
     public func removeSkill(skillID: String) {
         guard let bot = selectedBot else { return }
         do {
@@ -1954,6 +2116,7 @@ public final class BotsViewModel: ObservableObject {
             }.joined(separator: ","),
             advertisedWorkspace?.placeLabel ?? "",
             advertisedBrowser.map { "\($0.title)\u{1d}\($0.url)" } ?? "",
+            ownedSkillTexts(for: bot).map { "\($0.slug):\($0.body)" }.joined(separator: ","),
             selectedConversation?.id.value.uuidString ?? "",
             bot.notificationsEnabled ? "n1" : "n0",
         ].joined(separator: "\u{1f}")
@@ -1967,6 +2130,7 @@ public final class BotsViewModel: ObservableObject {
             userText: request,
             memory: memory,
             skills: skillBindings,
+            ownedSkills: ownedSkillTexts(for: bot),
             routines: routines,
             workspace: advertisedWorkspace,
             browser: advertisedBrowser,
@@ -2007,6 +2171,7 @@ public final class BotsViewModel: ObservableObject {
             )
             memoryDraft = ""
             adoptWrittenMemory(item)
+            projectMemory(bot)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -2021,6 +2186,7 @@ public final class BotsViewModel: ObservableObject {
             // returned the revised row. Insert it locally.
             let item = try botStore.correctMemory(id: id, content: trimmed)
             adoptWrittenMemory(item)
+            if let bot = selectedBot { projectMemory(bot) }
         } catch {
             errorMessage = String(describing: error)
         }
@@ -2033,6 +2199,7 @@ public final class BotsViewModel: ObservableObject {
             // marked the row forgotten. Drop it locally.
             try botStore.forgetMemory(id: id)
             dropForgottenMemory(id)
+            if let bot = selectedBot { projectMemory(bot) }
         } catch {
             errorMessage = String(describing: error)
         }
@@ -2049,11 +2216,16 @@ public final class BotsViewModel: ObservableObject {
         do {
             // Dest first. Save used to listRoutines after the store
             // wrote this schedule. The definition is already the row.
+            _ = try routineSpec.makeRecurrence()
+            if routineScheduleNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                routineScheduleNote = routineSpec.displayNote()
+            }
             let definition = BotRoutineDefinition(
                 botID: bot.id,
                 name: name,
                 prompt: prompt,
-                scheduleNote: routineScheduleNote
+                scheduleNote: routineScheduleNote,
+                scheduleSpecJSON: routineSpec.encodedJSON()
             )
             try botStore.saveRoutine(definition)
             routineName = ""
@@ -2098,6 +2270,13 @@ public final class BotsViewModel: ObservableObject {
             try botStore.requestRoutineTestRun(id: id)
             adoptTestRunRequested(id: id)
             if let botID, let bot = bots.first(where: { $0.id == botID }) {
+                if let spec = routine?.definition.scheduleSpec {
+                    deskRouting.provider = spec.provider
+                    deskRouting.providerInstanceID = spec.providerInstanceID
+                    deskRouting.model = spec.model
+                    deskRouting.routingMode = spec.routingMode
+                    deskRouting.reasoningEffort = spec.reasoningEffort
+                }
                 openDesk(bot)
             }
             _ = send(instruction)
@@ -2492,7 +2671,8 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func persistInspectorTab() {
-        UserDefaults.standard.set(inspectorTab.rawValue, forKey: Self.inspectorTabDefaultsKey)
+        let tab = inspectorTab.isUserFacing ? inspectorTab : .memory
+        UserDefaults.standard.set(tab.rawValue, forKey: Self.inspectorTabDefaultsKey)
     }
 
     private func persistScreen() {
@@ -2500,7 +2680,8 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func persistStudioTab() {
-        UserDefaults.standard.set(studioTab.rawValue, forKey: Self.studioTabDefaultsKey)
+        let tab = studioTab.isUserFacing ? studioTab : .profile
+        UserDefaults.standard.set(tab.rawValue, forKey: Self.studioTabDefaultsKey)
     }
 
     private func persistDeskSidePane() {
@@ -3199,7 +3380,8 @@ public final class BotsViewModel: ObservableObject {
     private func restoreInspectorTabIfNeeded() {
         guard let raw = UserDefaults.standard.string(forKey: Self.inspectorTabDefaultsKey),
               let tab = BotDeskInspectorTab(rawValue: raw) else { return }
-        inspectorTab = tab
+        // Brain left the inspector strip; leftover persists follow Memory.
+        inspectorTab = tab.isUserFacing ? tab : .memory
     }
 
     private func restoreStudioTabIfNeeded() {
@@ -3209,8 +3391,13 @@ public final class BotsViewModel: ObservableObject {
             studioTab = .security
             return
         }
+        // Brain left the Studio strip; leftover persists follow Profile.
+        if raw == "brain" {
+            studioTab = .profile
+            return
+        }
         guard let tab = BotStudioTab(rawValue: raw) else { return }
-        studioTab = tab
+        studioTab = tab.isUserFacing ? tab : .profile
     }
 
     private func restoreScreenIfNeeded() {
@@ -3882,6 +4069,7 @@ public final class BotsViewModel: ObservableObject {
                 userText: userText,
                 memory: memory,
                 skills: skills,
+                ownedSkills: ownedSkillTexts(for: bot),
                 routines: routines,
                 workspace: nil,
                 browser: advertisedBrowser,
@@ -4609,15 +4797,17 @@ public struct BotsRootView: View {
             studioHeader
             studioTabs
             Group {
-                switch vm.studioTab {
+                switch resolvedStudioTab {
                 case .profile:
                     studioPage { studioProfile }
                 case .brain:
-                    studioPage { studioBrain }
+                    studioPage { studioProfile }
                 case .memory:
                     studioPage { memoryTab }
                 case .skills:
                     studioPage { skillsTab }
+                case .files:
+                    studioPage { filesTab }
                 case .routines:
                     studioPage { routinesTab }
                 case .security:
@@ -4735,11 +4925,11 @@ public struct BotsRootView: View {
 
     private var studioTabs: some View {
         HStack(spacing: DS.Space.sm) {
-            ForEach(BotStudioTab.allCases) { tab in
+            ForEach(BotStudioTab.allCases.filter(\.isUserFacing)) { tab in
                 if tab == .memory && !vm.isMemoryActive {
                     EmptyView()
                 } else {
-                    let selected = vm.studioTab == tab
+                    let selected = resolvedStudioTab == tab
                     Button {
                         vm.studioTab = tab
                     } label: {
@@ -4817,9 +5007,10 @@ public struct BotsRootView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            labeledField("Description") {
+            labeledField(BotsChrome.Label.description, caption: BotsChrome.Label.descriptionCaption) {
                 studioMultiline(text: $vm.studioDraft.description, minHeight: 60)
                     .accessibilityIdentifier("bots.studio.description")
+                    .accessibilityHint(BotsChrome.Label.descriptionCaption)
                     .onChange(of: vm.studioDraft.description) { _ in
                         vm.refreshGeneratedStandingInstructions()
                     }
@@ -4851,10 +5042,11 @@ public struct BotsRootView: View {
         VStack(alignment: .leading, spacing: DS.Space.xl) {
             studioSectionHeader(
                 BotsChrome.Label.instructions,
-                caption: "Empty uses the built-in teammate default. Write your own to replace it. Published with the Bot."
+                caption: BotsChrome.Label.instructionsCaption
             )
             studioMultiline(text: $vm.studioDraft.soul, minHeight: 140)
                 .accessibilityLabel(BotsChrome.Label.instructions)
+                .accessibilityHint(BotsChrome.Label.instructionsCaption)
         }
         .accessibilityIdentifier("bots.studio.soul")
     }
@@ -5133,7 +5325,7 @@ public struct BotsRootView: View {
     private func deskInspector(_ bot: BotDefinition) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: DS.Space.sm) {
-                ForEach(BotDeskInspectorTab.allCases) { tab in
+                ForEach(BotDeskInspectorTab.allCases.filter(\.isUserFacing)) { tab in
                     if tab == .memory && !vm.isMemoryActive {
                         EmptyView()
                     } else {
@@ -5177,9 +5369,13 @@ public struct BotsRootView: View {
         .accessibilityIdentifier("bots.desk.inspector")
     }
 
+    private var resolvedStudioTab: BotStudioTab {
+        vm.studioTab.isUserFacing ? vm.studioTab : .profile
+    }
+
     private var resolvedInspectorTab: BotDeskInspectorTab {
-        if vm.inspectorTab == .memory && !vm.isMemoryActive {
-            return .brain
+        if !vm.inspectorTab.isUserFacing || (vm.inspectorTab == .memory && !vm.isMemoryActive) {
+            return vm.isMemoryActive ? .memory : .routines
         }
         return vm.inspectorTab
     }
@@ -5420,10 +5616,12 @@ public struct BotsRootView: View {
                     studioMultiline(text: $vm.routinePrompt, minHeight: 56, maxHeight: 96)
                         .accessibilityIdentifier("bots.routines.instruction")
                 }
-                labeledField("When") {
-                    studioField(placeholder: "Weekdays 9:00", text: $vm.routineScheduleNote)
-                        .accessibilityIdentifier("bots.routines.when")
-                }
+                BotScheduleSpecEditor(
+                    spec: $vm.routineSpec,
+                    providers: vm.providers,
+                    providersLoading: false
+                )
+                .accessibilityIdentifier("bots.routines.when")
                 Button("Save task") { vm.saveRoutine() }
                     .buttonStyle(BotsPrimaryButtonStyle())
                     .accessibilityIdentifier("bots.routines.save")
@@ -5983,8 +6181,11 @@ public struct BotsRootView: View {
         VStack(alignment: .leading, spacing: DS.Space.xxl) {
             studioSectionHeader(
                 BotsChrome.Label.skills,
-                caption: "Catalog ids only. A skill id is not a filesystem path."
+                caption: "Installed skills are bound, not edited. This bot’s skills are files."
             )
+            Text("Installed")
+                .font(DS.Font.bodyStrong)
+                .foregroundColor(DS.Palette.text)
             HStack(alignment: .center, spacing: DS.Space.md) {
                 studioField(placeholder: "weekly-account-health", text: $vm.skillDraft)
                     .frame(maxWidth: 420)
@@ -6033,8 +6234,111 @@ public struct BotsRootView: View {
                     }
                 }
             }
+            studioRule
+            Text("This bot")
+                .font(DS.Font.bodyStrong)
+                .foregroundColor(DS.Palette.text)
+            HStack(alignment: .center, spacing: DS.Space.md) {
+                studioField(placeholder: "weekly-invoice", text: $vm.thisBotSkillDraft)
+                    .frame(maxWidth: 420)
+                    .accessibilityLabel("This bot skill id")
+                    .accessibilityIdentifier("bots.studio.skills.owned.field")
+                Button("New skill") { vm.createThisBotSkill() }
+                    .buttonStyle(BotsPrimaryButtonStyle())
+                    .disabled(vm.thisBotSkillDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.selectedBot == nil)
+                    .accessibilityIdentifier("bots.studio.skills.owned.add")
+            }
+            let owned = vm.selectedBot.map { vm.ownedSkillTexts(for: $0) } ?? []
+            if owned.isEmpty {
+                Text("No files yet. New skill writes skills/<id>/SKILL.md.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            } else {
+                ForEach(owned, id: \.slug) { skill in
+                    Button {
+                        vm.openHomeFile("skills/\(skill.slug)/SKILL.md")
+                        vm.studioTab = .files
+                    } label: {
+                        HStack {
+                            Text(skill.slug)
+                                .font(DS.Font.mono)
+                                .foregroundColor(DS.Palette.text)
+                            Spacer()
+                            Text("Open")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.textSecondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("bots.studio.skills.owned.\(skill.slug)")
+                }
+            }
         }
         .accessibilityIdentifier("bots.studio.skills")
+    }
+
+    private var filesTab: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xxl) {
+            studioSectionHeader(
+                BotsChrome.Label.files,
+                caption: "This teammate’s exclusive folder. SOUL.md and Description publish like Save Bot. Identity and memory.md are projections."
+            )
+            HStack(alignment: .top, spacing: DS.Space.xl) {
+                VStack(alignment: .leading, spacing: DS.Space.sm) {
+                    ForEach(vm.homeFiles, id: \.self) { path in
+                        Button {
+                            vm.openHomeFile(path)
+                        } label: {
+                            Text(path)
+                                .font(DS.Font.caption.monospaced())
+                                .foregroundColor(vm.selectedHomePath == path ? DS.Palette.onAccent : DS.Palette.text)
+                                .padding(.horizontal, DS.Space.md)
+                                .padding(.vertical, DS.Space.sm)
+                                .background(vm.selectedHomePath == path ? DS.Palette.accent : Color.clear)
+                                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("bots.studio.files.row.\(path)")
+                    }
+                }
+                .frame(minWidth: 200, alignment: .leading)
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    if let path = vm.selectedHomePath {
+                        Text(path)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                        studioMultiline(text: $vm.homeDraft, minHeight: 240)
+                            .accessibilityLabel("Bot file")
+                            .accessibilityIdentifier("bots.studio.files.editor")
+                        HStack {
+                            Spacer()
+                            Button("Discard") { vm.discardHomeFile() }
+                                .buttonStyle(DSSecondaryButtonStyle())
+                                .disabled(vm.homeDraft == vm.homeOriginal)
+                                .accessibilityIdentifier("bots.studio.files.discard")
+                            Button("Save") { vm.saveHomeFile() }
+                                .buttonStyle(BotsPrimaryButtonStyle())
+                                .disabled(vm.homeDraft == vm.homeOriginal)
+                                .accessibilityIdentifier("bots.studio.files.save")
+                        }
+                    } else {
+                        Text("Select a file in this bot’s home.")
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .accessibilityIdentifier("bots.studio.files")
+        .onAppear {
+            if let bot = vm.selectedBot {
+                vm.ensureBotHome(bot, revision: vm.selectedRevision)
+                if vm.selectedHomePath == nil, let first = vm.homeFiles.first {
+                    vm.openHomeFile(first)
+                }
+            }
+        }
     }
 
     /// Studio lists facts as open rows between hairline rules; the Desk
@@ -6115,22 +6419,20 @@ public struct BotsRootView: View {
                     .foregroundColor(DS.Palette.textTertiary)
             }
             VStack(alignment: .leading, spacing: DS.Space.xl) {
-                HStack(alignment: .top, spacing: DS.Space.xl) {
-                    labeledField("Name") {
-                        studioField(placeholder: "Morning scan", text: $vm.routineName)
-                            .accessibilityIdentifier("bots.routines.name")
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    labeledField("When") {
-                        studioField(placeholder: "Weekdays 9:00", text: $vm.routineScheduleNote)
-                            .accessibilityIdentifier("bots.routines.when")
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                labeledField("Name") {
+                    studioField(placeholder: "Morning scan", text: $vm.routineName)
+                        .accessibilityIdentifier("bots.routines.name")
                 }
                 labeledField("Instruction") {
                     studioMultiline(text: $vm.routinePrompt, minHeight: 72, maxHeight: 140)
                         .accessibilityIdentifier("bots.routines.instruction")
                 }
+                BotScheduleSpecEditor(
+                    spec: $vm.routineSpec,
+                    providers: vm.providers,
+                    providersLoading: false
+                )
+                .accessibilityIdentifier("bots.routines.when")
                 Button("Save task") { vm.saveRoutine() }
                     .buttonStyle(BotsPrimaryButtonStyle())
                     .accessibilityIdentifier("bots.routines.save")
@@ -6219,12 +6521,22 @@ public struct BotsRootView: View {
         .accessibilityLabel("Back")
     }
 
-    private func labeledField<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+    private func labeledField<Content: View>(
+        _ label: String,
+        caption: String? = nil,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.xs) {
             Text(label)
                 .font(DS.Font.caption.weight(.medium))
                 .foregroundColor(DS.Palette.textSecondary)
                 .accessibilityHidden(true)
+            if let caption {
+                Text(caption)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             content()
                 .accessibilityLabel(label)
         }

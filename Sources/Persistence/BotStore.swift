@@ -1065,11 +1065,11 @@ public final class BotStore: @unchecked Sendable {
     private func insertRoutine(_ definition: BotRoutineDefinition, database: SQLiteDB) throws {
         let statement = try database.prepare("""
             INSERT INTO bot_routine_definitions(
-                id, bot_id, name, prompt, schedule_note, created_at, updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                id, bot_id, name, prompt, schedule_note, created_at, updated_at, schedule_spec_json
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name, prompt=excluded.prompt, schedule_note=excluded.schedule_note,
-                updated_at=excluded.updated_at;
+                updated_at=excluded.updated_at, schedule_spec_json=excluded.schedule_spec_json;
             """)
         defer { statement.reset() }
         try statement.bind(1, definition.id.value.uuidString.lowercased())
@@ -1079,6 +1079,7 @@ public final class BotStore: @unchecked Sendable {
         try statement.bind(5, definition.scheduleNote)
         try statement.bind(6, string(definition.createdAt))
         try statement.bind(7, string(definition.updatedAt))
+        try statement.bind(8, definition.scheduleSpecJSON)
         _ = try statement.step()
     }
 
@@ -1212,7 +1213,7 @@ public final class BotStore: @unchecked Sendable {
 
     private func loadRoutines(botID: BotID, database: SQLiteDB) throws -> [BotRoutine] {
         let statement = try database.prepare("""
-            SELECT d.id, d.bot_id, d.name, d.prompt, d.schedule_note, d.created_at, d.updated_at,
+            SELECT d.id, d.bot_id, d.name, d.prompt, d.schedule_note, d.created_at, d.updated_at, d.schedule_spec_json,
                    a.routine_id, a.bot_id, a.is_enabled, a.last_test_run_requested_at, a.updated_at
             FROM bot_routine_definitions d
             JOIN bot_routine_activations a ON a.routine_id = d.id
@@ -1224,7 +1225,7 @@ public final class BotStore: @unchecked Sendable {
         var result: [BotRoutine] = []
         while try statement.step() {
             let definition = try decodeRoutineDefinition(statement)
-            let activation = try decodeActivation(statement, offset: 7)
+            let activation = try decodeActivation(statement, offset: 8)
             result.append(BotRoutine(definition: definition, activation: activation))
         }
         return result
@@ -1437,6 +1438,7 @@ public final class BotStore: @unchecked Sendable {
             name: name,
             prompt: prompt,
             scheduleNote: note,
+            scheduleSpecJSON: statement.columnText(7) ?? "",
             createdAt: created,
             updatedAt: updated
         )

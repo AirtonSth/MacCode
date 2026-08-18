@@ -1585,6 +1585,41 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.isAutonomyActive)
     }
 
+    func test_botScheduleEditorCopiesAgentAppFrequencyAndRouting() throws {
+        // WHY: Bot Schedule Tasks used a free-text When field. Owners need
+        // the Agent App Frequency + Provider / Model Auto / Reasoning rows.
+        let source = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("bots.scheduleTasks.editor.frequency"))
+        XCTAssertTrue(source.contains("bots.scheduleTasks.editor.provider"))
+        XCTAssertTrue(source.contains("bots.scheduleTasks.editor.autoRouting"))
+        XCTAssertTrue(source.contains("bots.scheduleTasks.editor.reasoning"))
+        XCTAssertTrue(source.contains("struct BotScheduleSpecEditor"))
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.createScheduleTask()
+        var draft = try XCTUnwrap(vm.scheduleTaskDraft)
+        draft.name = "Morning scan"
+        draft.prompt = "Scan overnight"
+        draft.spec.provider = .grok
+        draft.spec.providerInstanceID = "grok"
+        draft.spec.routingMode = .auto
+        draft.spec.reasoningEffort = .medium
+        draft.spec.frequency = .daily
+        draft.spec.localTimeHour = 9
+        draft.spec.localTimeMinute = 0
+        vm.saveScheduleTask(draft)
+        let saved = try XCTUnwrap(vm.scheduleTaskItems.first)
+        let spec = try XCTUnwrap(BotScheduleSpec.decodeJSON(saved.scheduleSpecJSON))
+        XCTAssertEqual(spec.provider, .grok)
+        XCTAssertEqual(spec.routingMode, .auto)
+        XCTAssertEqual(spec.frequency, .daily)
+        XCTAssertEqual(saved.scheduleNote, "Daily 09:00")
+    }
+
     func test_scheduleTaskEditorFieldsHaveVoiceOverNames_becauseVisualLabelIsNotTheControlName() throws {
         // WHY: Computer Use / VoiceOver saw New Scheduled Task Name, When,
         // and Instruction as unnamed fields. `labeled` painted a caption
@@ -2581,8 +2616,9 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_brainPaneSurvivesRelaunch_becauseSelectedTabsAreUserWorkflowState() throws {
-        // WHY: Source vs Effective is a selected Brain pane. Relaunch used
-        // to drop Effective back to Source while inspectorTab stayed Brain.
+        // WHY: Source vs Effective is a selected Brain pane. The Brain tab
+        // is no longer user-facing, so leftover Brain persist remaps to
+        // Memory while the pane choice still survives for compile receipts.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
@@ -2590,8 +2626,62 @@ final class BotsWindowTests: XCTestCase {
         vm.inspectorTab = .brain
         vm.brainPane = .effective
         let reopened = BotsViewModel(context: context)
-        XCTAssertEqual(reopened.inspectorTab, .brain)
+        XCTAssertEqual(reopened.inspectorTab, .memory)
         XCTAssertEqual(reopened.brainPane, .effective)
+    }
+
+    func test_leftoverBrainStudioTabOpensProfile_becauseBrainIsNotUserFacing() throws {
+        // WHY: Brain is a compile inspector, not a Studio form. A leftover
+        // persist must not reopen a tab the owner can no longer reach.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        _ = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        UserDefaults.standard.set("brain", forKey: "bots.studioTab")
+        UserDefaults.standard.set("brain", forKey: "bots.inspectorTab")
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.studioTab, .profile)
+        XCTAssertEqual(reopened.inspectorTab, .memory)
+        XCTAssertFalse(BotStudioTab.brain.isUserFacing)
+        XCTAssertFalse(BotDeskInspectorTab.brain.isUserFacing)
+        XCTAssertTrue(BotStudioTab.files.isUserFacing)
+        XCTAssertEqual(
+            BotStudioTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["profile", "memory", "skills", "files", "routines", "security"]
+        )
+        XCTAssertEqual(
+            BotDeskInspectorTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["memory", "routines"]
+        )
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(
+            bots.contains("ForEach(BotStudioTab.allCases.filter(\\.isUserFacing))"),
+            "Brain stays on the enum for leftover persist; the Studio strip must not render it"
+        )
+        XCTAssertTrue(
+            bots.contains("ForEach(BotDeskInspectorTab.allCases.filter(\\.isUserFacing))"),
+            "Brain stays on the enum for leftover persist; the Desk inspector strip must not render it"
+        )
+    }
+
+    func test_soulFileSavePublishesSameRevisionAsStudioSave() throws {
+        // WHY: Files SOUL.md must not fork a second soul from Save Bot.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.beginEdit(bot)
+        let first = try XCTUnwrap(vm.selectedRevision?.revisionNumber)
+        vm.homeDraft = "Stand up for the brief."
+        vm.selectedHomePath = BotHome.soulName
+        vm.saveHomeFile()
+        let afterFiles = try XCTUnwrap(vm.selectedRevision)
+        XCTAssertEqual(afterFiles.soul, "Stand up for the brief.")
+        XCTAssertGreaterThan(afterFiles.revisionNumber, first)
+        let home = vm.botHome(for: try XCTUnwrap(vm.selectedBot))
+        XCTAssertEqual(try home.readSoul(), "Stand up for the brief.")
+        vm.studioDraft.soul = "Own the inbox."
+        _ = try vm.saveStudio()
+        XCTAssertEqual(try home.readSoul(), "Own the inbox.")
+        XCTAssertEqual(vm.selectedRevision?.soul, "Own the inbox.")
     }
 
     func test_previewBrainReusesUnchangedAssembly_becauseBrainDestMustNotRecompile() throws {
@@ -3481,6 +3571,22 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(bots.count, 2)
         XCTAssertEqual(Set(bots.map(\.handle)).count, 2)
         XCTAssertTrue(bots.allSatisfy { $0.name == "New Agent" })
+    }
+
+    func test_studioDescriptionAndInstructionsCaptionsContrastWhoVersusHow() throws {
+        // WHY: Description and Instructions sat unlabeled next to each
+        // other. Owners wrote job prose in the about field and identity
+        // into the soul. The captions must contrast who vs how.
+        XCTAssertTrue(BotsChrome.Label.descriptionCaption.hasPrefix("Who this teammate is"))
+        XCTAssertTrue(BotsChrome.Label.instructionsCaption.hasPrefix("How this teammate should work"))
+        XCTAssertTrue(BotsChrome.Label.descriptionCaption.contains("Empty stays out of the prompt"))
+        XCTAssertTrue(BotsChrome.Label.instructionsCaption.contains("Always sent"))
+        XCTAssertTrue(BotsChrome.Label.instructionsCaption.contains("Empty uses the built-in teammate default"))
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(bots.contains("BotsChrome.Label.descriptionCaption"))
+        XCTAssertTrue(bots.contains("BotsChrome.Label.instructionsCaption"))
+        XCTAssertTrue(bots.contains(".accessibilityHint(BotsChrome.Label.descriptionCaption)"))
+        XCTAssertTrue(bots.contains(".accessibilityHint(BotsChrome.Label.instructionsCaption)"))
     }
 
     func test_beginCreateSeedsStandingInstructions_becauseHermesDoesNotStartSoulless() throws {
@@ -5620,6 +5726,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.studio\")"))
         XCTAssertTrue(bots.contains("bots.studio.tab.profile"))
         XCTAssertTrue(bots.contains("bots.studio.tab.brain"))
+        XCTAssertTrue(
+            bots.contains("ForEach(BotStudioTab.allCases.filter(\\.isUserFacing))"),
+            "Brain stays on the enum for leftover persist; the Studio strip must not render it"
+        )
         XCTAssertTrue(bots.contains("bots.studio.tab.memory"))
         XCTAssertTrue(bots.contains("bots.studio.tab.skills"))
         XCTAssertTrue(bots.contains("bots.studio.tab.routines"))
@@ -5636,7 +5746,15 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(bots.contains("bots.home.goal"))
         XCTAssertTrue(bots.contains("accessibilityAddTraits(selected ? .isSelected : [])"))
         XCTAssertTrue(bots.contains("BotsChrome.hitTarget"))
-        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "memory", "skills", "routines", "security"])
+        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "memory", "skills", "files", "routines", "security"])
+        XCTAssertEqual(
+            BotStudioTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["profile", "memory", "skills", "files", "routines", "security"]
+        )
+        XCTAssertEqual(
+            BotDeskInspectorTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["memory", "routines"]
+        )
         XCTAssertTrue(chrome.contains(BotsChrome.Label.agentic))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.currentGoal))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.todaysActivity))
@@ -5649,7 +5767,19 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("bots.studio.identity"))
         XCTAssertFalse(bots.contains("bots.studio.routing"))
         XCTAssertTrue(bots.contains("bots.studio.soul"))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.descriptionCaption))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.instructionsCaption))
+        XCTAssertTrue(bots.contains("BotsChrome.Label.descriptionCaption"))
+        XCTAssertTrue(bots.contains("BotsChrome.Label.instructionsCaption"))
         XCTAssertTrue(bots.contains("Empty uses the built-in teammate default"))
+        XCTAssertTrue(
+            BotsChrome.Label.descriptionCaption.contains("Who this teammate is"),
+            "Description must say who, not how"
+        )
+        XCTAssertTrue(
+            BotsChrome.Label.instructionsCaption.contains("How this teammate should work"),
+            "Instructions must say how, not who"
+        )
         XCTAssertTrue(bots.contains("refreshGeneratedStandingInstructions"))
         XCTAssertTrue(
             bots.contains(".accessibilityLabel(BotsChrome.Label.instructions)"),
@@ -5770,6 +5900,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.inspector\")"))
         XCTAssertTrue(bots.contains("bots.studio.tab.brain"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.brain"))
+        XCTAssertTrue(
+            bots.contains("ForEach(BotDeskInspectorTab.allCases.filter(\\.isUserFacing))"),
+            "Brain stays on the enum for leftover persist; the Desk inspector strip must not render it"
+        )
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.memory"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.routines"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.brain"))
