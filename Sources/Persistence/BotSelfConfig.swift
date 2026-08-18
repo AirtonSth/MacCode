@@ -484,11 +484,23 @@ public struct BotSelfConfigService: Sendable {
         guard !trimmedName.isEmpty, !trimmedPrompt.isEmpty else {
             throw BotSelfConfigError.invalid("Routine name and instruction are required.")
         }
+        let existing = try store.listRoutines(botID: callerBotID)
+        let prior: BotRoutineDefinition?
         if let id {
-            let existing = try store.listRoutines(botID: callerBotID)
-            guard existing.contains(where: { $0.definition.id == id }) else {
+            prior = existing.first(where: { $0.definition.id == id })?.definition
+            guard prior != nil else {
                 throw BotSelfConfigError.crossBot
             }
+        } else {
+            prior = nil
+        }
+        let specJSON: String
+        if let parsed = BotScheduleSpec.parseDisplayNote(scheduleNote) {
+            specJSON = parsed.encodedJSON()
+        } else if let prior, !prior.scheduleSpecJSON.isEmpty {
+            specJSON = prior.scheduleSpecJSON
+        } else {
+            specJSON = ""
         }
         try store.saveRoutine(
             BotRoutineDefinition(
@@ -496,7 +508,8 @@ public struct BotSelfConfigService: Sendable {
                 botID: callerBotID,
                 name: trimmedName,
                 prompt: trimmedPrompt,
-                scheduleNote: scheduleNote
+                scheduleNote: scheduleNote,
+                scheduleSpecJSON: specJSON
             )
         )
         return try snapshot()

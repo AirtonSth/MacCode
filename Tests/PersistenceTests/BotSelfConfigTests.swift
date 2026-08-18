@@ -3487,6 +3487,37 @@ final class BotSelfConfigTests: XCTestCase {
         }
     }
 
+    func test_saveRoutinePersistsSpecFromWhenNote_becauseFleetEditMustNotDefaultDaily() throws {
+        // WHY: bot_save_routine wrote schedule_note only. Fleet Edit then
+        // hydrated BotScheduleSpec() (Daily / now) and Save wiped Weekdays 9:00.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "name": "QA morning scan",
+            "instruction": "Check overnight failures and reply with one short status.",
+            "when": "Weekdays 9:00",
+        ])
+        XCTAssertEqual(saved.routines.first?.scheduleNote, "Weekdays 9:00")
+        let created = try XCTUnwrap(try store.listRoutines(botID: bot.id).first)
+        let spec = try XCTUnwrap(created.definition.scheduleSpec)
+        XCTAssertFalse(created.definition.scheduleSpecJSON.isEmpty)
+        XCTAssertEqual(spec.frequency, .weekdays)
+        XCTAssertEqual(spec.localTimeHour, 9)
+        XCTAssertEqual(spec.localTimeMinute, 0)
+
+        _ = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
+            "routine_id": saved.routines[0].id,
+            "name": "QA morning scan",
+            "prompt": "Check overnight failures and reply with one short status.",
+            "schedule_note": "Daily",
+        ])
+        let updated = try XCTUnwrap(try store.listRoutines(botID: bot.id).first)
+        let kept = try XCTUnwrap(updated.definition.scheduleSpec)
+        XCTAssertEqual(updated.definition.scheduleNote, "Daily")
+        XCTAssertEqual(kept.frequency, .weekdays)
+        XCTAssertEqual(kept.localTimeHour, 9)
+    }
+
     func test_saveRoutineAdvertisedNamesPersist_becauseStudioSaysInstructionAndWhen() throws {
         // WHY: Tools and Studio say Instruction / When. Parse only read
         // prompt / schedule_note, so first-chat "change the instruction"

@@ -63,9 +63,7 @@ public struct BotScheduleTaskDraft: Identifiable, Equatable {
         self.name = item.name
         self.prompt = item.prompt
         self.scheduleNote = item.scheduleNote
-        self.spec = item.scheduleSpecJSON.isEmpty
-            ? BotScheduleSpec()
-            : (BotScheduleSpec.decodeJSON(item.scheduleSpecJSON) ?? BotScheduleSpec())
+        self.spec = BotScheduleSpec.resolved(json: item.scheduleSpecJSON, note: item.scheduleNote)
         self.isEnabled = item.isEnabled
         self.isNew = false
     }

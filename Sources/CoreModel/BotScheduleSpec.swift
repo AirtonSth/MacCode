@@ -134,6 +134,96 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
         decoder.dateDecodingStrategy = .iso8601
         return try? decoder.decode(BotScheduleSpec.self, from: data)
     }
+
+    /// JSON wins. Otherwise recover Frequency + local time from `displayNote()`
+    /// (and the unpadded `Weekdays 9:00` bots persist via When).
+    public static func resolved(json: String, note: String) -> BotScheduleSpec {
+        decodeJSON(json) ?? parseDisplayNote(note) ?? BotScheduleSpec()
+    }
+
+    public static func parseDisplayNote(_ raw: String) -> BotScheduleSpec? {
+        let note = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !note.isEmpty else { return nil }
+        if note.compare("Once", options: .caseInsensitive) == .orderedSame {
+            return makeParsed(frequency: .once)
+        }
+        if let hours = parseEveryHours(note) {
+            return makeParsed(frequency: .hourly, intervalHours: hours)
+        }
+        if let monthly = parseMonthlyDay(note) {
+            return makeParsed(
+                frequency: .monthly,
+                hour: monthly.hour,
+                minute: monthly.minute,
+                monthlyDay: monthly.day
+            )
+        }
+        if let named = parseNamedTime(note) {
+            return makeParsed(frequency: named.frequency, hour: named.hour, minute: named.minute)
+        }
+        return nil
+    }
+
+    private static func makeParsed(
+        frequency: ScheduledTaskFrequency,
+        hour: Int = 9,
+        minute: Int = 0,
+        intervalHours: Int = 1,
+        monthlyDay: Int = 1
+    ) -> BotScheduleSpec {
+        var spec = BotScheduleSpec()
+        spec.frequency = frequency
+        spec.localTimeHour = hour
+        spec.localTimeMinute = minute
+        spec.intervalHours = intervalHours
+        spec.monthlyDay = monthlyDay
+        return spec
+    }
+
+    private static func parseNamedTime(
+        _ note: String
+    ) -> (frequency: ScheduledTaskFrequency, hour: Int, minute: Int)? {
+        let pairs: [(String, ScheduledTaskFrequency)] = [
+            ("Daily ", .daily),
+            ("Weekdays ", .weekdays),
+            ("Weekly ", .weekly),
+        ]
+        for (prefix, frequency) in pairs {
+            guard let clock = suffix(note, after: prefix), let time = parseClock(clock) else { continue }
+            return (frequency, time.hour, time.minute)
+        }
+        return nil
+    }
+
+    private static func parseEveryHours(_ note: String) -> Int? {
+        guard let rest = suffix(note, after: "Every "), rest.hasSuffix("h") else { return nil }
+        guard let hours = Int(rest.dropLast()), (1...24).contains(hours) else { return nil }
+        return hours
+    }
+
+    private static func parseMonthlyDay(_ note: String) -> (day: Int, hour: Int, minute: Int)? {
+        guard let rest = suffix(note, after: "Monthly day ") else { return nil }
+        let tokens = rest.split(whereSeparator: { $0.isWhitespace })
+        guard tokens.count == 2,
+              let day = Int(tokens[0]), (1...28).contains(day),
+              let time = parseClock(String(tokens[1])) else { return nil }
+        return (day, time.hour, time.minute)
+    }
+
+    private static func parseClock(_ raw: String) -> (hour: Int, minute: Int)? {
+        let parts = raw.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let hour = Int(parts[0]), (0...23).contains(hour),
+              let minute = Int(parts[1]), (0...59).contains(minute) else { return nil }
+        return (hour, minute)
+    }
+
+    private static func suffix(_ note: String, after prefix: String) -> String? {
+        guard note.count >= prefix.count,
+              note.prefix(prefix.count).compare(prefix, options: .caseInsensitive) == .orderedSame
+        else { return nil }
+        return String(note.dropFirst(prefix.count))
+    }
 }
 
 public enum BotScheduleSpecError: Error, Equatable, CustomStringConvertible {

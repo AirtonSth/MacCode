@@ -719,6 +719,7 @@ public struct BotRoutineDefinition: Codable, Sendable, Equatable {
 
     public var scheduleSpec: BotScheduleSpec? {
         BotScheduleSpec.decodeJSON(scheduleSpecJSON)
+            ?? BotScheduleSpec.parseDisplayNote(scheduleNote)
     }
 }
 

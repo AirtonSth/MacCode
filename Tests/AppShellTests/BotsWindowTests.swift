@@ -1818,6 +1818,35 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_editScheduleTaskHydratesFrequencyFromNote_becauseEmptySpecMustNotBecomeDailyNow() throws {
+        // WHY: Bot-created routines persist When as "Weekdays 9:00" with
+        // empty schedule_spec_json. Fleet Edit used to open Daily at now,
+        // so Save replaced the visible weekdays 9:00 schedule.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        try context.botStore.saveRoutine(
+            BotRoutineDefinition(
+                botID: piper.id,
+                name: "QA morning scan",
+                prompt: "Check overnight failures and reply with one short status.",
+                scheduleNote: "Weekdays 9:00"
+            )
+        )
+        vm.openScheduleTasks()
+        let item = try XCTUnwrap(vm.scheduleTaskItems.first)
+        XCTAssertEqual(item.scheduleNote, "Weekdays 9:00")
+        XCTAssertTrue(item.scheduleSpecJSON.isEmpty)
+
+        vm.editScheduleTask(item)
+
+        let draft = try XCTUnwrap(vm.scheduleTaskDraft)
+        XCTAssertEqual(draft.name, "QA morning scan")
+        XCTAssertEqual(draft.spec.frequency, .weekdays)
+        XCTAssertEqual(draft.spec.localTimeHour, 9)
+        XCTAssertEqual(draft.spec.localTimeMinute, 0)
+    }
+
     func test_studioEditRoutineOpensDedicatedEditor_becauseExistingTasksMustBeEditable() throws {
         // WHY: Studio Schedule Tasks only created new rows. Existing tasks
         // showed Test run and Active, so owners could not change name,
