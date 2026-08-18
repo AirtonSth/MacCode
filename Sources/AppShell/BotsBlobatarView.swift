@@ -65,9 +65,6 @@ public struct BotBlobatarView: View {
             .translatedBy(x: 50 + motion.shakeX, y: 50 + motion.bobY + motion.shakeY)
             .scaledBy(x: motion.breatheX, y: motion.breatheY)
             .translatedBy(x: -50, y: -50)
-        if let plate = backgroundPath(figure) {
-            context.fill(Path(plate).applying(scaleOnly), with: .color(color(figure.palette.bg)))
-        }
         let head = color(figure.palette.head)
         for petal in figure.petals {
             let rect = CGRect(x: petal.cx - petal.r, y: petal.cy - petal.r, width: petal.r * 2, height: petal.r * 2)
@@ -91,19 +88,6 @@ public struct BotBlobatarView: View {
                 .scaledBy(x: 1, y: glance.blink)
                 .translatedBy(x: -capsule.cx, y: -capsule.cy)
             context.fill(superellipse(capsule).applying(eye), with: .color(ink))
-        }
-    }
-
-    private func backgroundPath(_ figure: BotBlobatarFigure) -> CGPath? {
-        switch figure.background {
-        case .none:
-            return nil
-        case .square:
-            return CGPath(rect: CGRect(x: 0, y: 0, width: 100, height: 100), transform: nil)
-        case .circle:
-            return superellipse(BotBlobatarEllipse(cx: 50, cy: 50, rx: 50, ry: 50, n: 2, rot: 0)).cgPath
-        case .squircle:
-            return superellipse(BotBlobatarEllipse(cx: 50, cy: 50, rx: 50, ry: 50, n: 6, rot: 0)).cgPath
         }
     }
 
@@ -199,6 +183,7 @@ struct BotBlobatarEditor: View {
     @Binding var token: String
     var seed: String
     var handle: String = ""
+    var columns: Int = 2
 
     private var spec: BotBlobatarSpec {
         BotBlobatarSpec.parse(token) ?? .default
@@ -207,7 +192,10 @@ struct BotBlobatarEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.xl) {
             section("shape") {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: DS.Space.sm), count: 4), spacing: DS.Space.md) {
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: DS.Space.sm), count: max(2, columns)),
+                    spacing: DS.Space.md
+                ) {
                     ForEach(BotBlobatarShape.allCases, id: \.self) { shape in
                         tile(
                             label: shape.rawValue,
@@ -219,23 +207,6 @@ struct BotBlobatarEditor: View {
                         }
                     }
                 }
-            }
-            section("expression") {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: DS.Space.sm), count: 4), spacing: DS.Space.md) {
-                    ForEach(BotBlobatarExpression.allCases, id: \.self) { expression in
-                        tile(
-                            label: expression.rawValue,
-                            selected: spec.expression == expression,
-                            identifier: "bots.studio.avatar.expression.\(expression.rawValue)",
-                            preview: previewing { $0.expression = expression }
-                        ) {
-                            apply { $0.expression = expression }
-                        }
-                    }
-                }
-            }
-            section("background") {
-                backgroundPills
             }
             section("hue") {
                 hueRow
@@ -268,7 +239,7 @@ struct BotBlobatarEditor: View {
                     .font(DS.Font.caption2)
                     .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
             }
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, minHeight: BotsChrome.hitTarget)
             .padding(.vertical, DS.Space.sm)
             .background(selected ? DS.Palette.surfaceOverlay : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
@@ -278,34 +249,6 @@ struct BotBlobatarEditor: View {
         .accessibilityLabel(label)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityIdentifier(identifier)
-    }
-
-    private var backgroundPills: some View {
-        HStack(spacing: 0) {
-            ForEach(BotBlobatarBackground.allCases, id: \.self) { background in
-                let selected = spec.background == background
-                Button {
-                    apply { $0.background = background }
-                } label: {
-                    Text(background.rawValue)
-                        .font(DS.Font.caption.weight(selected ? .semibold : .regular))
-                        .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
-                        .padding(.horizontal, DS.Space.lg)
-                        .padding(.vertical, DS.Space.sm)
-                        .frame(maxWidth: .infinity)
-                        .background(selected ? DS.Palette.text : Color.clear)
-                        .clipShape(Capsule())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(background.rawValue)
-                .accessibilityAddTraits(selected ? .isSelected : [])
-                .accessibilityIdentifier("bots.studio.avatar.background.\(background.rawValue)")
-            }
-        }
-        .padding(2)
-        .background(DS.Palette.surfaceOverlay)
-        .clipShape(Capsule())
-        .accessibilityIdentifier("bots.studio.avatar.background")
     }
 
     private var hueRow: some View {
@@ -365,6 +308,8 @@ struct BotBlobatarEditor: View {
     private func apply(_ mutate: (inout BotBlobatarSpec) -> Void) {
         var next = spec
         mutate(&next)
+        next.expression = .idle
+        next.background = .none
         if next.isDefaultAppearance {
             next.frozenSeed = nil
         } else if next.frozenSeed == nil || next.frozenSeed?.isEmpty == true {

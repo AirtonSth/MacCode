@@ -192,6 +192,33 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func renameHandle(id: BotID, handle: String, now: Date = Date()) throws -> BotDefinition {
+        guard let normalized = BotHandle.normalize(handle) else { throw BotPublishError.handleEmpty }
+        return try db.transaction {
+            guard let bot = try loadBot(id: id, database: db), bot.deletedAt == nil else {
+                throw BotStoreError.notFound
+            }
+            if bot.handle == normalized { return bot }
+            try assertHandleAvailable(normalized, excluding: bot.handle, database: db)
+            let updateBot = try db.prepare(
+                "UPDATE bots SET handle = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL;"
+            )
+            defer { updateBot.reset() }
+            try updateBot.bind(1, normalized)
+            try updateBot.bind(2, string(now))
+            try updateBot.bind(3, id.value.uuidString.lowercased())
+            _ = try updateBot.step()
+            let dropOld = try db.prepare("DELETE FROM bot_handles WHERE bot_id = ? AND handle = ?;")
+            defer { dropOld.reset() }
+            try dropOld.bind(1, id.value.uuidString.lowercased())
+            try dropOld.bind(2, bot.handle)
+            _ = try dropOld.step()
+            try insertLiveHandle(normalized, botID: id, at: now, database: db)
+            guard let updated = try loadBot(id: id, database: db) else { throw BotStoreError.notFound }
+            return updated
+        }
+    }
+
     public func setPinned(id: BotID, pinned: Bool, now: Date = Date()) throws {
         try db.performSync { database in
             let statement = try database.prepare(
@@ -384,6 +411,33 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func listLinkedAgentThreadIDs() throws -> Set<AgentThreadID> {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                "SELECT linked_agent_thread_id FROM bot_conversations WHERE linked_agent_thread_id IS NOT NULL;"
+            )
+            defer { statement.reset() }
+            var ids = Set<AgentThreadID>()
+            while try statement.step() {
+                guard let raw = statement.columnText(0),
+                      let uuid = UUID(uuidString: raw) else { continue }
+                ids.insert(AgentThreadID(uuid))
+            }
+            return ids
+        }
+    }
+
+    public func conversation(id: BotConversationID) throws -> BotConversation? {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                Self.conversationSelect + " WHERE id = ? LIMIT 1;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, id.value.uuidString.lowercased())
+            return try statement.step() ? try decodeConversation(statement) : nil
+        }
+    }
+
     public func conversationLinked(to threadID: AgentThreadID) throws -> BotConversation? {
         try db.performSync { database in
             let statement = try database.prepare(
@@ -392,6 +446,23 @@ public final class BotStore: @unchecked Sendable {
             defer { statement.reset() }
             try statement.bind(1, threadID.value.uuidString.lowercased())
             return try statement.step() ? try decodeConversation(statement) : nil
+        }
+    }
+
+    public func listConversations(attentionStates: [BotAttentionState]) throws -> [BotConversation] {
+        guard !attentionStates.isEmpty else { return [] }
+        return try db.performSync { database in
+            let marks = Array(repeating: "?", count: attentionStates.count).joined(separator: ",")
+            let statement = try database.prepare(
+                Self.conversationSelect + " WHERE attention_state IN (\(marks)) ORDER BY updated_at DESC;"
+            )
+            defer { statement.reset() }
+            for (index, state) in attentionStates.enumerated() {
+                try statement.bind(Int32(index + 1), state.rawValue)
+            }
+            var result: [BotConversation] = []
+            while try statement.step() { result.append(try decodeConversation(statement)) }
+            return result
         }
     }
 
@@ -938,7 +1009,12 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
-    private func assertHandleAvailable(_ handle: String, database: SQLiteDB) throws {
+    private func assertHandleAvailable(
+        _ handle: String,
+        excluding current: String? = nil,
+        database: SQLiteDB
+    ) throws {
+        if current == handle { return }
         if try handleIsTaken(handle, database: database) { throw BotPublishError.handleConflict }
     }
 

@@ -246,6 +246,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private var workspaceContentTopConstraint: NSLayoutConstraint?
     private var workspaceWindows: [WorkspaceID: WorkspaceWindowController] = [:]
     private var detachedWorkspaceIDs: Set<WorkspaceID> = []
+    private var botWindows: [BotID: BotDeskWindowController] = [:]
     /// PERF-MAC_SHELL_WINDOW-002: signature of the last container build
     /// (selected workspace + pane/surface/selection structure). When an
     /// unchanged signature comes back through `refreshFromState` (app
@@ -363,10 +364,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
                 self.window.contentView?.layoutSubtreeIfNeeded()
             }
             sidebar.view.isHidden = sidebarCollapsed
-            collapsedWorkspaceHeader.isHidden = !sidebarCollapsed
-            visibleWorkspaceHeader.isHidden = sidebarCollapsed
-            splitTopConstraint?.constant = sidebarCollapsed ? collapsedHeaderHeight : 0
-            workspaceContentTopConstraint?.constant = sidebarCollapsed ? 0 : collapsedHeaderHeight
             updateCollapsedWorkspaceHeader()
             if !sidebarCollapsed {
                 split.setPosition(sidebarWidth, ofDividerAt: 0)
@@ -386,10 +383,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private func applyStoredCollapsedLayout() {
         sidebarCollapsed = true
         sidebar.view.isHidden = true
-        collapsedWorkspaceHeader.isHidden = false
-        visibleWorkspaceHeader.isHidden = true
-        splitTopConstraint?.constant = collapsedHeaderHeight
-        workspaceContentTopConstraint?.constant = 0
         updateCollapsedWorkspaceHeader()
     }
 
@@ -599,7 +592,19 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         updateCollapsedWorkspaceHeader()
     }
 
+        /// Desk / Studio already paint the teammate header. The shell "Bots"
+        /// row is a second title above it. Collapsed sidebar still needs its
+        /// full-width bar for the sidebar toggle.
+        private func applyWorkspaceHeaderVisibility() {
+            let hideVisible = sidebarCollapsed || shellContentMode == .bots
+            visibleWorkspaceHeader.isHidden = hideVisible
+            collapsedWorkspaceHeader.isHidden = !sidebarCollapsed
+            splitTopConstraint?.constant = sidebarCollapsed ? collapsedHeaderHeight : 0
+            workspaceContentTopConstraint?.constant = hideVisible ? 0 : collapsedHeaderHeight
+        }
+
 	    private func updateCollapsedWorkspaceHeader() {
+            defer { applyWorkspaceHeaderVisibility() }
             // Schedule Tasks is a shell destination, not a workspace — title and
             // header must not keep the last workspace name.
             if shellContentMode == .scheduledTasks {
@@ -929,6 +934,31 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 
     public func isWorkspaceOpenInNewWindow(_ workspaceID: WorkspaceID) -> Bool {
         workspaceWindows[workspaceID] != nil
+    }
+
+    public func openBotInNewWindow(_ botID: BotID) {
+        guard let ctx = context, let router else { return }
+        guard (try? ctx.botStore.get(id: botID)) != nil else { return }
+        if let existing = botWindows[botID] {
+            existing.window?.makeKeyAndOrderFront(nil)
+            return
+        }
+        let controller = BotDeskWindowController(
+            botID: botID,
+            context: ctx,
+            router: router,
+            onClose: { [weak self] in self?.botWindowClosed(botID) }
+        )
+        botWindows[botID] = controller
+        controller.show()
+    }
+
+    public func botWindow(for botID: BotID) -> NSWindow? {
+        botWindows[botID]?.window
+    }
+
+    private func botWindowClosed(_ botID: BotID) {
+        botWindows.removeValue(forKey: botID)
     }
 
     private func returnWorkspaceToSidebar(_ workspaceID: WorkspaceID) {

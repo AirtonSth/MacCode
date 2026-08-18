@@ -38,6 +38,37 @@ final class BotHomeTests: XCTestCase {
         )
     }
 
+    func test_ensureSeedsFileMemoryNotProjection() throws {
+        // WHY: Memory is the markdown the bot writes. A projection header
+        // would tell the model the store still owns Forget/Correct.
+        let bot = BotDefinition(
+            handle: "piper",
+            name: "Piper",
+            title: "Scout",
+            description: "Looks around"
+        )
+        let home = BotHome(appSupportDirectory: directory, bot: bot)
+        try home.ensure(
+            name: bot.name,
+            handle: bot.handle,
+            title: bot.title,
+            description: bot.description,
+            soul: "Be brief."
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.memoryURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.memoryDirectoryURL.path))
+        XCTAssertEqual(home.memoryURL.lastPathComponent, "MEMORY.md")
+        let body = try String(contentsOf: home.memoryURL, encoding: .utf8)
+        XCTAssertTrue(body.contains("Durable facts"))
+        XCTAssertFalse(body.contains("Memory projection"))
+        XCTAssertFalse(body.contains("Forget and Correct still go through Memory"))
+        XCTAssertTrue(BotHome.isWritableMemoryPath("MEMORY.md"))
+        XCTAssertTrue(BotHome.isWritableMemoryPath("memory/2026-08-18.md"))
+        XCTAssertTrue(BotHome.isWritableMemoryPath("USER.md"))
+        XCTAssertFalse(BotHome.isWritableMemoryPath("IDENTITY.md"))
+        XCTAssertFalse(BotHome.isWritableMemoryPath("memory/not-a-date.md"))
+    }
+
     func test_ensureSeedsIdentitySoulMemorySkillsAndFiles() throws {
         let bot = BotDefinition(
             handle: "piper",
@@ -70,7 +101,8 @@ final class BotHomeTests: XCTestCase {
         XCTAssertEqual(try home.readDescription(), "Looks around")
         XCTAssertTrue(try home.readIdentity().contains("@piper"))
         XCTAssertTrue(try home.readIdentity().contains("Name: Piper"))
-        XCTAssertTrue(try String(contentsOf: home.memoryURL, encoding: .utf8).contains(BotHome.memoryProjectionHeader))
+        XCTAssertTrue(try String(contentsOf: home.memoryURL, encoding: .utf8).contains("Durable facts"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.memoryDirectoryURL.path))
     }
 
     func test_identityFileIsGeneratedAndHandleStaysCreateOnly() throws {
@@ -101,16 +133,51 @@ final class BotHomeTests: XCTestCase {
         XCTAssertNil(BotHome.normalizeSkillSlug("../x"))
     }
 
-    func test_memoryMarkdownIsProjectionNotSourceOfTruth() throws {
+    func test_legacyMemoryProjectionMigratesOnceIntoMEMORY() throws {
+        // WHY: Existing homes wrote memory.md from the store. Opening them
+        // must lift that text into MEMORY.md once and never overwrite a
+        // bot-edited MEMORY.md with leftover store bullets.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let home = BotHome(appSupportDirectory: directory, bot: bot)
+        try FileManager.default.createDirectory(at: home.root, withIntermediateDirectories: true)
+        let legacy = """
+        # Memory projection
+        # Trusted facts from the store. Forget and Correct still go through Memory.
+        - Prefers dark mode
+        """
+        try legacy.write(
+            to: home.root.appendingPathComponent(BotHome.legacyMemoryName),
+            atomically: true,
+            encoding: .utf8
+        )
+        try home.migrateLegacyMemoryIfNeeded(legacyFacts: ["Store leftover"])
+        let migrated = try String(contentsOf: home.memoryURL, encoding: .utf8)
+        XCTAssertTrue(migrated.contains("Prefers dark mode"))
+        XCTAssertFalse(migrated.contains("Memory projection"))
+        XCTAssertFalse(migrated.contains("Store leftover"))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: home.root.appendingPathComponent(BotHome.legacyMemoryName).path
+            )
+        )
+        try home.migrateLegacyMemoryIfNeeded(legacyFacts: ["Must not clobber"])
+        XCTAssertEqual(try String(contentsOf: home.memoryURL, encoding: .utf8), migrated)
+    }
+
+    func test_removeOwnedSkillDeletesSkillDirectory() throws {
+        // WHY: Remove must delete the markdown the bot owns. A leftover
+        // store unbind would leave SKILL.md compiled.
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
         let home = BotHome(appSupportDirectory: directory, bot: bot)
         try home.ensure(name: bot.name, handle: bot.handle, title: bot.title, description: "", soul: "")
-        try home.writeMemoryProjection(facts: ["Prefers dark mode"])
-        XCTAssertTrue(try String(contentsOf: home.memoryURL, encoding: .utf8).contains("Prefers dark mode"))
-        try home.writeMemoryProjection(facts: [])
-        let wiped = try String(contentsOf: home.memoryURL, encoding: .utf8)
-        XCTAssertFalse(wiped.contains("Prefers dark mode"))
-        XCTAssertTrue(wiped.contains(BotHome.memoryProjectionHeader))
+        let relative = try home.createOwnedSkill(slug: "weekly-invoice")
+        XCTAssertEqual(relative, "skills/weekly-invoice/SKILL.md")
+        XCTAssertTrue(BotHome.isWritableSkillPath(relative))
+        XCTAssertTrue(BotHome.isWritableHomePath(relative))
+        XCTAssertFalse(BotHome.isWritableSkillPath("skills/weekly-invoice/NOTES.md"))
+        try home.removeOwnedSkill(slug: "weekly-invoice")
+        XCTAssertTrue(try home.listOwnedSkills().isEmpty)
+        XCTAssertThrowsError(try home.removeOwnedSkill(slug: "weekly-invoice"))
     }
 
     func test_writeFileRejectsPathEscape() throws {

@@ -121,6 +121,17 @@ public final class ActiveThreadsViewModel: ObservableObject {
     }
 
     public func openActive(_ item: PetActiveThreadItem) {
+        if case .botsDesk(let botID) = item.route {
+            do {
+                guard try router.openBotsDesk(botID: botID) else {
+                    errorMessage = "Could not open bot Desk."
+                    return
+                }
+            } catch {
+                errorMessage = "Could not open bot Desk: \(error.localizedDescription)"
+            }
+            return
+        }
         openThread(item.threadID, workspaceID: workspaceID(from: item.route))
     }
 

@@ -795,4 +795,249 @@ final class PetAttentionStoreTests: XCTestCase {
             ts: 502
         )), "Successful provider updates do not require user attention.")
     }
+
+    func test_destUnreadActivityProjectsAsCompletedBotsDeskRow() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let bots = BotStore(db: db)
+        let bot = try bots.create(name: "Ceo", title: "Lead", description: "", provider: .claude)
+        var conversation = BotConversation(botID: bot.id, title: "Standup", attentionState: .unreadActivity)
+        try bots.upsertConversation(conversation)
+        let store = PetAttentionStore(
+            threadRepository: AgentThreadRepository(db: db),
+            callbackRepository: ProviderPendingCallbackRepository(db: db),
+            notificationRepository: NotificationRepository(db: db),
+            destLookup: {
+                PetDestAttentionSnapshot(
+                    bots: try bots.list(),
+                    conversations: try bots.listConversations(attentionStates: [.unreadActivity, .needsAttention]),
+                    attention: try bots.listAttention(),
+                    linkedThreadIDs: try bots.listLinkedAgentThreadIDs()
+                )
+            }
+        )
+        let items = try store.refresh().items
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].classification, .completed)
+        XCTAssertEqual(items[0].route, .botsDesk(botID: bot.id))
+        XCTAssertEqual(items[0].workspaceName, "Bots")
+        XCTAssertFalse(items[0].title.localizedCaseInsensitiveContains("standup"))
+        XCTAssertFalse((items[0].detail ?? "").localizedCaseInsensitiveContains("standup"))
+        conversation.attentionState = .none
+        try bots.upsertConversation(conversation)
+        XCTAssertTrue(try store.refresh().items.isEmpty)
+    }
+
+    func test_destNeedsYouAndDisabledBell() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let bots = BotStore(db: db)
+        let live = try bots.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let muted = try bots.create(
+            name: "Quinn",
+            title: "Reviewer",
+            description: "",
+            provider: .claude,
+            notificationsEnabled: false
+        )
+        let liveConversation = BotConversation(botID: live.id, title: "Fail", attentionState: .needsAttention)
+        try bots.upsertConversation(liveConversation)
+        try bots.upsertAttention(
+            BotAttentionItem(
+                botID: live.id,
+                conversationID: liveConversation.id,
+                kind: .blocked,
+                title: "secret stack",
+                detail: "token=private"
+            )
+        )
+        try bots.upsertConversation(
+            BotConversation(botID: muted.id, title: "Quiet", attentionState: .unreadActivity)
+        )
+        let store = PetAttentionStore(
+            threadRepository: AgentThreadRepository(db: db),
+            callbackRepository: ProviderPendingCallbackRepository(db: db),
+            notificationRepository: NotificationRepository(db: db),
+            destLookup: {
+                PetDestAttentionSnapshot(
+                    bots: try bots.list(),
+                    conversations: try bots.listConversations(attentionStates: [.unreadActivity, .needsAttention]),
+                    attention: try bots.listAttention(),
+                    linkedThreadIDs: try bots.listLinkedAgentThreadIDs()
+                )
+            }
+        )
+        let items = try store.refresh().items
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].classification, .needsYou)
+        XCTAssertEqual(items[0].route, .botsDesk(botID: live.id))
+        XCTAssertFalse(items[0].title.contains("secret"))
+        XCTAssertFalse((items[0].detail ?? "").contains("private"))
+        XCTAssertFalse(items.contains { if case .botsDesk(let id) = $0.route { return id == muted.id }; return false })
+    }
+
+    func test_destLinkedThreadIsNotProjectedAsAgentAppRow() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let bots = BotStore(db: db)
+        let bot = try bots.create(name: "Ceo", title: "Lead", description: "", provider: .claude)
+        let threadID = AgentThreadID()
+        try bots.upsertConversation(
+            BotConversation(
+                botID: bot.id,
+                title: "Live",
+                attentionState: .working,
+                linkedAgentThreadID: threadID
+            )
+        )
+        let threads = AgentThreadRepository(db: db)
+        try threads.upsert(
+            AgentThread(
+                id: threadID,
+                workspaceId: nil,
+                title: "raw dest payload",
+                provider: .claude,
+                model: "opus",
+                status: .completed,
+                hasUnread: true
+            )
+        )
+        let store = PetAttentionStore(
+            threadRepository: threads,
+            callbackRepository: ProviderPendingCallbackRepository(db: db),
+            notificationRepository: NotificationRepository(db: db),
+            destLookup: {
+                PetDestAttentionSnapshot(
+                    bots: try bots.list(),
+                    conversations: try bots.listConversations(attentionStates: [.unreadActivity, .needsAttention]),
+                    attention: try bots.listAttention(),
+                    linkedThreadIDs: try bots.listLinkedAgentThreadIDs()
+                )
+            }
+        )
+        let items = try store.refresh().items
+        XCTAssertFalse(items.contains { $0.id == "thread:\(threadID.value.uuidString)" })
+        XCTAssertFalse(items.contains { if case .agentThread = $0.route { return true }; return false })
+    }
+
+    func test_destAttentionKindsProjectAsNeedsYou() throws {
+        // WHY: Every dest inbox kind that still needs the owner must badge
+        // needs-you. Mapping blocked/unknownEffect to a completed agent
+        // outcome would hide a dest blocker behind a mark-read row.
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let bots = BotStore(db: db)
+        let kinds: [BotAttentionItemKind] = [.question, .approval, .handoff, .blocked, .unknownEffect]
+        var botIDs: [BotAttentionItemKind: BotID] = [:]
+        for kind in kinds {
+            let bot = try bots.create(
+                name: kind.rawValue.capitalized,
+                title: "Role",
+                description: "",
+                provider: .claude
+            )
+            botIDs[kind] = bot.id
+            try bots.upsertAttention(
+                BotAttentionItem(
+                    botID: bot.id,
+                    kind: kind,
+                    title: "secret \(kind.rawValue)",
+                    detail: "token=private"
+                )
+            )
+        }
+        let store = PetAttentionStore(
+            threadRepository: AgentThreadRepository(db: db),
+            callbackRepository: ProviderPendingCallbackRepository(db: db),
+            notificationRepository: NotificationRepository(db: db),
+            destLookup: {
+                PetDestAttentionSnapshot(
+                    bots: try bots.list(),
+                    conversations: try bots.listConversations(attentionStates: [.unreadActivity, .needsAttention]),
+                    attention: try bots.listAttention(),
+                    linkedThreadIDs: try bots.listLinkedAgentThreadIDs()
+                )
+            }
+        )
+        let items = try store.refresh().items
+        XCTAssertEqual(items.count, kinds.count)
+        for kind in kinds {
+            let botID = try XCTUnwrap(botIDs[kind])
+            let item = try XCTUnwrap(items.first { $0.route == .botsDesk(botID: botID) })
+            XCTAssertEqual(item.classification, .needsYou, "\(kind.rawValue) must stay needs-you")
+            XCTAssertFalse(item.title.contains("secret"))
+            XCTAssertFalse((item.detail ?? "").contains("private"))
+        }
+    }
+
+    func test_destBlockerOpenDoesNotAck() throws {
+        // WHY: Opening Desk for a dest question must not dest dest
+        // acknowledge. Dest blockers stay until dest Chat acks them.
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let bots = BotStore(db: db)
+        let bot = try bots.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let destItem = BotAttentionItem(botID: bot.id, kind: .question, title: "Need you", detail: "token=private")
+        try bots.upsertAttention(destItem)
+        var acknowledged: [BotAttentionItemID] = []
+        let store = PetAttentionStore(
+            threadRepository: AgentThreadRepository(db: db),
+            callbackRepository: ProviderPendingCallbackRepository(db: db),
+            notificationRepository: NotificationRepository(db: db),
+            destLookup: {
+                PetDestAttentionSnapshot(
+                    bots: try bots.list(),
+                    conversations: try bots.listConversations(attentionStates: [.unreadActivity, .needsAttention]),
+                    attention: try bots.listAttention(),
+                    linkedThreadIDs: try bots.listLinkedAgentThreadIDs()
+                )
+            },
+            markBotConversationViewed: { _ in
+                XCTFail("dest blocker must not dest dest unread")
+            },
+            acknowledgeBotAttention: { id in
+                acknowledged.append(id)
+            }
+        )
+        let item = try XCTUnwrap(try store.refresh().items.first)
+        XCTAssertEqual(item.classification, .needsYou)
+        XCTAssertEqual(try store.openAndMarkRead(itemID: item.id) { _ in true }, .retainedBlocker)
+        XCTAssertTrue(acknowledged.isEmpty)
+        XCTAssertEqual(try store.refresh().items.count, 1)
+    }
+
+    func test_destUnreadKindDoesNotDuplicateCompletedRow() throws {
+        // WHY: Dest `.unread` items only shadow conversation unreadActivity.
+        // Projecting both would double-count one completed dest turn.
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let bots = BotStore(db: db)
+        let bot = try bots.create(name: "Ceo", title: "Lead", description: "", provider: .claude)
+        var conversation = BotConversation(botID: bot.id, title: "Standup", attentionState: .unreadActivity)
+        try bots.upsertConversation(conversation)
+        try bots.upsertAttention(
+            BotAttentionItem(botID: bot.id, conversationID: conversation.id, kind: .unread, title: "secret")
+        )
+        let store = PetAttentionStore(
+            threadRepository: AgentThreadRepository(db: db),
+            callbackRepository: ProviderPendingCallbackRepository(db: db),
+            notificationRepository: NotificationRepository(db: db),
+            destLookup: {
+                PetDestAttentionSnapshot(
+                    bots: try bots.list(),
+                    conversations: try bots.listConversations(attentionStates: [.unreadActivity, .needsAttention]),
+                    attention: try bots.listAttention(),
+                    linkedThreadIDs: try bots.listLinkedAgentThreadIDs()
+                )
+            }
+        )
+        let items = try store.refresh().items
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].classification, .completed)
+        XCTAssertEqual(items[0].route, .botsDesk(botID: bot.id))
+        XCTAssertFalse(items[0].title.contains("secret"))
+        conversation.attentionState = .none
+        try bots.upsertConversation(conversation)
+        XCTAssertTrue(try store.refresh().items.isEmpty)
+    }
 }

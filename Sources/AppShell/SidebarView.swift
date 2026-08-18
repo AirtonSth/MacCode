@@ -2649,40 +2649,6 @@ public struct SidebarRootView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 2) {
                 Spacer(minLength: 0)
-                if vm.privateAccountUser != nil {
-                    Button(action: onOpenAccount) {
-                        headerAccountAvatar
-                            .frame(width: 28, height: 32)
-                            .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(accountSubtitle)
-                .accessibilityLabel("Account")
-                .accessibilityValue(accountSubtitle)
-            }
-
-            Button(action: reportBug) {
-                Image(systemName: "ladybug")
-                    .font(.system(size: 15, weight: .regular))
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .frame(width: 28, height: 32)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Report a bug via email")
-            .accessibilityLabel("Report Bug")
-            .accessibilityIdentifier("sidebar.reportBug")
-
-            Button(action: onOpenSettings) {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 15, weight: .regular))
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .frame(width: 28, height: 32)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Settings")
-            .accessibilityLabel("Settings")
 
                 Button { vm.toggleSidebar() } label: {
                     Image(systemName: "sidebar.left")
@@ -2695,6 +2661,41 @@ public struct SidebarRootView: View {
                 .help("Toggle sidebar")
                 .accessibilityLabel("Toggle sidebar")
                 .accessibilityIdentifier("shell.toggleSidebar")
+
+                Button(action: reportBug) {
+                    Image(systemName: "ladybug")
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .frame(width: 28, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Report a bug via email")
+                .accessibilityLabel("Report Bug")
+                .accessibilityIdentifier("sidebar.reportBug")
+
+                Button(action: onOpenSettings) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .frame(width: 28, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Settings")
+                .accessibilityLabel("Settings")
+
+                if vm.privateAccountUser != nil {
+                    Button(action: onOpenAccount) {
+                        headerAccountAvatar
+                            .frame(width: 28, height: 32)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(accountSubtitle)
+                    .accessibilityLabel("Account")
+                    .accessibilityValue(accountSubtitle)
+                }
             }
             .padding(.horizontal, DS.Space.md)
             .frame(height: 44)
@@ -2703,7 +2704,7 @@ public struct SidebarRootView: View {
                 isBotsSelected: vm.isBotsSelected,
                 onSelectAgentic: {
                     if vm.isBotsSelected {
-                        botsVM?.onLeaveBots?()
+                        botsVM?.requestLeaveBotsMode()
                     }
                 },
                 onSelectBots: {

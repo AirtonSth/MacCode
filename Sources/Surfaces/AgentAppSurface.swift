@@ -269,43 +269,6 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
     }
 }
 
-public enum AgentModelPopoverTransition: Equatable {
-    case none
-    case fadeAndSlide
-}
-
-public struct AgentModelPopoverPresentation: Equatable {
-    public static let autoDisclaimer = "Remote Code will automatically orchestrate the model to maximize quality while using the fewest tokens."
-    public static let autoStatus = "Orchestration active"
-    public static let autoAccessibilityLabel = "Automatic model routing"
-    public static let autoAccessibilityHint = "Turns automatic model routing on or off."
-
-    public let mode: AgentRoutingMode
-    public let reduceMotion: Bool
-    public let autoRoutingLoading: Bool
-
-    public init(mode: AgentRoutingMode, reduceMotion: Bool, autoRoutingLoading: Bool = false) {
-        self.mode = mode
-        self.reduceMotion = reduceMotion
-        self.autoRoutingLoading = autoRoutingLoading
-    }
-
-    public var showsModelControls: Bool { mode != .auto }
-    public var showsReasoningControls: Bool { mode != .auto }
-    public var showsServiceTierControls: Bool { mode != .auto }
-    public var showsDisclaimer: Bool { mode == .auto }
-    public var showsAutoLoadingIndicator: Bool { autoRoutingLoading }
-    public var autoToggleEnabled: Bool { !autoRoutingLoading }
-    public var transition: AgentModelPopoverTransition {
-        reduceMotion ? .none : .fadeAndSlide
-    }
-    public var accessibilityLabel: String { Self.autoAccessibilityLabel }
-    public var accessibilityValue: String { mode == .auto ? "On" : "Off" }
-    public var accessibilityHint: String { Self.autoAccessibilityHint }
-    public var disclaimer: String { Self.autoDisclaimer }
-
-}
-
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var threads: [AgentThread] = [] { didSet { filteredThreadsCache = nil } }
@@ -2420,13 +2383,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func permissionModeUnavailableReason(_ mode: AgentPermissionMode) -> String? {
         guard !supportedPermissionModesForSelectedProvider.contains(mode) else { return nil }
-        let label: String
-        switch mode {
-        case .supervised: label = "Supervised"
-        case .autoAcceptEdits: label = "Auto-edit"
-        case .fullAccess: label = "Full access"
-        }
-        return "\(providerDisplayName(provider)) does not support \(label) for this session."
+        return "\(providerDisplayName(provider)) does not support \(mode.displayName) for this session."
     }
 
     public var threadForkUnavailableReason: String? {
@@ -9762,13 +9719,6 @@ public enum ThreadMarkdownFormatter {
     }
 }
 
-private final class TimelineScrollScheduler {
-    var scheduled = false
-    var forcePending = false
-    /// Bumped on user unpin so in-flight async follows no-op (unless force).
-    var followGeneration = 0
-}
-
 private struct PendingSessionApprovalConfirmation {
     let originThreadId: AgentThreadID
     let request: AssistantPendingRequest
@@ -9862,8 +9812,6 @@ public struct AgentAppView: View {
     private static let threadRailIdealWidth: CGFloat = 320
     private static let conversationMinimumWidth: CGFloat = 560
     private static let planSidebarIdealWidth: CGFloat = 300
-    private static let timelineBottomRevealSlack: CGFloat = 4
-    private static let scrollDownButtonBottomInset: CGFloat = 22
     static func visibleStatusMessage(_ raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
@@ -9896,14 +9844,10 @@ public struct AgentAppView: View {
     @State private var selectedThreadIds: Set<AgentThreadID> = []
     @State private var lastSelectedThreadId: AgentThreadID?
     @State private var draggingThreadId: AgentThreadID?
-    @State private var timelineSticksToBottom = true
-    @State private var showScrollDownButton = false
-    /// Increments on FAB / thread-open so TimelineScrollFollower re-arms pin
-    /// even when sticky detach would otherwise ignore a stale `pinned: true`.
-    @State private var timelinePinForceToken = 0
+    @State private var timelineThreadRejoinEpoch = 0
     // IMP-MAC_AGENT-010: highlights the transcript while a file drag hovers it.
     @State private var timelineDropTargeted = false
-    @State private var timelineScrollScheduler = TimelineScrollScheduler()
+
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
     // macos:32: suggestion popup state. selection nil == nothing highlighted;
     // dismissed == user pressed Esc for the current token.
@@ -12198,36 +12142,22 @@ public struct AgentAppView: View {
     private var autoRoutingPillLoading: Bool {
         vm.routingMode == .auto && autoRoutingPrerequisitesLoading
     }
-    private var permissionLabel: String {
-        switch vm.permissionMode {
-        case .supervised: return "Supervised"
-        case .autoAcceptEdits: return "Auto-edit"
-        case .fullAccess: return "Full access"
-        }
-    }
-    private var permissionTone: Color {
-        switch vm.permissionMode {
-        case .supervised: return DS.Palette.textSecondary
-        case .autoAcceptEdits: return DS.Palette.warning
-        case .fullAccess: return DS.Palette.danger
-        }
-    }
     private var effortLabel: String { vm.reasoningEffort.displayName }
     private var serviceTierLabel: String { vm.serviceTier == .fast ? "Fast" : "Auto" }
     /// P3: VoiceOver label for the model picker pill that reads as structured
     /// text rather than the raw concatenated visual tokens.
+    private var modelPillPresentation: AgentModelPillPresentation {
+        AgentModelPillPresentation(
+            title: modelLabel,
+            loading: autoRoutingPillLoading,
+            effort: (vm.routingMode == .manual && vm.supportsReasoningForSelectedModel) ? effortLabel : nil,
+            serviceTier: (vm.routingMode == .manual && vm.serviceTier == .fast) ? serviceTierLabel : nil,
+            contextWindow: vm.routingMode == .manual ? vm.selectedModelContextWindowLabel : nil
+        )
+    }
+
     private var modelMenuAccessibilityLabel: String {
-        if vm.routingMode == .auto {
-            return autoRoutingPillLoading ? "Auto model routing, loading" : "Auto model routing"
-        }
-        var parts = ["Model \(modelLabel)"]
-        if vm.supportsReasoningForSelectedModel {
-            parts.append("effort \(effortLabel)")
-        }
-        if vm.serviceTier == .fast {
-            parts.append("tier Fast")
-        }
-        return parts.joined(separator: ", ")
+        modelPillPresentation.accessibilityLabel
     }
 
     private var threadRailIntent: AdaptiveSidebarIntent {
@@ -12326,19 +12256,12 @@ public struct AgentAppView: View {
     // messages as right-aligned bubbles, assistant output as full-width
     // prose, tools as one dim line. No per-item cards.
     private var timeline: some View {
-        ScrollViewReader { proxy in
-            ZStack(alignment: .bottomTrailing) {
-                GeometryReader { viewport in
-                    // Horizontal padding on the transcript stack is 22pt each side.
-                    // User bubbles size against this content column, not the raw viewport.
-                    let timelineColumnWidth = max(0, viewport.size.width - 44)
-                    ScrollView {
-                        // Viewport virtualization: LazyVStack releases off-screen rows.
-                        // Guardrails vs historical LazyLayout loops (PERF-MAC_AGENT-022):
-                        // 1) Stable row .id = TranscriptEntry.id (never index-based)
-                        // 2) Order from single merge; rematerialize never re-sorts
-                        // 3) paintOrderedTranscriptEntries (time order + final after Work so far)
-                        // 4) Pin geometry via TimelineScrollFollower (inside scroll document)
+        AgentChatTimelineScrollContainer(
+            rejoinToken: vm.focusTick &+ timelineThreadRejoinEpoch,
+            followToken: workDisclosureLayoutEpoch,
+            scrollToBottomIdentifier: "agent.timeline.scrollToBottom",
+            accessibilityIdentifier: "agent.timeline"
+        ) { timelineColumnWidth in
                         let allEntries = Self.paintOrderedTranscriptEntries(transcriptEntries)
                         let entries = Self.paintOrderedTranscriptEntries(
                             Self.visibleTranscriptWindow(
@@ -12355,9 +12278,6 @@ public struct AgentAppView: View {
                             vm.transcriptHistoryRevealCount,
                             hiddenCount
                         )
-                        // Build full paint sequence first, THEN split live/eager.
-                        // Splitting only the idle window left unfinished turns inside
-                        // revealed-older history (Lazy) — the split exists to prevent that.
                         let paintSequence: [TranscriptEntry] = {
                             if revealedHiddenCount > 0 {
                                 let older = Self.hiddenTranscriptRevealWindow(
@@ -12380,24 +12300,6 @@ public struct AgentAppView: View {
                         let historyEntries = split.history
                         let liveTail = split.liveTail
                         VStack(alignment: .leading, spacing: 32) {
-                            // Pin probe MUST live inside the scroll document so
-                            // `enclosingScrollView` resolves. Placing it on ScrollView's
-                            // `.background` left the follower detached → pin never
-                            // unpinned → auto-scroll stayed always-on (Ajuste 4).
-                            // 1×1 (not 0×0): zero-size probes can fail attach after
-                            // hosting rebuilds; non-zero keeps the NSView in hierarchy.
-                            TimelineScrollFollower(
-                                slack: Self.timelineBottomRevealSlack,
-                                pinned: timelineSticksToBottom,
-                                pinForceToken: timelinePinForceToken,
-                                onScrolledAway: { onTimelineScrolledAway() },
-                                onReturnedToBottom: { onTimelineReturnedToBottom() }
-                            )
-                            .frame(width: 1, height: 1)
-                            .opacity(0.001)
-                            .allowsHitTesting(false)
-                            .accessibilityHidden(true)
-
                             if vm.messageHistoryIsPartial {
                                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                                     Text("Showing the recent message window. Earlier messages remain stored locally.")
@@ -12497,119 +12399,48 @@ public struct AgentAppView: View {
                                 interruptedContinueRow
                                     .id("agent.continue.interrupted")
                             }
-                            Color.clear
-                                .frame(height: 1)
-                                .id("BOTTOM")
                         }
-                        .padding(.horizontal, 22)
-                        .padding(.vertical, 32)
-                        .frame(width: viewport.size.width, alignment: .leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .coordinateSpace(name: "agentTimeline")
-                    .background(DS.Palette.bg)
-                    // IMP-MAC_AGENT-010: the conversation area is a natural drop
-                    // target — accept file drops here too, routing them to the
-                    // same composer attachments as the composer's own drop zone.
-                    .onDrop(of: [UTType.fileURL], isTargeted: $timelineDropTargeted) { providers in
-                        loadDroppedFileAttachments(from: providers)
-                    }
-                    .overlay {
-                        if timelineDropTargeted {
-                            RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
-                                .strokeBorder(DS.Palette.accent, lineWidth: 2)
-                                .padding(DS.Space.sm)
-                                .allowsHitTesting(false)
-                        }
-                    }
-                }
-                if showScrollDownButton {
-                    Button {
-                        rejoinTimelineBottom(proxy)
-                    } label: {
-                        Image(systemName: "arrow.down")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundColor(.white)
-                            .frame(width: 44, height: 44)
-                            .background(DS.Palette.accent)
-                            .clipShape(Circle())
-                            .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Scroll to latest message")
-                    .accessibilityIdentifier("agent.timeline.scrollToBottom")
-                    .help("Scroll to latest message")
-                    .padding(.trailing, 14)
-                    .padding(.bottom, Self.scrollDownButtonBottomInset)
-                    .zIndex(1)
-                    .transition(.opacity.combined(with: .scale(scale: 0.94)))
-                }
+        } followOverlay: { follow in
+            TranscriptPaintTickScope(paintTick: vm.transcriptState.paintTick) {
+                collapseAllCompletedWorkOnFinalIfNeeded()
+                follow()
             }
-            .onAppear { rejoinTimelineBottom(proxy) }
-            .overlay(alignment: .topLeading) {
-                // Tick lives on a sibling ObservableObject. Observing it here
-                // (not on TranscriptReactiveScope) keeps scroll/collapse at
-                // ~30 Hz without rebuilding the transcript for unchanged content.
-                TranscriptPaintTickScope(paintTick: vm.transcriptState.paintTick) {
-                    collapseAllCompletedWorkOnFinalIfNeeded()
-                    // One coalesced schedule. A second async pass raced TimelineScrollFollower
-                    // post-layout snaps and multipass-jumped the viewport during streams.
-                    // Follower handleContentGrowth re-snaps after Lazy materialize.
-                    scheduleTimelineScrollToBottom(proxy, force: false)
-                }
+        }
+        .onDrop(of: [UTType.fileURL], isTargeted: $timelineDropTargeted) { providers in
+            loadDroppedFileAttachments(from: providers)
+        }
+        .overlay {
+            if timelineDropTargeted {
+                RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
+                    .strokeBorder(DS.Palette.accent, lineWidth: 2)
+                    .padding(DS.Space.sm)
+                    .allowsHitTesting(false)
             }
-            .onChange(of: vm.focusTick) { _ in
-                // focusTick bumps on outgoing user send — collapse before the
-                // new turn paints so pending follow-ups do not keep prior expands.
+        }
+        .onChange(of: vm.focusTick) { _ in
+            collapseTranscriptForNewTurn()
+        }
+        .onChange(of: vm.timeline.turns.count) { _ in
+            DispatchQueue.main.async {
+                pruneExpandedItemIds()
+            }
+        }
+        .onChange(of: vm.status) { newStatus in
+            if newStatus == .pending || newStatus == .running {
                 collapseTranscriptForNewTurn()
-                rejoinTimelineBottom(proxy)
             }
-            .onChange(of: workDisclosureLayoutEpoch) { _ in
-                // Height change while following live output: re-assert bottom.
-                // force=false so a user who scrolled up to audit is never re-pinned.
-                guard timelineSticksToBottom else { return }
-                scheduleTimelineScrollToBottom(proxy, force: false)
+        }
+        .onChange(of: vm.runStartedAt) { newValue in
+            if newValue != nil {
+                collapseTranscriptForNewTurn()
             }
-            .onChange(of: vm.messages.last?.id) { _ in
-                // New bubble: follow only when still pinned. force=true used to
-                // re-pin on every host append and yank auditors back to bottom.
-                scheduleTimelineScrollToBottom(proxy, force: false)
-            }
-            .onChange(of: vm.timeline.turns.count) { _ in
-                // PERF-MAC_AGENT-012: drop expansion ids for items that no longer
-                // exist (turns are memory-capped at AssistantTimelineState.liveTurnLimit)
-                // so the sets don't leak over a long session. Runs only on a turn
-                // add/remove, not per text delta. No scroll here — tick handles paint.
-                DispatchQueue.main.async {
-                    pruneExpandedItemIds()
-                }
-            }
-            .onChange(of: vm.status) { newStatus in
-                if newStatus == .pending || newStatus == .running {
-                    collapseTranscriptForNewTurn()
-                }
-                scheduleTimelineScrollToBottom(proxy)
-            }
-            // P1: collapse revealed history + open work/tool disclosures whenever
-            // a new run starts so a follow-up reads as a fresh chat turn, not a
-            // re-expansion of every prior command.
-            .onChange(of: vm.runStartedAt) { newValue in
-                if newValue != nil {
-                    collapseTranscriptForNewTurn()
-                }
-            }
-            // PERF-MAC_AGENT-023: also collapse on thread switch. Idle threads now
-            // bound their render to a recent tail (visibleTranscriptWindow), so a
-            // revealed flag carried into a different long thread would eagerly
-            // render its whole history with no user action — reintroducing the hang.
-            .onChange(of: vm.selectedThreadId) { _ in
-                vm.transcriptHistoryRevealCount = 0
-                pendingSessionApproval = nil
-                collapseAllWorkDisclosures()
-                knownFinishedWorkTurnIds = []
-                // Opening a thread: rejoin bottom (user expectation) and re-enable auto-follow.
-                rejoinTimelineBottom(proxy)
-            }
+        }
+        .onChange(of: vm.selectedThreadId) { _ in
+            vm.transcriptHistoryRevealCount = 0
+            pendingSessionApproval = nil
+            collapseAllWorkDisclosures()
+            knownFinishedWorkTurnIds = []
+            timelineThreadRejoinEpoch &+= 1
         }
     }
 
@@ -13172,69 +13003,6 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.askOption.\(request.id).\(question.id).\(option.label)")
     }
 
-    private func scheduleTimelineScrollToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
-        let scheduler = timelineScrollScheduler
-        scheduler.forcePending = scheduler.forcePending || force
-        // Capture generation at schedule time so a later user unpin cancels this follow.
-        let generation = scheduler.followGeneration
-        guard !scheduler.scheduled else { return }
-        scheduler.scheduled = true
-        DispatchQueue.main.async {
-            let shouldForce = scheduler.forcePending
-            scheduler.forcePending = false
-            scheduler.scheduled = false
-            // force (FAB / send / open) always runs; stream follows only if still same gen.
-            guard shouldForce || generation == scheduler.followGeneration else { return }
-            scrollTimelineToBottom(proxy, force: shouldForce)
-        }
-    }
-
-    /// Intentional rejoin: re-arm pin, invalidate sticky detach via force token, scroll.
-    private func rejoinTimelineBottom(_ proxy: ScrollViewProxy) {
-        timelineSticksToBottom = true
-        showScrollDownButton = false
-        timelinePinForceToken &+= 1
-        scheduleTimelineScrollToBottom(proxy, force: true)
-    }
-
-    private func scrollTimelineToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
-        // force=true only for intentional rejoin (FAB, send focus, thread appear).
-        // Stream/message ticks must pass force=false so audit scroll-up is preserved.
-        guard ScrollPinPolicy.shouldProgrammaticFollow(
-            pinned: timelineSticksToBottom,
-            force: force
-        ) else { return }
-        if force {
-            timelineSticksToBottom = true
-            showScrollDownButton = false
-        }
-        // PERF-MAC_AGENT-003: the onChange triggers all funnel here and fire per
-        // streaming delta. Skip the per-token animation while running (it caused a
-        // layout pass + animation churn on every delta); only animate on settle
-        // (idle, or an explicit forced scroll). TimelineScrollFollower re-pins to the
-        // exact post-layout bottom on its own; this is the discrete-event re-assert.
-        // Always a single BOTTOM sentinel. Dual scrollTo(latest)+BOTTOM multipass-
-        // jumped the viewport on stream *and* force rejoin (open/FAB/send) —
-        // wrong size, flash, and measured settle loops amplified it. AppKit
-        // TimelineScrollFollower snaps true post-layout bottom while pinned;
-        // SwiftUI only re-asserts the sentinel once per pass.
-        let targets = Self.programmaticScrollTargets(
-            messages: vm.messages,
-            turns: vm.timeline.turns,
-            force: force
-        )
-        let apply: () -> Void = {
-            for id in targets {
-                proxy.scrollTo(id, anchor: .bottom)
-            }
-        }
-        if vm.status == .running && !force {
-            apply()
-        } else {
-            withAnimation(DS.Motion.micro, apply)
-        }
-    }
-
     /// Ordered scroll ids for one programmatic rejoin/follow pass.
     /// Always BOTTOM only — dual content+BOTTOM multipass-jumped open and stream.
     nonisolated static func programmaticScrollTargets(
@@ -13247,22 +13015,6 @@ public struct AgentAppView: View {
         _ = turns
         _ = force
         return ["BOTTOM"]
-    }
-
-    // TimelineScrollFollower reports pin transitions from real AppKit geometry — these
-    // only flip @State when actually crossing, so they never churn the body per frame.
-    private func onTimelineReturnedToBottom() {
-        guard !timelineSticksToBottom || showScrollDownButton else { return }
-        timelineSticksToBottom = true
-        showScrollDownButton = false
-    }
-
-    private func onTimelineScrolledAway() {
-        // Invalidate in-flight stream follows immediately (generation), then pin state.
-        timelineScrollScheduler.followGeneration &+= 1
-        guard timelineSticksToBottom || !showScrollDownButton else { return }
-        timelineSticksToBottom = false
-        showScrollDownButton = true
     }
 
     // UX-MAC_AGENT-CONTINUE: shown when the thread was interrupted by relaunch.
@@ -14994,21 +14746,7 @@ public struct AgentAppView: View {
         // message already drained) must not show an empty "Queued 0" header.
         if !vm.queuedMessages.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
-                // UX-MAC_AGENT-019: emphasize the Queued header (accent) so it's
-                // clear new sends are queuing behind the active turn.
-                HStack(spacing: DS.Space.sm) {
-                    Image(systemName: "text.line.first.and.arrowtriangle.forward")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(DS.Palette.accent)
-                    Text("Queued")
-                        .font(DS.Font.caption.weight(.semibold))
-                        .foregroundColor(DS.Palette.accent)
-                    Text("\(vm.queuedMessages.count)")
-                        .font(DS.Font.caption.monospacedDigit())
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Spacer(minLength: 0)
-                }
-                .accessibilityIdentifier("agent.queued.header")
+                AgentQueuedHeader(count: vm.queuedMessages.count, identifier: "agent.queued.header")
                 if let message = vm.queueStatusMessage {
                     HStack(spacing: DS.Space.sm) {
                         Text(message)
@@ -15707,34 +15445,16 @@ public struct AgentAppView: View {
     }
 
     private var permissionMenu: some View {
-        Menu {
-            Button("Supervised") { vm.setPermissionMode(.supervised) }
-                .disabled(!vm.supportedPermissionModesForSelectedProvider.contains(.supervised))
-                .help(vm.permissionModeUnavailableReason(.supervised) ?? "Ask before tool actions")
-            Button("Auto-edit") { vm.setPermissionMode(.autoAcceptEdits) }
-                .disabled(!vm.supportedPermissionModesForSelectedProvider.contains(.autoAcceptEdits))
-                .help(vm.permissionModeUnavailableReason(.autoAcceptEdits) ?? "Apply edits without asking")
-            Button("Full access") { vm.setPermissionMode(.fullAccess) }
-                .disabled(!vm.supportedPermissionModesForSelectedProvider.contains(.fullAccess))
-                .help(vm.permissionModeUnavailableReason(.fullAccess) ?? "Run tools without asking")
-        } label: {
-            HStack(spacing: DS.Space.xs) {
-                Image(systemName: vm.permissionMode == .fullAccess ? "exclamationmark.shield.fill" : "lock.shield")
-                    .font(.system(size: 10))
-                Text(permissionLabel).font(DS.Font.caption.weight(.medium)).lineLimit(1)
-                Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
-            }
-            .fixedSize()
-            .foregroundColor(permissionTone)
-            .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-            .background(permissionTone.opacity(0.13))
-            .clipShape(Capsule())
-        }
-        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
-        .disabled(vm.activeRunConfigurationLocked || !vm.selectedProviderCanRun)
-        .help(vm.providerExecutionUnavailableReason
-            ?? (vm.activeRunConfigurationLocked ? "Permission is fixed for the active run" : "Permission mode"))
-        .accessibilityIdentifier("agent.permission.menu")
+        AgentPermissionCapsule(
+            selected: vm.permissionMode,
+            modes: AgentPermissionMode.allCases,
+            unavailableReason: { vm.permissionModeUnavailableReason($0) },
+            disabled: vm.activeRunConfigurationLocked || !vm.selectedProviderCanRun,
+            help: vm.providerExecutionUnavailableReason
+                ?? (vm.activeRunConfigurationLocked ? "Permission is fixed for the active run" : "Permission mode"),
+            accessibilityIdentifier: "agent.permission.menu",
+            onSelect: { vm.setPermissionMode($0) }
+        )
     }
 
     private var executionMenu: some View {
@@ -15774,20 +15494,13 @@ public struct AgentAppView: View {
                 }
             }
         } label: {
-            HStack(spacing: DS.Space.xs) {
-                Image(systemName: vm.executionMode == .worktree ? "arrow.triangle.branch" : "folder")
-                    .font(.system(size: 10))
-                Text(vm.executionMode == .worktree ? "Worktree" : "Local")
-                    .font(DS.Font.caption.weight(.medium))
-                    .lineLimit(1)
-                Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
+            AgentComposerCapsule {
+                AgentComposerCapsuleLabel(
+                    icon: vm.executionMode == .worktree ? "arrow.triangle.branch" : "folder",
+                    title: vm.executionMode == .worktree ? "Worktree" : "Local",
+                    chevron: true
+                )
             }
-            .fixedSize()
-            .foregroundColor(DS.Palette.textSecondary)
-            .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-            .background(DS.Palette.surfaceRaised)
-            .clipShape(Capsule())
-            .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
         }
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
         .disabled(vm.executionLocked || !vm.selectedProviderCanRun)
@@ -15800,83 +15513,15 @@ public struct AgentAppView: View {
     private var runAsUserMenu: some View {
         let users = vm.availableRunAsUsers.isEmpty ? MacOSLocalUserCatalog.listEligibleUsers() : vm.availableRunAsUsers
         let selected = vm.runAsUser ?? AgentRunAsUser.current()
-        let interactive = users.count > 1
-            && !vm.providerLocked
-            && !vm.selectedThreadRunIsStartingOrRunning
-        let label = selected.shortName
-        return Group {
-            if interactive {
-                Menu {
-                    ForEach(users, id: \.id) { user in
-                        Button {
-                            vm.setRunAsUser(user)
-                        } label: {
-                            HStack {
-                                if user.uid == selected.uid {
-                                    Image(systemName: "checkmark")
-                                }
-                                Text(user.shortName)
-                                if let full = user.fullName, full != user.shortName {
-                                    Text("· \(full)")
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                        }
-                    }
-                } label: {
-                    runAsUserCapsuleLabel(label: label, showChevron: true, locked: false)
-                }
-                .menuStyle(.button)
-                .buttonStyle(.plain)
-                .menuIndicator(.hidden)
-                .fixedSize()
-            } else {
-                runAsUserCapsuleLabel(
-                    label: label,
-                    showChevron: false,
-                    locked: vm.providerLocked
-                )
-            }
-        }
-        .disabled(vm.selectedThreadRunIsStartingOrRunning)
-        .help(runAsUserHelpText(interactive: interactive, selected: selected))
-        .accessibilityLabel("Run as macOS user \(label)")
-        .accessibilityIdentifier("agent.runAsUser.menu")
-        .onAppear { vm.refreshAvailableRunAsUsers() }
-    }
-
-    private func runAsUserHelpText(interactive: Bool, selected: AgentRunAsUser) -> String {
-        if vm.selectedThreadRunIsStartingOrRunning {
-            return "macOS user is fixed while a run is active"
-        }
-        if vm.providerLocked {
-            return "macOS user is fixed after the first message. Start a new thread to run as a different user."
-        }
-        if !interactive {
-            return "Provider processes run as macOS user \(selected.shortName)"
-        }
-        return "Choose which macOS user executes Codex/Claude/Grok (like sudo -u)"
-    }
-
-    private func runAsUserCapsuleLabel(label: String, showChevron: Bool, locked: Bool) -> some View {
-        HStack(spacing: DS.Space.xs) {
-            Image(systemName: locked ? "lock.fill" : "person.fill")
-                .font(.system(size: 10))
-            Text(label)
-                .font(DS.Font.caption.weight(.medium))
-                .lineLimit(1)
-                .truncationMode(.tail)
-            if showChevron {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .semibold))
-            }
-        }
-        .fixedSize()
-        .foregroundColor(DS.Palette.textSecondary)
-        .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(Capsule())
-        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+        return AgentRunAsUserCapsule(
+            users: users,
+            selected: selected,
+            runLocked: vm.selectedThreadRunIsStartingOrRunning,
+            identityLocked: vm.providerLocked,
+            accessibilityIdentifier: "agent.runAsUser.menu",
+            onSelect: { vm.setRunAsUser($0) },
+            onAppear: { vm.refreshAvailableRunAsUsers() }
+        )
     }
 
     /// Dedicated provider-instance source capsule (CODEX_HOME isolation).
@@ -15887,28 +15532,18 @@ public struct AgentAppView: View {
     /// `Menu` that collapses to a static label when locked made "click does
     /// nothing" the common report after the first message — fail loud instead.
     private var sourceMenu: some View {
-        let canSwitch = sourceCanSwitch
-        let label = sourceCapsuleLabel
-        let helpText = sourceCapsuleHelpText(canSwitch: canSwitch)
-        return Button {
-            showSourceOptions.toggle()
-        } label: {
-            sourceCapsuleLabelView(
-                label: label,
-                showChevron: true,
-                locked: vm.providerLocked || vm.selectedThreadRunIsStartingOrRunning
-            )
-        }
-        .buttonStyle(.plain)
-        .help(helpText)
-        .accessibilityLabel("Account \(label)")
-        .accessibilityHint(canSwitch
-            ? "Choose which ChatGPT, Claude, or Grok account runs this thread"
-            : helpText)
-        .accessibilityIdentifier("agent.source.menu")
-        .popover(isPresented: $showSourceOptions, arrowEdge: .bottom) {
-            sourceOptionsPopover
-        }
+        AgentSourceCapsule(
+            label: sourceCapsuleLabel,
+            entries: sourceMenuEntries,
+            runLocked: vm.selectedThreadRunIsStartingOrRunning,
+            providerLocked: vm.providerLocked,
+            unavailableReason: vm.providerExecutionUnavailableReason,
+            rowWidth: compactModelMenuWidth,
+            accessibilityIdentifier: "agent.source.menu",
+            popoverIdentifier: "agent.source.popover",
+            isPresented: $showSourceOptions,
+            onSelect: selectSourceMenuEntry
+        )
     }
 
     private var sourceCanSwitch: Bool {
@@ -15920,55 +15555,6 @@ public struct AgentAppView: View {
             // the menu open to pick a working account.
             runLocked: vm.selectedThreadRunIsStartingOrRunning
         )
-    }
-
-    private var sourceOptionsPopover: some View {
-        let canSwitch = sourceCanSwitch
-        let entries = sourceMenuEntries
-        return VStack(alignment: .leading, spacing: DS.Space.xs) {
-            if vm.selectedThreadRunIsStartingOrRunning {
-                Text("Account is fixed while a run is active")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .fixedSize(horizontal: true, vertical: false)
-            } else if vm.providerLocked {
-                Text("Account is fixed after the first message. Start a new thread to use a different account.")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: compactModelMenuWidth, alignment: .leading)
-            } else if let reason = vm.providerExecutionUnavailableReason {
-                Text(reason)
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.warning)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: compactModelMenuWidth, alignment: .leading)
-            } else if entries.count <= 1 {
-                Text("Only one account is available")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .fixedSize(horizontal: true, vertical: false)
-            }
-
-            compactMenuSection("Account")
-            if entries.isEmpty {
-                Text("No accounts loaded")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-            } else {
-                ForEach(entries, id: \.id) { entry in
-                    compactMenuRow(entry.title, selected: entry.isSelected) {
-                        selectSourceMenuEntry(entry)
-                        showSourceOptions = false
-                    }
-                    .disabled(!canSwitch)
-                }
-            }
-        }
-        .padding(DS.Space.sm)
-        .background(DS.Palette.surfaceOverlay)
-        .fixedSize(horizontal: true, vertical: false)
-        .accessibilityIdentifier("agent.source.popover")
     }
 
     private var sourceCapsuleLabel: String {
@@ -16004,48 +15590,11 @@ public struct AgentAppView: View {
         }
     }
 
-    private func sourceCapsuleHelpText(canSwitch: Bool) -> String {
-        if vm.selectedThreadRunIsStartingOrRunning {
-            return "Account is fixed while a run is active"
-        }
-        if vm.providerLocked {
-            return "Account is fixed after the first message. Start a new thread to use a different account."
-        }
-        if let reason = vm.providerExecutionUnavailableReason {
-            return reason
-        }
-        if !canSwitch {
-            return "Account / source for this agent run"
-        }
-        return "Choose which ChatGPT / Claude / Grok account runs this thread"
-    }
-
-    private func sourceCapsuleLabelView(label: String, showChevron: Bool, locked: Bool) -> some View {
-        HStack(spacing: DS.Space.xs) {
-            Image(systemName: locked ? "lock.fill" : "person.crop.circle")
-                .font(.system(size: 10))
-            Text(label)
-                .font(DS.Font.caption.weight(.medium))
-                .lineLimit(1)
-                .truncationMode(.tail)
-            if showChevron {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .semibold))
-            }
-        }
-        .fixedSize()
-        .foregroundColor(DS.Palette.textSecondary)
-        .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(Capsule())
-        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-    }
-
     private var modelMenu: some View {
         Button {
             showModelOptions.toggle()
         } label: {
-            modelMenuLabel
+            AgentModelPillLabel(presentation: modelPillPresentation, width: currentModelMenuLabelWidth)
         }
         .buttonStyle(.plain)
         // P3: expose a meaningful VoiceOver label instead of the raw concatenated
@@ -16077,51 +15626,18 @@ public struct AgentAppView: View {
         // while running; the retry and recovery rows are excluded.
         let running = vm.selectedThreadRunIsStartingOrRunning
         let configurationLocked = running || !vm.selectedProviderCanRun
-        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let presentation = AgentModelPopoverPresentation(
+        let presentation = AgentModelPopoverPresentation.current(
             mode: vm.routingMode,
-            reduceMotion: reduceMotion,
             autoRoutingLoading: autoRoutingPrerequisitesLoading
         )
-        return VStack(alignment: .leading, spacing: DS.Space.md) {
-            HStack(spacing: DS.Space.md) {
-                Text("Model")
-                    .font(DS.Font.caption.weight(.medium))
-                    .foregroundColor(DS.Palette.text)
-                Spacer(minLength: DS.Space.xxl)
-                Text("Auto")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.text)
-                if presentation.showsAutoLoadingIndicator {
-                    ProgressView()
-                        .controlSize(.small)
-                        .accessibilityLabel("Loading automatic routing")
-                        .accessibilityIdentifier("agent.model.auto.loading")
-                }
-                Toggle("", isOn: Binding(
-                    get: { vm.routingMode == .auto },
-                    set: { _ = vm.setAutoModelRoutingEnabled($0) }
-                ))
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .tint(DS.Palette.success)
-                .disabled(running || !presentation.autoToggleEnabled)
-                .accessibilityLabel(presentation.accessibilityLabel)
-                .accessibilityValue(presentation.accessibilityValue)
-                .accessibilityHint(presentation.accessibilityHint)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityHidden(true)
-            }
-            Divider()
-                .accessibilityIdentifier("agent.model.auto.divider")
-            if presentation.showsDisclaimer {
-                autoRoutingCard(presentation: presentation)
-                    .transition(presentation.transition == .fadeAndSlide
-                        ? .opacity.combined(with: .move(edge: .top))
-                        : .identity)
-            } else {
+        return AgentModelPopoverChrome(
+            presentation: presentation,
+            autoEnabled: Binding(
+                get: { vm.routingMode == .auto },
+                set: { _ = vm.setAutoModelRoutingEnabled($0) }
+            ),
+            toggleDisabled: running || !presentation.autoToggleEnabled
+        ) {
             // UX-MAC_AGENT-016: readable while running; mutation rows disable below.
             if running {
                 Text("Read-only while running")
@@ -16274,147 +15790,20 @@ public struct AgentAppView: View {
                     dismiss: { vm.dismissProviderRecoveryStatusMessage() }
                 )
             }
-            }
         }
-        .animation(
-            presentation.transition == .fadeAndSlide
-                ? .easeInOut(duration: 0.2)
-                : nil,
-            value: vm.routingMode
-        )
-        .padding(DS.Space.sm)
-        .background(DS.Palette.surfaceOverlay)
-        .fixedSize(horizontal: true, vertical: false)
         .accessibilityIdentifier("agent.model.popover")
     }
 
-    private func autoRoutingCard(presentation: AgentModelPopoverPresentation) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.lg) {
-            ZStack {
-                Ellipse()
-                    .stroke(
-                        LinearGradient(
-                            colors: [DS.Palette.accent, DS.Palette.success],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        ),
-                        lineWidth: 1.5
-                    )
-                    .frame(width: 40, height: 20)
-                    .rotationEffect(.degrees(-12))
-                Image(systemName: "sparkles")
-                    .font(.system(size: 19, weight: .medium))
-                    .foregroundStyle(DS.Palette.text)
-            }
-            .frame(width: 48, height: 48)
-
-            VStack(alignment: .leading, spacing: DS.Space.md) {
-                Text(presentation.disclaimer)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.text)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: DS.Space.xs) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(DS.Palette.success)
-                    Text(AgentModelPopoverPresentation.autoStatus)
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textSecondary)
-                }
-            }
-        }
-        .padding(DS.Space.lg)
-        .frame(width: 360, alignment: .leading)
-        .background(
-            LinearGradient(
-                colors: [DS.Palette.surfaceRaised, DS.Palette.success.opacity(0.12)],
-                startPoint: .leading,
-                endPoint: .bottomTrailing
-            )
-        )
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
-                .strokeBorder(DS.Palette.accent.opacity(0.22), lineWidth: DS.Border.hairline)
-        )
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("agent.model.auto.card")
-    }
-
-    private var modelMenuLabel: some View {
-        HStack(spacing: DS.Space.xs) {
-            if autoRoutingPillLoading {
-                ProgressView()
-                    .controlSize(.mini)
-                    .accessibilityHidden(true)
-            }
-            Text(modelLabel).font(DS.Font.caption.weight(.medium)).foregroundColor(DS.Palette.text)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            if vm.routingMode == .manual && vm.supportsReasoningForSelectedModel {
-                Text("·").foregroundColor(DS.Palette.textTertiary)
-                Text(effortLabel).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            if vm.routingMode == .manual && vm.serviceTier == .fast {
-                Text("·").foregroundColor(DS.Palette.textTertiary)
-                Text(serviceTierLabel).font(DS.Font.caption).foregroundColor(DS.Palette.warning)
-                    .lineLimit(1)
-            }
-            // IMP-MAC_AGENT-014: surface the model's context window on the pill so
-            // the active limit is visible at a glance without opening the popover.
-            if vm.routingMode == .manual, let ctx = vm.selectedModelContextWindowLabel {
-                Text("·").foregroundColor(DS.Palette.textTertiary)
-                Text(ctx).font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(1)
-            }
-            Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
-                .foregroundColor(DS.Palette.textTertiary)
-        }
-        .frame(width: currentModelMenuLabelWidth, alignment: .trailing)
-        .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(Capsule())
-        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-    }
-
     private func compactMenuSection(_ title: String) -> some View {
-        Text(title)
-            .font(DS.Font.caption2.weight(.semibold))
-            .foregroundColor(DS.Palette.textTertiary)
-            .padding(.top, DS.Space.xs)
-            .fixedSize(horizontal: true, vertical: false)
+        AgentCompactMenuSection(title)
     }
 
     private func compactMenuRow(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10, weight: .semibold))
-                    .frame(width: 12)
-                    .opacity(selected ? 1 : 0)
-                Text(title)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.text)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, DS.Space.xs)
-            .padding(.vertical, DS.Space.xs)
-            .frame(width: compactModelMenuWidth, alignment: .leading)
-            .background(selected ? DS.Palette.selection : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-        }
-        .buttonStyle(.plain)
+        AgentCompactMenuRow(title, selected: selected, width: compactModelMenuWidth, action: action)
     }
 
     private var compactMenuDivider: some View {
-        Rectangle()
-            .fill(DS.Palette.line)
-            .frame(height: DS.Border.hairline)
-            .padding(.vertical, DS.Space.xs)
-            .frame(width: compactModelMenuWidth)
+        AgentCompactMenuDivider(width: compactModelMenuWidth)
     }
 
     // UX-MAC_AGENT-013: inline custom-model field, no blocking modal. Validates
@@ -17817,353 +17206,6 @@ enum ScrollPinPolicy {
     }
 }
 
-/// Auto-follow + pin/unpin for the timeline, driven from the AppKit layer where the
-/// real post-layout geometry lives. This replaced a timer-based SwiftUI heuristic
-/// (a 0.4s guard window + a 180ms reveal Task + a DragGesture) that was both racy and
-/// blind to trackpad/wheel scrolls — it only watched DragGesture, so a two-finger
-/// scroll-up during a fast stream was silently ignored, and the 0.4s guard could
-/// swallow a genuine scroll-away. Two AppKit facts make this version deterministic:
-///
-///   • Unpin only when the scroll is **user-owned** (live scroll / wheel) AND the
-///     flip-normalized origin moves toward top while away from bottom. Content
-///     growth, Lazy height jumps, and programmatic snaps also move origin — those
-///     must not clear the pin (matches iOS `userOwnedScrollPhase`).
-///   • When pinned, we re-scroll the clip to the document's true bottom on every
-///     content-growth notification (i.e. AFTER layout), so a stream always lands
-///     exactly at the bottom instead of a frame short.
-///
-/// Crucially this writes SwiftUI @State only on an actual pin<->unpin transition
-/// (never per streaming delta), so it cannot reintroduce the layout-storm freeze
-/// (PERF-MAC_AGENT-021). Sticky local detach prevents stream `updateNSView` from
-/// re-arming pin before geometry is at bottom (council T-002).
-private struct TimelineScrollFollower: NSViewRepresentable {
-    let slack: CGFloat
-    let pinned: Bool
-    let pinForceToken: Int
-    let onScrolledAway: () -> Void
-    let onReturnedToBottom: () -> Void
-
-    func makeNSView(context: Context) -> FollowerView {
-        let view = FollowerView()
-        view.configure(
-            slack: slack,
-            pinned: pinned,
-            pinForceToken: pinForceToken,
-            onScrolledAway: onScrolledAway,
-            onReturnedToBottom: onReturnedToBottom
-        )
-        return view
-    }
-
-    func updateNSView(_ view: FollowerView, context: Context) {
-        view.configure(
-            slack: slack,
-            pinned: pinned,
-            pinForceToken: pinForceToken,
-            onScrolledAway: onScrolledAway,
-            onReturnedToBottom: onReturnedToBottom
-        )
-        view.attach()
-    }
-
-    final class FollowerView: NSView {
-        private var slack: CGFloat = 4
-        private var pinned: Bool = true
-        private var lastPinForceToken: Int = 0
-        private var onScrolledAway: (() -> Void)?
-        private var onReturnedToBottom: (() -> Void)?
-
-        private weak var scrollView: NSScrollView?
-        private var clipObserver: NSObjectProtocol?
-        private var docObserver: NSObjectProtocol?
-        private var liveScrollStartObserver: NSObjectProtocol?
-        private var liveScrollEndObserver: NSObjectProtocol?
-        /// True between willStartLiveScroll and didEndLiveScroll (user gesture).
-        private var userOwnedLiveScroll = false
-        private var lastOriginY: CGFloat = 0
-        private var lastAtBottom: Bool?
-        private var pendingBottomSnap = false
-        private var pendingBottomSnapWorkItem: DispatchWorkItem?
-        /// Growth arrived while a snap was already queued — run another pass after.
-        private var snapDirty = false
-        private var lastBottomSnapAt: TimeInterval = 0
-        /// ~1 frame at 60Hz: keep follow tight on dense shell streams without
-        /// hammering layout every token.
-        private let minimumBottomSnapInterval: TimeInterval = 0.05
-        private var attachRetryCount = 0
-        private let maxAttachRetries = 8
-        #if DEBUG
-        private var didLogDetach = false
-        #endif
-
-        func configure(
-            slack: CGFloat,
-            pinned: Bool,
-            pinForceToken: Int,
-            onScrolledAway: @escaping () -> Void,
-            onReturnedToBottom: @escaping () -> Void
-        ) {
-            self.slack = slack
-            self.onScrolledAway = onScrolledAway
-            self.onReturnedToBottom = onReturnedToBottom
-
-            let forceTokenChanged = pinForceToken != lastPinForceToken
-            if forceTokenChanged {
-                lastPinForceToken = pinForceToken
-            }
-
-            if !pinned {
-                // Always honor SwiftUI detach immediately; cancel any pending snap.
-                if self.pinned {
-                    cancelPendingSnap()
-                }
-                self.pinned = false
-            } else {
-                let atBottom = geometry()?.atBottom ?? false
-                let accept = ScrollBottomGeometry.shouldAcceptSwiftUIPin(
-                    localPinned: self.pinned,
-                    swiftUIPinned: true,
-                    forceTokenChanged: forceTokenChanged,
-                    geometricallyAtBottom: atBottom
-                )
-                if accept {
-                    self.pinned = true
-                    if forceTokenChanged {
-                        // FAB / send / open: snap now that pin is re-armed.
-                        scheduleScrollToBottom()
-                    }
-                }
-                // else: sticky detach — stream body still reports pinned:true
-            }
-        }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            attachRetryCount = 0
-            DispatchQueue.main.async { [weak self] in self?.attach() }
-        }
-
-        deinit {
-            removeObservers()
-            pendingBottomSnapWorkItem?.cancel()
-        }
-
-        private func removeObservers() {
-            if let clipObserver { NotificationCenter.default.removeObserver(clipObserver) }
-            if let docObserver { NotificationCenter.default.removeObserver(docObserver) }
-            if let liveScrollStartObserver {
-                NotificationCenter.default.removeObserver(liveScrollStartObserver)
-            }
-            if let liveScrollEndObserver {
-                NotificationCenter.default.removeObserver(liveScrollEndObserver)
-            }
-            clipObserver = nil
-            docObserver = nil
-            liveScrollStartObserver = nil
-            liveScrollEndObserver = nil
-        }
-
-        func attach() {
-            guard let scroll = enclosingScrollView else {
-                // Hosting rebuild: retry a few frames so pin never silently detaches.
-                if attachRetryCount < maxAttachRetries {
-                    attachRetryCount += 1
-                    DispatchQueue.main.async { [weak self] in self?.attach() }
-                } else {
-                    #if DEBUG
-                    if !didLogDetach {
-                        didLogDetach = true
-                        NSLog("TimelineScrollFollower: enclosingScrollView nil after retries — auto-scroll pin inactive")
-                    }
-                    #endif
-                }
-                return
-            }
-            attachRetryCount = 0
-            guard scroll !== scrollView else { return }
-            removeObservers()
-            scrollView = scroll
-            let clip = scroll.contentView
-            clip.postsBoundsChangedNotifications = true
-            clipObserver = NotificationCenter.default.addObserver(
-                forName: NSView.boundsDidChangeNotification, object: clip, queue: .main
-            ) { [weak self] _ in self?.handleScroll() }
-            if let doc = scroll.documentView {
-                doc.postsFrameChangedNotifications = true
-                docObserver = NotificationCenter.default.addObserver(
-                    forName: NSView.frameDidChangeNotification, object: doc, queue: .main
-                ) { [weak self] _ in self?.handleContentGrowth() }
-            }
-            // User-owned scroll phase (iOS parity). Programmatic scroll(to:) and
-            // content growth do not post these — so layout jitter cannot unpin.
-            liveScrollStartObserver = NotificationCenter.default.addObserver(
-                forName: NSScrollView.willStartLiveScrollNotification,
-                object: scroll,
-                queue: .main
-            ) { [weak self] _ in self?.userOwnedLiveScroll = true }
-            liveScrollEndObserver = NotificationCenter.default.addObserver(
-                forName: NSScrollView.didEndLiveScrollNotification,
-                object: scroll,
-                queue: .main
-            ) { [weak self] _ in
-                guard let self else { return }
-                self.userOwnedLiveScroll = false
-                // Settle: user may have dragged back to bottom — re-evaluate pin.
-                self.handleScroll()
-            }
-            lastOriginY = clip.bounds.origin.y
-            handleScroll()
-        }
-
-        /// True when the current bounds change is attributable to the user
-        /// (trackpad/wheel live scroll or in-flight scroll-wheel event).
-        private var isUserOwnedScroll: Bool {
-            if userOwnedLiveScroll { return true }
-            guard let event = NSApp.currentEvent else { return false }
-            switch event.type {
-            case .scrollWheel, .magnify:
-                return ScrollPinPolicy.isRecentScrollInput(
-                    eventTimestamp: event.timestamp,
-                    now: ProcessInfo.processInfo.systemUptime
-                )
-            default:
-                return false
-            }
-        }
-
-        private func geometry() -> (origin: CGFloat, gap: CGFloat, atBottom: Bool, isFlipped: Bool)? {
-            guard let scroll = scrollView, let doc = scroll.documentView else { return nil }
-            // Never force layout here. This method runs from updateNSView and from
-            // frame/bounds notifications that NSHostingView can emit mid-layout;
-            // recursively flushing the document produces SwiftUI's reentrant-layout
-            // fault on every dense provider delta. Those callbacks already expose the
-            // latest completed geometry, and a trailing snap handles later growth.
-            let origin = scroll.contentView.bounds.origin.y
-            let visible = scroll.contentView.bounds.height
-            let content = max(doc.bounds.height, doc.frame.height)
-            let flipped = doc.isFlipped
-            let gap = ScrollBottomGeometry.gap(
-                documentHeight: content,
-                visibleOriginY: origin,
-                visibleHeight: visible,
-                isFlipped: flipped
-            )
-            return (origin, gap, gap <= slack, flipped)
-        }
-
-        // The clip view moved. Reaching the bottom re-pins; only a *user-owned*
-        // origin move toward top while away from bottom unpins (audit mode).
-        private func handleScroll() {
-            guard let g = geometry() else { return }
-            let delta = ScrollBottomGeometry.originDeltaTowardTop(
-                previousOriginY: lastOriginY,
-                currentOriginY: g.origin,
-                isFlipped: g.isFlipped
-            )
-            defer { lastOriginY = g.origin }
-            // Ignore origin noise while a programmatic snap is in flight.
-            if pendingBottomSnap {
-                if g.atBottom { report(atBottom: true) }
-                return
-            }
-            switch ScrollPinPolicy.evaluate(
-                originDelta: delta,
-                gap: g.gap,
-                slack: slack,
-                userOwned: isUserOwnedScroll
-            ) {
-            case .reachedBottom:  report(atBottom: true)
-            case .scrolledAway:   report(atBottom: false)
-            case .unchanged:      break
-            }
-        }
-
-        // The document grew/shrank (a streaming delta, a new row). While pinned, snap the
-        // clip back to the true bottom now that layout has settled.
-        private func handleContentGrowth() {
-            guard let g = geometry() else { return }
-            if pinned, g.gap > slack {
-                scheduleScrollToBottom()
-            } else if g.atBottom {
-                report(atBottom: true)
-            }
-        }
-
-        private func cancelPendingSnap() {
-            pendingBottomSnapWorkItem?.cancel()
-            pendingBottomSnapWorkItem = nil
-            pendingBottomSnap = false
-            snapDirty = false
-        }
-
-        private func scheduleScrollToBottom() {
-            // Mark dirty so continuous stream growth while a snap is queued still
-            // lands a trailing pass (old `guard !pending` dropped mid-burst growth).
-            snapDirty = true
-            guard !pendingBottomSnap else { return }
-            pendingBottomSnap = true
-            let now = ProcessInfo.processInfo.systemUptime
-            let delay = max(0, minimumBottomSnapInterval - (now - lastBottomSnapAt))
-            let workItem = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                self.pendingBottomSnap = false
-                self.pendingBottomSnapWorkItem = nil
-                guard self.pinned else {
-                    self.snapDirty = false
-                    return
-                }
-                let hadWork = self.snapDirty
-                self.snapDirty = false
-                guard hadWork, let g = self.geometry() else { return }
-                if g.gap > self.slack {
-                    self.scrollToBottom()
-                    // One bounded re-snap if layout grew again during the scroll.
-                    if let after = self.geometry(), after.gap > self.slack, self.pinned {
-                        self.scrollToBottom()
-                    }
-                } else if g.atBottom {
-                    self.report(atBottom: true)
-                }
-                // Growth arrived while we were snapping — schedule another pass.
-                if self.snapDirty && self.pinned {
-                    self.scheduleScrollToBottom()
-                }
-            }
-            pendingBottomSnapWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
-        }
-
-        private func scrollToBottom() {
-            guard let scroll = scrollView, let doc = scroll.documentView else { return }
-            // scheduleScrollToBottom runs on a trailing MainActor turn. Read the
-            // completed frame directly instead of recursively laying out SwiftUI.
-            let visible = scroll.contentView.bounds.height
-            let content = max(doc.bounds.height, doc.frame.height)
-            let targetY = ScrollBottomGeometry.maxScrollOriginY(
-                documentHeight: content,
-                visibleHeight: visible,
-                isFlipped: doc.isFlipped
-            )
-            scroll.contentView.scroll(to: NSPoint(x: 0, y: targetY))
-            scroll.reflectScrolledClipView(scroll.contentView)
-            lastOriginY = targetY
-            lastBottomSnapAt = ProcessInfo.processInfo.systemUptime
-        }
-
-        private func report(atBottom: Bool) {
-            guard atBottom != lastAtBottom else { return }
-            lastAtBottom = atBottom
-            pinned = atBottom
-            if atBottom {
-                onReturnedToBottom?()
-            } else {
-                cancelPendingSnap()
-                onScrolledAway?()
-            }
-        }
-    }
-}
-
 // PERF-MAC_AGENT-004: 1s cadence for the first minute, 5s after, so the
 // "Working for Xs" row stops forcing a re-render every second on long runs.
 private struct ElapsedTickSchedule: TimelineSchedule {
@@ -18313,6 +17355,58 @@ public enum AgentSourceCapsulePresentation {
         }
 
         return entries
+    }
+
+    public static func helpText(
+        canSwitch: Bool,
+        runLocked: Bool,
+        providerLocked: Bool,
+        unavailableReason: String?
+    ) -> String {
+        if runLocked { return "Account is fixed while a run is active" }
+        if providerLocked {
+            return "Account is fixed after the first message. Start a new thread to use a different account."
+        }
+        if let unavailableReason, !unavailableReason.isEmpty { return unavailableReason }
+        if !canSwitch { return "Account / source for this agent run" }
+        return "Choose which ChatGPT / Claude / Grok account runs this thread"
+    }
+
+    public static func switchHint(canSwitch: Bool, helpText: String) -> String {
+        canSwitch
+            ? "Choose which ChatGPT, Claude, or Grok account runs this thread"
+            : helpText
+    }
+
+    public struct LockNotice: Equatable {
+        public let text: String
+        public let isWarning: Bool
+        public let wraps: Bool
+    }
+
+    public static func lockNotice(
+        runLocked: Bool,
+        providerLocked: Bool,
+        unavailableReason: String?,
+        entryCount: Int
+    ) -> LockNotice? {
+        if runLocked {
+            return LockNotice(text: "Account is fixed while a run is active", isWarning: false, wraps: false)
+        }
+        if providerLocked {
+            return LockNotice(
+                text: "Account is fixed after the first message. Start a new thread to use a different account.",
+                isWarning: false,
+                wraps: true
+            )
+        }
+        if let unavailableReason, !unavailableReason.isEmpty {
+            return LockNotice(text: unavailableReason, isWarning: true, wraps: true)
+        }
+        if entryCount <= 1 {
+            return LockNotice(text: "Only one account is available", isWarning: false, wraps: false)
+        }
+        return nil
     }
 
     private static func primaryLabel(
@@ -18545,25 +17639,6 @@ private struct TabColorMenuLabel: View {
         }
         image.isTemplate = false
         return image
-    }
-}
-
-// F34: effort semantics are non-obvious — especially "Ultracode" vs "Max" vs
-// "Extra High" — so the picker rows carry tooltips that spell out what each
-// level buys (and costs) before the user commits to it. Ultracode is not a
-// plain effort value: it is xhigh effort plus standing workflow orchestration
-// (see AgentReasoningEffort.claudeSupportedCases).
-extension AgentReasoningEffort {
-    var pickerHelpText: String {
-        switch self {
-        case .minimal: return "Fastest — minimal reasoning"
-        case .low: return "Light reasoning for simple tasks"
-        case .medium: return "Balanced reasoning (default)"
-        case .high: return "Deeper reasoning for harder tasks"
-        case .xhigh: return "Very deep reasoning for hard problems"
-        case .max: return "Deepest reasoning the model supports — slowest, most tokens"
-        case .ultracode: return "Extra High effort + autonomous workflow orchestration"
-        }
     }
 }
 

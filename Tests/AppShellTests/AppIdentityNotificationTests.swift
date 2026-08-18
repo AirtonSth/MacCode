@@ -126,12 +126,18 @@ final class AppIdentityNotificationTests: XCTestCase {
         let updates = try XCTUnwrap(source.range(of: "title: vm.updateActionTitle"))
 
         let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
-        XCTAssertLessThan(account.lowerBound, reportBug.lowerBound,
-                          "logged-in account avatar must stay before Report Bug in the sidebar header")
+        XCTAssertLessThan(toggle.lowerBound, reportBug.lowerBound,
+                          "Hide Sidebar is the leftmost icon in the header cluster, not under the traffic lights")
         XCTAssertLessThan(reportBug.lowerBound, settings.lowerBound,
                           "Report Bug is the ladybug icon immediately left of the Settings cog")
-        XCTAssertLessThan(settings.lowerBound, toggle.lowerBound,
-                          "Settings must stay as the cog icon directly before the sidebar toggle")
+        XCTAssertLessThan(settings.lowerBound, account.lowerBound,
+                          "the account avatar is the rightmost header control")
+        let headerStart = try XCTUnwrap(source.range(of: "HStack(spacing: 2)"))
+        let header = source[headerStart.lowerBound...]
+        let spacer = try XCTUnwrap(header.range(of: "Spacer(minLength: 0)"))
+        let toggleInHeader = try XCTUnwrap(header.range(of: "Button { vm.toggleSidebar() }"))
+        XCTAssertLessThan(spacer.lowerBound, toggleInHeader.lowerBound,
+                          "Spacer must push Hide Sidebar into the right-side icon cluster")
         XCTAssertLessThan(newWorkspace.lowerBound, updates.lowerBound,
                           "the update/check action belongs below Settings, not above New Workspace")
         XCTAssertTrue(source.contains("Text(title)\n                .font(DS.Font.body)"),

@@ -607,6 +607,50 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
 
         let reduced = AgentModelPopoverPresentation(mode: .auto, reduceMotion: true)
         XCTAssertEqual(reduced.transition, .none)
+
+        let current = AgentModelPopoverPresentation.current(mode: .auto, autoRoutingLoading: true)
+        XCTAssertEqual(current.mode, .auto)
+        XCTAssertTrue(current.showsDisclaimer)
+        XCTAssertTrue(current.showsAutoLoadingIndicator)
+        XCTAssertFalse(current.autoToggleEnabled)
+    }
+
+    func test_agentAndBotsShareTheSameAutoPopoverChrome() throws {
+        // WHY: Desk Auto used to be a header-only fork. Auto-on must paint
+        // the same orchestration card from one component, not a second copy.
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let chrome = try String(
+            contentsOf: repo.appendingPathComponent("Sources/Surfaces/AgentModelPopover.swift"),
+            encoding: .utf8
+        )
+        let agent = try String(
+            contentsOf: repo.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let bots = try String(
+            contentsOf: repo.appendingPathComponent("Sources/AppShell/BotsWindow.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(chrome.contains("struct AgentModelPopoverChrome"))
+        XCTAssertTrue(chrome.contains("struct AgentModelAutoRoutingCard"))
+        XCTAssertTrue(chrome.contains("agent.model.auto.card"))
+        XCTAssertTrue(chrome.contains(AgentModelPopoverPresentation.autoDisclaimer))
+        XCTAssertTrue(chrome.contains(AgentModelPopoverPresentation.autoStatus))
+
+        XCTAssertTrue(agent.contains("AgentModelPopoverChrome("))
+        XCTAssertFalse(
+            agent.contains("private func autoRoutingCard"),
+            "Agent App must not keep a private Auto card after the shared chrome exists"
+        )
+        XCTAssertTrue(bots.contains("AgentModelPopoverChrome("))
+        XCTAssertFalse(
+            bots.contains(AgentModelPopoverPresentation.autoDisclaimer),
+            "Bots Desk must not recopy the Auto card; use AgentModelPopoverChrome"
+        )
     }
 
     func testProviderSnapshotLoadingStateCoversTheWholeStartupLoad() async throws {

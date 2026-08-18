@@ -104,6 +104,32 @@ public final class PetController {
             markNotificationRead: { try router.notificationMarkRead(id: $0) },
             workspaceNameProvider: { [weak context] workspaceID in
                 context?.state.workspaces[workspaceID]?.name
+            },
+            destLookup: { [weak context] in
+                guard let store = context?.botStore else {
+                    return PetDestAttentionSnapshot(bots: [], conversations: [], attention: [])
+                }
+                return PetDestAttentionSnapshot(
+                    bots: try store.list(),
+                    conversations: try store.listConversations(
+                        attentionStates: [.unreadActivity, .needsAttention]
+                    ),
+                    attention: try store.listAttention(),
+                    linkedThreadIDs: try store.listLinkedAgentThreadIDs()
+                )
+            },
+            markBotConversationViewed: { [weak context] conversationID in
+                guard let store = context?.botStore,
+                      var conversation = try store.conversation(id: conversationID) else { return }
+                conversation.unread = false
+                if conversation.attentionState == .unreadActivity {
+                    conversation.attentionState = .none
+                }
+                conversation.updatedAt = Date()
+                try store.upsertConversation(conversation)
+            },
+            acknowledgeBotAttention: { [weak context] itemID in
+                try context?.botStore.acknowledgeAttention(id: itemID)
             }
         )
         self.notificationRecorder = PetTerminalNotificationRecorder(
@@ -263,6 +289,7 @@ public final class PetController {
         "notification.created", "notification.read", "notification.dismissed",
         "agent.thread.read", "agent.thread.updated", "agent.thread.deleted",
         "agent.thread.deleted_many",
+        "bots.attention.changed",
     ]
 
     private static func isPotentialProjectionKind(_ kind: String) -> Bool {
@@ -1027,7 +1054,22 @@ public final class PetController {
                 lastUpdatePreview: self.lastUpdatePreviewByThread[threadID]
             )
         }
-        model.apply(activeThreads: items)
+        let destNames = Dictionary(uniqueKeysWithValues: ((try? context.botStore.list()) ?? []).map { ($0.id, $0.name) })
+        let remapped = items.map { item -> PetActiveThreadItem in
+            guard let botID = (try? context.botStore.conversationLinked(to: item.threadID))?.botID else {
+                return item
+            }
+            return PetActiveThreadItem(
+                threadID: item.threadID,
+                workspaceID: nil,
+                workspaceName: "Bots",
+                threadTitle: destNames[botID],
+                startedAt: startedAtByThread[item.threadID],
+                lastUpdatePreview: item.lastUpdatePreview,
+                route: .botsDesk(botID: botID)
+            )
+        }
+        model.apply(activeThreads: remapped)
         // User-visible Active is empty → pet must leave work/plan even if EventBus
         // still holds a ghost run id (missed finished / stale projection lag).
         if threadIDs.isEmpty, reducer.activeRunCount > 0 || PetEventReducer.isWorkPose(model.animationState) {
@@ -1076,6 +1118,12 @@ public final class PetController {
                 && destinationWindowIsKey(destinationWindow)
         case .settings(let settingsRoute):
             return openSettings(settingsRoute)
+        case .botsDesk(let botID):
+            guard try router.openBotsDesk(botID: botID) else { return false }
+            let destination = router.windowController?.window
+            return destination?.isVisible == true
+                && destination?.isMiniaturized == false
+                && destinationWindowIsKey(destination!)
         }
     }
 

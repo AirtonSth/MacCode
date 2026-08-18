@@ -40,6 +40,16 @@ public enum BotBlobatarExpression: String, CaseIterable, Sendable {
     public var displayName: String {
         rawValue.capitalized
     }
+
+    /// Face follows what is happening to the bot. Studio does not pick this.
+    public static func live(for attention: BotAttentionState) -> BotBlobatarExpression {
+        switch attention {
+        case .none: return .idle
+        case .working: return .happy
+        case .unreadActivity: return .sad
+        case .needsAttention: return .mad
+        }
+    }
 }
 
 public enum BotBlobatarBackground: String, CaseIterable, Sendable {
@@ -115,6 +125,14 @@ public struct BotBlobatarSpec: Equatable, Sendable {
 
     public var isDefaultAppearance: Bool {
         shape == .auto && expression == .idle && background == .none && hue == .auto
+    }
+
+    /// Paint-time face: live attention, never a plate.
+    public func liveFaced(attention: BotAttentionState) -> BotBlobatarSpec {
+        var next = self
+        next.expression = .live(for: attention)
+        next.background = .none
+        return next
     }
 
     /// User picked something in Studio, or a leftover custom token.

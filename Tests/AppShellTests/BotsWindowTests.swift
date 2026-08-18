@@ -16,6 +16,7 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.screen")
         UserDefaults.standard.removeObject(forKey: "bots.studioTab")
         UserDefaults.standard.removeObject(forKey: "bots.deskSidePane")
+        UserDefaults.standard.removeObject(forKey: "bots.deskSidePaneWidth")
         UserDefaults.standard.removeObject(forKey: "bots.showHidden")
         UserDefaults.standard.removeObject(forKey: "bots.brainPane")
         UserDefaults.standard.removeObject(forKey: "bots.queuedFollowUps")
@@ -25,6 +26,7 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.searchText")
         UserDefaults.standard.removeObject(forKey: "bots.deskRouting")
         UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+        UserDefaults.standard.removeObject(forKey: "bots.unpublishedNewBotIDs")
     }
 
     override func tearDown() {
@@ -80,6 +82,42 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try store.validatedForRetry(sent), sent)
         XCTAssertTrue(sent.path.hasPrefix(store.root.path + "/"))
         router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
+    }
+
+    func test_deskSendDoesNotRelistProviders_becauseAgentAppDoesNotProbeCatalogOnSend() async throws {
+        // WHY: Agent App send uses the dest catalog already in memory.
+        // Desk send used to listAgentProviderSnapshots inside preflight
+        // (Grok ACP + Anthropic + Codex) before startRun — that is the
+        // wait behind Loading….
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        context.coordinator.replaceProvider(
+            .claude,
+            runner: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: "ok"))
+        )
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "claude"
+        )
+        router.rememberProviderSnapshotsForSend([snapshot])
+        router.preflightListedProviderSnapshotsForTesting = false
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.claude)
+        let exp = expectation(description: "send preflight resolved from dest cache")
+        router.sendAgentMessageAfterPreflightProbeForTesting = { exp.fulfill() }
+        XCTAssertTrue(vm.send("oi"))
+        await fulfillment(of: [exp], timeout: 5)
+        XCTAssertFalse(
+            router.preflightListedProviderSnapshotsForTesting,
+            "send preflight must use the dest catalog, not rediscover models"
+        )
+        router.sendAgentMessageAfterPreflightProbeForTesting = nil
     }
 
     func test_deskSendLoadingSurvivesRosterReopen_becauseSendMustStayAcknowledged() throws {
@@ -528,6 +566,154 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.studio"))
     }
 
+    func test_deskIdentityOpensStudio() throws {
+        // WHY: The labeled Studio button competed with Chat. Identity and a
+        // cog must dest to Studio; the inspector toggle stays last on the right.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.openStudio(bot)
+        XCTAssertEqual(vm.screen, .studio)
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private func deskHeader") else {
+            return XCTFail("desk header must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private func deskChat")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("bots.desk.identity"))
+        XCTAssertTrue(slice.contains("gearshape"))
+        XCTAssertFalse(slice.contains("Button(\"Studio\")"))
+        let studio = slice.range(of: "bots.desk.studio")?.lowerBound
+        let toggle = slice.range(of: "bots.desk.inspectorToggle")?.lowerBound
+        XCTAssertNotNil(studio)
+        XCTAssertNotNil(toggle)
+        XCTAssertLessThan(studio!, toggle!)
+    }
+
+    func test_deskSidePaneResizesLikeOtherPanels_becauseWidthMustNotStayCapped() throws {
+        // WHY: Files and the shell sidebar drag with DSResizeDivider and
+        // persist width. Desk inspector was a fixed 340–420 strip, so the
+        // owner could not match those panels.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        XCTAssertEqual(vm.deskSidePaneWidth, BotsChrome.desktopPaneWidth)
+        vm.resizeDeskSidePane(by: 80)
+        XCTAssertEqual(vm.deskSidePaneWidth, 420)
+        vm.resizeDeskSidePane(by: 400)
+        XCTAssertEqual(vm.deskSidePaneWidth, BotsChrome.desktopPaneMaxWidth)
+        vm.resizeDeskSidePane(by: -1000)
+        XCTAssertEqual(vm.deskSidePaneWidth, BotsChrome.desktopPaneMinWidth)
+
+        UserDefaults.standard.set(480.0, forKey: "bots.deskSidePaneWidth")
+        let restored = BotsViewModel(context: context)
+        XCTAssertEqual(restored.deskSidePaneWidth, 480)
+
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private func deskChat") else {
+            return XCTFail("desk chat must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private func deskDesktopPane")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("DSResizeDivider"))
+        XCTAssertTrue(slice.contains("Resize inspector"))
+        XCTAssertTrue(slice.contains("resizeDeskSidePane(by: -delta)"))
+        XCTAssertTrue(slice.contains(".frame(width: vm.deskSidePaneWidth)"))
+        XCTAssertFalse(slice.contains("maxWidth: 420"))
+    }
+
+    func test_deskHeaderIsToolbarSized_becauseTheShellTitlebarAlreadyWentAway() throws {
+        // WHY: Removing the shell "Bots" bar left Desk in the titlebar
+        // inset with title2 + xl padding. That read as a second titlebar.
+        // Identity must sit in a 44pt chrome strip like a workspace row.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("ignoresSafeArea(.container, edges: .top)"))
+        guard let start = source.range(of: "private func deskHeader") else {
+            return XCTFail("desk header must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private func deskChat")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("DS.Font.bodyStrong"))
+        XCTAssertTrue(slice.contains("size: 22"))
+        XCTAssertTrue(slice.contains(".frame(height: 44)"))
+        XCTAssertFalse(slice.contains("DS.Font.title2"))
+        XCTAssertFalse(slice.contains("padding(.vertical, DS.Space.xl)"))
+    }
+
+    func test_deskHeaderOpenInNewWindowSitsAfterStudioCog() throws {
+        // WHY: Agentic pops a workspace with rectangle.on.rectangle. The
+        // cog row is the bot chrome; the pop-out must sit after Studio and
+        // before the inspector toggle, and vanish in the detached window.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private func deskHeader") else {
+            return XCTFail("desk header must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private func deskChat")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        let studio = try XCTUnwrap(slice.range(of: "bots.desk.studio")?.lowerBound)
+        let pop = try XCTUnwrap(slice.range(of: "bots.desk.openInNewWindow")?.lowerBound)
+        let toggle = try XCTUnwrap(slice.range(of: "bots.desk.inspectorToggle")?.lowerBound)
+        XCTAssertLessThan(studio, pop)
+        XCTAssertLessThan(pop, toggle)
+        XCTAssertTrue(slice.contains("rectangle.on.rectangle"))
+        XCTAssertTrue(slice.contains("Open in New Window"))
+        XCTAssertTrue(slice.contains("if !vm.presentsAsDetachedWindow"))
+        XCTAssertTrue(source.contains("class BotDeskWindowController"))
+        XCTAssertTrue(source.contains("embedsRosterRail: false"))
+        XCTAssertTrue(
+            slice.contains("HStack(spacing: Self.deskHeaderIconSpacing)"),
+            "Studio / pop-out / inspector must cluster, not inherit the header's Space.md"
+        )
+        XCTAssertTrue(
+            source.contains("DS.Space.xs - (DSIconButton.hitTargetSize - DSIconButton.visualSize.width)"),
+            "Desk header glyphs must sit Space.xs apart like workspace header icons"
+        )
+    }
+
+    func test_openBotInNewWindowReusesWindow_andLeavesMainDesk() throws {
+        // WHY: A second click must focus the same window. Pop-out is not
+        // workspace eviction; the main Desk selection must stay put.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        let controller = MainWindowController(context: context, router: router)
+        router.windowController = controller
+        defer {
+            controller.botWindow(for: bot.id)?.orderOut(nil)
+            controller.window.orderOut(nil)
+        }
+        controller.openBotInNewWindow(bot.id)
+        let first = try XCTUnwrap(controller.botWindow(for: bot.id))
+        controller.openBotInNewWindow(bot.id)
+        XCTAssertTrue(controller.botWindow(for: bot.id) === first)
+        XCTAssertEqual(vm.selectedBotID, bot.id)
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertFalse(vm.presentsAsDetachedWindow)
+    }
+
+    func test_botsHidesShellWorkspaceHeader_becauseDeskAlreadyHasTheBotHeader() throws {
+        // WHY: The shell "Bots" bar sat above Desk's identity header.
+        // Desk is the title. Hide that chrome row when the sidebar is open;
+        // collapsed still needs it for the sidebar toggle.
+        let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
+        XCTAssertTrue(main.contains("applyWorkspaceHeaderVisibility"))
+        XCTAssertTrue(
+            main.contains("sidebarCollapsed || shellContentMode == .bots"),
+            "Bots must drop the visible workspace header, not only when the sidebar is collapsed"
+        )
+        XCTAssertTrue(
+            main.contains("workspaceContentTopConstraint?.constant = hideVisible ? 0 : collapsedHeaderHeight"),
+            "hiding the bar without collapsing the inset leaves a 34pt gap"
+        )
+    }
+
     func test_deskWorkingLabelFollowsALiveWorkLog_becauseDeskMustShowWorking() throws {
         // WHY: a supervised run in Working must surface the Agent App thinking
         // label on Desk, not only the work-log status pill.
@@ -838,8 +1024,8 @@ final class BotsWindowTests: XCTestCase {
         let end = rest.range(of: "\n    private func ")?.lowerBound ?? rest.endIndex
         let slice = String(source[start.lowerBound..<end])
         XCTAssertTrue(
-            slice.contains("vm.openDesk(bot)"),
-            "clicking a roster bot must call openDesk, not openHome"
+            slice.contains("vm.openDeskFromRoster(bot)"),
+            "clicking a roster bot must dest Desk, not openHome"
         )
         XCTAssertFalse(
             slice.contains("vm.openHome(bot)"),
@@ -852,6 +1038,53 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(
             slice.contains("botManagementButtons"),
             "roster menu must share Fleet's Pin/Hide/Duplicate/Edit/Delete, not a one-off Delete"
+        )
+        let rowEnd = rest.range(of: "\n@MainActor")?.lowerBound ?? end
+        let row = String(source[start.lowerBound..<rowEnd])
+        XCTAssertTrue(
+            row.contains(".padding(.horizontal, DS.Space.sm)"),
+            "roster rows must use the same horizontal inset as workspace rows"
+        )
+        XCTAssertTrue(
+            row.contains("size: 16"),
+            "the avatar must sit inside the 20pt workspace icon slot, not overflow into the rail margin"
+        )
+        XCTAssertTrue(row.contains(".frame(width: 20, height: 20)"))
+        XCTAssertFalse(
+            row.contains("size: 22"),
+            "a 22pt blob in a 20pt slot eats the Space.sm inset the folder icon keeps"
+        )
+    }
+
+    func test_rosterSelectionUsesAvatarInk_becauseWorkspaceRowsTintFromIdentity() throws {
+        // WHY: Workspace rows wash the selected plate with the folder
+        // color. A bot row must use the painted avatar, not the generic
+        // selection gray.
+        let pink = BotBlobatarSpec(hue: .named("pink"))
+        XCTAssertEqual(
+            BotsChrome.identityHex(name: "Ceo", handle: "ceo", symbol: pink.token),
+            BotBlobatar.figure(name: "Ceo", spec: pink, handle: "ceo").palette.head
+        )
+        XCTAssertEqual(
+            BotsChrome.identityHex(name: "Ceo", handle: "ceo", symbol: "person.crop.circle"),
+            BotsChrome.avatarHex(for: "ceo")
+        )
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private func rosterRow") else {
+            return XCTFail("roster row must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private func ")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("BotsChrome.identityColor"))
+        XCTAssertTrue(slice.contains("identity.opacity(0.22)"))
+        XCTAssertFalse(
+            slice.contains("DS.Palette.selection"),
+            "selected bot rows must not use the generic workspace-less gray"
+        )
+        XCTAssertFalse(
+            slice.contains("DS.Palette.accent"),
+            "the leading bar must follow the avatar, not the app accent"
         )
     }
 
@@ -884,7 +1117,20 @@ final class BotsWindowTests: XCTestCase {
             studio.contains("backButton"),
             "Studio Back is the real dest back to Chat"
         )
-        XCTAssertTrue(studio.contains("vm.openDesk(bot)"))
+        XCTAssertTrue(
+            studio.contains("requestLeaveUnsavedNewBot"),
+            "Studio Back must confirm unsaved New Bot before desting Chat"
+        )
+        XCTAssertTrue(studio.contains("leaveStudioAfterUnsavedGate"))
+        XCTAssertTrue(
+            studio.contains("studioHeaderNotify"),
+            "Notify lives in the header so it stays reachable on Files and Security"
+        )
+        XCTAssertTrue(studio.contains("bots.studio.notifications"))
+        XCTAssertFalse(
+            source.contains("private var studioNotifications"),
+            "a Profile notifications section would bury the switch under the fold"
+        )
     }
 
     func test_rosterDeleteUsesPendingConfirmation_becauseDeleteRemovesTheTeammate() throws {
@@ -2010,7 +2256,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.screen, .desk)
         vm.openDesk(bot)
         XCTAssertEqual(vm.screen, .desk)
-        XCTAssertEqual(vm.inspectorTab, .memory)
+        XCTAssertEqual(vm.inspectorTab, .routines)
     }
 
     func test_deskInspectorKeepsChatVisible_becauseMemoryMustNotReplaceTheConversation() throws {
@@ -2022,7 +2268,7 @@ final class BotsWindowTests: XCTestCase {
         vm.openDesk(bot)
         vm.send("Summarize overnight")
         XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
-        XCTAssertEqual(vm.inspectorTab, .memory)
+        XCTAssertEqual(vm.inspectorTab, .routines)
 
         vm.inspectorTab = .routines
         XCTAssertEqual(vm.screen, .desk)
@@ -2035,6 +2281,46 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.screen, .desk)
         XCTAssertEqual(vm.deskMessages.first?.text, "Summarize overnight")
         XCTAssertTrue(vm.memoryDraft.isEmpty)
+    }
+
+    func test_deskAddScheduledTaskOpensStudio() throws {
+        // WHY: Desk is the chat dest. Creating a schedule is Studio work.
+        // A form in the inspector would keep the owner off Chat.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.inspectorTab = .routines
+        vm.routineName = "Leftover"
+        vm.openStudioToAddRoutine()
+        XCTAssertEqual(vm.screen, .studio)
+        XCTAssertEqual(vm.studioTab, .routines)
+        XCTAssertTrue(vm.routineName.isEmpty)
+        XCTAssertEqual(vm.selectedBotID, bot.id)
+    }
+
+    func test_deskInspectorListsRoutinesWithoutAForm() throws {
+        // WHY: The inspector must show live tasks, not a second create form.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.saveRoutine()
+        XCTAssertEqual(vm.routines.map(\.definition.name), ["Morning scan"])
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private var inspectorRoutines") else {
+            return XCTFail("desk inspector routines must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private func deskTimeline")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertFalse(slice.contains("bots.routines.name"))
+        XCTAssertFalse(slice.contains("bots.routines.save"))
+        XCTAssertFalse(slice.contains("BotScheduleSpecEditor"))
+        XCTAssertTrue(slice.contains("bots.desk.inspector.routines.add"))
+        XCTAssertTrue(slice.contains("deskRoutineRow"))
     }
 
     func test_saveRoutineDoesNotListRoutines_becauseSaveDestMustNotRereadSchedules() throws {
@@ -2090,7 +2376,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Which repo is this?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2119,7 +2405,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Which Desktop?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2155,7 +2441,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "What's open?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace,
@@ -2196,7 +2482,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: try XCTUnwrap(vm.selectedBot),
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Will you notify me?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2205,31 +2491,32 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_previewBrainIncludesAdvertisedMemoryMutateKey_becauseDestMustNotOmitForgetKeys() throws {
-        // WHY: Studio already says Memory. Compile headed facts with
-        // Trusted memory, so first-chat "what's in Memory?" invented a hop.
-        // Dest preview and compose must share the advertised heading.
+        // WHY: Memory is the files. Dest preview and compose must share
+        // MEMORY.md so first-chat "what's in Memory?" cannot invent a hop.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let piper = try vm.create(name: "Piper", title: "Scout", soul: "Own the inbox.", provider: .claude)
         vm.openDesk(piper)
-        vm.memoryDraft = "Prefers dark mode"
-        vm.addMemory()
-        let item = try XCTUnwrap(vm.memoryItems.first)
+        try vm.botHome(for: piper).writeFile(
+            relativePath: BotHome.memoryName,
+            contents: "- Prefers dark mode\n"
+        )
         vm.composerText = "Forget the dark-mode fact"
         let preview = try XCTUnwrap(vm.previewBrain())
-        let key = item.id.value.uuidString.lowercased()
         XCTAssertTrue(preview.compiledPayload.contains("Memory:"))
         XCTAssertFalse(preview.compiledPayload.contains("Trusted memory:"))
-        XCTAssertTrue(preview.compiledPayload.contains("Fact: Prefers dark mode"))
-        XCTAssertTrue(preview.compiledPayload.contains(key))
+        XCTAssertTrue(preview.compiledPayload.contains("### MEMORY.md"))
+        XCTAssertTrue(preview.compiledPayload.contains("Prefers dark mode"))
+        XCTAssertFalse(preview.compiledPayload.contains("Fact: Prefers dark mode"))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
+        XCTAssertTrue(preview.compiledPayload.contains(BotStandingInstructions.writeMemoryFileTool))
         XCTAssertEqual(
             preview.compiledPayload,
             BotsDeskFollowThrough.composeRunPrompt(
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Forget the dark-mode fact",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2261,7 +2548,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "What's your Approval mode?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2296,7 +2583,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Allow once",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2323,7 +2610,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Change your handle",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2350,7 +2637,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "What's your Role?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2378,7 +2665,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "What are your Instructions?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2407,7 +2694,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "What's your Model?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2438,7 +2725,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "If Claude is down use Grok",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2475,7 +2762,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "What are your Routines?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2513,7 +2800,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Test this routine",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2536,7 +2823,7 @@ final class BotsWindowTests: XCTestCase {
         vm.setSkillEnabled(skillID: "off-skill", enabled: false)
         vm.composerText = "Which Skills?"
         let preview = try XCTUnwrap(vm.previewBrain())
-        XCTAssertTrue(preview.compiledPayload.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(preview.compiledPayload.contains("Skills: weekly-account-health"))
         XCTAssertFalse(preview.compiledPayload.contains("Enabled skills"))
         XCTAssertFalse(preview.compiledPayload.contains("off-skill"))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
@@ -2546,7 +2833,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Which Skills?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2579,7 +2866,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "What do you run?",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 routines: vm.routines,
                 workspace: vm.advertisedWorkspace
@@ -2814,7 +3101,7 @@ final class BotsWindowTests: XCTestCase {
     func test_brainPaneSurvivesRelaunch_becauseSelectedTabsAreUserWorkflowState() throws {
         // WHY: Source vs Effective is a selected Brain pane. The Brain tab
         // is no longer user-facing, so leftover Brain persist remaps to
-        // Memory while the pane choice still survives for compile receipts.
+        // Routines while the pane choice still survives for compile receipts.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
@@ -2822,7 +3109,7 @@ final class BotsWindowTests: XCTestCase {
         vm.inspectorTab = .brain
         vm.brainPane = .effective
         let reopened = BotsViewModel(context: context)
-        XCTAssertEqual(reopened.inspectorTab, .memory)
+        XCTAssertEqual(reopened.inspectorTab, .routines)
         XCTAssertEqual(reopened.brainPane, .effective)
     }
 
@@ -2836,17 +3123,17 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.set("brain", forKey: "bots.inspectorTab")
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.studioTab, .profile)
-        XCTAssertEqual(reopened.inspectorTab, .memory)
+        XCTAssertEqual(reopened.inspectorTab, .routines)
         XCTAssertFalse(BotStudioTab.brain.isUserFacing)
         XCTAssertFalse(BotDeskInspectorTab.brain.isUserFacing)
         XCTAssertTrue(BotStudioTab.files.isUserFacing)
         XCTAssertEqual(
             BotStudioTab.allCases.filter(\.isUserFacing).map(\.id),
-            ["profile", "memory", "skills", "files", "routines", "security"]
+            ["profile", "files", "routines", "security"]
         )
         XCTAssertEqual(
             BotDeskInspectorTab.allCases.filter(\.isUserFacing).map(\.id),
-            ["memory", "routines"]
+            ["routines"]
         )
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(
@@ -2927,10 +3214,9 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
-    func test_studioFilesSurfaceLocksIdentityAndMemoryProjections() throws {
-        // WHY: IDENTITY.md and memory.md are generated projections. The
-        // Agentic Files editor would persist a handle rewrite unless the
-        // listing marks those rows read-only.
+    func test_studioFilesSurfaceLocksIdentityOnly() throws {
+        // WHY: IDENTITY.md is still generated. MEMORY.md is the bot's
+        // own file — locking it would send Forget/Correct back to a store.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
@@ -2943,8 +3229,58 @@ final class BotsWindowTests: XCTestCase {
         let memory = try XCTUnwrap(model.entries.first { $0.name == BotHome.memoryName })
         let soul = try XCTUnwrap(model.entries.first { $0.name == BotHome.soulName })
         XCTAssertFalse(identity.isEditable)
-        XCTAssertFalse(memory.isEditable)
+        XCTAssertTrue(memory.isEditable)
         XCTAssertTrue(soul.isEditable)
+        XCTAssertEqual(BotHome.memoryName, "MEMORY.md")
+    }
+
+    func test_studioSkillsLiveInFilesNotASkillsTab() throws {
+        // WHY: Owners already have Files. A leftover Skills tab must not
+        // come back; persist remaps to Files.
+        XCTAssertFalse(BotStudioTab.allCases.map(\.id).contains("skills"))
+        XCTAssertTrue(BotStudioTab.files.isUserFacing)
+        XCTAssertEqual(
+            BotStudioTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["profile", "files", "routines", "security"]
+        )
+        UserDefaults.standard.set("skills", forKey: "bots.studioTab")
+        let context = try makeContext()
+        _ = try BotsViewModel(context: context).create(name: "Piper", title: "Scout", provider: .claude)
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.studioTab, .files)
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertFalse(bots.contains("private var skillsTab"))
+        XCTAssertFalse(bots.contains("Skill catalog id"))
+        XCTAssertFalse(bots.contains("bots.studio.tab.skills"))
+        XCTAssertTrue(bots.contains("bots.studio.files"))
+    }
+
+    func test_studioMemoryLivesInFilesNotAMemoryTab() throws {
+        // WHY: Owners already have Files. A leftover Memory tab must not
+        // come back; persist remaps to Files / Routines.
+        XCTAssertFalse(BotStudioTab.allCases.map(\.id).contains("memory"))
+        XCTAssertFalse(BotDeskInspectorTab.allCases.map(\.id).contains("memory"))
+        XCTAssertTrue(BotStudioTab.files.isUserFacing)
+        XCTAssertEqual(
+            BotStudioTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["profile", "files", "routines", "security"]
+        )
+        XCTAssertEqual(
+            BotDeskInspectorTab.allCases.filter(\.isUserFacing).map(\.id),
+            ["routines"]
+        )
+        UserDefaults.standard.set("memory", forKey: "bots.studioTab")
+        UserDefaults.standard.set("memory", forKey: "bots.inspectorTab")
+        let context = try makeContext()
+        _ = try BotsViewModel(context: context).create(name: "Piper", title: "Scout", provider: .claude)
+        let reopened = BotsViewModel(context: context)
+        XCTAssertEqual(reopened.studioTab, .files)
+        XCTAssertEqual(reopened.inspectorTab, .routines)
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertFalse(bots.contains("Remember a fact"))
+        XCTAssertFalse(bots.contains("bots.studio.tab.memory"))
+        XCTAssertFalse(bots.contains("bots.desk.inspector.tab.memory"))
+        XCTAssertTrue(bots.contains("bots.studio.files"))
     }
 
     func test_studioFilesOpenTabDoesNotMountWorkspacePane() throws {
@@ -3444,13 +3780,13 @@ final class BotsWindowTests: XCTestCase {
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.beginEdit(bot)
-        vm.studioTab = .memory
+        vm.studioTab = .files
         XCTAssertEqual(vm.screen, .studio)
 
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.selectedBotID, bot.id)
         XCTAssertEqual(reopened.screen, .studio)
-        XCTAssertEqual(reopened.studioTab, .memory)
+        XCTAssertEqual(reopened.studioTab, .files)
         XCTAssertEqual(reopened.studioDraft.name, "Piper")
     }
 
@@ -3594,12 +3930,12 @@ final class BotsWindowTests: XCTestCase {
         let vm = BotsViewModel(context: context)
         let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.openStudio(piper)
-        vm.studioTab = .skills
+        vm.studioTab = .files
         vm.openDesk(piper)
         XCTAssertEqual(vm.screen, .desk)
         vm.openStudio(piper)
         XCTAssertEqual(vm.screen, .studio)
-        XCTAssertEqual(vm.studioTab, .skills)
+        XCTAssertEqual(vm.studioTab, .files)
         XCTAssertEqual(vm.studioDraft.botID, piper.id)
     }
 
@@ -3608,7 +3944,7 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
-        vm.studioTab = .skills
+        vm.studioTab = .files
         vm.beginEdit(piper)
         XCTAssertEqual(vm.screen, .studio)
         XCTAssertEqual(vm.studioTab, .profile)
@@ -3677,6 +4013,128 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.botStore.list().count, 1)
         XCTAssertEqual(try context.botStore.list().first?.name, "New Agent")
         XCTAssertTrue(try context.threadRepo.list().isEmpty)
+        XCTAssertTrue(
+            vm.needsUnsavedNewBotConfirm,
+            "New Bot is a placeholder until Save Bot; leaving must confirm"
+        )
+    }
+
+    func test_beginCreateMarksUnpublished_andSaveClearsConfirm() throws {
+        // WHY: Save Bot is the only first-class publish. After it, Back
+        // must keep the teammate and must not ask again.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.beginCreate()
+        XCTAssertTrue(vm.needsUnsavedNewBotConfirm)
+        XCTAssertEqual(try context.botStore.list().count, 1)
+
+        _ = try vm.saveStudio()
+        XCTAssertFalse(vm.needsUnsavedNewBotConfirm, "Save Bot is the explicit keep")
+        XCTAssertEqual(try context.botStore.list().count, 1)
+
+        var left = false
+        vm.requestLeaveUnsavedNewBot { left = true }
+        XCTAssertTrue(left, "saved teammates leave Studio without a confirm")
+        XCTAssertFalse(vm.pendingUnsavedNewBotConfirm)
+        XCTAssertEqual(try context.botStore.list().first?.name, "New Agent")
+    }
+
+    func test_unsavedNewBotLeaveConfirms_andDiscardRemovesPlaceholder() throws {
+        // WHY: Back used to openDesk the placeholder, so New Agent stayed
+        // in the fleet without Save Bot. Don't Save must delete it; Cancel
+        // must stay on Studio.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        vm.beginCreate()
+        XCTAssertEqual(try context.botStore.list().count, 2)
+        XCTAssertTrue(vm.needsUnsavedNewBotConfirm)
+
+        var left = false
+        vm.requestLeaveUnsavedNewBot { left = true }
+        XCTAssertTrue(vm.pendingUnsavedNewBotConfirm)
+        XCTAssertFalse(left, "unsaved New Bot must not leave until the owner confirms")
+
+        vm.cancelUnsavedNewBotLeave()
+        XCTAssertFalse(vm.pendingUnsavedNewBotConfirm)
+        XCTAssertFalse(left)
+        XCTAssertEqual(vm.screen, .studio)
+        XCTAssertEqual(try context.botStore.list().count, 2)
+
+        vm.requestLeaveUnsavedNewBot {
+            left = true
+            vm.leaveStudioAfterUnsavedGate()
+        }
+        vm.discardUnsavedNewBotAndLeave()
+        XCTAssertTrue(left)
+        XCTAssertFalse(vm.needsUnsavedNewBotConfirm)
+        XCTAssertFalse(vm.pendingUnsavedNewBotConfirm)
+        let remaining = try context.botStore.list()
+        XCTAssertEqual(remaining.map(\.name), ["Piper"])
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(vm.screen, .desk)
+    }
+
+    func test_unsavedNewBotConfirmChromeAndBackUseTheLeaveGate() throws {
+        // WHY: A source-only dialog would regress to openDesk on Back.
+        // The chevron and the chrome copy are the owner's named dest.
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let chrome = try String(contentsOf: sourceURL("Sources/AppShell/BotsChrome.swift"), encoding: .utf8)
+        XCTAssertTrue(bots.contains("requestLeaveUnsavedNewBot"))
+        XCTAssertTrue(bots.contains("BotsUnsavedNewBotConfirmation"))
+        XCTAssertTrue(bots.contains("leaveStudioAfterUnsavedGate"))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.unsavedNewBotConfirmTitle))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.unsavedNewBotConfirmMessage))
+        XCTAssertTrue(chrome.contains(BotsChrome.Label.unsavedNewBotDontSave))
+        XCTAssertTrue(BotsChrome.allVisibleLabels.contains(BotsChrome.Label.unsavedNewBotConfirmTitle))
+        XCTAssertTrue(BotsChrome.allVisibleLabels.contains(BotsChrome.Label.unsavedNewBotConfirmMessage))
+        XCTAssertTrue(BotsChrome.allVisibleLabels.contains(BotsChrome.Label.unsavedNewBotDontSave))
+        let back = try XCTUnwrap(bots.range(of: "accessibilityLabel(\"Back\")"))
+        let header = bots[bots.startIndex..<back.lowerBound]
+        XCTAssertTrue(
+            header.contains("requestLeaveUnsavedNewBot"),
+            "Studio Back must confirm unsaved New Bot instead of openDesk"
+        )
+    }
+
+    func test_beginCreateAgainConfirmsBeforeASecondPlaceholder() throws {
+        // WHY: New Bot again is another leave-without-save. The first
+        // placeholder must not silently stay in the fleet.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.beginCreate()
+        let first = try XCTUnwrap(vm.selectedBotID)
+        vm.beginCreate()
+        XCTAssertTrue(vm.pendingUnsavedNewBotConfirm)
+        XCTAssertEqual(try context.botStore.list().count, 1)
+        XCTAssertEqual(vm.selectedBotID, first)
+        vm.discardUnsavedNewBotAndLeave()
+        XCTAssertEqual(try context.botStore.list().count, 1)
+        XCTAssertNotEqual(vm.selectedBotID, first)
+        XCTAssertTrue(vm.needsUnsavedNewBotConfirm)
+    }
+
+    func test_deskPermissionLabelUsesAgentAppDisplayName() throws {
+        // WHY: the header used "Auto-accept edits" while the composer chip
+        // said "Auto-edit". Both must use AgentPermissionMode.displayName.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude, model: "opus")
+        vm.openDesk(bot)
+        vm.setDeskPermissionMode(.autoAcceptEdits)
+        XCTAssertEqual(vm.permissionLabel(for: bot), "Auto-edit")
+        XCTAssertEqual(vm.permissionLabel(for: bot), AgentPermissionMode.autoAcceptEdits.displayName)
+    }
+
+    func test_deskRoutingDecodesLegacyPayloadWithoutRunAsUser() throws {
+        // WHY: adding runAsUser to persisted desk routing must not drop
+        // existing UserDefaults payloads from before the field existed.
+        let json = Data(#"{"provider":"codex","providerInstanceID":"codex","model":"","routingMode":"auto","permissionMode":"supervised"}"#.utf8)
+        let decoded = try JSONDecoder().decode(BotDeskRouting.self, from: json)
+        XCTAssertEqual(decoded.provider, .codex)
+        XCTAssertEqual(decoded.routingMode, .auto)
+        XCTAssertEqual(decoded.runAsUser.id, AgentRunAsUser.current().id)
     }
 
     func test_deskRoutingSeedsFromPublishedRoute_becauseComposerStartsOnTheStudioDefault() throws {
@@ -3710,10 +4168,28 @@ final class BotsWindowTests: XCTestCase {
         vm.setDeskReasoningEffort(.high)
         XCTAssertEqual(vm.deskRunReasoning, .high)
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.source\")"))
+        XCTAssertTrue(source.contains("\"bots.desk.source\""))
         XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.model\")"))
-        XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.permission\")"))
+        XCTAssertTrue(source.contains("\"bots.desk.permission\""))
         XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.model.popover\")"))
+        XCTAssertTrue(
+            source.contains("AgentModelPopoverChrome("),
+            "Desk Auto must use the Agent App Model popover chrome, not a header-only fork"
+        )
+        XCTAssertTrue(source.contains("AgentSourceCapsule("))
+        XCTAssertTrue(source.contains("AgentPermissionCapsule("))
+        XCTAssertTrue(source.contains("AgentRunAsUserCapsule("))
+        XCTAssertTrue(source.contains("AgentModelPillLabel("))
+        XCTAssertTrue(source.contains("AgentCompactMenuRow("))
+        XCTAssertTrue(source.contains("AgentQueuedHeader("))
+        XCTAssertFalse(
+            source.contains(AgentModelPopoverPresentation.autoDisclaimer),
+            "Desk must not recopy the orchestration card; the shared chrome owns that copy"
+        )
+        XCTAssertFalse(
+            source.contains("func deskChipLabel"),
+            "Desk must not keep a private capsule fork"
+        )
         guard let start = source.range(of: "private func startSupervisedRun") else {
             return XCTFail("startSupervisedRun must exist")
         }
@@ -3723,6 +4199,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(slice.contains("provider: deskRouting.provider"))
         XCTAssertTrue(slice.contains("permissionMode: deskRouting.permissionMode"))
         XCTAssertTrue(slice.contains("reasoningEffort: effort"))
+        XCTAssertTrue(slice.contains("runAsUser: deskRunAsUser"))
         XCTAssertTrue(slice.contains("workspace: nil"))
         XCTAssertFalse(
             slice.contains("provider: revision.provider"),
@@ -3872,11 +4349,46 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         vm.beginCreate()
+        _ = try vm.saveStudio()
         vm.beginCreate()
+        _ = try vm.saveStudio()
         let bots = try context.botStore.list()
         XCTAssertEqual(bots.count, 2)
         XCTAssertEqual(Set(bots.map(\.handle)).count, 2)
         XCTAssertTrue(bots.allSatisfy { $0.name == "New Agent" })
+    }
+
+    func test_studioSlugFollowsNameUntilOwnerEditsIt() throws {
+        // WHY: CEO must become @ceo while the slug is unlocked. A typed
+        // slug must stay put when the name changes again.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.beginCreate()
+        vm.didEditStudioName("CEO")
+        XCTAssertEqual(BotHandle.normalize(vm.studioDraft.handle), "ceo")
+        XCTAssertTrue(vm.studioSlugFollowsName)
+        vm.didEditStudioSlug("boss")
+        XCTAssertFalse(vm.studioSlugFollowsName)
+        vm.didEditStudioName("Chief")
+        XCTAssertEqual(vm.studioDraft.handle, "boss")
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(bots.contains("labeledField(\"Slug\")"))
+        XCTAssertTrue(bots.contains("bots.studio.slug"))
+        XCTAssertFalse(bots.contains("labeledField(\"Handle\")"))
+        XCTAssertFalse(bots.contains(".disabled(!vm.studioDraft.isNew)"))
+    }
+
+    func test_studioSavePersistsSlugRename() throws {
+        // WHY: New Bot already has a uniqued handle. Studio Save must
+        // write the owner slug, not keep new-agent-N.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.beginCreate()
+        vm.didEditStudioName("CEO")
+        XCTAssertEqual(BotHandle.normalize(vm.studioDraft.handle), "ceo")
+        let saved = try vm.saveStudio()
+        XCTAssertEqual(saved.handle, "ceo")
+        XCTAssertEqual(try context.botStore.get(id: saved.id)?.handle, "ceo")
     }
 
     func test_studioDescriptionAndInstructionsCaptionsContrastWhoVersusHow() throws {
@@ -4004,20 +4516,14 @@ final class BotsWindowTests: XCTestCase {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         let settings = try String(contentsOf: sourceURL("Sources/AppShell/SettingsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("desktopHonestyLabel"))
-        if let start = source.range(of: "private var studioSummary") {
-            let rest = source[start.upperBound...]
-            let end = rest.range(of: "\n    private func studioSummaryRow")?.lowerBound ?? rest.endIndex
-            let slice = String(source[start.lowerBound..<end])
-            XCTAssertFalse(
-                slice.contains("desktopHonestyLabel"),
-                "Configuration summary must not repeat the Desktop honesty block"
-            )
-        } else {
-            XCTFail("studio summary must exist")
-        }
+        XCTAssertFalse(
+            source.contains("private var studioSummary"),
+            "Configuration summary is gone; it cannot repeat the Desktop honesty block"
+        )
+        XCTAssertTrue(source.contains("studioAvatarPane"))
         XCTAssertTrue(
-            source.contains("BotRoute.fallbackOrderHonesty") || source.contains("not shipped in P1a"),
-            "Studio must keep the P1a fallback-order honesty on the routing panel"
+            BotRoute.fallbackOrderHonesty.contains("not shipped in P1a"),
+            "P1a fallback-order honesty stays on the compiler path after Studio lost the routing panel"
         )
         XCTAssertFalse(
             source.contains("Guest not running"),
@@ -4057,7 +4563,6 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertTrue(source.contains("bots.studio.desktop.honesty") || source.contains("bots.desk.desktop"))
         XCTAssertTrue(source.contains("BotRoutineCopy.testRunHonestyCaption"))
-        XCTAssertTrue(source.contains("no app-closed runs"))
         XCTAssertFalse(
             source.contains("isAutonomyActive ? \"active\""),
             "autonomy-on must not imply app-closed execution"
@@ -4349,6 +4854,103 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).title, "Scout")
         XCTAssertEqual(vm.permissionLabel(for: bot), "Supervised")
         XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
+    }
+
+    func test_petOpenBotsDesk_destsThatBotsDesk() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(try router.openBotsDesk(botID: piper.id))
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertFalse(try router.openBotsDesk(botID: BotID()))
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+    }
+
+    func test_petProjectsDestAttention_andHidesDisabledBots() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let muted = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude, notificationsEnabled: false)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("From Piper"))
+        let conversation = try XCTUnwrap(vm.selectedConversation)
+        vm.openDesk(muted)
+        vm.applyFollowThroughForTests(bot: piper, conversation: conversation, status: .completed)
+        let dest = PetDestAttentionSnapshot(
+            bots: try context.botStore.list(),
+            conversations: try context.botStore.listConversations(
+                attentionStates: [.unreadActivity, .needsAttention]
+            ),
+            attention: try context.botStore.listAttention(),
+            linkedThreadIDs: try context.botStore.listLinkedAgentThreadIDs()
+        )
+        let items = PetAttentionStore.projectDest(dest)
+        XCTAssertTrue(items.contains { $0.route == .botsDesk(botID: piper.id) })
+        XCTAssertFalse(items.contains { $0.route == .botsDesk(botID: muted.id) })
+        XCTAssertFalse(items.contains { $0.title.localizedCaseInsensitiveContains("from piper") })
+    }
+
+    func test_petMarkReadFollowsDestLedger() throws {
+        let context = try makeContext()
+        let store = PetAttentionStore(
+            threadRepository: context.threadRepo,
+            callbackRepository: context.providerPendingCallbackRepo,
+            notificationRepository: NotificationRepository(db: context.db),
+            destLookup: {
+                PetDestAttentionSnapshot(
+                    bots: try context.botStore.list(),
+                    conversations: try context.botStore.listConversations(
+                        attentionStates: [.unreadActivity, .needsAttention]
+                    ),
+                    attention: try context.botStore.listAttention(),
+                    linkedThreadIDs: try context.botStore.listLinkedAgentThreadIDs()
+                )
+            },
+            markBotConversationViewed: { id in
+                guard var conversation = try context.botStore.conversation(id: id) else { return }
+                conversation.unread = false
+                conversation.attentionState = .none
+                try context.botStore.upsertConversation(conversation)
+            }
+        )
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        // Dest unread is the dest ledger. send() without a router writes a
+        // leftover dest question and would hide this completed row.
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Brief", unread: true, attentionState: .unreadActivity)
+        )
+        let item = try XCTUnwrap(try store.refresh().items.first { $0.route == .botsDesk(botID: piper.id) })
+        XCTAssertEqual(item.classification, .completed)
+        XCTAssertEqual(try store.openAndMarkRead(itemID: item.id) { _ in true }, .marked)
+        XCTAssertTrue(try store.refresh().items.filter { $0.route == .botsDesk(botID: piper.id) }.isEmpty)
+    }
+
+    func test_deskTimelineUsesSharedAgentAppScrollContainer_becauseChatMustFollowTheSamePin() throws {
+        // WHY: Desk used a plain ScrollView. Agent App pin/FAB/BOTTOM lived
+        // only in AgentAppSurface, so send did not auto-scroll. Same control
+        // must be one shared container.
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(bots.range(of: "private func deskTimeline"))
+        let rest = bots[start.lowerBound...]
+        let end = rest.range(of: "\n    private func deskBubble")?.lowerBound ?? rest.endIndex
+        let slice = String(bots[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("AgentChatTimelineScrollContainer("))
+        XCTAssertTrue(slice.contains("deskTimelineRejoinToken"))
+        XCTAssertTrue(slice.contains("\"bots.desk.scrollToBottom\""))
+        XCTAssertFalse(slice.contains("ScrollView {"))
+        let agent = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
+        XCTAssertTrue(agent.contains("AgentChatTimelineScrollContainer("))
+        XCTAssertFalse(agent.contains("private struct TimelineScrollFollower"))
+        let chrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatTimelineChrome.swift"), encoding: .utf8)
+        XCTAssertTrue(chrome.contains("struct AgentChatTimelineScrollFollower"))
+        XCTAssertTrue(chrome.contains("Scroll to latest message"))
     }
 
     func test_deskTimelineUsesUserAssistantLabelsAndTimestamps() {
@@ -5256,17 +5858,7 @@ final class BotsWindowTests: XCTestCase {
             desktopKind: .logicalExecutionSpace,
             digest: "x"
         )
-        let live = BotMemoryItem(
-            botID: bot.id,
-            currentRevisionID: UUID(),
-            content: "Prefers dark mode",
-            provenance: "user",
-            trusted: true,
-            source: "chat"
-        )
-        var forgotten = live
-        forgotten.content = "Old secret"
-        forgotten.forgottenAt = Date()
+        let live = BotMemoryFileText(path: "MEMORY.md", body: "Prefers dark mode")
         let enabled = BotSkillBinding(botID: bot.id, skillID: "weekly-account-health", enabled: true)
         let disabled = BotSkillBinding(botID: bot.id, skillID: "off-skill", enabled: false)
 
@@ -5274,17 +5866,17 @@ final class BotsWindowTests: XCTestCase {
             bot: bot,
             revision: revision,
             userText: "Summarize overnight",
-            memory: [live, forgotten],
+            memoryFiles: [live],
             skills: [enabled, disabled]
         )
 
         XCTAssertTrue(prompt.contains("Prefers dark mode"))
-        XCTAssertFalse(prompt.contains("Old secret"))
+        XCTAssertTrue(prompt.contains("### MEMORY.md"))
         XCTAssertTrue(prompt.contains("Role: Scout"))
         XCTAssertFalse(prompt.contains("You are Piper (@piper) — Scout"))
         XCTAssertTrue(prompt.contains("Instructions:"))
         XCTAssertFalse(prompt.contains("Standing instructions:"))
-        XCTAssertTrue(prompt.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(prompt.contains("Skills: weekly-account-health"))
         XCTAssertFalse(prompt.contains("Enabled skills"))
         XCTAssertFalse(prompt.contains("off-skill"))
         XCTAssertTrue(prompt.contains("Summarize overnight"))
@@ -5303,15 +5895,17 @@ final class BotsWindowTests: XCTestCase {
             provider: .claude
         )
         vm.openDesk(bot)
-        vm.memoryDraft = "Prefers dark mode"
-        vm.addMemory()
+        try vm.botHome(for: bot).writeFile(
+            relativePath: BotHome.memoryName,
+            contents: "- Prefers dark mode\n"
+        )
         vm.composerText = "Summarize overnight"
         let preview = try XCTUnwrap(vm.previewBrain())
         XCTAssertEqual(preview.compiledPayload, BotsDeskFollowThrough.composeRunPrompt(
             bot: bot,
             revision: try XCTUnwrap(vm.selectedRevision),
             userText: "Summarize overnight",
-            memory: vm.memoryItems,
+            memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
             skills: vm.skillBindings,
             workspace: vm.advertisedWorkspace
         ))
@@ -5427,7 +6021,7 @@ final class BotsWindowTests: XCTestCase {
                 bot: piper,
                 revision: try XCTUnwrap(vm.selectedRevision),
                 userText: "Summarize overnight",
-                memory: vm.memoryItems,
+                memoryFiles: vm.selectedBot.map { vm.memoryFileTexts(for: $0) } ?? [],
                 skills: vm.skillBindings,
                 workspace: vm.advertisedWorkspace
             ),
@@ -5671,7 +6265,7 @@ final class BotsWindowTests: XCTestCase {
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.beginEdit(bot)
-        vm.studioTab = .skills
+        vm.studioTab = .files
         vm.skillDraft = "weekly-account-health"
         vm.addSkill()
 
@@ -5969,23 +6563,16 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_memoryTabHeaderSaysMemory_becauseMemoryMustNotNameTheBrainSiblingTab() throws {
-        // WHY: Brain and Memory are sibling Studio tabs and the tab strip
-        // already says Memory. A "Brain / Memory" body header is leftover
-        // from before the split and claims Memory lives under Brain.
+        // WHY: Memory left Studio as a tab. A leftover "Brain / Memory"
+        // header would still claim memory lives under Brain.
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertFalse(
             source.contains("Brain / Memory"),
             "Memory's header must not name the Brain sibling tab"
         )
-        guard let start = source.range(of: "private var memoryTab") else {
-            return XCTFail("memory tab must exist")
-        }
-        let rest = source[start.upperBound...]
-        let end = rest.range(of: "\n    private var ")?.lowerBound ?? rest.endIndex
-        let slice = String(source[start.lowerBound..<end])
-        XCTAssertTrue(
-            slice.contains("studioSectionHeader(BotsChrome.Label.memory)"),
-            "Memory keeps a section title like every sibling Studio tab, titled by the shared chrome token"
+        XCTAssertFalse(
+            source.contains("private var memoryTab"),
+            "Memory lives in Files, not a Studio tab body"
         )
     }
 
@@ -6023,15 +6610,17 @@ final class BotsWindowTests: XCTestCase {
 
     func test_studioAvatarPickerIsBlobatar_becauseStudioLetsTheUserComposeTheCreature() throws {
         // WHY: Studio Avatar used to be eight SF chips. The owner now
-        // composes shape / expression / background / hue, matching the
-        // blobatar editor. A leftover symbol row would hide that.
+        // composes shape and hue on the right pane. Expression follows
+        // live attention; the creature never has a plate.
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         let editor = try String(contentsOf: sourceURL("Sources/AppShell/BotsBlobatarView.swift"), encoding: .utf8)
         XCTAssertTrue(bots.contains("BotBlobatarEditor"))
+        XCTAssertTrue(bots.contains("studioAvatarPane"))
+        XCTAssertTrue(bots.contains("bots.studio.avatar.pane"))
         XCTAssertTrue(bots.contains("BotBlobatarSpec.default.token"))
         XCTAssertTrue(editor.contains("bots.studio.avatar.shape"))
-        XCTAssertTrue(editor.contains("bots.studio.avatar.expression"))
-        XCTAssertTrue(editor.contains("bots.studio.avatar.background"))
+        XCTAssertFalse(editor.contains("bots.studio.avatar.expression"))
+        XCTAssertFalse(editor.contains("bots.studio.avatar.background"))
         XCTAssertTrue(editor.contains("bots.studio.avatar.hue"))
         XCTAssertTrue(editor.contains("BotBlobatarShape.allCases"))
         XCTAssertTrue(editor.contains("bots.studio.avatar.shape.\\(shape.rawValue)"))
@@ -6093,8 +6682,8 @@ final class BotsWindowTests: XCTestCase {
             bots.contains("ForEach(BotStudioTab.allCases.filter(\\.isUserFacing))"),
             "Brain stays on the enum for leftover persist; the Studio strip must not render it"
         )
-        XCTAssertTrue(bots.contains("bots.studio.tab.memory"))
-        XCTAssertTrue(bots.contains("bots.studio.tab.skills"))
+        XCTAssertFalse(bots.contains("bots.studio.tab.memory"))
+        XCTAssertFalse(bots.contains("bots.studio.tab.skills"))
         XCTAssertTrue(bots.contains("bots.studio.tab.routines"))
         XCTAssertFalse(
             bots.contains("bots.studio.tab.desktop"),
@@ -6109,14 +6698,14 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(bots.contains("bots.home.goal"))
         XCTAssertTrue(bots.contains("accessibilityAddTraits(selected ? .isSelected : [])"))
         XCTAssertTrue(bots.contains("BotsChrome.hitTarget"))
-        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "memory", "skills", "files", "routines", "security"])
+        XCTAssertEqual(BotStudioTab.allCases.map(\.id), ["profile", "brain", "files", "routines", "security"])
         XCTAssertEqual(
             BotStudioTab.allCases.filter(\.isUserFacing).map(\.id),
-            ["profile", "memory", "skills", "files", "routines", "security"]
+            ["profile", "files", "routines", "security"]
         )
         XCTAssertEqual(
             BotDeskInspectorTab.allCases.filter(\.isUserFacing).map(\.id),
-            ["memory", "routines"]
+            ["routines"]
         )
         XCTAssertTrue(chrome.contains(BotsChrome.Label.agentic))
         XCTAssertTrue(chrome.contains(BotsChrome.Label.currentGoal))
@@ -6148,38 +6737,25 @@ final class BotsWindowTests: XCTestCase {
             bots.contains(".accessibilityLabel(BotsChrome.Label.instructions)"),
             "Soul TextArea must name Instructions the way Description names Description"
         )
-        XCTAssertTrue(
-            bots.contains("studioMultiline(text: $vm.memoryDraft, minHeight: 56, maxHeight: 72)"),
-            "Studio Memory still uses the unlabeled multiline path"
+        XCTAssertFalse(
+            bots.contains("Remember a fact"),
+            "Memory CRUD left Studio; facts live in MEMORY.md"
         )
-        XCTAssertTrue(
-            bots.contains(".accessibilityLabel(\"Remember a fact\")"),
-            "Studio Memory TextArea must name the fact field the way Desk inspector does"
-        )
-        XCTAssertTrue(
+        XCTAssertFalse(
             bots.contains("bots.memory.correct.field"),
-            "Correct memory edits inline; the editing field must be identifiable"
+            "Correct memory left Studio; edit MEMORY.md in Files"
         )
         XCTAssertFalse(
             bots.contains("NSAlert()"),
-            "Correct memory must edit inline, not through a modal alert"
+            "Correct memory must not come back as a modal alert"
         )
-        XCTAssertTrue(
-            bots.contains("studioField(placeholder: \"Remember a fact\", text: $vm.memoryDraft)"),
-            "Desk inspector Memory still uses studioField"
-        )
-        XCTAssertGreaterThanOrEqual(
-            bots.components(separatedBy: ".accessibilityLabel(\"Remember a fact\")").count - 1,
-            2,
-            "Desk inspector Memory field must be named Remember a fact, not sit unlabeled"
-        )
-        XCTAssertTrue(
+        XCTAssertFalse(
             bots.contains(".accessibilityLabel(\"Skill catalog id\")"),
-            "Studio Skills field must name the catalog id, not sit unlabeled beside Add"
+            "Skills catalog Add left Studio; skills live in skills/<slug>/SKILL.md"
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             bots.contains(".accessibilityLabel(binding.skillID)"),
-            "Studio Skills enable switch must name the catalog id, not sit unlabeled beside On"
+            "Skills enable switch left Studio; skills live in Files"
         )
         XCTAssertTrue(
             bots.contains(".accessibilityLabel(\"Active, \\(routine.definition.name)\")"),
@@ -6198,7 +6774,8 @@ final class BotsWindowTests: XCTestCase {
             ),
             "labeledField must name the control the way studioFormRow does"
         )
-        XCTAssertTrue(bots.contains("bots.studio.summary"))
+        XCTAssertTrue(bots.contains("bots.studio.avatar.pane"))
+        XCTAssertFalse(bots.contains("bots.studio.summary"))
         XCTAssertTrue(bots.contains("bots.studio.desktop.honesty"))
         XCTAssertTrue(
             bots.contains("BotsChrome.Label.roleAndIdentity") || chrome.contains("Role & Identity"),
@@ -6209,8 +6786,8 @@ final class BotsWindowTests: XCTestCase {
             "Studio must not mention a published provider"
         )
         XCTAssertTrue(
-            bots.contains("BotsChrome.Label.configurationSummary") || chrome.contains("Configuration summary"),
-            "Studio summary header must use the Configuration summary token"
+            bots.contains("studioAvatarPane"),
+            "Studio Profile right pane must be the avatar, not Configuration summary"
         )
         XCTAssertTrue(bots.contains("AgentChatUserBubble"))
         XCTAssertTrue(bots.contains("AgentChatAssistantReply"))
@@ -6257,7 +6834,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.job\")"))
         XCTAssertFalse(bots.contains("accessibilityIdentifier(\"bots.desk.provider\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.model\")"))
-        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.permission\")"))
+        XCTAssertTrue(bots.contains("\"bots.desk.permission\""))
         XCTAssertTrue(bots.contains("bots.desk.role.user"))
         XCTAssertTrue(bots.contains("bots.desk.role.assistant"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.inspector\")"))
@@ -6267,22 +6844,22 @@ final class BotsWindowTests: XCTestCase {
             bots.contains("ForEach(BotDeskInspectorTab.allCases.filter(\\.isUserFacing))"),
             "Brain stays on the enum for leftover persist; the Desk inspector strip must not render it"
         )
-        XCTAssertTrue(bots.contains("bots.desk.inspector.tab.memory"))
+        XCTAssertFalse(bots.contains("bots.desk.inspector.tab.memory"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.routines"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.brain"))
-        XCTAssertTrue(bots.contains("bots.desk.inspector.memory"))
+        XCTAssertFalse(bots.contains("bots.desk.inspector.memory"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.routines"))
         XCTAssertTrue(bots.contains("bots.brain.honesty"))
         XCTAssertTrue(bots.contains("bots.brain.source"))
         XCTAssertTrue(bots.contains("bots.brain.effective"))
         XCTAssertTrue(bots.contains("bots.brain.whyMemory"))
         XCTAssertTrue(bots.contains("bots.brain.digest"))
-        XCTAssertTrue(bots.contains("bots.memory.field"))
-        XCTAssertTrue(bots.contains("bots.memory.add"))
-        XCTAssertTrue(bots.contains("bots.memory.list"))
-        XCTAssertTrue(bots.contains("bots.memory.correct"))
-        XCTAssertTrue(bots.contains("bots.memory.forget"))
-        XCTAssertTrue(bots.contains("bots.studio.skills.remove"))
+        XCTAssertFalse(bots.contains("bots.memory.field"))
+        XCTAssertFalse(bots.contains("bots.memory.add"))
+        XCTAssertFalse(bots.contains("bots.memory.list"))
+        XCTAssertFalse(bots.contains("bots.memory.correct"))
+        XCTAssertFalse(bots.contains("bots.memory.forget"))
+        XCTAssertFalse(bots.contains("bots.studio.skills.remove"))
         XCTAssertTrue(bots.contains("bots.routines.name"))
         XCTAssertTrue(bots.contains("bots.routines.instruction"))
         XCTAssertTrue(bots.contains("bots.routines.when"))

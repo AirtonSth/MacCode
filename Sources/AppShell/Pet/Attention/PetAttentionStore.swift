@@ -9,6 +9,9 @@ public final class PetAttentionStore {
     private let markAgentThreadReadMutation: (AgentThreadID) throws -> Void
     private let markNotificationReadMutation: (String) throws -> Void
     private let workspaceNameProvider: (WorkspaceID) -> String?
+    private let destLookup: (() throws -> PetDestAttentionSnapshot)?
+    private let markBotConversationViewed: ((BotConversationID) throws -> Void)?
+    private let acknowledgeBotAttention: ((BotAttentionItemID) throws -> Void)?
     // PERF: approvalActionLabel allocated JSONDecoder per approval callback
     // during refresh. Store usage is sequential; one instance decoder avoids
     // per-item codec construction (kind-only decode unchanged).
@@ -20,7 +23,10 @@ public final class PetAttentionStore {
         notificationRepository: NotificationRepository,
         markAgentThreadRead: ((AgentThreadID) throws -> Void)? = nil,
         markNotificationRead: ((String) throws -> Void)? = nil,
-        workspaceNameProvider: ((WorkspaceID) -> String?)? = nil
+        workspaceNameProvider: ((WorkspaceID) -> String?)? = nil,
+        destLookup: (() throws -> PetDestAttentionSnapshot)? = nil,
+        markBotConversationViewed: ((BotConversationID) throws -> Void)? = nil,
+        acknowledgeBotAttention: ((BotAttentionItemID) throws -> Void)? = nil
     ) {
         self.threadRepository = threadRepository
         self.callbackRepository = callbackRepository
@@ -34,6 +40,9 @@ public final class PetAttentionStore {
             try notificationRepository.markRead(id: id)
         }
         self.workspaceNameProvider = workspaceNameProvider ?? { _ in nil }
+        self.destLookup = destLookup
+        self.markBotConversationViewed = markBotConversationViewed
+        self.acknowledgeBotAttention = acknowledgeBotAttention
     }
 
     public func refresh(filter: PetAttentionFilter = .all) throws -> PetAttentionSnapshot {
@@ -42,16 +51,24 @@ public final class PetAttentionStore {
         let callbacks = try callbackRepository.list(states: [.pending, .stale])
         let blockedThreadIDs = Set(callbacks.map(\.threadId))
 
-        let callbackItems = callbacks.map { callback in
-            callbackItem(callback, thread: threadsByID[callback.threadId])
+        let dest = try destLookup?()
+        let destLinkedThreadIDs = dest?.linkedThreadIDs ?? []
+        let callbackItems = callbacks.compactMap { callback -> PetAttentionItem? in
+            if destLinkedThreadIDs.contains(callback.threadId) { return nil }
+            return callbackItem(callback, thread: threadsByID[callback.threadId])
         }
         let threadItems = threads
-            .filter { $0.hasUnread && !blockedThreadIDs.contains($0.id) }
+            .filter {
+                $0.hasUnread
+                    && !blockedThreadIDs.contains($0.id)
+                    && !destLinkedThreadIDs.contains($0.id)
+            }
             .compactMap(threadItem)
         let notificationItems = try notificationRepository.list(unreadOnly: true)
             .compactMap(notificationItem)
+        let destItems = dest.map(Self.projectDest) ?? []
 
-        let allItems = (callbackItems + threadItems + notificationItems)
+        let allItems = (callbackItems + threadItems + notificationItems + destItems)
             .sorted(by: Self.attentionOrder)
         let filtered: [PetAttentionItem]
         switch filter {
@@ -97,6 +114,15 @@ public final class PetAttentionStore {
             guard !item.kind.needsUserAction else { return .retainedBlocker }
             try markNotificationReadMutation(id)
             return .marked
+        case .bot(_, let conversationID, let attentionItemID):
+            guard !item.kind.needsUserAction else { return .retainedBlocker }
+            if let conversationID {
+                try markBotConversationViewed?(conversationID)
+            }
+            if let attentionItemID {
+                try acknowledgeBotAttention?(attentionItemID)
+            }
+            return .marked
         }
     }
 
@@ -114,6 +140,19 @@ public final class PetAttentionStore {
             where notificationItem(notification)?.classification == .completed {
             try markNotificationReadMutation(notification.id)
             marked += 1
+        }
+        if let dest = try destLookup?() {
+            for item in Self.projectDest(dest) where item.classification == .completed {
+                if case .bot(_, let conversationID, let attentionItemID) = item.source {
+                    if let conversationID {
+                        try markBotConversationViewed?(conversationID)
+                        marked += 1
+                    }
+                    if let attentionItemID {
+                        try acknowledgeBotAttention?(attentionItemID)
+                    }
+                }
+            }
         }
         return marked
     }
@@ -261,6 +300,129 @@ public final class PetAttentionStore {
         }
         if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
         return lhs.id < rhs.id
+    }
+
+    static func projectDest(_ dest: PetDestAttentionSnapshot) -> [PetAttentionItem] {
+        let enabled = Set(dest.bots.filter(\.notificationsEnabled).map(\.id))
+        let botsByID = Dictionary(uniqueKeysWithValues: dest.bots.map { ($0.id, $0) })
+        var items: [PetAttentionItem] = []
+        var coveredConversations = Set<BotConversationID>()
+        var botsWithUnscopedAttention = Set<BotID>()
+
+        for row in dest.attention where row.acknowledgedAt == nil && enabled.contains(row.botID) {
+            // Dest `.unread` only duplicates conversation unreadActivity.
+            guard row.kind != .unread else { continue }
+            let kinds = destPetKinds(for: row.kind)
+            let bot = botsByID[row.botID]
+            let presentation = PetAttentionPresentation.safe(
+                kind: kinds.presentation,
+                context: PetAttentionContext(
+                    workspaceName: "Bots",
+                    threadTitle: bot?.name
+                )
+            )
+            items.append(
+                PetAttentionItem(
+                    id: "bot.attention:\(row.id.value.uuidString)",
+                    kind: kinds.item,
+                    title: presentation.title,
+                    detail: presentation.detail,
+                    workspaceName: "Bots",
+                    createdAt: row.createdAt,
+                    route: .botsDesk(botID: row.botID),
+                    source: .bot(
+                        botID: row.botID,
+                        conversationID: row.conversationID,
+                        attentionItemID: row.id
+                    )
+                )
+            )
+            if let conversationID = row.conversationID {
+                coveredConversations.insert(conversationID)
+            } else {
+                // P1 dest keeps one conversation per bot. An unscoped inbox
+                // row is that dest event — do not also project conversation state.
+                botsWithUnscopedAttention.insert(row.botID)
+            }
+        }
+
+        for conversation in dest.conversations {
+            guard enabled.contains(conversation.botID) else { continue }
+            if coveredConversations.contains(conversation.id) { continue }
+            if botsWithUnscopedAttention.contains(conversation.botID) { continue }
+            let bot = botsByID[conversation.botID]
+            switch conversation.attentionState {
+            case .unreadActivity:
+                let presentation = PetAttentionPresentation.safe(
+                    kind: .agentOutcome(.completed),
+                    context: PetAttentionContext(
+                        workspaceName: "Bots",
+                        threadTitle: bot?.name
+                    )
+                )
+                items.append(
+                    PetAttentionItem(
+                        id: "bot.conversation:\(conversation.id.value.uuidString)",
+                        kind: .agentOutcome(.completed),
+                        title: presentation.title,
+                        detail: presentation.detail,
+                        workspaceName: "Bots",
+                        createdAt: conversation.updatedAt,
+                        route: .botsDesk(botID: conversation.botID),
+                        source: .bot(
+                            botID: conversation.botID,
+                            conversationID: conversation.id,
+                            attentionItemID: nil
+                        )
+                    )
+                )
+            case .needsAttention:
+                let presentation = PetAttentionPresentation.safe(
+                    kind: .question(isSecret: false),
+                    context: PetAttentionContext(
+                        workspaceName: "Bots",
+                        threadTitle: bot?.name
+                    )
+                )
+                items.append(
+                    PetAttentionItem(
+                        id: "bot.conversation:\(conversation.id.value.uuidString)",
+                        kind: .callback(.question, isStale: false),
+                        title: presentation.title,
+                        detail: presentation.detail,
+                        workspaceName: "Bots",
+                        createdAt: conversation.updatedAt,
+                        route: .botsDesk(botID: conversation.botID),
+                        source: .bot(
+                            botID: conversation.botID,
+                            conversationID: conversation.id,
+                            attentionItemID: nil
+                        )
+                    )
+                )
+            case .none, .working:
+                continue
+            }
+        }
+        return items
+    }
+
+    /// Dest inbox kinds that still need the owner stay pet blockers. Completed
+    /// dest turns stay `.agentOutcome` so mark-read can dest dest unread.
+    static func destPetKinds(for destKind: BotAttentionItemKind) -> (
+        item: PetAttentionItemKind,
+        presentation: PetAttentionKind
+    ) {
+        switch destKind {
+        case .approval:
+            return (.callback(.approval, isStale: false), .approval)
+        case .question, .handoff:
+            return (.callback(.question, isStale: false), .question(isSecret: false))
+        case .blocked, .unknownEffect:
+            return (.callback(.question, isStale: false), .agentOutcome(.failed))
+        case .unread:
+            return (.agentOutcome(.completed), .agentOutcome(.completed))
+        }
     }
 
     private static func providerLabel(_ provider: AgentProvider) -> String {

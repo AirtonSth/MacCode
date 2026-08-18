@@ -6,6 +6,11 @@
 - Do not add browser behavior that only works on one side without updating the other side in the same change.
 - User workflow state must survive closing and reopening RemoteCode. Persist the user's active workspace, panes, selected tabs, browser URLs/titles, surface metadata, agent thread state, and other explicit user choices unless the user intentionally closes/deletes them.
 
+## Shared components
+
+- Reusing components is welcome and encouraged when it is done well. If two surfaces already show the same control (composer chips, popovers, bubbles, live-turn chrome, queued header), extract one component and mount it from both. Do not copy a second SwiftUI implementation just because the caller lives in another file.
+- "Well done" means the shared type owns the real look, copy, a11y, and behavior — not a lookalike fork, and not a wrapper that still paints its own capsule. Different products stay different (Desk editor placeholder, workspace-less Local execution, bot @mentions). Same control must stay one component.
+
 ## Token Saver / Distill rules
 
 - Token Saver is the only paid token-economy feature. No Distill dialect injection, `| distill` PATH/wrappers, PostToolUse compression, prompt compression, or SR1 humanize may run while `tokenSaverEnabled` is false.

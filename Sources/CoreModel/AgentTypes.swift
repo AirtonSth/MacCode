@@ -5,6 +5,24 @@ public enum AgentPermissionMode: String, Codable, Sendable, CaseIterable {
     case supervised
     case autoAcceptEdits = "auto_accept_edits"
     case fullAccess = "full_access"
+
+    /// Human label for composer chips and menus. One string so Agent App and
+    /// Bots Desk cannot drift ("Auto-edit" vs "Auto-accept edits").
+    public var displayName: String {
+        switch self {
+        case .supervised: return "Supervised"
+        case .autoAcceptEdits: return "Auto-edit"
+        case .fullAccess: return "Full access"
+        }
+    }
+
+    public var pickerHelpText: String {
+        switch self {
+        case .supervised: return "Ask before tool actions"
+        case .autoAcceptEdits: return "Apply edits without asking"
+        case .fullAccess: return "Run tools without asking"
+        }
+    }
 }
 
 public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
@@ -42,6 +60,18 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
         case .xhigh: return "Extra High"
         case .max: return "Max"
         case .ultracode: return "Ultracode"
+        }
+    }
+
+    public var pickerHelpText: String {
+        switch self {
+        case .minimal: return "Fastest — minimal reasoning"
+        case .low: return "Light reasoning for simple tasks"
+        case .medium: return "Balanced reasoning (default)"
+        case .high: return "Deeper reasoning for harder tasks"
+        case .xhigh: return "Very deep reasoning for hard problems"
+        case .max: return "Deepest reasoning the model supports — slowest, most tokens"
+        case .ultracode: return "Extra High effort + autonomous workflow orchestration"
         }
     }
 }

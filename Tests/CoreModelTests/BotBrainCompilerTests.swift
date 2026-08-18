@@ -27,22 +27,8 @@ final class BotBrainCompilerTests: XCTestCase {
             desktopKind: .logicalExecutionSpace,
             digest: "x"
         )
-        let live = BotMemoryItem(
-            botID: bot.id,
-            currentRevisionID: UUID(),
-            content: "Prefers dark mode",
-            provenance: "user",
-            trusted: true,
-            source: "chat"
-        )
-        var forgotten = live
-        forgotten.id = BotMemoryItemID()
-        forgotten.content = "Old secret"
-        forgotten.forgottenAt = Date()
-        var untrusted = live
-        untrusted.id = BotMemoryItemID()
-        untrusted.content = "Rumor"
-        untrusted.trusted = false
+        let live = BotMemoryFileText(path: "MEMORY.md", body: "Prefers dark mode")
+        let empty = BotMemoryFileText(path: "memory/2026-08-17.md", body: "   ")
         let enabled = BotSkillBinding(botID: bot.id, skillID: "weekly-account-health", enabled: true)
         let disabled = BotSkillBinding(botID: bot.id, skillID: "off-skill", enabled: false)
 
@@ -50,14 +36,14 @@ final class BotBrainCompilerTests: XCTestCase {
             bot: bot,
             revision: revision,
             userText: "Summarize overnight",
-            memory: [live, forgotten, untrusted],
+            memoryFiles: [live, empty],
             skills: [enabled, disabled]
         )
         let composed = BotBrainCompiler.composeRunPrompt(
             bot: bot,
             revision: revision,
             userText: "Summarize overnight",
-            memory: [live, forgotten, untrusted],
+            memoryFiles: [live, empty],
             skills: [enabled, disabled]
         )
 
@@ -66,23 +52,20 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertEqual(receipt.compilerVersion, ContextAssemblyReceipt.compilerVersion)
         XCTAssertTrue(receipt.compiledPayload.contains("Memory:"))
         XCTAssertFalse(receipt.compiledPayload.contains("Trusted memory:"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Fact: Prefers dark mode"))
+        XCTAssertTrue(receipt.compiledPayload.contains("### MEMORY.md"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Prefers dark mode"))
         XCTAssertTrue(receipt.compiledPayload.contains("Role: Scout"))
         XCTAssertFalse(receipt.compiledPayload.contains("You are Piper (@piper) — Scout"))
         XCTAssertTrue(receipt.compiledPayload.contains("Description: Looks around"))
-        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(live.id.value)))
-        XCTAssertFalse(receipt.compiledPayload.contains("Old secret"))
-        XCTAssertFalse(receipt.compiledPayload.contains("Rumor"))
-        XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(forgotten.id.value)))
-        XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(untrusted.id.value)))
-        XCTAssertTrue(receipt.compiledPayload.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Fact: Prefers dark mode"))
+        XCTAssertFalse(receipt.compiledPayload.contains("memory/2026-08-17.md"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Skills: weekly-account-health"))
         XCTAssertFalse(receipt.compiledPayload.contains("Enabled skills"))
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
         XCTAssertTrue(receipt.compiledPayload.contains("Workspace: \(BotBrainCompiler.workspaceHostAssignedHonesty)"))
         XCTAssertTrue(receipt.compiledPayload.contains("Desktop: \(BotDesktopKind.logicalExecutionSpace.displayTitle). \(BotDesktopKind.logicalExecutionSpaceHonestyLabel)"))
         XCTAssertTrue(receipt.compiledPayload.contains("Approval mode: \(BotBrainCompiler.approvalModeText())"))
-        XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Old secret") })?.included, false)
-        XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Rumor") })?.included, false)
+        XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("memory/2026-08-17.md") })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Prefers dark mode") })?.included, true)
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "off-skill" })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .user })?.text, "Summarize overnight")
@@ -1438,14 +1421,14 @@ final class BotBrainCompilerTests: XCTestCase {
             userText: "Which Skills?",
             skills: [enabled, disabled]
         )
-        XCTAssertTrue(receipt.compiledPayload.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Skills: weekly-account-health"))
         XCTAssertFalse(receipt.compiledPayload.contains("Enabled skills"))
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
-        XCTAssertEqual(receipt.layers.first(where: { $0.text == "weekly-account-health" })?.included, true)
+        XCTAssertEqual(receipt.layers.first(where: { $0.text == "weekly-account-health" })?.included, false)
         XCTAssertEqual(receipt.layers.first(where: { $0.text == "off-skill" })?.included, false)
         XCTAssertEqual(
             receipt.layers.first(where: { $0.text == "off-skill" })?.reason,
-            "Disabled. Not injected."
+            "Leftover catalog binding. Skills are files."
         )
     }
 
@@ -1471,39 +1454,28 @@ final class BotBrainCompilerTests: XCTestCase {
             desktopKind: .logicalExecutionSpace,
             digest: "x"
         )
-        let live = BotMemoryItem(
-            botID: bot.id,
-            currentRevisionID: UUID(),
-            content: "Prefers dark mode",
-            provenance: "user",
-            trusted: true,
-            source: "chat"
-        )
+        let live = BotMemoryFileText(path: "MEMORY.md", body: "Prefers dark mode")
         let receipt = BotBrainCompiler.assemble(
             bot: bot,
             revision: revision,
             userText: "Forget the dark-mode fact",
-            memory: [live]
+            memoryFiles: [live]
         )
-        let key = BotBrainCompiler.mutateKey(live.id.value)
         XCTAssertTrue(receipt.compiledPayload.contains("Memory:"))
         XCTAssertFalse(receipt.compiledPayload.contains("Trusted memory:"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Fact: Prefers dark mode"))
-        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.memoryLine(live)))
-        XCTAssertTrue(receipt.compiledPayload.contains(key))
+        XCTAssertTrue(receipt.compiledPayload.contains("### MEMORY.md"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Prefers dark mode"))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.memoryFileLine(live)))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.text, BotBrainCompiler.memoryLine(live))
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.text, BotBrainCompiler.memoryFileLine(live))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.included, true)
-        XCTAssertFalse(
-            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains(key),
-            "mutate keys are a compiler layer, not starter soul"
-        )
+        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.writeMemoryFileTool))
     }
 
-    func test_forgottenMemoryDoesNotCompileMutateKey_becauseTombstonesAreNotAuthority() {
-        // WHY: Forget must remove the key from the adapter payload. A custom
-        // soul still sees live keys; a tombstone must not remain callable.
+    func test_fileMemoryCompilesFromMarkdownNotStoreFacts() {
+        // WHY: Store Fact UUID lines hid the files the bot is supposed to
+        // edit. Compile must inject MEMORY.md and today's note as files.
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
         let revision = BotRevision(
             botID: bot.id,
@@ -1521,27 +1493,72 @@ final class BotBrainCompilerTests: XCTestCase {
             desktopKind: .logicalExecutionSpace,
             digest: "x"
         )
-        var forgotten = BotMemoryItem(
-            botID: bot.id,
-            currentRevisionID: UUID(),
-            content: "Old secret",
-            provenance: "user",
-            trusted: true,
-            source: "chat"
-        )
-        forgotten.forgottenAt = Date()
+        let files = [
+            BotMemoryFileText(path: "MEMORY.md", body: "- Prefers dark mode\n"),
+            BotMemoryFileText(path: "memory/2026-08-18.md", body: "Shipped the overnight brief.\n"),
+        ]
         let receipt = BotBrainCompiler.assemble(
             bot: bot,
             revision: revision,
             userText: "What do you remember?",
-            memory: [forgotten]
+            memoryFiles: files
         )
-        XCTAssertFalse(receipt.compiledPayload.contains("Memory:"))
-        XCTAssertFalse(receipt.compiledPayload.contains("Trusted memory:"))
-        XCTAssertFalse(receipt.compiledPayload.contains("Old secret"))
-        XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.mutateKey(forgotten.id.value)))
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.included, false)
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .memory })?.text, BotBrainCompiler.memoryLine(forgotten))
+        XCTAssertTrue(receipt.compiledPayload.contains("### MEMORY.md"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Prefers dark mode"))
+        XCTAssertTrue(receipt.compiledPayload.contains("### memory/2026-08-18.md"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Shipped the overnight brief."))
+        XCTAssertFalse(receipt.compiledPayload.contains("Fact: Prefers dark mode"))
+        XCTAssertEqual(receipt.memoryLayers.count, 2)
+        XCTAssertTrue(receipt.memoryLayers.allSatisfy(\.included))
+    }
+
+    func test_ownedSkillFilesCompileWithoutCatalogAdd() {
+        // WHY: Catalog Add hid the markdown the bot is supposed to edit.
+        // Compile must inject skills/<slug>/SKILL.md and leave leftover
+        // bindings out of the payload.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let leftover = BotSkillBinding(botID: bot.id, skillID: "weekly-account-health", enabled: true)
+        let owned = BotOwnedSkillText(
+            slug: "weekly-invoice",
+            body: "---\nname: weekly-invoice\n---\nInvoice the week.\n"
+        )
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Run the invoice skill",
+            skills: [leftover],
+            ownedSkills: [owned]
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("Skills:"))
+        XCTAssertTrue(receipt.compiledPayload.contains("### skills/weekly-invoice/SKILL.md"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Invoice the week."))
+        XCTAssertFalse(receipt.compiledPayload.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Bot skills:"))
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.id == "skill-weekly-account-health" })?.included,
+            false
+        )
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.id == "owned-skill-weekly-invoice" })?.included,
+            true
+        )
+        XCTAssertTrue(receipt.compiledPayload.contains("skills/<slug>/SKILL.md"))
     }
 
     func test_notificationsHonestyCompilesForCustomSoul_becauseStudioToggleIsNotAnEscapeHatch() {
@@ -1648,7 +1665,7 @@ final class BotBrainCompilerTests: XCTestCase {
             skills: [enabled, disabled],
             ownedSkills: [owned]
         )
-        XCTAssertTrue(receipt.compiledPayload.contains("Skills: weekly-account-health"))
+        XCTAssertFalse(receipt.compiledPayload.contains("Skills: weekly-account-health"))
         XCTAssertFalse(receipt.compiledPayload.contains("off-skill"))
         XCTAssertTrue(receipt.compiledPayload.contains("Bot skills:"))
         XCTAssertTrue(receipt.compiledPayload.contains("### weekly-invoice"))

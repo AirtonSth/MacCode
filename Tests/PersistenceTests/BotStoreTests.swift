@@ -245,7 +245,9 @@ final class BotStoreTests: XCTestCase {
             bot: bot,
             revision: revision,
             userText: "Summarize overnight",
-            memory: [trusted, forgotten],
+            memoryFiles: [
+                BotMemoryFileText(path: "MEMORY.md", body: "- Prefers dark mode\n"),
+            ],
             conversationID: conversation.id
         )
         try store.insertContextReceipt(receipt)
@@ -256,10 +258,11 @@ final class BotStoreTests: XCTestCase {
         XCTAssertEqual(loaded.payloadDigest, receipt.payloadDigest)
         XCTAssertEqual(loaded.compiledPayload, receipt.compiledPayload)
         XCTAssertTrue(loaded.compiledPayload.contains("Prefers dark mode"))
+        XCTAssertTrue(loaded.compiledPayload.contains("### MEMORY.md"))
         XCTAssertFalse(loaded.compiledPayload.contains("Old secret"))
         XCTAssertEqual(
-            loaded.memoryLayers.first(where: { $0.text.contains("Old secret") })?.included,
-            false
+            loaded.memoryLayers.first(where: { $0.text.contains("Prefers dark mode") })?.included,
+            true
         )
     }
 
@@ -317,6 +320,24 @@ final class BotStoreTests: XCTestCase {
             )
         }
         XCTAssertEqual(try store.list(includeDeleted: true).map(\.id), [bot.id])
+    }
+
+    func test_renameHandleUpdatesLiveRowAndFreesOldSlug() throws {
+        let bot = try store.create(
+            name: "CEO", title: "", description: "", handle: "new-agent-19",
+            provider: .claude
+        )
+        let renamed = try store.renameHandle(id: bot.id, handle: "ceo")
+        XCTAssertEqual(renamed.handle, "ceo")
+        XCTAssertEqual(try store.get(id: bot.id)?.handle, "ceo")
+        let recycled = try store.create(
+            name: "Other", title: "", description: "", handle: "new-agent-19",
+            provider: .claude
+        )
+        XCTAssertEqual(recycled.handle, "new-agent-19")
+        XCTAssertThrowsError(try store.renameHandle(id: recycled.id, handle: "ceo")) { error in
+            XCTAssertEqual(error as? BotPublishError, .handleConflict)
+        }
     }
 
     func test_memoryCorrectAndForget_keepsPriorRevision_becauseCorrectionsAreNotRewrites() throws {

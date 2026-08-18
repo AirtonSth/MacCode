@@ -344,6 +344,8 @@ public enum PetLiveActivityCopy: Sendable {
             return (workspaceID.value.uuidString, nil)
         case .settings:
             return (nil, nil)
+        case .botsDesk:
+            return (nil, nil)
         }
     }
 
