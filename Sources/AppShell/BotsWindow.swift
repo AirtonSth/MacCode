@@ -2261,6 +2261,9 @@ public final class BotsViewModel: ObservableObject {
         }
         states[botID] = Self.attentionState(from: conversations, hasOpenAttention: hasOpenAttention)
         attentionStateByBot = states
+        if screen == .activeBots {
+            reloadActiveBotsScreen()
+        }
     }
 
     private static func attentionState(

@@ -1453,6 +1453,35 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.filteredActiveBotItems().isEmpty)
     }
 
+    func test_activeBotItemsClearWhenRunFinishes_becauseChipMustMatchFooter() throws {
+        // WHY: Computer Use saw Active chip "1" while the footer said
+        // "0 active" after a mention hop finished. The chip reads cached
+        // activeBotItems; the footer reads liveWorkingBots(). Follow-through
+        // must refresh that cache so chip, list, and footer agree.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        let live = BotConversation(botID: piper.id, title: "live turn", attentionState: .working)
+        try context.botStore.upsertConversation(live)
+        vm.reload()
+        vm.openActiveBots()
+        XCTAssertEqual(vm.screen, .activeBots)
+        XCTAssertEqual(vm.activeBotCount, 1)
+        XCTAssertEqual(vm.filteredActiveBotItems().map(\.botID), [piper.id])
+        XCTAssertEqual(vm.filteredActiveBotItems().count, vm.activeBotCount)
+
+        vm.applyFollowThroughForTests(bot: piper, conversation: live, status: .completed)
+        XCTAssertEqual(vm.attentionState(for: piper), .unreadActivity)
+        XCTAssertEqual(vm.activeBotCount, 0)
+        XCTAssertTrue(
+            vm.filteredActiveBotItems().isEmpty,
+            "Active chip/list must drop the finished bot without reopening the tab"
+        )
+        XCTAssertEqual(vm.filteredActiveBotItems().count, vm.activeBotCount)
+        XCTAssertEqual(vm.activeBotsFooterLine.hasPrefix("0 active"), true)
+    }
+
     func test_refreshPublishedIdentityPicksUpSelfConfigTitle() throws {
         // WHY: bot_set_settings publishes through a sidecar SQLite write.
         // Desk kept the stale name/title until remount. After a self-edit
