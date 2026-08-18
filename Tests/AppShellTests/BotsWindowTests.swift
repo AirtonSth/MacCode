@@ -1553,6 +1553,35 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.isAutonomyActive)
     }
 
+    func test_scheduleTaskEditorFieldsHaveVoiceOverNames_becauseVisualLabelIsNotTheControlName() throws {
+        // WHY: Computer Use / VoiceOver saw New Scheduled Task Name, When,
+        // and Instruction as unnamed fields. `labeled` painted a caption
+        // but never named the control. Studio `labeledField` already hides
+        // the caption and sets accessibilityLabel — this editor must too.
+        let source = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"),
+            encoding: .utf8
+        )
+        guard let start = source.range(of: "private func labeled<Content: View>") else {
+            return XCTFail("schedule editor labeled helper must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n}\n")?.upperBound ?? rest.endIndex
+        let helper = String(source[start.lowerBound..<end])
+        XCTAssertTrue(
+            helper.contains(".accessibilityHidden(true)"),
+            "visual Name/When/Instruction captions must not double-speak"
+        )
+        XCTAssertTrue(
+            helper.contains(".accessibilityLabel(title)"),
+            "Name, When, and Instruction must expose the caption as the control name"
+        )
+        XCTAssertTrue(
+            source.contains("Picker(\"\", selection: $draft.botID)"),
+            "Picker title must stay empty so VoiceOver does not speak Bot, Bot"
+        )
+    }
+
     func test_searchKeepsSelectedVisible_becauseChatMustMatchTheRoster() throws {
         // WHY: searching "copy" hid the open teammate while Desk still painted
         // their chat. Keep the selected row in the list so dest and roster agree.

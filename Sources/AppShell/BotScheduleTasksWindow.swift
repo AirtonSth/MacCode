@@ -434,7 +434,7 @@ private struct BotScheduleTaskEditorView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: DS.Space.xxl) {
                     labeled("Bot") {
-                        Picker("Bot", selection: $draft.botID) {
+                        Picker("", selection: $draft.botID) {
                             ForEach(bots, id: \.id) { bot in
                                 Text(bot.name).tag(bot.id)
                             }
@@ -476,7 +476,9 @@ private struct BotScheduleTaskEditorView: View {
             Text(title)
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityHidden(true)
             content()
+                .accessibilityLabel(title)
                 .padding(DS.Space.lg)
                 .background(DS.Palette.surfaceRaised)
                 .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
