@@ -8472,13 +8472,27 @@ public struct AgentComposerSuggestion: Identifiable, Equatable, Sendable {
     public let subtitle: String
     public let insertText: String
     public let kind: Kind
+    public let botName: String?
+    public let botHandle: String?
+    public let botAvatarSymbol: String?
 
-    public init(title: String, subtitle: String, insertText: String, kind: Kind) {
+    public init(
+        title: String,
+        subtitle: String,
+        insertText: String,
+        kind: Kind,
+        botName: String? = nil,
+        botHandle: String? = nil,
+        botAvatarSymbol: String? = nil
+    ) {
         self.id = "\(kind)-\(insertText)"
         self.title = title
         self.subtitle = subtitle
         self.insertText = insertText
         self.kind = kind
+        self.botName = botName
+        self.botHandle = botHandle
+        self.botAvatarSymbol = botAvatarSymbol
     }
 }
 
@@ -8509,7 +8523,10 @@ public enum AgentComposerSuggestions {
                         title: bot.name,
                         subtitle: bot.title.isEmpty ? "@\(bot.handle)" : "\(bot.title) · @\(bot.handle)",
                         insertText: "@\(bot.handle) ",
-                        kind: .bot
+                        kind: .bot,
+                        botName: bot.name,
+                        botHandle: bot.handle,
+                        botAvatarSymbol: bot.avatarSymbol
                     )
                 }
         }
@@ -15383,65 +15400,17 @@ public struct AgentAppView: View {
     private var suggestionPopup: some View {
         let suggestions = vm.composerSuggestions
         if ComposerSuggestionNavigation.isOpen(count: suggestions.count, dismissed: suggestionPopupDismissed) {
-            let layout = ComposerSuggestionPlacement.layout(suggestionCount: suggestions.count)
-            VStack(spacing: 0) {
-                ScrollView(.vertical, showsIndicators: suggestions.count > layout.maxVisibleRows) {
-                    VStack(spacing: 0) {
-                        ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, suggestion in
-                            suggestionRow(suggestion, highlighted: index == suggestionSelectedIndex)
-                                .frame(height: layout.rowHeight)
-                        }
-                    }
+            AgentComposerSuggestionPanel(
+                suggestions: suggestions,
+                highlightedIndex: suggestionSelectedIndex,
+                identifier: "agent.suggestion.popup",
+                onSelect: { suggestion in
+                    vm.applyComposerSuggestion(suggestion)
+                    suggestionPopupDismissed = true
                 }
-                .frame(height: layout.height)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(DS.Palette.surfaceRaised)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.bottom, DS.Space.xs)
-            .accessibilityIdentifier("agent.suggestion.popup")
-            .allowsHitTesting(true)
+            )
             .transition(.opacity.combined(with: .move(edge: .bottom)))
         }
-    }
-
-    private func suggestionIcon(_ kind: AgentComposerSuggestion.Kind) -> String {
-        switch kind {
-        case .skill: return "puzzlepiece.extension"
-        case .bot: return "person.crop.circle"
-        case .slashCommand: return "command"
-        }
-    }
-
-    private func suggestionRow(_ suggestion: AgentComposerSuggestion, highlighted: Bool) -> some View {
-        Button { vm.applyComposerSuggestion(suggestion); suggestionPopupDismissed = true } label: {
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: suggestionIcon(suggestion.kind))
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(highlighted ? DS.Palette.accent : DS.Palette.textSecondary)
-                    .frame(width: 16)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(suggestion.title)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(1)
-                    Text(suggestion.subtitle)
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, DS.Space.sm)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(highlighted ? DS.Palette.accent.opacity(0.14) : Color.clear)
-        }
-        .buttonStyle(.plain)
-        .help(suggestion.subtitle)
-        .accessibilityIdentifier("agent.suggestion.\(suggestion.insertText.trimmingCharacters(in: .whitespaces))")
     }
 
     private var permissionMenu: some View {
@@ -16704,15 +16673,15 @@ struct ComposerSuggestionNavigation: Equatable {
 // WHY: layout for the slash/skill panel must stay pure and testable. The panel
 // owns vertical space between the editor and toolbar so it never collides with
 // composer controls (the previous caret-overlay + place-below path did).
-struct ComposerSuggestionPlacement: Equatable {
-    var height: CGFloat
-    var rowHeight: CGFloat
-    var maxVisibleRows: Int
+public struct ComposerSuggestionPlacement: Equatable {
+    public var height: CGFloat
+    public var rowHeight: CGFloat
+    public var maxVisibleRows: Int
 
-    static let defaultRowHeight: CGFloat = 30
-    static let defaultMaxVisibleRows = 6
+    public static let defaultRowHeight: CGFloat = 30
+    public static let defaultMaxVisibleRows = 6
 
-    static func layout(
+    public static func layout(
         suggestionCount: Int,
         rowHeight: CGFloat = defaultRowHeight,
         maxVisibleRows: Int = defaultMaxVisibleRows

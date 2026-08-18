@@ -601,3 +601,87 @@ public struct AgentQueuedHeader: View {
         .accessibilityIdentifier(identifier)
     }
 }
+
+// MARK: - Suggestion panel
+
+public struct AgentComposerSuggestionPanel: View {
+    public let suggestions: [AgentComposerSuggestion]
+    public let highlightedIndex: Int?
+    public let identifier: String
+    public let onSelect: (AgentComposerSuggestion) -> Void
+
+    public init(
+        suggestions: [AgentComposerSuggestion],
+        highlightedIndex: Int?,
+        identifier: String,
+        onSelect: @escaping (AgentComposerSuggestion) -> Void
+    ) {
+        self.suggestions = suggestions
+        self.highlightedIndex = highlightedIndex
+        self.identifier = identifier
+        self.onSelect = onSelect
+    }
+
+    public var body: some View {
+        let layout = ComposerSuggestionPlacement.layout(suggestionCount: suggestions.count)
+        VStack(spacing: 0) {
+            ScrollView(.vertical, showsIndicators: suggestions.count > layout.maxVisibleRows) {
+                VStack(spacing: 0) {
+                    ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, suggestion in
+                        row(suggestion, highlighted: index == highlightedIndex)
+                            .frame(height: layout.rowHeight)
+                    }
+                }
+            }
+            .frame(height: layout.height)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.bottom, DS.Space.xs)
+        .accessibilityIdentifier(identifier)
+        .allowsHitTesting(true)
+    }
+
+    private func row(_ suggestion: AgentComposerSuggestion, highlighted: Bool) -> some View {
+        Button { onSelect(suggestion) } label: {
+            HStack(spacing: DS.Space.sm) {
+                if suggestion.kind == .bot {
+                    BotsAvatarView(
+                        name: suggestion.botName ?? suggestion.title,
+                        handle: suggestion.botHandle ?? "",
+                        symbol: suggestion.botAvatarSymbol,
+                        size: 18
+                    )
+                } else {
+                    Image(systemName: suggestion.kind == .skill ? "puzzlepiece.extension" : "command")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(highlighted ? DS.Palette.accent : DS.Palette.textSecondary)
+                        .frame(width: 16)
+                }
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(suggestion.title)
+                        .font(DS.Font.caption.weight(.medium))
+                        .foregroundColor(DS.Palette.text)
+                        .lineLimit(1)
+                    Text(suggestion.subtitle)
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(highlighted ? DS.Palette.accent.opacity(0.14) : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .help(suggestion.subtitle)
+        .accessibilityIdentifier("agent.suggestion.\(suggestion.insertText.trimmingCharacters(in: .whitespaces))")
+    }
+}

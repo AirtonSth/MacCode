@@ -3288,6 +3288,35 @@ public final class BotsViewModel: ObservableObject {
         return BotMentionParser.suggestions(query: query, bots: bots, excluding: selectedBotID)
     }
 
+    func replaceProvidersForTests(_ snapshots: [AgentProviderSnapshot]) {
+        providers = snapshots
+    }
+
+    public var composerSuggestions: [AgentComposerSuggestion] {
+        let snapshot = selectedDeskSnapshot
+        let isClaude = snapshot?.provider == .claude || deskRouting.provider == .claude
+        return AgentComposerSuggestions.suggestions(
+            for: composerText,
+            snapshot: snapshot,
+            localSlashCommands: [],
+            extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
+            extraSkillNames: isClaude ? ClaudeSlashCommandDiscovery.discover(
+                cwd: nil,
+                home: ProcessInfo.processInfo.environment["HOME"]
+                    ?? FileManager.default.homeDirectoryForCurrentUser.path
+            ) : [],
+            mentionableBots: bots.filter { $0.id != selectedBotID }
+        )
+    }
+
+    public func applyComposerSuggestion(_ suggestion: AgentComposerSuggestion) {
+        composerText = AgentComposerSuggestions.replacingActiveToken(
+            in: composerText,
+            cursorOffset: nil,
+            with: suggestion.insertText
+        )
+    }
+
     public func applyBotMention(_ bot: BotDefinition) {
         composerText = BotMentionParser.applying(bot, to: composerText)
     }
@@ -5749,8 +5778,13 @@ public struct BotsRootView: View {
                 if !vm.queuedFollowUps.isEmpty {
                     deskQueuedFollowUps
                 }
-                if !vm.botMentionSuggestions.isEmpty {
-                    botMentionPicker
+                if !vm.composerSuggestions.isEmpty {
+                    AgentComposerSuggestionPanel(
+                        suggestions: vm.composerSuggestions,
+                        highlightedIndex: 0,
+                        identifier: "bots.desk.suggestion.popup",
+                        onSelect: { vm.applyComposerSuggestion($0) }
+                    )
                 }
                 composerBar(bot)
             }
