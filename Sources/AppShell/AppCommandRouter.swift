@@ -309,6 +309,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var beforePullRequestThreadCommitForTesting: (() throws -> Void)?
     /// Fires after inbound attachments pass `validatedForRetry` on the managed store.
     var sendAgentMessageResolvedAttachmentsProbeForTesting: (([AgentAttachment]) -> Void)?
+    /// Fires after send preflight resolves, whether from cache or a catalog list.
+    var sendAgentMessageAfterPreflightProbeForTesting: (() -> Void)?
+    var listAgentProviderSnapshotsCallCountForTesting = 0
+    var preflightListedProviderSnapshotsForTesting = false
+    private var cachedProviderSnapshots: [AgentProviderSnapshot] = []
+    private var cachedProviderSnapshotsAt: Date?
     var codexForkProtocolSupportProbe: (String, [String: String]) -> Bool = { binary, environment in
         CodexForkProtocolSupport.probe(binary: binary, environment: environment).isSupported
     }
@@ -3487,7 +3493,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let desiredProvider = provider ?? thread.provider
         let desiredInstance = providerInstanceId
             ?? (desiredProvider == thread.provider ? thread.providerInstanceId : nil)
-        let snapshots = await listAgentProviderSnapshots()
+        // Agent App send uses the dest catalog already in memory. Desk used
+        // to re-list every provider (Grok ACP + Anthropic + Codex) here and
+        // wait on that before startRun.
+        let snapshots: [AgentProviderSnapshot]
+        if !cachedProviderSnapshots.isEmpty, providerSnapshotsAreFresh {
+            snapshots = cachedProviderSnapshots
+        } else {
+            preflightListedProviderSnapshotsForTesting = true
+            snapshots = await listAgentProviderSnapshots()
+        }
         // Match AgentAppViewModel.selectedProviderSnapshot: prefer exact
         // instance+provider, then same provider. Do not fail closed on
         // "grok-cli" vs "grok" / stale instance ids when a live snapshot exists.
@@ -3528,6 +3543,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 attachments: resolvedAttachments
             )
         }
+        sendAgentMessageAfterPreflightProbeForTesting?()
         if existing.status == .running
             || ctx.coordinator.hasPendingProviderStart(threadId: thread)
             || ctx.coordinator.hasProviderSession(threadId: thread) {
@@ -4183,6 +4199,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let settings = SettingsStore(db: ctx.db).load()
         guard ctx.isTokenSaverRuntimeActive(settings: settings),
               settings.isGraphifyRuntimeActive else { return baseEnvironment }
+        // Bots Desk is workspace-less Local. Walking process cwd is the
+        // git-rev-parse beachball Agent App already pulled off send.
+        guard thread.workspaceId != nil else {
+            return GraphifyWorkspaceService.stripGraphifyKeys(from: baseEnvironment)
+        }
         configureGraphifyService(from: settings)
 
         let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? cwd
@@ -4891,6 +4912,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return env
     }
 
+    /// Dest send already listed the catalog. Reuse it so startRun is not
+    /// blocked on Grok/Anthropic/Codex discovery again.
+    public func rememberProviderSnapshotsForSend(_ snapshots: [AgentProviderSnapshot]) {
+        guard !snapshots.isEmpty else { return }
+        cachedProviderSnapshots = snapshots
+        cachedProviderSnapshotsAt = Date()
+    }
+
+    public func cachedProviderSnapshotsForSend() -> [AgentProviderSnapshot] {
+        guard providerSnapshotsAreFresh, !cachedProviderSnapshots.isEmpty else { return [] }
+        return cachedProviderSnapshots
+    }
+
+    private var providerSnapshotsAreFresh: Bool {
+        !ModelListTTLDecision.shouldRefetch(
+            lastFetchedAt: cachedProviderSnapshotsAt,
+            ttl: ModelListTTLDecision.defaultCatalogTTL,
+            now: Date()
+        )
+    }
+
     /// Protocol/CommandRouting entry — probes as the app owner.
     public func listAgentProviderSnapshots() async -> [AgentProviderSnapshot] {
         await listAgentProviderSnapshots(runAsUser: nil)
@@ -4899,6 +4941,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Snapshot probe for Auto admission / Source UI. Pass `runAsUser` so binary
     /// + auth match the account Claude will actually `sudo -u` as.
     public func listAgentProviderSnapshots(runAsUser: AgentRunAsUser?) async -> [AgentProviderSnapshot] {
+        listAgentProviderSnapshotsCallCountForTesting += 1
         var snapshots: [AgentProviderSnapshot] = []
         let configuredInstances = providerInstanceConfigs()
         if !configuredInstances.isEmpty {
@@ -5029,6 +5072,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     modelDiscoveryCacheKey: grokDiscovery?.discoveryCacheKey
                 ))
             }
+            rememberProviderSnapshotsForSend(snapshots)
             return snapshots
         }
         for provider in AgentProvider.allCases {
@@ -5141,6 +5185,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 modelDiscoveryCacheKey: grokDiscovery?.discoveryCacheKey
             ))
         }
+        rememberProviderSnapshotsForSend(snapshots)
         return snapshots
     }
 

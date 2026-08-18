@@ -84,6 +84,42 @@ final class BotsWindowTests: XCTestCase {
         router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
     }
 
+    func test_deskSendDoesNotRelistProviders_becauseAgentAppDoesNotProbeCatalogOnSend() async throws {
+        // WHY: Agent App send uses the dest catalog already in memory.
+        // Desk send used to listAgentProviderSnapshots inside preflight
+        // (Grok ACP + Anthropic + Codex) before startRun — that is the
+        // wait behind Loading….
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        context.coordinator.replaceProvider(
+            .claude,
+            runner: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: "ok"))
+        )
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "claude"
+        )
+        router.rememberProviderSnapshotsForSend([snapshot])
+        router.preflightListedProviderSnapshotsForTesting = false
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.claude)
+        let exp = expectation(description: "send preflight resolved from dest cache")
+        router.sendAgentMessageAfterPreflightProbeForTesting = { exp.fulfill() }
+        XCTAssertTrue(vm.send("oi"))
+        await fulfillment(of: [exp], timeout: 5)
+        XCTAssertFalse(
+            router.preflightListedProviderSnapshotsForTesting,
+            "send preflight must use the dest catalog, not rediscover models"
+        )
+        router.sendAgentMessageAfterPreflightProbeForTesting = nil
+    }
+
     func test_deskSendLoadingSurvivesRosterReopen_becauseSendMustStayAcknowledged() throws {
         // WHY: openDesk reloads the selected bot. That used to clear
         // deskSendInFlight, so Loading… vanished while sendAgentMessage was

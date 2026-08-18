@@ -1146,10 +1146,13 @@ public final class BotsViewModel: ObservableObject {
             reloadScheduleTasks()
         }
         Task { [weak self] in
-            guard let self else { return }
-            if let router = self.resolvedRouter() {
-                self.providers = await router.listAgentProviderSnapshots()
+            guard let self, let router = self.resolvedRouter() else { return }
+            let cached = router.cachedProviderSnapshotsForSend()
+            if !cached.isEmpty {
+                self.providers = cached
+                return
             }
+            self.providers = await router.listAgentProviderSnapshots()
         }
     }
 
@@ -4338,6 +4341,7 @@ public final class BotsViewModel: ObservableObject {
         lastDeskRunPermissionForTesting = deskRouting.permissionMode
         lastDeskRunReasoningForTesting = effort
         do {
+            var liveConversation = conversation
             let thread: AgentThread
             if let linked = conversation.linkedAgentThreadID,
                let existing = try context.threadRepo.get(id: linked),
@@ -4346,7 +4350,6 @@ public final class BotsViewModel: ObservableObject {
                existing.providerInstanceId == deskRouting.providerInstanceID,
                deskRunAsMatches(existing) {
                 thread = existing
-                try persistWorkingConversation(conversation)
             } else {
                 thread = try router.createAgentThread(
                     workspace: nil,
@@ -4361,9 +4364,14 @@ public final class BotsViewModel: ObservableObject {
                     routingConfiguration: nil,
                     quiet: true
                 )
-                var linked = conversation
-                linked.linkedAgentThreadID = thread.id
-                try persistWorkingConversation(linked)
+                liveConversation.linkedAgentThreadID = thread.id
+                try botStore.upsertConversation(liveConversation)
+                lastStartedConversationByBot[liveConversation.botID] = liveConversation
+                if selectedBotID == liveConversation.botID {
+                    adoptWrittenConversation(liveConversation)
+                } else {
+                    patchStudioSupportConversation(liveConversation, botID: liveConversation.botID)
+                }
             }
             lastSupervisedRunUserTextForTesting = userText
             supervisedRunBotIDsForTesting.append(bot.id)
@@ -4380,12 +4388,12 @@ public final class BotsViewModel: ObservableObject {
                 routines: routines,
                 workspace: nil,
                 browser: advertisedBrowser,
-                conversationID: conversation.id
+                conversationID: liveConversation.id
             )
-            try botStore.insertContextReceipt(receipt)
-            if selectedBotID == bot.id {
-                lastContextReceipt = receipt
-                rememberStudioSupport(for: bot.id)
+            // Dest already listed Source on open. Stamp that catalog so
+            // sendAgentMessage preflight does not rediscover models.
+            if !providers.isEmpty {
+                router.rememberProviderSnapshotsForSend(providers)
             }
             let result = try await router.sendAgentMessage(
                 thread: thread.id,
@@ -4397,6 +4405,13 @@ public final class BotsViewModel: ObservableObject {
                 providerInstanceId: deskRouting.providerInstanceID,
                 attachments: attachments
             )
+            // Dest persist cannot unstart a live provider turn.
+            _ = try? persistWorkingConversation(liveConversation)
+            _ = try? botStore.insertContextReceipt(receipt)
+            if selectedBotID == bot.id {
+                lastContextReceipt = receipt
+                rememberStudioSupport(for: bot.id)
+            }
             if let runId = result.runId {
                 receipt.runID = runId
                 try? botStore.insertContextReceipt(receipt)
