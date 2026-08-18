@@ -1,5 +1,6 @@
 import CoreModel
 import DesignSystemKit
+import Surfaces
 import SwiftUI
 
 public enum ActiveBotsTab: String, CaseIterable, Identifiable {
@@ -142,58 +143,30 @@ public struct ActiveBotsRootView: View {
 
     private var filterChips: some View {
         HStack(spacing: DS.Space.sm) {
-            filterChip(.active, count: vm.filteredActiveBotItems().count)
-            filterChip(.lastFinished, count: vm.filteredFinishedBotItems().count)
+            AgentListFilterChip(
+                title: ActiveBotsTab.active.title,
+                count: vm.filteredActiveBotItems().count,
+                selected: vm.activeBotsTab == .active,
+                identifier: "activeBots.tab.active"
+            ) { vm.activeBotsTab = .active }
+            AgentListFilterChip(
+                title: ActiveBotsTab.lastFinished.title,
+                count: vm.filteredFinishedBotItems().count,
+                selected: vm.activeBotsTab == .lastFinished,
+                identifier: "activeBots.tab.lastFinished"
+            ) { vm.activeBotsTab = .lastFinished }
         }
         .accessibilityIdentifier("activeBots.statusFilter")
     }
 
-    private func filterChip(_ tab: ActiveBotsTab, count: Int) -> some View {
-        let selected = vm.activeBotsTab == tab
-        return Button {
-            vm.activeBotsTab = tab
-        } label: {
-            HStack(spacing: DS.Space.xs) {
-                Text(tab.title)
-                    .font(DS.Font.caption.weight(.semibold))
-                Text("\(count)")
-                    .font(DS.Font.caption2.weight(.bold))
-                    .opacity(selected ? 0.9 : 0.7)
-            }
-            .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.vertical, DS.Space.sm)
-            .background(selected ? DS.Palette.accent : DS.Palette.surfaceRaised)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .strokeBorder(selected ? Color.clear : DS.Palette.line, lineWidth: DS.Border.hairline)
-            )
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-        .accessibilityIdentifier("activeBots.tab.\(tab.rawValue)")
-    }
-
     private var searchField: some View {
-        HStack(spacing: DS.Space.sm) {
-            Image(systemName: "magnifyingglass")
-                .foregroundColor(DS.Palette.textTertiary)
-                .accessibilityHidden(true)
-            TextField("Search bots", text: $vm.activeBotsSearchText)
-                .textFieldStyle(.plain)
-                .foregroundColor(DS.Palette.text)
-                .accessibilityLabel("Search bots")
-                .accessibilityIdentifier("activeBots.search")
-        }
-        .padding(.horizontal, DS.Space.lg)
-        .padding(.vertical, DS.Space.md)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        AgentListSearchField(
+            text: $vm.activeBotsSearchText,
+            placeholder: "Search bots",
+            identifier: "activeBots.search",
+            accessibilityLabel: "Search bots"
         )
+        .accessibilityLabel("Search bots")
     }
 
     @ViewBuilder
@@ -265,23 +238,11 @@ public struct ActiveBotsRootView: View {
     }
 
     private var footerBar: some View {
-        HStack(spacing: DS.Space.md) {
-            Text(vm.activeBotsFooterLine)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-            if vm.activeBotCount > 0 {
-                DSPill("Live", tone: .warning)
-                    .accessibilityHidden(true)
-            } else {
-                DSPill("Idle", tone: .neutral)
-                    .accessibilityHidden(true)
-            }
-            Spacer(minLength: DS.Space.md)
-        }
-        .padding(.horizontal, DS.Space.xxl)
-        .frame(height: 40)
-        .background(DS.Palette.surface)
-        .accessibilityElement(children: .combine)
+        AgentListFooterBar(
+            caption: vm.activeBotsFooterLine,
+            pillTitle: vm.activeBotCount > 0 ? "Live" : "Idle",
+            pillTone: vm.activeBotCount > 0 ? .warning : .neutral
+        )
         .accessibilityLabel(vm.activeBotsFooterLine)
     }
 }
@@ -291,81 +252,37 @@ private struct ActiveBotCard: View {
     let onOpen: () -> Void
 
     var body: some View {
-        Button(action: onOpen) {
+        AgentOverviewCard(
+            icon: "bolt.fill",
+            iconColor: DS.Palette.accent,
+            title: item.title,
+            subtitle: item.detail,
+            identifier: "activeBots.active.\(item.botID.value.uuidString.lowercased())",
+            onOpen: onOpen
+        ) {
+            DSPill("Running", tone: .success)
+        } meta: {
             HStack(alignment: .center, spacing: DS.Space.xl) {
-                Image(systemName: "bolt.fill")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(DS.Palette.accent)
-                    .frame(width: 44, height: 44)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                    )
-                    .accessibilityHidden(true)
-
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    HStack(spacing: DS.Space.sm) {
-                        Text(item.title)
-                            .font(DS.Font.body.weight(.semibold))
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(1)
-                        DSPill("Running", tone: .success)
-                    }
-                    Text(item.detail)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Last Triggered")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(item.lastTriggeredLabel)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(2)
-                }
-                .frame(width: 140, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Next Run")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(item.nextRunLabel)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.warning)
-                        .lineLimit(2)
-                }
-                .frame(width: 140, alignment: .leading)
-
-                Menu {
-                    Button("Open Desk", action: onOpen)
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .menuStyle(.borderlessButton)
-                .accessibilityLabel("Bot actions")
+                AgentOverviewMetaColumn(title: "Last Triggered", value: item.lastTriggeredLabel)
+                AgentOverviewMetaColumn(
+                    title: "Next Run",
+                    value: item.nextRunLabel,
+                    valueColor: DS.Palette.warning
+                )
             }
-            .padding(.horizontal, DS.Space.xl)
-            .padding(.vertical, DS.Space.lg)
-            .background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-            )
-            .contentShape(Rectangle())
+        } trailing: {
+            Menu {
+                Button("Open Desk", action: onOpen)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel("Bot actions")
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("activeBots.active.\(item.botID.value.uuidString.lowercased())")
     }
 }
 
@@ -374,81 +291,33 @@ private struct FinishedBotCard: View {
     let onOpen: () -> Void
 
     var body: some View {
-        Button(action: onOpen) {
+        AgentOverviewCard(
+            icon: statusIcon,
+            iconColor: statusColor,
+            title: item.title,
+            subtitle: item.detail,
+            identifier: "activeBots.finished.\(item.runID.value.uuidString.lowercased())",
+            onOpen: onOpen
+        ) {
+            statusPill
+        } meta: {
             HStack(alignment: .center, spacing: DS.Space.xl) {
-                Image(systemName: statusIcon)
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(statusColor)
-                    .frame(width: 44, height: 44)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                    )
-                    .accessibilityHidden(true)
-
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    HStack(spacing: DS.Space.sm) {
-                        Text(item.title)
-                            .font(DS.Font.body.weight(.semibold))
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(1)
-                        statusPill
-                    }
-                    Text(item.detail)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Last Triggered")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(item.lastTriggeredLabel)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(2)
-                }
-                .frame(width: 140, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Next Run")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(item.nextRunLabel)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(2)
-                }
-                .frame(width: 140, alignment: .leading)
-
-                Menu {
-                    Button("Open Desk", action: onOpen)
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .menuStyle(.borderlessButton)
-                .accessibilityLabel("Bot actions")
+                AgentOverviewMetaColumn(title: "Last Triggered", value: item.lastTriggeredLabel)
+                AgentOverviewMetaColumn(title: "Next Run", value: item.nextRunLabel)
             }
-            .padding(.horizontal, DS.Space.xl)
-            .padding(.vertical, DS.Space.lg)
-            .background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-            )
-            .contentShape(Rectangle())
+        } trailing: {
+            Menu {
+                Button("Open Desk", action: onOpen)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel("Bot actions")
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("activeBots.finished.\(item.runID.value.uuidString.lowercased())")
     }
 
     private var statusIcon: String {

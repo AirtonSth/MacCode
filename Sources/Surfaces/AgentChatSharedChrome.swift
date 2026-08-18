@@ -141,20 +141,38 @@ public extension AgentChatThreadRow where Leading == EmptyView, Trailing == Empt
 public struct AgentQueuedRow<Trailing: View>: View {
     public let text: String
     public let identifier: String
+    public var leading: AnyView? = nil
+    public var detail: AnyView? = nil
     public var trailing: Trailing
 
-    public init(text: String, identifier: String, @ViewBuilder trailing: () -> Trailing) {
+    public init(
+        text: String,
+        identifier: String,
+        leading: AnyView? = nil,
+        detail: AnyView? = nil,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
         self.text = text
         self.identifier = identifier
+        self.leading = leading
+        self.detail = detail
         self.trailing = trailing()
     }
 
     public var body: some View {
         HStack(alignment: .top, spacing: DS.Space.md) {
-            Text(text)
-                .font(DS.Font.body)
-                .foregroundColor(DS.Palette.text)
-                .lineLimit(3)
+            if let leading {
+                leading
+            }
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text(text)
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(3)
+                if let detail {
+                    detail
+                }
+            }
             Spacer(minLength: DS.Space.sm)
             trailing
         }
@@ -220,21 +238,41 @@ public struct AgentChatAttachmentChips: View {
 public struct AgentChatWorkingPill: View {
     public let label: String
     public var identifier: String = "agent.workingPhase"
+    public var tone: DSPill.Tone = .accent
+    public var help: String? = nil
+    public var accessibilityLabelText: String? = nil
+    public var padded: Bool = true
 
-    public init(label: String, identifier: String = "agent.workingPhase") {
+    public init(
+        label: String,
+        identifier: String = "agent.workingPhase",
+        tone: DSPill.Tone = .accent,
+        help: String? = nil,
+        accessibilityLabelText: String? = nil,
+        padded: Bool = true
+    ) {
         self.label = label
         self.identifier = identifier
+        self.tone = tone
+        self.help = help
+        self.accessibilityLabelText = accessibilityLabelText
+        self.padded = padded
     }
 
     public var body: some View {
-        HStack {
-            DSPill(label, tone: .accent)
-                .help(label)
-                .accessibilityIdentifier(identifier)
-                .accessibilityLabel(label)
-            Spacer(minLength: 0)
+        let pill = DSPill(label, tone: tone)
+            .help(help ?? label)
+            .accessibilityIdentifier(identifier)
+            .accessibilityLabel(accessibilityLabelText ?? label)
+        if padded {
+            HStack {
+                pill
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.top, DS.Space.sm)
+        } else {
+            pill
         }
-        .padding(.horizontal, DS.Space.lg)
-        .padding(.top, DS.Space.sm)
     }
 }

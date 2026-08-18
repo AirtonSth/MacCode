@@ -4,6 +4,7 @@ import SwiftUI
 import CoreModel
 import Persistence
 import DesignSystemKit
+import Surfaces
 
 public enum ScheduledTaskStatusFilter: String, CaseIterable, Identifiable {
     case all = "All"
@@ -556,23 +557,11 @@ public struct ScheduledTasksRootView: View {
     }
 
     private var footerBar: some View {
-        HStack(spacing: DS.Space.md) {
-            Text(vm.footerTaskCountLine)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-            if !vm.serviceRequiresApproval {
-                DSPill(
-                    vm.schedulerActive ? "Scheduler online" : "Scheduler paused",
-                    tone: vm.schedulerActive ? .success : .warning
-                )
-                .accessibilityHidden(true)
-            }
-            Spacer(minLength: DS.Space.md)
-        }
-        .padding(.horizontal, DS.Space.xxl)
-        .frame(height: 40)
-        .background(DS.Palette.surface)
-        .accessibilityElement(children: .combine)
+        AgentListFooterBar(
+            caption: vm.footerTaskCountLine,
+            pillTitle: vm.schedulerActive ? "Scheduler online" : "Scheduler paused",
+            pillTone: vm.schedulerActive ? .success : .warning
+        )
         .accessibilityLabel(vm.footerStatsLine)
     }
 
@@ -664,122 +653,45 @@ public struct ScheduledTasksRootView: View {
     /// Global kill-switch control: status chrome + switch.
     /// State is conveyed by icon + label + tint (not color alone — WCAG 1.4.1).
     private var schedulerActiveControl: some View {
-        let active = vm.schedulerActive
-        let tone = active ? DS.Palette.success : DS.Palette.warning
-        let icon = active ? "bolt.fill" : "pause.fill"
-        let title = active ? "Active" : "Paused"
-        let subtitle = active ? "Schedules on" : "Travel pause"
-
-        return HStack(spacing: DS.Space.md) {
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: icon)
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(tone)
-                    .frame(width: 22, height: 22)
-                    .background(tone.opacity(0.16))
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(title)
-                        .font(DS.Font.captionStrong)
-                        .foregroundColor(DS.Palette.text)
-                    Text(subtitle)
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                }
-            }
-            .accessibilityHidden(true)
-
-            Toggle(isOn: Binding(
-                get: { vm.schedulerActive },
-                set: { vm.setSchedulerActive($0) }
-            )) {
-                Text("Active")
-            }
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .tint(DS.Palette.success)
-            .accessibilityIdentifier("scheduledTasks.globalActive")
-            .accessibilityLabel(active ? "Schedules active" : "Schedules paused")
-            .accessibilityValue(active ? "On" : "Off")
-            .accessibilityHint("Disables all automatic scheduled task runs without deleting tasks")
-        }
-        .padding(.leading, DS.Space.lg)
-        .padding(.trailing, DS.Space.md)
-        .padding(.vertical, DS.Space.sm)
-        .background(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .fill(DS.Palette.surfaceRaised)
+        AgentKillSwitchControl(
+            isActive: vm.schedulerActive,
+            identifier: "scheduledTasks.globalActive",
+            accessibilityLabel: vm.schedulerActive ? "Schedules active" : "Schedules paused",
+            onChange: { vm.setSchedulerActive($0) }
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .strokeBorder(
-                    active ? tone.opacity(0.45) : DS.Palette.line,
-                    lineWidth: DS.Border.hairline
-                )
-        )
-        .animation(DS.Motion.micro, value: active)
-        .help(active
-              ? "Schedules are running. Turn off to pause all automatic runs (e.g. while traveling)."
-              : "All automatic runs are paused. Turn on when you return.")
-        .contentShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
     }
 
     private var filterChips: some View {
         HStack(spacing: DS.Space.sm) {
-            filterChip(.all, count: vm.filterCounts.all)
-            filterChip(.active, count: vm.filterCounts.active)
-            filterChip(.paused, count: vm.filterCounts.paused)
+            AgentListFilterChip(
+                title: ScheduledTaskStatusFilter.all.rawValue,
+                count: vm.filterCounts.all,
+                selected: vm.statusFilter == .all,
+                identifier: "scheduledTasks.filter.all"
+            ) { vm.statusFilter = .all }
+            AgentListFilterChip(
+                title: ScheduledTaskStatusFilter.active.rawValue,
+                count: vm.filterCounts.active,
+                selected: vm.statusFilter == .active,
+                identifier: "scheduledTasks.filter.active"
+            ) { vm.statusFilter = .active }
+            AgentListFilterChip(
+                title: ScheduledTaskStatusFilter.paused.rawValue,
+                count: vm.filterCounts.paused,
+                selected: vm.statusFilter == .paused,
+                identifier: "scheduledTasks.filter.paused"
+            ) { vm.statusFilter = .paused }
         }
         .accessibilityIdentifier("scheduledTasks.statusFilter")
         .accessibilityLabel("Filter tasks by status")
     }
 
-    private func filterChip(_ filter: ScheduledTaskStatusFilter, count: Int) -> some View {
-        let selected = vm.statusFilter == filter
-        return Button {
-            vm.statusFilter = filter
-        } label: {
-            HStack(spacing: DS.Space.xs) {
-                Text(filter.rawValue)
-                    .font(DS.Font.caption.weight(.semibold))
-                Text("\(count)")
-                    .font(DS.Font.caption2.weight(.bold))
-                    .opacity(selected ? 0.9 : 0.7)
-            }
-            .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.vertical, DS.Space.sm)
-            .background(selected ? DS.Palette.accent : DS.Palette.surfaceRaised)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .strokeBorder(selected ? Color.clear : DS.Palette.line, lineWidth: DS.Border.hairline)
-            )
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-        .accessibilityLabel("\(filter.rawValue), \(count)")
-    }
-
     private var searchField: some View {
-        HStack(spacing: DS.Space.sm) {
-            Image(systemName: "magnifyingglass")
-                .foregroundColor(DS.Palette.textTertiary)
-                .accessibilityHidden(true)
-            TextField("Search tasks", text: $vm.searchText)
-                .textFieldStyle(.plain)
-                .foregroundColor(DS.Palette.text)
-                .accessibilityIdentifier("scheduledTasks.search")
-        }
-        .padding(.horizontal, DS.Space.lg)
-        .padding(.vertical, DS.Space.md)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        AgentListSearchField(
+            text: $vm.searchText,
+            placeholder: "Search tasks",
+            identifier: "scheduledTasks.search",
+            accessibilityLabel: "Search tasks"
         )
     }
 
@@ -1160,57 +1072,24 @@ private struct ScheduledTaskCard: View {
     private var isActiveRun: Bool { activeRunStatus != nil }
 
     var body: some View {
-        Button(action: onOpen) {
+        AgentOverviewCard(
+            icon: "calendar.badge.clock",
+            iconColor: DS.Palette.accent,
+            title: task.title,
+            subtitle: "\(workspaceName) · \(task.runAsUser) · \(providerLabel)",
+            identifier: "scheduledTasks.task.\(task.id.uuidString.lowercased())",
+            accessibilityValue: accessibilityStatusValue,
+            onOpen: onOpen
+        ) {
+            badge
+        } meta: {
             HStack(alignment: .center, spacing: DS.Space.xl) {
-                Image(systemName: "calendar.badge.clock")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(DS.Palette.accent)
-                    .frame(width: 44, height: 44)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                    )
-                    .accessibilityHidden(true)
-
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    HStack(spacing: DS.Space.sm) {
-                        Text(task.title)
-                            .font(DS.Font.body.weight(.semibold))
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(1)
-                        badge
-                    }
-                    Text("\(workspaceName) · \(task.runAsUser) · \(providerLabel)")
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Schedule")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(task.recurrence.detailSummary)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(2)
-                }
-                .frame(width: 140, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(isActiveRun ? "Status" : "Next run")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(statusOrNext)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(isActiveRun ? DS.Palette.warning : DS.Palette.text)
-                        .lineLimit(2)
-                }
-                .frame(width: 140, alignment: .leading)
-
+                AgentOverviewMetaColumn(title: "Schedule", value: task.recurrence.detailSummary)
+                AgentOverviewMetaColumn(
+                    title: isActiveRun ? "Status" : "Next run",
+                    value: statusOrNext,
+                    valueColor: isActiveRun ? DS.Palette.warning : DS.Palette.text
+                )
                 HStack(spacing: DS.Space.xs) {
                     Image(systemName: "clock")
                         .font(.system(size: 11, weight: .semibold))
@@ -1222,37 +1101,24 @@ private struct ScheduledTaskCard: View {
                 }
                 .frame(width: 44, alignment: .trailing)
                 .accessibilityLabel("\(runCount) runs")
-
-                Menu {
-                    Button(task.isEnabled ? "Pause" : "Resume", action: onToggle)
-                    Button("Run Now", action: onRunNow)
-                    Button("Edit", action: onEdit)
-                    Divider()
-                    Button("Delete", role: .destructive, action: onDelete)
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .menuStyle(.borderlessButton)
-                .accessibilityLabel("Task actions")
             }
-            .padding(.horizontal, DS.Space.xl)
-            .padding(.vertical, DS.Space.lg)
-            .background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-            )
-            .contentShape(Rectangle())
+        } trailing: {
+            Menu {
+                Button(task.isEnabled ? "Pause" : "Resume", action: onToggle)
+                Button("Run Now", action: onRunNow)
+                Button("Edit", action: onEdit)
+                Divider()
+                Button("Delete", role: .destructive, action: onDelete)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel("Task actions")
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("scheduledTasks.task.\(task.id.uuidString.lowercased())")
-        .accessibilityElement(children: .combine)
-        .accessibilityValue(accessibilityStatusValue)
     }
 
     @ViewBuilder
@@ -1289,6 +1155,8 @@ private struct ScheduledTaskCard: View {
 
 private struct ScheduledTaskEditorView: View {
     @State private var draft: ScheduledTaskEditorDraft
+    @State private var showSourceOptions = false
+    @State private var showModelOptions = false
     @ObservedObject var vm: ScheduledTasksViewModel
     let onBack: () -> Void
     let onCancel: () -> Void
@@ -1399,32 +1267,14 @@ private struct ScheduledTaskEditorView: View {
                             }
                         }
                         formRow("Run as user") {
-                            Picker("System user", selection: $draft.runAsUser) {
-                                ForEach(vm.users) { user in
-                                    Text(user.name).tag(user.name)
-                                }
-                            }
-                            .labelsHidden()
-                            .onChange(of: draft.runAsUser) { _, name in
-                                draft.runAsUID = vm.users.first { $0.name == name }?.uid ?? 0
-                            }
+                            editorRunAsCapsule
                         }
-                        // Parity with Agent App: one Provider/Source picker only
+                        // Parity with Agent App: one Provider/Source capsule only
                         // (Codex / Claude / Grok). Instance id is derived from the
                         // selected provider's primary snapshot and stays in the model.
                         formRow("Provider") {
-                            Picker("Provider", selection: $draft.provider) {
-                                ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
-                            }
-                            .labelsHidden()
-                            .onChange(of: draft.provider) { _, provider in
-                                if let snapshot = vm.providerSnapshots(for: provider).first {
-                                    draft.providerInstanceID = snapshot.id
-                                    draft.model = snapshot.models.first?.id ?? ""
-                                    draft.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .high
-                                }
-                            }
-                            .accessibilityIdentifier("scheduledTasks.editor.provider")
+                            editorSourceCapsule
+                                .accessibilityIdentifier("scheduledTasks.editor.provider")
                         }
                         formRow("Model routing") {
                             HStack(spacing: DS.Space.sm) {
@@ -1454,24 +1304,16 @@ private struct ScheduledTaskEditorView: View {
                             }
                         } else {
                             formRow("Model") {
-                                Picker("Model", selection: $draft.model) {
-                                    ForEach(vm.models(provider: draft.provider, instanceID: draft.providerInstanceID), id: \.id) {
-                                        Text($0.label).tag($0.id)
-                                    }
-                                    if !draft.model.isEmpty,
-                                       !vm.models(provider: draft.provider, instanceID: draft.providerInstanceID).contains(where: { $0.id == draft.model }) {
-                                        Text(draft.model).tag(draft.model)
-                                    }
+                                Button {
+                                    showModelOptions.toggle()
+                                } label: {
+                                    AgentModelPillLabel(presentation: editorModelPillPresentation)
                                 }
-                                .labelsHidden()
+                                .buttonStyle(.plain)
                                 .accessibilityIdentifier("scheduledTasks.editor.model")
-                            }
-                            formRow("Reasoning") {
-                                Picker("Reasoning", selection: $draft.reasoningEffort) {
-                                    ForEach(AgentReasoningEffort.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                                .popover(isPresented: $showModelOptions, arrowEdge: .bottom) {
+                                    editorModelPopover
                                 }
-                                .labelsHidden()
-                                .accessibilityIdentifier("scheduledTasks.editor.reasoning")
                             }
                         }
                     }
@@ -1644,6 +1486,118 @@ private struct ScheduledTaskEditorView: View {
                 DatePicker("Local time", selection: $draft.localTime, displayedComponents: .hourAndMinute)
                     .labelsHidden()
             }
+        }
+    }
+
+    private var editorRunAsCapsule: some View {
+        let users = vm.users.map { user -> AgentRunAsUser in
+            let name = user.name
+            let uid = user.uid
+            let homeDirectory = user.homeDirectory
+            return AgentRunAsUser(generatedUID: "", shortName: name, uid: uid, gid: 0, homePath: homeDirectory)
+        }
+        let selected = users.first(where: { $0.shortName == draft.runAsUser && $0.uid == draft.runAsUID })
+            ?? users.first(where: { $0.shortName == draft.runAsUser })
+            ?? AgentRunAsUser(generatedUID: "", shortName: draft.runAsUser, uid: draft.runAsUID, gid: 0, homePath: "")
+        return AgentRunAsUserCapsule(
+            users: users,
+            selected: selected,
+            runLocked: false,
+            identityLocked: false,
+            accessibilityIdentifier: "scheduledTasks.editor.runAsUser",
+            onSelect: { user in
+                draft.runAsUser = user.shortName
+                draft.runAsUID = user.uid
+            }
+        )
+    }
+
+    private var editorSourceCapsule: some View {
+        AgentSourceCapsule(
+            label: AgentSourceCapsulePresentation.capsuleLabel(
+                selected: vm.providers.first(where: {
+                    $0.id == draft.providerInstanceID && $0.provider == draft.provider
+                }) ?? vm.providerSnapshots(for: draft.provider).first,
+                fallbackProvider: draft.provider,
+                fallbackInstanceId: draft.providerInstanceID,
+                snapshots: vm.providers
+            ),
+            entries: AgentSourceCapsulePresentation.menuEntries(
+                snapshots: vm.providers,
+                selectedSnapshotId: draft.providerInstanceID,
+                selectedProvider: draft.provider,
+                providerDisplayName: { $0.rawValue.capitalized }
+            ),
+            runLocked: false,
+            providerLocked: false,
+            accessibilityIdentifier: "scheduledTasks.editor.provider",
+            popoverIdentifier: "scheduledTasks.editor.source.popover",
+            isPresented: $showSourceOptions,
+            onSelect: { selectScheduledSource($0) }
+        )
+    }
+
+    private var editorModelPillPresentation: AgentModelPillPresentation {
+        let models = vm.models(provider: draft.provider, instanceID: draft.providerInstanceID)
+        let title = models.first(where: { $0.id == draft.model })?.label
+            ?? (draft.model.isEmpty ? "Model" : draft.model)
+        return AgentModelPillPresentation(
+            title: title,
+            effort: draft.reasoningEffort.displayName
+        )
+    }
+
+    private var editorModelPopover: some View {
+        let models = vm.models(provider: draft.provider, instanceID: draft.providerInstanceID)
+        return AgentModelPopoverChrome(
+            presentation: AgentModelPopoverPresentation.current(mode: draft.routingMode),
+            autoEnabled: Binding(
+                get: { draft.routingMode == .auto },
+                set: { setAutoRoutingEnabled($0) }
+            ),
+            toggleDisabled: false
+        ) {
+            AgentCompactMenuSection("Model")
+            ForEach(models, id: \.id) { model in
+                AgentCompactMenuRow(model.label, selected: model.id == draft.model) {
+                    draft.model = model.id
+                    if let effort = model.supportedReasoningEfforts.first {
+                        draft.reasoningEffort = effort
+                    }
+                    showModelOptions = false
+                }
+            }
+            if !draft.model.isEmpty, !models.contains(where: { $0.id == draft.model }) {
+                AgentCompactMenuRow(draft.model, selected: true) {
+                    showModelOptions = false
+                }
+            }
+            AgentCompactMenuDivider()
+            AgentCompactMenuSection("Reasoning")
+            ForEach(AgentReasoningEffort.allCases, id: \.self) { effort in
+                AgentCompactMenuRow(effort.displayName, selected: effort == draft.reasoningEffort) {
+                    draft.reasoningEffort = effort
+                    showModelOptions = false
+                }
+            }
+        }
+        .accessibilityIdentifier("scheduledTasks.editor.reasoning")
+    }
+
+    private func selectScheduledSource(_ entry: AgentSourceCapsulePresentation.MenuEntry) {
+        if let snapshot = vm.providers.first(where: { $0.id == entry.id }) {
+            draft.provider = snapshot.provider
+            draft.providerInstanceID = snapshot.id
+            draft.model = snapshot.models.first?.id ?? ""
+            draft.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .high
+            return
+        }
+        guard let provider = AgentProvider(rawValue: entry.id) else { return }
+        draft.provider = provider
+        if let snapshot = vm.providerSnapshots(for: provider).first {
+            draft.providerInstanceID = snapshot.id
+            draft.model = snapshot.models.first?.id ?? ""
+            draft.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .high
         }
     }
 

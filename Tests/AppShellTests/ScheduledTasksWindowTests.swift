@@ -180,11 +180,14 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("setSchedulerActive"))
         XCTAssertTrue(source.contains("schedulerActive"))
         XCTAssertTrue(source.contains("schedulerActiveControl"))
+        XCTAssertTrue(source.contains("AgentKillSwitchControl("))
         // UX: state is not color-only — icon + Active/Paused label + switch.
-        XCTAssertTrue(source.contains("bolt.fill"))
-        XCTAssertTrue(source.contains("pause.fill"))
-        XCTAssertTrue(source.contains("\"Paused\""))
-        XCTAssertTrue(source.contains("Travel pause"))
+        // Paint lives on AgentKillSwitchControl; this window only mounts it.
+        let chrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentListChrome.swift"), encoding: .utf8)
+        XCTAssertTrue(chrome.contains("bolt.fill"))
+        XCTAssertTrue(chrome.contains("pause.fill"))
+        XCTAssertTrue(chrome.contains("\"Paused\""))
+        XCTAssertTrue(chrome.contains("Travel pause"))
         XCTAssertTrue(settings.contains("scheduledTasksActive"))
         XCTAssertTrue(runtime.contains("scheduledTasksActive"))
         XCTAssertTrue(runtime.contains("global_active=false")
