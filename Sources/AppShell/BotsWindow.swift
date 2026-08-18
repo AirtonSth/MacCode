@@ -694,12 +694,17 @@ public final class BotsViewModel: ObservableObject {
     private var studioDraftHydrated = false
     private var isApplyingStudioDraft = false
     private var deskLiveTurnWatch: Task<Void, Never>?
+    public var computerGuestService: BotComputerGuestService?
 
     public init(context: AppContext, router: AppCommandRouter? = nil) {
         self.context = context
         self.router = router
         self.botStore = context.botStore
         self.settingsStore = SettingsStore(db: context.db)
+        self.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: BotComputerDockerCLI()
+        )
         restoreQueuedFollowUpsIfNeeded()
         restoreComposerDraftsIfNeeded()
         restoreInspectorDraftsIfNeeded()
@@ -1328,6 +1333,7 @@ public final class BotsViewModel: ObservableObject {
         persistSelection()
         leaveDeskLiveWatch()
         reloadStudioSupport(id: fresh.id)
+        refreshDockerGuestProbe()
     }
 
     private func loadStudioDraft(_ bot: BotDefinition) {
@@ -1803,6 +1809,7 @@ public final class BotsViewModel: ObservableObject {
 
     public func delete(id: BotID, navigate: Bool = true) {
         do {
+            computerGuestService?.teardown(botID: id)
             try botStore.delete(id: id)
             let leaving = selectedBotID == id
             unpublishedNewBotIDs.remove(id)
@@ -1936,6 +1943,12 @@ public final class BotsViewModel: ObservableObject {
         let message = (text ?? composerText).trimmingCharacters(in: .whitespacesAndNewlines)
         guard AgentChatTranscriptChrome.admitsSend(text: message, attachmentCount: attached.count) else { return false }
         guard let bot = selectedBot else { return false }
+        do {
+            try admitDesktopSend(bot: bot)
+        } catch {
+            errorMessage = "Docker desktop is not ready."
+            return false
+        }
         lastSendAcknowledgedOnScreenForTesting = screen
         composerText = ""
         composerCursorOffset = nil
@@ -4777,10 +4790,40 @@ public final class BotsViewModel: ObservableObject {
 
     /// Machine probe. Tests inject a ready/not-ready override.
     public var dockerGuestReadyOverrideForTesting: Bool?
+    public var desktopKindOverrideForTesting: BotDesktopKind?
     public var dockerGuestProbeReason: String?
 
     public var dockerGuestReady: Bool {
-        dockerGuestReadyOverrideForTesting ?? false
+        if let dockerGuestReadyOverrideForTesting { return dockerGuestReadyOverrideForTesting }
+        return computerGuestService?.lastReady != nil
+    }
+
+    public func admitDesktopSend(bot: BotDefinition) throws {
+        let kind = desktopKindOverrideForTesting
+            ?? resolvedDesktopKind(selectedRevision?.desktopKind ?? .logicalExecutionSpace)
+        guard kind == .dockerDesktop else { return }
+        if dockerGuestReadyOverrideForTesting == false {
+            throw BotComputerGuestError.notReady
+        }
+        if dockerGuestReadyOverrideForTesting == true {
+            return
+        }
+        guard let service = computerGuestService else {
+            throw BotComputerGuestError.notReady
+        }
+        _ = try service.provision(botID: bot.id)
+    }
+
+    public func refreshDockerGuestProbe() {
+        guard dockerGuestReadyOverrideForTesting == nil else { return }
+        guard let service = computerGuestService else { return }
+        Task.detached {
+            let ready = service.proveReady()
+            await MainActor.run {
+                self.dockerGuestProbeReason = ready ? nil : service.lastReason
+                self.objectWillChange.send()
+            }
+        }
     }
 
     private func resolvedDesktopKind(_ requested: BotDesktopKind) -> BotDesktopKind {

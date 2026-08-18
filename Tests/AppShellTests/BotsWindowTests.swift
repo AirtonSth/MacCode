@@ -4812,6 +4812,39 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, 1)
     }
 
+    func test_studioSavesBotOwnedAndDockerWhenReady() throws {
+        // WHY: the owner must persist this Mac bot browser without Docker,
+        // and Docker desktop only after the radio is enabled.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .botOwnedBrowser
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .botOwnedBrowser)
+
+        vm.dockerGuestReadyOverrideForTesting = true
+        vm.studioDraft.desktopKind = .dockerDesktop
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
+    }
+
+    func test_dockerDesktopSendFailsClosedWithoutGuestPNG() throws {
+        // WHY: Codex advisor: published dockerDesktop must not compile/send
+        // HID on this Mac when the guest cannot return a PNG.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        vm.dockerGuestReadyOverrideForTesting = false
+        vm.desktopKindOverrideForTesting = .dockerDesktop
+        XCTAssertFalse(vm.send("open chrome"))
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+        vm.desktopKindOverrideForTesting = nil
+        vm.dockerGuestReadyOverrideForTesting = true
+        XCTAssertTrue(vm.send("open chrome"))
+    }
+
     func test_desktopLabelContainsNotIsolated_becauseP1aMustNotClaimAVM() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
