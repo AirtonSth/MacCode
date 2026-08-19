@@ -7815,5 +7815,13 @@ private struct BotGuestDesktopRoot: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.Palette.surface)
+        .alert("Bots", isPresented: Binding(
+            get: { vm.errorMessage != nil },
+            set: { if !$0 { vm.errorMessage = nil } }
+        )) {
+            Button("OK") { vm.errorMessage = nil }
+        } message: {
+            Text(vm.errorMessage ?? "")
+        }
     }
 }

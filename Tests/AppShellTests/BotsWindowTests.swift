@@ -5459,6 +5459,18 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(canvas.contains("Button(\"Terminal\""))
     }
 
+    func test_detachedGuestDesktopPresentsRebuildFailureAlert() throws {
+        // WHY: the shared Rebuild control is also mounted in the detached
+        // desktop window, whose root must not silently swallow vm.errorMessage.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private struct BotGuestDesktopRoot") else {
+            return XCTFail("detached guest root must exist")
+        }
+        let root = String(source[start.lowerBound...])
+        XCTAssertTrue(root.contains(".alert(\"Bots\""))
+        XCTAssertTrue(root.contains("vm.errorMessage"))
+    }
+
     func test_rebuildDockerGuestPublishesProgressAndRejectsDuplicateWork() async throws {
         // WHY: image builds can take minutes. The first click must acknowledge
         // work immediately and a second click must not start a competing build.
@@ -5559,6 +5571,79 @@ final class BotsWindowTests: XCTestCase {
         let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
         XCTAssertGreaterThan(png.count, 2_000)
         if let artifact = ProcessInfo.processInfo.environment["REMOTE_CODE_BOT_GUEST_ARTIFACT"] {
+            try png.write(to: URL(fileURLWithPath: artifact), options: .atomic)
+        }
+    }
+
+    func test_filesLocationBarRendersFullStudioWidthOffscreen() throws {
+        // WHY: the modifier contract is also rendered through the real Studio
+        // hierarchy so a passing source assertion cannot hide a broken view tree.
+        let (_, vm, bot, _) = try makeDockerStudio()
+        vm.setStudioFilesLocation(.botFiles, for: bot)
+        vm.studioTab = .files
+        let root = BotsRootView(vm: vm, embedsRosterRail: false)
+            .frame(width: 1_100, height: 760)
+        let hosting = NSHostingView(rootView: root)
+        hosting.frame = NSRect(x: 0, y: 0, width: 1_100, height: 760)
+        hosting.wantsLayer = true
+        let window = NSWindow(
+            contentRect: hosting.bounds,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.layoutIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+
+        let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        XCTAssertGreaterThan(png.count, 10_000)
+        if let artifact = ProcessInfo.processInfo.environment["REMOTE_CODE_BOT_FILES_LAYOUT_ARTIFACT"] {
+            try png.write(to: URL(fileURLWithPath: artifact), options: .atomic)
+        }
+    }
+
+    func test_guestCanvasRunningControlsRenderOffscreen() throws {
+        // WHY: Rebuild and Stop must materialize as macOS chrome, not only as
+        // source copy that disappears under a conditional running branch.
+        let canvas = BotComputerGuestCanvas(
+            url: nil,
+            running: true,
+            rebuilding: false,
+            launchState: .idle,
+            startIdentifier: "test.desktop.start",
+            rebuildIdentifier: "test.desktop.rebuild",
+            stopIdentifier: "test.desktop.stop",
+            screenIdentifier: "test.desktop.screen",
+            onStart: {},
+            onRebuild: {},
+            onStop: {}
+        )
+        .frame(width: 640, height: 220)
+        .background(Color.black)
+        .environment(\.colorScheme, .dark)
+        let hosting = NSHostingView(rootView: canvas)
+        hosting.frame = NSRect(x: 0, y: 0, width: 640, height: 220)
+        hosting.wantsLayer = true
+        let window = NSWindow(
+            contentRect: hosting.bounds,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.layoutIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        XCTAssertGreaterThan(png.count, 2_000)
+        if let artifact = ProcessInfo.processInfo.environment["REMOTE_CODE_BOT_GUEST_CONTROLS_ARTIFACT"] {
             try png.write(to: URL(fileURLWithPath: artifact), options: .atomic)
         }
     }
