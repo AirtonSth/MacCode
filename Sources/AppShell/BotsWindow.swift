@@ -3114,12 +3114,42 @@ public final class BotsViewModel: ObservableObject {
         UserDefaults.standard.set(Double(deskThreadRailWidth), forKey: Self.deskThreadRailWidthDefaultsKey)
     }
 
-    /// Desk bleeds into the titlebar only while the shell sidebar is open.
-    static func bleedsIntoTitlebar(
+    /// The content column is never under the traffic lights: the sidebar
+    /// owns them when open, and the 34pt restore bar owns them when
+    /// collapsed. So the main shell always drops every titlebar inset —
+    /// keeping .top while the sidebar is open parked the Ceo header a
+    /// full titlebar below the traffic lights, and keeping .leading hung
+    /// Ceo in empty padding next to the sidebar. Constant edges also
+    /// keep Desk still while the sidebar toggle animates.
+    static func ignoredSafeAreaEdges(
         embedsRosterRail: Bool,
-        shellSidebarCollapsed: Bool
-    ) -> Bool {
-        embedsRosterRail && !shellSidebarCollapsed
+        presentsAsDetachedWindow: Bool
+    ) -> Edge.Set {
+        if presentsAsDetachedWindow { return [] }
+        if embedsRosterRail { return .top }
+        return [.top, .leading, .trailing]
+    }
+
+    /// Identity row padding is the same with the sidebar open or hidden.
+    /// Extra traffic-light width is cancelled on the hosting view, not added here.
+    static func deskIdentityLeadingPadding(shellSidebarCollapsed: Bool) -> CGFloat {
+        _ = shellSidebarCollapsed
+        return DS.Space.xl
+    }
+
+    static func cancelsWindowLeadingTitlebarGutter(presentsAsDetachedWindow: Bool) -> Bool {
+        !presentsAsDetachedWindow
+    }
+
+    /// How much of the window titlebar leading inset still reaches Desk.
+    /// Main shell must be 0 or Ceo sits in a traffic-light-sized hole.
+    static func addedLeadingInsetBeyondIdentityPadding(
+        windowTitlebarLeading: CGFloat,
+        presentsAsDetachedWindow: Bool
+    ) -> CGFloat {
+        cancelsWindowLeadingTitlebarGutter(presentsAsDetachedWindow: presentsAsDetachedWindow)
+            ? 0
+            : windowTitlebarLeading
     }
 
     private func restoreShellSidebarCollapsedIfNeeded() {
@@ -5378,14 +5408,10 @@ private func botManagementButtons(
 }
 
 private struct BotsTitlebarBleed: ViewModifier {
-    let enabled: Bool
+    let edges: Edge.Set
 
     func body(content: Content) -> some View {
-        if enabled {
-            content.ignoresSafeArea(.container, edges: .top)
-        } else {
-            content
-        }
+        content.ignoresSafeArea(.container, edges: edges)
     }
 }
 
@@ -5469,10 +5495,10 @@ public struct BotsRootView: View {
         self.embedsRosterRail = embedsRosterRail
     }
 
-    private var bleedsIntoTitlebar: Bool {
-        BotsViewModel.bleedsIntoTitlebar(
+    private var titlebarSafeAreaEdges: Edge.Set {
+        BotsViewModel.ignoredSafeAreaEdges(
             embedsRosterRail: embedsRosterRail,
-            shellSidebarCollapsed: vm.isShellSidebarCollapsed
+            presentsAsDetachedWindow: vm.presentsAsDetachedWindow
         )
     }
 
@@ -5506,9 +5532,11 @@ public struct BotsRootView: View {
         }
         .frame(minWidth: embedsRosterRail ? 980 : 700, minHeight: 680)
         .background(DS.Palette.bg)
-        // Sidebar already ignores the titlebar inset. Bleed only while
-        // the shell sidebar is open — collapsed keeps the 34pt toggle bar.
-        .modifier(BotsTitlebarBleed(enabled: bleedsIntoTitlebar))
+        // Sidebar (open) or the 34pt restore bar (collapsed) owns the
+        // traffic lights, so Desk drops every titlebar inset: .top or the
+        // Ceo header floats a titlebar below the traffic lights, .leading
+        // or it hangs in empty padding beside the open sidebar.
+        .modifier(BotsTitlebarBleed(edges: titlebarSafeAreaEdges))
         .alert("Bots", isPresented: Binding(
             get: { vm.errorMessage != nil },
             set: { if !$0 { vm.errorMessage = nil } }
@@ -6124,7 +6152,10 @@ public struct BotsRootView: View {
                 .accessibilityIdentifier("bots.desk.inspectorToggle")
             }
         }
-        .padding(.horizontal, DS.Space.xl)
+        .padding(.leading, BotsViewModel.deskIdentityLeadingPadding(
+            shellSidebarCollapsed: vm.isShellSidebarCollapsed
+        ))
+        .padding(.trailing, DS.Space.xl)
         .frame(height: 44)
         .dsBar(edge: .bottom)
     }

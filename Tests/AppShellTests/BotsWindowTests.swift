@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import CoreModel
 import AgentRuntime
 @testable import AppShell
@@ -676,18 +677,59 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(header.contains("AgentChatThreadRailCopy.newHelp"))
     }
 
-    func test_deskStopsTitlebarBleedWhenSidebarCollapses_becauseTheHeaderMustStay() throws {
-        // WHY: dest dest dest dest dest ignores the titlebar while the sidebar is
-        // open. Collapsing the sidebar puts a 34pt toggle bar in that
-        // inset; keep bleeding and dest dest dest dest dest dest header disappears under it.
+    func test_deskAlwaysDropsTitlebarInsetsInMainShell_becauseTheHeaderMustHugTheTrafficLightRow() throws {
+        // WHY: the sidebar (open) or the 34pt restore bar (collapsed) owns
+        // the traffic lights. Keeping the .top inset while the sidebar was
+        // open parked the Ceo header a full titlebar below the traffic
+        // lights — the vertical padding in the bug report. The edge set is
+        // also state-independent so Desk stays still during the toggle.
+        XCTAssertEqual(
+            BotsViewModel.ignoredSafeAreaEdges(
+                embedsRosterRail: false,
+                presentsAsDetachedWindow: false
+            ),
+            [.top, .leading, .trailing],
+            "main-shell Desk owns its whole pane: no titlebar strip, no traffic-light gutter"
+        )
+        XCTAssertEqual(
+            BotsViewModel.deskIdentityLeadingPadding(shellSidebarCollapsed: false),
+            BotsViewModel.deskIdentityLeadingPadding(shellSidebarCollapsed: true),
+            "Ceo leading padding must match open and collapsed — the gutter is not padding"
+        )
         XCTAssertTrue(
-            BotsViewModel.bleedsIntoTitlebar(embedsRosterRail: true, shellSidebarCollapsed: false)
+            BotsViewModel.cancelsWindowLeadingTitlebarGutter(presentsAsDetachedWindow: false),
+            "main-shell Desk must drop the window traffic-light inset"
         )
         XCTAssertFalse(
-            BotsViewModel.bleedsIntoTitlebar(embedsRosterRail: true, shellSidebarCollapsed: true)
+            BotsViewModel.cancelsWindowLeadingTitlebarGutter(presentsAsDetachedWindow: true)
         )
-        XCTAssertFalse(
-            BotsViewModel.bleedsIntoTitlebar(embedsRosterRail: false, shellSidebarCollapsed: false)
+        XCTAssertEqual(
+            BotsViewModel.addedLeadingInsetBeyondIdentityPadding(
+                windowTitlebarLeading: 78,
+                presentsAsDetachedWindow: false
+            ),
+            0,
+            "open sidebar must not still reserve the titlebar gutter on Desk"
+        )
+        XCTAssertEqual(
+            BotsViewModel.addedLeadingInsetBeyondIdentityPadding(
+                windowTitlebarLeading: 78,
+                presentsAsDetachedWindow: true
+            ),
+            78
+        )
+        let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
+        XCTAssertTrue(
+            main.contains("ContentColumnHostingView"),
+            "NSHostingView must override safeAreaInsets — ignoresSafeArea alone leaves the gutter"
+        )
+        XCTAssertTrue(main.contains("cancelHorizontalTitlebarGutter"))
+        XCTAssertTrue(
+            BotsViewModel.ignoredSafeAreaEdges(
+                embedsRosterRail: false,
+                presentsAsDetachedWindow: true
+            ).isEmpty,
+            "a detached Desk window has its own titlebar and must keep its insets"
         )
         let context = try makeContext()
         try context.settingsRepo.set(MainWindowController.sidebarCollapsedSettingsKey, "1")
@@ -700,7 +742,7 @@ final class BotsWindowTests: XCTestCase {
         // inset with title2 + xl padding. That read as a second titlebar.
         // Identity must sit in a 44pt chrome strip like a workspace row.
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("ignoresSafeArea(.container, edges: .top)"))
+        XCTAssertTrue(source.contains("ignoresSafeArea(.container, edges:"))
         guard let start = source.range(of: "private func deskHeader") else {
             return XCTFail("desk header must exist")
         }
@@ -710,6 +752,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(slice.contains("DS.Font.bodyStrong"))
         XCTAssertTrue(slice.contains("size: 22"))
         XCTAssertTrue(slice.contains(".frame(height: 44)"))
+        XCTAssertTrue(
+            slice.contains("deskIdentityLeadingPadding"),
+            "Desk identity must use the shared leading padding, not a sidebar-open gutter"
+        )
         XCTAssertFalse(slice.contains("DS.Font.title2"))
         XCTAssertFalse(slice.contains("padding(.vertical, DS.Space.xl)"))
     }
@@ -776,7 +822,7 @@ final class BotsWindowTests: XCTestCase {
         let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
         XCTAssertTrue(main.contains("applyWorkspaceHeaderVisibility"))
         XCTAssertTrue(
-            main.contains("sidebarCollapsed || shellContentMode == .bots"),
+            main.contains("showCollapsed || shellContentMode == .bots"),
             "Bots must drop the visible workspace header, not only when the sidebar is collapsed"
         )
         XCTAssertTrue(

@@ -198,20 +198,27 @@ public extension Notification.Name {
     static let rc2SidebarVisibility = Notification.Name("rc2.sidebarVisibility")
 }
 
-/// Hide/show motion for the shell sidebar. dest dest dest inspector, dest dest dest
-/// thread rail, and Files use DS.Motion.standard (0.22s ease-out). The
-/// AppKit split must match that — dest dest dest is full-bleed, so a snapped
-/// 34pt header inset is obvious.
+/// Hide/show motion for the shell sidebar, matching DS.Motion.standard
+/// (0.22s ease-out) like the inspector / thread rail. The glass panel
+/// keeps its width and slides off the leading edge — translating never
+/// reflows the sidebar content or resizes the vibrancy backdrop, so
+/// there is nothing to squeeze, snap, or drift.
 public enum ShellSidebarToggleMotion {
     public static let duration: TimeInterval = 0.22
-    public static let restingMinCoordinate: CGFloat = 180
+    public static let minimumSidebarWidth: CGFloat = 180
+    public static let maximumSidebarWidth: CGFloat = 560
 
-    public static func dividerPosition(collapsed: Bool, expandedWidth: CGFloat) -> CGFloat {
-        collapsed ? 0 : expandedWidth
+    /// Leading offset of the constant-width sidebar panel.
+    public static func leadingOffset(collapsed: Bool, width: CGFloat) -> CGFloat {
+        collapsed ? -width : 0
     }
 
-    public static func minDividerCoordinate(animatingToggle: Bool) -> CGFloat {
-        animatingToggle ? 0 : restingMinCoordinate
+    /// Whole pixels only, floored/capped to the product bounds and to
+    /// what the window can grant (content keeps at least 520pt). A
+    /// fractional edge antialiases the seam into a blurry stray line.
+    public static func clampedSidebarWidth(_ width: CGFloat, contentWidth: CGFloat) -> CGFloat {
+        let maxAllowed = min(maximumSidebarWidth, max(220, contentWidth - 520))
+        return min(max(width.rounded(), minimumSidebarWidth), maxAllowed)
     }
 
     public static func splitTopInset(collapsed: Bool, headerHeight: CGFloat) -> CGFloat {
@@ -228,12 +235,18 @@ public enum ShellSidebarToggleMotion {
 }
 
 @MainActor
-public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitViewDelegate, PaneKeyboardResizeHandling {
+public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboardResizeHandling {
     public let window: NSWindow
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
 
     private let sidebar: SidebarView
+    /// Side-by-side host for the sliding sidebar panel and the content
+    /// column. Plain Auto Layout — no NSSplitView, no divider strip.
+    private let columns = NSView()
+    private let sidebarResizeHandle = SidebarResizeHandleView()
+    private var sidebarLeadingConstraint: NSLayoutConstraint?
+    private var sidebarWidthConstraint: NSLayoutConstraint?
     private let workspaceContainer = NSView()
     private let workspaceContent = NSView()
     private let collapsedWorkspaceHeader = NoDragView()
@@ -244,7 +257,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private let visibleWorkspaceLabel = NSTextField(labelWithString: "")
     private let visibleFinderButton = NoDragButton(frame: .zero)
     private let visibleNewWindowButton = NoDragButton(frame: .zero)
-    private let split = NSSplitView()
     private let toolbarLabel = NSTextField(labelWithString: "RemoteCode")
     /// Retains the live pane controllers; their @objc button and tab
     /// targets die with them, so they must outlive a layout rebuild.
@@ -257,17 +269,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// IMP-MAC_SHELL_WINDOW-005: AppKit frame-autosave key for the main
     /// window so its size/position survive relaunch.
     private static let mainWindowFrameAutosaveName = "io.remotecode.mainWindow"
+    /// The user's chosen sidebar width. The width constraint may hold a
+    /// window-clamped value; this keeps the preference so growing the
+    /// window restores it. Persisted once per drag gesture (mouse up).
     private var sidebarWidth: CGFloat = MainWindowController.defaultSidebarWidth
-    private var didApplyInitialSidebarWidth = false
-    private var isApplyingInitialSidebarWidth = false
-    private var lastSplitBoundsWidth: CGFloat?
-    /// PERF-MAC_SHELL_WINDOW-003: debounce sidebar.width DB writes.
-    /// One DispatchWorkItem replaces the previous on each tick; only the
-    /// item that survives the 0.3 s idle period actually calls settingsRepo.
-    private var sidebarWidthDebounceItem: DispatchWorkItem?
-    /// True while the sidebar divider is sliding. Min width drops to 0 and
-    /// resize persistence must not record the in-flight width.
-    private var isAnimatingSidebarToggle = false
     private var sidebarToggleGeneration = 0
     private var headerVisibilityAnimated = false
     /// PERF-MAC_SHELL_WINDOW-004: coalesce refreshFromState calls per
@@ -276,7 +281,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// triggering a full sidebar reload + signature walk.
     private var hasPendingRefresh = false
     private let collapsedHeaderHeight: CGFloat = 34
-    private var splitTopConstraint: NSLayoutConstraint?
+    private var columnsTopConstraint: NSLayoutConstraint?
     private var workspaceContentTopConstraint: NSLayoutConstraint?
     private var workspaceWindows: [WorkspaceID: WorkspaceWindowController] = [:]
     private var detachedWorkspaceIDs: Set<WorkspaceID> = []
@@ -391,37 +396,23 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         sidebarToggleGeneration += 1
         let generation = sidebarToggleGeneration
         shellLog.debug("sidebar.toggle collapsed=\(self.sidebarCollapsed, privacy: .public)")
-        if sidebarCollapsed, sidebar.view.frame.width > 1 {
-            sidebarWidth = sidebar.view.frame.width
-        }
-        isAnimatingSidebarToggle = true
+        sidebar.view.isHidden = false
+        sidebarResizeHandle.isHidden = sidebarCollapsed
         headerVisibilityAnimated = true
-        if !sidebarCollapsed {
-            sidebar.view.isHidden = false
-            split.setPosition(0, ofDividerAt: 0)
-        }
-        let targetWidth = ShellSidebarToggleMotion.dividerPosition(
-            collapsed: sidebarCollapsed,
-            expandedWidth: sidebarWidth
-        )
-        NSAnimationContext.runAnimationGroup({ ctx in
+        NSAnimationContext.runAnimationGroup({ [self] ctx in
             ctx.duration = ShellSidebarToggleMotion.duration
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             ctx.allowsImplicitAnimation = true
-            split.animator().setPosition(targetWidth, ofDividerAt: 0)
+            sidebarLeadingConstraint?.animator().constant = ShellSidebarToggleMotion.leadingOffset(
+                collapsed: sidebarCollapsed,
+                width: sidebarWidthConstraint?.constant ?? sidebarWidth
+            )
             updateCollapsedWorkspaceHeader()
+            window.contentView?.layoutSubtreeIfNeeded()
         }, completionHandler: { [weak self] in
             guard let self, generation == self.sidebarToggleGeneration else { return }
-            self.isAnimatingSidebarToggle = false
-            if self.sidebarCollapsed {
-                self.sidebar.view.isHidden = true
-            }
-            if !self.sidebarCollapsed {
-                self.collapsedWorkspaceHeader.isHidden = true
-                self.collapsedWorkspaceHeader.alphaValue = 1
-            }
-            self.split.adjustSubviews()
-            self.window.contentView?.layoutSubtreeIfNeeded()
+            // Off-window is invisible but still VoiceOver-reachable.
+            self.sidebar.view.isHidden = self.sidebarCollapsed
         })
         headerVisibilityAnimated = false
         NotificationCenter.default.post(
@@ -437,7 +428,47 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private func applyStoredCollapsedLayout() {
         sidebarCollapsed = true
         sidebar.view.isHidden = true
+        sidebarResizeHandle.isHidden = true
+        sidebarLeadingConstraint?.constant = ShellSidebarToggleMotion.leadingOffset(
+            collapsed: true,
+            width: sidebarWidthConstraint?.constant ?? sidebarWidth
+        )
         updateCollapsedWorkspaceHeader()
+    }
+
+    /// Live drag from the seam handle: move the width constraint only.
+    /// No DB writes while dragging — one durable write on mouse up.
+    func sidebarDragUpdated(toWidth proposed: CGFloat) {
+        guard !sidebarCollapsed, let content = window.contentView else { return }
+        let clamped = ShellSidebarToggleMotion.clampedSidebarWidth(
+            proposed, contentWidth: content.bounds.width
+        )
+        sidebarWidth = clamped
+        sidebarWidthConstraint?.constant = clamped
+        content.layoutSubtreeIfNeeded()
+    }
+
+    func sidebarDragEnded() {
+        guard let ctx = context else { return }
+        try? ctx.settingsRepo.set(Self.sidebarWidthSettingsKey, "\(Double(sidebarWidth))")
+    }
+
+    /// Shrinking the window must not push content off; growing it back
+    /// restores the user's chosen width.
+    public func windowDidResize(_ notification: Notification) {
+        guard (notification.object as? NSWindow) === window,
+              let content = window.contentView, content.bounds.width > 0 else { return }
+        let clamped = ShellSidebarToggleMotion.clampedSidebarWidth(
+            sidebarWidth, contentWidth: content.bounds.width
+        )
+        guard let widthConstraint = sidebarWidthConstraint,
+              abs(widthConstraint.constant - clamped) > 0.5 else { return }
+        widthConstraint.constant = clamped
+        if sidebarCollapsed {
+            sidebarLeadingConstraint?.constant = ShellSidebarToggleMotion.leadingOffset(
+                collapsed: true, width: clamped
+            )
+        }
     }
 
     private func setupLayout() {
@@ -446,11 +477,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         content.wantsLayer = true
         content.layer?.backgroundColor = DS.NS.bg.cgColor
         content.translatesAutoresizingMaskIntoConstraints = false
-        split.isVertical = true
-        split.dividerStyle = .thin
-        split.delegate = self
-        split.translatesAutoresizingMaskIntoConstraints = false
+        columns.translatesAutoresizingMaskIntoConstraints = false
+        columns.setAccessibilityIdentifier("shell.columns")
         sidebar.view.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.view.setAccessibilityIdentifier("shell.sidebar")
         workspaceContainer.translatesAutoresizingMaskIntoConstraints = false
         workspaceContent.translatesAutoresizingMaskIntoConstraints = false
 
@@ -469,21 +499,54 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         ])
         configureCollapsedWorkspaceHeader()
         configureVisibleWorkspaceHeader()
-        split.addArrangedSubview(sidebar.view)
-        split.addArrangedSubview(workspaceContainer)
-        split.setHoldingPriority(.defaultLow, forSubviewAt: 1)
+        columns.addSubview(sidebar.view)
+        columns.addSubview(workspaceContainer)
+        columns.addSubview(sidebarResizeHandle)
+        sidebarResizeHandle.translatesAutoresizingMaskIntoConstraints = false
+        sidebarResizeHandle.currentWidth = { [weak self] in
+            self?.sidebarWidthConstraint?.constant ?? MainWindowController.defaultSidebarWidth
+        }
+        sidebarResizeHandle.onDrag = { [weak self] proposed in
+            self?.sidebarDragUpdated(toWidth: proposed)
+        }
+        sidebarResizeHandle.onDragEnded = { [weak self] in
+            self?.sidebarDragEnded()
+        }
+        // The glass panel never resizes during the toggle — it keeps the
+        // user's width and slides off the leading edge; the content
+        // column's leading is pinned to its trailing, so one animated
+        // constraint drives the whole motion with no divider strip.
+        let sidebarLeading = sidebar.view.leadingAnchor.constraint(
+            equalTo: columns.leadingAnchor,
+            constant: ShellSidebarToggleMotion.leadingOffset(collapsed: sidebarCollapsed, width: sidebarWidth)
+        )
+        sidebarLeadingConstraint = sidebarLeading
+        let sidebarWidthC = sidebar.view.widthAnchor.constraint(equalToConstant: sidebarWidth)
+        sidebarWidthConstraint = sidebarWidthC
 
-        content.addSubview(split)
+        content.addSubview(columns)
         content.addSubview(visibleWorkspaceHeader)
         content.addSubview(collapsedWorkspaceHeader)
         collapsedWorkspaceHeader.isHidden = true
-        let splitTop = split.topAnchor.constraint(equalTo: content.topAnchor, constant: 0)
-        splitTopConstraint = splitTop
+        let columnsTop = columns.topAnchor.constraint(equalTo: content.topAnchor, constant: 0)
+        columnsTopConstraint = columnsTop
         NSLayoutConstraint.activate([
-            splitTop,
-            split.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            sidebarLeading,
+            sidebarWidthC,
+            sidebar.view.topAnchor.constraint(equalTo: columns.topAnchor),
+            sidebar.view.bottomAnchor.constraint(equalTo: columns.bottomAnchor),
+            workspaceContainer.leadingAnchor.constraint(equalTo: sidebar.view.trailingAnchor),
+            workspaceContainer.topAnchor.constraint(equalTo: columns.topAnchor),
+            workspaceContainer.bottomAnchor.constraint(equalTo: columns.bottomAnchor),
+            workspaceContainer.trailingAnchor.constraint(equalTo: columns.trailingAnchor),
+            sidebarResizeHandle.leadingAnchor.constraint(equalTo: sidebar.view.trailingAnchor, constant: -2),
+            sidebarResizeHandle.widthAnchor.constraint(equalToConstant: 5),
+            sidebarResizeHandle.topAnchor.constraint(equalTo: columns.topAnchor),
+            sidebarResizeHandle.bottomAnchor.constraint(equalTo: columns.bottomAnchor),
+            columnsTop,
+            columns.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            columns.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            columns.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             visibleWorkspaceHeader.topAnchor.constraint(equalTo: content.topAnchor),
             visibleWorkspaceHeader.leadingAnchor.constraint(equalTo: workspaceContainer.leadingAnchor),
             visibleWorkspaceHeader.trailingAnchor.constraint(equalTo: content.trailingAnchor),
@@ -494,23 +557,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             collapsedWorkspaceHeader.heightAnchor.constraint(equalToConstant: collapsedHeaderHeight)
         ])
         window.contentView = content
-        // give sidebar a default size
-        DispatchQueue.main.async { self.applyInitialSidebarWidthIfNeeded() }
-    }
-
-    private func applyInitialSidebarWidthIfNeeded() {
-        guard !didApplyInitialSidebarWidth else { return }
-        isApplyingInitialSidebarWidth = true
-        didApplyInitialSidebarWidth = true
-        // UX-MAC_SHELL_WINDOW-016: clamp the requested width to what the
-        // current window can actually grant (the max-divider math caps it
-        // at width-520) so the divider lands where it will stay, instead
-        // of silently shrinking the sidebar below its stored value.
-        let maxAllowed = max(220, split.bounds.width - 520)
-        let applied = min(sidebarWidth, maxAllowed)
-        split.setPosition(applied, ofDividerAt: 0)
-        lastSplitBoundsWidth = split.bounds.width
-        isApplyingInitialSidebarWidth = false
     }
 
     public func show() {
@@ -650,9 +696,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         /// row is a second title above it. Collapsed sidebar still needs its
         /// full-width bar for the sidebar toggle.
         private func applyWorkspaceHeaderVisibility() {
-            let hideVisible = sidebarCollapsed || shellContentMode == .bots
-            visibleWorkspaceHeader.isHidden = hideVisible
             let showCollapsed = sidebarCollapsed
+            let hideVisible = showCollapsed || shellContentMode == .bots
+            visibleWorkspaceHeader.isHidden = hideVisible
             if headerVisibilityAnimated {
                 if showCollapsed {
                     if collapsedWorkspaceHeader.isHidden {
@@ -668,19 +714,19 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
                 collapsedWorkspaceHeader.alphaValue = 1
             }
             let splitTop = ShellSidebarToggleMotion.splitTopInset(
-                collapsed: sidebarCollapsed,
+                collapsed: showCollapsed,
                 headerHeight: collapsedHeaderHeight
             )
             let contentTop = ShellSidebarToggleMotion.workspaceContentTopInset(
-                collapsed: sidebarCollapsed,
+                collapsed: showCollapsed,
                 hidesVisibleHeader: shellContentMode == .bots,
                 headerHeight: collapsedHeaderHeight
             )
             if headerVisibilityAnimated {
-                splitTopConstraint?.animator().constant = splitTop
+                columnsTopConstraint?.animator().constant = splitTop
                 workspaceContentTopConstraint?.animator().constant = contentTop
             } else {
-                splitTopConstraint?.constant = splitTop
+                columnsTopConstraint?.constant = splitTop
                 workspaceContentTopConstraint?.constant = contentTop
             }
         }
@@ -1201,7 +1247,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         vm.reload()
         // Keep Desk / Studio / Attention. openFleet() here kicked users
         // home every time they left Bots and came back.
-        let host = NSHostingView(rootView: BotsRootView(vm: vm, embedsRosterRail: false))
+        let host = ContentColumnHostingView(rootView: BotsRootView(vm: vm, embedsRosterRail: false))
+        host.cancelHorizontalTitlebarGutter = BotsViewModel.cancelsWindowLeadingTitlebarGutter(
+            presentsAsDetachedWindow: vm.presentsAsDetachedWindow
+        )
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
         host.layer?.backgroundColor = DS.NS.bg.cgColor
@@ -1571,63 +1620,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         repairSelectedTerminalFocus(reason: "main_window_key")
     }
 
-    // MARK: NSSplitViewDelegate
-    public func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
-        guard splitView === split, dividerIndex == 0 else { return proposedMinimumPosition }
-        return ShellSidebarToggleMotion.minDividerCoordinate(
-            animatingToggle: isAnimatingSidebarToggle
-        )
-    }
-
-    public func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
-        guard splitView === split, dividerIndex == 0 else { return proposedMaximumPosition }
-        return max(220, splitView.bounds.width - 520)
-    }
-
-    public func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
-        false
-    }
-
-    public func splitViewDidResizeSubviews(_ notification: Notification) {
-        guard let splitView = notification.object as? NSSplitView,
-              splitView === split else { return }
-        guard didApplyInitialSidebarWidth else {
-            applyInitialSidebarWidthIfNeeded()
-            return
-        }
-        guard !isApplyingInitialSidebarWidth, !sidebarCollapsed, !isAnimatingSidebarToggle else { return }
-        let currentSplitWidth = splitView.bounds.width
-        let sidebarFrameWidth = sidebar.view.frame.width
-        if let lastSplitBoundsWidth,
-           abs(lastSplitBoundsWidth - currentSplitWidth) > 0.5,
-           abs(sidebarFrameWidth - sidebarWidth) > 0.5 {
-            isApplyingInitialSidebarWidth = true
-            let maxAllowed = max(220, currentSplitWidth - 520)
-            split.setPosition(min(sidebarWidth, maxAllowed), ofDividerAt: 0)
-            self.lastSplitBoundsWidth = currentSplitWidth
-            isApplyingInitialSidebarWidth = false
-            return
-        }
-        lastSplitBoundsWidth = currentSplitWidth
-        sidebarWidth = sidebar.view.frame.width
-        // PERF-MAC_SHELL_WINDOW-003: debounce — cancel any pending write and
-        // schedule a new one; only the item surviving the idle fires the DB write.
-        sidebarWidthDebounceItem?.cancel()
-        let capturedWidth = sidebarWidth
-        let item = DispatchWorkItem { [weak self] in
-            guard let self, let ctx = self.context else { return }
-            try? ctx.settingsRepo.set(Self.sidebarWidthSettingsKey, "\(Double(capturedWidth))")
-        }
-        sidebarWidthDebounceItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
-    }
-
     static func storedSidebarWidth(context: AppContext) -> CGFloat {
         guard let raw = (try? context.settingsRepo.get(sidebarWidthSettingsKey)) ?? nil,
               let value = Double(raw) else {
             return defaultSidebarWidth
         }
-        return min(560, max(180, CGFloat(value)))
+        // Whole pixels: a fractional stored width would put the sidebar
+        // seam on a half pixel and antialias it into a blurry line.
+        return min(560, max(180, CGFloat(value).rounded()))
     }
 
     private static func storedSidebarCollapsed(context: AppContext) -> Bool {
@@ -1660,26 +1660,51 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     }
 }
 
-// MARK: - Sidebar width debounce helper
+/// Bots in the main split inherits the window's traffic-light leading
+/// inset even though that gutter already lives in the sidebar. Zero it
+/// so Desk identity padding is only `DS.Space.xl`.
+final class ContentColumnHostingView<Root: View>: NSHostingView<Root> {
+    var cancelHorizontalTitlebarGutter = false
 
-/// Returns true when a sidebar.width DB write should be issued.
-///
-/// Contract (enforced by SidebarWidthDebounceTests):
-///   - Returns false if a write occurred within `interval` seconds of `now`.
-///   - Returns true when no previous write exists (first drag).
-///   - Returns true when elapsed time exceeds `interval`.
-///
-/// Pure function — no side effects, no AppKit, no @MainActor needed.
-/// The MainWindowController uses this to gate settingsRepo.set calls so that
-/// live-dragging the sidebar divider produces one DB write (on idle) instead
-/// of one per resize tick (which was ~60 synchronous SQLite writes/second).
-nonisolated func sidebarWidthShouldWrite(
-    lastWriteAt: Date?,
-    now: Date,
-    interval: TimeInterval
-) -> Bool {
-    guard let last = lastWriteAt else { return true }
-    return now.timeIntervalSince(last) >= interval
+    override var safeAreaInsets: NSEdgeInsets {
+        var insets = super.safeAreaInsets
+        if cancelHorizontalTitlebarGutter {
+            insets.left = 0
+            insets.right = 0
+        }
+        return insets
+    }
+}
+
+// MARK: - Sidebar resize handle
+
+/// Invisible 5pt grab strip on the sidebar seam — the seam has no
+/// divider strip (the 1px NSSplitView divider was the "strange line"),
+/// so this is the only resize affordance. Writes nothing while
+/// dragging; the controller persists once on mouse up.
+final class SidebarResizeHandleView: NSView {
+    var currentWidth: (() -> CGFloat)?
+    var onDrag: ((CGFloat) -> Void)?
+    var onDragEnded: (() -> Void)?
+    private var dragStartWidth: CGFloat = 0
+    private var dragStartX: CGFloat = 0
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .resizeLeftRight)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        dragStartWidth = currentWidth?() ?? 0
+        dragStartX = event.locationInWindow.x
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        onDrag?(dragStartWidth + (event.locationInWindow.x - dragStartX))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        onDragEnded?()
+    }
 }
 
 // MARK: - Refresh coalesce decision helper

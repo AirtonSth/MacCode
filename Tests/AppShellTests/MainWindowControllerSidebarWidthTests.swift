@@ -22,6 +22,14 @@ final class MainWindowControllerSidebarWidthTests: XCTestCase {
         return try AppContext(channel: .debug, appSupportOverride: dir)
     }
 
+    private func sourceURL(_ relative: String) -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent(relative)
+    }
+
     // MARK: - Default width when no persisted value exists
 
     /// WHY: On first launch there is no stored width. The default must be
@@ -105,22 +113,26 @@ final class MainWindowControllerSidebarWidthTests: XCTestCase {
                        "instead of crashing or producing NaN  -  corrupt settings must not break the layout")
     }
 
-    func test_sidebarToggleMotion_matchesOtherChrome_becauseBotsJumpWasASnap() {
-        // WHY: dest dest dest inspector / dest dest dest thread rail slide in 0.22s
-        // ease-out. The shell sidebar used 0.18s + isHidden + layout flush,
-        // so dest dest dest jumped 34pt. The divider must slide to 0 and
-        // min-width must yield during that slide.
+    func test_sidebarSlideMotion_isATranslationNotAResize_becauseTheSplitMachineryDrewGlitches() throws {
+        // WHY: the NSSplitView toggle (divider animator + proportional
+        // redistribution + hidden-divider space) landed off target
+        // (439.5 for 444), drew a 1px near-black divider strip, and
+        // snapped chrome after the slide. The rewrite slides the
+        // constant-width glass panel by its leading offset only — one
+        // animated constraint, nothing to squeeze, snap, or drift.
         XCTAssertEqual(ShellSidebarToggleMotion.duration, 0.22, accuracy: 0.001)
         XCTAssertEqual(
-            ShellSidebarToggleMotion.dividerPosition(collapsed: true, expandedWidth: 272),
-            0
+            ShellSidebarToggleMotion.leadingOffset(collapsed: true, width: 444),
+            -444,
+            "hidden = the panel parked fully outside the window's leading edge"
         )
+        XCTAssertEqual(ShellSidebarToggleMotion.leadingOffset(collapsed: false, width: 444), 0)
         XCTAssertEqual(
-            ShellSidebarToggleMotion.dividerPosition(collapsed: false, expandedWidth: 272),
-            272
+            ShellSidebarToggleMotion.splitTopInset(collapsed: true, headerHeight: 34),
+            34,
+            "collapsed keeps the 34pt restore bar above the columns"
         )
-        XCTAssertEqual(ShellSidebarToggleMotion.minDividerCoordinate(animatingToggle: true), 0)
-        XCTAssertEqual(ShellSidebarToggleMotion.minDividerCoordinate(animatingToggle: false), 180)
+        XCTAssertEqual(ShellSidebarToggleMotion.splitTopInset(collapsed: false, headerHeight: 34), 0)
         XCTAssertEqual(
             ShellSidebarToggleMotion.workspaceContentTopInset(
                 collapsed: false,
@@ -128,6 +140,42 @@ final class MainWindowControllerSidebarWidthTests: XCTestCase {
                 headerHeight: 34
             ),
             34
+        )
+        let source = try String(
+            contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8
+        )
+        XCTAssertFalse(
+            source.contains("NSSplitViewDelegate"),
+            "the shell sidebar must not go back to NSSplitView — its divider strip and drift were the reported glitches"
+        )
+    }
+
+    func test_clampedSidebarWidthIsWholePixelsWithinBounds_becauseHalfPixelSeamsRenderAsBlurryLines() {
+        // WHY: a fractional edge (observed 439.5 after hide/show on the
+        // old split) antialiases the seam into the reported blurry
+        // "strange line"; and the panel must stay within the product
+        // bounds and leave the content column at least 520pt.
+        XCTAssertEqual(
+            ShellSidebarToggleMotion.clampedSidebarWidth(271.5, contentWidth: 1200),
+            272
+        )
+        XCTAssertEqual(
+            ShellSidebarToggleMotion.clampedSidebarWidth(439.5, contentWidth: 1200),
+            440
+        )
+        XCTAssertEqual(
+            ShellSidebarToggleMotion.clampedSidebarWidth(40, contentWidth: 1200),
+            ShellSidebarToggleMotion.minimumSidebarWidth,
+            "a drag below the floor must not leave an unusable sliver sidebar"
+        )
+        XCTAssertEqual(
+            ShellSidebarToggleMotion.clampedSidebarWidth(900, contentWidth: 1200),
+            ShellSidebarToggleMotion.maximumSidebarWidth
+        )
+        XCTAssertEqual(
+            ShellSidebarToggleMotion.clampedSidebarWidth(444, contentWidth: 900),
+            380,
+            "a small window caps the sidebar so the content column keeps 520pt"
         )
     }
 }
