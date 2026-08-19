@@ -27,12 +27,14 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.searchText")
         UserDefaults.standard.removeObject(forKey: "bots.deskRouting")
         UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+        UserDefaults.standard.removeObject(forKey: "bots.studioFilesLocations")
         UserDefaults.standard.removeObject(forKey: "bots.unpublishedNewBotIDs")
         UserDefaults.standard.removeObject(forKey: "bots.deskThreadRail")
         UserDefaults.standard.removeObject(forKey: "bots.deskThreadRailWidth")
     }
 
     override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: "bots.studioFilesLocations")
         if let directory {
             try? FileManager.default.removeItem(atPath: directory)
         }
@@ -3441,6 +3443,164 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_studioDockerFilesSurfaceUsesPersistentGuestHome() throws {
+        // WHY: Docker's real home is the existing /home/remotecode bind.
+        // Studio must edit that exact host directory, including ordinary
+        // files whose names are generated projections only in Bot files.
+        let (_, vm, bot, _) = try makeDockerStudio()
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        defer { model.close() }
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        let expected = BotComputerGuestSpec.guestHomeURL(
+            appSupport: URL(fileURLWithPath: directory, isDirectory: true),
+            botID: bot.id
+        )
+        XCTAssertEqual(vm.studioFilesLocation, .dockerHome)
+        XCTAssertEqual(model.root, expected.path)
+
+        _ = try router.fsWorkspaceCreateFile(
+            workspace: router.workspaceID,
+            path: BotHome.identityName,
+            content: "ordinary docker file"
+        )
+        model.loadDirectory("")
+        let identity = try XCTUnwrap(model.entries.first { $0.name == BotHome.identityName })
+        XCTAssertTrue(identity.isEditable)
+        let opened = try router.filesEditOpen(
+            surface: SurfaceID(bot.id.value),
+            path: BotHome.identityName
+        )
+        let sessionID = try XCTUnwrap(opened.objectValue?["session_id"]?.stringValue)
+        let original = opened.objectValue?["content"]?.stringValue ?? ""
+        _ = try router.filesEditApplyPatch(
+            sessionID: sessionID,
+            baseDraftRevision: opened.objectValue?["draft_revision"]?.intValue ?? 1,
+            rangeLocation: 0,
+            rangeLength: (original as NSString).length,
+            replacement: "edited through Files",
+            deviceID: "test"
+        )
+        _ = try router.filesEditSave(sessionID: sessionID)
+        XCTAssertEqual(
+            try String(contentsOf: expected.appendingPathComponent(BotHome.identityName), encoding: .utf8),
+            "edited through Files"
+        )
+        _ = try? router.filesEditClose(sessionID: sessionID)
+    }
+
+    func test_studioDockerFilesSeedsRootDockerfileAndOpensItAsText() throws {
+        // WHY: Dockerfile is per bot and extensionless. Studio must place it at the
+        // exact persisted guest-home root, then promote it from unknown to editable text.
+        let (context, vm, bot, docker) = try makeDockerStudio()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL(),
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        defer { model.close() }
+        model.loadDirectory("")
+
+        let dockerfile = try XCTUnwrap(model.entries.first { $0.name == "Dockerfile" })
+        XCTAssertEqual(dockerfile.relativePath, "Dockerfile")
+        XCTAssertEqual(
+            dockerfile.path,
+            BotComputerGuestSpec.guestHomeURL(
+                appSupport: context.appSupportDirectory,
+                botID: bot.id
+            ).appendingPathComponent("Dockerfile").path
+        )
+        XCTAssertFalse(dockerfile.isEditable, "directory listing should not read every file")
+
+        model.select(dockerfile)
+
+        XCTAssertEqual(model.selectedEntry?.kind, "text")
+        XCTAssertTrue(model.selectedEntry?.isEditable == true)
+        XCTAssertTrue(model.draftText.contains("FROM debian"))
+    }
+
+    func test_studioDockerFilesCanSwitchBackToBotHome() throws {
+        // WHY: Docker home is the default, but the owner must be able to
+        // return to the versioned bot configuration and keep that choice.
+        let (context, vm, bot, _) = try makeDockerStudio()
+        vm.attachHomeFilesSurface(for: bot)
+        XCTAssertEqual(vm.studioFilesLocation, .dockerHome)
+
+        vm.setStudioFilesLocation(.botFiles, for: bot)
+        XCTAssertEqual(vm.studioFilesLocation, .botFiles)
+        XCTAssertEqual(vm.homeFilesModel?.root, vm.botHome(for: bot).root.path)
+
+        let reopened = BotsViewModel(context: context)
+        reopened.dockerGuestReadyOverrideForTesting = true
+        reopened.openStudio(bot)
+        reopened.attachHomeFilesSurface(for: bot)
+        XCTAssertEqual(reopened.studioFilesLocation, .botFiles)
+        XCTAssertEqual(reopened.homeFilesModel?.root, reopened.botHome(for: bot).root.path)
+        reopened.homeFilesModel?.close()
+    }
+
+    func test_dockerFilesPersistAcrossReopenUntilExplicitClear() throws {
+        // WHY: Stop and ordinary reopen preserve the bind. Only the confirmed
+        // destructive action may tear it down and replace it with an empty home.
+        let (context, vm, bot, docker) = try makeDockerStudio()
+        vm.attachHomeFilesSurface(for: bot)
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        _ = try router.fsWorkspaceCreateFile(
+            workspace: router.workspaceID,
+            path: "sentinel.txt",
+            content: "keep me"
+        )
+        let guestHome = BotComputerGuestSpec.guestHomeURL(
+            appSupport: context.appSupportDirectory,
+            botID: bot.id
+        )
+        let sentinel = guestHome.appendingPathComponent("sentinel.txt")
+        vm.rememberGuestScreen(
+            url: try XCTUnwrap(URL(string: "http://127.0.0.1:49152/vnc.html")),
+            botID: bot.id,
+            running: true
+        )
+        vm.stopDockerGuest(botID: bot.id)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+
+        let reopened = BotsViewModel(context: context)
+        reopened.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        reopened.dockerGuestReadyOverrideForTesting = true
+        reopened.openStudio(bot)
+        reopened.attachHomeFilesSurface(for: bot)
+        XCTAssertEqual(reopened.homeFilesModel?.root, guestHome.path)
+        XCTAssertEqual(try String(contentsOf: sentinel, encoding: .utf8), "keep me")
+        let beforeClear = reopened.homeFilesModel
+        reopened.rememberGuestScreen(
+            url: try XCTUnwrap(URL(string: "http://127.0.0.1:49152/vnc.html")),
+            botID: bot.id,
+            running: true
+        )
+
+        reopened.confirmClearDockerData(for: bot)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sentinel.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: guestHome.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: guestHome.path), [])
+        XCTAssertEqual(reopened.homeFilesModel?.root, guestHome.path)
+        XCTAssertFalse(reopened.homeFilesModel === beforeClear)
+        XCTAssertFalse(reopened.isGuestRunning(bot.id))
+        XCTAssertNil(reopened.guestScreenURL(for: bot.id))
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("pendingDockerDataClear"))
+        XCTAssertTrue(source.contains("bots.studio.files.docker.clear"))
+        reopened.homeFilesModel?.close()
+    }
+
     func test_studioFilesSurfaceLocksIdentityOnly() throws {
         // WHY: IDENTITY.md is still generated. MEMORY.md is the bot's
         // own file — locking it would send Forget/Correct back to a store.
@@ -3532,15 +3692,18 @@ final class BotsWindowTests: XCTestCase {
     func test_openHomeFileRevealsOwnedSkillInStudioFiles() throws {
         // WHY: Skills Open used to write homeDraft only. Studio Files now
         // hosts FilesSurfaceRoot, so that path left the preview on
-        // "No file selected" instead of skills/<id>/SKILL.md.
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        // "No file selected" instead of skills/<id>/SKILL.md. A Docker bot
+        // must also leave its default Docker root before revealing Bot files.
+        let (_, vm, bot, _) = try makeDockerStudio()
         vm.openStudio(bot)
+        vm.attachHomeFilesSurface(for: bot)
+        XCTAssertEqual(vm.studioFilesLocation, .dockerHome)
         vm.thisBotSkillDraft = "night-scan"
         vm.createThisBotSkill()
         let path = "skills/night-scan/SKILL.md"
         XCTAssertNil(vm.errorMessage, vm.errorMessage ?? "")
+        XCTAssertEqual(vm.studioFilesLocation, .botFiles)
+        XCTAssertEqual(vm.homeFilesModel?.root, vm.botHome(for: bot).root.path)
         let model = try XCTUnwrap(vm.homeFilesModel)
         defer { model.close() }
         XCTAssertEqual(model.selectedPath, path)
@@ -4757,6 +4920,64 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.lastSendStartedProviderRun)
     }
 
+    func test_botMentionShowsNamedWaitingThenClearsWhenReplyArrives() async throws {
+        // WHY: the originating Desk must name the teammate during the peer
+        // run and clear that state only once the imported reply exists.
+        let (vm, piper, quinn) = try makeMentionPair(peerReply: "PONG from Quinn")
+        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp"))
+        let outboundID = try XCTUnwrap(
+            vm.deskTranscriptForTesting(botID: piper.id)
+                .last(where: { $0.peer?.direction == .messaged })?.id
+        )
+        let waiting = try XCTUnwrap(
+            vm.deskTranscriptForTesting(botID: piper.id).first { $0.id == outboundID }
+        )
+        XCTAssertEqual(waiting.peer?.name, "Quinn")
+        XCTAssertEqual(waiting.peer?.activityPhase, .waiting)
+
+        let receivedReply = await waitUntil(timeout: 8) {
+            vm.deskTranscriptForTesting(botID: piper.id).contains {
+                $0.peer?.direction == .fromPeer && $0.text == "PONG from Quinn"
+            }
+        }
+        XCTAssertTrue(receivedReply)
+        let settled = try XCTUnwrap(
+            vm.deskTranscriptForTesting(botID: piper.id).first { $0.id == outboundID }
+        )
+        XCTAssertNil(settled.peer?.activityPhase)
+        XCTAssertEqual(
+            vm.deskTranscriptForTesting(botID: piper.id).filter {
+                $0.peer?.direction == .fromPeer && $0.text == "PONG from Quinn"
+            }.count,
+            1,
+            "settling the exact request must not duplicate the imported reply"
+        )
+    }
+
+    func test_botMentionNeedsAttentionSurvivesReload() throws {
+        // WHY: a setup failure must replace the spinner with durable truth,
+        // including after a new view model restores the same peer ledger.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp"))
+        let failed = try XCTUnwrap(
+            vm.deskTranscriptForTesting(botID: piper.id)
+                .last(where: { $0.peer?.direction == .messaged })
+        )
+        XCTAssertEqual(failed.peer?.activityPhase, .needsAttention)
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(piper)
+        let restored = try XCTUnwrap(
+            reopened.deskTranscriptForTesting(botID: piper.id).first { $0.id == failed.id }
+        )
+        XCTAssertEqual(restored.peer?.name, "Quinn")
+        XCTAssertEqual(restored.peer?.activityPhase, .needsAttention)
+    }
+
     func test_hopRelayOmitsMentionToken() async throws {
         // WHY: hop used to embed (@handle). Mention-send would loop, or
         // lastAssistantText was empty and the host never saw the reply.
@@ -4948,10 +5169,14 @@ final class BotsWindowTests: XCTestCase {
 
     private final class RecordingDocker: BotComputerDockerClienting, @unchecked Sendable {
         var created: [String] = []
+        var builds: [URL] = []
         var png = BotComputerGuestObserve.pngSignature + Data(repeating: 1, count: 16)
         var containers: [String: BotComputerContainerInspect] = [:]
         var startError: Error?
         var startCallCount = 0
+        var blocksBuild = false
+        let buildStarted = DispatchSemaphore(value: 0)
+        let allowBuild = DispatchSemaphore(value: 0)
 
         func info() throws -> String { "ok" }
         func imageExists(tag: String) throws -> Bool { true }
@@ -4959,7 +5184,13 @@ final class BotsWindowTests: XCTestCase {
             key == BotComputerGuestSpec.recipeLabelKey ? BotComputerGuestSpec.recipeRevision : ""
         }
         func imageID(tag: String) throws -> String { "img" }
-        func build(context: URL, tag: String) throws {}
+        func build(context: URL, tag: String) throws {
+            builds.append(context)
+            if blocksBuild {
+                buildStarted.signal()
+                _ = allowBuild.wait(timeout: .now() + 2)
+            }
+        }
         func create(options: BotComputerContainerCreateOptions) throws -> String {
             created.append(options.name)
             containers[options.name] = BotComputerContainerInspect(running: false, imageID: "img", hostPort: 49152)
@@ -5193,20 +5424,118 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(canvas.contains("First launch can take a few minutes"))
     }
 
+    func test_filesLocationBarClaimsFullWidthForBothLocations() throws {
+        // WHY: Docker home happened to expand the bar through its explanatory
+        // HStack, while Bot files collapsed the same bar to the picker's width
+        // and floated it above only the editor pane.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private var filesTab") else {
+            return XCTFail("files tab must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n            Group {")?.lowerBound ?? rest.endIndex
+        let bar = String(rest[..<end])
+
+        XCTAssertTrue(
+            bar.contains(".frame(maxWidth: .infinity, alignment: .leading)"),
+            "the location bar must claim the full Files width even when Bot files has no descriptive row"
+        )
+    }
+
+    func test_guestCanvasOffersRebuildBeforeStopAndNoTerminalControl() throws {
+        // WHY: Dockerfile changes need an explicit safe apply action beside the
+        // running desktop; Terminal is unrelated and consumed scarce chrome.
+        let source = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotComputerGuestScreenView.swift"),
+            encoding: .utf8
+        )
+        guard let start = source.range(of: "struct BotComputerGuestCanvas") else {
+            return XCTFail("guest canvas must exist")
+        }
+        let canvas = String(source[start.lowerBound...])
+        let rebuild = try XCTUnwrap(canvas.range(of: "Text(rebuilding ? \"Rebuilding…\" : \"Rebuild\")")?.lowerBound)
+        let stop = try XCTUnwrap(canvas.range(of: "Button(\"Stop\"")?.lowerBound)
+        XCTAssertLessThan(rebuild, stop, "Rebuild must sit immediately before Stop")
+        XCTAssertFalse(canvas.contains("Button(\"Terminal\""))
+    }
+
+    func test_rebuildDockerGuestPublishesProgressAndRejectsDuplicateWork() async throws {
+        // WHY: image builds can take minutes. The first click must acknowledge
+        // work immediately and a second click must not start a competing build.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        try vm.ensureDockerGuest(botID: bot.id)
+        fake.blocksBuild = true
+
+        vm.rebuildDockerGuest(botID: bot.id)
+        XCTAssertTrue(vm.isGuestRebuilding(bot.id))
+        XCTAssertEqual(fake.buildStarted.wait(timeout: .now() + 1), .success)
+        vm.rebuildDockerGuest(botID: bot.id)
+        XCTAssertEqual(fake.builds.count, 1, "a visible in-flight rebuild must reject duplicate clicks")
+        fake.allowBuild.signal()
+
+        let completed = await waitUntil(timeout: 2) { !vm.isGuestRebuilding(bot.id) }
+        XCTAssertTrue(completed)
+        XCTAssertEqual(
+            fake.builds,
+            [BotComputerGuestSpec.recipeURL(appSupport: context.appSupportDirectory, botID: bot.id)]
+        )
+        XCTAssertTrue(vm.isGuestRunning(bot.id))
+        XCTAssertEqual(vm.guestScreenURL(for: bot.id)?.host, "127.0.0.1")
+    }
+
+    func test_rebuildDockerGuestFailureKeepsCurrentDesktopRunning() async throws {
+        // WHY: a bad Dockerfile must report failure without taking down the
+        // already-running desktop that the user can still repair.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        try vm.ensureDockerGuest(botID: bot.id)
+        fake.startError = BotComputerGuestError.dockerUnavailable
+
+        vm.rebuildDockerGuest(botID: bot.id)
+
+        let completed = await waitUntil(timeout: 2) { !vm.isGuestRebuilding(bot.id) }
+        XCTAssertTrue(completed)
+        XCTAssertTrue(vm.isGuestRunning(bot.id), "the canonical desktop must survive a failed replacement")
+        XCTAssertEqual(
+            vm.errorMessage,
+            "Could not rebuild the Linux desktop. The current desktop is still running."
+        )
+    }
+
     func test_guestCanvasStartingStateRendersOffscreen() throws {
         // WHY: the acknowledged launch state must produce a real macOS view,
         // not only compile-time copy that never reaches the rendered canvas.
         let canvas = BotComputerGuestCanvas(
             url: nil,
             running: false,
+            rebuilding: false,
             launchState: .starting,
             startIdentifier: "test.desktop.start",
+            rebuildIdentifier: "test.desktop.rebuild",
             stopIdentifier: "test.desktop.stop",
-            terminalIdentifier: "test.desktop.terminal",
             screenIdentifier: "test.desktop.screen",
             onStart: {},
-            onStop: {},
-            onTerminal: {}
+            onRebuild: {},
+            onStop: {}
         )
         .frame(width: 360, height: 220)
         let hosting = NSHostingView(rootView: canvas)
@@ -7968,6 +8297,24 @@ final class BotsWindowTests: XCTestCase {
         vm.openDesk(piper)
         vm.setDeskProvider(.claude)
         return (vm, piper, quinn)
+    }
+
+    private func makeDockerStudio() throws -> (AppContext, BotsViewModel, BotDefinition, RecordingDocker) {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let docker = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = true
+        let created = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(created)
+        vm.studioDraft.desktopKind = .dockerDesktop
+        let bot = try vm.saveStudio()
+        return (context, vm, bot, docker)
     }
 
     private func waitUntil(timeout: TimeInterval, _ predicate: () -> Bool) async -> Bool {

@@ -201,6 +201,74 @@ public enum AgentWorkingStripPresentation {
     }
 }
 
+public enum AgentChatWorkingContext: Sendable, Equatable {
+    case agent(name: String)
+    case reviewing(peerName: String)
+}
+
+public enum AgentPeerActivityPresentation {
+    public static func title(for snapshot: BotPeerActivitySnapshot) -> String {
+        switch snapshot.phase {
+        case .waiting:
+            return "Waiting for \(snapshot.name)"
+        case .needsAttention:
+            return "\(snapshot.name) needs attention"
+        }
+    }
+
+    public static func detail(
+        for snapshot: BotPeerActivitySnapshot,
+        elapsedSeconds: Int
+    ) -> String {
+        switch snapshot.phase {
+        case .waiting:
+            return AgentChatWorkingCopy.statusLabel(
+                context: .agent(name: snapshot.name),
+                elapsedSeconds: elapsedSeconds
+            )
+        case .needsAttention:
+            return "The run stopped before \(snapshot.name) could reply."
+        }
+    }
+
+    public static func accessibilityLabel(
+        for snapshot: BotPeerActivitySnapshot,
+        elapsedSeconds: Int
+    ) -> String {
+        "\(title(for: snapshot)). \(detail(for: snapshot, elapsedSeconds: elapsedSeconds))"
+    }
+}
+
+public enum AgentChatWorkingCopy {
+    public static func statusLabel(
+        context: AgentChatWorkingContext?,
+        elapsedSeconds: Int,
+        seed: UInt64 = 0
+    ) -> String {
+        let elapsed = AgentWorkingStripPresentation.formatElapsed(elapsedSeconds)
+        switch context {
+        case .agent(let name):
+            return "\(name) is working for \(elapsed)"
+        case .reviewing(let peerName):
+            return "Reviewing \(peerName)'s reply for \(elapsed)"
+        case nil:
+            return AgentWorkingCatCopy.statusLabel(elapsedSeconds: elapsedSeconds, seed: seed)
+        }
+    }
+
+    public static func accessibilityLabel(
+        context: AgentChatWorkingContext?,
+        elapsedSeconds: Int
+    ) -> String {
+        switch context {
+        case .agent, .reviewing:
+            return statusLabel(context: context, elapsedSeconds: elapsedSeconds)
+        case nil:
+            return AgentWorkingCatCopy.accessibilityLabel(elapsedSeconds: elapsedSeconds)
+        }
+    }
+}
+
 // MARK: - Cat working strip (pet parity)
 
 /// Rotating kitten activity verbs for the in-flight "… for Ns" strip.

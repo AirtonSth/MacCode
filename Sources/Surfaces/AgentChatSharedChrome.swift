@@ -297,6 +297,65 @@ public struct AgentChatWorkingPill: View {
     }
 }
 
+public struct AgentChatPeerActivityRow: View {
+    public let snapshot: BotPeerActivitySnapshot
+    public let startedAt: Date
+
+    public init(snapshot: BotPeerActivitySnapshot, startedAt: Date) {
+        self.snapshot = snapshot
+        self.startedAt = startedAt
+    }
+
+    public var body: some View {
+        TimelineView(AgentChatElapsedTickSchedule(start: startedAt)) { context in
+            let seconds = max(0, Int(context.date.timeIntervalSince(startedAt)))
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                stateIcon
+                    .frame(width: 14, height: 14)
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    Text(AgentPeerActivityPresentation.title(for: snapshot))
+                        .font(DS.Font.body.weight(.medium))
+                        .foregroundColor(titleColor)
+                    Text(AgentPeerActivityPresentation.detail(
+                        for: snapshot,
+                        elapsedSeconds: seconds
+                    ))
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(AgentPeerActivityPresentation.accessibilityLabel(
+                for: snapshot,
+                elapsedSeconds: seconds
+            ))
+            .accessibilityIdentifier("agent.peerActivity")
+        }
+    }
+
+    @ViewBuilder
+    private var stateIcon: some View {
+        switch snapshot.phase {
+        case .waiting:
+            ProgressView()
+                .controlSize(.small)
+                .tint(DS.Palette.accent)
+                .accessibilityHidden(true)
+        case .needsAttention:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Palette.danger)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private var titleColor: Color {
+        snapshot.phase == .needsAttention ? DS.Palette.danger : DS.Palette.text
+    }
+}
+
 /// Shared thread rail chrome. Agent App and dest mount this so hide,
 /// Clear All, +, and search stay one control.
 public struct AgentChatThreadRail<Content: View>: View {

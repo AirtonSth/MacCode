@@ -21,8 +21,13 @@ final class BotComputerGuestSpecTests: XCTestCase {
         XCTAssertEqual(options.network, BotComputerGuestSpec.networkName(botID: botID))
         XCTAssertGreaterThanOrEqual(options.shmSize, BotComputerGuestSpec.minimumShmBytes)
         let recipe = BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID).path
-        XCTAssertTrue(recipe.hasPrefix(home))
-        XCTAssertTrue(recipe.hasSuffix("/computer"))
+        XCTAssertEqual(recipe, home,
+            "each bot's editable Dockerfile must live directly in that bot's persisted guest home")
+        XCTAssertNotEqual(
+            recipe,
+            BotComputerGuestSpec.recipeURL(appSupport: support, botID: BotID()).path,
+            "Docker build contexts must remain isolated per bot"
+        )
         XCTAssertTrue(BotComputerGuestSpec.execUsesRoot("apt-get install -y sl"))
         XCTAssertFalse(BotComputerGuestSpec.execUsesRoot("ls"))
 

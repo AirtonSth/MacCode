@@ -184,6 +184,18 @@ public struct BotStudioDraft: Equatable, Codable {
     public var isNew: Bool { botID == nil }
 }
 
+public enum BotStudioFilesLocation: String, Codable, Sendable, Equatable {
+    case botFiles
+    case dockerHome
+
+    public var title: String {
+        switch self {
+        case .botFiles: return "Bot files"
+        case .dockerHome: return "Docker home"
+        }
+    }
+}
+
 private struct BotStudioSupportSnapshot {
     var conversations: [BotConversation]
     var selectedConversation: BotConversation?
@@ -205,21 +217,35 @@ public struct BotDeskPeer: Equatable, Sendable {
     public var name: String
     public var title: String
     public var handle: String
+    public var activityPhase: BotPeerActivityPhase?
 
-    public init(direction: Direction, bot: BotDefinition) {
+    public init(
+        direction: Direction,
+        bot: BotDefinition,
+        activityPhase: BotPeerActivityPhase? = nil
+    ) {
         self.direction = direction
         self.botID = bot.id
         self.name = bot.name
         self.title = bot.title
         self.handle = bot.handle
+        self.activityPhase = activityPhase
     }
 
-    public init(direction: Direction, botID: BotID, name: String, title: String, handle: String) {
+    public init(
+        direction: Direction,
+        botID: BotID,
+        name: String,
+        title: String,
+        handle: String,
+        activityPhase: BotPeerActivityPhase? = nil
+    ) {
         self.direction = direction
         self.botID = botID
         self.name = name
         self.title = title
         self.handle = handle
+        self.activityPhase = activityPhase
     }
 
     public var identityLine: String {
@@ -638,6 +664,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public var homeDraft: String = ""
     @Published public private(set) var homeOriginal: String = ""
     @Published private(set) var homeFilesModel: FilesViewModel?
+    @Published public private(set) var studioFilesLocation: BotStudioFilesLocation = .botFiles
     private var homeFilesRouter: BotHomeFilesRouter?
     @Published public var thisBotSkillDraft: String = ""
     @Published public var routineName: String = "" {
@@ -702,6 +729,7 @@ public final class BotsViewModel: ObservableObject {
     private var isApplyingDeskRouting = false
     private var deskRoutingByBot: [BotID: BotDeskRouting] = [:]
     private var peerTurnsByHost: [BotID: [BotDeskMessage]] = [:]
+    private var studioFilesLocationsByBot: [BotID: BotStudioFilesLocation] = [:]
     private var inspectorDraftsByBot: [BotID: BotInspectorDraft] = [:]
     private var inspectorHydrated = false
     private var isApplyingInspectorDraft = false
@@ -737,6 +765,7 @@ public final class BotsViewModel: ObservableObject {
         restoreSearchTextIfNeeded()
         restoreDeskRoutingIfNeeded()
         restorePeerTurnsIfNeeded()
+        restoreStudioFilesLocationsIfNeeded()
         restoreUnpublishedNewBotIDsIfNeeded()
         restoreShellSidebarCollapsedIfNeeded()
         observeShellSidebarVisibility()
@@ -1386,6 +1415,7 @@ public final class BotsViewModel: ObservableObject {
         applyPersistedStudioDraftIfMatching(bot.id)
         isApplyingStudioDraft = false
         adoptSelectedBot(bot.id)
+        studioFilesLocation = resolvedStudioFilesLocation(for: bot)
     }
 
     public func openFleet() {
@@ -1873,11 +1903,13 @@ public final class BotsViewModel: ObservableObject {
             queuedFollowUpsByBot[id] = nil
             composerDraftsByBot[id] = nil
             inspectorDraftsByBot[id] = nil
+            studioFilesLocationsByBot[id] = nil
             clearPersistedStudioDraft(for: id)
             clearDeskSendInFlight(for: id)
             persistQueuedFollowUps()
             persistComposerDrafts()
             persistInspectorDrafts()
+            persistStudioFilesLocations()
             syncQueuedFollowUps()
             // Dest first. Delete used to reloadFleet (every teammate's
             // conversations + recent messages) before Chat could dest the
@@ -1945,6 +1977,19 @@ public final class BotsViewModel: ObservableObject {
             hasStreamingTools: deskHasStreamingTools,
             now: now
         )
+    }
+
+    public var deskWorkingContext: AgentChatWorkingContext? {
+        guard deskRunIsLive, let bot = selectedBot else { return nil }
+        if let replyIndex = deskMessages.lastIndex(where: {
+            $0.peer?.direction == .fromPeer
+        }), let peer = deskMessages[replyIndex].peer,
+           !deskMessages[deskMessages.index(after: replyIndex)...].contains(where: {
+               $0.role == .user
+           }) {
+            return .reviewing(peerName: peer.name)
+        }
+        return .agent(name: bot.name)
     }
 
     public func refreshDeskLiveTurn() {
@@ -2097,7 +2142,7 @@ public final class BotsViewModel: ObservableObject {
         let outbound = BotDeskMessage(
             role: .user,
             text: display,
-            peer: BotDeskPeer(direction: .messaged, bot: peer)
+            peer: BotDeskPeer(direction: .messaged, bot: peer, activityPhase: .waiting)
         )
         do {
             let hostConversation = try persistUserMessage(bot: host, text: display)
@@ -2118,6 +2163,11 @@ public final class BotsViewModel: ObservableObject {
             guard let router = resolvedRouter(),
                   let revision = try currentRevision(for: peer) else {
                 recordNeedsAttention(bot: peer, conversation: peerConversation, userText: text)
+                updatePeerActivity(
+                    hostID: host.id,
+                    messageID: outbound.id,
+                    phase: .needsAttention
+                )
                 return true
             }
             beginDeskSendInFlight(for: host.id)
@@ -2143,8 +2193,18 @@ public final class BotsViewModel: ObservableObject {
                     self.restoreDeskWorkLog(botID: host.id)
                     let peerLive = self.lastStartedConversationByBot[peer.id] ?? peerConversation
                     await self.followLinkedRun(bot: peer, conversation: peerLive, runId: runId)
-                    self.importPeerReply(from: peer, onto: host)
-                    if relayHop == 0 {
+                    let imported = self.importPeerReply(
+                        from: peer,
+                        onto: host,
+                        outboundMessageID: outbound.id
+                    )
+                    if !imported {
+                        self.updatePeerActivity(
+                            hostID: host.id,
+                            messageID: outbound.id,
+                            phase: .needsAttention
+                        )
+                    } else if relayHop == 0 {
                         await self.relayPeerReplyToHost(
                             host: host,
                             hostConversation: hostConversation,
@@ -2155,11 +2215,21 @@ public final class BotsViewModel: ObservableObject {
                 } else {
                     self.deskSendInFlightStartedAt = nil
                     self.recordNeedsAttention(bot: peer, conversation: peerConversation, userText: text)
+                    self.updatePeerActivity(
+                        hostID: host.id,
+                        messageID: outbound.id,
+                        phase: .needsAttention
+                    )
                 }
                 _ = hostConversation
             }
             return true
         } catch {
+            updatePeerActivity(
+                hostID: host.id,
+                messageID: outbound.id,
+                phase: .needsAttention
+            )
             errorMessage = String(describing: error)
             return false
         }
@@ -2332,6 +2402,7 @@ public final class BotsViewModel: ObservableObject {
 
     public func openHomeFile(_ relativePath: String) {
         guard let bot = selectedBot else { return }
+        setStudioFilesLocation(.botFiles, for: bot)
         do {
             let text = try botHome(for: bot).readFile(relativePath: relativePath)
             selectedHomePath = relativePath
@@ -2392,26 +2463,93 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func attachHomeFilesSurface(for bot: BotDefinition) {
-        let home = botHome(for: bot)
-        ensureBotHome(bot, revision: selectedRevision)
-        if let model = homeFilesModel, model.root == home.root.path {
+        let location = resolvedStudioFilesLocation(for: bot)
+        let root: URL
+        switch location {
+        case .botFiles:
+            let home = botHome(for: bot)
+            ensureBotHome(bot, revision: selectedRevision)
+            root = home.root
+        case .dockerHome:
+            do {
+                try computerGuestService?.prepareHome(botID: bot.id)
+                root = try BotGuestHome.ensure(
+                    appSupport: context.appSupportDirectory,
+                    botID: bot.id
+                )
+            } catch {
+                errorMessage = String(describing: error)
+                return
+            }
+        }
+        studioFilesLocation = location
+        if let model = homeFilesModel, model.root == root.path {
             return
         }
         homeFilesModel?.close()
         let workspaceID = WorkspaceID(bot.id.value)
-        let router = BotHomeFilesRouter(root: home.root.path, workspaceID: workspaceID)
-        router.onDidSave = { [weak self] path, content in
-            self?.publishHomeFileIfNeeded(relativePath: path, contents: content)
+        let router = BotHomeFilesRouter(
+            root: root.path,
+            workspaceID: workspaceID,
+            locksBotHomeProjections: location == .botFiles
+        )
+        if location == .botFiles {
+            router.onDidSave = { [weak self] path, content in
+                self?.publishHomeFileIfNeeded(relativePath: path, contents: content)
+            }
         }
         homeFilesRouter = router
         let model = FilesViewModel(
             surfaceID: SurfaceID(bot.id.value),
             workspaceID: workspaceID,
-            root: home.root.path,
+            root: root.path,
             router: router
         )
         homeFilesModel = model
         model.loadInitialState()
+    }
+
+    public func setStudioFilesLocation(
+        _ location: BotStudioFilesLocation,
+        for bot: BotDefinition
+    ) {
+        let resolved = supportsDockerHomeFiles(for: bot) ? location : .botFiles
+        studioFilesLocationsByBot[bot.id] = resolved
+        persistStudioFilesLocations()
+        studioFilesLocation = resolved
+        attachHomeFilesSurface(for: bot)
+    }
+
+    func supportsDockerHomeFiles(for bot: BotDefinition) -> Bool {
+        cachedRevision(for: bot)?.desktopKind == .dockerDesktop
+            || (selectedBotID == bot.id && selectedRevision?.desktopKind == .dockerDesktop)
+    }
+
+    private func resolvedStudioFilesLocation(for bot: BotDefinition) -> BotStudioFilesLocation {
+        guard supportsDockerHomeFiles(for: bot) else { return .botFiles }
+        return studioFilesLocationsByBot[bot.id] ?? .dockerHome
+    }
+
+    public func confirmClearDockerData(for bot: BotDefinition) {
+        guard supportsDockerHomeFiles(for: bot),
+              resolvedStudioFilesLocation(for: bot) == .dockerHome else { return }
+        homeFilesModel?.close()
+        homeFilesModel = nil
+        homeFilesRouter = nil
+        computerGuestService?.teardown(botID: bot.id)
+        guestScreenURLByBot[bot.id.value] = nil
+        guestRunningByBot[bot.id.value] = nil
+        guestLaunchStateByBot[bot.id.value] = nil
+        if selectedBotID == bot.id {
+            lastGuestScreenURL = nil
+        }
+        do {
+            _ = try BotGuestHome.ensure(appSupport: context.appSupportDirectory, botID: bot.id)
+            attachHomeFilesSurface(for: bot)
+        } catch {
+            errorMessage = String(describing: error)
+        }
+        objectWillChange.send()
     }
 
     var homeFilesRouterForTesting: BotHomeFilesRouter? { homeFilesRouter }
@@ -3080,6 +3218,7 @@ public final class BotsViewModel: ObservableObject {
     private static let composerDraftsDefaultsKey = "bots.composerDrafts"
     private static let deskRoutingDefaultsKey = "bots.deskRouting"
     private static let peerTurnsDefaultsKey = "bots.peerTurns"
+    private static let studioFilesLocationsDefaultsKey = "bots.studioFilesLocations"
     private static let inspectorDraftsDefaultsKey = "bots.inspectorDrafts"
     private static let studioDraftDefaultsKey = "bots.studioDraft"
     private static let searchTextDefaultsKey = "bots.searchText"
@@ -3748,6 +3887,31 @@ public final class BotsViewModel: ObservableObject {
         persistPeerTurns()
     }
 
+    private func updatePeerActivity(
+        hostID: BotID,
+        messageID: UUID,
+        phase: BotPeerActivityPhase?
+    ) {
+        func update(_ messages: inout [BotDeskMessage]) {
+            guard let index = messages.firstIndex(where: { $0.id == messageID }),
+                  messages[index].peer?.direction == .messaged else { return }
+            messages[index].peer?.activityPhase = phase
+        }
+
+        if var turns = peerTurnsByHost[hostID] {
+            update(&turns)
+            peerTurnsByHost[hostID] = turns
+        }
+        if var messages = messagesByBot[hostID] {
+            update(&messages)
+            messagesByBot[hostID] = messages
+        }
+        if selectedBotID == hostID {
+            update(&deskMessages)
+        }
+        persistPeerTurns()
+    }
+
     private func mergePeerTurns(_ messages: [BotDeskMessage], hostID: BotID) -> [BotDeskMessage] {
         let extras = peerTurnsByHost[hostID] ?? []
         guard !extras.isEmpty else { return messages }
@@ -3788,8 +3952,14 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    private func importPeerReply(from peer: BotDefinition, onto host: BotDefinition) {
-        guard let reply = lastAssistantText(for: peer.id), !reply.isEmpty else { return }
+    @discardableResult
+    private func importPeerReply(
+        from peer: BotDefinition,
+        onto host: BotDefinition,
+        outboundMessageID: UUID
+    ) -> Bool {
+        guard let reply = lastAssistantText(for: peer.id), !reply.isEmpty else { return false }
+        updatePeerActivity(hostID: host.id, messageID: outboundMessageID, phase: nil)
         let inbound = BotDeskMessage(
             role: .assistant,
             text: reply,
@@ -3797,6 +3967,7 @@ public final class BotsViewModel: ObservableObject {
         )
         appendDeskMessage(inbound, botID: host.id, conversationID: destConversation(for: host.id)?.id)
         rememberPeerTurn(inbound, hostID: host.id)
+        return true
     }
 
     private func lastAssistantText(for botID: BotID) -> String? {
@@ -3838,6 +4009,7 @@ public final class BotsViewModel: ObservableObject {
         var name: String
         var title: String
         var handle: String
+        var activityPhase: BotPeerActivityPhase?
     }
 
     private func persistPeerTurns() {
@@ -3854,7 +4026,8 @@ public final class BotsViewModel: ObservableObject {
                     peerBotID: peer.botID.value,
                     name: peer.name,
                     title: peer.title,
-                    handle: peer.handle
+                    handle: peer.handle,
+                    activityPhase: peer.activityPhase
                 )
             }
         }
@@ -3887,12 +4060,34 @@ public final class BotsViewModel: ObservableObject {
                         botID: BotID(turn.peerBotID),
                         name: turn.name,
                         title: turn.title,
-                        handle: turn.handle
+                        handle: turn.handle,
+                        activityPhase: turn.activityPhase
                     )
                 )
             }
         }
         peerTurnsByHost = restored
+    }
+
+    private func persistStudioFilesLocations() {
+        let payload = Dictionary(uniqueKeysWithValues: studioFilesLocationsByBot.map {
+            ($0.key.value.uuidString.lowercased(), $0.value)
+        })
+        if payload.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.studioFilesLocationsDefaultsKey)
+        } else if let data = try? JSONEncoder().encode(payload) {
+            UserDefaults.standard.set(data, forKey: Self.studioFilesLocationsDefaultsKey)
+        }
+    }
+
+    private func restoreStudioFilesLocationsIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.studioFilesLocationsDefaultsKey),
+              let payload = try? JSONDecoder().decode([String: BotStudioFilesLocation].self, from: data)
+        else { return }
+        studioFilesLocationsByBot = Dictionary(uniqueKeysWithValues: payload.compactMap { raw, location in
+            guard let uuid = UUID(uuidString: raw) else { return nil }
+            return (BotID(uuid), location)
+        })
     }
 
     private func persistComposerDrafts() {
@@ -4934,6 +5129,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public var lastGuestScreenURL: URL?
     @Published public var guestScreenURLByBot: [UUID: URL] = [:]
     @Published public var guestRunningByBot: [UUID: Bool] = [:]
+    @Published private var guestRebuildingByBot: [UUID: Bool] = [:]
     @Published private(set) var guestLaunchStateByBot: [UUID: BotComputerGuestLaunchState] = [:]
 
     func guestScreenURL(for botID: BotID) -> URL? {
@@ -4942,6 +5138,10 @@ public final class BotsViewModel: ObservableObject {
 
     func isGuestRunning(_ botID: BotID) -> Bool {
         guestRunningByBot[botID.value] == true
+    }
+
+    func isGuestRebuilding(_ botID: BotID) -> Bool {
+        guestRebuildingByBot[botID.value] == true
     }
 
     func guestLaunchState(for botID: BotID) -> BotComputerGuestLaunchState {
@@ -5018,15 +5218,30 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    func openGuestTerminal(botID: BotID) {
-        guard let service = computerGuestService else { return }
-        do {
-            try service.openTerminal(botID: botID)
-            guestRunningByBot[botID.value] = true
-            guestLaunchStateByBot[botID.value] = .idle
-            objectWillChange.send()
-        } catch {
-            errorMessage = "Could not open a guest terminal."
+    func rebuildDockerGuest(botID: BotID) {
+        guard !isGuestRebuilding(botID) else { return }
+        guard let service = computerGuestService else {
+            errorMessage = "Docker desktop is not ready."
+            return
+        }
+        let wasRunning = isGuestRunning(botID)
+        guestRebuildingByBot[botID.value] = true
+        Task.detached {
+            do {
+                let ready = try service.rebuild(botID: botID)
+                let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
+                await MainActor.run {
+                    self.guestRebuildingByBot[botID.value] = false
+                    self.rememberGuestScreen(url: url, botID: botID, running: true)
+                }
+            } catch {
+                await MainActor.run {
+                    self.guestRebuildingByBot[botID.value] = false
+                    self.errorMessage = wasRunning
+                        ? "Could not rebuild the Linux desktop. The current desktop is still running."
+                        : "Could not rebuild the Linux desktop."
+                }
+            }
         }
     }
 
@@ -5629,6 +5844,7 @@ public struct BotsRootView: View {
     @State private var showDeskModelOptions = false
     @State private var showDeskSourceOptions = false
     @State private var pendingClearAllDeskThreads = false
+    @State private var pendingDockerDataClear: BotID?
 
     public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
         self.vm = vm
@@ -6058,19 +6274,20 @@ public struct BotsRootView: View {
                 BotComputerGuestCanvas(
                     url: (vm.studioDraft.botID.flatMap { vm.guestScreenURL(for: $0) }) ?? vm.lastGuestScreenURL,
                     running: vm.studioDraft.botID.map { vm.isGuestRunning($0) } ?? false,
+                    rebuilding: vm.studioDraft.botID.map { vm.isGuestRebuilding($0) } ?? false,
                     launchState: vm.studioDraft.botID.map { vm.guestLaunchState(for: $0) } ?? .idle,
                     startIdentifier: "bots.studio.desktop.start",
+                    rebuildIdentifier: "bots.studio.desktop.rebuild",
                     stopIdentifier: "bots.studio.desktop.stop",
-                    terminalIdentifier: "bots.studio.desktop.terminal",
                     screenIdentifier: "bots.studio.desktop.guestScreen",
                     onStart: {
                         if let id = vm.studioDraft.botID { vm.presentGuestDesktop(botID: id) }
                     },
+                    onRebuild: {
+                        if let id = vm.studioDraft.botID { vm.rebuildDockerGuest(botID: id) }
+                    },
                     onStop: {
                         if let id = vm.studioDraft.botID { vm.stopDockerGuest(botID: id) }
-                    },
-                    onTerminal: {
-                        if let id = vm.studioDraft.botID { vm.openGuestTerminal(botID: id) }
                     }
                 )
             }
@@ -6381,14 +6598,15 @@ public struct BotsRootView: View {
                 BotComputerGuestCanvas(
                     url: vm.guestScreenURL(for: bot.id),
                     running: vm.isGuestRunning(bot.id),
+                    rebuilding: vm.isGuestRebuilding(bot.id),
                     launchState: vm.guestLaunchState(for: bot.id),
                     startIdentifier: "bots.desk.desktop.start",
+                    rebuildIdentifier: "bots.desk.desktop.rebuild",
                     stopIdentifier: "bots.desk.desktop.stop",
-                    terminalIdentifier: "bots.desk.desktop.terminal",
                     screenIdentifier: "bots.desk.desktop.guestScreen",
                     onStart: { vm.presentGuestDesktop(botID: bot.id) },
+                    onRebuild: { vm.rebuildDockerGuest(botID: bot.id) },
                     onStop: { vm.stopDockerGuest(botID: bot.id) },
-                    onTerminal: { vm.openGuestTerminal(botID: bot.id) },
                     onOpenInNewWindow: { vm.openGuestDesktopInNewWindow(bot) }
                 )
             }
@@ -6747,6 +6965,7 @@ public struct BotsRootView: View {
                     AgentChatWorkingStatusStrip(
                         startedAt: started,
                         isStopping: vm.isStopping,
+                        context: vm.deskWorkingContext,
                         onStop: { vm.stopDeskRun() }
                     )
                 }
@@ -6785,6 +7004,19 @@ public struct BotsRootView: View {
                         roleIdentifier: "bots.desk.role.assistant"
                     )
                 }
+            }
+            if let peer = message.peer,
+               peer.direction == .messaged,
+               let phase = peer.activityPhase {
+                AgentChatPeerActivityRow(
+                    snapshot: BotPeerActivitySnapshot(
+                        phase: phase,
+                        name: peer.name,
+                        title: peer.title,
+                        handle: peer.handle
+                    ),
+                    startedAt: message.createdAt
+                )
             }
         }
     }
@@ -7106,16 +7338,53 @@ public struct BotsRootView: View {
     }
 
     private var filesTab: some View {
-        Group {
-            if let model = vm.homeFilesModel {
-                FilesSurfaceRoot(model: model)
-            } else {
-                studioEmptyState(
-                    icon: "folder",
-                    title: "Bot files",
-                    subtitle: "This teammate’s exclusive folder."
-                )
+        VStack(spacing: 0) {
+            if let bot = vm.selectedBot, vm.supportsDockerHomeFiles(for: bot) {
+                VStack(alignment: .leading, spacing: DS.Space.sm) {
+                    Picker("Files location", selection: Binding(
+                        get: { vm.studioFilesLocation },
+                        set: { vm.setStudioFilesLocation($0, for: bot) }
+                    )) {
+                        Text(BotStudioFilesLocation.botFiles.title)
+                            .tag(BotStudioFilesLocation.botFiles)
+                        Text(BotStudioFilesLocation.dockerHome.title)
+                            .tag(BotStudioFilesLocation.dockerHome)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 280)
+                    .accessibilityIdentifier("bots.studio.files.location")
+                    if vm.studioFilesLocation == .dockerHome {
+                        HStack(alignment: .firstTextBaseline, spacing: DS.Space.lg) {
+                            Text("Persisted on this Mac and mounted in Docker at /home/remotecode.")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.textSecondary)
+                            Spacer(minLength: 0)
+                            Button("Clear Docker data…", role: .destructive) {
+                                pendingDockerDataClear = bot.id
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundColor(DS.Palette.danger)
+                            .accessibilityIdentifier("bots.studio.files.docker.clear")
+                        }
+                    }
+                }
+                .padding(.horizontal, DS.Space.xl)
+                .padding(.vertical, DS.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .dsBar(edge: .bottom)
             }
+            Group {
+                if let model = vm.homeFilesModel {
+                    FilesSurfaceRoot(model: model)
+                } else {
+                    studioEmptyState(
+                        icon: "folder",
+                        title: "Bot files",
+                        subtitle: "This teammate’s exclusive folder."
+                    )
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityIdentifier("bots.studio.files")
@@ -7128,6 +7397,28 @@ public struct BotsRootView: View {
             if let bot = vm.selectedBot {
                 vm.attachHomeFilesSurface(for: bot)
             }
+        }
+        .confirmationDialog(
+            "Clear Docker data?",
+            isPresented: Binding(
+                get: { pendingDockerDataClear != nil },
+                set: { presented in
+                    if !presented { pendingDockerDataClear = nil }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Clear Docker data", role: .destructive) {
+                let botID = pendingDockerDataClear
+                pendingDockerDataClear = nil
+                if let botID,
+                   let bot = vm.fleet.first(where: { $0.id == botID }) {
+                    vm.confirmClearDockerData(for: bot)
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingDockerDataClear = nil }
+        } message: {
+            Text("Deletes this teammate’s Docker container and every file in /home/remotecode. This cannot be undone.")
         }
     }
 
@@ -7505,14 +7796,15 @@ private struct BotGuestDesktopRoot: View {
                 BotComputerGuestCanvas(
                     url: vm.guestScreenURL(for: bot.id),
                     running: vm.isGuestRunning(bot.id),
+                    rebuilding: vm.isGuestRebuilding(bot.id),
                     launchState: vm.guestLaunchState(for: bot.id),
                     startIdentifier: "bots.desk.desktop.window.start",
+                    rebuildIdentifier: "bots.desk.desktop.window.rebuild",
                     stopIdentifier: "bots.desk.desktop.window.stop",
-                    terminalIdentifier: "bots.desk.desktop.window.terminal",
                     screenIdentifier: "bots.desk.desktop.window.guestScreen",
                     onStart: { vm.presentGuestDesktop(botID: bot.id) },
-                    onStop: { vm.stopDockerGuest(botID: bot.id) },
-                    onTerminal: { vm.openGuestTerminal(botID: bot.id) }
+                    onRebuild: { vm.rebuildDockerGuest(botID: bot.id) },
+                    onStop: { vm.stopDockerGuest(botID: bot.id) }
                 )
                 .padding(DS.Space.lg)
             } else {

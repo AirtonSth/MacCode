@@ -95,15 +95,43 @@ public enum BotMentionParser {
     }
 }
 
-/// Persistable caption for a teammate turn inside an Agent App thread.
+public enum BotPeerActivityPhase: String, Codable, Sendable, Equatable {
+    case waiting
+    case needsAttention
+}
+
+public struct BotPeerActivitySnapshot: Sendable, Equatable {
+    public let phase: BotPeerActivityPhase
+    public let name: String
+    public let title: String
+    public let handle: String
+
+    public init(phase: BotPeerActivityPhase, name: String, title: String, handle: String) {
+        self.phase = phase
+        self.name = name
+        self.title = title
+        self.handle = handle
+    }
+
+    public var identityLine: String {
+        [name, title.isEmpty ? nil : title, handle]
+            .compactMap { $0 }
+            .joined(separator: " - ")
+    }
+}
+
+/// Persistable state for a teammate turn inside an Agent App thread.
 public enum BotPeerTranscript {
     private static let prefix = "[[rc:bot-from:"
+    private static let activityPrefix = "[[rc:bot-activity:"
 
     public static func encode(peer: BotDefinition, text: String) -> String {
         "\(prefix)\(peer.handle)|\(peer.name)|\(peer.title)]]\n\(text)"
     }
 
-    public static func parse(_ content: String) -> (caption: String, body: String)? {
+    public static func parse(
+        _ content: String
+    ) -> (caption: String, body: String, name: String, title: String, handle: String)? {
         guard content.hasPrefix(prefix),
               let end = content.range(of: "]]") else { return nil }
         let payload = content[content.index(content.startIndex, offsetBy: prefix.count)..<end.lowerBound]
@@ -118,7 +146,28 @@ public enum BotPeerTranscript {
         let bodyStart = content.index(end.upperBound, offsetBy: 0)
         var body = String(content[bodyStart...])
         if body.hasPrefix("\n") { body.removeFirst() }
-        return ("Message from \(identity)", body)
+        return ("Message from \(identity)", body, name, title, handle)
+    }
+
+    public static func encodeActivity(peer: BotDefinition, phase: BotPeerActivityPhase) -> String {
+        "\(activityPrefix)\(phase.rawValue)|\(peer.handle)|\(peer.name)|\(peer.title)]]"
+    }
+
+    public static func parseActivity(_ content: String) -> BotPeerActivitySnapshot? {
+        guard content.hasPrefix(activityPrefix),
+              let end = content.range(of: "]]") else { return nil }
+        let payload = content[
+            content.index(content.startIndex, offsetBy: activityPrefix.count)..<end.lowerBound
+        ]
+        let parts = payload.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 4,
+              let phase = BotPeerActivityPhase(rawValue: parts[0]) else { return nil }
+        return BotPeerActivitySnapshot(
+            phase: phase,
+            name: parts[2],
+            title: parts[3],
+            handle: parts[1]
+        )
     }
 
     public static func messagedCaption(for bot: BotDefinition) -> String {

@@ -116,6 +116,12 @@ public final class BotComputerGuestService: @unchecked Sendable {
         return try readyState(name: name, resumed: false)
     }
 
+    /// Makes the bot's editable build recipe visible without starting Docker.
+    public func prepareHome(botID: BotID) throws {
+        _ = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
+        try seedRecipe(botID: botID)
+    }
+
     public func stop(botID: BotID) throws {
         try docker.stop(name: BotComputerGuestSpec.containerName(botID: botID))
     }
@@ -284,16 +290,27 @@ public final class BotComputerGuestService: @unchecked Sendable {
 
     private func seedRecipe(botID: BotID) throws {
         let dest = BotComputerGuestSpec.recipeURL(appSupport: appSupport, botID: botID)
-        try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
-        guard let recipeContext else { return }
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: dest, withIntermediateDirectories: true)
         let names = ["Dockerfile", "start.sh", "embed.html", "launch-browser.sh"]
+        let legacy = dest.appendingPathComponent("computer", isDirectory: true)
         for name in names {
             let target = dest.appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: target.path) { continue }
-            let source = recipeContext.appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: source.path) {
-                try FileManager.default.copyItem(at: source, to: target)
+            if fileManager.fileExists(atPath: target.path) { continue }
+            let legacySource = legacy.appendingPathComponent(name)
+            if fileManager.fileExists(atPath: legacySource.path) {
+                try fileManager.moveItem(at: legacySource, to: target)
+                continue
             }
+            guard let recipeContext else { continue }
+            let source = recipeContext.appendingPathComponent(name)
+            if fileManager.fileExists(atPath: source.path) {
+                try fileManager.copyItem(at: source, to: target)
+            }
+        }
+        if fileManager.fileExists(atPath: legacy.path),
+           (try fileManager.contentsOfDirectory(atPath: legacy.path)).isEmpty {
+            try fileManager.removeItem(at: legacy)
         }
     }
 

@@ -23,10 +23,9 @@ public enum BotComputerGuestSpec {
             .appendingPathComponent("home", isDirectory: true)
     }
 
-    /// Dockerfile the bot can edit. Lives in the existing guest-home bind.
+    /// Per-bot Docker build context. Its editable Dockerfile lives at the guest-home root.
     public static func recipeURL(appSupport: URL, botID: BotID) -> URL {
         guestHomeURL(appSupport: appSupport, botID: botID)
-            .appendingPathComponent("computer", isDirectory: true)
     }
 
     public static func botImageTag(botID: BotID) -> String {

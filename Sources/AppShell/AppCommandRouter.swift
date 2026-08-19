@@ -2506,9 +2506,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // would loop. Upgrade: multi-hop with an explicit hop budget.
         lastAgentAppHopTextForTesting = nil
         for peer in peers {
+            let activityID = agent.viewModel.presentBotPeerActivity(
+                peer: peer,
+                phase: .waiting,
+                threadId: threadId
+            )
             guard let reply = await botsViewModel?.runMentionedPrompt(peer: peer, text: text),
-                  !reply.isEmpty else { continue }
-            agent.viewModel.presentBotPeerMessage(peer: peer, text: reply, threadId: threadId)
+                  !reply.isEmpty else {
+                agent.viewModel.presentBotPeerActivity(
+                    peer: peer,
+                    phase: .needsAttention,
+                    threadId: threadId,
+                    replacing: activityID
+                )
+                continue
+            }
+            agent.viewModel.presentBotPeerMessage(
+                peer: peer,
+                text: reply,
+                threadId: threadId,
+                replacing: activityID
+            )
             let hop = BotPeerTranscript.hostHopPrompt(peerName: peer.name, reply: reply)
             lastAgentAppHopTextForTesting = hop
             await agent.viewModel.sendBotPeerFollowUp(

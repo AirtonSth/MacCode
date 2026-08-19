@@ -50,7 +50,7 @@ public enum BotComputerCatalog: Sendable {
         case exec:
             return "Run a command inside this bot's Linux container. Use this to install packages (apt-get) or edit files. Do not run host docker."
         case rebuild:
-            return "Rebuild this bot's Linux image from /home/remotecode/computer/Dockerfile and restart the desktop. Use after editing that Dockerfile."
+            return "Rebuild this bot's Linux image from /home/remotecode/Dockerfile and restart the desktop. Use after editing that Dockerfile."
         default:
             return name
         }

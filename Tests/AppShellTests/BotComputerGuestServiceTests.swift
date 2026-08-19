@@ -389,6 +389,48 @@ final class BotComputerGuestServiceTests: XCTestCase {
         service.teardown(botID: botID)
     }
 
+    func test_prepareHomeMigratesCustomizedLegacyRecipeWithoutLosingIt() throws {
+        // WHY: existing bots already have an editable computer/Dockerfile. Moving the
+        // recipe to the guest-home root must preserve that per-bot customization.
+        let support = makeSupport("rc-guest-recipe-migration")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let botID = BotID()
+        let home = BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: botID)
+        let legacy = home.appendingPathComponent("computer", isDirectory: true)
+        try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: true)
+        let customized = "FROM debian:bookworm-slim\nRUN echo customized\n"
+        try customized.write(
+            to: legacy.appendingPathComponent("Dockerfile"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: FakeDocker(),
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL(),
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        try service.prepareHome(botID: botID)
+
+        XCTAssertEqual(
+            try String(contentsOf: home.appendingPathComponent("Dockerfile"), encoding: .utf8),
+            customized,
+            "migration must keep the bot's edited Dockerfile byte-for-byte"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: legacy.appendingPathComponent("Dockerfile").path),
+            "the active Dockerfile must no longer appear under a misleading computer folder"
+        )
+        for name in ["start.sh", "embed.html", "launch-browser.sh"] {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: home.appendingPathComponent(name).path),
+                "the root build context must keep every file referenced by Dockerfile"
+            )
+        }
+    }
+
     private final class SleepCounter: @unchecked Sendable {
         var count = 0
     }

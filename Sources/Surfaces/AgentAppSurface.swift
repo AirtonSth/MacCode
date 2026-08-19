@@ -6178,20 +6178,62 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         Task { await onDispatchBotMentions(peers, text, threadId) }
     }
 
-    public func presentBotPeerMessage(peer: BotDefinition, text: String, threadId: AgentThreadID) {
+    @discardableResult
+    public func presentBotPeerActivity(
+        peer: BotDefinition,
+        phase: BotPeerActivityPhase,
+        threadId: AgentThreadID,
+        replacing replacementID: AgentMessageID? = nil
+    ) -> AgentMessageID? {
+        presentBotPeerContent(
+            BotPeerTranscript.encodeActivity(peer: peer, phase: phase),
+            threadId: threadId,
+            replacing: replacementID
+        )
+    }
+
+    @discardableResult
+    public func presentBotPeerMessage(
+        peer: BotDefinition,
+        text: String,
+        threadId: AgentThreadID,
+        replacing replacementID: AgentMessageID? = nil
+    ) -> AgentMessageID? {
+        presentBotPeerContent(
+            BotPeerTranscript.encode(peer: peer, text: text),
+            threadId: threadId,
+            replacing: replacementID
+        )
+    }
+
+    private func presentBotPeerContent(
+        _ content: String,
+        threadId: AgentThreadID,
+        replacing replacementID: AgentMessageID?
+    ) -> AgentMessageID? {
+        let messageID = replacementID ?? AgentMessageID()
+        let existing = messages.first(where: { $0.id == messageID })
+            ?? (try? messageRepo.get(id: messageID))
         let message = AgentMessage(
+            id: messageID,
             threadId: threadId,
             role: .assistant,
-            content: BotPeerTranscript.encode(peer: peer, text: text)
+            content: content,
+            createdAt: existing?.createdAt ?? Date()
         )
         do {
             try messageRepo.append(message)
         } catch {
             statusMessage = String(describing: error)
-            return
+            return nil
         }
-        guard selectedThreadId == threadId else { return }
-        messages.append(message)
+        guard selectedThreadId == threadId else { return messageID }
+        if let index = messages.firstIndex(where: { $0.id == messageID }) {
+            messages[index] = message
+        } else {
+            messages.append(message)
+        }
+        return messageID
     }
 
     /// Hop-1 after a mentioned bot replies. No `@handle` so dispatch cannot loop.
@@ -11186,6 +11228,27 @@ public struct AgentAppView: View {
         )
     }
 
+    private var activeBotPeerReviewName: String? {
+        guard vm.selectedThreadRunIsStartingOrRunning,
+              let runStartedAt = vm.runStartedAt else { return nil }
+        var newestUserMessageAt: Date?
+        var newestPeerReply: (createdAt: Date, name: String)?
+        for entry in visibleTranscriptEntries {
+            guard case .message(let message) = entry else { continue }
+            if message.role == .user {
+                newestUserMessageAt = message.createdAt
+            } else if message.role == .assistant,
+                      let reply = BotPeerTranscript.parse(message.content) {
+                newestPeerReply = (message.createdAt, reply.name)
+            }
+        }
+        guard let newestUserMessageAt,
+              let newestPeerReply,
+              newestPeerReply.createdAt >= newestUserMessageAt,
+              newestPeerReply.createdAt <= runStartedAt else { return nil }
+        return newestPeerReply.name
+    }
+
     /// Pure seam: which transcript entries the eager VStack renders.
     ///
     /// - Running / pending: prefer the slice from the newest user message
@@ -12337,6 +12400,9 @@ public struct AgentAppView: View {
                                 AgentChatWorkingStatusStrip(
                                     startedAt: vm.runStartedAt ?? Date(),
                                     isStopping: vm.isStopping,
+                                    context: activeBotPeerReviewName.map {
+                                        AgentChatWorkingContext.reviewing(peerName: $0)
+                                    },
                                     onStop: { vm.stop() }
                                 )
                                 .id("agent.workingStatus")
@@ -13542,6 +13608,8 @@ public struct AgentAppView: View {
                         .italic()
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityLabel("Content omitted: message body was too large to display")
+                } else if let activity = BotPeerTranscript.parseActivity(msg.content) {
+                    AgentChatPeerActivityRow(snapshot: activity, startedAt: msg.createdAt)
                 } else {
                     let showBadge = Self.showsTokenSaverOptimizedBadge(
                         wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)

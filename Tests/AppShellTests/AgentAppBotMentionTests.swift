@@ -64,7 +64,9 @@ final class AgentAppBotMentionTests: XCTestCase {
         let source = try String(contentsOf: sourceURL)
         XCTAssertTrue(source.contains("configureAgentAppBotMentions"))
         XCTAssertTrue(source.contains("runMentionedPrompt"))
+        XCTAssertTrue(source.contains("presentBotPeerActivity"))
         XCTAssertTrue(source.contains("presentBotPeerMessage"))
+        XCTAssertTrue(source.contains("replacing:"))
     }
 
     func test_agentAppDispatchStartsPeerAndPaintsReply() async throws {
@@ -85,7 +87,9 @@ final class AgentAppBotMentionTests: XCTestCase {
             "Agent App mention must start the peer provider run"
         )
         let stored = try ctx.messageRepo.listRecent(threadId: threadId, limit: 16)
-        let inbound = try XCTUnwrap(stored.last(where: { $0.role == .assistant }))
+        let assistantRows = stored.filter { $0.role == .assistant }
+        XCTAssertEqual(assistantRows.count, 1, "waiting must update into reply, not remain as a second row")
+        let inbound = try XCTUnwrap(assistantRows.first)
         let parsed = try XCTUnwrap(BotPeerTranscript.parse(inbound.content))
         XCTAssertTrue(parsed.caption.contains("Message from Quinn"))
         XCTAssertTrue(parsed.body.contains("PONG from Quinn"))
@@ -110,6 +114,169 @@ final class AgentAppBotMentionTests: XCTestCase {
         )
         XCTAssertFalse(BotPeerTranscript.containsMentionToken(hop, handle: quinn.handle))
         XCTAssertFalse(hop.contains("@\(quinn.handle)"))
+    }
+
+    func test_agentAppPeerActivityUpsertsOneDurableRow() async throws {
+        // WHY: waiting and reply are one teammate turn. Appending the reply as
+        // a second row leaves stale "Waiting" chrome after completion/relaunch.
+        let dir = NSTemporaryDirectory() + "RC2AgentPeerActivity-" + UUID().uuidString
+        let workspaceID = WorkspaceID()
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let surface = AgentAppSurface(
+            workspaceID: workspaceID,
+            cwd: dir,
+            coordinator: ctx.coordinator,
+            threadRepo: ctx.threadRepo,
+            messageRepo: ctx.messageRepo
+        )
+        let quinn = BotDefinition(
+            handle: "quinn",
+            name: "Quinn",
+            title: "CRM Controller",
+            description: ""
+        )
+        surface.viewModel.createThread(title: "Peer activity reply")
+        let threadId = try XCTUnwrap(surface.viewModel.selectedThreadId)
+
+        let waitingID = try XCTUnwrap(surface.viewModel.presentBotPeerActivity(
+            peer: quinn,
+            phase: .waiting,
+            threadId: threadId
+        ))
+        let waitingRows = try ctx.messageRepo.list(threadId: threadId)
+        XCTAssertEqual(waitingRows.count, 1)
+        XCTAssertEqual(waitingRows.first?.id, waitingID)
+        XCTAssertEqual(
+            waitingRows.first.map(\.content).flatMap(BotPeerTranscript.parseActivity),
+            BotPeerActivitySnapshot(
+                phase: .waiting,
+                name: "Quinn",
+                title: "CRM Controller",
+                handle: "quinn"
+            )
+        )
+        let waitingCreatedAt = try XCTUnwrap(waitingRows.first?.createdAt)
+
+        let replyID = try XCTUnwrap(surface.viewModel.presentBotPeerMessage(
+            peer: quinn,
+            text: "Inbox is clear.",
+            threadId: threadId,
+            replacing: waitingID
+        ))
+        XCTAssertEqual(replyID, waitingID)
+        XCTAssertEqual(surface.viewModel.messages.count, 1)
+        XCTAssertEqual(surface.viewModel.messages.first?.id, waitingID)
+
+        let replyRows = try ctx.messageRepo.list(threadId: threadId)
+        XCTAssertEqual(replyRows.count, 1)
+        let reply = try XCTUnwrap(replyRows.first)
+        XCTAssertEqual(reply.id, waitingID)
+        XCTAssertEqual(reply.createdAt, waitingCreatedAt)
+        let parsedReply = try XCTUnwrap(BotPeerTranscript.parse(reply.content))
+        XCTAssertEqual(parsedReply.caption, "Message from Quinn - CRM Controller - quinn")
+        XCTAssertEqual(parsedReply.body, "Inbox is clear.")
+        XCTAssertEqual(parsedReply.name, "Quinn")
+        XCTAssertEqual(parsedReply.title, "CRM Controller")
+        XCTAssertEqual(parsedReply.handle, "quinn")
+
+        let reloaded = AgentAppSurface(
+            workspaceID: workspaceID,
+            cwd: dir,
+            coordinator: ctx.coordinator,
+            threadRepo: ctx.threadRepo,
+            messageRepo: ctx.messageRepo,
+            initialThreadId: threadId
+        )
+        await reloaded.viewModel.waitForMessageHistoryLoad()
+        XCTAssertEqual(reloaded.viewModel.messages.count, 1)
+        XCTAssertEqual(reloaded.viewModel.messages.first?.id, waitingID)
+        XCTAssertEqual(
+            reloaded.viewModel.messages.first.flatMap { BotPeerTranscript.parse($0.content)?.body },
+            "Inbox is clear."
+        )
+    }
+
+    func test_agentAppPeerActivityFailureUpdatesSameRow() async throws {
+        // WHY: a peer that produces no answer must replace its live waiting row
+        // with durable recovery chrome instead of disappearing or duplicating it.
+        let dir = NSTemporaryDirectory() + "RC2AgentPeerFailure-" + UUID().uuidString
+        let workspaceID = WorkspaceID()
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let surface = AgentAppSurface(
+            workspaceID: workspaceID,
+            cwd: dir,
+            coordinator: ctx.coordinator,
+            threadRepo: ctx.threadRepo,
+            messageRepo: ctx.messageRepo
+        )
+        let quinn = BotDefinition(
+            handle: "quinn",
+            name: "Quinn",
+            title: "CRM Controller",
+            description: ""
+        )
+        surface.viewModel.createThread(title: "Peer activity failure")
+        let threadId = try XCTUnwrap(surface.viewModel.selectedThreadId)
+
+        let waitingID = try XCTUnwrap(surface.viewModel.presentBotPeerActivity(
+            peer: quinn,
+            phase: .waiting,
+            threadId: threadId
+        ))
+        let waitingRows = try ctx.messageRepo.list(threadId: threadId)
+        XCTAssertEqual(waitingRows.count, 1)
+        XCTAssertEqual(waitingRows.first?.id, waitingID)
+        XCTAssertEqual(
+            waitingRows.first.map(\.content).flatMap(BotPeerTranscript.parseActivity)?.phase,
+            .waiting
+        )
+        let waitingCreatedAt = try XCTUnwrap(waitingRows.first?.createdAt)
+
+        let failureID = try XCTUnwrap(surface.viewModel.presentBotPeerActivity(
+            peer: quinn,
+            phase: .needsAttention,
+            threadId: threadId,
+            replacing: waitingID
+        ))
+        XCTAssertEqual(failureID, waitingID)
+        XCTAssertEqual(surface.viewModel.messages.count, 1)
+        XCTAssertEqual(surface.viewModel.messages.first?.id, waitingID)
+
+        let failureRows = try ctx.messageRepo.list(threadId: threadId)
+        XCTAssertEqual(failureRows.count, 1)
+        let failure = try XCTUnwrap(failureRows.first)
+        XCTAssertEqual(failure.id, waitingID)
+        XCTAssertEqual(failure.createdAt, waitingCreatedAt)
+        XCTAssertEqual(
+            BotPeerTranscript.parseActivity(failure.content),
+            BotPeerActivitySnapshot(
+                phase: .needsAttention,
+                name: "Quinn",
+                title: "CRM Controller",
+                handle: "quinn"
+            )
+        )
+
+        let reloaded = AgentAppSurface(
+            workspaceID: workspaceID,
+            cwd: dir,
+            coordinator: ctx.coordinator,
+            threadRepo: ctx.threadRepo,
+            messageRepo: ctx.messageRepo,
+            initialThreadId: threadId
+        )
+        await reloaded.viewModel.waitForMessageHistoryLoad()
+        XCTAssertEqual(reloaded.viewModel.messages.count, 1)
+        XCTAssertEqual(reloaded.viewModel.messages.first?.id, waitingID)
+        XCTAssertEqual(
+            reloaded.viewModel.messages.first.map(\.content).flatMap(BotPeerTranscript.parseActivity),
+            BotPeerActivitySnapshot(
+                phase: .needsAttention,
+                name: "Quinn",
+                title: "CRM Controller",
+                handle: "quinn"
+            )
+        )
     }
 
     private func makeWiredMentionSurface(

@@ -29,7 +29,7 @@ struct BotComputerGuestScreenView: NSViewRepresentable {
         return view
     }
 
-    /// The app owns the viewer chrome (Stop / Terminal), so noVNC's floating
+    /// The app owns the viewer chrome (Rebuild / Stop), so noVNC's floating
     /// control-bar handle reads as a broken leftover. Hide it and blend the
     /// page background into the surrounding pane (DS.Palette.surface).
     private static let embedStyleScript = """
@@ -105,18 +105,19 @@ enum BotComputerGuestLaunchState: Equatable {
     }
 }
 
-/// Shared Desk/Studio chrome: live screen plus Start / Stop / Terminal.
+/// Shared Desk/Studio chrome: live screen plus Start or Rebuild / Stop.
 struct BotComputerGuestCanvas: View {
     let url: URL?
     let running: Bool
+    let rebuilding: Bool
     let launchState: BotComputerGuestLaunchState
     let startIdentifier: String
+    let rebuildIdentifier: String
     let stopIdentifier: String
-    let terminalIdentifier: String
     let screenIdentifier: String
     let onStart: () -> Void
+    let onRebuild: () -> Void
     let onStop: () -> Void
-    let onTerminal: () -> Void
     var onOpenInNewWindow: (() -> Void)? = nil
     var openInNewWindowIdentifier: String = "bots.desk.desktop.openInNewWindow"
 
@@ -128,13 +129,23 @@ struct BotComputerGuestCanvas: View {
                     .foregroundColor(DS.Palette.text)
                 Spacer(minLength: 0)
                 if running {
+                    Button(action: onRebuild) {
+                        HStack(spacing: DS.Space.xs) {
+                            if rebuilding {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Text(rebuilding ? "Rebuilding…" : "Rebuild")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(rebuilding)
+                    .accessibilityLabel(rebuilding ? "Rebuilding Linux desktop" : "Rebuild Linux desktop")
+                    .accessibilityIdentifier(rebuildIdentifier)
                     Button("Stop", action: onStop)
                         .buttonStyle(.bordered)
+                        .disabled(rebuilding)
                         .accessibilityIdentifier(stopIdentifier)
-                    Button("Terminal", action: onTerminal)
-                        .buttonStyle(.bordered)
-                        .disabled(!running)
-                        .accessibilityIdentifier(terminalIdentifier)
                 } else {
                     Button(action: onStart) {
                         HStack(spacing: DS.Space.xs) {

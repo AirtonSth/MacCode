@@ -11,6 +11,7 @@ final class BotHomeFilesRouter: FilesSurfaceRouting {
     let root: String
     let workspaceID: WorkspaceID
     var onDidSave: ((String, String) -> Void)?
+    private let locksBotHomeProjections: Bool
     private(set) var lastOpenTabPath: String?
     private var state: [String: JSONValue] = [
         "current_directory": .string(""),
@@ -19,9 +20,14 @@ final class BotHomeFilesRouter: FilesSurfaceRouting {
     ]
     private let files = WorkspaceFileService()
 
-    init(root: String, workspaceID: WorkspaceID) {
+    init(
+        root: String,
+        workspaceID: WorkspaceID,
+        locksBotHomeProjections: Bool = true
+    ) {
         self.root = root
         self.workspaceID = workspaceID
+        self.locksBotHomeProjections = locksBotHomeProjections
     }
 
     func filesEditClose(sessionID: String) throws -> JSONValue {
@@ -36,7 +42,8 @@ final class BotHomeFilesRouter: FilesSurfaceRouting {
     }
 
     func fsWorkspaceList(workspace: WorkspaceID, path: String?) throws -> JSONValue {
-        Self.lockProjections(try files.list(root: root, path: path))
+        let listed = try files.list(root: root, path: path)
+        return locksBotHomeProjections ? Self.lockProjections(listed) : listed
     }
 
     func filesStateUpdate(
@@ -54,7 +61,9 @@ final class BotHomeFilesRouter: FilesSurfaceRouting {
     }
 
     func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue {
-        try Self.rejectProjectionEdit(path)
+        if locksBotHomeProjections {
+            try Self.rejectProjectionEdit(path)
+        }
         return try FileEditSessionStore.shared.open(
             surfaceID: surface,
             workspaceID: workspaceID,
