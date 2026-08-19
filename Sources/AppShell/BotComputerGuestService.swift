@@ -52,14 +52,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         do {
             _ = try docker.info()
             try? docker.removeMatching(namePrefix: "remotecode-probe-")
-            if try docker.imageExists(tag: BotComputerGuestSpec.imageTag) == false {
-                guard let recipeContext else {
-                    lastReady = nil
-                    lastReason = "Docker image missing"
-                    return false
-                }
-                try docker.build(context: recipeContext, tag: BotComputerGuestSpec.imageTag)
-            }
+            try ensureCurrentImage()
             let name = "remotecode-probe-\(UUID().uuidString.lowercased())"
             probeName = name
             let botID = BotID()
@@ -89,7 +82,9 @@ public final class BotComputerGuestService: @unchecked Sendable {
             return true
         } catch {
             lastReady = nil
-            lastReason = String(describing: error)
+            if lastReason == "Guest is proving the screen…" {
+                lastReason = String(describing: error)
+            }
             return false
         }
     }
@@ -97,15 +92,19 @@ public final class BotComputerGuestService: @unchecked Sendable {
     public func provision(botID: BotID) throws -> BotComputerGuestReady {
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
         try seedRecipe(botID: botID)
+        try ensureCurrentImage()
         let name = BotComputerGuestSpec.containerName(botID: botID)
         try docker.ensureNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
-        if let existing = try? docker.inspect(name: name) {
-            if existing.running == false {
-                try docker.start(name: name)
-            }
-            return try readyState(name: name, resumed: true)
-        }
         let image = try resolvedImage(botID: botID)
+        if let existing = try? docker.inspect(name: name) {
+            if imageMatches(existing, tag: image) {
+                if existing.running == false {
+                    try docker.start(name: name)
+                }
+                return try readyState(name: name, resumed: true)
+            }
+            try? docker.remove(name: name)
+        }
         let options = try BotComputerGuestSpec.containerCreateOptions(
             botID: botID,
             guestHome: home.path,
@@ -259,6 +258,28 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let tag = BotComputerGuestSpec.botImageTag(botID: botID)
         if try docker.imageExists(tag: tag) { return tag }
         return BotComputerGuestSpec.imageTag
+    }
+
+    private func ensureCurrentImage() throws {
+        let tag = BotComputerGuestSpec.imageTag
+        let label = (try? docker.imageLabel(tag: tag, key: BotComputerGuestSpec.recipeLabelKey)) ?? ""
+        if try docker.imageExists(tag: tag), label == BotComputerGuestSpec.recipeRevision {
+            return
+        }
+        guard let recipeContext else {
+            if try docker.imageExists(tag: tag) { return }
+            lastReason = "Docker image missing"
+            throw BotComputerGuestError.dockerUnavailable
+        }
+        try docker.build(context: recipeContext, tag: tag)
+    }
+
+    private func imageMatches(_ existing: BotComputerContainerInspect, tag: String) -> Bool {
+        let want = (try? docker.imageID(tag: tag)) ?? ""
+        if want.isEmpty { return true }
+        return existing.imageID == want
+            || existing.imageID.hasSuffix(want)
+            || want.hasSuffix(existing.imageID)
     }
 
     private func seedRecipe(botID: BotID) throws {

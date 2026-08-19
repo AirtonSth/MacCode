@@ -4919,6 +4919,10 @@ final class BotsWindowTests: XCTestCase {
 
         func info() throws -> String { "ok" }
         func imageExists(tag: String) throws -> Bool { true }
+        func imageLabel(tag: String, key: String) throws -> String {
+            key == BotComputerGuestSpec.recipeLabelKey ? BotComputerGuestSpec.recipeRevision : ""
+        }
+        func imageID(tag: String) throws -> String { "img" }
         func build(context: URL, tag: String) throws {}
         func create(options: BotComputerContainerCreateOptions) throws -> String {
             created.append(options.name)
@@ -5047,6 +5051,8 @@ final class BotsWindowTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(canvas.contains("struct BotComputerGuestCanvas"))
+        XCTAssertTrue(canvas.contains("acceptsFirstResponder"))
+        XCTAssertTrue(canvas.contains("makeFirstResponder"))
         XCTAssertFalse(canvas.contains("View-only noVNC"))
     }
 

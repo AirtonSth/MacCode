@@ -2,6 +2,9 @@ import Foundation
 
 public enum BotComputerGuestSpec {
     public static let imageTag = "remotecode/computer:local"
+    public static let recipeLabelKey = "remotecode.recipe"
+    /// Bump when start.sh / Dockerfile change. Missing label rebuilds the image.
+    public static let recipeRevision = "2"
     public static let guestUserHome = "/home/remotecode"
     public static let screenPort = 6080
     public static let minimumShmBytes: Int = 256 * 1024 * 1024
@@ -100,6 +103,7 @@ public enum BotComputerGuestSpec {
         components.queryItems = [
             URLQueryItem(name: "autoconnect", value: "1"),
             URLQueryItem(name: "resize", value: "scale"),
+            URLQueryItem(name: "view_only", value: "0"),
             URLQueryItem(name: "token", value: token),
         ]
         guard let url = components.url else { throw BotComputerGuestError.invalidScreenURL }

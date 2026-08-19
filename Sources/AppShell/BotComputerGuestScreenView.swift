@@ -7,17 +7,62 @@ import WebKit
 struct BotComputerGuestScreenView: NSViewRepresentable {
     let url: URL
 
-    func makeNSView(context: Context) -> WKWebView {
-        let view = WKWebView()
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> BotComputerGuestWebView {
+        let view = BotComputerGuestWebView()
         view.setValue(false, forKey: "drawsBackground")
+        view.navigationDelegate = context.coordinator
+        view.allowsBackForwardNavigationGestures = false
         return view
     }
 
-    func updateNSView(_ view: WKWebView, context: Context) {
+    func updateNSView(_ view: BotComputerGuestWebView, context: Context) {
         guard (try? BotComputerGuestSpec.validateScreenURL(url)) != nil else { return }
         if view.url != url {
             view.load(URLRequest(url: url))
         }
+    }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            webView.window?.makeFirstResponder(webView)
+            webView.evaluateJavaScript(
+                """
+                (function() {
+                  const canvas = document.querySelector('canvas');
+                  if (canvas) {
+                    canvas.tabIndex = 0;
+                    canvas.focus();
+                  }
+                })();
+                """,
+                completionHandler: nil
+            )
+        }
+    }
+}
+
+/// Clicks on the guest must steal key focus from the Desk composer.
+final class BotComputerGuestWebView: WKWebView {
+    override var acceptsFirstResponder: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        evaluateJavaScript(
+            "var c = document.querySelector('canvas'); if (c) { c.tabIndex = 0; c.focus(); }",
+            completionHandler: nil
+        )
+        return accepted
     }
 }
 
@@ -57,7 +102,7 @@ struct BotComputerGuestCanvas: View {
             if let url {
                 BotComputerGuestScreenView(url: url)
                     .frame(minHeight: 280)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                    .clipped()
                     .accessibilityIdentifier(screenIdentifier)
             } else {
                 Text("Start the Linux desktop to use this machine.")

@@ -18,12 +18,24 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var lastExec: (name: String, command: [String], user: String?, detach: Bool)?
     var networks: [String] = []
     var renamed: [(String, String)] = []
+    var imageLabels: [String: String] = [
+        BotComputerGuestSpec.imageTag: BotComputerGuestSpec.recipeRevision
+    ]
 
     func info() throws -> String { infoText }
     func imageExists(tag: String) throws -> Bool { images.contains(tag) }
+    func imageLabel(tag: String, key: String) throws -> String {
+        guard key == BotComputerGuestSpec.recipeLabelKey else { return "" }
+        return imageLabels[tag] ?? ""
+    }
+    func imageID(tag: String) throws -> String {
+        guard images.contains(tag) else { throw BotComputerGuestError.dockerUnavailable }
+        return "img"
+    }
     func build(context: URL, tag: String) throws {
         builds.append(context)
         images.insert(tag)
+        imageLabels[tag] = BotComputerGuestSpec.recipeRevision
     }
     func create(options: BotComputerContainerCreateOptions) throws -> String {
         created.append(options.name)
@@ -126,6 +138,48 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(service.lastReason, "Docker image missing")
         XCTAssertTrue(fake.builds.isEmpty)
         XCTAssertTrue(fake.created.isEmpty)
+    }
+
+    func test_proveReadyRebuildsImageWhenRecipeRevisionIsStale() throws {
+        // WHY: Removing -viewonly from start.sh does nothing if Studio
+        // keeps the old remotecode/computer:local image.
+        let support = makeSupport("rc-guest-stale")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
+        let fake = FakeDocker()
+        fake.imageLabels = [:]
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            recipeContext: recipe,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        XCTAssertTrue(service.proveReady())
+        XCTAssertEqual(fake.builds, [recipe])
+        XCTAssertEqual(fake.imageLabels[BotComputerGuestSpec.imageTag], BotComputerGuestSpec.recipeRevision)
+    }
+
+    func test_provisionRecreatesContainerWhenImageIsStale() throws {
+        let support = makeSupport("rc-guest-recreate")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        fake.containers[name] = BotComputerContainerInspect(
+            running: true, imageID: "old-viewonly", hostPort: 49152
+        )
+        let ready = try service.provision(botID: botID)
+        XCTAssertFalse(ready.resumed)
+        XCTAssertTrue(fake.removed.contains(name))
+        XCTAssertTrue(fake.created.contains(name))
+        service.teardown(botID: botID)
     }
 
     func test_proveReadyRetriesUntilPNGThenRemovesProbe() throws {

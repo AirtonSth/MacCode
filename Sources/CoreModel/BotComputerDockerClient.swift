@@ -3,6 +3,8 @@ import Foundation
 public protocol BotComputerDockerClienting: Sendable {
     func info() throws -> String
     func imageExists(tag: String) throws -> Bool
+    func imageLabel(tag: String, key: String) throws -> String
+    func imageID(tag: String) throws -> String
     func build(context: URL, tag: String) throws
     func create(options: BotComputerContainerCreateOptions) throws -> String
     func start(name: String) throws
@@ -47,8 +49,31 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         }
     }
 
+    public func imageLabel(tag: String, key: String) throws -> String {
+        let data = try run([
+            "inspect",
+            "-f",
+            "{{index .Config.Labels \"\(key)\"}}",
+            tag,
+        ])
+        return (String(data: data, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public func imageID(tag: String) throws -> String {
+        let data = try run(["inspect", "-f", "{{.Id}}", tag])
+        return (String(data: data, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     public func build(context: URL, tag: String) throws {
-        _ = try run(["build", "-t", tag, context.path])
+        _ = try run([
+            "build",
+            "-t", tag,
+            "--label",
+            "\(BotComputerGuestSpec.recipeLabelKey)=\(BotComputerGuestSpec.recipeRevision)",
+            context.path,
+        ])
     }
 
     public func create(options: BotComputerContainerCreateOptions) throws -> String {

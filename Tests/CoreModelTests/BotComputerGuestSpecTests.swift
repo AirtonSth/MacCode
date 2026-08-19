@@ -44,6 +44,7 @@ final class BotComputerGuestSpecTests: XCTestCase {
         XCTAssertEqual(url.host, "127.0.0.1")
         XCTAssertEqual(url.path, "/vnc.html")
         XCTAssertTrue(url.query?.contains("autoconnect=1") == true)
+        XCTAssertTrue(url.query?.contains("view_only=0") == true)
         XCTAssertThrowsError(try BotComputerGuestSpec.validateScreenURL(URL(string: "http://0.0.0.0:6080/")!))
         XCTAssertThrowsError(try BotComputerGuestSpec.viewerURL(URL(string: "http://0.0.0.0:6080/")!))
         let loopback = try BotComputerGuestSpec.viewerURL(url)
