@@ -4836,6 +4836,66 @@ final class BotsWindowTests: XCTestCase {
         func remove(name: String) throws { containers[name] = nil }
     }
 
+    func test_e2eThreeRuntimesUseShippedStudioSaveAndSend() throws {
+        // WHY: the owner must persist and send on all three advertised
+        // runtimes. this-Mac paths stay live without Docker; Docker-with-GUI
+        // only after shipped proveReady + this-bot PNG.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.dockerGuestReadyOverrideForTesting = false
+
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .logicalExecutionSpace
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .logicalExecutionSpace)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Open https://example.com in the default macOS browser."))
+        XCTAssertEqual(
+            BotStandingInstructions.admittedToolsText(for: .logicalExecutionSpace)
+                .contains(BotStandingInstructions.macosHarnessTool),
+            true
+        )
+
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .botOwnedBrowser
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .botOwnedBrowser)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Open https://example.com in this teammate's own browser."))
+        XCTAssertFalse(
+            BotStandingInstructions.admittedToolsText(for: .botOwnedBrowser)
+                .contains(BotStandingInstructions.generatedMacOSHarnessLine)
+        )
+
+        guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1" else {
+            vm.openStudio(piper)
+            vm.studioDraft.desktopKind = .dockerDesktop
+            XCTAssertThrowsError(try vm.saveStudio())
+            return
+        }
+        let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
+        let service = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: BotComputerDockerCLI(),
+            recipeContext: recipe
+        )
+        vm.computerGuestService = service
+        vm.dockerGuestReadyOverrideForTesting = nil
+        XCTAssertTrue(service.proveReady(), service.lastReason)
+        XCTAssertEqual(service.lastReady?.pngMagic, "89504e47")
+        XCTAssertEqual(service.lastReady?.screenURL.host, "127.0.0.1")
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .dockerDesktop
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
+        XCTAssertEqual(vm.lastGuestScreenURL?.host, "127.0.0.1")
+        let shot = try service.observe(botID: piper.id)
+        XCTAssertEqual(shot.magic, "89504e47")
+        print("E2E_LOGICAL=1 E2E_BOT_BROWSER=1 E2E_DOCKER=1 PNG_MAGIC=\(shot.magic)")
+        service.teardown(botID: piper.id)
+    }
+
     func test_ensureDockerGuestProvisionsThisBotOnLoopback() throws {
         // WHY: Save of Docker-with-GUI must provision THIS bot and keep a
         // 127.0.0.1 viewer URL. Tests that inject ready=true skip Docker.
