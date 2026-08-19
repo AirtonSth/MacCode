@@ -222,7 +222,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             do {
                 let png = try docker.exec(
                     name: name,
-                    command: ["import", "-window", "root", "png:-"],
+                    command: ["env", "DISPLAY=:1", "import", "-window", "root", "png:-"],
                     user: nil,
                     detach: false
                 )

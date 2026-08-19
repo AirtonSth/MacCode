@@ -1306,6 +1306,7 @@ public final class BotsViewModel: ObservableObject {
         persistSelection()
         leaveDeskLiveWatch()
         reloadStudioSupport(id: fresh.id)
+        refreshDockerGuestProbe()
     }
 
     public var studioSlugFollowsName: Bool {
@@ -4908,9 +4909,9 @@ public final class BotsViewModel: ObservableObject {
     public var dockerGuestReadyOverrideForTesting: Bool?
     public var desktopKindOverrideForTesting: BotDesktopKind?
     public var dockerGuestProbeReason: String?
-    public var lastGuestScreenURL: URL?
-    public var guestScreenURLByBot: [UUID: URL] = [:]
-    public var guestRunningByBot: [UUID: Bool] = [:]
+    @Published public var lastGuestScreenURL: URL?
+    @Published public var guestScreenURLByBot: [UUID: URL] = [:]
+    @Published public var guestRunningByBot: [UUID: Bool] = [:]
 
     func guestScreenURL(for botID: BotID) -> URL? {
         guestScreenURLByBot[botID.value]
@@ -4959,6 +4960,7 @@ public final class BotsViewModel: ObservableObject {
                 await MainActor.run {
                     self.dockerGuestProbeReason = String(describing: error)
                     self.guestRunningByBot[botID.value] = false
+                    self.errorMessage = "Could not start the Linux desktop."
                     self.objectWillChange.send()
                 }
             }
@@ -6014,8 +6016,8 @@ public struct BotsRootView: View {
                 .accessibilityIdentifier("bots.studio.desktop.honesty")
             if vm.displayedDesktopKind == .dockerDesktop {
                 BotComputerGuestCanvas(
-                    url: vm.lastGuestScreenURL,
-                    running: vm.selectedBotID.map { vm.isGuestRunning($0) } ?? false,
+                    url: (vm.studioDraft.botID.flatMap { vm.guestScreenURL(for: $0) }) ?? vm.lastGuestScreenURL,
+                    running: vm.studioDraft.botID.map { vm.isGuestRunning($0) } ?? false,
                     startIdentifier: "bots.studio.desktop.start",
                     stopIdentifier: "bots.studio.desktop.stop",
                     terminalIdentifier: "bots.studio.desktop.terminal",
