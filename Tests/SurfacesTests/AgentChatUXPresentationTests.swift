@@ -707,5 +707,11 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertTrue(chrome.contains(".lineLimit(1)"))
         XCTAssertTrue(chrome.contains(".fixedSize(horizontal: true, vertical: false)"))
         XCTAssertTrue(chrome.contains("headerControlSpacing"))
+        XCTAssertTrue(chrome.contains("DS.Space.md"))
+        XCTAssertTrue(chrome.contains("DSIconButton.visualPackInset"))
+        XCTAssertFalse(
+            chrome.contains("DS.Space.xs - (DSIconButton.hitTargetSize"),
+            "Clear All is text; packing 44pt hit boxes against it mashed the cluster"
+        )
     }
 }

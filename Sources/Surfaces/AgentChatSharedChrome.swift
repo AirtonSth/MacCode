@@ -338,6 +338,7 @@ public struct AgentChatThreadRail<Content: View>: View {
             DSSectionHeaderG(title) {
                 HStack(spacing: Self.headerControlSpacing) {
                     hideButton
+                        .padding(.horizontal, -DSIconButton.visualPackInset)
                     if AgentChatThreadRailCopy.showsClearAll(isEmpty: isEmpty) {
                         Button(AgentChatThreadRailCopy.clearAllTitle, action: onClearAll)
                             .buttonStyle(.plain)
@@ -349,6 +350,7 @@ public struct AgentChatThreadRail<Content: View>: View {
                             .help(AgentChatThreadRailCopy.clearAllHelp)
                     }
                     DSIconButton("plus", help: newHelp, action: onNew)
+                        .padding(.horizontal, -DSIconButton.visualPackInset)
                         .accessibilityIdentifier(newIdentifier)
                 }
                 .fixedSize(horizontal: true, vertical: false)
@@ -381,11 +383,9 @@ public struct AgentChatThreadRail<Content: View>: View {
         }
     }
 
-    /// DSIconButton lays out at 44pt; pack the glyphs like dest dest dest / workspace
-    /// header icons so "Clear All" stays one line.
-    private static var headerControlSpacing: CGFloat {
-        DS.Space.xs - (DSIconButton.hitTargetSize - DSIconButton.visualSize.width)
-    }
+    /// Gap between hide, Clear All, and +. Icons keep a 44pt hit box via
+    /// `visualPackInset`; this spacing is the visible air between glyphs.
+    private static var headerControlSpacing: CGFloat { DS.Space.md }
 
     private var hideButton: some View {
         DSIconButton("sidebar.left", help: AgentChatThreadRailCopy.hideHelp, action: onHide)

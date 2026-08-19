@@ -29,6 +29,10 @@ final class DesignSystemComponentsTests: XCTestCase {
             DSIconButton.visualSize.height, DSIconButton.hitTargetSize,
             "Visual icon height must be smaller than hit target"
         )
+        XCTAssertEqual(
+            DSIconButton.visualPackInset,
+            (DSIconButton.hitTargetSize - DSIconButton.visualSize.width) / 2
+        )
     }
 
     // MARK: - DSResizeDivider accessible label (P3 UX gap fix)

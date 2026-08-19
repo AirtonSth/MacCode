@@ -252,7 +252,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private var sidebarCollapsed = false
     static let defaultSidebarWidth: CGFloat = 444
     static let sidebarWidthSettingsKey = "sidebar.width"
-    private static let sidebarCollapsedSettingsKey = "sidebar.collapsed"
+    static let sidebarCollapsedSettingsKey = "sidebar.collapsed"
     static let botsShellSettingsKey = "shell.botsSelected"
     /// IMP-MAC_SHELL_WINDOW-005: AppKit frame-autosave key for the main
     /// window so its size/position survive relaunch.

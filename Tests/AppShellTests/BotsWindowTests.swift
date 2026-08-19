@@ -676,6 +676,25 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(header.contains("AgentChatThreadRailCopy.newHelp"))
     }
 
+    func test_deskStopsTitlebarBleedWhenSidebarCollapses_becauseTheHeaderMustStay() throws {
+        // WHY: dest dest dest dest dest ignores the titlebar while the sidebar is
+        // open. Collapsing the sidebar puts a 34pt toggle bar in that
+        // inset; keep bleeding and dest dest dest dest dest dest header disappears under it.
+        XCTAssertTrue(
+            BotsViewModel.bleedsIntoTitlebar(embedsRosterRail: true, shellSidebarCollapsed: false)
+        )
+        XCTAssertFalse(
+            BotsViewModel.bleedsIntoTitlebar(embedsRosterRail: true, shellSidebarCollapsed: true)
+        )
+        XCTAssertFalse(
+            BotsViewModel.bleedsIntoTitlebar(embedsRosterRail: false, shellSidebarCollapsed: false)
+        )
+        let context = try makeContext()
+        try context.settingsRepo.set(MainWindowController.sidebarCollapsedSettingsKey, "1")
+        let vm = BotsViewModel(context: context)
+        XCTAssertTrue(vm.isShellSidebarCollapsed)
+    }
+
     func test_deskHeaderIsToolbarSized_becauseTheShellTitlebarAlreadyWentAway() throws {
         // WHY: Removing the shell "Bots" bar left Desk in the titlebar
         // inset with title2 + xl padding. That read as a second titlebar.

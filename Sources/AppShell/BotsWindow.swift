@@ -511,6 +511,9 @@ public final class BotsViewModel: ObservableObject {
         didSet { persistDeskThreadRailWidth() }
     }
     @Published public var deskThreadSearchQuery: String = ""
+    /// Shell sidebar collapse. Desk only bleeds into the titlebar while
+    /// the sidebar is open; collapsed keeps the 34pt toggle bar visible.
+    @Published public var isShellSidebarCollapsed: Bool = false
     /// Detached Desk windows hide the pop-out control so they do not nest.
     public var presentsAsDetachedWindow: Bool = false
     @Published public var studioDraft = BotStudioDraft() {
@@ -694,6 +697,7 @@ public final class BotsViewModel: ObservableObject {
     private var studioDraftsByBot: [BotID: BotStudioDraft] = [:]
     private var studioDraftHydrated = false
     private var isApplyingStudioDraft = false
+    private var shellSidebarVisibilityObserver: NSObjectProtocol?
     private var deskLiveTurnWatch: Task<Void, Never>?
     public var computerGuestService: BotComputerGuestService?
 
@@ -723,6 +727,8 @@ public final class BotsViewModel: ObservableObject {
         restoreDeskRoutingIfNeeded()
         restorePeerTurnsIfNeeded()
         restoreUnpublishedNewBotIDsIfNeeded()
+        restoreShellSidebarCollapsedIfNeeded()
+        observeShellSidebarVisibility()
         reload()
         restoreScreenIfNeeded()
         studioDraftHydrated = true
@@ -740,6 +746,9 @@ public final class BotsViewModel: ObservableObject {
 
     deinit {
         deskLiveTurnWatch?.cancel()
+        if let shellSidebarVisibilityObserver {
+            NotificationCenter.default.removeObserver(shellSidebarVisibilityObserver)
+        }
         context.coordinator.removeObserver(self)
     }
 
@@ -3105,6 +3114,31 @@ public final class BotsViewModel: ObservableObject {
         UserDefaults.standard.set(Double(deskThreadRailWidth), forKey: Self.deskThreadRailWidthDefaultsKey)
     }
 
+    /// Desk bleeds into the titlebar only while the shell sidebar is open.
+    static func bleedsIntoTitlebar(
+        embedsRosterRail: Bool,
+        shellSidebarCollapsed: Bool
+    ) -> Bool {
+        embedsRosterRail && !shellSidebarCollapsed
+    }
+
+    private func restoreShellSidebarCollapsedIfNeeded() {
+        isShellSidebarCollapsed = ((try? context.settingsRepo.get(MainWindowController.sidebarCollapsedSettingsKey)) ?? nil) == "1"
+    }
+
+    private func observeShellSidebarVisibility() {
+        shellSidebarVisibilityObserver = NotificationCenter.default.addObserver(
+            forName: .rc2SidebarVisibility,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let collapsed = note.userInfo?["collapsed"] as? Bool else { return }
+            Task { @MainActor in
+                self?.isShellSidebarCollapsed = collapsed
+            }
+        }
+    }
+
     private func restoreDeskThreadRailWidthIfNeeded() {
         let stored = UserDefaults.standard.double(forKey: Self.deskThreadRailWidthDefaultsKey)
         guard stored > 0 else { return }
@@ -5343,6 +5377,18 @@ private func botManagementButtons(
     .accessibilityIdentifier("bots.menu.delete")
 }
 
+private struct BotsTitlebarBleed: ViewModifier {
+    let enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.ignoresSafeArea(.container, edges: .top)
+        } else {
+            content
+        }
+    }
+}
+
 private struct BotsUnsavedNewBotConfirmation: ViewModifier {
     @ObservedObject var vm: BotsViewModel
 
@@ -5423,6 +5469,13 @@ public struct BotsRootView: View {
         self.embedsRosterRail = embedsRosterRail
     }
 
+    private var bleedsIntoTitlebar: Bool {
+        BotsViewModel.bleedsIntoTitlebar(
+            embedsRosterRail: embedsRosterRail,
+            shellSidebarCollapsed: vm.isShellSidebarCollapsed
+        )
+    }
+
     public var body: some View {
         HStack(spacing: 0) {
             if showsRosterRail {
@@ -5453,10 +5506,9 @@ public struct BotsRootView: View {
         }
         .frame(minWidth: embedsRosterRail ? 980 : 700, minHeight: 680)
         .background(DS.Palette.bg)
-        // Sidebar already ignores the titlebar inset. After the shell
-        // "Bots" bar went away the content column sat in that inset and
-        // the Desk header looked like a second titlebar.
-        .ignoresSafeArea(.container, edges: .top)
+        // Sidebar already ignores the titlebar inset. Bleed only while
+        // the shell sidebar is open — collapsed keeps the 34pt toggle bar.
+        .modifier(BotsTitlebarBleed(enabled: bleedsIntoTitlebar))
         .alert("Bots", isPresented: Binding(
             get: { vm.errorMessage != nil },
             set: { if !$0 { vm.errorMessage = nil } }

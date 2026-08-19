@@ -113,6 +113,11 @@ public struct DSIconButton: View {
     nonisolated public static let hitTargetSize: CGFloat = 44
     /// Visual icon frame (narrower than hit target).
     nonisolated public static let visualSize: CGSize = CGSize(width: 26, height: 22)
+    /// Inset that collapses the 44pt layout box to the glyph so HStack
+    /// spacing is measured between icons, not hit boxes.
+    nonisolated public static var visualPackInset: CGFloat {
+        (hitTargetSize - visualSize.width) / 2
+    }
 
     public init(_ systemName: String, help: String = "", action: @escaping () -> Void) {
         self.systemName = systemName; self.help = help; self.action = action
