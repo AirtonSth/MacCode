@@ -47,4 +47,16 @@ final class BotComputerGuestSpecTests: XCTestCase {
         let loopback = try BotComputerGuestSpec.viewerURL(url)
         XCTAssertEqual(loopback.host, "127.0.0.1")
     }
+
+    func test_ensureNetworkCreatesABridgeNotAnInternalNetwork() throws {
+        // WHY: --internal would block apt-get and Chromium on the guest.
+        var seen: [[String]] = []
+        let cli = BotComputerDockerCLI(run: { args in
+            seen.append(args)
+            return Data()
+        })
+        try cli.ensureNetwork(name: "remotecode-bot-example")
+        XCTAssertEqual(seen.first, ["network", "create", "remotecode-bot-example"])
+        XCTAssertFalse(seen.contains(where: { $0.contains("--internal") }))
+    }
 }

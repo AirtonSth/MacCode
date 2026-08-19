@@ -86,7 +86,7 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
 
     public func ensureNetwork(name: String) throws {
         do {
-            _ = try run(["network", "create", "--internal", name])
+            _ = try run(["network", "create", name])
         } catch {
             _ = try run(["network", "inspect", name])
         }
