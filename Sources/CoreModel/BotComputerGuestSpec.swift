@@ -136,10 +136,27 @@ public struct BotComputerContainerCreateOptions: Equatable, Sendable {
     public var network: String?
 }
 
-public enum BotComputerGuestError: Error, Equatable {
+public enum BotComputerGuestError: Error, Equatable, LocalizedError, CustomStringConvertible {
     case invalidHomePath
     case invalidScreenURL
     case dockerUnavailable
     case observeFailed
     case notReady
+
+    public var description: String {
+        switch self {
+        case .invalidHomePath:
+            return "Guest home path is not allowed."
+        case .invalidScreenURL:
+            return "Guest screen URL must stay on 127.0.0.1."
+        case .dockerUnavailable:
+            return "Docker is unavailable. Start Docker, then try again."
+        case .observeFailed:
+            return "Could not capture the Linux desktop."
+        case .notReady:
+            return "Docker desktop is not ready."
+        }
+    }
+
+    public var errorDescription: String? { description }
 }

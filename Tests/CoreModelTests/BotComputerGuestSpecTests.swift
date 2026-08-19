@@ -89,4 +89,13 @@ final class BotComputerGuestSpecTests: XCTestCase {
         )
         XCTAssertTrue(formats.contains(where: { $0.contains("{{else}}0{{end}}") }))
     }
+
+    func test_notReadyErrorCopyIsHuman_becauseSaveBotMustNotAlertCaseName() {
+        // WHY: Save Bot presented String(describing:) of the enum case, so
+        // the owner saw an alert titled Bots with the body "notReady".
+        XCTAssertEqual(BotComputerGuestError.notReady.description, "Docker desktop is not ready.")
+        XCTAssertEqual(BotComputerGuestError.notReady.errorDescription, "Docker desktop is not ready.")
+        XCTAssertEqual(String(describing: BotComputerGuestError.notReady), "Docker desktop is not ready.")
+        XCTAssertNotEqual(String(describing: BotComputerGuestError.notReady), "notReady")
+    }
 }

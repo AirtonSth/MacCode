@@ -1661,6 +1661,12 @@ public final class BotsViewModel: ObservableObject {
         return bot
     }
 
+    /// Keep a message already set by saveStudio/send; otherwise use LocalizedError copy.
+    public func presentAlertError(_ error: Error) {
+        guard errorMessage == nil else { return }
+        errorMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+    }
+
     @discardableResult
     public func saveStudio() throws -> BotDefinition {
         let name = studioDraft.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1673,7 +1679,9 @@ public final class BotsViewModel: ObservableObject {
             errorMessage = "Slug is empty or invalid."
             throw BotPublishError.handleEmpty
         }
+        let publishedDesktop = selectedRevision?.desktopKind
         if studioDraft.desktopKind == .dockerDesktop,
+           publishedDesktop != .dockerDesktop,
            !BotDesktopKind.dockerDesktop.isSelectable(
             flags: settingsStore.load().botControlPlaneFlags,
             guestReady: dockerGuestReady
@@ -1682,7 +1690,10 @@ public final class BotsViewModel: ObservableObject {
             throw BotComputerGuestError.notReady
         }
         let desktop = resolvedDesktopKind(studioDraft.desktopKind)
-        if desktop == .dockerDesktop, let botID = studioDraft.botID {
+        // First Docker GUI publish still provisions. Later identity saves do not.
+        if desktop == .dockerDesktop,
+           let botID = studioDraft.botID,
+           publishedDesktop != .dockerDesktop {
             try ensureDockerGuest(botID: botID)
         }
         let soul = BotStandingInstructions.resolved(
@@ -5856,7 +5867,7 @@ public struct BotsRootView: View {
                 do {
                     _ = try vm.saveStudio()
                 } catch {
-                    vm.errorMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    vm.presentAlertError(error)
                 }
             }
             .buttonStyle(BotsPrimaryButtonStyle())

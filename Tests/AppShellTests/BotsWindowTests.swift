@@ -5282,6 +5282,53 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
     }
 
+    func test_saveStudioPersistsIdentityWhenPublishedDockerGuestIsNotReady() throws {
+        // WHY: LinkedIn Controller already published Docker GUI. Save Bot on
+        // Profile still threw notReady whenever the global proveReady probe
+        // had not finished, so name/description/instructions never persisted.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(piper)
+        vm.dockerGuestReadyOverrideForTesting = true
+        vm.studioDraft.desktopKind = .dockerDesktop
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
+
+        vm.dockerGuestReadyOverrideForTesting = false
+        vm.computerGuestService = nil
+        vm.studioDraft.name = "Piper Prime"
+        vm.studioDraft.title = "Night scout"
+        vm.studioDraft.description = "Identity only"
+        vm.studioDraft.soul = "Do the job. Ask when blocked."
+        let saved = try vm.saveStudio()
+        XCTAssertEqual(saved.name, "Piper Prime")
+        XCTAssertEqual(saved.title, "Night scout")
+        XCTAssertEqual(saved.description, "Identity only")
+        XCTAssertEqual(vm.selectedRevision?.soul, "Do the job. Ask when blocked.")
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
+        XCTAssertNil(vm.errorMessage)
+    }
+
+    func test_saveBotAlertKeepsStudioErrorCopy_becauseRawNotReadyMustNotSurface() throws {
+        // WHY: Save Bot overwrote saveStudio's "Docker desktop is not ready."
+        // with String(describing: BotComputerGuestError.notReady) → "notReady".
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.errorMessage = "Docker desktop is not ready."
+        vm.presentAlertError(BotComputerGuestError.notReady)
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+
+        vm.errorMessage = nil
+        vm.presentAlertError(BotComputerGuestError.notReady)
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+        XCTAssertNotEqual(vm.errorMessage, "notReady")
+
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("vm.presentAlertError(error)"))
+        XCTAssertTrue(source.contains("bots.studio.save"))
+    }
+
     func test_leftoverDedicatedLocalVMDoesNotBecomeDockerWhenGuestReady() throws {
         // WHY: leftover Dedicated local VM must stay leftover. A passing
         // probe must not rewrite it into Docker with GUI.
