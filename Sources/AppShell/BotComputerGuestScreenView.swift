@@ -77,6 +77,9 @@ struct BotComputerGuestCanvas: View {
     let onStart: () -> Void
     let onStop: () -> Void
     let onTerminal: () -> Void
+    var onOpenInNewWindow: (() -> Void)? = nil
+    var openInNewWindowIdentifier: String = "bots.desk.desktop.openInNewWindow"
+    var compact: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
@@ -98,10 +101,17 @@ struct BotComputerGuestCanvas: View {
                         .buttonStyle(.borderedProminent)
                         .accessibilityIdentifier(startIdentifier)
                 }
+                if let onOpenInNewWindow {
+                    DSIconButton("rectangle.on.rectangle", help: "Open in New Window") {
+                        onOpenInNewWindow()
+                    }
+                    .accessibilityIdentifier(openInNewWindowIdentifier)
+                }
             }
             if let url {
                 BotComputerGuestScreenView(url: url)
-                    .frame(minHeight: 280)
+                    .frame(minHeight: compact ? 180 : 280)
+                    .frame(maxHeight: .infinity)
                     .clipped()
                     .accessibilityIdentifier(screenIdentifier)
             } else {

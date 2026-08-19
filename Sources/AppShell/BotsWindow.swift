@@ -1490,6 +1490,10 @@ public final class BotsViewModel: ObservableObject {
         router?.openBotInNewWindow(bot.id)
     }
 
+    public func openGuestDesktopInNewWindow(_ bot: BotDefinition) {
+        router?.openBotGuestDesktopInNewWindow(bot.id)
+    }
+
     private func markOpenedConversationRead(botID: BotID) {
         if let snapshot = studioSupportByBot[botID],
            !Self.conversationsNeedMarkRead(snapshot.conversations),
@@ -6285,9 +6289,6 @@ public struct BotsRootView: View {
                 }
             }
             VStack(spacing: 0) {
-                if vm.displayedDesktopKind == .dockerDesktop {
-                    deskGuestCanvas(bot)
-                }
                 deskTimeline(bot)
                 if !vm.queuedFollowUps.isEmpty {
                     deskQueuedFollowUps
@@ -6325,26 +6326,8 @@ public struct BotsRootView: View {
         }
     }
 
-    private func deskGuestCanvas(_ bot: BotDefinition) -> some View {
-        BotComputerGuestCanvas(
-            url: vm.guestScreenURL(for: bot.id),
-            running: vm.isGuestRunning(bot.id),
-            startIdentifier: "bots.desk.desktop.start",
-            stopIdentifier: "bots.desk.desktop.stop",
-            terminalIdentifier: "bots.desk.desktop.terminal",
-            screenIdentifier: "bots.desk.desktop.guestScreen",
-            onStart: { vm.presentGuestDesktop(botID: bot.id) },
-            onStop: { vm.stopDockerGuest(botID: bot.id) },
-            onTerminal: { vm.openGuestTerminal(botID: bot.id) }
-        )
-        .padding(DS.Space.lg)
-        .dsBar(edge: .bottom)
-        .accessibilityIdentifier("bots.desk.desktop.canvas")
-    }
-
-    /// Honesty caption in the inspector. The live screen lives on Desk.
     private func deskDesktopPane(_ bot: BotDefinition) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
             HStack(spacing: DS.Space.sm) {
                 Image(systemName: "desktopcomputer")
                     .font(.system(size: 12, weight: .semibold))
@@ -6357,6 +6340,21 @@ public struct BotsRootView: View {
                 Spacer(minLength: 0)
                 DSPill(vm.desktopStatusPill, tone: .neutral)
             }
+            if vm.displayedDesktopKind == .dockerDesktop {
+                BotComputerGuestCanvas(
+                    url: vm.guestScreenURL(for: bot.id),
+                    running: vm.isGuestRunning(bot.id),
+                    startIdentifier: "bots.desk.desktop.start",
+                    stopIdentifier: "bots.desk.desktop.stop",
+                    terminalIdentifier: "bots.desk.desktop.terminal",
+                    screenIdentifier: "bots.desk.desktop.guestScreen",
+                    onStart: { vm.presentGuestDesktop(botID: bot.id) },
+                    onStop: { vm.stopDockerGuest(botID: bot.id) },
+                    onTerminal: { vm.openGuestTerminal(botID: bot.id) },
+                    onOpenInNewWindow: { vm.openGuestDesktopInNewWindow(bot) },
+                    compact: true
+                )
+            }
             Text(vm.desktopHonestyLabel)
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.warning)
@@ -6364,8 +6362,8 @@ public struct BotsRootView: View {
                 .accessibilityIdentifier("bots.desk.desktop.honesty")
         }
         .padding(DS.Space.lg)
+        .frame(maxHeight: vm.displayedDesktopKind == .dockerDesktop ? .infinity : nil)
         .dsBar(edge: .bottom)
-        .accessibilityElement(children: .ignore)
         .accessibilityIdentifier("bots.desk.desktop")
         .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
     }
@@ -7403,5 +7401,93 @@ public final class BotDeskWindowController: NSWindowController, NSWindowDelegate
 
     public func windowWillClose(_ notification: Notification) {
         onClose()
+    }
+}
+
+/// Linux desktop only. Reuses the same guest container as Desk.
+public final class BotGuestDesktopWindowController: NSWindowController, NSWindowDelegate {
+    private let viewModel: BotsViewModel
+    private let botID: BotID
+    private let onClose: () -> Void
+
+    public init(
+        botID: BotID,
+        context: AppContext,
+        router: AppCommandRouter,
+        onClose: @escaping () -> Void
+    ) {
+        self.botID = botID
+        let vm = BotsViewModel(context: context, router: router)
+        vm.reload()
+        if let bot = vm.bots.first(where: { $0.id == botID }) {
+            vm.openDesk(bot)
+        }
+        self.viewModel = vm
+        self.onClose = onClose
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 980, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let title = "\((vm.selectedBot?.name ?? "Bot")) Desktop"
+        window.title = title
+        window.minSize = NSSize(width: 640, height: 420)
+        window.backgroundColor = DS.NS.bg
+        window.titlebarAppearsTransparent = true
+        window.contentView = NSHostingView(rootView: BotGuestDesktopRoot(vm: vm))
+        window.setAccessibilityIdentifier("bots.desk.desktop.window")
+        super.init(window: window)
+        window.delegate = self
+        let autosave = "io.remotecode.detachedBotDesktop.\(botID.value.uuidString)"
+        if !window.setFrameUsingName(autosave) {
+            window.center()
+        }
+        window.setFrameAutosaveName(autosave)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    public func show() {
+        viewModel.reload()
+        if let bot = viewModel.bots.first(where: { $0.id == botID }) {
+            viewModel.openDesk(bot)
+        }
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    public func windowWillClose(_ notification: Notification) {
+        onClose()
+    }
+}
+
+private struct BotGuestDesktopRoot: View {
+    @ObservedObject var vm: BotsViewModel
+
+    var body: some View {
+        Group {
+            if let bot = vm.selectedBot {
+                BotComputerGuestCanvas(
+                    url: vm.guestScreenURL(for: bot.id),
+                    running: vm.isGuestRunning(bot.id),
+                    startIdentifier: "bots.desk.desktop.window.start",
+                    stopIdentifier: "bots.desk.desktop.window.stop",
+                    terminalIdentifier: "bots.desk.desktop.window.terminal",
+                    screenIdentifier: "bots.desk.desktop.window.guestScreen",
+                    onStart: { vm.presentGuestDesktop(botID: bot.id) },
+                    onStop: { vm.stopDockerGuest(botID: bot.id) },
+                    onTerminal: { vm.openGuestTerminal(botID: bot.id) }
+                )
+                .padding(DS.Space.lg)
+            } else {
+                Text("Start the Linux desktop to use this machine.")
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(DS.Palette.surface)
     }
 }

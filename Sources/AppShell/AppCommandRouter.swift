@@ -6346,6 +6346,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         windowController?.openBotInNewWindow(bot)
     }
 
+    public func openBotGuestDesktopInNewWindow(_ bot: BotID) {
+        windowController?.openBotGuestDesktopInNewWindow(bot)
+    }
+
     public func notificationCreate(workspaceId: WorkspaceID?, title: String, body: String?, category: String?) throws -> String {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let repo = NotificationRepository(db: ctx.db)

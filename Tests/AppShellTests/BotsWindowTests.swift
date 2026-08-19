@@ -850,6 +850,32 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(vm.presentsAsDetachedWindow)
     }
 
+    func test_openBotGuestDesktopInNewWindowReusesWindow() throws {
+        // WHY: Open in New Window on the Linux desktop must pop only that
+        // screen, and a second click must focus the same window.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        let controller = MainWindowController(context: context, router: router)
+        router.windowController = controller
+        defer {
+            controller.botGuestDesktopWindow(for: bot.id)?.orderOut(nil)
+            controller.window.orderOut(nil)
+        }
+        controller.openBotGuestDesktopInNewWindow(bot.id)
+        let first = try XCTUnwrap(controller.botGuestDesktopWindow(for: bot.id))
+        XCTAssertEqual(first.accessibilityIdentifier(), "bots.desk.desktop.window")
+        controller.openBotGuestDesktopInNewWindow(bot.id)
+        XCTAssertTrue(controller.botGuestDesktopWindow(for: bot.id) === first)
+        XCTAssertEqual(vm.selectedBotID, bot.id)
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("class BotGuestDesktopWindowController"))
+        XCTAssertTrue(source.contains("BotGuestDesktopRoot"))
+    }
+
     func test_botsHidesShellWorkspaceHeader_becauseDeskAlreadyHasTheBotHeader() throws {
         // WHY: The shell "Bots" bar sat above Desk's identity header.
         // Desk is the title. Hide that chrome row when the sidebar is open;
@@ -5038,21 +5064,28 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_deskDockerGuestScreenLivesOnMainCanvas() throws {
-        // WHY: Docker GUI was a caption in the inspector. The owner needs the
-        // live Linux screen on Desk, plus Start/Stop/Terminal.
+        // WHY: the live Linux screen belongs in the inspector desktop
+        // pane, not above the chat timeline.
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("deskGuestCanvas"))
-        XCTAssertTrue(source.contains("bots.desk.desktop.guestScreen"))
-        XCTAssertTrue(source.contains("bots.desk.desktop.start"))
-        XCTAssertTrue(source.contains("bots.desk.desktop.stop"))
-        XCTAssertTrue(source.contains("bots.desk.desktop.terminal"))
+        guard let chat = source.range(of: "private func deskChat") else {
+            return XCTFail("desk chat must exist")
+        }
+        let paneStart = source.range(of: "private func deskDesktopPane")?.lowerBound ?? source.endIndex
+        let chatSlice = String(source[chat.lowerBound..<paneStart])
+        XCTAssertFalse(chatSlice.contains("BotComputerGuestCanvas"))
+        let pane = String(source[paneStart...].prefix(2200))
+        XCTAssertTrue(pane.contains("BotComputerGuestCanvas"))
+        XCTAssertTrue(pane.contains("bots.desk.desktop.guestScreen"))
+        XCTAssertTrue(pane.contains("bots.desk.desktop.start"))
+        XCTAssertTrue(source.contains("openGuestDesktopInNewWindow"))
         let canvas = try String(
             contentsOf: sourceURL("Sources/AppShell/BotComputerGuestScreenView.swift"),
             encoding: .utf8
         )
         XCTAssertTrue(canvas.contains("struct BotComputerGuestCanvas"))
+        XCTAssertTrue(canvas.contains("rectangle.on.rectangle"))
+        XCTAssertTrue(canvas.contains("bots.desk.desktop.openInNewWindow"))
         XCTAssertTrue(canvas.contains("acceptsFirstResponder"))
-        XCTAssertTrue(canvas.contains("makeFirstResponder"))
         XCTAssertFalse(canvas.contains("View-only noVNC"))
     }
 
@@ -7485,8 +7518,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop.honesty\")"))
         XCTAssertTrue(
-            bots.contains(".accessibilityElement(children: .ignore)"),
-            "Desk desktop pane must be one VoiceOver name, not the honesty line four times"
+            bots.contains("bots.desk.desktop.guestScreen"),
+            "Docker GUI must expose the live screen in the inspector desktop pane"
         )
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.name\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.handle\")"))

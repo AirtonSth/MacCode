@@ -286,6 +286,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     private var workspaceWindows: [WorkspaceID: WorkspaceWindowController] = [:]
     private var detachedWorkspaceIDs: Set<WorkspaceID> = []
     private var botWindows: [BotID: BotDeskWindowController] = [:]
+    private var botGuestWindows: [BotID: BotGuestDesktopWindowController] = [:]
     /// PERF-MAC_SHELL_WINDOW-002: signature of the last container build
     /// (selected workspace + pane/surface/selection structure). When an
     /// unchanged signature comes back through `refreshFromState` (app
@@ -1085,8 +1086,33 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         botWindows[botID]?.window
     }
 
+    public func openBotGuestDesktopInNewWindow(_ botID: BotID) {
+        guard let ctx = context, let router else { return }
+        guard (try? ctx.botStore.get(id: botID)) != nil else { return }
+        if let existing = botGuestWindows[botID] {
+            existing.window?.makeKeyAndOrderFront(nil)
+            return
+        }
+        let controller = BotGuestDesktopWindowController(
+            botID: botID,
+            context: ctx,
+            router: router,
+            onClose: { [weak self] in self?.botGuestWindowClosed(botID) }
+        )
+        botGuestWindows[botID] = controller
+        controller.show()
+    }
+
+    public func botGuestDesktopWindow(for botID: BotID) -> NSWindow? {
+        botGuestWindows[botID]?.window
+    }
+
     private func botWindowClosed(_ botID: BotID) {
         botWindows.removeValue(forKey: botID)
+    }
+
+    private func botGuestWindowClosed(_ botID: BotID) {
+        botGuestWindows.removeValue(forKey: botID)
     }
 
     private func returnWorkspaceToSidebar(_ workspaceID: WorkspaceID) {
