@@ -6378,8 +6378,7 @@ public struct BotsRootView: View {
                     onStart: { vm.presentGuestDesktop(botID: bot.id) },
                     onStop: { vm.stopDockerGuest(botID: bot.id) },
                     onTerminal: { vm.openGuestTerminal(botID: bot.id) },
-                    onOpenInNewWindow: { vm.openGuestDesktopInNewWindow(bot) },
-                    compact: true
+                    onOpenInNewWindow: { vm.openGuestDesktopInNewWindow(bot) }
                 )
             }
             Text(vm.desktopHonestyLabel)
@@ -6389,7 +6388,6 @@ public struct BotsRootView: View {
                 .accessibilityIdentifier("bots.desk.desktop.honesty")
         }
         .padding(DS.Space.lg)
-        .frame(maxHeight: vm.displayedDesktopKind == .dockerDesktop ? .infinity : nil)
         .dsBar(edge: .bottom)
         .accessibilityIdentifier("bots.desk.desktop")
         .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
@@ -6397,24 +6395,18 @@ public struct BotsRootView: View {
 
     private func deskInspector(_ bot: BotDefinition) -> some View {
         VStack(spacing: 0) {
+            // Routines is the only user-facing tab, so a tab strip renders a
+            // single always-selected chip that reads as a dead button. Show a
+            // plain section header instead (same language as the desktop pane).
             HStack(spacing: DS.Space.sm) {
-                ForEach(BotDeskInspectorTab.allCases.filter(\.isUserFacing)) { tab in
-                    let selected = resolvedInspectorTab == tab
-                    Button {
-                        vm.inspectorTab = tab
-                    } label: {
-                        Text(tab.title)
-                            .font(DS.Font.caption.weight(selected ? .semibold : .regular))
-                            .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.textSecondary)
-                            .padding(.horizontal, DS.Space.md)
-                            .padding(.vertical, DS.Space.sm)
-                            .background(selected ? DS.Palette.accent : DS.Palette.surfaceRaised)
-                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(selected ? .isSelected : [])
-                    .accessibilityIdentifier(tab.accessibilityIdentifier)
-                }
+                Image(systemName: "clock.arrow.2.circlepath")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityHidden(true)
+                Text(resolvedInspectorTab.title)
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                    .accessibilityAddTraits(.isHeader)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, DS.Space.lg)
@@ -6626,10 +6618,13 @@ public struct BotsRootView: View {
     private var inspectorRoutines: some View {
         VStack(spacing: 0) {
             if vm.routines.isEmpty {
+                // The button below is the way in — the subtitle sells the
+                // feature instead of pointing somewhere else.
                 DSEmptyState(
                     icon: "clock.arrow.2.circlepath",
                     title: "No scheduled tasks",
-                    subtitle: "Add one in Studio."
+                    subtitle: "Run this teammate automatically at times you choose.",
+                    background: .clear
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {

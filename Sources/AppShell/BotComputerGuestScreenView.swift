@@ -12,12 +12,36 @@ struct BotComputerGuestScreenView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> BotComputerGuestWebView {
-        let view = BotComputerGuestWebView()
+        let configuration = WKWebViewConfiguration()
+        // The only audio in vnc.html is the RFB bell. The URL already asks
+        // noVNC not to play it (bell=off); this blocks any autoplay outright
+        // so the guest can never make the Mac beep.
+        configuration.mediaTypesRequiringUserActionForPlayback = .all
+        configuration.userContentController.addUserScript(WKUserScript(
+            source: Self.embedStyleScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
+        let view = BotComputerGuestWebView(frame: .zero, configuration: configuration)
         view.setValue(false, forKey: "drawsBackground")
         view.navigationDelegate = context.coordinator
         view.allowsBackForwardNavigationGestures = false
         return view
     }
+
+    /// The app owns the viewer chrome (Stop / Terminal), so noVNC's floating
+    /// control-bar handle reads as a broken leftover. Hide it and blend the
+    /// page background into the surrounding pane (DS.Palette.surface).
+    private static let embedStyleScript = """
+    (function() {
+      const style = document.createElement('style');
+      style.textContent = `
+        html, body { background: #171D24 !important; }
+        #noVNC_control_bar_anchor { display: none !important; }
+      `;
+      document.documentElement.appendChild(style);
+    })();
+    """
 
     func updateNSView(_ view: BotComputerGuestWebView, context: Context) {
         guard (try? BotComputerGuestSpec.validateScreenURL(url)) != nil else { return }
@@ -95,7 +119,6 @@ struct BotComputerGuestCanvas: View {
     let onTerminal: () -> Void
     var onOpenInNewWindow: (() -> Void)? = nil
     var openInNewWindowIdentifier: String = "bots.desk.desktop.openInNewWindow"
-    var compact: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
@@ -135,10 +158,16 @@ struct BotComputerGuestCanvas: View {
                 }
             }
             if let url {
+                // Match the guest framebuffer (start.sh: Xvfb 1280x800) so the
+                // viewer hugs the actual screen instead of letterboxing.
                 BotComputerGuestScreenView(url: url)
-                    .frame(minHeight: compact ? 180 : 280)
-                    .frame(maxHeight: .infinity)
-                    .clipped()
+                    .aspectRatio(1280.0 / 800.0, contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                    )
+                    .frame(maxWidth: .infinity)
                     .accessibilityIdentifier(screenIdentifier)
             } else {
                 emptyScreen

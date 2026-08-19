@@ -45,6 +45,9 @@ final class BotComputerGuestSpecTests: XCTestCase {
         XCTAssertEqual(url.path, "/vnc.html")
         XCTAssertTrue(url.query?.contains("autoconnect=1") == true)
         XCTAssertTrue(url.query?.contains("view_only=0") == true)
+        // WHY: noVNC plays bell.oga whenever the guest xterm rings; the
+        // viewer must stay silent (ui.js only plays when bell == "on").
+        XCTAssertTrue(url.query?.contains("bell=off") == true)
         XCTAssertThrowsError(try BotComputerGuestSpec.validateScreenURL(URL(string: "http://0.0.0.0:6080/")!))
         XCTAssertThrowsError(try BotComputerGuestSpec.viewerURL(URL(string: "http://0.0.0.0:6080/")!))
         let loopback = try BotComputerGuestSpec.viewerURL(url)

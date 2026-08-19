@@ -104,6 +104,9 @@ public enum BotComputerGuestSpec {
             URLQueryItem(name: "autoconnect", value: "1"),
             URLQueryItem(name: "resize", value: "scale"),
             URLQueryItem(name: "view_only", value: "0"),
+            // noVNC plays bell.oga on every RFB Bell (xterm rings it constantly).
+            // ui.js only plays when the `bell` config var is exactly "on".
+            URLQueryItem(name: "bell", value: "off"),
             URLQueryItem(name: "token", value: token),
         ]
         guard let url = components.url else { throw BotComputerGuestError.invalidScreenURL }

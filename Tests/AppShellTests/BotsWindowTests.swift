@@ -3359,9 +3359,17 @@ final class BotsWindowTests: XCTestCase {
             bots.contains("ForEach(BotStudioTab.allCases.filter(\\.isUserFacing))"),
             "Brain stays on the enum for leftover persist; the Studio strip must not render it"
         )
+        // Routines is the only user-facing inspector tab, so the Desk shows a
+        // static section header instead of a one-chip tab strip. Brain stays
+        // unreachable: there is no strip to render it, and the header title
+        // resolves through the leftover-persist remap.
+        XCTAssertFalse(
+            bots.contains("ForEach(BotDeskInspectorTab.allCases"),
+            "A single user-facing tab must render as a header, not a dead one-chip strip"
+        )
         XCTAssertTrue(
-            bots.contains("ForEach(BotDeskInspectorTab.allCases.filter(\\.isUserFacing))"),
-            "Brain stays on the enum for leftover persist; the Desk inspector strip must not render it"
+            bots.contains("Text(resolvedInspectorTab.title)"),
+            "The Desk inspector header must resolve through the leftover-persist remap"
         )
     }
 
@@ -7669,9 +7677,13 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.inspector\")"))
         XCTAssertTrue(bots.contains("bots.studio.tab.brain"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.brain"))
+        XCTAssertFalse(
+            bots.contains("ForEach(BotDeskInspectorTab.allCases"),
+            "A single user-facing tab must render as a header, not a dead one-chip strip"
+        )
         XCTAssertTrue(
-            bots.contains("ForEach(BotDeskInspectorTab.allCases.filter(\\.isUserFacing))"),
-            "Brain stays on the enum for leftover persist; the Desk inspector strip must not render it"
+            bots.contains("Text(resolvedInspectorTab.title)"),
+            "The Desk inspector header must resolve through the leftover-persist remap"
         )
         XCTAssertFalse(bots.contains("bots.desk.inspector.tab.memory"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.routines"))
