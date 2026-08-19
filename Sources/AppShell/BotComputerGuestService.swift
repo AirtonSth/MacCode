@@ -65,6 +65,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             let botID = BotID()
             probeBotID = botID
             let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
+            try? docker.ensureNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
             var options = try BotComputerGuestSpec.containerCreateOptions(
                 botID: botID,
                 guestHome: home.path,
@@ -95,49 +96,136 @@ public final class BotComputerGuestService: @unchecked Sendable {
 
     public func provision(botID: BotID) throws -> BotComputerGuestReady {
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
+        try seedRecipe(botID: botID)
         let name = BotComputerGuestSpec.containerName(botID: botID)
-        if let existing = try? docker.inspect(name: name), existing.running {
-            let png = try waitForPNG(name: name)
-            let hash = try BotComputerGuestObserve.validatePNG(png)
-            let url = try BotComputerGuestSpec.screenURL(hostPort: existing.hostPort, token: hash)
-            try BotComputerGuestSpec.validateScreenURL(url)
-            let ready = BotComputerGuestReady(
-                screenURL: url,
-                pngHash: hash,
-                pngMagic: Self.pngMagic(png),
-                resumed: true
-            )
-            lastReady = ready
-            return ready
+        try docker.ensureNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
+        if let existing = try? docker.inspect(name: name) {
+            if existing.running == false {
+                try docker.start(name: name)
+            }
+            return try readyState(name: name, resumed: true)
         }
-        try? docker.remove(name: name)
+        let image = try resolvedImage(botID: botID)
         let options = try BotComputerGuestSpec.containerCreateOptions(
             botID: botID,
             guestHome: home.path,
-            appSupport: appSupport
+            appSupport: appSupport,
+            image: image
         )
         _ = try docker.create(options: options)
         try docker.start(name: name)
-        let inspect = try docker.inspect(name: name)
-        let png = try waitForPNG(name: name)
-        let hash = try BotComputerGuestObserve.validatePNG(png)
-        let url = try BotComputerGuestSpec.screenURL(hostPort: inspect.hostPort, token: hash)
-        try BotComputerGuestSpec.validateScreenURL(url)
-        let ready = BotComputerGuestReady(
-            screenURL: url,
-            pngHash: hash,
-            pngMagic: Self.pngMagic(png),
-            resumed: false
+        return try readyState(name: name, resumed: false)
+    }
+
+    public func stop(botID: BotID) throws {
+        try docker.stop(name: BotComputerGuestSpec.containerName(botID: botID))
+    }
+
+    public func exec(botID: BotID, command: String) throws -> Data {
+        let trimmed = try BotComputerGuestSpec.assertExecCommand(command)
+        _ = try provision(botID: botID)
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        let user = BotComputerGuestSpec.execUsesRoot(trimmed) ? "0" : nil
+        let data = try docker.exec(
+            name: name,
+            command: ["bash", "-lc", trimmed],
+            user: user,
+            detach: false
         )
-        lastReady = ready
-        return ready
+        if data.count <= 32_768 { return data }
+        return data.prefix(32_768)
+    }
+
+    public func openTerminal(botID: BotID) throws {
+        _ = try provision(botID: botID)
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        _ = try docker.exec(
+            name: name,
+            command: BotComputerGuestSpec.terminalCommand(),
+            user: nil,
+            detach: true
+        )
+    }
+
+    public func rebuild(botID: BotID) throws -> BotComputerGuestReady {
+        try seedRecipe(botID: botID)
+        let recipe = BotComputerGuestSpec.recipeURL(appSupport: appSupport, botID: botID)
+        let tag = BotComputerGuestSpec.botImageTag(botID: botID)
+        try docker.build(context: recipe, tag: tag)
+        let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
+        try docker.ensureNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
+        let canonical = BotComputerGuestSpec.containerName(botID: botID)
+        let next = BotComputerGuestSpec.nextContainerName(botID: botID)
+        try? docker.remove(name: next)
+        let options = try BotComputerGuestSpec.containerCreateOptions(
+            botID: botID,
+            guestHome: home.path,
+            appSupport: appSupport,
+            image: tag,
+            name: next
+        )
+        _ = try docker.create(options: options)
+        do {
+            try docker.start(name: next)
+            _ = try readyState(name: next, resumed: false)
+            try? docker.stop(name: canonical)
+            try? docker.remove(name: canonical)
+            try docker.rename(from: next, to: canonical)
+            let renamed = try readyState(name: canonical, resumed: false)
+            lastReady = renamed
+            return renamed
+        } catch {
+            try? docker.remove(name: next)
+            throw error
+        }
+    }
+
+    public func apply(_ action: BotComputerPendingAction) throws -> [String: Any] {
+        guard let uuid = UUID(uuidString: action.botID) else {
+            throw BotComputerError.invalid("Invalid bot id.")
+        }
+        let botID = BotID(uuid)
+        switch action.kind {
+        case BotComputerCatalog.observe:
+            let shot = try observe(botID: botID)
+            return [
+                "png_magic": shot.magic,
+                "png_hash": shot.hash,
+                "png_base64": shot.png.base64EncodedString(),
+                "host": "127.0.0.1",
+                "image": BotComputerGuestSpec.imageTag,
+            ]
+        case BotComputerCatalog.act:
+            try act(botID: botID, steps: action.steps)
+            return ["ok": true, "steps": action.steps.count]
+        case BotComputerCatalog.exec:
+            let output = try exec(botID: botID, command: action.command)
+            return [
+                "ok": true,
+                "output": String(data: output, encoding: .utf8) ?? "",
+            ]
+        case BotComputerCatalog.rebuild:
+            let ready = try rebuild(botID: botID)
+            return [
+                "ok": true,
+                "host": ready.screenURL.host ?? "127.0.0.1",
+                "image": BotComputerGuestSpec.botImageTag(botID: botID),
+            ]
+        default:
+            throw BotComputerError.invalid("unknown tool: \(action.kind)")
+        }
     }
 
     private func waitForPNG(name: String) throws -> Data {
         var lastError: Error = BotComputerGuestError.observeFailed
         for attempt in 0..<observeAttempts {
             do {
-                let png = try docker.exec(name: name, command: ["import", "-window", "root", "png:-"])
+                let png = try docker.exec(
+                    name: name,
+                    command: ["import", "-window", "root", "png:-"],
+                    user: nil,
+                    detach: false
+                )
                 _ = try BotComputerGuestObserve.validatePNG(png)
                 return png
             } catch {
@@ -148,6 +236,44 @@ public final class BotComputerGuestService: @unchecked Sendable {
             }
         }
         throw lastError
+    }
+
+    private func readyState(name: String, resumed: Bool) throws -> BotComputerGuestReady {
+        let png = try waitForPNG(name: name)
+        let hash = try BotComputerGuestObserve.validatePNG(png)
+        let inspect = try docker.inspect(name: name)
+        let url = try BotComputerGuestSpec.screenURL(hostPort: inspect.hostPort, token: hash)
+        try BotComputerGuestSpec.validateScreenURL(url)
+        let ready = BotComputerGuestReady(
+            screenURL: url,
+            pngHash: hash,
+            pngMagic: Self.pngMagic(png),
+            resumed: resumed
+        )
+        lastReady = ready
+        lastReason = ""
+        return ready
+    }
+
+    private func resolvedImage(botID: BotID) throws -> String {
+        let tag = BotComputerGuestSpec.botImageTag(botID: botID)
+        if try docker.imageExists(tag: tag) { return tag }
+        return BotComputerGuestSpec.imageTag
+    }
+
+    private func seedRecipe(botID: BotID) throws {
+        let dest = BotComputerGuestSpec.recipeURL(appSupport: appSupport, botID: botID)
+        try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+        guard let recipeContext else { return }
+        let names = ["Dockerfile", "start.sh", "embed.html", "launch-browser.sh"]
+        for name in names {
+            let target = dest.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: target.path) { continue }
+            let source = recipeContext.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: source.path) {
+                try FileManager.default.copyItem(at: source, to: target)
+            }
+        }
     }
 
     public static func pngMagic(_ data: Data) -> String {
@@ -167,7 +293,12 @@ public final class BotComputerGuestService: @unchecked Sendable {
         _ = try provision(botID: botID)
         let name = BotComputerGuestSpec.containerName(botID: botID)
         for step in steps {
-            _ = try docker.exec(name: name, command: try step.execCommand())
+            _ = try docker.exec(
+                name: name,
+                command: try step.execCommand(),
+                user: nil,
+                detach: false
+            )
         }
     }
 

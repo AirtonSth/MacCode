@@ -20,6 +20,24 @@ public enum BotComputerGuestSpec {
             .appendingPathComponent("home", isDirectory: true)
     }
 
+    /// Dockerfile the bot can edit. Lives in the existing guest-home bind.
+    public static func recipeURL(appSupport: URL, botID: BotID) -> URL {
+        guestHomeURL(appSupport: appSupport, botID: botID)
+            .appendingPathComponent("computer", isDirectory: true)
+    }
+
+    public static func botImageTag(botID: BotID) -> String {
+        "remotecode/computer:bot-\(botID.value.uuidString.lowercased())"
+    }
+
+    public static func networkName(botID: BotID) -> String {
+        "remotecode-bot-\(botID.value.uuidString.lowercased())"
+    }
+
+    public static func nextContainerName(botID: BotID) -> String {
+        "\(containerName(botID: botID))-next"
+    }
+
     public static func assertGuestHomePath(_ path: String, appSupport: URL, botID: BotID) throws {
         let allowed = guestHomeURL(appSupport: appSupport, botID: botID).standardizedFileURL.path
         let candidate = URL(fileURLWithPath: path).standardizedFileURL.path
@@ -34,12 +52,14 @@ public enum BotComputerGuestSpec {
     public static func containerCreateOptions(
         botID: BotID,
         guestHome: String,
-        appSupport: URL
+        appSupport: URL,
+        image: String = imageTag,
+        name: String? = nil
     ) throws -> BotComputerContainerCreateOptions {
         try assertGuestHomePath(guestHome, appSupport: appSupport, botID: botID)
         return BotComputerContainerCreateOptions(
-            name: containerName(botID: botID),
-            image: imageTag,
+            name: name ?? containerName(botID: botID),
+            image: image,
             labels: [
                 "remotecode.managed": "1",
                 "remotecode.botId": botID.value.uuidString.lowercased(),
@@ -48,8 +68,26 @@ public enum BotComputerGuestSpec {
             hostIP: "127.0.0.1",
             hostPort: 0,
             containerPort: screenPort,
-            shmSize: minimumShmBytes
+            shmSize: minimumShmBytes,
+            network: networkName(botID: botID)
         )
+    }
+
+    public static func terminalCommand() -> [String] {
+        ["env", "DISPLAY=:1", "xterm"]
+    }
+
+    public static func execUsesRoot(_ command: String) -> Bool {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("apt") || trimmed.hasPrefix("apt-get")
+    }
+
+    public static func assertExecCommand(_ command: String) throws -> String {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 4000, !trimmed.contains("\0") else {
+            throw BotComputerGuestError.observeFailed
+        }
+        return trimmed
     }
 
     public static func screenURL(hostPort: Int, token: String) throws -> URL {
@@ -84,6 +122,7 @@ public struct BotComputerContainerCreateOptions: Equatable, Sendable {
     public var hostPort: Int
     public var containerPort: Int
     public var shmSize: Int
+    public var network: String?
 }
 
 public enum BotComputerGuestError: Error, Equatable {

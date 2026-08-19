@@ -1416,6 +1416,10 @@ public final class BotsViewModel: ObservableObject {
         syncQueuedFollowUps()
         drainQueuedFollowUp()
         deskTimelineRejoinToken &+= 1
+        lastGuestScreenURL = guestScreenURLByBot[bot.id.value]
+        if displayedDesktopKind == .dockerDesktop {
+            presentGuestDesktop(botID: bot.id)
+        }
     }
 
     public func createDeskThread() {
@@ -4905,6 +4909,25 @@ public final class BotsViewModel: ObservableObject {
     public var desktopKindOverrideForTesting: BotDesktopKind?
     public var dockerGuestProbeReason: String?
     public var lastGuestScreenURL: URL?
+    public var guestScreenURLByBot: [UUID: URL] = [:]
+    public var guestRunningByBot: [UUID: Bool] = [:]
+
+    func guestScreenURL(for botID: BotID) -> URL? {
+        guestScreenURLByBot[botID.value]
+    }
+
+    func isGuestRunning(_ botID: BotID) -> Bool {
+        guestRunningByBot[botID.value] == true
+    }
+
+    func rememberGuestScreen(url: URL, botID: BotID, running: Bool) {
+        guestScreenURLByBot[botID.value] = url
+        guestRunningByBot[botID.value] = running
+        if selectedBotID == botID {
+            lastGuestScreenURL = url
+        }
+        objectWillChange.send()
+    }
 
     func ensureDockerGuest(botID: BotID) throws {
         if dockerGuestReadyOverrideForTesting != nil { return }
@@ -4914,10 +4937,53 @@ public final class BotsViewModel: ObservableObject {
         }
         do {
             let ready = try service.provision(botID: botID)
-            lastGuestScreenURL = try BotComputerGuestSpec.viewerURL(ready.screenURL)
+            let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
+            rememberGuestScreen(url: url, botID: botID, running: true)
         } catch {
             errorMessage = "Docker desktop is not ready."
             throw BotComputerGuestError.notReady
+        }
+    }
+
+    func presentGuestDesktop(botID: BotID) {
+        if dockerGuestReadyOverrideForTesting != nil { return }
+        guard let service = computerGuestService else { return }
+        Task.detached {
+            do {
+                let ready = try service.provision(botID: botID)
+                let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
+                await MainActor.run {
+                    self.rememberGuestScreen(url: url, botID: botID, running: true)
+                }
+            } catch {
+                await MainActor.run {
+                    self.dockerGuestProbeReason = String(describing: error)
+                    self.guestRunningByBot[botID.value] = false
+                    self.objectWillChange.send()
+                }
+            }
+        }
+    }
+
+    func stopDockerGuest(botID: BotID) {
+        guard let service = computerGuestService else { return }
+        do {
+            try service.stop(botID: botID)
+            guestRunningByBot[botID.value] = false
+            objectWillChange.send()
+        } catch {
+            errorMessage = "Could not stop the Linux desktop."
+        }
+    }
+
+    func openGuestTerminal(botID: BotID) {
+        guard let service = computerGuestService else { return }
+        do {
+            try service.openTerminal(botID: botID)
+            guestRunningByBot[botID.value] = true
+            objectWillChange.send()
+        } catch {
+            errorMessage = "Could not open a guest terminal."
         }
     }
 
@@ -5946,10 +6012,24 @@ public struct BotsRootView: View {
                 .foregroundColor(DS.Palette.warning)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("bots.studio.desktop.honesty")
-            if vm.displayedDesktopKind == .dockerDesktop, let url = vm.lastGuestScreenURL {
-                BotComputerGuestScreenView(url: url)
-                    .frame(minHeight: 220)
-                    .accessibilityIdentifier("bots.studio.desktop.guestScreen")
+            if vm.displayedDesktopKind == .dockerDesktop {
+                BotComputerGuestCanvas(
+                    url: vm.lastGuestScreenURL,
+                    running: vm.selectedBotID.map { vm.isGuestRunning($0) } ?? false,
+                    startIdentifier: "bots.studio.desktop.start",
+                    stopIdentifier: "bots.studio.desktop.stop",
+                    terminalIdentifier: "bots.studio.desktop.terminal",
+                    screenIdentifier: "bots.studio.desktop.guestScreen",
+                    onStart: {
+                        if let id = vm.studioDraft.botID { vm.presentGuestDesktop(botID: id) }
+                    },
+                    onStop: {
+                        if let id = vm.studioDraft.botID { vm.stopDockerGuest(botID: id) }
+                    },
+                    onTerminal: {
+                        if let id = vm.studioDraft.botID { vm.openGuestTerminal(botID: id) }
+                    }
+                )
             }
         }
         .accessibilityIdentifier("bots.studio.desktop")
@@ -6203,6 +6283,9 @@ public struct BotsRootView: View {
                 }
             }
             VStack(spacing: 0) {
+                if vm.displayedDesktopKind == .dockerDesktop {
+                    deskGuestCanvas(bot)
+                }
                 deskTimeline(bot)
                 if !vm.queuedFollowUps.isEmpty {
                     deskQueuedFollowUps
@@ -6240,8 +6323,24 @@ public struct BotsRootView: View {
         }
     }
 
-    /// One quiet row. A decorative preview told the reader nothing a
-    /// caption cannot; the space belongs to the inspector.
+    private func deskGuestCanvas(_ bot: BotDefinition) -> some View {
+        BotComputerGuestCanvas(
+            url: vm.guestScreenURL(for: bot.id),
+            running: vm.isGuestRunning(bot.id),
+            startIdentifier: "bots.desk.desktop.start",
+            stopIdentifier: "bots.desk.desktop.stop",
+            terminalIdentifier: "bots.desk.desktop.terminal",
+            screenIdentifier: "bots.desk.desktop.guestScreen",
+            onStart: { vm.presentGuestDesktop(botID: bot.id) },
+            onStop: { vm.stopDockerGuest(botID: bot.id) },
+            onTerminal: { vm.openGuestTerminal(botID: bot.id) }
+        )
+        .padding(DS.Space.lg)
+        .dsBar(edge: .bottom)
+        .accessibilityIdentifier("bots.desk.desktop.canvas")
+    }
+
+    /// Honesty caption in the inspector. The live screen lives on Desk.
     private func deskDesktopPane(_ bot: BotDefinition) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.xs) {
             HStack(spacing: DS.Space.sm) {

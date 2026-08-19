@@ -27,7 +27,9 @@ public enum BotComputerCatalog: Sendable {
     public static let callerEnvironmentKey = "RC_REMOTE_CODE_BOT_ID"
     public static let observe = BotStandingInstructions.computerObserveTool
     public static let act = BotStandingInstructions.computerActTool
-    public static var toolNames: [String] { [observe, act] }
+    public static let exec = BotStandingInstructions.computerExecTool
+    public static let rebuild = BotStandingInstructions.computerRebuildTool
+    public static var toolNames: [String] { [observe, act, exec, rebuild] }
 
     public static func toolCatalog() -> [[String: Any]] {
         toolNames.map { name in
@@ -45,6 +47,10 @@ public enum BotComputerCatalog: Sendable {
             return "Screenshot the Docker Linux desktop on 127.0.0.1. Returns a PNG. Do not use macos-harness."
         case act:
             return "Click, type, or press a key on the Docker Linux desktop. Batch at most 24 steps."
+        case exec:
+            return "Run a command inside this bot's Linux container. Use this to install packages (apt-get) or edit files. Do not run host docker."
+        case rebuild:
+            return "Rebuild this bot's Linux image from /home/remotecode/computer/Dockerfile and restart the desktop. Use after editing that Dockerfile."
         default:
             return name
         }
@@ -56,6 +62,19 @@ public enum BotComputerCatalog: Sendable {
         ]
         switch name {
         case observe:
+            return ["type": "object", "properties": botID]
+        case exec:
+            return [
+                "type": "object",
+                "properties": botID.merging([
+                    "command": [
+                        "type": "string",
+                        "description": "Shell command to run inside the guest. apt-get runs as root.",
+                    ],
+                ]) { _, new in new },
+                "required": ["command"],
+            ]
+        case rebuild:
             return ["type": "object", "properties": botID]
         case act:
             return [
@@ -90,12 +109,42 @@ public struct BotComputerPendingAction: Codable, Equatable, Sendable {
     public var botID: String
     public var kind: String
     public var steps: [BotComputerActStep]
+    public var command: String
 
-    public init(id: String, botID: String, kind: String, steps: [BotComputerActStep] = []) {
+    public init(
+        id: String,
+        botID: String,
+        kind: String,
+        steps: [BotComputerActStep] = [],
+        command: String = ""
+    ) {
         self.id = id
         self.botID = botID
         self.kind = kind
         self.steps = steps
+        self.command = command
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, botID, kind, steps, command
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        botID = try container.decode(String.self, forKey: .botID)
+        kind = try container.decode(String.self, forKey: .kind)
+        steps = try container.decodeIfPresent([BotComputerActStep].self, forKey: .steps) ?? []
+        command = try container.decodeIfPresent(String.self, forKey: .command) ?? ""
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(botID, forKey: .botID)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(steps, forKey: .steps)
+        try container.encode(command, forKey: .command)
     }
 }
 
@@ -253,6 +302,13 @@ public struct BotComputerService: Sendable {
             let steps = try parseSteps(rawSteps)
             try BotComputerGuestObserve.assertActStepCount(steps.count)
             return try perform(kind: BotComputerCatalog.act, steps: steps)
+        case BotComputerCatalog.exec:
+            let command = try BotComputerGuestSpec.assertExecCommand(
+                arguments["command"] as? String ?? ""
+            )
+            return try perform(kind: BotComputerCatalog.exec, command: command)
+        case BotComputerCatalog.rebuild:
+            return try perform(kind: BotComputerCatalog.rebuild)
         default:
             throw BotComputerError.invalid("unknown tool: \(name)")
         }
@@ -273,15 +329,23 @@ public struct BotComputerService: Sendable {
         }
     }
 
-    private func perform(kind: String, steps: [BotComputerActStep]) throws -> [String: Any] {
+    private func perform(
+        kind: String,
+        steps: [BotComputerActStep] = [],
+        command: String = ""
+    ) throws -> [String: Any] {
+        let waitMS = (kind == BotComputerCatalog.exec || kind == BotComputerCatalog.rebuild)
+            ? max(timeoutMS, 180_000)
+            : timeoutMS
         let pending = BotComputerPendingAction(
             id: UUID().uuidString.lowercased(),
             botID: callerBotID.value.uuidString.lowercased(),
             kind: kind,
-            steps: steps
+            steps: steps,
+            command: command
         )
         try BotComputerHost.request(store: store, action: pending)
-        let deadline = Date().addingTimeInterval(max(0.2, timeoutMS / 1000))
+        let deadline = Date().addingTimeInterval(max(0.2, waitMS / 1000))
         while Date() < deadline {
             if let result = try store.takeResult(id: pending.id) {
                 if !result.error.isEmpty {

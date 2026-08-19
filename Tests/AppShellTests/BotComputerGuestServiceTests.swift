@@ -10,9 +10,14 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var png = BotComputerGuestObserve.pngSignature + Data(repeating: 1, count: 16)
     var created: [String] = []
     var removed: [String] = []
+    var started: [String] = []
+    var stopped: [String] = []
     var builds: [URL] = []
     var execCalls = 0
     var execFailuresRemaining = 0
+    var lastExec: (name: String, command: [String], user: String?, detach: Bool)?
+    var networks: [String] = []
+    var renamed: [(String, String)] = []
 
     func info() throws -> String { infoText }
     func imageExists(tag: String) throws -> Bool { images.contains(tag) }
@@ -26,19 +31,36 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
         return options.name
     }
     func start(name: String) throws {
+        started.append(name)
         containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49152)
+    }
+    func stop(name: String) throws {
+        stopped.append(name)
+        if var value = containers[name] {
+            value.running = false
+            containers[name] = value
+        }
     }
     func inspect(name: String) throws -> BotComputerContainerInspect {
         guard let value = containers[name] else { throw BotComputerGuestError.notReady }
         return value
     }
-    func exec(name: String, command: [String]) throws -> Data {
+    func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data {
         execCalls += 1
+        lastExec = (name, command, user, detach)
         if execFailuresRemaining > 0 {
             execFailuresRemaining -= 1
             throw BotComputerGuestError.observeFailed
         }
         return png
+    }
+    func rename(from: String, to: String) throws {
+        renamed.append((from, to))
+        containers[to] = containers[from]
+        containers[from] = nil
+    }
+    func ensureNetwork(name: String) throws {
+        networks.append(name)
     }
     func remove(name: String) throws {
         removed.append(name)
@@ -260,6 +282,56 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(shot.magic, "89504e47")
         try service.act(botID: botID, steps: [BotComputerActStep(action: "key", key: "Return")])
         print("ACT_OK=1")
+        service.teardown(botID: botID)
+    }
+
+    func test_provisionStartsStoppedContainerInsteadOfRecreating() throws {
+        // WHY: Stop then Send used to rm+create, wiping apt packages and the port.
+        let support = makeSupport("rc-guest-restart")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+        _ = try service.provision(botID: botID)
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        try service.stop(botID: botID)
+        XCTAssertEqual(fake.stopped, [name])
+        fake.created.removeAll()
+        let ready = try service.provision(botID: botID)
+        XCTAssertTrue(ready.resumed)
+        XCTAssertTrue(fake.created.isEmpty)
+        XCTAssertTrue(fake.started.contains(name))
+        XCTAssertFalse(fake.removed.contains(name))
+        service.teardown(botID: botID)
+    }
+
+    func test_execRunsAptAsRootAndOpenTerminalDetaches() throws {
+        let support = makeSupport("rc-guest-exec")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL(),
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+        _ = try service.exec(botID: botID, command: "apt-get install -y sl")
+        XCTAssertEqual(fake.lastExec?.user, "0")
+        XCTAssertEqual(Array(fake.lastExec?.command.prefix(2) ?? []), ["bash", "-lc"])
+        try service.openTerminal(botID: botID)
+        XCTAssertEqual(fake.lastExec?.detach, true)
+        XCTAssertEqual(fake.lastExec?.command, BotComputerGuestSpec.terminalCommand())
+        let rebuilt = try service.rebuild(botID: botID)
+        XCTAssertEqual(rebuilt.screenURL.host, "127.0.0.1")
+        XCTAssertTrue(fake.builds.contains(BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID)))
+        XCTAssertFalse(fake.renamed.isEmpty)
         service.teardown(botID: botID)
     }
 

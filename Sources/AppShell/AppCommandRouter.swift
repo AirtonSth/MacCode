@@ -6119,18 +6119,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                   BotDesktopAdmission.forPublished(revision.desktopKind).allowsGuestComputer else {
                 throw BotComputerError.notDockerDesktop
             }
-            if action.kind == BotComputerCatalog.observe {
-                let shot = try service.observe(botID: botID)
-                return [
-                    "png_magic": shot.magic,
-                    "png_hash": shot.hash,
-                    "png_base64": shot.png.base64EncodedString(),
-                    "host": "127.0.0.1",
-                    "image": BotComputerGuestSpec.imageTag,
-                ]
-            }
-            try service.act(botID: botID, steps: action.steps)
-            return ["ok": true, "steps": action.steps.count]
+            return try service.apply(action)
         }
     }
 

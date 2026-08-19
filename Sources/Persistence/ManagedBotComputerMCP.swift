@@ -34,7 +34,7 @@ public struct ManagedBotComputerMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "Linux desktop in Docker on 127.0.0.1. Use bot_computer_observe then bot_computer_act. Do not run macos-harness.",
+                "instructions": "Linux desktop in Docker on 127.0.0.1. Use bot_computer_observe, bot_computer_act, bot_computer_exec, and bot_computer_rebuild. Do not run macos-harness. Do not run host docker.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": BotComputerCatalog.toolCatalog()])

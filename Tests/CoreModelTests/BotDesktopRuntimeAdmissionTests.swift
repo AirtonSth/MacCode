@@ -68,6 +68,8 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
 
         let docker = BotStandingInstructions.admittedToolsText(for: .dockerDesktop)
         XCTAssertTrue(docker.contains(BotStandingInstructions.computerObserveTool))
+        XCTAssertTrue(docker.contains(BotStandingInstructions.computerExecTool))
+        XCTAssertTrue(docker.contains(BotStandingInstructions.computerRebuildTool))
         XCTAssertFalse(docker.contains(BotStandingInstructions.generatedMacOSHarnessLine))
         XCTAssertFalse(docker.contains(BotStandingInstructions.generatedBrowserLine))
     }

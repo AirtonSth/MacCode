@@ -18,7 +18,7 @@ fluxbox -display :1 -log /tmp/fluxbox.log >/tmp/fluxbox.out 2>&1 &
 /opt/remotecode-computer/launch-browser.sh || xterm -display :1 &
 
 # Guest VNC stays loopback. Docker NAT publishes 6080 on 127.0.0.1 of the host.
-x11vnc -display :1 -rfbport 5900 -localhost -viewonly -forever -shared -nopw \
+x11vnc -display :1 -rfbport 5900 -localhost -forever -shared -nopw \
     >/tmp/x11vnc.log 2>&1 &
 
 websockify --web /usr/share/novnc 0.0.0.0:6080 127.0.0.1:5900 \

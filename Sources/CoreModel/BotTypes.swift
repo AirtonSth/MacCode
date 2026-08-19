@@ -391,8 +391,10 @@ public enum BotStandingInstructions {
 
     public static let computerObserveTool = "bot_computer_observe"
     public static let computerActTool = "bot_computer_act"
+    public static let computerExecTool = "bot_computer_exec"
+    public static let computerRebuildTool = "bot_computer_rebuild"
     public static let generatedGuestComputerLine =
-        "When asked to see or use the Linux desktop, call \(computerObserveTool) then \(computerActTool). That screen is the Docker guest on 127.0.0.1. Do not run \(macosHarnessTool). Do not call remotecode-computer-use. Do not use this Mac's default browser."
+        "When asked to see or use the Linux desktop, call \(computerObserveTool) then \(computerActTool). To install packages or run a command in the guest, call \(computerExecTool). To change the guest image, edit /home/remotecode/computer/Dockerfile then call \(computerRebuildTool). That screen is the Docker guest on 127.0.0.1. Do not run \(macosHarnessTool). Do not call remotecode-computer-use. Do not use this Mac's default browser. Do not run host docker."
 
     /// Compiler layer. Starter soul must not own these names.
     public static let admittedToolsText = admittedToolsText(for: .logicalExecutionSpace)

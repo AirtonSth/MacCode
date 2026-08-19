@@ -13,7 +13,7 @@
     const params = new URLSearchParams(location.search);
     const token = params.get("token") || "";
     const frame = document.getElementById("screen");
-    frame.src = "/vnc.html?autoconnect=1&resize=scale&view_only=1&path=websockify?token=" + encodeURIComponent(token);
+    frame.src = "/vnc.html?autoconnect=1&resize=scale&view_only=0&path=websockify?token=" + encodeURIComponent(token);
   </script>
 </body>
 </html>

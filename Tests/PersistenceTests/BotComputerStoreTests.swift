@@ -54,4 +54,28 @@ final class BotComputerStoreTests: XCTestCase {
         XCTAssertFalse(typed.contains(where: { $0.contains(";") }))
         XCTAssertThrowsError(try BotComputerActStep(action: "key", key: "Return;rm").execCommand())
     }
+
+    func test_execRoundTripCarriesCommand() throws {
+        // WHY: the bot installs packages through host-brokered exec, not host docker.
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-bot-computer-exec-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = BotComputerStore(appSupportDirectory: root)
+        var service = BotComputerService(callerBotID: BotID(), store: store)
+        service.timeoutMS = 2_000
+        DispatchQueue.global().async {
+            Thread.sleep(forTimeInterval: 0.02)
+            try? BotComputerHost.applyPending(store: store) { action in
+                XCTAssertEqual(action.kind, BotComputerCatalog.exec)
+                XCTAssertEqual(action.command, "apt-get install -y sl")
+                return ["ok": true, "output": "done"]
+            }
+        }
+        let result = try service.call(
+            name: BotComputerCatalog.exec,
+            arguments: ["command": "apt-get install -y sl"]
+        )
+        XCTAssertEqual(result["ok"] as? Bool, true)
+        XCTAssertEqual(result["output"] as? String, "done")
+    }
 }

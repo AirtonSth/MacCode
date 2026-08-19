@@ -4928,11 +4928,22 @@ final class BotsWindowTests: XCTestCase {
         func start(name: String) throws {
             containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49152)
         }
+        func stop(name: String) throws {
+            if var value = containers[name] {
+                value.running = false
+                containers[name] = value
+            }
+        }
         func inspect(name: String) throws -> BotComputerContainerInspect {
             guard let value = containers[name] else { throw BotComputerGuestError.notReady }
             return value
         }
-        func exec(name: String, command: [String]) throws -> Data { png }
+        func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data { png }
+        func rename(from: String, to: String) throws {
+            containers[to] = containers[from]
+            containers[from] = nil
+        }
+        func ensureNetwork(name: String) throws {}
         func remove(name: String) throws { containers[name] = nil }
         func removeMatching(namePrefix: String) throws {
             for name in containers.keys where name.hasPrefix(namePrefix) {
@@ -5018,6 +5029,25 @@ final class BotsWindowTests: XCTestCase {
         try vm.ensureDockerGuest(botID: piper.id)
         XCTAssertEqual(vm.lastGuestScreenURL?.host, "127.0.0.1")
         XCTAssertTrue(fake.created.contains(BotComputerGuestSpec.containerName(botID: piper.id)))
+        XCTAssertEqual(vm.guestScreenURL(for: piper.id)?.host, "127.0.0.1")
+        XCTAssertTrue(vm.isGuestRunning(piper.id))
+    }
+
+    func test_deskDockerGuestScreenLivesOnMainCanvas() throws {
+        // WHY: Docker GUI was a caption in the inspector. The owner needs the
+        // live Linux screen on Desk, plus Start/Stop/Terminal.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("deskGuestCanvas"))
+        XCTAssertTrue(source.contains("bots.desk.desktop.guestScreen"))
+        XCTAssertTrue(source.contains("bots.desk.desktop.start"))
+        XCTAssertTrue(source.contains("bots.desk.desktop.stop"))
+        XCTAssertTrue(source.contains("bots.desk.desktop.terminal"))
+        let canvas = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotComputerGuestScreenView.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(canvas.contains("struct BotComputerGuestCanvas"))
+        XCTAssertFalse(canvas.contains("View-only noVNC"))
     }
 
     func test_viewModelWiresBundledComputerGuestRecipe() throws {

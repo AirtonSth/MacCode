@@ -3,7 +3,7 @@ import XCTest
 final class BotComputerGuestRecipeTests: XCTestCase {
     func test_recipeIsFirstPartyLinuxDesktop_notAlpineSleep() throws {
         // WHY: alpine/sleep would let Studio show Docker desktop without a
-        // screen. The guest must be Xvfb + Chromium + view-only noVNC.
+        // screen. The guest must be Xvfb + Chromium + interactive noVNC.
         let root = sourceURL("Sources/AppShell/Resources/ComputerGuest")
         let dockerfile = try String(contentsOf: root.appendingPathComponent("Dockerfile"), encoding: .utf8)
         let start = try String(contentsOf: root.appendingPathComponent("start.sh"), encoding: .utf8)
@@ -14,12 +14,12 @@ final class BotComputerGuestRecipeTests: XCTestCase {
         XCTAssertFalse(dockerfile.contains("CMD sleep"))
         XCTAssertTrue(start.contains("Xvfb"))
         XCTAssertTrue(start.lowercased().contains("fluxbox"))
-        XCTAssertTrue(start.contains("viewonly") || start.contains("-viewonly"))
+        XCTAssertFalse(start.contains("viewonly") || start.contains("-viewonly"))
         XCTAssertTrue(start.contains("websockify"))
         XCTAssertTrue(browser.lowercased().contains("chromium"))
         XCTAssertTrue(browser.contains("--no-sandbox"))
         XCTAssertTrue(embed.contains("token"))
-        XCTAssertTrue(embed.contains("view_only"))
+        XCTAssertTrue(embed.contains("view_only=0"))
     }
 
     private func sourceURL(_ relative: String) -> URL {

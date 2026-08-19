@@ -6,8 +6,11 @@ public protocol BotComputerDockerClienting: Sendable {
     func build(context: URL, tag: String) throws
     func create(options: BotComputerContainerCreateOptions) throws -> String
     func start(name: String) throws
+    func stop(name: String) throws
     func inspect(name: String) throws -> BotComputerContainerInspect
-    func exec(name: String, command: [String]) throws -> Data
+    func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data
+    func rename(from: String, to: String) throws
+    func ensureNetwork(name: String) throws
     func remove(name: String) throws
     func removeMatching(namePrefix: String) throws
 }
@@ -55,6 +58,9 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             "--shm-size", "\(options.shmSize)",
             "-p", "\(options.hostIP):\(options.hostPort):\(options.containerPort)",
         ]
+        if let network = options.network, !network.isEmpty {
+            args += ["--network", network]
+        }
         for (key, value) in options.labels.sorted(by: { $0.key < $1.key }) {
             args += ["--label", "\(key)=\(value)"]
         }
@@ -68,6 +74,22 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
 
     public func start(name: String) throws {
         _ = try run(["start", name])
+    }
+
+    public func stop(name: String) throws {
+        _ = try run(["stop", name])
+    }
+
+    public func rename(from: String, to: String) throws {
+        _ = try run(["rename", from, to])
+    }
+
+    public func ensureNetwork(name: String) throws {
+        do {
+            _ = try run(["network", "create", "--internal", name])
+        } catch {
+            _ = try run(["network", "inspect", name])
+        }
     }
 
     public func inspect(name: String) throws -> BotComputerContainerInspect {
@@ -86,8 +108,15 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         return BotComputerContainerInspect(running: running, imageID: image, hostPort: port)
     }
 
-    public func exec(name: String, command: [String]) throws -> Data {
-        try run(["exec", name] + command)
+    public func exec(name: String, command: [String], user: String? = nil, detach: Bool = false) throws -> Data {
+        var args = ["exec"]
+        if detach { args.append("-d") }
+        if let user, !user.isEmpty {
+            args += ["-u", user]
+        }
+        args.append(name)
+        args += command
+        return try run(args)
     }
 
     public func remove(name: String) throws {

@@ -18,7 +18,13 @@ final class BotComputerGuestSpecTests: XCTestCase {
         XCTAssertEqual(options.image, BotComputerGuestSpec.imageTag)
         XCTAssertEqual(options.labels["remotecode.managed"], "1")
         XCTAssertTrue(options.binds.first?.hasPrefix(home) == true)
+        XCTAssertEqual(options.network, BotComputerGuestSpec.networkName(botID: botID))
         XCTAssertGreaterThanOrEqual(options.shmSize, BotComputerGuestSpec.minimumShmBytes)
+        let recipe = BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID).path
+        XCTAssertTrue(recipe.hasPrefix(home))
+        XCTAssertTrue(recipe.hasSuffix("/computer"))
+        XCTAssertTrue(BotComputerGuestSpec.execUsesRoot("apt-get install -y sl"))
+        XCTAssertFalse(BotComputerGuestSpec.execUsesRoot("ls"))
 
         XCTAssertThrowsError(
             try BotComputerGuestSpec.containerCreateOptions(
