@@ -96,8 +96,12 @@ public enum BotComputerGuestSpec {
         components.scheme = "http"
         components.host = "127.0.0.1"
         components.port = hostPort
-        components.path = "/"
-        components.queryItems = [URLQueryItem(name: "token", value: token)]
+        components.path = "/vnc.html"
+        components.queryItems = [
+            URLQueryItem(name: "autoconnect", value: "1"),
+            URLQueryItem(name: "resize", value: "scale"),
+            URLQueryItem(name: "token", value: token),
+        ]
         guard let url = components.url else { throw BotComputerGuestError.invalidScreenURL }
         return url
     }

@@ -96,7 +96,7 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         let data = try run([
             "inspect",
             "-f",
-            "{{.State.Running}} {{.Image}} {{(index (index .NetworkSettings.Ports \"6080/tcp\") 0).HostPort}}",
+            "{{.State.Running}} {{.Image}} {{with (index .NetworkSettings.Ports \"6080/tcp\")}}{{(index . 0).HostPort}}{{else}}0{{end}}",
             name,
         ])
         let parts = (String(data: data, encoding: .utf8) ?? "")

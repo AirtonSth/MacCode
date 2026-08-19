@@ -42,6 +42,8 @@ final class BotComputerGuestSpecTests: XCTestCase {
         )
         let url = try BotComputerGuestSpec.screenURL(hostPort: 49152, token: "abc")
         XCTAssertEqual(url.host, "127.0.0.1")
+        XCTAssertEqual(url.path, "/vnc.html")
+        XCTAssertTrue(url.query?.contains("autoconnect=1") == true)
         XCTAssertThrowsError(try BotComputerGuestSpec.validateScreenURL(URL(string: "http://0.0.0.0:6080/")!))
         XCTAssertThrowsError(try BotComputerGuestSpec.viewerURL(URL(string: "http://0.0.0.0:6080/")!))
         let loopback = try BotComputerGuestSpec.viewerURL(url)
@@ -58,5 +60,29 @@ final class BotComputerGuestSpecTests: XCTestCase {
         try cli.ensureNetwork(name: "remotecode-bot-example")
         XCTAssertEqual(seen.first, ["network", "create", "remotecode-bot-example"])
         XCTAssertFalse(seen.contains(where: { $0.contains("--internal") }))
+    }
+
+    func test_inspectFormatSurvivesAStoppedContainer() throws {
+        // WHY: Docker clears published ports on stop. The old Go template
+        // crashed inspect, so Start after Stop treated the guest as missing
+        // and docker create failed on the leftover name.
+        var formats: [String] = []
+        let cli = BotComputerDockerCLI(run: { args in
+            if args.first == "inspect" {
+                if let idx = args.firstIndex(of: "-f"), args.index(after: idx) < args.endIndex {
+                    formats.append(args[args.index(after: idx)])
+                }
+                return Data("false sha256:img 0\n".utf8)
+            }
+            return Data()
+        })
+        let inspect = try cli.inspect(name: "remotecode-bot-example")
+        XCTAssertFalse(inspect.running)
+        XCTAssertEqual(inspect.hostPort, 0)
+        XCTAssertFalse(
+            formats.contains(where: { $0.contains("index (index .NetworkSettings.Ports") }),
+            "inspect must not index Ports[0] on a stopped container"
+        )
+        XCTAssertTrue(formats.contains(where: { $0.contains("{{else}}0{{end}}") }))
     }
 }
