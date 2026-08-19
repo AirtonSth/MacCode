@@ -346,6 +346,30 @@ final class AdaptiveSidebarPolicyTests: XCTestCase {
     }
 }
 
+final class DSPanelTests: XCTestCase {
+    func test_panelOccupiesFullProposedWidth_becauseCardsAreBlockContainers() throws {
+        // WHY: dsPanel hugged intrinsic content, so Supervised-run and
+        // settings cards sat as incomplete lines. A panel is a full-width
+        // surface in its parent column.
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/DesignSystemKit/Components.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        guard let start = source.range(of: "func dsPanel(") else {
+            return XCTFail("dsPanel must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n    func dsBar(")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(
+            slice.contains(".frame(maxWidth: .infinity, alignment: .leading)"),
+            "dsPanel must expand to the proposed width before painting the surface"
+        )
+    }
+}
+
 final class DSEmptyStateTests: XCTestCase {
     func test_emptyStateIconIsHiddenFromVoiceOver_becauseSymbolNameIsNotTheMessage() throws {
         // WHY: Computer Use heard puzzlepiece.extension on Skills empty state

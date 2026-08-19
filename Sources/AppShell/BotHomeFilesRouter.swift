@@ -73,7 +73,8 @@ final class BotHomeFilesRouter: FilesSurfaceRouting {
     }
 
     func fsWorkspaceRead(workspace: WorkspaceID, path: String, maxBytes: Int?) throws -> JSONValue {
-        try files.read(root: root, path: path, maxBytes: maxBytes)
+        let read = try files.read(root: root, path: path, maxBytes: maxBytes)
+        return locksBotHomeProjections ? Self.lockReadProjection(read, path: path) : read
     }
 
     func filesEditSave(sessionID: String) throws -> JSONValue {
@@ -159,14 +160,28 @@ final class BotHomeFilesRouter: FilesSurfaceRouting {
             guard var body = entry.objectValue,
                   let relative = body["relative_path"]?.stringValue,
                   Self.isProjection(relative),
-                  var identity = body["identity"]?.objectValue else { return entry }
-            identity["is_editable"] = .bool(false)
-            identity["editability_reason"] = .string("Generated projection")
-            body["identity"] = .object(identity)
+                  let identity = body["identity"]?.objectValue else { return entry }
+            body["identity"] = .object(Self.lockedIdentity(identity))
             return .object(body)
         }
         object["entries"] = .array(entries)
         return .object(object)
+    }
+
+    static func lockReadProjection(_ value: JSONValue, path: String) -> JSONValue {
+        let relative = value.objectValue?["relative_path"]?.stringValue ?? path
+        guard isProjection(relative) || isProjection(path),
+              var object = value.objectValue,
+              let identity = object["identity"]?.objectValue else { return value }
+        object["identity"] = .object(lockedIdentity(identity))
+        return .object(object)
+    }
+
+    static func lockedIdentity(_ identity: [String: JSONValue]) -> [String: JSONValue] {
+        var identity = identity
+        identity["is_editable"] = .bool(false)
+        identity["editability_reason"] = .string("Generated projection")
+        return identity
     }
 
     static func isProjection(_ relativePath: String) -> Bool {

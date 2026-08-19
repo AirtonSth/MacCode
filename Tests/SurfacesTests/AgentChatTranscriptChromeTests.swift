@@ -4,6 +4,29 @@ import CoreModel
 
 final class AgentChatTranscriptChromeTests: XCTestCase {
 
+    func test_statusCardIsFullWidthOnItsOwnLine_becauseRunHeadersAreNotBubbles() throws {
+        // WHY: Supervised-run / work-log panels hugged content next to a
+        // timestamp gutter. System cards must span the transcript column.
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: "Sources/Surfaces/AgentChatTranscriptChrome.swift"),
+            encoding: .utf8
+        )
+        guard let start = source.range(of: "public struct AgentChatStatusCard") else {
+            return XCTFail("AgentChatStatusCard must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\npublic struct AgentChatUserBubble")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains(".frame(maxWidth: .infinity, alignment: .leading)"))
+        XCTAssertTrue(slice.contains(".dsPanel(padding: DS.Space.lg)"))
+        XCTAssertTrue(slice.contains("DSPill(statusLabel, tone: statusTone)"))
+        XCTAssertTrue(slice.contains("style: .time"))
+        XCTAssertFalse(
+            slice.contains("frame(width: 56"),
+            "status card must not recreate the timestamp gutter"
+        )
+    }
+
     func test_bubbleMetricsMatchAgentApp_becauseDeskMustShareTheSameChatChrome() {
         // WHY: Bots Desk is supposed to look like Agent App chat. If these
         // numbers drift, user bubbles wrap at a different width and the

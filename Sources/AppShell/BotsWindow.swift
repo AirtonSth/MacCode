@@ -5435,7 +5435,7 @@ extension BotsViewModel: AgentRunObserver {
 
 // MARK: - Shared sidebar chrome
 
-/// One control for the single shell sidebar: Agentic (workspaces) or Bots (roster).
+/// One control for the single shell sidebar: Workspaces or Bots (roster).
 public struct BotsModeSwitcher: View {
     public var isBotsSelected: Bool
     public var onSelectAgentic: () -> Void
@@ -6913,7 +6913,7 @@ public struct BotsRootView: View {
             .accessibilityIdentifier("bots.routines.active")
         }
         .dsPanel(padding: DS.Space.md)
-        .frame(minHeight: BotsChrome.hitTarget)
+        .frame(maxWidth: .infinity, minHeight: BotsChrome.hitTarget, alignment: .leading)
     }
 
     private func deskTimeline(_ bot: BotDefinition) -> some View {
@@ -7039,32 +7039,15 @@ public struct BotsRootView: View {
     }
 
     private func deskWorkLogRow(_ row: BotDeskWorkLogRow) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.md) {
-            Text(row.createdAt, style: .time)
-                .font(DS.Font.caption2)
-                .foregroundColor(DS.Palette.textTertiary)
-                .frame(width: 56, alignment: .trailing)
-            HStack(alignment: .center, spacing: DS.Space.md) {
-                Image(systemName: "list.bullet.rectangle")
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(row.title)
-                        .font(DS.Font.bodyStrong)
-                        .foregroundColor(DS.Palette.text)
-                    if !row.detail.isEmpty {
-                        Text(row.detail)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                    }
-                }
-                Spacer(minLength: 0)
-                DSPill(row.statusLabel, tone: workLogTone(row.statusLabel))
-            }
-            .dsPanel(padding: DS.Space.lg)
-        }
-        .accessibilityIdentifier("bots.desk.workLog")
-        .accessibilityLabel("work log \(row.title) \(row.statusLabel)")
+        AgentChatStatusCard(
+            title: row.title,
+            detail: row.detail,
+            statusLabel: row.statusLabel,
+            statusTone: workLogTone(row.statusLabel),
+            createdAt: row.createdAt,
+            accessibilityIdentifier: "bots.desk.workLog",
+            accessibilityLabel: "work log \(row.title) \(row.statusLabel)"
+        )
     }
 
     private func workLogTone(_ status: String) -> DSPill.Tone {
@@ -7484,6 +7467,7 @@ public struct BotsRootView: View {
         if compact {
             routineRowBody(routine)
                 .dsPanel(padding: DS.Space.lg)
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             routineRowBody(routine)
                 .padding(.vertical, DS.Space.lg)

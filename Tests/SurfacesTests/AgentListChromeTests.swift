@@ -17,6 +17,10 @@ final class AgentListChromeTests: XCTestCase {
         XCTAssertTrue(chrome.contains(".frame(width: 44, height: 44)"))
         XCTAssertTrue(chrome.contains("DS.Palette.accent"))
         XCTAssertTrue(chrome.contains("DS.Palette.onAccent"))
+        XCTAssertTrue(
+            chrome.contains(".frame(maxWidth: .infinity, alignment: .leading)"),
+            "overview cards occupy one complete line, not a hugging capsule"
+        )
     }
 
     func test_destAndAgenticScheduleMountSharedChrome() throws {

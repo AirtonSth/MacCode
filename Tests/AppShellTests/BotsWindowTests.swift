@@ -3621,6 +3621,55 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(BotHome.memoryName, "MEMORY.md")
     }
 
+    func test_studioFilesIdentityOpensReadOnly_becauseGeneratedProjectionMustNotDumpRPCError() throws {
+        // WHY: listing locks IDENTITY.md. Opening it used to re-read identity
+        // as editable, call filesEditOpen, and replace the editor with
+        // JSONRPCError "Generated projection".
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openStudio(bot)
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        defer { model.close() }
+        model.loadDirectory("")
+        let identity = try XCTUnwrap(model.entries.first { $0.name == BotHome.identityName })
+        XCTAssertFalse(identity.isEditable)
+
+        let read = try router.fsWorkspaceRead(
+            workspace: router.workspaceID,
+            path: BotHome.identityName,
+            maxBytes: nil
+        )
+        XCTAssertEqual(
+            read.objectValue?["identity"]?.objectValue?["is_editable"]?.boolValue,
+            false,
+            "read identity must stay locked so loadFile does not call filesEditOpen"
+        )
+        XCTAssertEqual(
+            read.objectValue?["identity"]?.objectValue?["editability_reason"]?.stringValue,
+            "Generated projection"
+        )
+        XCTAssertThrowsError(
+            try router.filesEditOpen(surface: SurfaceID(bot.id.value), path: BotHome.identityName)
+        ) { error in
+            XCTAssertTrue(
+                String(describing: error).contains("Generated projection"),
+                "edit-open must still refuse IDENTITY.md"
+            )
+        }
+
+        model.select(identity)
+        XCTAssertNil(
+            model.errorText,
+            "IDENTITY.md must open as a read-only projection, not a Files error overlay"
+        )
+        XCTAssertFalse(try XCTUnwrap(model.selectedEntry).isEditable)
+        XCTAssertTrue(model.visibleText.contains("Name: Piper"))
+        XCTAssertFalse(model.isDirty)
+    }
+
     func test_studioSkillsLiveInFilesNotASkillsTab() throws {
         // WHY: Owners already have Files. A leftover Skills tab must not
         // come back; persist remaps to Files.
@@ -6230,6 +6279,27 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(try store.refresh().items.filter { $0.route == .botsDesk(botID: piper.id) }.isEmpty)
     }
 
+    func test_deskWorkLogCardIsFullWidthOnItsOwnLine_becauseStatusCardsAreNotChatBubbles() throws {
+        // WHY: a 56pt timestamp gutter beside the Supervised-run panel left a
+        // hugging card. Status cards occupy one complete line at column width.
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = bots.range(of: "private func deskWorkLogRow") else {
+            return XCTFail("deskWorkLogRow must exist")
+        }
+        let rest = bots[start.lowerBound...]
+        let end = rest.range(of: "\n    private func workLogTone")?.lowerBound ?? rest.endIndex
+        let slice = String(bots[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("AgentChatStatusCard("))
+        XCTAssertFalse(
+            slice.contains("frame(width: 56"),
+            "work-log must not keep a timestamp column beside the panel"
+        )
+        XCTAssertFalse(
+            slice.contains("style: .time"),
+            "time lives inside the shared full-width card, not a Desk gutter"
+        )
+    }
+
     func test_deskTimelineUsesSharedAgentAppScrollContainer_becauseChatMustFollowTheSamePin() throws {
         // WHY: Desk used a plain ScrollView. Agent App pin/FAB/BOTTOM lived
         // only in AgentAppSurface, so send did not auto-scroll. Same control
@@ -8120,7 +8190,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(chatChrome.contains("arrow.up"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.timeline\")"))
-        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.workLog\")"))
+        XCTAssertTrue(bots.contains("AgentChatStatusCard("))
+        XCTAssertTrue(bots.contains("\"bots.desk.workLog\""))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop.honesty\")"))
         XCTAssertTrue(
@@ -8207,6 +8278,13 @@ final class BotsWindowTests: XCTestCase {
             sidebar.contains("BotsModeSwitcher"),
             "Bots is entered from the Agentic/Bots switcher, not a dest row"
         )
+    }
+
+    func test_modeSwitcherShowsWorkspaces_becauseUsersSeeWorkspaceModeNotInternalAgenticName() {
+        // WHY: the left mode is the workspace list. Shipping "Agentic" as the
+        // visible tab name was product jargon; the control must say Workspaces.
+        XCTAssertEqual(BotsChrome.Label.agentic, "Workspaces")
+        XCTAssertEqual(BotsChrome.Label.bots, "Bots")
     }
 
     func test_botsRosterMenusMatchAgentic_becauseBotsChromeMirrorsWorkspaceActions() throws {

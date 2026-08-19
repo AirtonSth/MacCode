@@ -21,9 +21,11 @@ public extension View {
 
 public extension View {
     /// Panel: the dense card used for changed-files, plan, feed rows.
+    /// Occupies the full proposed width (one complete line); content stays leading.
     func dsPanel(padding: CGFloat = DS.Space.lg, raised: Bool = false) -> some View {
         self
             .padding(padding)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(raised ? DS.Palette.surfaceRaised : DS.Palette.surface)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             .overlay(

@@ -7,7 +7,7 @@ import DesignSystemKit
 /// only per-bot avatar identity colors are local to Bots.
 public enum BotsChrome {
     public enum Label {
-        public static let agentic = "Agentic"
+        public static let agentic = "Workspaces"
         public static let bots = "Bots"
         public static let newBot = "New Bot"
         public static let activeBots = "Active Bots"

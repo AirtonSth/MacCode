@@ -324,6 +324,7 @@ public struct AgentOverviewCard<Badge: View, Meta: View, Trailing: View>: View {
             }
             .padding(.horizontal, DS.Space.xl)
             .padding(.vertical, DS.Space.lg)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(DS.Palette.surface)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             .overlay(
@@ -333,6 +334,7 @@ public struct AgentOverviewCard<Badge: View, Meta: View, Trailing: View>: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier(identifier)
         .accessibilityElement(children: .combine)
         .modifier(AgentOverviewCardValue(value: accessibilityValue))
