@@ -153,6 +153,23 @@ public final class BotComputerGuestService: @unchecked Sendable {
         data.prefix(4).map { String(format: "%02x", $0) }.joined()
     }
 
+    public func observe(botID: BotID) throws -> (png: Data, hash: String, magic: String) {
+        _ = try provision(botID: botID)
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        let png = try waitForPNG(name: name)
+        let hash = try BotComputerGuestObserve.validatePNG(png)
+        return (png, hash, Self.pngMagic(png))
+    }
+
+    public func act(botID: BotID, steps: [BotComputerActStep]) throws {
+        try BotComputerGuestObserve.assertActStepCount(steps.count)
+        _ = try provision(botID: botID)
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        for step in steps {
+            _ = try docker.exec(name: name, command: try step.execCommand())
+        }
+    }
+
     public func teardown(botID: BotID) {
         try? docker.remove(name: BotComputerGuestSpec.containerName(botID: botID))
         try? BotGuestHome.wipe(appSupport: appSupport, botID: botID)

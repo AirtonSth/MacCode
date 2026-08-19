@@ -24,3 +24,43 @@ public enum BotComputerGuestObserve {
         }
     }
 }
+
+public struct BotComputerActStep: Codable, Equatable, Sendable {
+    public var action: String
+    public var x: Int?
+    public var y: Int?
+    public var text: String?
+    public var key: String?
+
+    public init(action: String, x: Int? = nil, y: Int? = nil, text: String? = nil, key: String? = nil) {
+        self.action = action
+        self.x = x
+        self.y = y
+        self.text = text
+        self.key = key
+    }
+
+    public func execCommand() throws -> [String] {
+        switch action {
+        case "click":
+            guard let x, let y, (0...1600).contains(x), (0...1200).contains(y) else {
+                throw BotComputerGuestError.observeFailed
+            }
+            return ["env", "DISPLAY=:1", "xdotool", "mousemove", "\(x)", "\(y)", "click", "1"]
+        case "type":
+            let typed = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !typed.isEmpty, typed.count <= 2000 else {
+                throw BotComputerGuestError.observeFailed
+            }
+            return ["env", "DISPLAY=:1", "xdotool", "type", "--delay", "10", "--", typed]
+        case "key":
+            let name = (key ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard name.range(of: "^[A-Za-z0-9+_]+$", options: .regularExpression) != nil else {
+                throw BotComputerGuestError.observeFailed
+            }
+            return ["env", "DISPLAY=:1", "xdotool", "key", "--", name]
+        default:
+            throw BotComputerGuestError.observeFailed
+        }
+    }
+}

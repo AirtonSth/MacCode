@@ -6,6 +6,7 @@ import Persistence
 import SocketServer
 import Surfaces
 import SwiftUI
+import WebKit
 
 // MARK: - Drafts & rows
 
@@ -1652,6 +1653,9 @@ public final class BotsViewModel: ObservableObject {
             throw BotComputerGuestError.notReady
         }
         let desktop = resolvedDesktopKind(studioDraft.desktopKind)
+        if desktop == .dockerDesktop, let botID = studioDraft.botID {
+            try ensureDockerGuest(botID: botID)
+        }
         let soul = BotStandingInstructions.resolved(
             name: name,
             title: studioDraft.title,
@@ -1727,6 +1731,9 @@ public final class BotsViewModel: ObservableObject {
             notificationsEnabled: studioDraft.notificationsEnabled,
             desktopKind: desktop
         )
+        if desktop == .dockerDesktop {
+            try ensureDockerGuest(botID: created.id)
+        }
         beginEdit(created)
         clearUnpublishedNewBot(created.id)
         return created
@@ -4801,6 +4808,22 @@ public final class BotsViewModel: ObservableObject {
     public var dockerGuestReadyOverrideForTesting: Bool?
     public var desktopKindOverrideForTesting: BotDesktopKind?
     public var dockerGuestProbeReason: String?
+    public var lastGuestScreenURL: URL?
+
+    func ensureDockerGuest(botID: BotID) throws {
+        if dockerGuestReadyOverrideForTesting != nil { return }
+        guard let service = computerGuestService else {
+            errorMessage = "Docker desktop is not ready."
+            throw BotComputerGuestError.notReady
+        }
+        do {
+            let ready = try service.provision(botID: botID)
+            lastGuestScreenURL = try BotComputerGuestSpec.viewerURL(ready.screenURL)
+        } catch {
+            errorMessage = "Docker desktop is not ready."
+            throw BotComputerGuestError.notReady
+        }
+    }
 
     public var dockerGuestReady: Bool {
         if let dockerGuestReadyOverrideForTesting { return dockerGuestReadyOverrideForTesting }
@@ -5811,6 +5834,11 @@ public struct BotsRootView: View {
                 .foregroundColor(DS.Palette.warning)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("bots.studio.desktop.honesty")
+            if vm.displayedDesktopKind == .dockerDesktop, let url = vm.lastGuestScreenURL {
+                BotComputerGuestScreenView(url: url)
+                    .frame(minHeight: 220)
+                    .accessibilityIdentifier("bots.studio.desktop.guestScreen")
+            }
         }
         .accessibilityIdentifier("bots.studio.desktop")
     }

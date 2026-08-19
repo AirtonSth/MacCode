@@ -6099,6 +6099,41 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return json
     }
 
+    /// Drain MCP pending guest observe/act through the app-process Docker CLI.
+    public func reconcileBotComputerActions() {
+        guard let ctx = context else { return }
+        let store = BotComputerStore(appSupportDirectory: ctx.appSupportDirectory)
+        let service = BotComputerGuestService(
+            appSupport: ctx.appSupportDirectory,
+            docker: BotComputerDockerCLI(),
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
+        )
+        try? BotComputerHost.applyPending(store: store) { action in
+            guard let uuid = UUID(uuidString: action.botID) else {
+                throw BotComputerError.invalid("Invalid bot id.")
+            }
+            let botID = BotID(uuid)
+            guard let bot = try ctx.botStore.get(id: botID),
+                  let revisionID = bot.currentRevisionID,
+                  let revision = try ctx.botStore.getRevision(id: revisionID),
+                  BotDesktopAdmission.forPublished(revision.desktopKind).allowsGuestComputer else {
+                throw BotComputerError.notDockerDesktop
+            }
+            if action.kind == BotComputerCatalog.observe {
+                let shot = try service.observe(botID: botID)
+                return [
+                    "png_magic": shot.magic,
+                    "png_hash": shot.hash,
+                    "png_base64": shot.png.base64EncodedString(),
+                    "host": "127.0.0.1",
+                    "image": BotComputerGuestSpec.imageTag,
+                ]
+            }
+            try service.act(botID: botID, steps: action.steps)
+            return ["ok": true, "steps": action.steps.count]
+        }
+    }
+
     /// Drain MCP pending opens through the same `openBotBrowser` path tests drive.
     @discardableResult
     public func reconcileBotBrowserOpens() throws -> [BotBrowserTarget] {

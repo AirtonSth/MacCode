@@ -231,6 +231,11 @@ struct RemoteCodeDistillServiceMain {
             runBotWebMCP()
             return
         }
+        if programName == "rc-bot-computer"
+            || rawArgs.dropFirst().first == BotComputerCatalog.cliArgument {
+            runBotComputerMCP()
+            return
+        }
         // Nested provider PATH controller: invoked via managed symlinks
         // (~/.remote-code/bin/{grok,claude,codex}) or explicit `provider-proxy <name> …`.
         // Records content-free Subagents receipts and execs the real CLI outside managed bin.
@@ -741,6 +746,15 @@ struct RemoteCodeDistillServiceMain {
 
     private static func runBotWebMCP() {
         let server = ManagedBotWebMCP()
+        while let line = readLine(strippingNewline: true) {
+            if let response = server.handle(line) {
+                FileHandle.standardOutput.write(Data((response + "\n").utf8))
+            }
+        }
+    }
+
+    private static func runBotComputerMCP() {
+        let server = ManagedBotComputerMCP()
         while let line = readLine(strippingNewline: true) {
             if let response = server.handle(line) {
                 FileHandle.standardOutput.write(Data((response + "\n").utf8))

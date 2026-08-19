@@ -360,6 +360,7 @@ public final class AppContext {
             refreshActiveAgentWorkspaceProjection()
             startBotBrowserPendingOpenObserver()
             try? router?.reconcileBotBrowserOpens()
+            router?.reconcileBotComputerActions()
         }
     }
     private var botBrowserOpenObserver: NSObjectProtocol?
@@ -1985,6 +1986,13 @@ public final class AppContext {
                 )
             }
             do {
+                try installer.installBotComputerMCP()
+            } catch {
+                NSLog(
+                    "RemoteCode: installBotComputerMCP before agent turn failed: \(error.localizedDescription)"
+                )
+            }
+            do {
                 try installer.installBotWebMCP()
             } catch {
                 NSLog(
@@ -2109,6 +2117,13 @@ public final class AppContext {
         } catch {
             NSLog(
                 "RemoteCode: installBotBrowserMCP before subagent env failed: \(error.localizedDescription)"
+            )
+        }
+        do {
+            try installer.installBotComputerMCP()
+        } catch {
+            NSLog(
+                "RemoteCode: installBotComputerMCP before subagent env failed: \(error.localizedDescription)"
             )
         }
         do {
@@ -2607,6 +2622,13 @@ public final class AppContext {
         ) { [weak self] _ in
             Task { await self?.router?.reconcileBotBrowserActions() }
         }
+        DistributedNotificationCenter.default().addObserver(
+            forName: BotComputerHost.pendingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.router?.reconcileBotComputerActions()
+        }
     }
 
     func reconcileComputerUseMCP() {
@@ -2625,6 +2647,11 @@ public final class AppContext {
             try installer.installBotBrowserMCP()
         } catch {
             NSLog("RemoteCode: installBotBrowserMCP failed: \(error.localizedDescription)")
+        }
+        do {
+            try installer.installBotComputerMCP()
+        } catch {
+            NSLog("RemoteCode: installBotComputerMCP failed: \(error.localizedDescription)")
         }
         do {
             try installer.installBotWebMCP()

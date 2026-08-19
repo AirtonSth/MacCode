@@ -4812,6 +4812,49 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, 1)
     }
 
+    private final class RecordingDocker: BotComputerDockerClienting, @unchecked Sendable {
+        var created: [String] = []
+        var png = BotComputerGuestObserve.pngSignature + Data(repeating: 1, count: 16)
+        var containers: [String: BotComputerContainerInspect] = [:]
+
+        func info() throws -> String { "ok" }
+        func imageExists(tag: String) throws -> Bool { true }
+        func build(context: URL, tag: String) throws {}
+        func create(options: BotComputerContainerCreateOptions) throws -> String {
+            created.append(options.name)
+            containers[options.name] = BotComputerContainerInspect(running: false, imageID: "img", hostPort: 49152)
+            return options.name
+        }
+        func start(name: String) throws {
+            containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49152)
+        }
+        func inspect(name: String) throws -> BotComputerContainerInspect {
+            guard let value = containers[name] else { throw BotComputerGuestError.notReady }
+            return value
+        }
+        func exec(name: String, command: [String]) throws -> Data { png }
+        func remove(name: String) throws { containers[name] = nil }
+    }
+
+    func test_ensureDockerGuestProvisionsThisBotOnLoopback() throws {
+        // WHY: Save of Docker-with-GUI must provision THIS bot and keep a
+        // 127.0.0.1 viewer URL. Tests that inject ready=true skip Docker.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        try vm.ensureDockerGuest(botID: piper.id)
+        XCTAssertEqual(vm.lastGuestScreenURL?.host, "127.0.0.1")
+        XCTAssertTrue(fake.created.contains(BotComputerGuestSpec.containerName(botID: piper.id)))
+    }
+
     func test_viewModelWiresBundledComputerGuestRecipe() throws {
         // WHY: recipeContext=nil left Studio unable to build the bundled
         // ComputerGuest image, so the Docker radio never enabled.

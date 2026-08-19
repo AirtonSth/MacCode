@@ -1789,6 +1789,14 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try installCodexBotBrowserMCP(binary: binary)
     }
 
+    public func installBotComputerMCP(serviceBinaryURL: URL? = nil) throws {
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+            throw AgentSkillCLIError.serviceBinaryUnavailable
+        }
+        try installClaudeBotComputerMCP(binary: binary)
+        try installCodexBotComputerMCP(binary: binary)
+    }
+
     public func installBotWebMCP(serviceBinaryURL: URL? = nil) throws {
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
@@ -1882,6 +1890,28 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
         let next = BotBrowserMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
+        try Data(next.utf8).write(to: url, options: .atomic)
+    }
+
+    private func installClaudeBotComputerMCP(binary: URL) throws {
+        let url = claudeSettingsURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            root = obj
+        }
+        let existing = root["mcpServers"] as? [String: Any] ?? [:]
+        root["mcpServers"] = BotComputerMCPAdmit.admitClaude(existing: existing, command: binary.path)
+        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try out.write(to: url, options: .atomic)
+    }
+
+    private func installCodexBotComputerMCP(binary: URL) throws {
+        let url = codexConfigURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let next = BotComputerMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
         try Data(next.utf8).write(to: url, options: .atomic)
     }
 

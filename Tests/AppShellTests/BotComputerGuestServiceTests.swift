@@ -144,6 +144,30 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertNil(service.lastReady)
     }
 
+    func test_observeAndActDriveTheGuestThroughDockerExec() throws {
+        // WHY: dockerDesktop tools must screenshot and click the guest,
+        // not this Mac. Fake docker records the exact exec argv.
+        let support = makeSupport("rc-guest-act")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+        let shot = try service.observe(botID: botID)
+        XCTAssertEqual(shot.magic, BotComputerGuestService.pngMagicHex)
+        XCTAssertEqual(shot.png.prefix(4), BotComputerGuestObserve.pngSignature)
+        try service.act(botID: botID, steps: [
+            BotComputerActStep(action: "click", x: 40, y: 80),
+            BotComputerActStep(action: "type", text: "hello"),
+        ])
+        XCTAssertTrue(fake.execCalls >= 3)
+        service.teardown(botID: botID)
+    }
+
     func test_provisionRetriesUntilPNG() throws {
         let support = makeSupport("rc-guest-prov-retry")
         defer { try? FileManager.default.removeItem(at: support) }
@@ -205,6 +229,15 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(magic, "89504e47")
         XCTAssertEqual(host, "127.0.0.1")
         XCTAssertEqual(image, "remotecode/computer:local")
+
+        let botID = BotID()
+        let shot = try service.observe(botID: botID)
+        print("OBSERVE_PNG_MAGIC=\(shot.magic)")
+        print("OBSERVE_HOST=127.0.0.1")
+        XCTAssertEqual(shot.magic, "89504e47")
+        try service.act(botID: botID, steps: [BotComputerActStep(action: "key", key: "Return")])
+        print("ACT_OK=1")
+        service.teardown(botID: botID)
     }
 
     private final class SleepCounter: @unchecked Sendable {
