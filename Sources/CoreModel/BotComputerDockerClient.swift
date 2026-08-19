@@ -9,6 +9,7 @@ public protocol BotComputerDockerClienting: Sendable {
     func inspect(name: String) throws -> BotComputerContainerInspect
     func exec(name: String, command: [String]) throws -> Data
     func remove(name: String) throws
+    func removeMatching(namePrefix: String) throws
 }
 
 public struct BotComputerContainerInspect: Equatable, Sendable {
@@ -91,6 +92,17 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
 
     public func remove(name: String) throws {
         _ = try run(["rm", "-f", name])
+    }
+
+    public func removeMatching(namePrefix: String) throws {
+        let data = try run(["ps", "-aq", "--filter", "name=\(namePrefix)"])
+        let names = (String(data: data, encoding: .utf8) ?? "")
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        for name in names {
+            try? remove(name: name)
+        }
     }
 
     public static func defaultRun(_ args: [String]) throws -> Data {

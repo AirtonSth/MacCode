@@ -51,6 +51,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         }
         do {
             _ = try docker.info()
+            try? docker.removeMatching(namePrefix: "remotecode-probe-")
             if try docker.imageExists(tag: BotComputerGuestSpec.imageTag) == false {
                 guard let recipeContext else {
                     lastReady = nil

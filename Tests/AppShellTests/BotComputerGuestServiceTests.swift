@@ -44,6 +44,11 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
         removed.append(name)
         containers[name] = nil
     }
+    func removeMatching(namePrefix: String) throws {
+        for name in containers.keys where name.hasPrefix(namePrefix) {
+            try remove(name: name)
+        }
+    }
 }
 
 @MainActor
@@ -124,6 +129,24 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertTrue(fake.containers.isEmpty)
         XCTAssertEqual(service.lastReady?.pngMagic, BotComputerGuestService.pngMagicHex)
         XCTAssertEqual(service.lastReady?.screenURL.host, "127.0.0.1")
+    }
+
+    func test_proveReadyScavengesLeftoverProbes() throws {
+        let support = makeSupport("rc-guest-scavenge")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.containers["remotecode-probe-stale"] = BotComputerContainerInspect(
+            running: false, imageID: "img", hostPort: 1
+        )
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        XCTAssertTrue(service.proveReady())
+        XCTAssertFalse(fake.containers.keys.contains("remotecode-probe-stale"))
+        XCTAssertTrue(fake.removed.contains("remotecode-probe-stale"))
     }
 
     func test_proveReadyRemovesProbeWhenPNGNeverArrives() throws {

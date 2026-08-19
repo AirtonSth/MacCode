@@ -4834,6 +4834,11 @@ final class BotsWindowTests: XCTestCase {
         }
         func exec(name: String, command: [String]) throws -> Data { png }
         func remove(name: String) throws { containers[name] = nil }
+        func removeMatching(namePrefix: String) throws {
+            for name in containers.keys where name.hasPrefix(namePrefix) {
+                containers[name] = nil
+            }
+        }
     }
 
     func test_e2eThreeRuntimesUseShippedStudioSaveAndSend() throws {
