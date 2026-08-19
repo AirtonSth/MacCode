@@ -110,6 +110,26 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View {
     }
 }
 
+/// Provider monogram chip at the leading edge of a thread row. Agent
+/// App and Desk mount the same chip — the rails must not fork it.
+public struct AgentThreadProviderMonogram: View {
+    public let provider: AgentProvider
+
+    public init(provider: AgentProvider) {
+        self.provider = provider
+    }
+
+    public var body: some View {
+        Text(AgentThreadRailRowCopy.monogram(for: provider))
+            .font(.system(size: 9, weight: .bold, design: .rounded))
+            .foregroundColor(DS.Palette.textSecondary)
+            .frame(width: 16, height: 16)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .accessibilityHidden(true)
+    }
+}
+
 public extension AgentChatThreadRow where Leading == EmptyView, Trailing == EmptyView {
     init(
         title: String,

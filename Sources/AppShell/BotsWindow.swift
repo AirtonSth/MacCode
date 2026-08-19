@@ -451,6 +451,17 @@ public enum BotBrainInspectorPane: String, CaseIterable, Identifiable {
 
 // MARK: - View model
 
+/// Provider · model chip data for one desk thread-rail row.
+public struct BotDeskThreadRailRouting: Equatable {
+    public let provider: AgentProvider
+    public let model: String
+
+    public init(provider: AgentProvider, model: String) {
+        self.provider = provider
+        self.model = model
+    }
+}
+
 @MainActor
 public final class BotsViewModel: ObservableObject {
     public static let assistantPlaceholder = BotsDeskFollowThrough.noRouterPlaceholder
@@ -2843,6 +2854,7 @@ public final class BotsViewModel: ObservableObject {
         studioSupportReloadCountForTesting += 1
         do {
             conversationListCountForTesting += 1
+            deskThreadRailRoutingCache.removeAll()
             conversations = try botStore.listConversations(botID: id)
             if let remembered = selectedConversationByBot[id],
                let found = conversations.first(where: { $0.id == remembered }) {
@@ -3112,6 +3124,26 @@ public final class BotsViewModel: ObservableObject {
 
     private func persistDeskThreadRailWidth() {
         UserDefaults.standard.set(Double(deskThreadRailWidth), forKey: Self.deskThreadRailWidthDefaultsKey)
+    }
+
+    /// Memo for thread-rail provider · model chips: one repo point-get
+    /// per linked thread instead of one per row per render (the desk
+    /// composer republishes this model on every keystroke).
+    private var deskThreadRailRoutingCache: [AgentThreadID: BotDeskThreadRailRouting] = [:]
+
+    /// Provider · model for a desk thread row — the same chip data the
+    /// Agent App rail shows. The linked run's thread wins; a never-run
+    /// conversation shows what the desk would route it to today.
+    public func deskThreadRailRouting(for conversation: BotConversation) -> BotDeskThreadRailRouting {
+        if let threadID = conversation.linkedAgentThreadID {
+            if let cached = deskThreadRailRoutingCache[threadID] { return cached }
+            if let thread = try? context.threadRepo.get(id: threadID) {
+                let routing = BotDeskThreadRailRouting(provider: thread.provider, model: thread.model)
+                deskThreadRailRoutingCache[threadID] = routing
+                return routing
+            }
+        }
+        return BotDeskThreadRailRouting(provider: deskRouting.provider, model: deskRouting.model)
     }
 
     /// The content column is never under the traffic lights: the sidebar
@@ -6713,20 +6745,42 @@ public struct BotsRootView: View {
         }
     }
 
+    /// Desk rows are the Agent App rail rows: same provider monogram,
+    /// same provider · model · time subtitle, same status marks. The
+    /// rails must not fork the chrome.
     private func deskThreadRow(_ conversation: BotConversation) -> some View {
         let unread = conversation.unread || conversation.attentionState == .unreadActivity
-        let status: AgentChatThreadStatusMark = conversation.attentionState == .working
-            ? .running
-            : (unread ? .unread : .hidden)
+        let running = conversation.attentionState == .working
+        let status: AgentChatThreadStatusMark = {
+            if running { return .running }
+            if conversation.pinned {
+                return .symbol(name: "pin.fill", color: DS.Palette.textTertiary, size: 9)
+            }
+            if !unread {
+                return .symbol(name: "circle.fill", color: DS.Palette.textTertiary, size: 7)
+            }
+            return .hidden
+        }()
+        let routing = vm.deskThreadRailRouting(for: conversation)
+        let title = AgentThreadTitle.display(
+            conversation.title.isEmpty ? AgentThreadTitle.defaultTitle : conversation.title
+        )
         return AgentChatThreadRow(
-            title: conversation.title.isEmpty ? "New thread" : conversation.title,
-            subtitle: AgentChatTranscriptChrome.relativeTimestamp(conversation.updatedAt),
-            unread: false,
+            title: title,
+            subtitle: AgentThreadRailRowCopy.subtitle(
+                provider: routing.provider,
+                model: routing.model,
+                updatedAt: conversation.updatedAt
+            ),
+            unread: unread,
             selected: vm.selectedConversation?.id == conversation.id,
             status: status,
             identifier: "bots.desk.thread.row.\(conversation.id.value.uuidString)",
-            onSelect: { vm.selectDeskThread(conversation.id) }
+            onSelect: { vm.selectDeskThread(conversation.id) },
+            leading: { AgentThreadProviderMonogram(provider: routing.provider) },
+            trailing: { EmptyView() }
         )
+        .help(conversation.title.isEmpty ? AgentThreadTitle.defaultTitle : conversation.title)
     }
 
     private var deskQueuedFollowUps: some View {

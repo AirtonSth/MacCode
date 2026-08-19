@@ -1018,11 +1018,10 @@ final class PaneActionTests: XCTestCase {
         XCTAssertFalse(titleLabels.isEmpty,
                        "the visible-sidebar chrome must still show the selected workspace title over the workspace area")
 
-        let split = try XCTUnwrap(allSubviews(of: content).first { $0 is NSSplitView } as? NSSplitView)
-        let splitTop = try XCTUnwrap(content.constraints.first {
-            ($0.firstItem as? NSSplitView) === split && $0.firstAttribute == .top && $0.secondAttribute == .top
-        })
-        XCTAssertEqual(splitTop.constant, 0, accuracy: 0.1,
+        let columns = try XCTUnwrap(
+            allSubviews(of: content).first { $0.accessibilityIdentifier() == "shell.columns" }
+        )
+        XCTAssertEqual(columns.frame.maxY, content.bounds.maxY, accuracy: 0.1,
                        "the sidebar background must reach the top edge while the workspace area handles its own title inset")
 
         let rootPane = try XCTUnwrap(allSubviews(of: content).first { $0 is PaneRootView } as? PaneRootView)

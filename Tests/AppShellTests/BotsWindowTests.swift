@@ -760,6 +760,41 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(slice.contains("padding(.vertical, DS.Space.xl)"))
     }
 
+    func test_deskThreadRowsMatchAgentAppRail_becauseTheDeskMustNotForkTheChrome() throws {
+        // WHY: the Desk rail read as a different app — no provider
+        // monogram, a time-only subtitle, no resting status dot. Desk and
+        // Agent App mount the same AgentChatThreadRow, so the row inputs
+        // must stay the Agent App ones (bug report: "deveria ser
+        // exatamente igual ao do agent app").
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private func deskThreadRow") else {
+            return XCTFail("desk thread row must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private var deskQueuedFollowUps")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("AgentThreadProviderMonogram(provider:"),
+                      "desk rows need the same provider monogram chip as the Agent App rail")
+        XCTAssertTrue(slice.contains("AgentThreadRailRowCopy.subtitle"),
+                      "desk rows need the provider · model · time subtitle, not time alone")
+        XCTAssertTrue(slice.contains("pin.fill"))
+        XCTAssertTrue(slice.contains("circle.fill"),
+                      "resting rows show the same neutral dot as the Agent App rail")
+        XCTAssertTrue(slice.contains("AgentThreadTitle.display"))
+        XCTAssertFalse(slice.contains("AgentChatTranscriptChrome.relativeTimestamp"),
+                       "the time-only subtitle was the fork")
+        let agent = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
+        XCTAssertTrue(agent.contains("AgentThreadProviderMonogram(provider: t.provider)"),
+                      "Agent App must mount the shared monogram, not an inline copy")
+
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let conversation = BotConversation(botID: BotID(), title: "never ran")
+        let routing = vm.deskThreadRailRouting(for: conversation)
+        XCTAssertEqual(routing.provider, vm.deskRunProvider,
+                       "a never-run conversation must show the routing the desk would use today")
+    }
+
     func test_deskHeaderOpenInNewWindowSitsAfterStudioCog() throws {
         // WHY: Agentic pops a workspace with rectangle.on.rectangle. The
         // cog row is the bot chrome; the pop-out must sit after Studio and

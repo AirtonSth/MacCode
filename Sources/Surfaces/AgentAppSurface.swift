@@ -11805,13 +11805,7 @@ public struct AgentAppView: View {
                 runningIdentifier: "agent.thread.row.running.\(t.id.value.uuidString)",
                 onSelect: { selectThreadRow(t) },
                 leading: {
-                    Text(AgentThreadRailRowCopy.monogram(for: t.provider))
-                        .font(.system(size: 9, weight: .bold, design: .rounded))
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .frame(width: 16, height: 16)
-                        .background(DS.Palette.surfaceRaised)
-                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                        .accessibilityHidden(true)
+                    AgentThreadProviderMonogram(provider: t.provider)
                 },
                 trailing: {
                     if AgentThreadRowPresentation.showsSelectionCheck(
