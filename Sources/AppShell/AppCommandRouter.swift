@@ -5537,7 +5537,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     currentPath: cleaned["PATH"] ?? basePath,
                     managedBin: managedBin
                 )
-                return cleaned
+                return applyDesktopChildEnvironment(cleaned, threadId: threadId, context: context)
             }
             env.merge(tokenSaverEnv) { _, new in new }
             // Re-assert managed bin first after any Token Saver PATH rewrite.
@@ -5547,11 +5547,34 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     managedBin: managedBin
                 )
             }
+            return applyDesktopChildEnvironment(env, threadId: threadId, context: context)
         } else {
             // No thread context: keep provider tag only; scrub any residual TS keys.
             return Self.scrubTokenSaverEnvironment(env)
         }
-        return env
+    }
+
+    /// Docker-with-GUI child: stub macos-harness and hide host docker. Other
+    /// kinds pass through. Applied after PATH is finalized so stubs win.
+    private func applyDesktopChildEnvironment(
+        _ env: [String: String],
+        threadId: AgentThreadID,
+        context: AppContext
+    ) -> [String: String] {
+        guard let conversation = try? context.botStore.conversationLinked(to: threadId),
+              let bot = try? context.botStore.get(id: conversation.botID),
+              let revisionID = bot.currentRevisionID,
+              let revision = try? context.botStore.getRevision(id: revisionID) else {
+            return env
+        }
+        let stub = context.appSupportDirectory
+            .appendingPathComponent("bot-desktop-stubs", isDirectory: true)
+            .appendingPathComponent(revision.desktopKind.rawValue, isDirectory: true)
+        return BotDesktopChildEnvironment.apply(
+            kind: revision.desktopKind,
+            env: env,
+            stubDirectory: stub
+        )
     }
 
     /// Removes Token Saver env keys. For no-thread contexts also drops managed bin from

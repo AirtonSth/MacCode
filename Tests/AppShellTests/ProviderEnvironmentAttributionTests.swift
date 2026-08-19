@@ -664,4 +664,68 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let unbound = router.providerEnvironment(provider: .grok, instanceId: nil, threadId: other.id)
         XCTAssertNil(unbound[BotSelfConfigCatalog.callerEnvironmentKey])
     }
+
+    @MainActor
+    func test_providerEnvironmentStubsHarnessOnDockerDesktop() throws {
+        // WHY: dockerDesktop child PATH must win with a failing macos-harness
+        // and must not keep DOCKER_HOST. this-Mac runs must not get those stubs.
+        let appSupport = NSTemporaryDirectory() + "RC2DockerPath-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: ctx)
+        let dockerBot = try ctx.botStore.create(
+            name: "Piper",
+            title: "",
+            description: "",
+            provider: .claude,
+            desktopKind: .dockerDesktop
+        )
+        let dockerThread = try admittedThread(in: ctx, provider: .claude)
+        try ctx.botStore.upsertConversation(
+            BotConversation(botID: dockerBot.id, title: "Desk", linkedAgentThreadID: dockerThread.id)
+        )
+        let dockerEnv = router.providerEnvironment(
+            provider: .claude,
+            instanceId: nil,
+            threadId: dockerThread.id
+        )
+        XCTAssertNil(dockerEnv["DOCKER_HOST"])
+        XCTAssertNil(dockerEnv["DOCKER_CONTEXT"])
+        let stub = URL(fileURLWithPath: appSupport, isDirectory: true)
+            .appendingPathComponent("bot-desktop-stubs", isDirectory: true)
+            .appendingPathComponent("dockerDesktop", isDirectory: true)
+        let path = try XCTUnwrap(dockerEnv["PATH"])
+        XCTAssertTrue(
+            path.split(separator: ":").map(String.init).contains(stub.path),
+            "dockerDesktop PATH must include the stub dir, got \(path)"
+        )
+        XCTAssertTrue(
+            FileManager.default.isExecutableFile(atPath: stub.appendingPathComponent("macos-harness").path)
+        )
+        XCTAssertTrue(
+            FileManager.default.isExecutableFile(atPath: stub.appendingPathComponent("docker").path)
+        )
+
+        let hostBot = try ctx.botStore.create(
+            name: "Scout",
+            title: "",
+            description: "",
+            provider: .claude,
+            desktopKind: .logicalExecutionSpace
+        )
+        let hostThread = try admittedThread(in: ctx, provider: .claude)
+        try ctx.botStore.upsertConversation(
+            BotConversation(botID: hostBot.id, title: "Desk", linkedAgentThreadID: hostThread.id)
+        )
+        let hostEnv = router.providerEnvironment(
+            provider: .claude,
+            instanceId: nil,
+            threadId: hostThread.id
+        )
+        let hostPath = hostEnv["PATH"] ?? ""
+        XCTAssertFalse(
+            hostPath.split(separator: ":").map(String.init).contains(stub.path),
+            "this-Mac PATH must not include the dockerDesktop stub dir"
+        )
+    }
 }
