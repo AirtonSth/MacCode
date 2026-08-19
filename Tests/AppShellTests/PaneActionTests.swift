@@ -1149,6 +1149,41 @@ final class PaneActionTests: XCTestCase {
                        "the restored sidebar material must cover the columns height")
     }
 
+    func test_sidebarToggleRemainsReachableAcrossRepeatedHideShowCycles_becauseTransparentHeaderCannotInterceptClicks() throws {
+        // WHY: the collapsed header spans the full title row. Fading it to
+        // alpha zero without hiding it leaves an invisible hit-test layer over
+        // the restored sidebar controls, so the next toggle click does nothing.
+        let (ctx, router) = try makeContext()
+        _ = try router.createWorkspace(name: "repeat-toggle", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        controller.window.setFrame(NSRect(x: 0, y: 0, width: 1200, height: 720), display: false)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        let content = try XCTUnwrap(controller.window.contentView)
+
+        for cycle in 1...2 {
+            NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+            content.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
+
+            let restore = try XCTUnwrap(
+                allSubviews(of: content).compactMap { $0 as? NSButton }
+                    .first { $0.accessibilityIdentifier() == "shell.collapsed.toggleSidebar" }
+            )
+            let collapsedHeader = try XCTUnwrap(restore.superview)
+            XCTAssertFalse(collapsedHeader.isHidden)
+
+            restore.performClick(nil)
+            content.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
+
+            XCTAssertTrue(collapsedHeader.isHidden,
+                          "restored cycle \(cycle) must remove the transparent collapsed header from hit testing")
+            XCTAssertNil(collapsedHeader.hitTest(
+                NSPoint(x: collapsedHeader.bounds.midX, y: collapsedHeader.bounds.midY)
+            ))
+        }
+    }
+
     func test_sidebarSeamStaysSeamlessAndExactAcrossToggleCycle_becauseDriftDrewAStrayLine() throws {
         // WHY: the old NSSplitView toggle drew a 1px near-black divider
         // strip (the reported "strange line") and landed off target after

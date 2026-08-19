@@ -396,6 +396,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebarCollapsed.toggle()
         sidebarToggleGeneration += 1
         let generation = sidebarToggleGeneration
+        let collapsed = sidebarCollapsed
         shellLog.debug("sidebar.toggle collapsed=\(self.sidebarCollapsed, privacy: .public)")
         sidebar.view.isHidden = false
         sidebarResizeHandle.isHidden = sidebarCollapsed
@@ -412,8 +413,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             window.contentView?.layoutSubtreeIfNeeded()
         }, completionHandler: { [weak self] in
             guard let self, generation == self.sidebarToggleGeneration else { return }
-            // Off-window is invisible but still VoiceOver-reachable.
-            self.sidebar.view.isHidden = self.sidebarCollapsed
+            // Off-window or transparent views remain hit-testable / VoiceOver-reachable.
+            self.sidebar.view.isHidden = collapsed
+            self.collapsedWorkspaceHeader.isHidden = !collapsed
         })
         headerVisibilityAnimated = false
         NotificationCenter.default.post(
