@@ -160,19 +160,29 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
     }
 
     public static func defaultRun(_ args: [String]) throws -> Data {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["docker"] + args
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
-        try process.run()
-        process.waitUntilExit()
-        let data = stdout.fileHandleForReading.readDataToEndOfFile()
-        if process.terminationStatus != 0 {
+        let result = try runProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/env"),
+            arguments: ["docker"] + args
+        )
+        if result.terminationStatus != 0 {
             throw BotComputerGuestError.dockerUnavailable
         }
-        return data
+        return result.data
+    }
+
+    static func runProcess(
+        executableURL: URL,
+        arguments: [String]
+    ) throws -> (data: Data, terminationStatus: Int32) {
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (data, process.terminationStatus)
     }
 }

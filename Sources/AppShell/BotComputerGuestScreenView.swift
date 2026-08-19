@@ -66,10 +66,26 @@ final class BotComputerGuestWebView: WKWebView {
     }
 }
 
+enum BotComputerGuestLaunchState: Equatable {
+    case idle
+    case starting
+    case failed(String)
+
+    var isStarting: Bool {
+        self == .starting
+    }
+
+    var failureMessage: String? {
+        guard case .failed(let message) = self else { return nil }
+        return message
+    }
+}
+
 /// Shared Desk/Studio chrome: live screen plus Start / Stop / Terminal.
 struct BotComputerGuestCanvas: View {
     let url: URL?
     let running: Bool
+    let launchState: BotComputerGuestLaunchState
     let startIdentifier: String
     let stopIdentifier: String
     let terminalIdentifier: String
@@ -97,9 +113,19 @@ struct BotComputerGuestCanvas: View {
                         .disabled(!running)
                         .accessibilityIdentifier(terminalIdentifier)
                 } else {
-                    Button("Start", action: onStart)
-                        .buttonStyle(.borderedProminent)
-                        .accessibilityIdentifier(startIdentifier)
+                    Button(action: onStart) {
+                        HStack(spacing: DS.Space.xs) {
+                            if launchState.isStarting {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Text(startButtonTitle)
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(launchState.isStarting)
+                    .accessibilityLabel(startButtonAccessibilityLabel)
+                    .accessibilityIdentifier(startIdentifier)
                 }
                 if let onOpenInNewWindow {
                     DSIconButton("rectangle.on.rectangle", help: "Open in New Window") {
@@ -115,12 +141,51 @@ struct BotComputerGuestCanvas: View {
                     .clipped()
                     .accessibilityIdentifier(screenIdentifier)
             } else {
+                emptyScreen
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var emptyScreen: some View {
+        VStack(spacing: DS.Space.sm) {
+            switch launchState {
+            case .idle:
                 Text("Start the Linux desktop to use this machine.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
-                    .frame(maxWidth: .infinity, minHeight: 160, alignment: .center)
-                    .accessibilityIdentifier(screenIdentifier)
+            case .starting:
+                ProgressView()
+                    .controlSize(.small)
+                Text("Starting Linux desktop…")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                Text("First launch can take a few minutes while Docker prepares the desktop.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+            case .failed(let message):
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(DS.Palette.warning)
+                    .accessibilityHidden(true)
+                Text(message)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
             }
         }
+        .padding(DS.Space.lg)
+        .frame(maxWidth: .infinity, minHeight: 160, alignment: .center)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(screenIdentifier)
+    }
+
+    private var startButtonTitle: String {
+        if launchState.isStarting { return "Starting…" }
+        return launchState.failureMessage == nil ? "Start" : "Try Again"
+    }
+
+    private var startButtonAccessibilityLabel: String {
+        launchState.isStarting ? "Starting Linux desktop" : startButtonTitle
     }
 }

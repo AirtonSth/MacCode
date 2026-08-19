@@ -4942,6 +4942,8 @@ final class BotsWindowTests: XCTestCase {
         var created: [String] = []
         var png = BotComputerGuestObserve.pngSignature + Data(repeating: 1, count: 16)
         var containers: [String: BotComputerContainerInspect] = [:]
+        var startError: Error?
+        var startCallCount = 0
 
         func info() throws -> String { "ok" }
         func imageExists(tag: String) throws -> Bool { true }
@@ -4956,6 +4958,8 @@ final class BotsWindowTests: XCTestCase {
             return options.name
         }
         func start(name: String) throws {
+            startCallCount += 1
+            if let startError { throw startError }
             containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49152)
         }
         func stop(name: String) throws {
@@ -5063,6 +5067,83 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.isGuestRunning(piper.id))
     }
 
+    func test_presentGuestDesktopPublishesLaunchProgressAndSupportsRetry() async throws {
+        // WHY: a slow or failed Docker launch must acknowledge the user's click
+        // immediately, reject duplicate starts, and leave a working retry path.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let fake = RecordingDocker()
+        fake.startError = BotComputerGuestError.dockerUnavailable
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+
+        vm.presentGuestDesktop(botID: piper.id)
+        XCTAssertEqual(vm.guestLaunchState(for: piper.id), .starting)
+        vm.presentGuestDesktop(botID: piper.id)
+
+        var deadline = Date().addingTimeInterval(2)
+        while vm.guestLaunchState(for: piper.id) == .starting, Date() < deadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(
+            vm.guestLaunchState(for: piper.id),
+            .failed("Could not start the Linux desktop. Make sure Docker is running, then try again.")
+        )
+        XCTAssertEqual(fake.startCallCount, 1, "an acknowledged start must suppress duplicate work")
+        XCTAssertFalse(vm.isGuestRunning(piper.id))
+
+        fake.startError = nil
+        vm.presentGuestDesktop(botID: piper.id)
+        XCTAssertEqual(vm.guestLaunchState(for: piper.id), .starting)
+
+        deadline = Date().addingTimeInterval(2)
+        while !vm.isGuestRunning(piper.id), Date() < deadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(vm.isGuestRunning(piper.id))
+        XCTAssertEqual(vm.guestLaunchState(for: piper.id), .idle)
+        XCTAssertEqual(fake.startCallCount, 2)
+        XCTAssertEqual(vm.guestScreenURL(for: piper.id)?.host, "127.0.0.1")
+    }
+
+    func test_dockerDesktopAdmissionStartsGuestOffMainAndFailsClosedUntilReady() async throws {
+        // WHY: pressing Send must never provision Docker synchronously on the
+        // SwiftUI main thread; admission stays closed while the shared launch
+        // task prepares and validates this bot's guest screen.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.desktopKindOverrideForTesting = .dockerDesktop
+        vm.dockerGuestReadyOverrideForTesting = nil
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+
+        XCTAssertThrowsError(try vm.admitDesktopSend(bot: piper))
+        XCTAssertEqual(vm.guestLaunchState(for: piper.id), .starting)
+        XCTAssertFalse(vm.send("open the linux screen"))
+        XCTAssertEqual(vm.errorMessage, "Linux desktop is starting. Try again when it is ready.")
+
+        let deadline = Date().addingTimeInterval(2)
+        while !vm.isGuestRunning(piper.id), Date() < deadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(vm.isGuestRunning(piper.id))
+        XCTAssertEqual(vm.guestLaunchState(for: piper.id), .idle)
+        XCTAssertEqual(fake.startCallCount, 1, "repeated admission must share the active launch")
+        XCTAssertNoThrow(try vm.admitDesktopSend(bot: piper))
+    }
+
     func test_deskDockerGuestScreenLivesOnMainCanvas() throws {
         // WHY: the live Linux screen belongs in the inspector desktop
         // pane, not above the chat timeline.
@@ -5087,6 +5168,62 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(canvas.contains("bots.desk.desktop.openInNewWindow"))
         XCTAssertTrue(canvas.contains("acceptsFirstResponder"))
         XCTAssertFalse(canvas.contains("View-only noVNC"))
+    }
+
+    func test_guestCanvasAcknowledgesSlowStartAndOffersRetryAfterFailure() throws {
+        // WHY: Docker may need minutes to prepare the first desktop. The click
+        // must remain visibly acknowledged, and a failed launch must explain
+        // the recovery path instead of leaving the unchanged Start screen.
+        let canvas = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotComputerGuestScreenView.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(canvas.contains("ProgressView()"))
+        XCTAssertTrue(canvas.contains("Starting…"))
+        XCTAssertTrue(canvas.contains("Try Again"))
+        XCTAssertTrue(canvas.contains("First launch can take a few minutes"))
+    }
+
+    func test_guestCanvasStartingStateRendersOffscreen() throws {
+        // WHY: the acknowledged launch state must produce a real macOS view,
+        // not only compile-time copy that never reaches the rendered canvas.
+        let canvas = BotComputerGuestCanvas(
+            url: nil,
+            running: false,
+            launchState: .starting,
+            startIdentifier: "test.desktop.start",
+            stopIdentifier: "test.desktop.stop",
+            terminalIdentifier: "test.desktop.terminal",
+            screenIdentifier: "test.desktop.screen",
+            onStart: {},
+            onStop: {},
+            onTerminal: {}
+        )
+        .frame(width: 360, height: 220)
+        let hosting = NSHostingView(rootView: canvas)
+        hosting.frame = NSRect(x: 0, y: 0, width: 360, height: 220)
+        hosting.wantsLayer = true
+        let window = NSWindow(
+            contentRect: hosting.bounds,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.layoutIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        guard let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
+            return XCTFail("starting canvas must create an offscreen bitmap")
+        }
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        XCTAssertGreaterThan(png.count, 2_000)
+        if let artifact = ProcessInfo.processInfo.environment["REMOTE_CODE_BOT_GUEST_ARTIFACT"] {
+            try png.write(to: URL(fileURLWithPath: artifact), options: .atomic)
+        }
     }
 
     func test_viewModelWiresBundledComputerGuestRecipe() throws {

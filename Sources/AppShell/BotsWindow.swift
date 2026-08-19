@@ -1991,7 +1991,14 @@ public final class BotsViewModel: ObservableObject {
         do {
             try admitDesktopSend(bot: bot)
         } catch {
-            errorMessage = "Docker desktop is not ready."
+            switch guestLaunchState(for: bot.id) {
+            case .starting:
+                errorMessage = "Linux desktop is starting. Try again when it is ready."
+            case .failed(let message):
+                errorMessage = message
+            case .idle:
+                errorMessage = "Docker desktop is not ready."
+            }
             return false
         }
         lastSendAcknowledgedOnScreenForTesting = screen
@@ -4916,6 +4923,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public var lastGuestScreenURL: URL?
     @Published public var guestScreenURLByBot: [UUID: URL] = [:]
     @Published public var guestRunningByBot: [UUID: Bool] = [:]
+    @Published private(set) var guestLaunchStateByBot: [UUID: BotComputerGuestLaunchState] = [:]
 
     func guestScreenURL(for botID: BotID) -> URL? {
         guestScreenURLByBot[botID.value]
@@ -4925,9 +4933,16 @@ public final class BotsViewModel: ObservableObject {
         guestRunningByBot[botID.value] == true
     }
 
+    func guestLaunchState(for botID: BotID) -> BotComputerGuestLaunchState {
+        guestLaunchStateByBot[botID.value] ?? .idle
+    }
+
     func rememberGuestScreen(url: URL, botID: BotID, running: Bool) {
         guestScreenURLByBot[botID.value] = url
         guestRunningByBot[botID.value] = running
+        if running {
+            guestLaunchStateByBot[botID.value] = .idle
+        }
         if selectedBotID == botID {
             lastGuestScreenURL = url
         }
@@ -4951,8 +4966,15 @@ public final class BotsViewModel: ObservableObject {
     }
 
     func presentGuestDesktop(botID: BotID) {
-        if dockerGuestReadyOverrideForTesting != nil { return }
-        guard let service = computerGuestService else { return }
+        guard guestLaunchState(for: botID) != .starting else { return }
+        guard dockerGuestReadyOverrideForTesting == nil,
+              let service = computerGuestService else {
+            guestLaunchStateByBot[botID.value] = .failed(
+                "Docker is unavailable. Start Docker, then try again."
+            )
+            return
+        }
+        guestLaunchStateByBot[botID.value] = .starting
         Task.detached {
             do {
                 let ready = try service.provision(botID: botID)
@@ -4964,7 +4986,9 @@ public final class BotsViewModel: ObservableObject {
                 await MainActor.run {
                     self.dockerGuestProbeReason = String(describing: error)
                     self.guestRunningByBot[botID.value] = false
-                    self.errorMessage = "Could not start the Linux desktop."
+                    self.guestLaunchStateByBot[botID.value] = .failed(
+                        "Could not start the Linux desktop. Make sure Docker is running, then try again."
+                    )
                     self.objectWillChange.send()
                 }
             }
@@ -4976,6 +5000,7 @@ public final class BotsViewModel: ObservableObject {
         do {
             try service.stop(botID: botID)
             guestRunningByBot[botID.value] = false
+            guestLaunchStateByBot[botID.value] = .idle
             objectWillChange.send()
         } catch {
             errorMessage = "Could not stop the Linux desktop."
@@ -4987,6 +5012,7 @@ public final class BotsViewModel: ObservableObject {
         do {
             try service.openTerminal(botID: botID)
             guestRunningByBot[botID.value] = true
+            guestLaunchStateByBot[botID.value] = .idle
             objectWillChange.send()
         } catch {
             errorMessage = "Could not open a guest terminal."
@@ -5004,12 +5030,11 @@ public final class BotsViewModel: ObservableObject {
         let ready: Bool
         if let dockerGuestReadyOverrideForTesting {
             ready = dockerGuestReadyOverrideForTesting
-        } else if kind == .dockerDesktop, dockerGuestReadyOverrideForTesting == nil {
-            guard let service = computerGuestService else {
-                throw BotComputerGuestError.notReady
+        } else if kind == .dockerDesktop {
+            ready = isGuestRunning(bot.id)
+            if !ready {
+                presentGuestDesktop(botID: bot.id)
             }
-            _ = try service.provision(botID: bot.id)
-            ready = true
         } else {
             ready = dockerGuestReady
         }
@@ -6022,6 +6047,7 @@ public struct BotsRootView: View {
                 BotComputerGuestCanvas(
                     url: (vm.studioDraft.botID.flatMap { vm.guestScreenURL(for: $0) }) ?? vm.lastGuestScreenURL,
                     running: vm.studioDraft.botID.map { vm.isGuestRunning($0) } ?? false,
+                    launchState: vm.studioDraft.botID.map { vm.guestLaunchState(for: $0) } ?? .idle,
                     startIdentifier: "bots.studio.desktop.start",
                     stopIdentifier: "bots.studio.desktop.stop",
                     terminalIdentifier: "bots.studio.desktop.terminal",
@@ -6344,6 +6370,7 @@ public struct BotsRootView: View {
                 BotComputerGuestCanvas(
                     url: vm.guestScreenURL(for: bot.id),
                     running: vm.isGuestRunning(bot.id),
+                    launchState: vm.guestLaunchState(for: bot.id),
                     startIdentifier: "bots.desk.desktop.start",
                     stopIdentifier: "bots.desk.desktop.stop",
                     terminalIdentifier: "bots.desk.desktop.terminal",
@@ -7472,6 +7499,7 @@ private struct BotGuestDesktopRoot: View {
                 BotComputerGuestCanvas(
                     url: vm.guestScreenURL(for: bot.id),
                     running: vm.isGuestRunning(bot.id),
+                    launchState: vm.guestLaunchState(for: bot.id),
                     startIdentifier: "bots.desk.desktop.window.start",
                     stopIdentifier: "bots.desk.desktop.window.stop",
                     terminalIdentifier: "bots.desk.desktop.window.terminal",
