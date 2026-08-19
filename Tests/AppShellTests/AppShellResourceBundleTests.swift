@@ -75,6 +75,21 @@ final class AppShellResourceBundleTests: XCTestCase {
         )
     }
 
+    func test_computerGuestRecipeURL_findsDockerfile() throws {
+        // WHY: BotsViewModel must pass this URL into proveReady so Studio
+        // can build remotecode/computer:local without Bundle.module.
+        let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: recipe.appendingPathComponent("Dockerfile").path)
+        )
+        let dockerfile = try String(
+            contentsOf: recipe.appendingPathComponent("Dockerfile"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(dockerfile.lowercased().contains("debian"))
+        XCTAssertFalse(dockerfile.lowercased().contains("alpine"))
+    }
+
     @MainActor
     func test_bundledAtlas_loadsFromResolvedBundle() throws {
         // Live unit-test environment: SPM product layout under .build must resolve.

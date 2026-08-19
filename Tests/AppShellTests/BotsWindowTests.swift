@@ -4812,6 +4812,22 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, 1)
     }
 
+    func test_viewModelWiresBundledComputerGuestRecipe() throws {
+        // WHY: recipeContext=nil left Studio unable to build the bundled
+        // ComputerGuest image, so the Docker radio never enabled.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let wired = try XCTUnwrap(vm.computerGuestService?.recipeContextURL)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: wired.appendingPathComponent("Dockerfile").path)
+        )
+        let dockerfile = try String(
+            contentsOf: wired.appendingPathComponent("Dockerfile"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(dockerfile.lowercased().contains("debian"))
+    }
+
     func test_thisMacRuntimesPersistWhenDockerIsUnavailable() throws {
         // WHY: this-Mac create/save/send must work with Docker forced off.
         // Docker-with-GUI Save/Send must be refused without a PNG.

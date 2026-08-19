@@ -703,7 +703,8 @@ public final class BotsViewModel: ObservableObject {
         self.settingsStore = SettingsStore(db: context.db)
         self.computerGuestService = BotComputerGuestService(
             appSupport: context.appSupportDirectory,
-            docker: BotComputerDockerCLI()
+            docker: BotComputerDockerCLI(),
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
         )
         restoreQueuedFollowUpsIfNeeded()
         restoreComposerDraftsIfNeeded()
