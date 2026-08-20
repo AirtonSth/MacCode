@@ -2085,8 +2085,8 @@ public final class SidebarViewModel: ObservableObject {
             return "Agent run in thread \"\(display)\""
         }
         if let first = busySurfaceTitles.first {
-            let display = first.isEmpty ? "terminal" : first
-            return "Terminal job running in \"\(display)\""
+            let display = first.isEmpty ? "surface" : first
+            return "Activity running in \"\(display)\""
         }
         return nil
     }

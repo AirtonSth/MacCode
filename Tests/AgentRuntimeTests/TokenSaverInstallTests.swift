@@ -388,7 +388,8 @@ final class TokenSaverInstallTests: XCTestCase {
         ]
         let claudeABI = [
             "--print", "--permission-mode", "plan",
-            "--tools", "Read,Glob,Grep", "--no-session-persistence"
+            "--tools", "Read,Glob,Grep", "--no-session-persistence",
+            "--mcp-config", #"{"mcpServers":{"remotecode-bot-self-config":{"command":"RemoteCodeDistillService"}}}"#
         ]
         let codexABI = [
             "exec", "--strict-config", "--ephemeral", "--ignore-user-config",

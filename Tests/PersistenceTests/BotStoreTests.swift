@@ -159,6 +159,116 @@ final class BotStoreTests: XCTestCase {
         XCTAssertEqual(try store.listConversations(botID: quinn.id).map(\.title), ["Inbox"])
     }
 
+    func test_listAttentionHidesDeletedConversationItems_becauseAnErasedThreadCannotNeedTheUser() throws {
+        // WHY: conversation-scoped Attention rows are retained as history,
+        // but Clear All removes the thread that could make them actionable.
+        // Live consumers must not turn that archive into a Needs-you badge.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .grok)
+        let conversation = BotConversation(botID: bot.id, title: "Old request")
+        try store.upsertConversation(conversation)
+        let scoped = BotAttentionItem(
+            botID: bot.id,
+            conversationID: conversation.id,
+            kind: .question,
+            title: "Needs you"
+        )
+        let unscoped = BotAttentionItem(botID: bot.id, kind: .handoff, title: "Direct handoff")
+        try store.upsertAttention(scoped)
+        try store.upsertAttention(unscoped)
+
+        try store.deleteConversations(botID: bot.id)
+
+        XCTAssertEqual(try store.listAttention().map(\.id), [unscoped.id])
+        XCTAssertEqual(
+            Set(try store.listAttention(includeAcknowledged: true).map(\.id)),
+            Set([scoped.id, unscoped.id]),
+            "archival reads may retain the erased thread receipt"
+        )
+    }
+
+    func test_orphanedLinkedConversationCannotNeedTheUser_becauseItsProviderThreadNoLongerExists() throws {
+        // WHY: deleting an Agent thread can leave the Bot conversation as
+        // history. That archived row has no live provider and must not keep a
+        // stale Needs-you or unread badge on the Bot roster.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .grok)
+        let thread = AgentThread(title: "Delegated request", provider: .grok, model: "test")
+        let threads = AgentThreadRepository(db: db)
+        try threads.upsert(thread)
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: "Delegated request",
+            unread: true,
+            attentionState: .needsAttention,
+            linkedAgentThreadID: thread.id
+        )
+        try store.upsertConversation(conversation)
+        try AgentRunRepository(db: db).upsert(
+            AgentRun(threadId: thread.id, provider: .grok, model: "test", status: .failed)
+        )
+        let attention = BotAttentionItem(
+            botID: bot.id,
+            conversationID: conversation.id,
+            kind: .question,
+            title: "Needs you"
+        )
+        try store.upsertAttention(attention)
+
+        XCTAssertEqual(try store.listAttention().map(\.id), [attention.id])
+        XCTAssertEqual(try store.conversation(id: conversation.id)?.attentionState, .needsAttention)
+
+        try threads.delete(id: thread.id)
+
+        XCTAssertTrue(try store.listAttention().isEmpty)
+        XCTAssertEqual(
+            try store.listAttention(includeAcknowledged: true).map(\.id),
+            [attention.id],
+            "archival receipts stay readable even when they are no longer actionable"
+        )
+        let archived = try XCTUnwrap(store.conversation(id: conversation.id))
+        XCTAssertEqual(archived.linkedAgentThreadID, thread.id)
+        XCTAssertEqual(archived.attentionState, .none)
+        XCTAssertFalse(archived.unread)
+        XCTAssertTrue(try store.listConversations(attentionStates: [.needsAttention]).isEmpty)
+    }
+
+    func test_emptyLinkedConversationCannotNeedTheUser_becauseNoProviderWorkExists() throws {
+        // WHY: the retired direct-mention path left linked thread shells with no
+        // message or run. A shell cannot contain an actionable Bot question and
+        // must not keep a permanent Needs-you badge on the roster.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .grok)
+        let thread = AgentThread(title: "Unused delegation", provider: .grok, model: "test")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: "Unused delegation",
+            unread: true,
+            attentionState: .needsAttention,
+            linkedAgentThreadID: thread.id
+        )
+        try store.upsertConversation(conversation)
+        let attention = BotAttentionItem(
+            botID: bot.id,
+            conversationID: conversation.id,
+            kind: .question,
+            title: "Needs you"
+        )
+        try store.upsertAttention(attention)
+
+        XCTAssertTrue(try store.listAttention().isEmpty)
+        let empty = try XCTUnwrap(store.conversation(id: conversation.id))
+        XCTAssertEqual(empty.attentionState, .none)
+        XCTAssertFalse(empty.unread)
+        XCTAssertTrue(try store.listConversations(attentionStates: [.needsAttention]).isEmpty)
+        XCTAssertEqual(try store.listAttention(includeAcknowledged: true).map(\.id), [attention.id])
+
+        try AgentRunRepository(db: db).upsert(
+            AgentRun(threadId: thread.id, provider: .grok, model: "test", status: .failed)
+        )
+
+        XCTAssertEqual(try store.listAttention().map(\.id), [attention.id])
+        XCTAssertEqual(try store.conversation(id: conversation.id)?.attentionState, .needsAttention)
+    }
+
     func test_duplicate_copiesProfileAndRoutinesButNotMemoryOrConversations() throws {
         let bot = try store.create(
             name: "Piper", title: "Scout", description: "Looks around",

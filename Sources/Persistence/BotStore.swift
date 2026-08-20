@@ -454,7 +454,32 @@ public final class BotStore: @unchecked Sendable {
         return try db.performSync { database in
             let marks = Array(repeating: "?", count: attentionStates.count).joined(separator: ",")
             let statement = try database.prepare(
-                Self.conversationSelect + " WHERE attention_state IN (\(marks)) ORDER BY updated_at DESC;"
+                Self.conversationSelect + """
+                 WHERE (
+                     CASE
+                         WHEN linked_agent_thread_id IS NOT NULL
+                          AND (
+                              NOT EXISTS (
+                                  SELECT 1 FROM agent_threads
+                                  WHERE agent_threads.id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                              )
+                              OR (
+                                  NOT EXISTS (
+                                      SELECT 1 FROM agent_messages
+                                      WHERE agent_messages.thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                                  )
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM agent_runs
+                                      WHERE agent_runs.thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                                  )
+                              )
+                          )
+                         THEN 'none'
+                         ELSE attention_state
+                     END
+                 ) IN (\(marks))
+                 ORDER BY updated_at DESC;
+                """
             )
             defer { statement.reset() }
             for (index, state) in attentionStates.enumerated() {
@@ -717,7 +742,39 @@ public final class BotStore: @unchecked Sendable {
     public func listAttention(includeAcknowledged: Bool = false) throws -> [BotAttentionItem] {
         try db.performSync { database in
             var sql = Self.attentionSelect
-            if !includeAcknowledged { sql += " WHERE acknowledged_at IS NULL" }
+            if !includeAcknowledged {
+                sql += """
+                     WHERE acknowledged_at IS NULL
+                       AND (
+                           conversation_id IS NULL
+                           OR EXISTS (
+                               SELECT 1
+                               FROM bot_conversations
+                               WHERE bot_conversations.id = bot_attention_items.conversation_id
+                                 AND (
+                                     bot_conversations.linked_agent_thread_id IS NULL
+                                     OR (
+                                         EXISTS (
+                                             SELECT 1
+                                             FROM agent_threads
+                                             WHERE agent_threads.id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                                         )
+                                         AND (
+                                             EXISTS (
+                                                 SELECT 1 FROM agent_messages
+                                                 WHERE agent_messages.thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                                             )
+                                             OR EXISTS (
+                                                 SELECT 1 FROM agent_runs
+                                                 WHERE agent_runs.thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                                             )
+                                         )
+                                     )
+                                 )
+                           )
+                       )
+                    """
+            }
             sql += " ORDER BY created_at DESC;"
             let statement = try database.prepare(sql)
             defer { statement.reset() }
@@ -1616,7 +1673,49 @@ public final class BotStore: @unchecked Sendable {
         """
 
     private static let conversationSelect = """
-        SELECT id, bot_id, title, pinned, hidden, unread, attention_state,
+        SELECT id, bot_id, title, pinned, hidden,
+               CASE
+                   WHEN linked_agent_thread_id IS NOT NULL
+                    AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM agent_threads
+                            WHERE agent_threads.id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                        )
+                        OR (
+                            NOT EXISTS (
+                                SELECT 1 FROM agent_messages
+                                WHERE agent_messages.thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM agent_runs
+                                WHERE agent_runs.thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                            )
+                        )
+                    )
+                   THEN 0
+                   ELSE unread
+               END AS unread,
+               CASE
+                   WHEN linked_agent_thread_id IS NOT NULL
+                    AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM agent_threads
+                            WHERE agent_threads.id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                        )
+                        OR (
+                            NOT EXISTS (
+                                SELECT 1 FROM agent_messages
+                                WHERE agent_messages.thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM agent_runs
+                                WHERE agent_runs.thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                            )
+                        )
+                    )
+                   THEN 'none'
+                   ELSE attention_state
+               END AS attention_state,
                linked_agent_thread_id, created_at, updated_at
         FROM bot_conversations
         """

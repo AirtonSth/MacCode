@@ -962,9 +962,12 @@ public final class CodexAppServerClient: @unchecked Sendable {
         let withTokenSaver = AgentSkillInstaller.tokenSaverProviderPrompt(base, environment: environment)
         // Additive only: systemPromptDirective (NOT alwaysOnClaudeDirectives —
         // those carry Claude-CLI-only MCP rules).
-        if withTokenSaver.isEmpty {
-            return BackgroundAwaitContinuation.systemPromptDirective
-        }
-        return withTokenSaver + "\n\n" + BackgroundAwaitContinuation.systemPromptDirective
+        let alwaysOn = BotPeerDelegation.appendingTurnContext(
+            to: BackgroundAwaitContinuation.systemPromptDirective
+                + "\n\n" + BotPeerDelegation.providerDirective,
+            environment: environment
+        )
+        if withTokenSaver.isEmpty { return alwaysOn }
+        return withTokenSaver + "\n\n" + alwaysOn
     }
 }

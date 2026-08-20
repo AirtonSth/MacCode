@@ -868,6 +868,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         defer { client.stop() }
         _ = try await client.initialize()
 
+        let turnContext = "REMOTE CODE RESOLVED IDENTITY ONLY: @quinn is Quinn"
         let response = try await client.startTurn(
             providerThreadId: "thread-app-server-1",
             for: AgentRunRequest(
@@ -875,7 +876,8 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 provider: .codex,
                 model: "gpt-5.5",
                 cwd: "/tmp/remotecode-app-server-test",
-                prompt: "explore"
+                prompt: "explore",
+                environment: [BotPeerDelegation.turnContextEnvironmentKey: turnContext]
             )
         )
         let instructions = try XCTUnwrap(
@@ -888,6 +890,14 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertTrue(
             instructions.contains("Background-await protocol"),
             "Codex must receive systemPromptDirective"
+        )
+        XCTAssertTrue(
+            instructions.contains(BotPeerDelegation.providerDirective),
+            "Codex must receive the AI-authored Bot delegation contract"
+        )
+        XCTAssertTrue(
+            instructions.contains(turnContext),
+            "Codex must receive this turn's identity-only Bot context"
         )
         XCTAssertFalse(
             instructions.contains(BackgroundAwaitContinuation.mcpToolAvailabilityDirective),

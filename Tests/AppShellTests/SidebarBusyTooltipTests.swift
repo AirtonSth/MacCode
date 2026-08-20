@@ -54,13 +54,13 @@ final class SidebarBusyTooltipTests: XCTestCase {
     // MARK: - Surface-busy
 
     func test_surfaceBusy_tooltipNamesTheSurface() {
-        // A busy terminal surface titled "bash" must appear in the tooltip so
+        // A busy surface titled "bash" must appear in the tooltip so
         // the user can see which surface is executing work.
         let result = SidebarViewModel.busyTooltip(
             runningThreadTitles: [],
             busySurfaceTitles: ["bash"]
         )
-        XCTAssertEqual(result, "Terminal job running in \"bash\"")
+        XCTAssertEqual(result, "Activity running in \"bash\"")
     }
 
     func test_surfaceBusy_multipleSurfaces_useFirstTitle() {
@@ -70,17 +70,17 @@ final class SidebarBusyTooltipTests: XCTestCase {
             runningThreadTitles: [],
             busySurfaceTitles: ["bash", "zsh"]
         )
-        XCTAssertEqual(result, "Terminal job running in \"bash\"")
+        XCTAssertEqual(result, "Activity running in \"bash\"")
     }
 
     func test_surfaceBusy_emptyTitle_showsFallback() {
-        // A busy surface with a blank title must still produce a tooltip using
-        // the generic "terminal" label rather than an empty quoted string.
+        // A busy surface with a blank title must still produce a generic label
+        // rather than an empty quoted string.
         let result = SidebarViewModel.busyTooltip(
             runningThreadTitles: [],
             busySurfaceTitles: [""]
         )
-        XCTAssertEqual(result, "Terminal job running in \"terminal\"")
+        XCTAssertEqual(result, "Activity running in \"surface\"")
     }
 
     // MARK: - Thread priority over surface

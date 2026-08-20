@@ -610,6 +610,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // the undo window lapses. Cancelled on a new revert, on undo, or on teardown.
     private var checkpointRevertUndoExpiryTask: Task<Void, Never>?
     private var messageHistoryLoadTask: Task<Void, Never>?
+    private var botPeerReconciliationTask: Task<Void, Never>?
+    var botPeerReconciliationIntervalNanoseconds: UInt64 = 1_000_000_000
     /// PERF: tracks thread ids whose placeholder titles have already been repaired
     /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
     private var repairedThreadIds: Set<AgentThreadID> = []
@@ -1054,6 +1056,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         checkpointRevertUndoExpiryTask = nil
         messageHistoryLoadTask?.cancel()
         messageHistoryLoadTask = nil
+        botPeerReconciliationTask?.cancel()
+        botPeerReconciliationTask = nil
         cancelOlderMessageLoad()
         if let tokenSaverFooterObserver {
             NotificationCenter.default.removeObserver(tokenSaverFooterObserver)
@@ -2877,6 +2881,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.mergePersistedAssistantRCW1Responses(persistedResponses)
             self.mergePersistedTokenSaverDisplayModes(persistedDisplayModes)
             self.messageHistoryIsPartial = loaded?.hasMoreOlder ?? false
+            self.ensureBotPeerReconciliation()
             // Queue rows are not transcript bubbles; only re-apply plan
             // suppression after the durable message merge.
             self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
@@ -3189,6 +3194,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// App tabs share the same thread list, and a workspace-wide check made
     /// every tab spin whenever any one of them was running.
     public var hasRunningWorkForChrome: Bool {
+        if hasWaitingBotPeerActivity { return true }
         if selectedThreadRunIsStartingOrRunning { return true }
         return runThreads.values.contains { threadId in
             coordinator.activeRunId(threadId: threadId) != nil
@@ -4254,7 +4260,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public var mentionableBotsProvider: () -> [BotDefinition] = { [] }
-    public var onDispatchBotMentions: (([BotDefinition], String, AgentThreadID) async -> Void)?
 
     public var composerSuggestions: [AgentComposerSuggestion] {
         let isClaude = selectedProviderSnapshot?.provider == .claude
@@ -6163,7 +6168,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if selectedThreadCanQueuePrompt,
            await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
-            dispatchBotMentions(in: text, threadId: sendThreadId)
             return
         }
         if await startProviderRun(
@@ -6174,23 +6178,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             recoveryDisplayText: originalPrompt
         ) == nil {
             restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
-        } else {
-            dispatchBotMentions(in: text, threadId: sendThreadId)
         }
-    }
-
-    public private(set) var lastDispatchedMentionHandlesForTesting: [String] = []
-
-    public func dispatchBotMentions(in text: String, threadId: AgentThreadID?) {
-        guard let threadId else { return }
-        let peers = BotMentionParser.mentionedBots(
-            in: text,
-            bots: mentionableBotsProvider(),
-            excluding: nil
-        )
-        lastDispatchedMentionHandlesForTesting = peers.map(\.handle)
-        guard !peers.isEmpty, let onDispatchBotMentions else { return }
-        Task { await onDispatchBotMentions(peers, text, threadId) }
     }
 
     @discardableResult
@@ -6225,7 +6213,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// selected thread, composer draft, or focus state.
     public func applyPersistedBotPeerMessage(
         messageID: AgentMessageID,
-        threadId: AgentThreadID
+        threadId: AgentThreadID,
+        terminalStatus: AgentRunStatus? = nil
     ) {
         guard let thread = try? threadRepo.get(id: threadId),
               thread.workspaceId == workspaceID,
@@ -6238,8 +6227,105 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             } else {
                 messages.append(message)
             }
+            if let terminalStatus {
+                status = terminalStatus
+            }
+            ensureBotPeerReconciliation()
         }
         scheduleReloadThreads(delayMilliseconds: 0)
+    }
+
+    /// Replaces waiting peer chrome from its durable row when the immediate
+    /// projection event was missed.
+    func reconcilePersistedBotPeerActivities() async {
+        guard !isDisposed, let threadID = selectedThreadId else { return }
+        let waitingIDs = Set(messages.compactMap { message -> AgentMessageID? in
+            guard message.threadId == threadID,
+                  message.role == .assistant,
+                  BotPeerTranscript.parseActivity(message.content)?.phase == .waiting else {
+                return nil
+            }
+            return message.id
+        })
+        let awaitsTerminalThreadStatus = (status == .pending || status == .running)
+            && messages.contains {
+                $0.threadId == threadID
+                    && $0.role == .assistant
+                    && BotPeerTranscript.parse($0.content) != nil
+            }
+        guard !waitingIDs.isEmpty || awaitsTerminalThreadStatus else { return }
+
+        let repository = messageRepo
+        let persisted = await Task.detached(priority: .utility) {
+            var rows: [AgentMessageID: AgentMessage] = [:]
+            for messageID in waitingIDs {
+                if let message = try? repository.get(id: messageID) {
+                    rows[messageID] = message
+                }
+            }
+            return rows
+        }.value
+
+        guard !isDisposed, selectedThreadId == threadID else { return }
+        var replacedWaitingRow = false
+        for index in messages.indices {
+            let current = messages[index]
+            guard waitingIDs.contains(current.id),
+                  BotPeerTranscript.parseActivity(current.content)?.phase == .waiting,
+                  let stored = persisted[current.id],
+                  stored.threadId == threadID,
+                  stored.role == .assistant,
+                  stored.content != current.content,
+                  BotPeerTranscript.parse(stored.content) != nil
+                    || BotPeerTranscript.parseActivity(stored.content) != nil else { continue }
+            messages[index] = stored
+            replacedWaitingRow = true
+        }
+        if replacedWaitingRow || awaitsTerminalThreadStatus,
+           let thread = try? threadRepo.get(id: threadID) {
+            let statusChanged = status != thread.status
+            status = thread.status
+            if replacedWaitingRow || statusChanged {
+                scheduleReloadThreads(delayMilliseconds: 0)
+            }
+        }
+    }
+
+    private func ensureBotPeerReconciliation() {
+        guard botPeerReconciliationTask == nil,
+              needsBotPeerReconciliation else { return }
+        let interval = botPeerReconciliationIntervalNanoseconds
+        botPeerReconciliationTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: interval)
+                guard let self, !Task.isCancelled, !self.isDisposed else { return }
+                await self.reconcilePersistedBotPeerActivities()
+                guard self.needsBotPeerReconciliation else {
+                    self.botPeerReconciliationTask = nil
+                    return
+                }
+            }
+        }
+    }
+
+    private var hasWaitingBotPeerActivity: Bool {
+        guard let threadID = selectedThreadId else { return false }
+        return messages.contains {
+            $0.threadId == threadID
+                && $0.role == .assistant
+                && BotPeerTranscript.parseActivity($0.content)?.phase == .waiting
+        }
+    }
+
+    private var needsBotPeerReconciliation: Bool {
+        if hasWaitingBotPeerActivity { return true }
+        guard status == .pending || status == .running,
+              let threadID = selectedThreadId else { return false }
+        return messages.contains {
+            $0.threadId == threadID
+                && $0.role == .assistant
+                && BotPeerTranscript.parse($0.content) != nil
+        }
     }
 
     private func presentBotPeerContent(
@@ -6293,6 +6379,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } else {
             messages.append(message)
         }
+        ensureBotPeerReconciliation()
         return messageID
     }
 
@@ -6666,6 +6753,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         surfacePreparationStates[tid] = claimedState
         // Reservation already published before Graphify; keep it until startRun
         // registers or failure paths release it.
+        let mentionedBots = BotMentionParser.mentionedBots(
+            in: text,
+            bots: mentionableBotsProvider(),
+            excluding: nil
+        )
+        let providerEnvironment = BotPeerDelegation.environment(
+            addingTurnContextTo: graphifyEnv,
+            mentionedBots: mentionedBots
+        )
         let req = AgentRunRequest(
             runId: runId,
             threadId: tid,
@@ -6682,7 +6778,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             serviceTier: runServiceTier,
             interactionMode: interactionMode,
             providerBinary: launchConfig?.binary,
-            environment: graphifyEnv,
+            environment: providerEnvironment,
             runAsUser: threadRunAsUser
         )
         do {
@@ -10829,9 +10925,9 @@ public struct AgentAppView: View {
         }?.avatarSymbol
     }
 
-    static func messagedCaption(in text: String, bots: [BotDefinition]) -> String? {
+    static func mentionedCaption(in text: String, bots: [BotDefinition]) -> String? {
         guard let bot = messagedPeer(in: text, bots: bots) else { return nil }
-        return BotPeerTranscript.messagedCaption(for: bot)
+        return BotPeerTranscript.mentionedCaption(for: bot)
     }
 
     /// Visible-text check without allocating a trimmed copy.
@@ -11200,16 +11296,18 @@ public struct AgentAppView: View {
             // F1: a signature hit only proves the ORDER is unchanged — the signature
             // deliberately ignores item bodies/outputs/states and turn completion so
             // streaming deltas don't re-sort. The cached entries embed VALUE COPIES
-            // of the turn snapshots, so serving them verbatim froze streamed text at
-            // the last structural change. Re-materialize the turn payloads from the
-            // live timeline (shallow O(entries) map, no re-sort); messages are
-            // append-only immutable rows, so their cached copies stay.
+            // of the snapshots, so serving them verbatim froze streamed text at
+            // the last structural change. Re-materialize payloads from the live
+            // collections (shallow O(entries) map, no re-sort). Most messages are
+            // append-only, but bot activity deliberately replaces a waiting row
+            // with the reply under the same id.
             //
             // CRITICAL: write rematerialized entries BACK into the cache so a turn
             // that completes mid-signature stays baseline-finished and
             // shouldRematerializeTurn stops returning true on every later tick.
             let refreshed = Self.rematerializedTranscriptEntries(
                 cached: transcriptCache.entries,
+                messages: vm.messages,
                 turns: vm.timeline.turns
             )
             transcriptCache.entries = refreshed
@@ -11223,8 +11321,8 @@ public struct AgentAppView: View {
         return merged
     }
 
-    /// F1 + large-thread stream path: rewrite cached `.turn` payloads from the
-    /// live timeline while preserving cached ORDER.
+    /// F1 + large-thread stream path: rewrite mutable cached payloads from the
+    /// live collections while preserving cached ORDER.
     ///
     /// - **Unfinished / live turns** always take the live snapshot (streaming
     ///   bodies must not freeze — F1).
@@ -11233,20 +11331,27 @@ public struct AgentAppView: View {
     ///   turn must not rebuild every finished turn's item tree (O(paint-window)).
     nonisolated static func rematerializedTranscriptEntries(
         cached: [TranscriptEntry],
+        messages: [AgentMessage],
         turns: [AssistantTurnSnapshot],
         liveTurnIds: Set<String>? = nil
     ) -> [TranscriptEntry] {
-        guard !turns.isEmpty else { return cached }
+        guard !messages.isEmpty || !turns.isEmpty else { return cached }
+        var messagesById = [AgentMessageID: AgentMessage](minimumCapacity: messages.count)
+        for message in messages { messagesById[message.id] = message }
         var turnsById = [String: AssistantTurnSnapshot](minimumCapacity: turns.count)
         for turn in turns { turnsById[turn.turnId] = turn }
         let explicitLive = liveTurnIds
         return cached.map { entry in
-            guard case .turn(let stale) = entry else { return entry }
-            guard let live = turnsById[stale.turnId] else { return entry }
-            if Self.shouldRematerializeTurn(stale: stale, live: live, liveTurnIds: explicitLive) {
-                return .turn(live)
+            switch entry {
+            case .message(let stale):
+                return messagesById[stale.id].map(TranscriptEntry.message) ?? entry
+            case .turn(let stale):
+                guard let live = turnsById[stale.turnId] else { return entry }
+                if Self.shouldRematerializeTurn(stale: stale, live: live, liveTurnIds: explicitLive) {
+                    return .turn(live)
+                }
+                return entry
             }
-            return entry
         }
     }
 
@@ -13678,8 +13783,8 @@ public struct AgentAppView: View {
                             handle: bot.handle,
                             symbol: bot.avatarSymbol,
                             trailing: true,
-                            caption: BotPeerTranscript.messagedCaption(for: bot),
-                            accessibilityIdentifier: "agent.peer.messaged"
+                            caption: BotPeerTranscript.mentionedCaption(for: bot),
+                            accessibilityIdentifier: "agent.peer.mentioned"
                         )
                     )
                 },

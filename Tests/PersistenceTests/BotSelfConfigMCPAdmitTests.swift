@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 @testable import Persistence
 
 final class BotSelfConfigMCPAdmitTests: XCTestCase {
@@ -55,5 +56,56 @@ final class BotSelfConfigMCPAdmitTests: XCTestCase {
             $0["name"] as? String == BotSelfConfigMCPAdmit.serverName
         }
         XCTAssertEqual(emptyEnv?["env"] as? [[String: String]], [])
+    }
+
+    func test_grokACPForwardsExactActiveRunContextForAIDelegation() throws {
+        // WHY: Grok runs construct MCP servers per session. Without the exact
+        // thread/run/socket tuple, the AI-authored tool call cannot be bound to
+        // its active primary run and must never fall back to prompt parsing.
+        let environment = [
+            BotSelfConfigCatalog.callerEnvironmentKey: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": "/tmp/support",
+            BotPeerDelegation.threadEnvironmentKey: "11111111-2222-3333-4444-555555555555",
+            BotPeerDelegation.runEnvironmentKey: "66666666-7777-8888-9999-aaaaaaaaaaaa",
+            BotPeerDelegation.socketEnvironmentKey: "/tmp/remote-code.sock",
+            "UNRELATED_SECRET": "must-not-be-forwarded",
+        ]
+        let server = BotSelfConfigMCPAdmit.grokACPServer(
+            command: "/bin/svc",
+            environment: environment
+        )
+        let env = try XCTUnwrap(server["env"] as? [[String: String]])
+        let forwarded: [String: String] = Dictionary(uniqueKeysWithValues: env.compactMap { row -> (String, String)? in
+            guard let name = row["name"], let value = row["value"] else { return nil }
+            return (name, value)
+        })
+        XCTAssertEqual(forwarded, environment.filter { $0.key != "UNRELATED_SECRET" })
+        XCTAssertNil(forwarded["UNRELATED_SECRET"])
+    }
+
+    func test_claudeSDKForwardsOnlyExactActiveRunContextAndWaitsForPeer() throws {
+        // WHY: Claude's SDK ignores a managed settings entry when an explicit
+        // mcpServers map is supplied. Its long-lived query must receive a fresh,
+        // always-visible server for each exact primary run, without leaking the
+        // rest of the provider environment into the MCP subprocess.
+        let environment = [
+            BotSelfConfigCatalog.callerEnvironmentKey: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": "/tmp/support",
+            BotPeerDelegation.threadEnvironmentKey: "11111111-2222-3333-4444-555555555555",
+            BotPeerDelegation.runEnvironmentKey: "66666666-7777-8888-9999-aaaaaaaaaaaa",
+            BotPeerDelegation.socketEnvironmentKey: "/tmp/remote-code.sock",
+            "UNRELATED_SECRET": "must-not-be-forwarded",
+        ]
+        let server = BotSelfConfigMCPAdmit.claudeSDKServer(
+            command: "/bin/svc",
+            environment: environment
+        )
+        XCTAssertEqual(server["command"] as? String, "/bin/svc")
+        XCTAssertEqual(server["args"] as? [String], [BotSelfConfigMCPAdmit.cliArgument])
+        XCTAssertEqual(server["alwaysLoad"] as? Bool, true)
+        XCTAssertEqual(server["timeout"] as? Int, 600_000)
+        let forwarded = try XCTUnwrap(server["env"] as? [String: String])
+        XCTAssertEqual(forwarded, environment.filter { $0.key != "UNRELATED_SECRET" })
+        XCTAssertNil(forwarded["UNRELATED_SECRET"])
     }
 }

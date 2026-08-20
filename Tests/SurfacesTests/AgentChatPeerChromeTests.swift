@@ -22,7 +22,7 @@ final class AgentChatPeerChromeTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(source.contains("AgentChatPeerIdentityHeader("))
-        XCTAssertTrue(source.contains("accessibilityIdentifier: \"agent.peer.messaged\""))
+        XCTAssertTrue(source.contains("accessibilityIdentifier: \"agent.peer.mentioned\""))
         XCTAssertTrue(source.contains("accessibilityIdentifier: \"agent.peer.from\""))
         XCTAssertTrue(source.contains("AgentChatPeerGroupHeader("))
         XCTAssertTrue(source.contains("accessibilityIdentifier: \"agent.peer.group\""))
@@ -57,5 +57,19 @@ final class AgentChatPeerChromeTests: XCTestCase {
             ),
             "leaf.fill"
         )
+    }
+
+    func test_waitingActivityUsesVisibleSharedSpinner() throws {
+        // WHY: a 14pt small spinner disappears against the dark transcript.
+        // Workspaces and Bots both mount this shared activity row.
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: "Sources/Surfaces/AgentChatSharedChrome.swift"),
+            encoding: .utf8
+        )
+        let row = try XCTUnwrap(source.range(of: "public struct AgentChatPeerActivityRow"))
+        let slice = String(source[row.lowerBound...])
+        XCTAssertTrue(slice.contains(".controlSize(.regular)"))
+        XCTAssertTrue(slice.contains(".frame(width: 22, height: 22)"))
+        XCTAssertTrue(slice.contains("Circle().fill(DS.Palette.accent.opacity(0.16))"))
     }
 }

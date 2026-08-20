@@ -52,7 +52,11 @@ final class AgentAppRenderCacheFixesTests: XCTestCase {
             final: "Hello, full streamed answer",
             finished: true
         )
-        let refreshed = AgentAppView.rematerializedTranscriptEntries(cached: cached, turns: [live])
+        let refreshed = AgentAppView.rematerializedTranscriptEntries(
+            cached: cached,
+            messages: [msg(1)],
+            turns: [live]
+        )
 
         XCTAssertEqual(refreshed.count, 2, "re-materialization must not add or drop entries")
         guard case .turn(let servedTurn) = refreshed[1] else {
@@ -62,12 +66,19 @@ final class AgentAppRenderCacheFixesTests: XCTestCase {
                        "a signature hit must serve the LIVE turn snapshot — the signature ignores bodies/outputs/states/finished, so serving the cached copy freezes streamed text until the next structural change (F1)")
     }
 
-    /// WHY: the cache exists to skip the O(N log N) merge/sort — so the ORDER and
-    /// the immutable message payloads must come from the cache verbatim; only the
-    /// mutable turn payloads are refreshed.
+    /// WHY: the cache exists to skip the O(N log N) merge/sort, but bot activity
+    /// rows can replace their payload under the same message id. ORDER stays
+    /// cached while both message and turn payloads come from the live collections.
     func test_rematerialize_preservesOrderAndMessagePayloads() {
         let m1 = msg(1, content: "first")
         let m2 = msg(3, content: "second")
+        let liveM1 = AgentMessage(
+            id: m1.id,
+            threadId: m1.threadId,
+            role: m1.role,
+            content: "first updated",
+            createdAt: m1.createdAt
+        )
         let staleA = turn("a", items: [item("ia", turnId: "a", body: "old-a", startMs: 2_000)])
         let staleB = turn("b", items: [item("ib", turnId: "b", body: "old-b", startMs: 4_000)])
         let cached: [AgentAppView.TranscriptEntry] = [
@@ -78,15 +89,19 @@ final class AgentAppRenderCacheFixesTests: XCTestCase {
         let liveB = turn("b", items: [item("ib", turnId: "b", body: "new-b", startMs: 4_000)])
         let liveA = turn("a", items: [item("ia", turnId: "a", body: "new-a", startMs: 2_000)])
 
-        let refreshed = AgentAppView.rematerializedTranscriptEntries(cached: cached, turns: [liveB, liveA])
+        let refreshed = AgentAppView.rematerializedTranscriptEntries(
+            cached: cached,
+            messages: [liveM1, m2],
+            turns: [liveB, liveA]
+        )
 
         XCTAssertEqual(refreshed.map(\.id), cached.map(\.id),
                        "the cached ORDER is the whole point of the memo — re-materializing payloads must never reorder entries")
         guard case .message(let servedM1) = refreshed[0], case .message(let servedM2) = refreshed[2] else {
             return XCTFail("message entries must stay messages at their cached positions")
         }
-        XCTAssertEqual([servedM1.content, servedM2.content], ["first", "second"],
-                       "messages are append-only immutable rows — their cached copies pass through untouched")
+        XCTAssertEqual([servedM1.content, servedM2.content], ["first updated", "second"],
+                       "stable ids preserve order but must not freeze a replaced bot activity payload")
         guard case .turn(let servedA) = refreshed[1], case .turn(let servedB) = refreshed[3] else {
             return XCTFail("turn entries must stay turns at their cached positions")
         }
@@ -104,7 +119,11 @@ final class AgentAppRenderCacheFixesTests: XCTestCase {
         let cached: [AgentAppView.TranscriptEntry] = [.turn(stale)]
         let unrelatedLive = turn("other", items: [item("io", turnId: "other")])
 
-        let refreshed = AgentAppView.rematerializedTranscriptEntries(cached: cached, turns: [unrelatedLive])
+        let refreshed = AgentAppView.rematerializedTranscriptEntries(
+            cached: cached,
+            messages: [],
+            turns: [unrelatedLive]
+        )
 
         guard case .turn(let served) = refreshed.first else {
             return XCTFail("the cached turn entry must survive")
@@ -151,6 +170,7 @@ final class AgentAppRenderCacheFixesTests: XCTestCase {
 
         let refreshed = AgentAppView.rematerializedTranscriptEntries(
             cached: cached,
+            messages: [],
             turns: [finishedLive, liveLive]
         )
         guard case .turn(let servedFinished) = refreshed[0],

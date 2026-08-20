@@ -502,12 +502,14 @@ final class GrokACPProtocolTests: XCTestCase {
         // WHY: Grok never received systemPromptDirective, so the deterministic
         // [[RC_AWAITING]] self-declare path was dead. Inject only that directive —
         // not Claude-only MCP rules.
+        let turnContext = "REMOTE CODE RESOLVED IDENTITY ONLY: @quinn is Quinn"
         let request = AgentRunRequest(
             threadId: AgentThreadID(),
             provider: .grok,
             model: "grok-4.5",
             cwd: "/tmp",
-            prompt: "inspect"
+            prompt: "inspect",
+            environment: [BotPeerDelegation.turnContextEnvironmentKey: turnContext]
         )
         let blocks = try GrokACPClient.promptBlocks(
             for: request,
@@ -521,6 +523,14 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertTrue(
             prompt.contains("Background-await protocol"),
             "Grok must receive systemPromptDirective"
+        )
+        XCTAssertTrue(
+            prompt.contains(BotPeerDelegation.providerDirective),
+            "Grok must receive the AI-authored Bot delegation contract"
+        )
+        XCTAssertTrue(
+            prompt.contains(turnContext),
+            "Grok must receive this turn's identity-only Bot context"
         )
         XCTAssertFalse(
             prompt.contains(BackgroundAwaitContinuation.mcpToolAvailabilityDirective),

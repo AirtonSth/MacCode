@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 /// MCP stdio handler so a bot can read and change its own Studio settings.
 public struct ManagedBotSelfConfigMCP: Sendable {
@@ -35,7 +36,7 @@ public struct ManagedBotSelfConfigMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "Read and change this bot's own Studio settings. Cross-bot ids are rejected.",
+                "instructions": "Delegate to RemoteCode Bots with AI-authored prompts. Bot-owned runs can also read and change their own Studio settings; an Agent App run may change only a Bot consulted by that exact active run.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": BotSelfConfigCatalog.toolCatalog()])
@@ -47,6 +48,40 @@ public struct ManagedBotSelfConfigMCP: Sendable {
                 return errorReply(id: id, code: -32602, message: "unknown tool: \(name)")
             }
             do {
+                if name == BotSelfConfigCatalog.listPeers || name == BotSelfConfigCatalog.askPeer {
+                    let object = try BotPeerRPCClient(environment: environment).call(
+                        method: name == BotSelfConfigCatalog.listPeers
+                            ? "bot.peer.list"
+                            : "bot.peer.ask",
+                        arguments: arguments
+                    )
+                    return reply(id: id, result: [
+                        "content": [["type": "text", "text": encode(object) ?? "{}"]],
+                        "isError": false,
+                    ])
+                }
+                let callerID = BotSelfConfigService.callerID(from: environment)
+                let requestedID = (arguments["bot_id"] as? String)
+                    .flatMap(UUID.init)
+                    .map(BotID.init)
+                let usesDelegatedSettingsGrant = (name == BotSelfConfigCatalog.getSettings
+                    || name == BotSelfConfigCatalog.setSettings)
+                    && (callerID == nil || requestedID.map { $0 != callerID } == true)
+                if usesDelegatedSettingsGrant {
+                    guard name == BotSelfConfigCatalog.getSettings
+                            || name == BotSelfConfigCatalog.setSettings else {
+                        throw BotSelfConfigError.callerMissing
+                    }
+                    let object = try BotPeerRPCClient(environment: environment).call(
+                        method: "bot.peer.self_config",
+                        arguments: ["tool_name": name, "arguments": arguments]
+                    )
+                    return reply(id: id, result: [
+                        "content": [["type": "text", "text": encode(object) ?? "{}"]],
+                        "isError": false,
+                    ])
+                }
+                guard callerID != nil else { throw BotSelfConfigError.callerMissing }
                 let store = try storeFactory(environment)
                 let service = try BotSelfConfigService.make(environment: environment, store: store)
                 let object = try service.invoke(name: name, arguments: arguments)

@@ -2479,36 +2479,159 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         viewModel.stopScheduledThread = nil
     }
 
-    /// Agent App `@handle` mentions start a teammate and paint Message from
-    /// back into this thread. Surfaces cannot import AppShell; the store and
-    /// Desk runner stay here. The context authority now owns the suspended
-    /// continuation that legacy `runMentionedPrompt` / `presentBotPeerMessage`
-    /// calls kept on the initiating window.
+    /// `@handle` remains an autocomplete affordance. The provider receives the
+    /// complete turn and decides whether to call the Bot delegation tool; this
+    /// layer must not infer or pre-dispatch a peer prompt from user prose.
     private func configureAgentAppBotMentions(_ agent: AgentAppSurface) {
         agent.viewModel.mentionableBotsProvider = { [weak self] in
             (try? self?.context?.botStore.list()) ?? []
         }
-        agent.viewModel.onDispatchBotMentions = { [weak self, weak agent] peers, text, threadId in
-            await self?.dispatchAgentAppBotMentions(
-                peers: peers,
-                text: text,
-                threadId: threadId,
-                onto: agent
+    }
+
+    public func listBotPeers(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID
+    ) throws -> JSONValue {
+        let ctx = try validatedBotPeerCaller(threadID: callerThread, runID: callerRun)
+        return .object([
+            "bots": .array(try ctx.botStore.list().map { bot in
+                .object([
+                    "id": .string(bot.id.value.uuidString.lowercased()),
+                    "handle": .string(bot.handle),
+                    "name": .string(bot.name),
+                    "title": .string(bot.title),
+                ])
+            }),
+        ])
+    }
+
+    public func askBotPeer(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID,
+        handle: String,
+        prompt: String,
+        replyMode: BotPeerDelegation.ReplyMode
+    ) async throws -> JSONValue {
+        let ctx = try validatedBotPeerCaller(threadID: callerThread, runID: callerRun)
+        guard let normalizedHandle = BotHandle.normalize(handle),
+              let peer = try ctx.botStore.list().first(where: { $0.handle == normalizedHandle }) else {
+            throw JSONRPCError(code: -32044, message: "RemoteCode Bot @\(handle) was not found.")
+        }
+        let delegatedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !delegatedPrompt.isEmpty else { throw JSONRPCError.invalidParams }
+        guard let originThread = try ctx.threadRepo.get(id: callerThread) else {
+            throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.")
+        }
+
+        ctx.botPeerHandoffAuthority.router = self
+        guard let result = await ctx.botPeerHandoffAuthority.askPeerFromActiveProvider(
+            peer: peer,
+            prompt: delegatedPrompt,
+            originThread: originThread,
+            hostRunID: callerRun,
+            providerSnapshots: cachedProviderSnapshotsForSend()
+        ) else {
+            throw JSONRPCError(code: -32045, message: "The Bot delegation did not produce a verified reply.")
+        }
+        let current = (try? ctx.botStore.get(id: peer.id)) ?? peer
+        if replyMode == .replyOnly {
+            ctx.coordinator.suppressPrimaryAssistantReply(runId: callerRun)
+        }
+        return .object([
+            "activity_id": .string(result.activityID.uuidString.lowercased()),
+            "bot": .object([
+                "id": .string(current.id.value.uuidString.lowercased()),
+                "handle": .string(current.handle),
+                "name": .string(current.name),
+                "title": .string(current.title),
+            ]),
+            "reply": .string(result.reply),
+            "reply_mode": .string(replyMode.rawValue),
+            "attributed_reply_already_displayed": .bool(true),
+            "next": .string(
+                replyMode == .replyOnly
+                    ? "End the turn now. RemoteCode will keep only the attributed Bot reply."
+                    : "Continue the original user request using this reply."
+            ),
+        ])
+    }
+
+    public func invokeDelegatedBotSelfConfig(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID,
+        toolName: String,
+        arguments: [String: JSONValue]
+    ) throws -> JSONValue {
+        let ctx = try validatedBotPeerCaller(threadID: callerThread, runID: callerRun)
+        guard toolName == BotSelfConfigCatalog.getSettings
+                || toolName == BotSelfConfigCatalog.setSettings else {
+            throw JSONRPCError(code: -32602, message: "Tool is not available through a delegated Bot grant.")
+        }
+        let requestedID = arguments["bot_id"]?.stringValue
+            .flatMap(UUID.init)
+            .map(BotID.init)
+        guard let delegatedID = ctx.botPeerHandoffAuthority.delegatedBotID(
+            forHostRunID: callerRun,
+            requestedBotID: requestedID
+        ) else {
+            throw JSONRPCError(
+                code: -32046,
+                message: "This active run has no matching completed Bot consultation grant."
             )
+        }
+        var foundationArguments = arguments.mapValues(Self.botPeerFoundationValue)
+        foundationArguments["bot_id"] = delegatedID.value.uuidString.lowercased()
+        let environment = [
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": ctx.appSupportDirectory.path,
+            BotSelfConfigCatalog.callerEnvironmentKey: delegatedID.value.uuidString.lowercased(),
+        ]
+        let service = try BotSelfConfigService.make(environment: environment, store: ctx.botStore)
+        let result = try service.invoke(name: toolName, arguments: foundationArguments)
+        if toolName == BotSelfConfigCatalog.setSettings {
+            _ = botsViewModel?.refreshPublishedIdentity(for: delegatedID)
+        }
+        return JSONValue.from(result)
+    }
+
+    private func validatedBotPeerCaller(
+        threadID: AgentThreadID,
+        runID: AgentRunID
+    ) throws -> AppContext {
+        guard let ctx = context,
+              let thread = try ctx.threadRepo.get(id: threadID) else {
+            throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.")
+        }
+        guard ctx.coordinator.activeRunId(threadId: thread.id) == runID else {
+            throw JSONRPCError(code: -32047, message: "Bot delegation is limited to the exact active primary run.")
+        }
+        return ctx
+    }
+
+    private nonisolated static func botPeerFoundationValue(_ value: JSONValue) -> Any {
+        switch value {
+        case .null: return NSNull()
+        case .bool(let value): return value
+        case .number(let value): return value
+        case .string(let value): return value
+        case .array(let values): return values.map(botPeerFoundationValue)
+        case .object(let values): return values.mapValues(botPeerFoundationValue)
         }
     }
 
+    #if DEBUG
+    /// Legacy handoff lifecycle seam for the existing authority regression
+    /// suite. Product sends never call this; provider tool calls use
+    /// `askBotPeer` with an AI-authored prompt.
     func dispatchAgentAppBotMentions(
         peers: [BotDefinition],
         text: String,
         threadId: AgentThreadID,
-        onto agent: AgentAppSurface?
+        onto agent: AgentAppSurface?,
+        continueHost: Bool
     ) async {
         guard let agent,
               let ctx = context,
               let originThread = try? ctx.threadRepo.get(id: threadId) else { return }
-        // sam-goal: hop-1 only. A follow-up that still contains @handle
-        // would loop. Upgrade: multi-hop with an explicit hop budget.
         lastAgentAppHopTextForTesting = nil
         ctx.botPeerHandoffAuthority.router = self
         let providerSnapshots = cachedProviderSnapshotsForSend()
@@ -2522,10 +2645,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             if let milestone = ctx.botPeerHandoffAuthority.submitAgentAppMention(
                 peer: peer,
                 text: text,
+                peerText: text,
                 originThread: originThread,
                 activityID: activityID,
-                hostRunID: AgentRunID(),
-                providerSnapshots: providerSnapshots
+                hostRunID: continueHost ? AgentRunID() : nil,
+                providerSnapshots: providerSnapshots,
+                resumeHostAfterPeer: continueHost
             ) {
                 dispatchMilestones.append(milestone)
             }
@@ -2534,6 +2659,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             await milestone.value
         }
     }
+    #endif
 
     func recordAgentAppHop(_ hop: String) {
         lastAgentAppHopTextForTesting = hop
@@ -2548,13 +2674,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     func projectAgentAppPeerMessage(
         threadID: AgentThreadID,
-        messageID: AgentMessageID
+        messageID: AgentMessageID,
+        terminalStatus: AgentRunStatus? = nil
     ) {
         for surface in SurfaceRegistry.shared.all() {
             guard let agent = surface as? AgentAppSurface else { continue }
             agent.viewModel.applyPersistedBotPeerMessage(
                 messageID: messageID,
-                threadId: threadID
+                threadId: threadID,
+                terminalStatus: terminalStatus
             )
         }
     }

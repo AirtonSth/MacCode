@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import Persistence
 
 public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     public let provider: AgentProvider = .claude
@@ -265,6 +266,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     /// `--verbose` or the CLI rejects the run.
     public static func buildArgs(_ request: AgentRunRequest) -> [String] {
         var args: [String] = ["--print", "--output-format", "stream-json", "--verbose"]
+        args.append(contentsOf: ["--mcp-config", botPeerMCPConfigJSON(environment: request.environment)])
+        args.append(contentsOf: ["--allowedTools", BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools.joined(separator: ",")])
         args.append(contentsOf: ["--model", request.model])
         let prompt = request.providerPrompt
         let effort = normalizedReasoningEffort(request.reasoningEffort, model: request.model)
@@ -304,6 +307,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             // interactive claude. Matches the old SDK bridge's settingSources.
             "--setting-sources", "user,project,local"
         ]
+        args.append(contentsOf: ["--mcp-config", botPeerMCPConfigJSON(environment: request.environment)])
+        args.append(contentsOf: ["--allowedTools", BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools.joined(separator: ",")])
         args.append(contentsOf: ["--model", request.model])
         let effort = normalizedReasoningEffort(request.reasoningEffort, model: request.model)
         args.append(contentsOf: effortArgs(effort, model: request.model))
@@ -329,13 +334,43 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         // (both live via `alwaysOnClaudeDirectives`).
         // Background-await + MCP rules always; Distill only when Token Saver hint is set.
         // `--append-system-prompt` adds to the CLI's default prompt, so it stays additive.
+        let providerDirectives = BotPeerDelegation.appendingTurnContext(
+            to: BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
+            environment: request.environment
+        )
         let appendedSystemPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
-            BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
+            providerDirectives,
             environment: request.environment
         )
         args.append(contentsOf: ["--append-system-prompt", appendedSystemPrompt])
         args.append(contentsOf: extraArgsWithoutSettings(request.extraArgs))
         return args
+    }
+
+    /// Claude Code does not discover `mcpServers` from settings.json. Admit the
+    /// managed peer server through its documented per-process `--mcp-config`
+    /// input so every CLI turn gets the exact run context authored by the host.
+    /// User/project MCP sources remain enabled because this is not strict mode.
+    static func botPeerMCPConfigJSON(
+        environment: [String: String],
+        command: String? = nil
+    ) -> String {
+        let resolved = command
+            ?? AgentSkillInstaller.resolveServiceBinary()?.path
+            ?? BotSelfConfigMCPAdmit.fallbackCommand
+        let object: [String: Any] = [
+            "mcpServers": [
+                BotSelfConfigMCPAdmit.serverName: BotSelfConfigMCPAdmit.claudeSDKServer(
+                    command: resolved,
+                    environment: environment
+                )
+            ]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else {
+            return #"{"mcpServers":{}}"#
+        }
+        return json
     }
 
     /// Human-readable error shown when the provider binary is absent from PATH.

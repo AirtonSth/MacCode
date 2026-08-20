@@ -43,6 +43,7 @@ let current = {
   effort: undefined,
   settings: undefined,
   systemPrompt: undefined,
+  mcpServers: undefined,
   claudeExecutablePath: undefined,
 };
 const pendingPermissions = new Map();
@@ -569,11 +570,17 @@ function attachmentBlock(attachment) {
   };
 }
 
-function pushPrompt(text, attachments = []) {
+function pushPrompt(text, attachments = [], turnContext = undefined) {
   const content = [{ type: 'text', text }];
   for (const attachment of attachments) {
     const block = attachmentBlock(attachment);
     if (block) content.push(block);
+  }
+  if (typeof turnContext === 'string' && turnContext.trim()) {
+    content.push({
+      type: 'text',
+      text: `<remote_code_turn_context>\n${turnContext.trim()}\n</remote_code_turn_context>`,
+    });
   }
   const message = {
     type: 'user',
@@ -615,7 +622,7 @@ function sdkPermissionMode(mode, interactionMode) {
 
 function ensureQuery() {
   if (activeQuery) return activeQuery;
-  const mcpServers = e2eUserInputMcpServers();
+  const mcpServers = configuredMcpServers();
   activeQuery = query({
     prompt: promptStream(),
     options: {
@@ -633,6 +640,7 @@ function ensureQuery() {
       systemPrompt: current.systemPrompt,
       tools: { type: 'preset', preset: 'claude_code' },
       mcpServers,
+      allowedTools: current.allowedTools,
       // Reasoning effort for the query ('low'…'max' plus native 'ultracode';
       // the host also supplies the equivalent ultracode/workflow settings).
       effort: current.effort,
@@ -748,6 +756,15 @@ function ensureQuery() {
     }
   })();
   return activeQuery;
+}
+
+function configuredMcpServers() {
+  const configured = current.mcpServers && typeof current.mcpServers === 'object'
+    ? current.mcpServers
+    : {};
+  const e2e = e2eUserInputMcpServers() || {};
+  const merged = { ...configured, ...e2e };
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
 function e2eUserInputMcpServers() {
@@ -930,6 +947,10 @@ for await (const line of rl) {
       effort: command.effort || undefined,
       settings: command.settings || undefined,
       systemPrompt: command.system_prompt || undefined,
+      mcpServers: command.mcp_servers && typeof command.mcp_servers === 'object'
+        ? command.mcp_servers
+        : undefined,
+      allowedTools: Array.isArray(command.allowed_tools) ? command.allowed_tools : [],
       claudeExecutablePath: command.claude_executable_path || undefined,
     };
     bridgeConfigured = true;
@@ -950,7 +971,31 @@ for await (const line of rl) {
       });
       handshakePublished = true;
     }
-    pushPrompt(command.prompt || '', command.attachments || []);
+    if (command.mcp_servers && typeof command.mcp_servers === 'object') {
+      current.mcpServers = command.mcp_servers;
+      if (activeQuery && typeof activeQuery.setMcpServers === 'function') {
+        try {
+          const update = await activeQuery.setMcpServers(configuredMcpServers() || {});
+          if (update?.errors && Object.keys(update.errors).length > 0) {
+            emit({
+              type: 'sdk_error',
+              message: `Claude Agent SDK could not refresh RemoteCode MCP servers: ${JSON.stringify(update.errors)}`,
+            });
+            continue;
+          }
+        } catch (error) {
+          emit({
+            type: 'sdk_error',
+            message: `Claude Agent SDK could not refresh RemoteCode MCP servers: ${String(error?.message || error)}`,
+          });
+          continue;
+        }
+      }
+    }
+    if (Array.isArray(command.allowed_tools)) {
+      current.allowedTools = command.allowed_tools;
+    }
+    pushPrompt(command.prompt || '', command.attachments || [], command.turn_context);
     ensureQuery();
   } else if (command.type === 'rc_list_sessions') {
     if (!bridgeConfigured) {

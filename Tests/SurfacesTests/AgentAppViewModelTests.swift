@@ -2454,10 +2454,11 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "Refactor the auth module please" })
     }
 
-    func test_sendDispatchesMentionedBotsAfterStart() async throws {
-        // WHY: @quinn in Agent App must dispatch after the Agent turn starts.
-        // A hook that never runs from send() leaves mentions as dead composer sugar.
-        let (vm, _) = try makeVM()
+    func test_sendMentionStartsWithPrimaryAI_becauseOnlyItMayAuthorThePeerPrompt() async throws {
+        // WHY: the app must not treat @quinn as a routing command. The primary
+        // AI needs the complete request before it can decide what Quinn receives.
+        let hostRunner = CapturingProviderRunner(provider: .codex)
+        let (vm, _) = try makeVM(provider: hostRunner)
         vm.createThread(title: "New thread")
         let quinn = BotDefinition(
             handle: "quinn",
@@ -2466,15 +2467,24 @@ final class AgentAppViewModelTests: XCTestCase {
             description: ""
         )
         vm.mentionableBotsProvider = { [quinn] }
-        let done = expectation(description: "bot mention dispatch")
-        vm.onDispatchBotMentions = { peers, _, _ in
-            XCTAssertEqual(peers.map(\.id), [quinn.id])
-            done.fulfill()
-        }
-        vm.prompt = "@quinn check WhatsApp"
+        let prompt = "pergunte ao @quinn o nome dele e então decida o próximo passo"
+        vm.prompt = prompt
         await vm.send()
-        XCTAssertEqual(vm.lastDispatchedMentionHandlesForTesting, ["quinn"])
-        await fulfillment(of: [done], timeout: 1)
+        XCTAssertEqual(
+            hostRunner.prompts,
+            [prompt],
+            "the primary AI must receive the complete user turn verbatim"
+        )
+        XCTAssertEqual(
+            hostRunner.environments.first?[BotPeerDelegation.turnContextEnvironmentKey],
+            BotPeerDelegation.turnDirective(mentionedBots: [quinn]),
+            "resolved identity must travel separately from the user's words"
+        )
+        XCTAssertEqual(
+            vm.messages.filter { $0.role == .user && $0.content == prompt }.count,
+            1,
+            "the original request must remain one durable user turn"
+        )
     }
 
     func test_send_emptyPendingThreadStartsRunInsteadOfQueueing() async throws {

@@ -11,6 +11,16 @@ public enum BotSelfConfigMCPAdmit: Sendable {
     public static let tomlBeginMarker = "# RemoteCode managed bot self-config MCP: begin"
     public static let tomlEndMarker = "# RemoteCode managed bot self-config MCP: end"
 
+    /// Claude's supervised mode must not turn AI-authored Bot delegation into a
+    /// second user confirmation. These are only provider permission names; the
+    /// managed MCP still enforces the exact active run and consulted-Bot grant.
+    public static let claudeAutomaticallyAllowedTools = [
+        BotSelfConfigCatalog.listPeers,
+        BotSelfConfigCatalog.askPeer,
+        BotSelfConfigCatalog.getSettings,
+        BotSelfConfigCatalog.setSettings,
+    ].map { "mcp__\(serverName)__\($0)" }
+
     public static func stdioConfig(command: String) -> [String: Any] {
         [
             "command": command,
@@ -18,22 +28,56 @@ public enum BotSelfConfigMCPAdmit: Sendable {
         ]
     }
 
+    /// Claude Agent SDK sessions are long-lived, but Bot delegation is scoped
+    /// to one exact active run. Give the SDK a per-turn server definition so it
+    /// can restart the managed MCP with fresh host-authoritative context.
+    public static func claudeSDKServer(
+        command: String,
+        environment: [String: String]
+    ) -> [String: Any] {
+        var config = stdioConfig(command: command)
+        let extra = delegatedRunEnvironment(environment)
+        if !extra.isEmpty {
+            config["env"] = extra
+        }
+        config["alwaysLoad"] = true
+        config["timeout"] = 600_000
+        return config
+    }
+
     public static func grokACPServer(
         command: String,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: Any] {
+        GrokACPMcpServer.stdio(
+            name: serverName,
+            command: command,
+            args: [cliArgument],
+            extraEnv: delegatedRunEnvironment(environment)
+        )
+    }
+
+    private static func delegatedRunEnvironment(
+        _ environment: [String: String]
+    ) -> [String: String] {
         var extra: [String: String] = [:]
         if let botID = environment[BotSelfConfigCatalog.callerEnvironmentKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !botID.isEmpty {
             extra[BotSelfConfigCatalog.callerEnvironmentKey] = botID
         }
-        return GrokACPMcpServer.stdio(
-            name: serverName,
-            command: command,
-            args: [cliArgument],
-            extraEnv: extra
-        )
+        for key in [
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY",
+            BotPeerDelegation.threadEnvironmentKey,
+            BotPeerDelegation.runEnvironmentKey,
+            BotPeerDelegation.socketEnvironmentKey,
+        ] {
+            if let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty {
+                extra[key] = value
+            }
+        }
+        return extra
     }
 
     public static func admitClaude(existing: [String: Any], command: String) -> [String: Any] {

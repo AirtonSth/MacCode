@@ -91,7 +91,10 @@ public enum BackgroundAwaitContinuation {
     /// both live routes (CLI `buildStreamingArgs` and the SDK `claudeSystemPrompt`).
     /// Single source of truth so the two routes never drift: edit the directives
     /// above, not the call sites.
-    public static let alwaysOnClaudeDirectives = systemPromptDirective + "\n\n" + mcpToolAvailabilityDirective + "\n\n" + mcpConnectWaitDirective
+    public static let alwaysOnClaudeDirectives = systemPromptDirective
+        + "\n\n" + mcpToolAvailabilityDirective
+        + "\n\n" + mcpConnectWaitDirective
+        + "\n\n" + BotPeerDelegation.providerDirective
 
     /// The nudge sent to re-invoke a stalled agent. Provider-agnostic and explicit
     /// about both branches (done vs still-running) so the agent does the right

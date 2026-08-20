@@ -868,7 +868,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 "--permission-mode", "--tools", "--allowed-tools", "--allowedTools",
                 "--disallowed-tools", "--disallowedTools", "--append-system-prompt",
                 "--system-prompt", "--setting-sources", "--settings",
-                "--session-id", "--resume", "-r"
+                "--session-id", "--resume", "-r", "--mcp-config"
             ]
         case .codex:
             return [

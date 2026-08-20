@@ -311,7 +311,6 @@ public struct AgentChatPeerActivityRow: View {
             let seconds = max(0, Int(context.date.timeIntervalSince(startedAt)))
             HStack(alignment: .top, spacing: DS.Space.sm) {
                 stateIcon
-                    .frame(width: 14, height: 14)
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     Text(AgentPeerActivityPresentation.title(for: snapshot))
                         .font(DS.Font.body.weight(.medium))
@@ -340,8 +339,11 @@ public struct AgentChatPeerActivityRow: View {
         switch snapshot.phase {
         case .waiting:
             ProgressView()
-                .controlSize(.small)
+                .progressViewStyle(.circular)
+                .controlSize(.regular)
                 .tint(DS.Palette.accent)
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(DS.Palette.accent.opacity(0.16)))
                 .accessibilityHidden(true)
         case .needsAttention:
             Image(systemName: "exclamationmark.triangle.fill")

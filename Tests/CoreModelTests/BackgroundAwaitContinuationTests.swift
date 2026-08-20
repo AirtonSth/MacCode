@@ -151,6 +151,14 @@ final class BackgroundAwaitContinuationTests: XCTestCase {
         )
     }
 
+    func test_claudeAlwaysOnDirectivesIncludeAIDelegationContract() {
+        XCTAssertTrue(
+            BackgroundAwaitContinuation.alwaysOnClaudeDirectives.contains(
+                BotPeerDelegation.providerDirective
+            )
+        )
+    }
+
     func test_commandDetachesShellWork_classifier() {
         // Shared pure classifier used by Claude / Codex / Grok adapters when a
         // foreground shell tool backgrounds children the provider will not track.

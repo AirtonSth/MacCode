@@ -27,6 +27,7 @@ public final class UnixSocketServer: @unchecked Sendable {
     static let maxActiveRequests = 64
     private static let defaultLocalRequestTimeout: DispatchTimeInterval = .seconds(5)
     private static let agentMessageSendLocalRequestTimeout: DispatchTimeInterval = .seconds(120)
+    private static let botPeerAskLocalRequestTimeout: DispatchTimeInterval = .seconds(600)
 
     public let socketPath: String
     private let dispatcher: JSONRPCDispatcher
@@ -479,9 +480,14 @@ public final class UnixSocketServer: @unchecked Sendable {
             slot.value = response
             semaphore.signal()
         }
-        let requestTimeout = req.method == "agent.message.send"
-            ? agentMessageSendRequestTimeout
-            : localRequestTimeout
+        let requestTimeout: DispatchTimeInterval
+        if req.method == "bot.peer.ask" {
+            requestTimeout = Self.botPeerAskLocalRequestTimeout
+        } else if req.method == "agent.message.send" {
+            requestTimeout = agentMessageSendRequestTimeout
+        } else {
+            requestTimeout = localRequestTimeout
+        }
         guard semaphore.wait(timeout: .now() + requestTimeout) == .success else {
             task.cancel()
             EventBus.shared.publish(kind: "diagnostic.unix_request_timeout", payload: .object([

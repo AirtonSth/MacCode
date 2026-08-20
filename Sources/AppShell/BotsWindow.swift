@@ -254,7 +254,7 @@ public struct BotDeskPeer: Equatable, Sendable {
 
     public var caption: String {
         switch direction {
-        case .messaged: return BotPeerTranscript.toCaption(name: name)
+        case .messaged: return BotPeerTranscript.mentionedCaption(name: name)
         case .fromPeer: return BotPeerTranscript.fromCaption(name: name)
         }
     }
@@ -307,6 +307,8 @@ struct BotPeerHandoffSnapshot: Equatable {
     let peerThreadID: AgentThreadID?
     let peerRunID: AgentRunID?
     let inboundMessageID: UUID
+    let outboundText: String
+    let hostInstructionText: String
     let hostThreadID: AgentThreadID?
     let hostRunID: AgentRunID?
     let phase: BotPeerHandoffPhase
@@ -366,14 +368,19 @@ private struct PersistedBotPeerHandoff: Codable, Equatable {
     let peerHandle: String
     var peerAvatarSymbol: String? = nil
     let outboundText: String
+    var hostInstructionText: String? = nil
     let createdAt: Date
     let peerRoute: BotPeerHandoffRoute
+    var hostContinuationRequired: Bool? = nil
     var hostThreadID: AgentThreadID?
     var hostRunID: AgentRunID?
     var hostRoute: BotPeerHandoffRoute?
     var replyText: String?
     var replyCreatedAt: Date?
     var phase: BotPeerHandoffPhase
+
+    var requiresHostContinuation: Bool { hostContinuationRequired ?? true }
+    var resolvedHostInstructionText: String { hostInstructionText ?? outboundText }
 }
 
 private struct BotStartedRun {
@@ -470,8 +477,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         "originAgentThreadID", "peerBotID", "peerConversationID", "peerThreadID",
         "peerRunID", "inboundMessageID", "peerName", "peerTitle", "peerHandle",
         "peerAvatarSymbol",
-        "outboundText", "createdAt", "peerRoute", "hostThreadID", "hostRunID",
-        "hostRoute", "replyText", "replyCreatedAt", "phase",
+        "outboundText", "hostInstructionText", "createdAt", "peerRoute", "hostThreadID", "hostRunID",
+        "hostContinuationRequired", "hostRoute", "replyText", "replyCreatedAt", "phase",
     ]
 
     private struct StoredPayload {
@@ -581,26 +588,60 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         return handoffs
     }
 
+    /// Grants an active primary run access only to peers it actually consulted.
+    /// A requested id is required when that run consulted more than one peer.
+    func delegatedBotID(forHostRunID runID: AgentRunID, requestedBotID: BotID? = nil) -> BotID? {
+        refreshStorageProjection()
+        let ids = Set(handoffs.values.compactMap { handoff -> BotID? in
+            guard handoff.requiresHostContinuation,
+                  handoff.hostRunID == runID,
+                  (handoff.phase == .peerCompleted
+                    || handoff.phase == .hostPrepared
+                    || handoff.phase == .hostRunning
+                    || handoff.phase == .completed) else { return nil }
+            return handoff.peerBotID
+        })
+        if let requestedBotID { return ids.contains(requestedBotID) ? requestedBotID : nil }
+        return ids.count == 1 ? ids.first : nil
+    }
+
+    func delegatedBotID(forAgentAppHostRunID runID: AgentRunID) -> BotID? {
+        delegatedBotID(forHostRunID: runID)
+    }
+
+    func replyText(forActivityID activityID: UUID) -> String? {
+        refreshStorageProjection()
+        return handoffs[activityID]?.replyText
+    }
+
     func submitAgentAppMention(
         peer: BotDefinition,
         text: String,
+        peerText: String,
         originThread: AgentThread,
         activityID: AgentMessageID,
-        hostRunID: AgentRunID,
-        providerSnapshots: [AgentProviderSnapshot]
+        hostRunID: AgentRunID?,
+        providerSnapshots: [AgentProviderSnapshot],
+        resumeHostAfterPeer: Bool,
+        originBot: BotDefinition? = nil,
+        originConversation: BotConversation? = nil
     ) -> Task<Void, Never>? {
         let display = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let peerDisplay = peerText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !display.isEmpty,
+              !peerDisplay.isEmpty,
               let router,
               let revisionID = peer.currentRevisionID,
               let revision = try? botStore.getRevision(id: revisionID) else {
-            projectAgentAppNeedsAttention(peer: peer, threadID: originThread.id, activityID: activityID)
+            if originConversation == nil {
+                projectAgentAppNeedsAttention(peer: peer, threadID: originThread.id, activityID: activityID)
+            }
             return nil
         }
 
         var conversation = BotConversation(
             botID: peer.id,
-            title: Self.titleFromFirstMessage(display)
+            title: Self.titleFromFirstMessage(peerDisplay)
         )
         let routing = Self.persistedRouting(for: peer, revision: revision)
         let peerRunID = AgentRunID()
@@ -622,28 +663,32 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             conversation.linkedAgentThreadID = thread.id
             try botStore.upsertConversation(conversation)
 
-            let createdAt = (try? messageRepo.get(id: activityID))?.createdAt ?? Date()
+            let createdAt = originConversation == nil
+                ? ((try? messageRepo.get(id: activityID))?.createdAt ?? Date())
+                : Date()
             let handoff = PersistedBotPeerHandoff(
                 version: 2,
                 activityID: activityID.value,
-                originBotID: nil,
-                originConversationID: nil,
-                originAgentThreadID: originThread.id,
+                originBotID: originBot?.id,
+                originConversationID: originConversation?.id,
+                originAgentThreadID: originConversation == nil ? originThread.id : nil,
                 peerBotID: peer.id,
                 peerConversationID: conversation.id,
                 peerThreadID: thread.id,
                 peerRunID: peerRunID,
-                inboundMessageID: activityID.value,
+                inboundMessageID: originConversation == nil ? activityID.value : UUID(),
                 peerName: peer.name,
                 peerTitle: peer.title,
                 peerHandle: peer.handle,
                 peerAvatarSymbol: peer.avatarSymbol,
-                outboundText: display,
+                outboundText: peerDisplay,
+                hostInstructionText: hostRunID == nil ? nil : display,
                 createdAt: createdAt,
                 peerRoute: BotPeerHandoffRoute(routing),
-                hostThreadID: originThread.id,
+                hostContinuationRequired: hostRunID != nil,
+                hostThreadID: hostRunID == nil ? nil : originThread.id,
                 hostRunID: hostRunID,
-                hostRoute: BotPeerHandoffRoute(originThread),
+                hostRoute: hostRunID == nil ? nil : BotPeerHandoffRoute(originThread),
                 replyText: nil,
                 replyCreatedAt: nil,
                 phase: .peerPrepared
@@ -652,7 +697,9 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             candidate[activityID.value] = handoff
             guard replaceSnapshot(candidate) else {
                 markConversationNeedsAttention(conversation, detail: display)
-                projectAgentAppNeedsAttention(peer: peer, threadID: originThread.id, activityID: activityID)
+                if originConversation == nil {
+                    projectAgentAppNeedsAttention(peer: peer, threadID: originThread.id, activityID: activityID)
+                }
                 return nil
             }
 
@@ -683,14 +730,15 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 attachments: [],
                 providerSnapshots: providerSnapshots
             )
-            let relay = "An Agent App teammate asked you:\n\(display)"
             submit(
                 BotPeerExecutionPlan(
                     activityID: activityID.value,
                     peer: peer,
                     peerRun: peerPlan,
-                    peerReceipt: peerPlan.receipt(userText: relay),
-                    host: .agentApp(BotPeerAgentAppHostPlan(thread: originThread, runID: hostRunID))
+                    peerReceipt: peerPlan.receipt(userText: peerDisplay),
+                    host: resumeHostAfterPeer ? hostRunID.map {
+                        .agentApp(BotPeerAgentAppHostPlan(thread: originThread, runID: $0))
+                    } : nil
                 )
             )
             return Task { @MainActor [weak self] in
@@ -698,9 +746,49 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             }
         } catch {
             markConversationNeedsAttention(conversation, detail: display)
-            projectAgentAppNeedsAttention(peer: peer, threadID: originThread.id, activityID: activityID)
+            if originConversation == nil {
+                projectAgentAppNeedsAttention(peer: peer, threadID: originThread.id, activityID: activityID)
+            }
             return nil
         }
+    }
+
+    func askPeerFromActiveProvider(
+        peer: BotDefinition,
+        prompt: String,
+        originThread: AgentThread,
+        hostRunID: AgentRunID,
+        providerSnapshots: [AgentProviderSnapshot]
+    ) async -> (activityID: UUID, reply: String)? {
+        let originConversation = try? botStore.conversationLinked(to: originThread.id)
+        let originBot = originConversation.flatMap { try? botStore.get(id: $0.botID) }
+        if originConversation != nil, originBot == nil { return nil }
+
+        let activityID = AgentMessageID()
+        if originConversation == nil {
+            guard persistAgentAppProjection(
+                peer: peer,
+                threadID: originThread.id,
+                activityID: activityID,
+                content: BotPeerTranscript.encodeActivity(peer: peer, phase: .waiting),
+                createdAt: Date()
+            ) else { return nil }
+        }
+        guard let milestone = submitAgentAppMention(
+            peer: peer,
+            text: prompt,
+            peerText: prompt,
+            originThread: originThread,
+            activityID: activityID,
+            hostRunID: hostRunID,
+            providerSnapshots: providerSnapshots,
+            resumeHostAfterPeer: false,
+            originBot: originBot,
+            originConversation: originConversation
+        ) else { return nil }
+        await milestone.value
+        guard let reply = replyText(forActivityID: activityID.value) else { return nil }
+        return (activityID.value, reply)
     }
 
     private func awaitAgentAppDispatch(activityID: UUID) async {
@@ -1066,6 +1154,13 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             setPhase(plan.activityID, .needsAttention)
             return
         }
+        if handoffs[plan.activityID]?.originAgentThreadID != nil,
+           !projectAgentAppReply(activityID: plan.activityID) {
+            projectAgentAppNeedsAttention(activityID: plan.activityID)
+            setPhase(plan.activityID, .needsAttention, projectAttention: false)
+            resolveAgentAppDispatchWaiters(activityID: plan.activityID, force: true)
+            return
+        }
         guard let host = plan.host else {
             setPhase(plan.activityID, .completed)
             return
@@ -1074,7 +1169,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         let hop = BotPeerTranscript.hostHopPrompt(
             peerName: plan.peer.name,
             reply: replyMessage.content,
-            userText: handoffs[plan.activityID]?.outboundText ?? ""
+            userText: handoffs[plan.activityID]?.resolvedHostInstructionText ?? ""
         )
         switch host {
         case .desk(let hostRun):
@@ -1108,11 +1203,6 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 ) ? .completed : .needsAttention
             )
         case .agentApp(let hostRun):
-            guard projectAgentAppReply(activityID: plan.activityID) else {
-                projectAgentAppNeedsAttention(activityID: plan.activityID)
-                resolveAgentAppDispatchWaiters(activityID: plan.activityID, force: true)
-                return
-            }
             setPhase(plan.activityID, .hostPrepared)
             guard await startAgentAppHost(
                 hostRun,
@@ -1250,7 +1340,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             threadID: threadID,
             activityID: AgentMessageID(handoff.inboundMessageID),
             content: BotPeerTranscript.encode(peer: peer, text: reply),
-            createdAt: handoff.replyCreatedAt ?? handoff.createdAt
+            createdAt: handoff.replyCreatedAt ?? handoff.createdAt,
+            terminalStatus: handoff.requiresHostContinuation ? nil : .completed
         )
     }
 
@@ -1267,21 +1358,24 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         projectAgentAppNeedsAttention(
             peer: peer,
             threadID: threadID,
-            activityID: AgentMessageID(handoff.inboundMessageID)
+            activityID: AgentMessageID(handoff.inboundMessageID),
+            terminalStatus: handoff.requiresHostContinuation ? nil : .failed
         )
     }
 
     private func projectAgentAppNeedsAttention(
         peer: BotDefinition,
         threadID: AgentThreadID,
-        activityID: AgentMessageID
+        activityID: AgentMessageID,
+        terminalStatus: AgentRunStatus? = .failed
     ) {
         _ = persistAgentAppProjection(
             peer: peer,
             threadID: threadID,
             activityID: activityID,
             content: BotPeerTranscript.encodeActivity(peer: peer, phase: .needsAttention),
-            createdAt: (try? messageRepo.get(id: activityID))?.createdAt ?? Date()
+            createdAt: (try? messageRepo.get(id: activityID))?.createdAt ?? Date(),
+            terminalStatus: terminalStatus
         )
     }
 
@@ -1290,7 +1384,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         threadID: AgentThreadID,
         activityID: AgentMessageID,
         content: String,
-        createdAt: Date
+        createdAt: Date,
+        terminalStatus: AgentRunStatus? = nil
     ) -> Bool {
         let message = AgentMessage(
             id: activityID,
@@ -1305,14 +1400,26 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                   stored.threadId == threadID,
                   stored.role == .assistant,
                   stored.content == content else { return false }
-            if router?.agentAppThreadIsSelected(threadID) != true,
-               var thread = try threadRepo.get(id: threadID),
-               !thread.hasUnread {
-                thread.hasUnread = true
-                thread.updatedAt = Date()
-                try threadRepo.upsert(thread)
+            if var thread = try threadRepo.get(id: threadID) {
+                var changed = false
+                if let terminalStatus, thread.status != terminalStatus {
+                    thread.status = terminalStatus
+                    changed = true
+                }
+                if router?.agentAppThreadIsSelected(threadID) != true, !thread.hasUnread {
+                    thread.hasUnread = true
+                    changed = true
+                }
+                if changed {
+                    thread.updatedAt = Date()
+                    try threadRepo.upsert(thread)
+                }
             }
-            router?.projectAgentAppPeerMessage(threadID: threadID, messageID: activityID)
+            router?.projectAgentAppPeerMessage(
+                threadID: threadID,
+                messageID: activityID,
+                terminalStatus: terminalStatus
+            )
             return true
         } catch {
             return false
@@ -1508,12 +1615,22 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 }
                 guard setReply(activityID, message: reply),
                       importRestoredPeerReply(activityID: activityID) else { continue }
-                setPhase(activityID, .needsAttention, projectAttention: false)
+                setPhase(
+                    activityID,
+                    handoffs[activityID]?.requiresHostContinuation == false
+                        ? .completed
+                        : .needsAttention,
+                    projectAttention: false
+                )
 
             case .peerCompleted, .hostPrepared, .hostRunning:
                 guard importRestoredPeerReply(activityID: activityID) else { continue }
-                guard let current = handoffs[activityID],
-                      let hostThreadID = current.hostThreadID,
+                guard let current = handoffs[activityID] else { continue }
+                if !current.requiresHostContinuation {
+                    setPhase(activityID, .completed, projectAttention: false)
+                    continue
+                }
+                guard let hostThreadID = current.hostThreadID,
                       let hostRunID = current.hostRunID else {
                     setPhase(activityID, .needsAttention, projectAttention: false)
                     continue
@@ -2938,8 +3055,12 @@ public final class BotsViewModel: ObservableObject {
         messagesConversationIDByBot[bot.id] = nil
         deskMessages = []
         deskThreadSearchQuery = ""
+        attentionItems.removeAll {
+            $0.botID == bot.id && $0.conversationID != nil
+        }
         rememberStudioSupport(for: bot.id)
         applyAttentionState(for: bot.id, conversations: [])
+        Self.publishDestAttentionChanged()
         deskTimelineRejoinToken &+= 1
     }
 
@@ -3392,6 +3513,9 @@ public final class BotsViewModel: ObservableObject {
 
     public var deskShowsLoading: Bool {
         guard deskSendInFlight, !deskRunIsLive else { return false }
+        guard !deskMessages.contains(where: { $0.peer?.activityPhase == .waiting }) else {
+            return false
+        }
         return deskSendInFlightBotID == nil || deskSendInFlightBotID == selectedBotID
     }
 
@@ -3512,10 +3636,6 @@ public final class BotsViewModel: ObservableObject {
             )
             return true
         }
-        let peers = relayHop > 0 ? [] : mentionedBots(in: message)
-        if let peer = peers.first {
-            return sendMention(from: bot, to: peer, text: message, attachments: attached, relayHop: relayHop)
-        }
         do {
             let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attached)
             let conversation = try persistUserMessage(bot: bot, text: display)
@@ -3568,325 +3688,6 @@ public final class BotsViewModel: ObservableObject {
         } catch {
             errorMessage = String(describing: error)
             return false
-        }
-    }
-
-    @discardableResult
-    private func sendMention(
-        from host: BotDefinition,
-        to peer: BotDefinition,
-        text: String,
-        attachments: [AgentAttachment],
-        relayHop: Int
-    ) -> Bool {
-        lastMentionedBotIDForTesting = peer.id
-        lastDeskRunPermissionForTesting = frozenDeskRouting(for: host).permissionMode
-        var preparedPeerRunID: AgentRunID?
-        var preparedHostRunID: AgentRunID?
-        let display = AgentChatTranscriptChrome.displayUserLine(text: text, attachments: attachments)
-        let outbound = BotDeskMessage(
-            role: .user,
-            text: display,
-            peer: BotDeskPeer(direction: .messaged, bot: peer, activityPhase: .waiting)
-        )
-        do {
-            let hostConversation = try persistUserMessage(bot: host, text: display)
-            appendDeskMessage(outbound, botID: host.id, conversationID: hostConversation.id)
-            let peerConversation = try persistUserMessage(
-                bot: peer,
-                text: display,
-                adoptSelection: false,
-                createNew: true
-            )
-            appendDeskMessage(
-                BotDeskMessage(
-                    id: outbound.id,
-                    role: .user,
-                    text: display,
-                    createdAt: outbound.createdAt,
-                    peer: deskPeer(
-                        direction: .fromPeer,
-                        botID: host.id,
-                        name: host.name,
-                        title: host.title,
-                        handle: host.handle,
-                        avatarSymbol: host.avatarSymbol
-                    )
-                ),
-                botID: peer.id,
-                conversationID: peerConversation.id
-            )
-            guard let router = resolvedRouter(),
-                  let peerRevision = try currentRevision(for: peer) else {
-                recordNeedsAttention(bot: peer, conversation: peerConversation, userText: text)
-                persistUndispatchedPeerFailure(
-                    outbound: outbound,
-                    host: host,
-                    hostConversation: hostConversation,
-                    peer: peer,
-                    peerConversation: peerConversation
-                )
-                return true
-            }
-            var peerRouting = frozenDeskRouting(for: peer)
-            peerRouting.permissionMode = frozenDeskRouting(for: host).permissionMode
-            lastDeskRunPermissionForTesting = peerRouting.permissionMode
-            let peerPrepared = try prepareSupervisedRun(
-                bot: peer,
-                conversation: peerConversation,
-                routing: peerRouting,
-                router: router
-            )
-            preparedPeerRunID = peerPrepared.runID
-            let hostRevision = relayHop == 0 ? try currentRevision(for: host) : nil
-            let hostBrain = relayHop == 0 ? destBrainInputs(for: host) : nil
-            var hostRouting = relayHop == 0 ? frozenDeskRouting(for: host) : nil
-            hostRouting?.permissionMode = frozenDeskRouting(for: host).permissionMode
-            let hostPrepared = try hostRouting.map {
-                try prepareSupervisedRun(
-                    bot: host,
-                    conversation: hostConversation,
-                    routing: $0,
-                    router: router
-                )
-            }
-            preparedHostRunID = hostPrepared?.runID
-            let handoff = PersistedBotPeerHandoff(
-                version: 2,
-                activityID: outbound.id,
-                originBotID: host.id,
-                originConversationID: hostConversation.id,
-                originAgentThreadID: nil,
-                peerBotID: peer.id,
-                peerConversationID: peerPrepared.conversation.id,
-                peerThreadID: peerPrepared.thread.id,
-                peerRunID: peerPrepared.runID,
-                inboundMessageID: UUID(),
-                peerName: peer.name,
-                peerTitle: peer.title,
-                peerHandle: peer.handle,
-                peerAvatarSymbol: peer.avatarSymbol,
-                outboundText: display,
-                createdAt: outbound.createdAt,
-                peerRoute: BotPeerHandoffRoute(peerRouting),
-                hostThreadID: hostPrepared?.thread.id,
-                hostRunID: hostPrepared?.runID,
-                hostRoute: hostRouting.map(BotPeerHandoffRoute.init),
-                replyText: nil,
-                replyCreatedAt: nil,
-                phase: .peerPrepared
-            )
-            peerHandoffs[outbound.id] = handoff
-            guard persistPeerHandoffs() else {
-                peerHandoffs[outbound.id] = nil
-                cancelExactRunWait(peerPrepared.runID)
-                if let hostPrepared { cancelExactRunWait(hostPrepared.runID) }
-                recordNeedsAttention(bot: peer, conversation: peerConversation, userText: text)
-                errorMessage = "The bot handoff state could not be saved."
-                return false
-            }
-            let relay = BotPeerTranscript.peerAskPrompt(hostName: host.name, text: text)
-            let peerBrain = destBrainInputs(for: peer)
-            let peerRun = BotPeerRunPlan(
-                bot: peer,
-                revision: peerRevision,
-                started: peerPrepared,
-                memoryFiles: peerBrain.memoryFiles,
-                skills: peerBrain.skills,
-                ownedSkills: ownedSkillTexts(for: peer),
-                routines: peerBrain.routines,
-                browser: advertisedBrowser,
-                attachments: attachments,
-                providerSnapshots: providers
-            )
-            let hostRun: BotPeerRunPlan?
-            if let hostPrepared, let hostRevision, let hostBrain {
-                hostRun = BotPeerRunPlan(
-                    bot: host,
-                    revision: hostRevision,
-                    started: hostPrepared,
-                    memoryFiles: hostBrain.memoryFiles,
-                    skills: hostBrain.skills,
-                    ownedSkills: ownedSkillTexts(for: host),
-                    routines: hostBrain.routines,
-                    browser: advertisedBrowser,
-                    attachments: [],
-                    providerSnapshots: providers
-                )
-            } else {
-                hostRun = nil
-            }
-            lastSupervisedRunUserTextForTesting = relay
-            supervisedRunBotIDsForTesting.append(peer.id)
-            lastDeskRunProviderForTesting = peerRouting.provider
-            lastDeskRunModelForTesting = peerRouting.resolvedModel(defaultModel: Self.defaultModel(for:))
-            lastDeskRunPermissionForTesting = peerRouting.permissionMode
-            lastDeskRunReasoningForTesting = peerRouting.reasoningEffort
-            beginDeskSendInFlight(for: host.id)
-            context.botPeerHandoffAuthority.router = router
-            context.botPeerHandoffAuthority.submit(
-                BotPeerExecutionPlan(
-                    activityID: outbound.id,
-                    peer: peer,
-                    peerRun: peerRun,
-                    peerReceipt: peerRun.receipt(userText: relay),
-                    host: hostRun.map(BotPeerHostContinuation.desk)
-                )
-            )
-            return true
-        } catch {
-            if peerHandoffs[outbound.id] != nil {
-                setHandoffPhase(outbound.id, .needsAttention)
-            } else {
-                if let preparedPeerRunID { cancelExactRunWait(preparedPeerRunID) }
-                if let preparedHostRunID { cancelExactRunWait(preparedHostRunID) }
-            }
-            errorMessage = String(describing: error)
-            return false
-        }
-    }
-
-    /// Agent App `@mention` entry. Starts this teammate without stealing the
-    /// open Desk selection, then returns the finished assistant text.
-    @discardableResult
-    public func runMentionedPrompt(peer: BotDefinition, text: String) async -> String? {
-        await runMentionedPrompt(
-            peer: peer,
-            text: text,
-            originAgentThread: nil,
-            activityMessageID: nil,
-            hostRunID: nil
-        )
-    }
-
-    func runMentionedPrompt(
-        peer: BotDefinition,
-        text: String,
-        originAgentThread: AgentThread?,
-        activityMessageID: AgentMessageID?,
-        hostRunID: AgentRunID?
-    ) async -> String? {
-        lastMentionedBotIDForTesting = peer.id
-        let display = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !display.isEmpty else { return nil }
-        var preparedPeerRunID: AgentRunID?
-        var preparedHostRunID: AgentRunID?
-        do {
-            let conversation = try persistUserMessage(
-                bot: peer,
-                text: display,
-                adoptSelection: false,
-                createNew: true
-            )
-            appendDeskMessage(
-                BotDeskMessage(role: .user, text: display),
-                botID: peer.id,
-                conversationID: conversation.id
-            )
-            let brain = destBrainInputs(for: peer)
-            guard let router = resolvedRouter(),
-                  let revision = try currentRevision(for: peer) else {
-                recordNeedsAttention(bot: peer, conversation: conversation, userText: display)
-                return nil
-            }
-            var routing = frozenDeskRouting(for: peer)
-            if let originAgentThread {
-                routing.permissionMode = originAgentThread.permissionMode
-            }
-            let prepared = try prepareSupervisedRun(
-                bot: peer,
-                conversation: conversation,
-                routing: routing,
-                router: router
-            )
-            preparedPeerRunID = prepared.runID
-            if let originAgentThread, let activityMessageID, let hostRunID {
-                armExactRun(hostRunID)
-                preparedHostRunID = hostRunID
-                peerHandoffs[activityMessageID.value] = PersistedBotPeerHandoff(
-                    version: 2,
-                    activityID: activityMessageID.value,
-                    originBotID: nil,
-                    originConversationID: nil,
-                    originAgentThreadID: originAgentThread.id,
-                    peerBotID: peer.id,
-                    peerConversationID: prepared.conversation.id,
-                    peerThreadID: prepared.thread.id,
-                    peerRunID: prepared.runID,
-                    inboundMessageID: activityMessageID.value,
-                    peerName: peer.name,
-                    peerTitle: peer.title,
-                    peerHandle: peer.handle,
-                    peerAvatarSymbol: peer.avatarSymbol,
-                    outboundText: display,
-                    createdAt: Date(),
-                    peerRoute: BotPeerHandoffRoute(routing),
-                    hostThreadID: originAgentThread.id,
-                    hostRunID: hostRunID,
-                    hostRoute: BotPeerHandoffRoute(originAgentThread),
-                    replyText: nil,
-                    replyCreatedAt: nil,
-                    phase: .peerPrepared
-                )
-                guard persistPeerHandoffs() else {
-                    peerHandoffs[activityMessageID.value] = nil
-                    cancelExactRunWait(prepared.runID)
-                    cancelExactRunWait(hostRunID)
-                    recordNeedsAttention(bot: peer, conversation: conversation, userText: display)
-                    errorMessage = "The bot handoff state could not be saved."
-                    return nil
-                }
-                if screen == .activeBots { reloadActiveBotsScreen() }
-            }
-            let relay = "An Agent App teammate asked you:\n\(display)"
-            let started = await startSupervisedRun(
-                bot: peer,
-                revision: revision,
-                prepared: prepared,
-                userText: relay,
-                attachments: [],
-                memoryFiles: brain.memoryFiles,
-                skills: brain.skills,
-                routines: brain.routines,
-                router: router
-            )
-            guard let started else {
-                recordNeedsAttention(bot: peer, conversation: conversation, userText: display)
-                if let activityMessageID { setHandoffPhase(activityMessageID.value, .needsAttention) }
-                return nil
-            }
-            lastLinkedRunIDByBot[peer.id] = started.runID
-            if let activityMessageID { setHandoffPhase(activityMessageID.value, .peerRunning) }
-            let run = await followLinkedRun(bot: peer, started: started)
-            guard run?.status == .completed,
-                  let message = exactAssistantMessage(
-                    threadID: started.thread.id,
-                    runID: started.runID
-                  ) else {
-                if let activityMessageID { setHandoffPhase(activityMessageID.value, .needsAttention) }
-                return nil
-            }
-            if let activityMessageID, var handoff = peerHandoffs[activityMessageID.value] {
-                handoff.replyText = message.content
-                handoff.replyCreatedAt = message.createdAt
-                handoff.phase = .peerCompleted
-                peerHandoffs[activityMessageID.value] = handoff
-                guard persistPeerHandoffs() else {
-                    if let preparedHostRunID { cancelExactRunWait(preparedHostRunID) }
-                    setHandoffPhase(activityMessageID.value, .needsAttention)
-                    return nil
-                }
-            }
-            return message.content
-        } catch {
-            if let activityMessageID, peerHandoffs[activityMessageID.value] != nil {
-                setHandoffPhase(activityMessageID.value, .needsAttention)
-            } else {
-                if let preparedPeerRunID { cancelExactRunWait(preparedPeerRunID) }
-                if let preparedHostRunID { cancelExactRunWait(preparedHostRunID) }
-            }
-            errorMessage = String(describing: error)
-            return nil
         }
     }
 
@@ -4247,6 +4048,13 @@ public final class BotsViewModel: ObservableObject {
             bot.notificationsEnabled = studioDraft.notificationsEnabled
         }
         guard let revision = studioPreviewRevision(for: bot) ?? selectedRevision else { return nil }
+        let turnDirective = BotPeerDelegation.turnDirective(
+            mentionedBots: BotMentionParser.mentionedBots(
+                in: request,
+                bots: bots,
+                excluding: bot.id
+            )
+        )
         let memoryFiles = memoryFileTexts(for: bot)
         let key = [
             bot.id.value.uuidString,
@@ -4262,6 +4070,7 @@ public final class BotsViewModel: ObservableObject {
             ownedSkillTexts(for: bot).map { "\($0.slug):\($0.body)" }.joined(separator: ","),
             selectedConversation?.id.value.uuidString ?? "",
             bot.notificationsEnabled ? "n1" : "n0",
+            turnDirective ?? "",
         ].joined(separator: "\u{1f}")
         if cachedPreviewBrainKey == key, let cached = cachedPreviewBrain {
             return cached
@@ -4277,7 +4086,8 @@ public final class BotsViewModel: ObservableObject {
             routines: routines,
             workspace: advertisedWorkspace,
             browser: advertisedBrowser,
-            conversationID: selectedConversation?.id
+            conversationID: selectedConversation?.id,
+            turnDirective: turnDirective
         )
         cachedPreviewBrainKey = key
         cachedPreviewBrain = receipt
@@ -5542,52 +5352,6 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    private func persistUndispatchedPeerFailure(
-        outbound: BotDeskMessage,
-        host: BotDefinition,
-        hostConversation: BotConversation,
-        peer: BotDefinition,
-        peerConversation: BotConversation
-    ) {
-        var routing = frozenDeskRouting(for: peer)
-        routing.permissionMode = frozenDeskRouting(for: host).permissionMode
-        peerHandoffs[outbound.id] = PersistedBotPeerHandoff(
-            version: 2,
-            activityID: outbound.id,
-            originBotID: host.id,
-            originConversationID: hostConversation.id,
-            originAgentThreadID: nil,
-            peerBotID: peer.id,
-            peerConversationID: peerConversation.id,
-            peerThreadID: nil,
-            peerRunID: nil,
-            inboundMessageID: UUID(),
-            peerName: peer.name,
-            peerTitle: peer.title,
-            peerHandle: peer.handle,
-            peerAvatarSymbol: peer.avatarSymbol,
-            outboundText: outbound.text,
-            createdAt: outbound.createdAt,
-            peerRoute: BotPeerHandoffRoute(routing),
-            hostThreadID: nil,
-            hostRunID: nil,
-            hostRoute: nil,
-            replyText: nil,
-            replyCreatedAt: nil,
-            phase: .needsAttention
-        )
-        if !persistPeerHandoffs() {
-            peerHandoffs[outbound.id] = nil
-            errorMessage = "The bot handoff state could not be saved."
-            return
-        }
-        updatePeerActivity(
-            originConversationID: hostConversation.id,
-            messageID: outbound.id,
-            phase: .needsAttention
-        )
-    }
-
     private func hostSidePeerTurns(_ handoff: PersistedBotPeerHandoff) -> [BotDeskMessage] {
         let peer = deskPeer(
             direction: .messaged,
@@ -5815,6 +5579,8 @@ public final class BotsViewModel: ObservableObject {
                     peerThreadID: $0.peerThreadID,
                     peerRunID: $0.peerRunID,
                     inboundMessageID: $0.inboundMessageID,
+                    outboundText: $0.outboundText,
+                    hostInstructionText: $0.resolvedHostInstructionText,
                     hostThreadID: $0.hostThreadID,
                     hostRunID: $0.hostRunID,
                     phase: $0.phase,
@@ -6732,7 +6498,14 @@ public final class BotsViewModel: ObservableObject {
                 workspace: nil,
                 browser: advertisedBrowser,
                 conversationID: prepared.conversation.id,
-                liveRunMode: routing.permissionMode
+                liveRunMode: routing.permissionMode,
+                turnDirective: BotPeerDelegation.turnDirective(
+                    mentionedBots: BotMentionParser.mentionedBots(
+                        in: userText,
+                        bots: bots,
+                        excluding: bot.id
+                    )
+                )
             )
             // Dest already listed Source on open. Stamp that catalog so
             // sendAgentMessage preflight does not rediscover models.
@@ -7281,6 +7054,26 @@ extension BotsViewModel: BotPeerHandoffAuthorityObserver {
         guard delta.previous != delta.current, let handoff = delta.current else { return }
 
         if let conversationID = handoff.originConversationID {
+            if delta.previous == nil, let hostID = handoff.originBotID {
+                let outbound = BotDeskMessage(
+                    id: handoff.activityID,
+                    role: .user,
+                    text: handoff.outboundText,
+                    createdAt: handoff.createdAt,
+                    peer: deskPeer(
+                        direction: .messaged,
+                        botID: handoff.peerBotID,
+                        name: handoff.peerName,
+                        title: handoff.peerTitle,
+                        handle: handoff.peerHandle,
+                        avatarSymbol: handoff.peerAvatarSymbol,
+                        activityPhase: .waiting
+                    )
+                )
+                if !(messagesByBot[hostID] ?? []).contains(where: { $0.id == outbound.id }) {
+                    appendDeskMessage(outbound, botID: hostID, conversationID: conversationID)
+                }
+            }
             let activity: BotPeerActivityPhase?
             switch handoff.phase {
             case .peerPrepared, .peerRunning: activity = .waiting
@@ -7312,11 +7105,13 @@ extension BotsViewModel: BotPeerHandoffAuthorityObserver {
                 if !(messagesByBot[hostID] ?? []).contains(where: { $0.id == inbound.id }) {
                     appendDeskMessage(inbound, botID: hostID, conversationID: conversationID)
                 }
-                lastHopUserTextForTesting = BotPeerTranscript.hostHopPrompt(
-                    peerName: handoff.peerName,
-                    reply: reply,
-                    userText: handoff.outboundText
-                )
+                if handoff.hostRunID != nil {
+                    lastHopUserTextForTesting = BotPeerTranscript.hostHopPrompt(
+                        peerName: handoff.peerName,
+                        reply: reply,
+                        userText: handoff.resolvedHostInstructionText
+                    )
+                }
             }
         }
 

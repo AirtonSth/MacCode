@@ -63,6 +63,8 @@ public enum HostMutationContract {
     agent.attachment.upload
     agent.attachment.import
     agent.provider.update
+    bot.peer.ask
+    bot.peer.self_config
     fs.workspace.create_file
     fs.workspace.delete
     fs.workspace.rename
@@ -296,6 +298,8 @@ public enum HostMutationContract {
         case "agent.checkpoint.revert": return [.uuid("thread_id"), .firstPresentInt(["turn_count", "checkpoint_turn_count"])]
         case "agent.attachment.upload": return [.uuid("workspace_id"), .string("filename"), .anyString(["data_base64", "dataBase64"])]
         case "agent.attachment.import": return [.uuid("workspace_id"), .string("relative_path", nonempty: true)]
+        case "bot.peer.ask": return [.uuid("thread_id"), .uuid("run_id"), .string("handle"), .string("prompt"), .stringEnum("reply_mode", ["consult", "reply_only"])]
+        case "bot.peer.self_config": return [.uuid("thread_id"), .uuid("run_id"), .string("tool_name"), .object("arguments")]
         case "fs.workspace.create_file": return [.uuid("workspace_id"), .string("path")]
         case "fs.workspace.delete": return [.uuid("workspace_id")]
         case "fs.workspace.rename": return [.uuid("workspace_id"), .string("path"), .string("new_name")]

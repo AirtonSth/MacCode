@@ -2301,13 +2301,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             peers: [quinn],
             text: "@\(quinn.handle) T005_DELETE_AGENT_VICTIM",
             threadId: victimThread.id,
-            onto: surface
+            onto: surface,
+            continueHost: true
         )
         async let siblingDispatch: Void = router.dispatchAgentAppBotMentions(
             peers: [quinn],
             text: "@\(quinn.handle) T005_DELETE_AGENT_SIBLING",
             threadId: siblingThread.id,
-            onto: surface
+            onto: surface,
+            continueHost: true
         )
         let bothPeersStarted = await waitUntil(timeout: 5) {
             peerRunner.requests.contains { $0.prompt.contains("T005_DELETE_AGENT_VICTIM") }
@@ -2472,13 +2474,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             peers: [quinn],
             text: "@\(quinn.handle) T005_SURFACE_DELETE_VICTIM",
             threadId: victimThread.id,
-            onto: surface
+            onto: surface,
+            continueHost: true
         )
         async let siblingDispatch: Void = router.dispatchAgentAppBotMentions(
             peers: [quinn],
             text: "@\(quinn.handle) T005_SURFACE_DELETE_SIBLING",
             threadId: siblingThread.id,
-            onto: surface
+            onto: surface,
+            continueHost: true
         )
         let bothPeersStarted = await waitUntil(timeout: 5) {
             peerRunner.requests.contains { $0.prompt.contains("T005_SURFACE_DELETE_VICTIM") }
@@ -2617,13 +2621,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             peers: [fixture.peer],
             text: "@\(fixture.peer.handle) T005_ROLLBACK_VICTIM",
             threadId: fixture.threadID,
-            onto: fixture.surface
+            onto: fixture.surface,
+            continueHost: true
         )
         async let siblingDispatch: Void = fixture.router.dispatchAgentAppBotMentions(
             peers: [fixture.peer],
             text: "@\(fixture.peer.handle) T005_ROLLBACK_SIBLING",
             threadId: siblingThread.id,
-            onto: fixture.surface
+            onto: fixture.surface,
+            continueHost: true
         )
         let bothPeersStarted = await waitUntil(timeout: 5) {
             peerRunner.requests.contains { $0.prompt.contains("T005_ROLLBACK_VICTIM") }
@@ -5442,7 +5448,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 peers: [fixture.peer],
                 text: "@\(fixture.peer.handle) T005_BLOCK_ENRICHMENT",
                 threadId: fixture.threadID,
-                onto: fixture.surface
+                onto: fixture.surface,
+                continueHost: true
             )
         }
         let peerStarted = await waitUntil(timeout: 5) {
@@ -5532,7 +5539,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 peers: [fixture.peer],
                 text: "@\(fixture.peer.handle) T005_FAIL_MINIMAL_CHECKPOINT",
                 threadId: fixture.threadID,
-                onto: fixture.surface
+                onto: fixture.surface,
+                continueHost: true
             )
         }
         let peerStarted = await waitUntil(timeout: 5) {

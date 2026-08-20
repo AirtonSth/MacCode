@@ -366,6 +366,8 @@ public enum BotStandingInstructions {
     public static let viewSkillTool = "bot_skill_view"
     public static let recallTool = "bot_recall"
     public static let askUserTool = "bot_ask_user"
+    public static let listPeersTool = BotPeerDelegation.listTool
+    public static let askPeerTool = BotPeerDelegation.askTool
 
     public static let generatedCapabilityLine =
         "When asked to remember, forget, or correct a fact, write MEMORY.md or memory/YYYY-MM-DD.md with \(writeMemoryFileTool). When asked to change your name, Role, Instructions, description, notifications, or avatar, call \(changeJobTool)."
@@ -384,6 +386,9 @@ public enum BotStandingInstructions {
 
     public static let generatedAskLine =
         "When you need a choice only the user can make, call \(askUserTool) and end the turn. Do not keep waiting in the tool."
+
+    public static let generatedPeerLine =
+        "When another @Bot's input is needed, interpret the full request first, then call \(askPeerTool) with a new focused prompt containing only that Bot's part. Use \(listPeersTool) when you need the exact handle."
 
     public static let macosHarnessTool = "macos-harness"
     public static let generatedMacOSHarnessLine =
@@ -415,6 +420,7 @@ public enum BotStandingInstructions {
             generatedWebLine,
             generatedRecallLine,
             generatedAskLine,
+            generatedPeerLine,
         ])
         if admission.allowsMacOSHarness {
             lines.append(generatedMacOSHarnessLine)

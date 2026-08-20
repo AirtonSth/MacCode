@@ -33,6 +33,21 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.writeHomeFile))
             XCTAssertFalse(names.contains(BotSelfConfigCatalog.setSkill))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.saveRoutine))
+            XCTAssertTrue(names.contains(BotSelfConfigCatalog.listPeers))
+            XCTAssertTrue(names.contains(BotSelfConfigCatalog.askPeer))
+
+            let askPeer = try XCTUnwrap(tools.first {
+                ($0["name"] as? String) == BotSelfConfigCatalog.askPeer
+            })
+            let description = try XCTUnwrap(askPeer["description"] as? String)
+            XCTAssertTrue(description.contains("focused prompt written by you"))
+            XCTAssertTrue(description.contains("sent literally"))
+            let schema = try XCTUnwrap(askPeer["inputSchema"] as? [String: Any])
+            XCTAssertEqual(schema["required"] as? [String], ["handle", "prompt", "reply_mode"])
+            XCTAssertEqual(schema["additionalProperties"] as? Bool, false)
+            let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+            let prompt = try XCTUnwrap(properties["prompt"] as? [String: Any])
+            XCTAssertTrue((prompt["description"] as? String)?.contains("Only this text is sent") == true)
         }
     }
 

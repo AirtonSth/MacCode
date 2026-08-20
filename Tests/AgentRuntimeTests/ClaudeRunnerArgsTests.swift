@@ -1,6 +1,7 @@
 import XCTest
 @testable import AgentRuntime
 import CoreModel
+import Persistence
 
 /// Regression: `claude --print --output-format stream-json` is rejected by
 /// the CLI ("requires --verbose"). The runner MUST always pass --verbose,
@@ -59,6 +60,46 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                        "must load user + project + local to match interactive claude's `/` surface")
     }
 
+    func test_liveClaudeRoutesAdmitBotPeerMCPWithExactRunContext() throws {
+        // WHY: Claude Code does not read mcpServers from settings.json. Without
+        // the explicit per-process config, the primary AI can interpret @bot
+        // correctly yet has no bot_ask_peer tool and falsely asks the user to
+        // start a peer session. Both CLI routes must carry only active-run
+        // authority; no user prose or unrelated environment may enter config.
+        let environment = [
+            BotSelfConfigCatalog.callerEnvironmentKey: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            BotPeerDelegation.threadEnvironmentKey: "11111111-2222-3333-4444-555555555555",
+            BotPeerDelegation.runEnvironmentKey: "66666666-7777-8888-9999-aaaaaaaaaaaa",
+            BotPeerDelegation.socketEnvironmentKey: "/tmp/remote-code.sock",
+            "UNRELATED_SECRET": "must-not-be-forwarded",
+        ]
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .claude,
+            model: "claude-opus-4-7",
+            cwd: "/tmp",
+            prompt: "USER WORDS STAY OUT OF MCP CONFIG",
+            environment: environment
+        )
+        for args in [ClaudeRunner.buildArgs(request), ClaudeRunner.buildStreamingArgs(request)] {
+            let index = try XCTUnwrap(args.firstIndex(of: "--mcp-config"))
+            let data = Data(args[args.index(after: index)].utf8)
+            let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let servers = try XCTUnwrap(root["mcpServers"] as? [String: Any])
+            let server = try XCTUnwrap(servers[BotSelfConfigMCPAdmit.serverName] as? [String: Any])
+            let forwarded = try XCTUnwrap(server["env"] as? [String: String])
+            XCTAssertEqual(forwarded, environment.filter { $0.key != "UNRELATED_SECRET" })
+            XCTAssertNil(forwarded["UNRELATED_SECRET"])
+            XCTAssertFalse(args[args.index(after: index)].contains(request.prompt))
+            XCTAssertFalse(args.contains("--strict-mcp-config"),
+                           "RemoteCode's server must supplement, not replace, user/project MCP servers")
+            let allowedIndex = try XCTUnwrap(args.firstIndex(of: "--allowedTools"))
+            let allowed = Set(args[args.index(after: allowedIndex)].split(separator: ",").map(String.init))
+            XCTAssertEqual(allowed, Set(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools),
+                           "supervised mode must allow only the exact managed delegation/settings tools without another user confirmation")
+        }
+    }
+
     func test_uncaughtSignalIsFailureUnlessCancellationWasRequested() {
         XCTAssertEqual(
             ClaudeRunner.terminalStatus(cancelRequested: false, terminationReason: .uncaughtSignal, terminationStatus: 9),
@@ -81,9 +122,13 @@ final class ClaudeRunnerArgsTests: XCTestCase {
 
     func test_streamingAppendsBackgroundAwaitAlwaysAndDistillOnlyWithTokenSaver() {
         // Background-await always; Distill only with Token Saver hint.
+        let turnContext = "REMOTE CODE RESOLVED IDENTITY ONLY: @quinn is Quinn"
         let on = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                  model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi",
-                                 environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"])
+                                 environment: [
+                                    "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                                    BotPeerDelegation.turnContextEnvironmentKey: turnContext,
+                                 ])
         let aOn = ClaudeRunner.buildStreamingArgs(on)
         guard let idxOn = aOn.firstIndex(of: "--append-system-prompt") else {
             return XCTFail("Claude streaming runs must append a system prompt carrying the background-await rule")
@@ -91,6 +136,9 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let promptOn = aOn[aOn.index(after: idxOn)]
         XCTAssertTrue(promptOn.contains(BackgroundAwaitContinuation.awaitingMarker),
                       "appended system prompt must instruct the agent to self-declare a stall with the recovery marker")
+        XCTAssertTrue(promptOn.contains(BotPeerDelegation.providerDirective))
+        XCTAssertTrue(promptOn.contains(turnContext),
+                      "Claude CLI must receive this turn's identity-only Bot context")
         XCTAssertTrue(promptOn.contains("| distill"),
                       "Token Saver on injects the `| distill` piping rule")
         XCTAssertEqual(promptOn.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
@@ -111,6 +159,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let promptEmpty = aEmpty[aEmpty.index(after: idxEmpty)]
         XCTAssertTrue(promptEmpty.contains(BackgroundAwaitContinuation.awaitingMarker),
                       "the background-await rule must be present on every Claude call")
+        XCTAssertTrue(promptEmpty.contains(BotPeerDelegation.providerDirective))
         XCTAssertFalse(promptEmpty.contains("| distill"),
                        "Token Saver off must not inject Distill")
         XCTAssertFalse(promptEmpty.contains(TokenSaverProviderSafetyABI.block),
@@ -139,6 +188,14 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let sdkPrompt = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: request.environment)
         XCTAssertTrue(sdkPrompt.contains(BackgroundAwaitContinuation.mcpToolAvailabilityDirective),
                       "the SDK bridge route must carry the identical MCP-availability rule (both routes share one source so they cannot drift)")
+        XCTAssertTrue(sdkPrompt.contains(BotPeerDelegation.providerDirective))
+        let turnContext = "REMOTE CODE RESOLVED IDENTITY ONLY: @quinn is Quinn"
+        XCTAssertFalse(
+            ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: [
+                BotPeerDelegation.turnContextEnvironmentKey: turnContext,
+            ]).contains(turnContext),
+            "identity metadata must ride the individual SDK turn instead of freezing into the long-lived session prompt"
+        )
 
         XCTAssertTrue(BackgroundAwaitContinuation.alwaysOnClaudeDirectives.contains(BackgroundAwaitContinuation.awaitingMarker),
                       "the shared directive bundle must retain the background-await rule alongside the new MCP rule")

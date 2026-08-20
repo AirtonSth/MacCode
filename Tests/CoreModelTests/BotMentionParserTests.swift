@@ -2,6 +2,48 @@ import XCTest
 @testable import CoreModel
 
 final class BotMentionParserTests: XCTestCase {
+    func test_mentionsResolveIdentityOnly_becauseTheProviderMustAuthorDelegatedPrompts() {
+        // WHY: mention parsing may power autocomplete/identity, but must never
+        // interpret prose or manufacture the prompt sent to another Bot.
+        let bot = BotDefinition(
+            handle: "bot",
+            name: "Bot",
+            title: "",
+            description: ""
+        )
+
+        XCTAssertEqual(
+            BotMentionParser.mentionedBots(
+                in: "pergunte ao @bot o nome dele e depois decida o restante",
+                bots: [bot],
+                excluding: nil
+            ).map(\.id),
+            [bot.id]
+        )
+        XCTAssertTrue(BotPeerDelegation.providerDirective.contains("first interpret the complete user request"))
+        XCTAssertTrue(BotPeerDelegation.providerDirective.contains("new focused `prompt`"))
+        XCTAssertFalse(BotPeerDelegation.providerDirective.contains("Qual é o seu nome?"))
+        XCTAssertFalse(BotPeerDelegation.providerDirective.contains("com base na resposta"))
+        let directive = BotPeerDelegation.turnDirective(mentionedBots: [bot])
+        XCTAssertTrue(directive?.contains("@bot is Bot") == true)
+        XCTAssertTrue(directive?.contains(bot.id.value.uuidString.lowercased()) == true)
+        XCTAssertTrue(directive?.contains("identity metadata only") == true)
+        XCTAssertFalse(directive?.contains("nome dele") == true)
+        let environment = BotPeerDelegation.environment(
+            addingTurnContextTo: ["KEEP": "1"],
+            mentionedBots: [bot]
+        )
+        XCTAssertEqual(environment[BotPeerDelegation.turnContextEnvironmentKey], directive)
+        XCTAssertEqual(environment["KEEP"], "1")
+        XCTAssertEqual(
+            BotPeerDelegation.environment(
+                addingTurnContextTo: environment,
+                mentionedBots: []
+            )[BotPeerDelegation.turnContextEnvironmentKey],
+            nil
+        )
+    }
+
     func test_peerActivityRoundTripsBothPhasesAndIdentity() throws {
         let peer = BotDefinition(
             handle: "quinn",
@@ -61,14 +103,10 @@ final class BotMentionParserTests: XCTestCase {
         XCTAssertFalse(BotPeerTranscript.isHostHopUserText("Pergunte ao bot seu nome"))
     }
 
-    func test_peerAskPromptIsInternalAndStripsToDisplayText() {
-        // WHY: the asked bot ran "Ceo asked you:" as the provider user
-        // line. Desk must treat that wrapper as internal and show the
-        // original ask under From-host chrome.
-        let ask = BotPeerTranscript.peerAskPrompt(
-            hostName: "Ceo",
-            text: "@bot Pergunte ao bot seu nome e função"
-        )
+    func test_legacyPeerAskTextStillRestoresWithoutLeakingItsWrapper() {
+        // WHY: new peer prompts are authored literally by the AI, but existing
+        // stored conversations may still contain the retired wrapper.
+        let ask = "Ceo asked you:\nbot Pergunte ao bot seu nome e função"
         XCTAssertTrue(ask.contains("Ceo asked you:"))
         XCTAssertTrue(ask.contains("Pergunte ao bot seu nome e função"))
         XCTAssertFalse(ask.contains("@bot"))
@@ -84,15 +122,16 @@ final class BotMentionParserTests: XCTestCase {
         XCTAssertFalse(BotPeerTranscript.isHostHopUserText(ask))
     }
 
-    func test_visibleCaptionsAreToFromName_becauseIdentityLineIsNotChatChrome() {
+    func test_visibleCaptionsDistinguishMentionFromActualDelegation() {
         XCTAssertEqual(BotPeerTranscript.toCaption(name: "Quinn"), "To Quinn")
         XCTAssertEqual(BotPeerTranscript.fromCaption(name: "Quinn"), "From Quinn")
-        XCTAssertEqual(BotPeerTranscript.messagedCaption(for: BotDefinition(
+        XCTAssertEqual(BotPeerTranscript.mentionedCaption(name: "Quinn"), "Mentions Quinn")
+        XCTAssertEqual(BotPeerTranscript.mentionedCaption(for: BotDefinition(
             handle: "quinn",
             name: "Quinn",
             title: "CRM Controller",
             description: ""
-        )), "To Quinn")
+        )), "Mentions Quinn")
         XCTAssertEqual(
             BotPeerTranscript.groupCaption(hostName: "Ceo", peerName: "Bot", count: 3),
             "3 messages · Ceo × Bot"

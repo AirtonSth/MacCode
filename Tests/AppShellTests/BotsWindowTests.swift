@@ -4786,35 +4786,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.botStore.listConversations(botID: piper.id).count, 1)
     }
 
-    func test_mentionCreatesNewPeerConversation() throws {
-        // WHY: @quinn used to reuse Quinn's first dest row. A second
-        // mention must be its own thread.
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
-        let quinn = try vm.create(name: "Quinn", title: "CRM", provider: .claude)
-        vm.openDesk(piper)
-        XCTAssertTrue(vm.send("@quinn first ping"))
-        XCTAssertTrue(vm.send("@quinn second ping"))
-        let peerThreads = try context.botStore.listConversations(botID: quinn.id)
-        XCTAssertEqual(peerThreads.count, 2)
-        XCTAssertEqual(try context.botStore.listConversations(botID: piper.id).count, 1)
-        XCTAssertEqual(Set(peerThreads.map(\.id)).count, 2)
-    }
-
-    func test_agentAppMentionCreatesNewPeerConversation() async throws {
-        // WHY: Agent App @quinn must open a dest thread, not pile onto
-        // Quinn's already-open dest conversation.
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let quinn = try vm.create(name: "Quinn", title: "CRM", provider: .claude)
-        vm.openDesk(quinn)
-        XCTAssertTrue(vm.send("already on dest"))
-        XCTAssertEqual(try context.botStore.listConversations(botID: quinn.id).count, 1)
-        _ = await vm.runMentionedPrompt(peer: quinn, text: "@quinn from agent app")
-        XCTAssertEqual(try context.botStore.listConversations(botID: quinn.id).count, 2)
-    }
-
     func test_selectDeskThreadRestoresThatConversation() throws {
         // WHY: dest cache was per-bot. Switching threads must not keep
         // the previous transcript.
@@ -4904,6 +4875,13 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.botStore.listConversations(botID: piper.id).count, 0)
         XCTAssertEqual(try context.botStore.listConversations(botID: quinn.id).count, 1)
         XCTAssertEqual(try context.botStore.listConversations(botID: quinn.id).first?.title, "Quinn inbox")
+        XCTAssertEqual(vm.attentionState(for: piper), .none)
+        XCTAssertEqual(vm.openAttentionCount, 1, "only Quinn's live thread still needs attention")
+
+        let reopened = BotsViewModel(context: context)
+        let reopenedPiper = try XCTUnwrap(reopened.fleet.first(where: { $0.id == piper.id }))
+        XCTAssertEqual(reopened.attentionState(for: reopenedPiper), .none)
+        XCTAssertEqual(reopened.openAttentionCount, 1)
     }
 
     func test_clearAllDeskThreadsLeavesEmptyRail_becausePlusStartsTheNextConversation() throws {
@@ -5025,17 +5003,19 @@ final class BotsWindowTests: XCTestCase {
             status: .completed,
             reply: "sibling remains exact"
         ))
-        let siblingHostStarted = await waitUntil(timeout: 5) { !roryHostRunner.requests.isEmpty }
-        XCTAssertTrue(siblingHostStarted)
-        let siblingHostRunID = try XCTUnwrap(reloaded.peerHandoffSnapshotsForTesting(
+        let siblingCompleted = await waitUntil(timeout: 5) {
+            reloaded.peerHandoffSnapshotsForTesting(
+                originConversationID: siblingConversation.id,
+                originThreadID: nil
+            ).first?.phase == .completed
+        }
+        XCTAssertTrue(siblingCompleted)
+        XCTAssertNil(reloaded.peerHandoffSnapshotsForTesting(
             originConversationID: siblingConversation.id,
             originThreadID: nil
         ).first?.hostRunID)
-        XCTAssertTrue(roryHostRunner.finish(
-            runID: siblingHostRunID,
-            status: .cancelled,
-            reply: nil
-        ))
+        XCTAssertTrue(piperHostRunner.requests.isEmpty)
+        XCTAssertTrue(roryHostRunner.requests.isEmpty)
     }
 
     func test_sendContinuesSelectedConversation() throws {
@@ -5051,56 +5031,247 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("second") })
     }
 
-    func test_sendWithMentionTargetsPeer_notOnlyHost() throws {
-        // WHY: "@quinn do X" from Piper's Desk must run Quinn and paint
-        // Messaged Quinn on Piper's transcript. A host-only send would
-        // never let teammates talk to each other.
+    func test_deskMentionStartsWithPrimaryAI_becauseOnlyItMayAuthorThePeerPrompt() async throws {
+        // WHY: the app cannot know whether an @mention is a direct ask, a
+        // consultation, or merely context. The selected Bot's primary AI must
+        // receive the complete request before any peer provider starts.
         let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: "fake-model", label: "Fake Model", provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        })
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
         vm.openDesk(piper)
-        vm.composerText = "@quinn check WhatsApp"
-        XCTAssertTrue(vm.send())
-        XCTAssertEqual(vm.lastMentionedBotIDForTesting, quinn.id)
-        let outbound = try XCTUnwrap(vm.deskMessages.last)
-        XCTAssertEqual(outbound.role, .user)
-        XCTAssertEqual(outbound.peer?.direction, .messaged)
-        XCTAssertEqual(outbound.peer?.botID, quinn.id)
-        XCTAssertEqual(outbound.peer?.caption, "To Quinn")
-        XCTAssertEqual(outbound.peer?.avatarSymbol, quinn.avatarSymbol)
-        XCTAssertTrue(outbound.text.contains("@quinn"))
-    }
-
-    func test_sendMentionInheritsCallerFullAccessChip() throws {
-        // WHY: @mention used the peer's saved chip (default Supervised) even
-        // when the caller composer was Full access. The invocation chip wins.
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
-        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
-        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
         vm.setDeskPermissionMode(.fullAccess)
-        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp"))
-        XCTAssertEqual(vm.lastDeskRunPermissionForTesting, .fullAccess)
+
+        let prompt = "pergunte ao @\(quinn.handle) o nome dele e depois continue o trabalho"
+        XCTAssertTrue(vm.send(prompt))
+        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+        let hostRequest = try XCTUnwrap(hostRunner.requests.first)
+        XCTAssertTrue(hostRequest.prompt.hasSuffix("User request:\n\n\(prompt)"))
+        XCTAssertEqual(hostRequest.permissionMode, .fullAccess)
+        XCTAssertTrue(peerRunner.requests.isEmpty, "RemoteCode must not pre-dispatch a mention")
+        XCTAssertTrue(vm.peerHandoffSnapshotsForTesting().isEmpty)
+        XCTAssertTrue(hostRunner.finish(runID: hostRequest.runId, status: .completed, reply: "done"))
     }
 
-    func test_sendWithMentionStartsPeerProviderRun() async throws {
-        // WHY: parse-only tests passed while the mentioned bot never started.
-        // Shipped send() must attempt a provider run on the peer bot id.
-        let (vm, piper, quinn) = try makeMentionPair(peerReply: "PONG from Quinn")
-        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp and reply PONG"))
-        XCTAssertEqual(vm.lastMentionedBotIDForTesting, quinn.id)
-        let outbound = try XCTUnwrap(vm.deskTranscriptForTesting(botID: piper.id).last)
-        XCTAssertEqual(outbound.peer?.direction, .messaged)
-        XCTAssertEqual(outbound.peer?.botID, quinn.id)
+    func test_deskCompoundMentionIsInterpretedByPrimaryAIThenDelegatesFocusedPrompt() async throws {
+        // WHY: the original request contains two different jobs. Only the
+        // primary AI may decide the peer ask; RemoteCode must transport that
+        // new prompt literally and keep one primary run for the remaining work.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: "fake-model", label: "Fake Model", provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        })
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        let untouched = try vm.create(name: "Untouched", title: "Observer", provider: .grok)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
 
-        let startedPeer = await waitUntil(timeout: 8) {
-            vm.supervisedRunBotIDsForTesting.contains(quinn.id) && vm.lastSendStartedProviderRun
+        let prompt = "pergunte ao @\(quinn.handle) o nome dele e com base na resposta dê outro nome para ele. Faça a alteração agora sem pedir confirmação e no final diga qual nome foi aplicado."
+        XCTAssertTrue(vm.send(prompt))
+        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+        let hostRequest = try XCTUnwrap(hostRunner.requests.first)
+        XCTAssertTrue(
+            hostRequest.prompt.hasSuffix("User request:\n\n\(prompt)"),
+            "the primary AI must receive the complete turn first"
+        )
+        let turnDirective = try XCTUnwrap(BotPeerDelegation.turnDirective(mentionedBots: [quinn]))
+        XCTAssertTrue(hostRequest.prompt.contains(turnDirective))
+        XCTAssertEqual(BotDeskPeer(direction: .messaged, bot: quinn).caption, "Mentions Quinn")
+        XCTAssertTrue(peerRunner.requests.isEmpty)
+
+        let focusedPrompt = "Qual é o seu nome?"
+        let ask = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: hostRequest.threadId,
+                callerRun: hostRequest.runId,
+                handle: "@\(quinn.handle)",
+                prompt: focusedPrompt,
+                replyMode: .consult
+            )
         }
-        XCTAssertTrue(startedPeer, "peer provider start must be attempted for \(quinn.handle)")
-        XCTAssertEqual(vm.supervisedRunBotIDsForTesting.first, quinn.id)
-        XCTAssertTrue(vm.lastSendStartedProviderRun)
+        let peerStarted = await waitUntil(timeout: 5) { !peerRunner.requests.isEmpty }
+        XCTAssertTrue(peerStarted)
+        let peerRequest = try XCTUnwrap(peerRunner.requests.first)
+        XCTAssertTrue(peerRequest.prompt.contains(focusedPrompt))
+        XCTAssertFalse(peerRequest.prompt.contains("com base na resposta"))
+        XCTAssertFalse(peerRequest.prompt.contains("Faça a alteração"))
+        XCTAssertTrue(peerRunner.finish(
+            runID: peerRequest.runId,
+            status: .completed,
+            reply: "Meu nome atual é Quinn."
+        ))
+        let result = try await ask.value
+        XCTAssertEqual(result.objectValue?["reply"]?.stringValue, "Meu nome atual é Quinn.")
+
+        _ = try router.invokeDelegatedBotSelfConfig(
+            callerThread: hostRequest.threadId,
+            callerRun: hostRequest.runId,
+            toolName: BotSelfConfigCatalog.setSettings,
+            arguments: [
+                "bot_id": .string(quinn.id.value.uuidString.lowercased()),
+                "name": .string("Nova"),
+            ]
+        )
+        XCTAssertEqual(try context.botStore.get(id: quinn.id)?.name, "Nova")
+        XCTAssertEqual(try context.botStore.get(id: untouched.id)?.name, "Untouched")
+        XCTAssertEqual(hostRunner.requests.count, 1, "the original primary run must continue in place")
+
+        XCTAssertTrue(hostRunner.finish(
+            runID: hostRequest.runId,
+            status: .completed,
+            reply: "Nome aplicado: Nova."
+        ))
+        let hostCompleted = await waitUntil(timeout: 5) {
+            context.coordinator.activeRunId(threadId: hostRequest.threadId) == nil
+        }
+        XCTAssertTrue(hostCompleted)
+
+        let transcript = vm.deskTranscriptForTesting(botID: piper.id)
+        XCTAssertEqual(transcript.filter {
+            $0.role == .user
+                && $0.peer?.direction == .messaged
+                && $0.text == focusedPrompt
+        }.count, 1)
+        XCTAssertEqual(transcript.filter {
+            $0.role == .assistant
+                && $0.peer?.direction == .fromPeer
+                && $0.text == "Meu nome atual é Quinn."
+        }.count, 1)
+        let originRows = try context.messageRepo.listRecent(threadId: hostRequest.threadId, limit: 16)
+        XCTAssertEqual(originRows.filter { $0.role == .user && $0.content.contains(prompt) }.count, 1)
+        XCTAssertEqual(originRows.filter { $0.role == .assistant }.count, 1)
+    }
+
+    func test_deskReplyOnlyShowsOneAttributedBotReplyWithoutPrimaryDuplicate() async throws {
+        // WHY: the primary AI may decide that the named Bot's answer completes
+        // the whole turn. The Bot row is then the answer; any generic primary
+        // final must be suppressed from both storage and the live Desk.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: "fake-model", label: "Fake Model", provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        })
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+
+        let original = "@\(quinn.handle) você está por aí?"
+        XCTAssertTrue(vm.send(original))
+        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+        let hostRequest = try XCTUnwrap(hostRunner.requests.first)
+        XCTAssertTrue(hostRequest.prompt.hasSuffix("User request:\n\n\(original)"))
+
+        let focused = "Você está por aí?"
+        let ask = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: hostRequest.threadId,
+                callerRun: hostRequest.runId,
+                handle: quinn.handle,
+                prompt: focused,
+                replyMode: .replyOnly
+            )
+        }
+        let peerStarted = await waitUntil(timeout: 5) { !peerRunner.requests.isEmpty }
+        XCTAssertTrue(peerStarted)
+        let peerRequest = try XCTUnwrap(peerRunner.requests.first)
+        XCTAssertTrue(peerRequest.prompt.contains(focused))
+        XCTAssertTrue(peerRunner.finish(
+            runID: peerRequest.runId,
+            status: .completed,
+            reply: "Estou por aqui — manda o próximo."
+        ))
+        _ = try await ask.value
+
+        let duplicate = "Sim, estou aqui. Como posso ajudar?"
+        XCTAssertTrue(hostRunner.finish(
+            runID: hostRequest.runId,
+            status: .completed,
+            reply: duplicate
+        ))
+        let completed = await waitUntil(timeout: 5) {
+            context.coordinator.activeRunId(threadId: hostRequest.threadId) == nil
+        }
+        XCTAssertTrue(completed)
+        let attentionSettled = await waitUntil(timeout: 5) {
+            vm.attentionState(for: piper) == .none
+        }
+        XCTAssertTrue(
+            attentionSettled,
+            "the terminal callback must settle the primary Bot after reply-only completion"
+        )
+        XCTAssertEqual(
+            vm.attentionState(for: piper),
+            .none,
+            "a clean reply-only turn must not leave the primary Bot as Needs you"
+        )
+
+        let transcript = vm.deskTranscriptForTesting(botID: piper.id)
+        XCTAssertEqual(transcript.filter {
+            $0.role == .assistant
+                && $0.peer?.direction == .fromPeer
+                && $0.text == "Estou por aqui — manda o próximo."
+        }.count, 1)
+        XCTAssertFalse(transcript.contains { $0.text.contains(duplicate) })
+        let originRows = try context.messageRepo.listRecent(threadId: hostRequest.threadId, limit: 16)
+        XCTAssertFalse(originRows.contains { $0.role == .assistant && $0.content.contains(duplicate) })
+        XCTAssertFalse(
+            vm.deskLiveTimeline.turns
+                .flatMap(\.items)
+                .contains { $0.body.contains(duplicate) || ($0.output?.contains(duplicate) == true) }
+        )
     }
 
     func test_botMentionShowsNamedWaitingThenClearsWhenReplyArrives() async throws {
@@ -5117,6 +5288,10 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(waiting.peer?.name, "Quinn")
         XCTAssertEqual(waiting.peer?.activityPhase, .waiting)
+        XCTAssertFalse(
+            vm.deskShowsLoading,
+            "the named peer spinner must replace the generic Loading row"
+        )
 
         let receivedReply = await waitUntil(timeout: 8) {
             vm.deskTranscriptForTesting(botID: piper.id).contains {
@@ -5571,9 +5746,9 @@ final class BotsWindowTests: XCTestCase {
             originThreadID: nil
         ).first)
         let mainPeerRunID = try XCTUnwrap(mainHandoff.peerRunID)
-        let mainHostRunID = try XCTUnwrap(mainHandoff.hostRunID)
         let siblingPeerRunID = try XCTUnwrap(siblingHandoff.peerRunID)
-        let siblingHostRunID = try XCTUnwrap(siblingHandoff.hostRunID)
+        XCTAssertNil(mainHandoff.hostRunID)
+        XCTAssertNil(siblingHandoff.hostRunID)
 
         let observingVM = BotsViewModel(context: context, router: router)
         router.botsViewModel = observingVM
@@ -5602,17 +5777,6 @@ final class BotsWindowTests: XCTestCase {
             status: .completed,
             reply: "authority-owned peer reply"
         ))
-        let exactHostStarted = await waitUntil(timeout: 5) {
-            hostRunner.requests.contains { $0.runId == mainHostRunID }
-        }
-        XCTAssertTrue(exactHostStarted)
-        XCTAssertEqual(hostRunner.requests.filter { $0.runId == mainHostRunID }.count, 1)
-        XCTAssertFalse(hostRunner.requests.contains { $0.runId == siblingHostRunID })
-        XCTAssertTrue(hostRunner.finish(
-            runID: mainHostRunID,
-            status: .completed,
-            reply: "authority-owned host outcome"
-        ))
 
         let mainCompletedInNonOwner = await waitUntil(timeout: 5) {
             observingVM.peerHandoffSnapshotsForTesting(
@@ -5631,7 +5795,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(preservedSibling.activityID, siblingHandoff.activityID)
         XCTAssertEqual(preservedSibling.peerRunID, siblingPeerRunID)
         XCTAssertEqual(preservedSibling.phase, .peerRunning)
-        XCTAssertFalse(hostRunner.requests.contains { $0.runId == siblingHostRunID })
+        XCTAssertTrue(hostRunner.requests.isEmpty)
 
         XCTAssertTrue(roryRunner.finish(
             runID: siblingPeerRunID,
@@ -5702,7 +5866,7 @@ final class BotsWindowTests: XCTestCase {
             originThreadID: nil
         ).first)
         let peerRunID = try XCTUnwrap(running.peerRunID)
-        let hostRunID = try XCTUnwrap(running.hostRunID)
+        XCTAssertNil(running.hostRunID)
         XCTAssertEqual(
             siblingWindow.peerHandoffSnapshotsForTesting(
                 originConversationID: originConversation.id,
@@ -5766,50 +5930,6 @@ final class BotsWindowTests: XCTestCase {
             status: .completed,
             reply: "TWO_WINDOW_EXACT_REPLY"
         ))
-        let bothObservedHost = await waitUntil(timeout: 5) {
-            originWindow.peerHandoffSnapshotsForTesting(
-                originConversationID: originConversation.id,
-                originThreadID: nil
-            ).first?.phase == .hostRunning
-                && siblingWindow.peerHandoffSnapshotsForTesting(
-                    originConversationID: originConversation.id,
-                    originThreadID: nil
-                ).first?.phase == .hostRunning
-        }
-        XCTAssertTrue(bothObservedHost)
-        let hostSnapshot = try XCTUnwrap(originWindow.peerHandoffSnapshotsForTesting(
-            originConversationID: originConversation.id,
-            originThreadID: nil
-        ).first)
-        XCTAssertEqual(
-            siblingWindow.peerHandoffSnapshotsForTesting(
-                originConversationID: originConversation.id,
-                originThreadID: nil
-            ).first,
-            hostSnapshot
-        )
-        XCTAssertEqual(hostSnapshot.activityID, running.activityID)
-        XCTAssertEqual(hostSnapshot.peerRunID, peerRunID)
-        XCTAssertEqual(hostSnapshot.hostRunID, hostRunID)
-        XCTAssertEqual(hostRunner.requests.filter { $0.runId == hostRunID }.count, 1)
-        XCTAssertEqual(
-            originWindow.deskMessages.filter {
-                $0.peer?.direction == .fromPeer && $0.text == "TWO_WINDOW_EXACT_REPLY"
-            }.count,
-            1,
-            "the selected origin window must paint one stable reply row"
-        )
-        XCTAssertEqual(
-            try context.botStore.conversation(id: hostSnapshot.peerConversationID)?.attentionState,
-            .unreadActivity,
-            "the peer conversation attention must settle while the host continuation runs"
-        )
-
-        XCTAssertTrue(hostRunner.finish(
-            runID: hostRunID,
-            status: .completed,
-            reply: "TWO_WINDOW_HOST_COMPLETE"
-        ))
         let bothCompleted = await waitUntil(timeout: 5) {
             originWindow.peerHandoffSnapshotsForTesting(
                 originConversationID: originConversation.id,
@@ -5821,6 +5941,33 @@ final class BotsWindowTests: XCTestCase {
                 ).first?.phase == .completed
         }
         XCTAssertTrue(bothCompleted)
+        let completedSnapshot = try XCTUnwrap(originWindow.peerHandoffSnapshotsForTesting(
+            originConversationID: originConversation.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertEqual(
+            siblingWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first,
+            completedSnapshot
+        )
+        XCTAssertEqual(completedSnapshot.activityID, running.activityID)
+        XCTAssertEqual(completedSnapshot.peerRunID, peerRunID)
+        XCTAssertNil(completedSnapshot.hostRunID)
+        XCTAssertTrue(hostRunner.requests.isEmpty)
+        XCTAssertEqual(
+            originWindow.deskMessages.filter {
+                $0.peer?.direction == .fromPeer && $0.text == "TWO_WINDOW_EXACT_REPLY"
+            }.count,
+            1,
+            "the selected origin window must paint one stable reply row"
+        )
+        XCTAssertEqual(
+            try context.botStore.conversation(id: completedSnapshot.peerConversationID)?.attentionState,
+            .unreadActivity,
+            "the peer conversation attention must settle with the direct reply"
+        )
         XCTAssertEqual(
             siblingWindow.peerHandoffSnapshotsForTesting(
                 originConversationID: originConversation.id,
@@ -5833,8 +5980,8 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(
             try context.botStore.conversation(id: originConversation.id)?.attentionState,
-            .unreadActivity,
-            "the exact host conversation attention must settle after its terminal"
+            BotAttentionState.none,
+            "the open origin conversation must not gain stale unread attention after the direct reply"
         )
 
         XCTAssertEqual(originWindow.selectedBotID, originSelection)
@@ -5968,8 +6115,13 @@ final class BotsWindowTests: XCTestCase {
             status: .completed,
             reply: "EXACT_CHECKPOINT_REPLY"
         ))
-        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
-        XCTAssertTrue(hostStarted)
+        let completed = await waitUntil(timeout: 5) {
+            viewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase == .completed
+        }
+        XCTAssertTrue(completed)
         let checkpoint = try XCTUnwrap(
             context.turnCheckpointRepo.list(threadId: peerThreadID)
                 .first { $0.runId == peerRunID }
@@ -5989,12 +6141,11 @@ final class BotsWindowTests: XCTestCase {
             $0.peer?.direction == .fromPeer && $0.text == "EXACT_CHECKPOINT_REPLY"
         })
         XCTAssertFalse(viewModel.deskMessages.contains { $0.text == "NEWER_AMBIENT_MUST_LOSE" })
-        let exactHostRunID = try XCTUnwrap(viewModel.peerHandoffSnapshotsForTesting(
+        XCTAssertNil(viewModel.peerHandoffSnapshotsForTesting(
             originConversationID: origin.id,
             originThreadID: nil
         ).first?.hostRunID)
-        XCTAssertEqual(hostRunner.requests.first?.runId, exactHostRunID)
-        XCTAssertTrue(hostRunner.finish(runID: exactHostRunID, status: .cancelled, reply: nil))
+        XCTAssertTrue(hostRunner.requests.isEmpty)
     }
 
     func test_peerFailureAndCancellationSettleOnlyTheirExactOwningHandoffs() async throws {
@@ -6090,8 +6241,8 @@ final class BotsWindowTests: XCTestCase {
 
     func test_handoffOlderThanSixtyFiveLogicalSecondsStillSettlesFromExactTerminalsWithoutWallTimeout() async throws {
         // WHY: the former 120 x 500 ms polling loop fabricated a one-minute
-        // boundary. Durable run age is not failure evidence; both legs must
-        // remain owned until their exact terminal/checkpoint arrives.
+        // boundary. Durable run age is not failure evidence; the directly
+        // addressed peer must remain owned until its exact terminal arrives.
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
@@ -6140,28 +6291,6 @@ final class BotsWindowTests: XCTestCase {
         )
 
         XCTAssertTrue(peerRunner.finish(runID: peerRunID, status: .completed, reply: "reply after 65s"))
-        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
-        XCTAssertTrue(hostStarted)
-        let hostBound = await waitUntil(timeout: 5) {
-            vm.peerHandoffSnapshotsForTesting(
-                originConversationID: origin.id,
-                originThreadID: nil
-            ).first?.phase == .hostRunning
-        }
-        XCTAssertTrue(hostBound)
-        let handoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
-            originConversationID: origin.id,
-            originThreadID: nil
-        ).first)
-        let hostRunID = try XCTUnwrap(handoff.hostRunID)
-        var hostRun = try XCTUnwrap(try context.runRepo.get(id: hostRunID))
-        let hostLogicalNow = Date()
-        hostRun.startedAt = hostLogicalNow.addingTimeInterval(-66)
-        try context.runRepo.upsert(hostRun)
-        XCTAssertGreaterThan(hostLogicalNow.timeIntervalSince(hostRun.startedAt), 65)
-        XCTAssertEqual(handoff.phase, .hostRunning)
-
-        XCTAssertTrue(hostRunner.finish(runID: hostRunID, status: .completed, reply: "host after 65s"))
         let settled = await waitUntil(timeout: 5) {
             vm.peerHandoffSnapshotsForTesting(
                 originConversationID: origin.id,
@@ -6169,6 +6298,12 @@ final class BotsWindowTests: XCTestCase {
             ).first?.phase == .completed
         }
         XCTAssertTrue(settled)
+        let handoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertNil(handoff.hostRunID)
+        XCTAssertTrue(hostRunner.requests.isEmpty)
         XCTAssertLessThan(
             Date().timeIntervalSince(wallStart),
             10,
@@ -6238,10 +6373,10 @@ final class BotsWindowTests: XCTestCase {
         context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
     }
 
-    func test_routeMutationAfterDurablePrebindCannotRerouteEitherHandoffLeg() async throws {
+    func test_routeMutationAfterDurablePrebindCannotRerouteMentionedPeer() async throws {
         // WHY: the user can change the visible Desk route while a teammate is
-        // starting. Both peer and host legs must use the snapshots bound at
-        // admission, not whichever provider is ambient after suspension.
+        // starting. The addressed peer must keep its admission snapshot, and
+        // no ambient or host provider may start a duplicate answer.
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
@@ -6273,64 +6408,45 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(peerStarted)
         XCTAssertTrue(grok.requests.isEmpty)
         XCTAssertTrue(claude.finish(promptContaining: "ROUTE_FREEZE", reply: "frozen reply"))
-        let hostStarted = await waitUntil(timeout: 5) { !codex.requests.isEmpty }
-        XCTAssertTrue(hostStarted)
+        let completed = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase == .completed
+        }
+        XCTAssertTrue(completed)
 
         let handoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
             originConversationID: origin.id,
             originThreadID: nil
         ).first)
         XCTAssertEqual(handoff.peerProvider, .claude)
-        XCTAssertEqual(handoff.hostProvider, .codex)
+        XCTAssertNil(handoff.hostProvider)
         XCTAssertEqual(handoff.peerRunID, claude.requests.first?.runId)
-        XCTAssertEqual(handoff.hostRunID, codex.requests.first?.runId)
-        XCTAssertGreaterThanOrEqual(dispatches, 2)
-        XCTAssertTrue(grok.requests.isEmpty, "ambient mutation must not start either leg on Grok")
-
-        XCTAssertTrue(codex.finish(runID: try XCTUnwrap(handoff.hostRunID), status: .completed, reply: "done"))
-        let handoffCompleted = await waitUntil(timeout: 5) {
-            vm.peerHandoffSnapshotsForTesting(
-                originConversationID: origin.id,
-                originThreadID: nil
-            ).contains { $0.phase == .completed }
-        }
-        XCTAssertTrue(handoffCompleted)
+        XCTAssertNil(handoff.hostRunID)
+        XCTAssertEqual(dispatches, 1)
+        XCTAssertTrue(codex.requests.isEmpty, "the host must not answer a message addressed to Quinn")
+        XCTAssertTrue(grok.requests.isEmpty, "ambient mutation must not reroute the peer to Grok")
         vm.beforeBotRunDispatchForTesting = nil
     }
 
-    func test_hopRelayOmitsMentionToken() async throws {
-        // WHY: hop used to embed (@handle). Mention-send would loop, or
-        // lastAssistantText was empty and the host never saw the reply.
+    func test_directPeerReplyDoesNotStartHostHop() async throws {
+        // WHY: the From Quinn reply is the final answer. Feeding it back into
+        // Piper creates a second un-attributed assistant response.
         let (vm, piper, quinn) = try makeMentionPair(peerReply: "inbox is clear")
         XCTAssertTrue(vm.send("@\(quinn.handle) what is in the inbox?"))
-        let hopped = await waitUntil(timeout: 8) { vm.lastHopUserTextForTesting != nil }
-        XCTAssertTrue(hopped, "hop-1 must run after the peer assistant reply")
-        let hop = try XCTUnwrap(vm.lastHopUserTextForTesting)
-        XCTAssertEqual(
-            hop,
-            BotPeerTranscript.hostHopPrompt(
-                peerName: quinn.name,
-                reply: "inbox is clear",
-                userText: "@\(quinn.handle) what is in the inbox?"
-            )
-        )
-        XCTAssertTrue(hop.contains("inbox is clear"))
-        XCTAssertFalse(BotPeerTranscript.containsMentionToken(hop, handle: quinn.handle))
-        XCTAssertFalse(hop.contains("@\(quinn.handle)"))
-        let hostStarted = await waitUntil(timeout: 5) {
+        let completed = await waitUntil(timeout: 8) {
             guard let handoff = vm.peerHandoffSnapshotsForTesting().first(where: {
                 $0.originBotID == piper.id && $0.peerBotID == quinn.id
             }) else { return false }
-            return handoff.hostRunID != nil
-                && (handoff.phase == .hostRunning || handoff.phase == .completed)
+            return handoff.phase == .completed
         }
         let observedHandoff = vm.peerHandoffSnapshotsForTesting().first {
             $0.originBotID == piper.id && $0.peerBotID == quinn.id
         }
-        XCTAssertTrue(
-            hostStarted,
-            "hop must start the exact host, not mention-send; phase=\(String(describing: observedHandoff?.phase)) peerRunID=\(String(describing: observedHandoff?.peerRunID)) hostRunID=\(String(describing: observedHandoff?.hostRunID))"
-        )
+        XCTAssertTrue(completed)
+        XCTAssertNil(observedHandoff?.hostRunID)
+        XCTAssertNil(vm.lastHopUserTextForTesting)
         let imported = await waitUntil(timeout: 5) {
             vm.deskTranscriptForTesting(botID: piper.id).contains {
                 $0.role == .assistant
@@ -6365,20 +6481,6 @@ final class BotsWindowTests: XCTestCase {
             imported,
             "host desk must show the Message from peer reply; selectedConversationID=\(String(describing: vm.selectedConversation?.id)) observerSnapshotCount=\(observedHandoffs.count) phase=\(String(describing: exactHandoff?.phase)) inboundID=\(String(describing: exactHandoff?.inboundMessageID)) peerRunID=\(String(describing: exactHandoff?.peerRunID)) hostRunID=\(String(describing: exactHandoff?.hostRunID))"
         )
-    }
-
-    func test_runMentionedPromptTargetsPeerFromAgentApp() async throws {
-        // WHY: Agent App mentions call this entry. It must mark the peer
-        // and persist onto that teammate without stealing the open Desk.
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
-        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
-        vm.openDesk(piper)
-        let reply = await vm.runMentionedPrompt(peer: quinn, text: "@quinn check WhatsApp")
-        XCTAssertEqual(vm.lastMentionedBotIDForTesting, quinn.id)
-        XCTAssertNil(reply, "no provider is wired in this harness, so the peer run cannot finish")
-        XCTAssertEqual(vm.selectedBotID, piper.id)
     }
 
     func test_beginCreateTwiceAllocatesDistinctHandles_becauseNewAgentIsAPlaceholder() throws {

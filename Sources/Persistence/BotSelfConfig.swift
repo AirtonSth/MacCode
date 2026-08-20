@@ -40,12 +40,14 @@ public enum BotSelfConfigCatalog: Sendable {
     public static let skillView = "bot_skill_view"
     public static let recall = "bot_recall"
     public static let askUser = "bot_ask_user"
+    public static let listPeers = BotPeerDelegation.listTool
+    public static let askPeer = BotPeerDelegation.askTool
 
     public static var toolNames: [String] {
         [
             getSettings, setSettings, writeHomeFile,
             removeSkill, saveRoutine, setRoutineEnabled,
-            skillView, recall, askUser,
+            skillView, recall, askUser, listPeers, askPeer,
         ]
     }
 
@@ -79,13 +81,20 @@ public enum BotSelfConfigCatalog: Sendable {
             return "Search this bot's MEMORY.md, USER.md, daily notes, and linked conversation text."
         case askUser:
             return "Ask the user a question and end the turn. Do not wait inside this tool."
+        case listPeers:
+            return "List the live RemoteCode Bots available for AI-authored delegation, including each exact handle and id."
+        case askPeer:
+            return "Ask one RemoteCode Bot a focused prompt written by you after interpreting the user's complete request. The `prompt` is sent literally; RemoteCode does not extract, truncate, translate, or otherwise infer it from the user message. Use `consult` when you will continue with the reply, or `reply_only` when the whole user turn belongs to that Bot."
         default:
             return name
         }
     }
 
     public static func schema(for name: String) -> [String: Any] {
-        let botID: [String: Any] = ["bot_id": ["type": "string", "description": "Must match the calling bot or be omitted."]]
+        let botID: [String: Any] = ["bot_id": [
+            "type": "string",
+            "description": "Omit for a Bot's own settings. After bot_ask_peer, pass the returned Bot id to target that consulted Bot; Agent App runs may omit it when exactly one Bot was consulted.",
+        ]]
         switch name {
         case getSettings:
             return ["type": "object", "properties": botID]
@@ -171,6 +180,29 @@ public enum BotSelfConfigCatalog: Sendable {
                     "question": ["type": "string"],
                 ]) { _, new in new },
                 "required": ["question"],
+            ]
+        case listPeers:
+            return ["type": "object", "properties": [String: Any]()]
+        case askPeer:
+            return [
+                "type": "object",
+                "properties": [
+                    "handle": [
+                        "type": "string",
+                        "description": "Exact Bot handle, with or without the leading @.",
+                    ],
+                    "prompt": [
+                        "type": "string",
+                        "description": "A new focused prompt authored by the primary AI. Only this text is sent to the Bot.",
+                    ],
+                    "reply_mode": [
+                        "type": "string",
+                        "enum": ["consult", "reply_only"],
+                        "description": "consult to keep working with the reply; reply_only when the Bot reply itself is the complete user-facing answer.",
+                    ],
+                ],
+                "required": ["handle", "prompt", "reply_mode"],
+                "additionalProperties": false,
             ]
         default:
             return ["type": "object", "properties": [String: Any]()]

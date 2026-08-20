@@ -68,7 +68,13 @@ public enum BotMentionParser {
     }
 
     public static func mentionTokens(in text: String) -> [String] {
-        var tokens: [String] = []
+        mentionTokenRanges(in: text).map(\.token)
+    }
+
+    private static func mentionTokenRanges(
+        in text: String
+    ) -> [(token: String, range: Range<String.Index>)] {
+        var ranges: [(token: String, range: Range<String.Index>)] = []
         var index = text.startIndex
         while index < text.endIndex {
             if text[index] == "@" {
@@ -84,15 +90,17 @@ public enum BotMentionParser {
                     }
                 }
                 if start < end {
-                    tokens.append(String(text[start..<end]))
+                    let token = String(text[start..<end])
+                    ranges.append((token, index..<end))
                 }
                 index = end
             } else {
                 index = text.index(after: index)
             }
         }
-        return tokens
+        return ranges
     }
+
 }
 
 public enum BotPeerActivityPhase: String, Codable, Sendable, Equatable {
@@ -191,17 +199,13 @@ public enum BotPeerTranscript {
         )
     }
 
-    public static func messagedCaption(for bot: BotDefinition) -> String {
-        toCaption(name: bot.name)
+    public static func mentionedCaption(for bot: BotDefinition) -> String {
+        mentionedCaption(name: bot.name)
     }
+
+    public static func mentionedCaption(name: String) -> String { "Mentions \(name)" }
 
     private static let peerAskMarker = " asked you:\n"
-
-    /// Prompt the mentioned bot actually runs. No `@handle` so this cannot
-    /// re-enter Desk mention send if a later caller routes it through `send`.
-    public static func peerAskPrompt(hostName: String, text: String) -> String {
-        strippingAtHandles("\(hostName)\(peerAskMarker)\(text)")
-    }
 
     /// Internal provider line on the asked bot's thread. Hide it; the Desk
     /// paints the original ask with From-host chrome instead.

@@ -1,5 +1,6 @@
 import XCTest
 import CoreModel
+import Persistence
 @testable import AgentRuntime
 
 /// Regression tests for two Agent SDK bridge gaps:
@@ -175,6 +176,66 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
                        "the host and Node bridge must negotiate one explicit command schema before the SDK query starts")
         XCTAssertEqual(configures.first?["expected_sdk_version"] as? String, "0.3.157",
                        "the bridge handshake must verify the exact SDK version provisioned by the host")
+    }
+
+    func test_rcTurnCarriesRawUserPromptSeparateIdentityAndExactRunMCP() async throws {
+        // WHY: the primary AI must see the user's complete prompt unchanged and
+        // author the peer prompt itself. Identity and active-run authority are
+        // transport metadata, not host-side semantic extraction, and both must
+        // refresh on the individual turn rather than freeze in SDK session state.
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = try Self.makeTempDir(prefix: "rc2-sdk-bot-peer-turn")
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = tmp.appendingPathComponent("commands.jsonl")
+        try Self.loggingFakeBridgeSource(sessionId: "sdk-bot-peer-session")
+            .write(to: bridge, atomically: true, encoding: .utf8)
+
+        let thread = "11111111-2222-3333-4444-555555555555"
+        let run = "66666666-7777-8888-9999-AAAAAAAAAAAA"
+        let turnContext = "REMOTE CODE IDENTITY ONLY: @nexus is Nexus"
+        let original = "@nexus pergunte o nome e depois escolha outro nome"
+        let environment = [
+            BotPeerDelegation.threadEnvironmentKey: thread,
+            BotPeerDelegation.runEnvironmentKey: run,
+            BotPeerDelegation.socketEnvironmentKey: "/tmp/remote-code.sock",
+            BotPeerDelegation.turnContextEnvironmentKey: turnContext,
+        ]
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadID = AgentThreadID(UUID(uuidString: thread)!)
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadID,
+            provider: .claude,
+            model: "sonnet",
+            cwd: tmp.path,
+            prompt: original,
+            environment: environment,
+            extraArgs: [commandLog.path]
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        try await waitForFinish(in: sink, expected: "DONE_1")
+        defer { try? adapter.stopSession(threadId: threadID) }
+
+        let configure = try XCTUnwrap(Self.loggedCommands(at: commandLog, ofType: "rc_configure").first)
+        let turn = try XCTUnwrap(Self.loggedCommands(at: commandLog, ofType: "rc_turn").first)
+        let providerPrompt = try XCTUnwrap(turn["prompt"] as? String)
+        XCTAssertTrue(providerPrompt.hasSuffix("User request:\n\(original)"),
+                      "the provider envelope must carry the complete original request without extracting a Bot sub-prompt")
+        XCTAssertEqual(providerPrompt.components(separatedBy: original).count - 1, 1)
+        XCTAssertFalse(providerPrompt.contains(turnContext),
+                       "resolved identity belongs in separate turn metadata, never inside rewritten user prose")
+        XCTAssertEqual(turn["turn_context"] as? String, turnContext)
+        for command in [configure, turn] {
+            let servers = try XCTUnwrap(command["mcp_servers"] as? [String: Any])
+            let server = try XCTUnwrap(servers[BotSelfConfigMCPAdmit.serverName] as? [String: Any])
+            let forwarded = try XCTUnwrap(server["env"] as? [String: String])
+            XCTAssertEqual(forwarded[BotPeerDelegation.threadEnvironmentKey], thread)
+            XCTAssertEqual(forwarded[BotPeerDelegation.runEnvironmentKey], run)
+            XCTAssertEqual(forwarded[BotPeerDelegation.socketEnvironmentKey], "/tmp/remote-code.sock")
+            XCTAssertEqual(command["allowed_tools"] as? [String],
+                           BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools)
+        }
     }
 
     func test_rcConfigureOmitsHaikuEffortButKeepsThinkingEnabledAndSanitized() async throws {
@@ -1007,6 +1068,86 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
                       "query options must carry the ultracode settings payload from rc_configure")
         XCTAssertTrue(session.output.contains(#"\"path\":\"/usr/bin/true\""#),
                       "query options must use the app-selected Claude executable path as the runtime authority")
+    }
+
+    func test_bridgeRefreshesBotMCPAndKeepsIdentitySeparateOnEveryTurn() throws {
+        // WHY: Claude SDK reuses one query for multiple turns. A server admitted
+        // only at query creation retains a stale run_id and fails the exact-run
+        // authorization gate on the next mention. The bridge must refresh the
+        // dynamic MCP before it delivers each untouched user prompt.
+        guard let node = ProcessLocator.resolve("node") else { throw XCTSkip("node not available") }
+        let serverName = BotSelfConfigMCPAdmit.serverName
+        let session = try RealBridgeHarness(node: node, fakeSDKIndexJS: """
+        export function createSdkMcpServer() { return { instance: { server: {} } }; }
+        export function tool(name, description, schema, handler) { return { name, description, schema, handler }; }
+        export function query({ prompt, options }) {
+          let servers = options.mcpServers || {};
+          const allowed = options.allowedTools || [];
+          return {
+            async setMcpServers(next) {
+              servers = next || {};
+              return { added: Object.keys(servers), removed: [], errors: {} };
+            },
+            async *[Symbol.asyncIterator]() {
+              for await (const message of prompt) {
+                const content = message.message.content || [];
+                const run = servers['\(serverName)']?.env?.RC_REMOTE_CODE_ROOT_RUN_ID || 'NO_RUN';
+                const text = 'OBS:' + (content[0]?.text || '') + '|CTX:' + (content[1]?.text || '') + '|RUN:' + run + '|ALLOWED:' + allowed.join(',');
+                yield { type: 'assistant', message: { id: 'peer-' + run, content: [{ type: 'text', text }] }, session_id: 'fake-peer-session' };
+                yield { type: 'result', subtype: 'success', is_error: false, result: 'done-' + run, session_id: 'fake-peer-session' };
+              }
+            }
+          };
+        }
+        """)
+        defer { _ = session.finish() }
+
+        func server(_ run: String) -> [String: Any] {
+            [
+                serverName: [
+                    "command": "/bin/true",
+                    "args": [BotSelfConfigMCPAdmit.cliArgument],
+                    "env": [BotPeerDelegation.runEnvironmentKey: run],
+                ]
+            ]
+        }
+        try session.send([
+            "type": "rc_configure",
+            "bridge_protocol_version": ClaudeAgentSDKBridgeAdapter.bridgeProtocolVersion,
+            "expected_sdk_version": "0.3.157",
+            "cwd": NSTemporaryDirectory(),
+            "model": "claude-haiku-4-5-20251001",
+            "permission_mode": "supervised",
+            "interaction_mode": "default",
+            "provider_thread_id": "",
+            "session_id": UUID().uuidString,
+            "environment": [:],
+            "mcp_servers": server("RUN_ONE"),
+            "allowed_tools": BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools,
+            "claude_executable_path": "/usr/bin/true",
+        ])
+        try session.send([
+            "type": "rc_turn",
+            "prompt": "ORIGINAL_ONE",
+            "turn_context": "IDENTITY_ONE",
+            "mcp_servers": server("RUN_ONE"),
+        ])
+        XCTAssertTrue(session.waitFor("done-RUN_ONE"), "first SDK turn did not complete: \(session.stderrText())")
+
+        try session.send([
+            "type": "rc_turn",
+            "prompt": "ORIGINAL_TWO",
+            "turn_context": "IDENTITY_TWO",
+            "mcp_servers": server("RUN_TWO"),
+        ])
+        XCTAssertTrue(session.waitFor("done-RUN_TWO"), "second SDK turn did not receive refreshed MCP context: \(session.stderrText())")
+        XCTAssertTrue(session.output.contains("OBS:ORIGINAL_ONE|CTX:<remote_code_turn_context>\\nIDENTITY_ONE"))
+        XCTAssertTrue(session.output.contains("|RUN:RUN_ONE"))
+        XCTAssertTrue(session.output.contains("OBS:ORIGINAL_TWO|CTX:<remote_code_turn_context>\\nIDENTITY_TWO"))
+        XCTAssertTrue(session.output.contains("|RUN:RUN_TWO"),
+                      "the long-lived query must replace the stale first-run MCP before the next user turn")
+        XCTAssertTrue(session.output.contains("|ALLOWED:\(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools.joined(separator: ","))"),
+                      "SDK supervised mode must pre-authorize only RemoteCode's host-guarded Bot delegation tools")
     }
 
     // WHY (AG-007): an approval response normally carries only the decision.

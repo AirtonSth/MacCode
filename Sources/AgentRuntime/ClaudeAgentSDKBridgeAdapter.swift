@@ -1,6 +1,7 @@
 import Foundation
 import CoreModel
 import CryptoKit
+import Persistence
 
 struct ClaudeSDKSessionRecord: Sendable, Equatable {
     let sessionId: String
@@ -405,15 +406,23 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             // system_prompt after creation, so App Support graph paths must ride on
             // each turn when the host sets RC_GRAPHIFY_* on the environment.
             let writeTurn = {
-                try self.write([
+                var payload: [String: Any] = [
                     "type": "rc_turn",
                     "prompt": GraphifyStableSkillText.augmentTurnPrompt(
                         request.providerPrompt,
                         environment: request.environment
                     ),
                     "attachments": Self.attachmentPayload(request.attachments),
-                    "session_id": session.providerThreadId ?? request.threadId.value.uuidString
-                ], to: session)
+                    "session_id": session.providerThreadId ?? request.threadId.value.uuidString,
+                    "mcp_servers": Self.botPeerMCPServers(environment: request.environment),
+                    "allowed_tools": BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
+                ]
+                if let turnContext = request.environment[BotPeerDelegation.turnContextEnvironmentKey]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !turnContext.isEmpty {
+                    payload["turn_context"] = turnContext
+                }
+                try self.write(payload, to: session)
             }
             if let acceptancePermit = request.acceptancePermit {
                 try acceptancePermit.withAcceptance(writeTurn)
@@ -1699,7 +1708,28 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             payload["settings"] = settings
         }
         payload["system_prompt"] = Self.claudeSystemPrompt(environment: request.environment)
+        payload["mcp_servers"] = Self.botPeerMCPServers(environment: request.environment)
+        payload["allowed_tools"] = BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
         return payload
+    }
+
+    /// Explicit SDK admission is required because `query(options.mcpServers:)`
+    /// does not reliably inherit the managed server written to settings.json.
+    /// The definition is rebuilt per turn so the MCP receives that turn's exact
+    /// thread/run/socket authority without deriving anything from user prose.
+    static func botPeerMCPServers(
+        environment: [String: String],
+        command: String? = nil
+    ) -> [String: Any] {
+        let resolved = command
+            ?? AgentSkillInstaller.resolveServiceBinary()?.path
+            ?? BotSelfConfigMCPAdmit.fallbackCommand
+        return [
+            BotSelfConfigMCPAdmit.serverName: BotSelfConfigMCPAdmit.claudeSDKServer(
+                command: resolved,
+                environment: environment
+            )
+        ]
     }
 
     /// System prompt for the SDK session, set on every run (additive — the SDK's
@@ -1715,7 +1745,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// only when Token Saver is active. Codex/Grok use the same environment gates —
     /// never via `~/.claude/skills` / `~/.codex/skills`.
     static func claudeSystemPrompt(environment: [String: String]) -> String {
-        AgentSkillInstaller.tokenSaverProviderPrompt(
+        return AgentSkillInstaller.tokenSaverProviderPrompt(
             BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
             environment: environment
         )

@@ -276,7 +276,8 @@ public enum BotBrainCompiler {
         conversationID: BotConversationID? = nil,
         runID: AgentRunID? = nil,
         now: Date = Date(),
-        liveRunMode: AgentPermissionMode? = nil
+        liveRunMode: AgentPermissionMode? = nil,
+        turnDirective: String? = nil
     ) -> ContextAssemblyReceipt {
         let payload = composeRunPrompt(
             bot: bot,
@@ -288,7 +289,8 @@ public enum BotBrainCompiler {
             routines: routines,
             workspace: workspace,
             browser: browser,
-            liveRunMode: liveRunMode
+            liveRunMode: liveRunMode,
+            turnDirective: turnDirective
         )
         return ContextAssemblyReceipt(
             botID: bot.id,
@@ -313,7 +315,8 @@ public enum BotBrainCompiler {
                 routines: routines,
                 workspace: workspace,
                 browser: browser,
-                liveRunMode: liveRunMode
+                liveRunMode: liveRunMode,
+                turnDirective: turnDirective
             ),
             assembledAt: now
         )
@@ -330,7 +333,8 @@ public enum BotBrainCompiler {
         routines: [BotRoutine] = [],
         workspace: BotWorkspaceHonesty? = nil,
         browser: BotBrowserTarget? = nil,
-        liveRunMode: AgentPermissionMode? = nil
+        liveRunMode: AgentPermissionMode? = nil,
+        turnDirective: String? = nil
     ) -> String {
         var lines: [String] = []
         if let identity = identityLine(
@@ -409,6 +413,10 @@ public enum BotBrainCompiler {
         // Do the Instruction now. Does not set Active. Dest Source title
         // stays Routine. Schema does not grow a test tool.
         lines.append(testRunHonesty)
+        if let directive = turnDirective?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !directive.isEmpty {
+            lines.append(directive)
+        }
         lines.append("User request:")
         lines.append(userText)
         return lines.joined(separator: "\n\n")
@@ -623,7 +631,8 @@ public enum BotBrainCompiler {
         routines: [BotRoutine],
         workspace: BotWorkspaceHonesty? = nil,
         browser: BotBrowserTarget? = nil,
-        liveRunMode: AgentPermissionMode? = nil
+        liveRunMode: AgentPermissionMode? = nil,
+        turnDirective: String? = nil
     ) -> [BotContextLayer] {
         var layers: [BotContextLayer] = []
         if let identity = identityLine(
@@ -651,6 +660,20 @@ public enum BotBrainCompiler {
                     text: "",
                     included: false,
                     reason: "Name, handle, role, and avatar are empty."
+                )
+            )
+        }
+
+        if let directive = turnDirective?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !directive.isEmpty {
+            layers.append(
+                BotContextLayer(
+                    id: "bot-delegation",
+                    kind: .tools,
+                    title: "Bot delegation",
+                    text: directive,
+                    included: true,
+                    reason: "Resolved Bot identities only. The provider interprets intent and authors every peer prompt."
                 )
             )
         }

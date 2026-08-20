@@ -443,6 +443,7 @@ public final class GrokACPClient: @unchecked Sendable {
     private var stopped = false
     private let tokenSaverCensusAllowed: Bool
     private let foreignUserUID: uid_t?
+    private let mcpEnvironment: [String: String]
     private static let stderrLimit = 8_192
 
     public var notificationHandler: NotificationHandler?
@@ -526,6 +527,7 @@ public final class GrokACPClient: @unchecked Sendable {
         self.serverRequestHandler = serverRequestHandler
         self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
         self.foreignUserUID = runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid }
+        self.mcpEnvironment = environment
         parseQueue.setSpecific(key: parseQueueKey, value: 1)
         do {
             self.process = try ProviderSubprocessLauncher.makeProcess(
@@ -656,7 +658,10 @@ public final class GrokACPClient: @unchecked Sendable {
     func newSession(cwd: String) async throws -> GrokACPSessionOpenResult {
         let result = try await requestJSONObject(
             method: "session/new",
-            params: ["cwd": Self.resolvedSessionCwd(cwd), "mcpServers": Self.sessionMCPServers()],
+            params: [
+                "cwd": Self.resolvedSessionCwd(cwd),
+                "mcpServers": Self.sessionMCPServers(environment: mcpEnvironment),
+            ],
             timeout: 20
         )
         return try Self.openResult(result, fallbackSessionId: nil)
@@ -673,7 +678,7 @@ public final class GrokACPClient: @unchecked Sendable {
         var params: JSONObject = [
             "sessionId": sessionId,
             "cwd": Self.resolvedSessionCwd(cwd),
-            "mcpServers": Self.sessionMCPServers(),
+            "mcpServers": Self.sessionMCPServers(environment: mcpEnvironment),
         ]
         if noReplay {
             params["_meta"] = ["noReplay": true]
@@ -786,12 +791,14 @@ public final class GrokACPClient: @unchecked Sendable {
         // orchestration stalls reach the host's [[RC_AWAITING]] recovery path.
         // systemPromptDirective only — NOT alwaysOnClaudeDirectives (MCP rules
         // are Claude-CLI-specific).
-        let composed: String
-        if providerPrompt.isEmpty {
-            composed = BackgroundAwaitContinuation.systemPromptDirective
-        } else {
-            composed = providerPrompt + "\n\n" + BackgroundAwaitContinuation.systemPromptDirective
-        }
+        let alwaysOn = BotPeerDelegation.appendingTurnContext(
+            to: BackgroundAwaitContinuation.systemPromptDirective
+                + "\n\n" + BotPeerDelegation.providerDirective,
+            environment: request.environment
+        )
+        let composed = providerPrompt.isEmpty
+            ? alwaysOn
+            : providerPrompt + "\n\n" + alwaysOn
         if !composed.isEmpty { blocks.append(["type": "text", "text": composed]) }
         for attachment in request.attachments {
             switch attachment.kind {

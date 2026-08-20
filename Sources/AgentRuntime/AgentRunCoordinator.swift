@@ -1089,6 +1089,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var orchestrationDeadlineWorkItems: [AgentRunID: DispatchWorkItem] = [:]
     private var externalReceiptLeaseWorkItems: [AgentRunID: DispatchWorkItem] = [:]
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
+    /// The primary AI selected `reply_only` after interpreting the user turn.
+    /// Its peer reply is already durable and attributed, so suppress only this
+    /// exact run's later assistant item/final instead of relying on model copy.
+    private var replyOnlyPrimaryRuns: Set<AgentRunID> = []
+    private var replyOnlyAssistantItemIDs: [AgentRunID: Set<String>] = [:]
     private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
     private var bufferedProviderTextItems: [AgentRunID: [String: BufferedProviderTextItem]] = [:]
     /// Stream humanization is asynchronous. A provider can emit its terminal
@@ -1537,6 +1542,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func activeRunId(threadId: AgentThreadID) -> AgentRunID? {
         lock.lock(); defer { lock.unlock() }
         return activeThreads[threadId]
+    }
+
+    /// Records the semantic mode selected by the primary AI's Bot tool call.
+    /// This is run-scoped presentation deduplication, not prompt parsing.
+    public func suppressPrimaryAssistantReply(runId: AgentRunID) {
+        _ = lock.withLock {
+            replyOnlyPrimaryRuns.insert(runId)
+        }
     }
 
     @discardableResult
@@ -3358,6 +3371,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
         externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
         activeAssistantMessageIds.removeValue(forKey: runId)
+        replyOnlyPrimaryRuns.remove(runId)
+        replyOnlyAssistantItemIDs.removeValue(forKey: runId)
         activeProviderTextItemTypes.removeValue(forKey: runId)
         bufferedProviderTextItems.removeValue(forKey: runId)
         providerTextTranslationsInFlight.removeValue(forKey: runId)
@@ -5568,7 +5583,31 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return AgentMessageID(UUID(uuid: bytes))
     }
 
-    private func sanitizeFinalAssistantEvent(_ ev: AssistantEvent) -> AssistantEvent {
+    private func sanitizeFinalAssistantEvent(
+        _ ev: AssistantEvent,
+        runId: AgentRunID
+    ) -> AssistantEvent? {
+        let suppress = lock.withLock { replyOnlyPrimaryRuns.contains(runId) }
+        if suppress {
+            switch ev {
+            case .itemStarted(let item) where item.type == .assistantMessage:
+                _ = lock.withLock {
+                    replyOnlyAssistantItemIDs[runId, default: []].insert(item.id)
+                }
+                return nil
+            case .itemDelta(let itemId, _, _, _),
+                 .itemState(let itemId, _),
+                 .itemProgress(let itemId, _),
+                 .itemCompleted(let itemId, _):
+                if lock.withLock({ replyOnlyAssistantItemIDs[runId]?.contains(itemId) == true }) {
+                    return nil
+                }
+            case .turnCompleted(let turnId, _):
+                return .turnCompleted(turnId: turnId, finalMessage: nil)
+            default:
+                break
+            }
+        }
         switch ev {
         case .turnCompleted(let turnId, let finalMessage):
             return .turnCompleted(turnId: turnId, finalMessage: finalMessage.map(finalResponseDisplayText))
@@ -5826,7 +5865,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         defer { endAdmittedCallbackMutation(runId: runId) }
         switch event {
         case .event(let rawEvent):
-            let ev = sanitizeFinalAssistantEvent(rawEvent)
+            guard let ev = sanitizeFinalAssistantEvent(rawEvent, runId: runId) else { return }
             persistProviderNativeSubagentLifecycle(
                 from: ev,
                 parentRunId: runId,
@@ -6254,6 +6293,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 observer.runCoordinator(self, didChangeStatus: st, runId: runId, threadId: threadId)
             }
         case .finished(let reportedStatus, let rawFinalMessage, let providerThreadId):
+            let rawFinalMessage = lock.withLock { replyOnlyPrimaryRuns.contains(runId) }
+                ? nil
+                : rawFinalMessage
             lock.lock()
             if (providerTextTranslationsInFlight[runId] ?? 0) > 0 {
                 // User-initiated cancel (markStopRequested) must not wait for
@@ -6438,7 +6480,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.lock()
             let needsTerminalClaim = pendingTerminalEvents[runId] == nil
             let producedAssistantOutput =
-                (finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+                replyOnlyPrimaryRuns.contains(runId)
+                || (finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
                 || activeAssistantMessageIds[runId] != nil
             let providerFromMeta = activeRunMetadata[runId]?.provider
             let observedFromMemory = latestRunErrorMessages[runId]

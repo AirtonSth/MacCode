@@ -177,6 +177,9 @@ public protocol CommandRouting: AnyObject {
     func reorderAgentQueuedMessage(thread: AgentThreadID, id: AgentQueuedMessageID, position: Int) throws
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentMessageSendResult
     func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext?) async throws -> AgentMessageSendResult
+    func listBotPeers(callerThread: AgentThreadID, callerRun: AgentRunID) throws -> JSONValue
+    func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode) async throws -> JSONValue
+    func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue]) throws -> JSONValue
     func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID)
     func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String)
     /// Per-thread plan notes (mac plan sidebar). Returns "" when none exist.
@@ -312,6 +315,18 @@ public extension CommandRouting {
 
     func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot? {
         nil
+    }
+
+    func listBotPeers(callerThread: AgentThreadID, callerRun: AgentRunID) throws -> JSONValue {
+        throw JSONRPCError.notSupported("Bot delegation")
+    }
+
+    func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("Bot delegation")
+    }
+
+    func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue]) throws -> JSONValue {
+        throw JSONRPCError.notSupported("delegated Bot settings")
     }
 
     /// Safe in-memory default so FakeRouter/test hosts need no SQL body-budget path.
@@ -2235,6 +2250,50 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(s))
             case "token_saver.digest.get":
                 return .init(id: id, result: router.tokenSaverDigest() ?? .object([:]))
+            case "bot.peer.list":
+                guard let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init) else {
+                    throw JSONRPCError.invalidParams
+                }
+                return .init(
+                    id: id,
+                    result: try router.listBotPeers(callerThread: threadID, callerRun: runID)
+                )
+            case "bot.peer.ask":
+                guard let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init),
+                      let handle = params["handle"]?.stringValue,
+                      let prompt = params["prompt"]?.stringValue,
+                      let rawMode = params["reply_mode"]?.stringValue,
+                      let replyMode = BotPeerDelegation.ReplyMode(rawValue: rawMode) else {
+                    throw JSONRPCError.invalidParams
+                }
+                return .init(
+                    id: id,
+                    result: try await router.askBotPeer(
+                        callerThread: threadID,
+                        callerRun: runID,
+                        handle: handle,
+                        prompt: prompt,
+                        replyMode: replyMode
+                    )
+                )
+            case "bot.peer.self_config":
+                guard let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init),
+                      let toolName = params["tool_name"]?.stringValue,
+                      let arguments = params["arguments"]?.objectValue else {
+                    throw JSONRPCError.invalidParams
+                }
+                return .init(
+                    id: id,
+                    result: try router.invokeDelegatedBotSelfConfig(
+                        callerThread: threadID,
+                        callerRun: runID,
+                        toolName: toolName,
+                        arguments: arguments
+                    )
+                )
             case "agent.thread.list":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let threads = try await router.listAgentThreadsOffMain(workspace: wid)
