@@ -310,11 +310,49 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
             finished: true
         )
         let composition = AgentChatLiveTurnChrome.compose(turn)
-        XCTAssertEqual(composition.outside.map(\.id), ["483520EA-C4E5-471D-A409-1B8501E14F90"])
-        XCTAssertEqual(composition.outside.map(\.body), [answer])
-        XCTAssertFalse(
-            AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn),
-            "the item is the answer; the turn final must not paint a third copy"
+        XCTAssertTrue(
+            composition.outside.isEmpty,
+            "assistant items that match the turn final must not paint beside it"
         )
+        XCTAssertTrue(
+            AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn),
+            "the turn final is the single chat answer after Work so far"
+        )
+    }
+
+    func test_workThenMatchingItemAndFinalPaintsAnswerOnce() {
+        // WHY: Agent App showed Ran N commands, then the same paragraph twice —
+        // live assistant item plus turn final (and often a persisted copy).
+        let answer = "Confirmed all three blockers in code."
+        let turn = AssistantTurnSnapshot(
+            turnId: "t-dup",
+            items: [
+                AssistantItem(
+                    id: "cmd-1",
+                    turnId: "t-dup",
+                    type: .commandExecution,
+                    state: .completed,
+                    summary: "Bash",
+                    startedAtMs: 1,
+                    finishedAtMs: 2
+                ),
+                AssistantItem(
+                    id: "msg-1",
+                    turnId: "t-dup",
+                    type: .assistantMessage,
+                    state: .completed,
+                    body: answer,
+                    startedAtMs: 3,
+                    finishedAtMs: 4
+                ),
+            ],
+            finalAssistantMessage: answer,
+            finished: true
+        )
+        let composition = AgentChatLiveTurnChrome.compose(turn)
+        XCTAssertEqual(composition.work.map(\.id), ["cmd-1"])
+        XCTAssertTrue(composition.outside.isEmpty)
+        XCTAssertTrue(AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn))
+        XCTAssertTrue(AgentChatLiveTurnChrome.messageDuplicatesTurn(answer, turns: [turn]))
     }
 }
