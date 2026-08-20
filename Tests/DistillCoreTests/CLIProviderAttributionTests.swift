@@ -13,16 +13,7 @@ final class CLIProviderAttributionTests: XCTestCase {
         }
     }
 
-    private func builtBinary() -> URL? {
-        let cwd = FileManager.default.currentDirectoryPath
-        return [".build/debug/RemoteCodeDistillService", ".build/arm64-apple-macosx/debug/RemoteCodeDistillService"]
-            .map { URL(fileURLWithPath: cwd).appendingPathComponent($0) }
-            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
-    }
-
     func test_cliWithProviderEnvAttributesSavingsToProviderNotUnknown() async throws {
-        guard let binary = builtBinary() else { throw XCTSkip("RemoteCodeDistillService debug binary not built") }
-
         let capture = RecordCapture()
         let config = try DistillServiceConfiguration(authToken: "tok", appSupportDirectory: NSTemporaryDirectory())
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
@@ -36,24 +27,34 @@ final class CLIProviderAttributionTests: XCTestCase {
         let ready = try await server.start()
         defer { server.stop() }
 
-        let stateURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("attr-state-\(UUID().uuidString).json")
-        try Data("{\"base_url\":\"\(ready.baseURL)\",\"auth_token\":\"tok\"}".utf8).write(to: stateURL)
-        defer { try? FileManager.default.removeItem(at: stateURL) }
-
-        let (_, code) = try runProcess(
-            binary,
-            ["cli", "Did it pass? Return PASS or FAIL only."],
-            env: [
-                "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
-                "REMOTE_CODE_AGENT_PROVIDER": "claude",
-                "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace-attribution",
-                "RC_TOKEN_SAVER_PROJECT_ID": "project-attribution",
-                "RC_TOKEN_SAVER_THREAD_ID": "thread-attribution",
-                "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-attribution"
-            ],
-            stdin: "build passed\n0 failures"
+        let session = URLSession(configuration: .ephemeral)
+        let recovery = TokenSaverRecoveryRequestContext(
+            workspaceID: "workspace-attribution",
+            projectID: "project-attribution",
+            threadID: "thread-attribution",
+            provider: "claude",
+            attemptID: "attempt-attribution",
+            operationID: "op-attribution",
+            invocationID: UUID().uuidString.lowercased()
         )
-        XCTAssertEqual(code, 0)
+        let cli = ManagedDistillCLI(
+            arguments: ["Did it pass? Return PASS or FAIL only."],
+            stdin: Data("build passed\n0 failures\n".utf8),
+            state: .init(baseURL: ready.baseURL, authToken: "tok"),
+            provider: "claude",
+            recoveryContext: recovery,
+            distillAdmission: { true }
+        ) { request in
+            do {
+                let (data, response) = try await session.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                return (data, status)
+            } catch {
+                return nil
+            }
+        }
+        let result = await cli.run()
+        XCTAssertEqual(result.exitCode, 0)
 
         // onSuccess is awaited before the HTTP response, so by now the record exists.
         let records = await capture.records
@@ -64,22 +65,6 @@ final class CLIProviderAttributionTests: XCTestCase {
         XCTAssertEqual(record.mode, "command-output (deterministic)")
         XCTAssertEqual(record.routeStage, .deterministic)
         XCTAssertGreaterThan(record.savedTokens, 0, "and the saving is recorded")
-    }
-
-    private func runProcess(_ url: URL, _ args: [String], env: [String: String], stdin: String) throws -> (out: String, code: Int32) {
-        let process = Process()
-        process.executableURL = url
-        process.arguments = args
-        var environment = ProcessInfo.processInfo.environment
-        for (k, v) in env { environment[k] = v }
-        process.environment = environment
-        let inPipe = Pipe(), outPipe = Pipe()
-        process.standardInput = inPipe; process.standardOutput = outPipe; process.standardError = Pipe()
-        try process.run()
-        inPipe.fileHandleForWriting.write(Data(stdin.utf8)); inPipe.fileHandleForWriting.closeFile()
-        let out = String(decoding: outPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        process.waitUntilExit()
-        return (out, process.terminationStatus)
     }
 
     func test_resolveProvider_prefersExplicitOverRecovery() {

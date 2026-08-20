@@ -1020,12 +1020,13 @@ public struct LocalDistillRuntime: DistillRuntime {
         guard request.mode == .commandOutput else { return nil }
         let parsed = splitLegacyCommandPayload(request.input)
         let source = strippingANSIControlSequences(parsed.output)
-        guard JSONCrusher.looksLikeJSON(source),
-              let routed = contentRouter.route(source, options: routerOptions(for: request)),
-              routed.contentType == .json else {
-            return nil
-        }
-        return boundedCommandOutput(routed.output, maxOutputCharacters: request.maxOutputCharacters)
+        guard JSONCrusher.looksLikeJSON(source) else { return nil }
+        // Minify stays JSON. The general content router may emit TOON/CSV for
+        // token savings, but this path is the gh-color JSON contract: fields
+        // must still parse as JSON after ANSI is stripped.
+        let minified = JSONCrusher.minify(source) ?? source
+        guard minified.utf8.count < request.input.utf8.count else { return nil }
+        return boundedCommandOutput(minified, maxOutputCharacters: request.maxOutputCharacters)
     }
 
     private static let ansiCSIRegex = try! NSRegularExpression(
