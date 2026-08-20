@@ -773,6 +773,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         }
                         Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                         wireQueueDrainControl(on: agent.viewModel, context: ctx)
+                        wireBotPeerHandoffDeletion(on: agent.viewModel, context: ctx)
                         Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
                         configureAgentAppBotMentions(agent)
                         agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
@@ -2480,7 +2481,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     /// Agent App `@handle` mentions start a teammate and paint Message from
     /// back into this thread. Surfaces cannot import AppShell; the store and
-    /// Desk runner stay here.
+    /// Desk runner stay here. The context authority now owns the suspended
+    /// continuation that legacy `runMentionedPrompt` / `presentBotPeerMessage`
+    /// calls kept on the initiating window.
     private func configureAgentAppBotMentions(_ agent: AgentAppSurface) {
         agent.viewModel.mentionableBotsProvider = { [weak self] in
             (try? self?.context?.botStore.list()) ?? []
@@ -2501,37 +2504,57 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         threadId: AgentThreadID,
         onto agent: AgentAppSurface?
     ) async {
-        guard let agent else { return }
+        guard let agent,
+              let ctx = context,
+              let originThread = try? ctx.threadRepo.get(id: threadId) else { return }
         // sam-goal: hop-1 only. A follow-up that still contains @handle
         // would loop. Upgrade: multi-hop with an explicit hop budget.
         lastAgentAppHopTextForTesting = nil
+        ctx.botPeerHandoffAuthority.router = self
+        let providerSnapshots = cachedProviderSnapshotsForSend()
+        var dispatchMilestones: [Task<Void, Never>] = []
         for peer in peers {
-            let activityID = agent.viewModel.presentBotPeerActivity(
+            guard let activityID = agent.viewModel.presentBotPeerActivity(
                 peer: peer,
                 phase: .waiting,
                 threadId: threadId
-            )
-            guard let reply = await botsViewModel?.runMentionedPrompt(peer: peer, text: text),
-                  !reply.isEmpty else {
-                agent.viewModel.presentBotPeerActivity(
-                    peer: peer,
-                    phase: .needsAttention,
-                    threadId: threadId,
-                    replacing: activityID
-                )
-                continue
-            }
-            agent.viewModel.presentBotPeerMessage(
+            ) else { continue }
+            if let milestone = ctx.botPeerHandoffAuthority.submitAgentAppMention(
                 peer: peer,
-                text: reply,
-                threadId: threadId,
-                replacing: activityID
-            )
-            let hop = BotPeerTranscript.hostHopPrompt(peerName: peer.name, reply: reply)
-            lastAgentAppHopTextForTesting = hop
-            await agent.viewModel.sendBotPeerFollowUp(
-                text: hop,
-                threadId: threadId
+                text: text,
+                originThread: originThread,
+                activityID: activityID,
+                hostRunID: AgentRunID(),
+                providerSnapshots: providerSnapshots
+            ) {
+                dispatchMilestones.append(milestone)
+            }
+        }
+        for milestone in dispatchMilestones {
+            await milestone.value
+        }
+    }
+
+    func recordAgentAppHop(_ hop: String) {
+        lastAgentAppHopTextForTesting = hop
+    }
+
+    func agentAppThreadIsSelected(_ threadID: AgentThreadID) -> Bool {
+        SurfaceRegistry.shared.all().contains { surface in
+            guard let agent = surface as? AgentAppSurface else { return false }
+            return agent.viewModel.selectedThreadId == threadID
+        }
+    }
+
+    func projectAgentAppPeerMessage(
+        threadID: AgentThreadID,
+        messageID: AgentMessageID
+    ) {
+        for surface in SurfaceRegistry.shared.all() {
+            guard let agent = surface as? AgentAppSurface else { continue }
+            agent.viewModel.applyPersistedBotPeerMessage(
+                messageID: messageID,
+                threadId: threadID
             )
         }
     }
@@ -2573,6 +2596,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         viewModel.releaseQueueDrainSuppression = { [weak context] threadID, lease in
             context?.releaseQueueDrainSuppression(threadId: threadID, lease: lease)
+        }
+    }
+
+    private func wireBotPeerHandoffDeletion(on viewModel: AgentAppViewModel, context: AppContext) {
+        viewModel.beginBotPeerHandoffDeletion = { [weak context] threadIDs in
+            context?.botPeerHandoffAuthority.beginDeletion(threadIDs: threadIDs) ?? UUID()
+        }
+        viewModel.finishBotPeerHandoffDeletion = { [weak context] token, sourceDeleted in
+            guard let authority = context?.botPeerHandoffAuthority else { return }
+            if sourceDeleted {
+                _ = authority.commitDeletion(token)
+            } else {
+                authority.rollbackDeletion(token)
+            }
         }
     }
 
@@ -3325,17 +3362,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         var providerStartConfirmed = false
         do {
             let queuedRouting = try routingSnapshotForQueuedMessage(queued, context: ctx)
+            let manualRouting = queuedRouting?.configuration.mode == .manual
+                ? queuedRouting?.configuration
+                : nil
+            let manualSelection = manualRouting?.manualSelection
             let result = try await sendAgentMessage(
                 thread: queued.threadId,
                 text: queued.text,
-                provider: nil,
-                model: nil,
-                permissionMode: nil,
-                reasoningEffort: nil,
-                serviceTier: nil,
+                provider: manualSelection?.provider,
+                model: manualSelection?.effectiveModel,
+                permissionMode: queuedRouting?.permissionMode,
+                reasoningEffort: manualSelection?.reasoningEffort,
+                serviceTier: manualSelection?.serviceTier,
                 interactionMode: queued.interactionMode,
-                modelSelection: nil,
-                providerInstanceId: nil,
+                modelSelection: manualSelection,
+                providerInstanceId: manualRouting?.manualProviderInstanceId,
                 attachments: queued.attachments,
                 queueMessageId: queued.id,
                 queueAcceptancePermit: acceptancePermit,
@@ -3451,6 +3492,40 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    func sendAgentMessage(
+        thread: AgentThreadID,
+        text: String,
+        provider: AgentProvider?,
+        model: String?,
+        permissionMode: AgentPermissionMode?,
+        reasoningEffort: AgentReasoningEffort?,
+        serviceTier: AgentServiceTier? = nil,
+        interactionMode: AgentInteractionMode? = nil,
+        modelSelection: AgentModelSelection? = nil,
+        providerInstanceId: String? = nil,
+        attachments: [AgentAttachment] = [],
+        requestedRunID: AgentRunID,
+        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
+    ) async throws -> AgentMessageSendResult {
+        try await sendAgentMessage(
+            thread: thread,
+            text: text,
+            provider: provider,
+            model: model,
+            permissionMode: permissionMode,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier,
+            interactionMode: interactionMode,
+            modelSelection: modelSelection,
+            providerInstanceId: providerInstanceId,
+            attachments: attachments,
+            queueMessageId: nil,
+            routingSnapshot: routingSnapshot,
+            requestedRunID: requestedRunID,
+            orchestrationRoutingSnapshot: nil
+        )
+    }
+
     /// Path B / scheduled Auto: same send as Agent App, with the preflight orchestration
     /// snapshot so admit + launch match what was verified.
     public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = [], orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot?) async throws -> AgentMessageSendResult {
@@ -3556,7 +3631,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         let effectiveRouting = orchestrationRoutingSnapshot?.configuration
@@ -3584,16 +3659,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 throw JSONRPCError(code: -32000, message: "Thread became active before queued dispatch started.")
             }
             let queued = try ctx.queuedMessageRepo.enqueue(
+                id: requestedRunID.map { AgentQueuedMessageID($0.value) },
                 threadId: thread,
                 text: text,
                 attachments: resolvedAttachments,
                 interactionMode: interactionMode ?? .default,
-                routingSnapshot: routingSnapshot ?? effectiveRouting.map { AgentQueuedMessageRoutingSnapshot(configuration: $0) }
+                routingSnapshot: routingSnapshot ?? AgentQueuedMessageRoutingSnapshot(
+                    configuration: effectiveRouting ?? existing.effectiveRoutingConfiguration,
+                    permissionMode: permissionMode ?? existing.permissionMode
+                )
             )
             publishQueuedMessage(kind: "agent.message.queued", queued)
             refreshAgentSurfaces(thread: thread)
             ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread)
-            return AgentMessageSendResult(status: .queued, queuedMessage: queued)
+            return AgentMessageSendResult(status: .queued, runId: requestedRunID, queuedMessage: queued)
         }
         // A message-send is not a provider-change gesture. The provider INSTANCE
         // is immutable once the thread has started (A1 parity), so never forward it
@@ -3679,7 +3758,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             providerRunEnvironment[AgentAppRuntimeProfile.environmentKey] =
                 runtimeProfile.rawValue
         }
-        let requestedRunID = queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID()
+        let requestedRunID = requestedRunID ?? queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID()
         // Prefer a full orchestration snapshot (scheduled Path B / Auto admit)
         // so launch binary+catalog match preflight. Queued messages only carry
         // the lightweight admission fields and refill provider snapshots at start.
@@ -3690,7 +3769,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             coordinatorSnapshot = routingSnapshot.map {
                 AgentOrchestrationRoutingSnapshot(
                     configuration: $0.configuration,
-                    providerSnapshots: [],
+                    providerSnapshots: $0.configuration.mode == .manual
+                        ? cachedProviderSnapshotsForSend()
+                        : [],
                     admissionSnapshot: $0
                 )
             }
@@ -3897,17 +3978,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 _ = try? ctx.queuedMessageRepo.releasePrepared(lease, runId: dispatchRunId)
                 return
             }
+            let manualRouting = queuedRouting?.configuration.mode == .manual
+                ? queuedRouting?.configuration
+                : nil
+            let manualSelection = manualRouting?.manualSelection
             _ = try await sendAgentMessage(
                 thread: thread,
                 text: queued.text,
-                provider: nil,
-                model: nil,
-                permissionMode: nil,
-                reasoningEffort: nil,
-                serviceTier: nil,
+                provider: manualSelection?.provider,
+                model: manualSelection?.effectiveModel,
+                permissionMode: queuedRouting?.permissionMode,
+                reasoningEffort: manualSelection?.reasoningEffort,
+                serviceTier: manualSelection?.serviceTier,
                 interactionMode: queued.interactionMode,
-                modelSelection: nil,
-                providerInstanceId: nil,
+                modelSelection: manualSelection,
+                providerInstanceId: manualRouting?.manualProviderInstanceId,
                 attachments: queued.attachments,
                 queueMessageId: queued.id,
                 queueAcceptancePermit: acceptancePermit,
@@ -4796,14 +4881,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func deleteAgentThread(thread: AgentThreadID) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let handoffDeletion = ctx.botPeerHandoffAuthority.beginDeletion(threadIDs: [thread])
+        var didDeleteSource = false
+        defer {
+            if !didDeleteSource {
+                ctx.botPeerHandoffAuthority.rollbackDeletion(handoffDeletion)
+            }
+        }
         let suppressionLease = await ctx.acquireQueueDrainSuppression(threadId: thread)
         defer { ctx.releaseQueueDrainSuppression(threadId: thread, lease: suppressionLease) }
         try await ctx.coordinator.stopAndAwaitTermination(threadId: thread)
         try ctx.threadRepo.delete(id: thread)
+        didDeleteSource = true
+        _ = ctx.botPeerHandoffAuthority.commitDeletion(handoffDeletion)
     }
 
     public func deleteAgentThreads(_ threads: [AgentThreadID]) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let handoffDeletion = ctx.botPeerHandoffAuthority.beginDeletion(threadIDs: Set(threads))
+        var didDeleteSource = false
+        defer {
+            if !didDeleteSource {
+                ctx.botPeerHandoffAuthority.rollbackDeletion(handoffDeletion)
+            }
+        }
         let suppressionLeases = await ctx.acquireQueueDrainSuppressions(threadIds: threads)
         defer {
             for (thread, lease) in suppressionLeases {
@@ -4812,6 +4913,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         try await ctx.coordinator.stopAndAwaitTermination(threadIds: threads)
         try ctx.threadRepo.delete(ids: threads)
+        didDeleteSource = true
+        _ = ctx.botPeerHandoffAuthority.commitDeletion(handoffDeletion)
     }
 
     public func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread {
@@ -6761,6 +6864,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                 wireQueueDrainControl(on: agent.viewModel, context: ctx)
+                wireBotPeerHandoffDeletion(on: agent.viewModel, context: ctx)
                 Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
                 configureAgentAppBotMentions(agent)
                 agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in

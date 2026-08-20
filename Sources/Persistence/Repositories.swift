@@ -138,6 +138,69 @@ private func encodeRoutingConfiguration(_ configuration: AgentRoutingConfigurati
     return json
 }
 
+private struct AgentQueuedRoutingConfigurationPayload: Codable {
+    let configuration: AgentRoutingConfiguration
+    let permissionMode: AgentPermissionMode?
+
+    private enum CodingKeys: String, CodingKey {
+        case permissionMode
+    }
+
+    init(configuration: AgentRoutingConfiguration, permissionMode: AgentPermissionMode?) {
+        self.configuration = configuration
+        self.permissionMode = permissionMode
+    }
+
+    init(from decoder: Decoder) throws {
+        configuration = try AgentRoutingConfiguration(from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        permissionMode = try container.decodeIfPresent(AgentPermissionMode.self, forKey: .permissionMode)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        try configuration.encode(to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(permissionMode, forKey: .permissionMode)
+    }
+}
+
+private func encodeQueuedRoutingConfiguration(_ snapshot: AgentQueuedMessageRoutingSnapshot) throws -> String {
+    agentThreadJSONCodecLock.lock()
+    defer { agentThreadJSONCodecLock.unlock() }
+    let payload = AgentQueuedRoutingConfigurationPayload(
+        configuration: snapshot.configuration,
+        permissionMode: snapshot.permissionMode
+    )
+    let data = try agentThreadJSONEncoder.encode(payload)
+    guard let json = String(data: data, encoding: .utf8) else {
+        throw AgentRoutingPersistenceError.invalidConfigurationJSON
+    }
+    return json
+}
+
+private func decodeQueuedRoutingConfiguration(
+    json: String?,
+    storedRevision: Int?
+) throws -> AgentQueuedRoutingConfigurationPayload {
+    guard let json,
+          let data = json.data(using: .utf8) else {
+        throw AgentRoutingPersistenceError.invalidConfigurationJSON
+    }
+    agentThreadJSONCodecLock.lock()
+    let payload = try? agentThreadJSONDecoder.decode(AgentQueuedRoutingConfigurationPayload.self, from: data)
+    agentThreadJSONCodecLock.unlock()
+    guard let payload else {
+        throw AgentRoutingPersistenceError.invalidConfigurationJSON
+    }
+    if let storedRevision, storedRevision != payload.configuration.revision {
+        throw AgentRoutingPersistenceError.revisionConflict(
+            column: storedRevision,
+            configuration: payload.configuration.revision
+        )
+    }
+    return payload
+}
+
 private func decodeRoutingConfiguration(
     json: String?,
     storedMode: String?,
@@ -2819,6 +2882,7 @@ public final class AgentQueuedMessageRepository {
     public init(db: SQLiteDB) { self.db = db }
 
     public func enqueue(
+        id: AgentQueuedMessageID? = nil,
         threadId: AgentThreadID,
         text: String,
         attachments: [AgentAttachment],
@@ -2828,6 +2892,7 @@ public final class AgentQueuedMessageRepository {
     ) throws -> AgentQueuedMessage {
         let position = try nextPosition(threadId: threadId)
         let queued = AgentQueuedMessage(
+            id: id ?? AgentQueuedMessageID(),
             threadId: threadId,
             text: text,
             attachments: attachments,
@@ -2944,13 +3009,13 @@ public final class AgentQueuedMessageRepository {
         """)
         try statement.bind(1, id.value.uuidString)
         guard try statement.step() else { return nil }
-        let configuration = try decodeRoutingConfiguration(
+        let payload = try decodeQueuedRoutingConfiguration(
             json: statement.columnText(0),
-            storedMode: nil,
             storedRevision: Int(statement.columnInt64(1))
         )
         return AgentQueuedMessageRoutingSnapshot(
-            configuration: configuration,
+            configuration: payload.configuration,
+            permissionMode: payload.permissionMode,
             deadlineAt: statement.columnText(2).flatMap(iso.date(from:)),
             budgetTokens: statement.columnIsNull(3) ? nil : Int(statement.columnInt64(3)),
             budgetCostMicros: statement.columnIsNull(4) ? nil : Int(statement.columnInt64(4)),
@@ -2985,7 +3050,7 @@ public final class AgentQueuedMessageRepository {
                 admission_receipt_id=excluded.admission_receipt_id;
         """)
         try statement.bind(1, queuedMessageId.value.uuidString)
-        try statement.bind(2, try encodeRoutingConfiguration(snapshot.configuration))
+        try statement.bind(2, try encodeQueuedRoutingConfiguration(snapshot))
         try statement.bind(3, snapshot.configuration.revision)
         try statement.bind(4, iso.string(from: snapshot.configuration.updatedAt))
         try statement.bind(5, snapshot.deadlineAt.map(iso.string(from:)))
@@ -8745,6 +8810,38 @@ public final class SettingsRepository {
         try st.bind(2, value)
         try st.bind(3, iso.string(from: Date()))
         _ = try st.step()
+    }
+
+    /// Compares and replaces one exact settings value in the same SQLite
+    /// transaction as an external compatibility-mirror gate. A thrown gate or
+    /// COMMIT failure rolls the settings row back; a mismatched expected value
+    /// performs no write and returns false.
+    public func compareAndSetTransactionally(
+        _ key: String,
+        expectedValue: String?,
+        value: String,
+        externalCommitGate: () throws -> Void
+    ) throws -> Bool {
+        try db.transaction {
+            let read = try db.prepare("SELECT value FROM settings WHERE key = ?;")
+            defer { read.reset() }
+            try read.bind(1, key)
+            let current = try read.step() ? read.columnText(0) : nil
+            guard current == expectedValue else { return false }
+            read.reset()
+
+            let write = try db.prepare("""
+                INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
+            """)
+            defer { write.reset() }
+            try write.bind(1, key)
+            try write.bind(2, value)
+            try write.bind(3, iso.string(from: Date()))
+            _ = try write.step()
+            try externalCommitGate()
+            return true
+        }
     }
 
     /// Delete a single settings row by exact key. No-op if absent.

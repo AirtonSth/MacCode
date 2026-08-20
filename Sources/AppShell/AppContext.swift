@@ -353,9 +353,21 @@ public final class AppContext {
     public var state = LayoutState()
 
     public let coordinator: AgentRunCoordinator
+    lazy var botPeerHandoffAuthority = BotPeerHandoffAuthority(
+        botStore: botStore,
+        threadRepo: threadRepo,
+        runRepo: runRepo,
+        messageRepo: messageRepo,
+        queuedMessageRepo: queuedMessageRepo,
+        checkpointRepo: turnCheckpointRepo,
+        settingsRepo: settingsRepo,
+        coordinator: coordinator,
+        appSupportDirectory: appSupportDirectory
+    )
     private var tokenSaverCodexAdapter: CodexAppServerAdapter
     public var router: AppCommandRouter! {
         didSet {
+            botPeerHandoffAuthority.router = router
             drainRecoveredForkPrunedThreadIDsIfPossible()
             refreshActiveAgentWorkspaceProjection()
             startBotBrowserPendingOpenObserver()
@@ -1386,6 +1398,7 @@ public final class AppContext {
                 // makes the adapter idle. Wait through that bounded cancellation
                 // window; otherwise Force gets one premature drain and the promoted
                 // message remains stranded with no later lifecycle callback.
+                self.cancelQueueDrainWaiter(threadId: tid)
                 self.ensureQueueDrainWaiterIfNeeded(threadId: tid)
                 // Main agent only: nested/subagent workers must not fire
                 // system or private push banners (parent owns user-facing UX).
