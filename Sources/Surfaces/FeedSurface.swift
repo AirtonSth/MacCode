@@ -266,6 +266,7 @@ public struct FeedPanelView: View {
                                 }
                             }
                             .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             .background(DS.Palette.surface)
                             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
                             .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)

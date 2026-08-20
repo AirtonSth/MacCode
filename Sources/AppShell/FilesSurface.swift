@@ -159,6 +159,22 @@ struct FileEntry: Identifiable, Equatable {
         }
     }
 
+    func replacingIdentity(_ identity: [String: JSONValue]) -> FileEntry? {
+        var resolved = FileEntry(value: .object([
+            "name": .string(name),
+            "path": .string(path),
+            "relative_path": .string(relativePath),
+            "type": .string(isDirectory ? "directory" : "file"),
+            "size": .number(Double(size)),
+            "modified_at": modifiedAt.map(JSONValue.number) ?? .null,
+            "is_hidden": .bool(isHidden),
+            "identity": .object(identity),
+        ]))
+        resolved?.dragPayload = dragPayload
+        resolved?.moveDragPayload = moveDragPayload
+        return resolved
+    }
+
     static func icon(isDirectory: Bool, kind: String) -> String {
         if isDirectory { return "folder" }
         switch kind {
@@ -1249,9 +1265,24 @@ final class FilesViewModel: ObservableObject {
                 sessionPath = nil
                 isDirty = false
                 let read = try router?.fsWorkspaceRead(workspace: workspaceID, path: entry.relativePath, maxBytes: WorkspaceFileLimits.readBytes)
-                let content = read?.objectValue?["content"]?.stringValue ?? ""
-                setDraft(content)
-                renderedText = content
+                let readObject = read?.objectValue ?? [:]
+                let resolved = readObject["identity"]?.objectValue.flatMap(entry.replacingIdentity)
+                if let resolved {
+                    selectedEntry = resolved
+                }
+                if let resolved, resolved.isEditable {
+                    if let cached = sessionCache[entry.relativePath], cached.isDirty {
+                        restoreSession(cached)
+                    } else {
+                        let opened = try router?.filesEditOpen(surface: surfaceID, path: entry.relativePath)
+                        applyEditPayload(opened?.objectValue ?? [:], remote: false)
+                    }
+                    sessionPath = entry.relativePath
+                } else {
+                    let content = readObject["content"]?.stringValue ?? ""
+                    setDraft(content)
+                    renderedText = content
+                }
             }
             setSyncLabel("Up to date", revision: draftRevision)
         } catch {

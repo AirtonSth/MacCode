@@ -80,7 +80,7 @@ final class BotTypesTests: XCTestCase {
     func test_desktopLabel_statesSharedAccount_becauseUsersMustNotThinkP1aIsAnIsolatedVM() throws {
         XCTAssertEqual(
             BotDesktopKind.logicalExecutionSpace.honestyLabel,
-            "Same macOS account; not isolated. Not a dedicated Desktop."
+            "This Mac · default browser. Same macOS account; not isolated."
         )
         XCTAssertFalse(
             BotDesktopKind.logicalExecutionSpace.honestyLabel.localizedCaseInsensitiveContains("virtual machine")
@@ -113,9 +113,41 @@ final class BotTypesTests: XCTestCase {
             ),
             "Managed remote Mac must not be selectable even if a leftover persist flag is on"
         )
-        XCTAssertEqual(BotDesktopKind.advertisedKinds, [.logicalExecutionSpace])
+        XCTAssertEqual(
+            BotDesktopKind.logicalExecutionSpace.displayTitle,
+            "macOS with the default macOS browser"
+        )
+        XCTAssertEqual(
+            BotDesktopKind.botOwnedBrowser.displayTitle,
+            "macOS with the bot's own browser"
+        )
+        XCTAssertEqual(
+            BotDesktopKind.dockerDesktop.displayTitle,
+            "Docker with GUI"
+        )
+        XCTAssertEqual(
+            BotDesktopKind.advertisedKinds,
+            [.logicalExecutionSpace, .botOwnedBrowser, .dockerDesktop]
+        )
         XCTAssertFalse(BotDesktopKind.dedicatedLocalVM.isAdvertised)
         XCTAssertFalse(BotDesktopKind.managedRemoteMac.isAdvertised)
+        XCTAssertTrue(
+            BotDesktopKind.botOwnedBrowser.isSelectable(
+                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true)
+            )
+        )
+        XCTAssertFalse(
+            BotDesktopKind.dockerDesktop.isSelectable(
+                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true),
+                guestReady: false
+            )
+        )
+        XCTAssertTrue(
+            BotDesktopKind.dockerDesktop.isSelectable(
+                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true),
+                guestReady: true
+            )
+        )
         let leftover = try JSONDecoder().decode(
             BotDesktopKind.self,
             from: Data(#""dedicatedLocalVM""#.utf8)

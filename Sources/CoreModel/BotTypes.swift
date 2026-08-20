@@ -66,12 +66,20 @@ public struct BotControlPlaneFlags: Codable, Sendable, Equatable {
 
 public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
     case logicalExecutionSpace
+    case botOwnedBrowser
+    case dockerDesktop
     case dedicatedLocalVM
     case managedRemoteMac
 
     /// Honest P1a copy — this kind is not a VM or a dedicated Desktop.
     public static let logicalExecutionSpaceHonestyLabel =
-        "Same macOS account; not isolated. Not a dedicated Desktop."
+        "This Mac · default browser. Same macOS account; not isolated."
+
+    public static let botOwnedBrowserHonestyLabel =
+        "This Mac · this teammate's browser. Not the owner's default browser. Same macOS account."
+
+    public static let dockerDesktopHonestyLabel =
+        "Linux screen in Docker on 127.0.0.1. Agent, files, and workspace stay on this Mac. Not a security boundary."
 
     /// Decode-only leftover. Display and publish resolve to Logical execution space.
     public static let dedicatedLocalVMHonestyLabel =
@@ -81,6 +89,10 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
         switch self {
         case .logicalExecutionSpace:
             return Self.logicalExecutionSpaceHonestyLabel
+        case .botOwnedBrowser:
+            return Self.botOwnedBrowserHonestyLabel
+        case .dockerDesktop:
+            return Self.dockerDesktopHonestyLabel
         case .dedicatedLocalVM:
             return Self.dedicatedLocalVMHonestyLabel
         case .managedRemoteMac:
@@ -91,7 +103,11 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
     public var displayTitle: String {
         switch self {
         case .logicalExecutionSpace:
-            return "Logical execution space"
+            return "macOS with the default macOS browser"
+        case .botOwnedBrowser:
+            return "macOS with the bot's own browser"
+        case .dockerDesktop:
+            return "Docker with GUI"
         case .dedicatedLocalVM:
             return "Dedicated local VM"
         case .managedRemoteMac:
@@ -102,7 +118,11 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
     public var statusPill: String {
         switch self {
         case .logicalExecutionSpace:
-            return "Logical space"
+            return "Default browser"
+        case .botOwnedBrowser:
+            return "Bot browser"
+        case .dockerDesktop:
+            return "Docker · loopback"
         case .dedicatedLocalVM:
             return "Local VM · not running"
         case .managedRemoteMac:
@@ -113,6 +133,8 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
     /// Kinds Studio may offer. Dedicated local VM and Managed remote Mac stay persist-only leftovers.
     public static let advertisedKinds: [BotDesktopKind] = [
         .logicalExecutionSpace,
+        .botOwnedBrowser,
+        .dockerDesktop,
     ]
 
     public var isAdvertised: Bool { Self.advertisedKinds.contains(self) }
@@ -122,13 +144,61 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
         isAdvertised ? self : .logicalExecutionSpace
     }
 
-    public func isSelectable(flags: BotControlPlaneFlags) -> Bool {
+    public func isSelectable(flags: BotControlPlaneFlags, guestReady: Bool = false) -> Bool {
         switch self {
-        case .logicalExecutionSpace:
+        case .logicalExecutionSpace, .botOwnedBrowser:
             return flags.isBotControlPlaneActive
+        case .dockerDesktop:
+            return flags.isBotControlPlaneActive && guestReady
         case .dedicatedLocalVM, .managedRemoteMac:
             return false
         }
+    }
+}
+
+/// What a published desktop kind may drive on the next send.
+public struct BotDesktopAdmission: Equatable, Sendable {
+    public let kind: BotDesktopKind
+    public let allowsHostDefaultBrowser: Bool
+    public let allowsBotOwnedBrowser: Bool
+    public let allowsGuestComputer: Bool
+    public let allowsMacOSHarness: Bool
+
+    public static func forPublished(_ kind: BotDesktopKind) -> BotDesktopAdmission {
+        switch kind.advertisedOrLogical {
+        case .botOwnedBrowser:
+            return BotDesktopAdmission(
+                kind: .botOwnedBrowser,
+                allowsHostDefaultBrowser: false,
+                allowsBotOwnedBrowser: true,
+                allowsGuestComputer: false,
+                allowsMacOSHarness: false
+            )
+        case .dockerDesktop:
+            return BotDesktopAdmission(
+                kind: .dockerDesktop,
+                allowsHostDefaultBrowser: false,
+                allowsBotOwnedBrowser: false,
+                allowsGuestComputer: true,
+                allowsMacOSHarness: false
+            )
+        case .logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac:
+            return BotDesktopAdmission(
+                kind: .logicalExecutionSpace,
+                allowsHostDefaultBrowser: true,
+                allowsBotOwnedBrowser: true,
+                allowsGuestComputer: false,
+                allowsMacOSHarness: true
+            )
+        }
+    }
+
+    public static func requireSend(kind: BotDesktopKind, guestReady: Bool) throws -> BotDesktopAdmission {
+        let admission = forPublished(kind)
+        if admission.kind == .dockerDesktop && !guestReady {
+            throw BotComputerGuestError.notReady
+        }
+        return admission
     }
 }
 
@@ -317,18 +387,40 @@ public enum BotStandingInstructions {
 
     public static let macosHarnessTool = "macos-harness"
     public static let generatedMacOSHarnessLine =
-        "When asked to see the screen, click, type, or press keys on this Mac, run \(macosHarnessTool) with a Python program using mac.see, mac.key, mac.type, mac.click, mac.ax, and mac.script. If \(macosHarnessTool) is missing, install it with uv tool install --python 3.12 --upgrade macos-harness from https://github.com/browser-use/macos-harness then retry. Do not call remotecode-computer-use."
+        "When asked to see the screen, click, type, or press keys on this Mac, run \(macosHarnessTool) with a Python program using mac.see, mac.key, mac.type, mac.click, mac.ax, and mac.script. If \(macosHarnessTool) is missing, install it with uv tool install --python 3.12 --upgrade macos-harness from https://github.com/browser-use/macos-harness then retry. Do not call remotecode-computer-use. Open websites in the owner's default macOS browser."
+
+    public static let computerObserveTool = "bot_computer_observe"
+    public static let computerActTool = "bot_computer_act"
+    public static let computerExecTool = "bot_computer_exec"
+    public static let computerRebuildTool = "bot_computer_rebuild"
+    public static let generatedGuestComputerLine =
+        "When asked to see or use the Linux desktop, call \(computerObserveTool) then \(computerActTool). To install packages or run a command in the guest, call \(computerExecTool). To change the guest image, edit /home/remotecode/Dockerfile then call \(computerRebuildTool). That screen is the Docker guest on 127.0.0.1. Do not run \(macosHarnessTool). Do not call remotecode-computer-use. Do not use this Mac's default browser. Do not run host docker."
 
     /// Compiler layer. Starter soul must not own these names.
-    public static let admittedToolsText = [
-        generatedCapabilityLine,
-        generatedMutateLine,
-        generatedBrowserLine,
-        generatedWebLine,
-        generatedRecallLine,
-        generatedAskLine,
-        generatedMacOSHarnessLine,
-    ].joined(separator: "\n")
+    public static let admittedToolsText = admittedToolsText(for: .logicalExecutionSpace)
+
+    public static func admittedToolsText(for kind: BotDesktopKind) -> String {
+        let admission = BotDesktopAdmission.forPublished(kind)
+        var lines = [
+            generatedCapabilityLine,
+            generatedMutateLine,
+        ]
+        if admission.allowsGuestComputer {
+            lines.append(generatedGuestComputerLine)
+        }
+        if admission.allowsBotOwnedBrowser {
+            lines.append(generatedBrowserLine)
+        }
+        lines.append(contentsOf: [
+            generatedWebLine,
+            generatedRecallLine,
+            generatedAskLine,
+        ])
+        if admission.allowsMacOSHarness {
+            lines.append(generatedMacOSHarnessLine)
+        }
+        return lines.joined(separator: "\n")
+    }
 
     public static func fallback(name _: String, title _: String, description _: String = "") -> String {
         [

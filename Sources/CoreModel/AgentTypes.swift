@@ -2041,9 +2041,10 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
 }
 
 /// Admission values captured with queued work. These are immutable so a later
-/// thread-routing edit cannot change the deadline or reservation used on replay.
+/// thread edit cannot change the permission, deadline, or reservation used on replay.
 public struct AgentQueuedMessageRoutingSnapshot: Codable, Sendable, Equatable {
     public let configuration: AgentRoutingConfiguration
+    public let permissionMode: AgentPermissionMode?
     public let deadlineAt: Date?
     public let budgetTokens: Int?
     public let budgetCostMicros: Int?
@@ -2054,6 +2055,7 @@ public struct AgentQueuedMessageRoutingSnapshot: Codable, Sendable, Equatable {
 
     public init(
         configuration: AgentRoutingConfiguration,
+        permissionMode: AgentPermissionMode? = nil,
         deadlineAt: Date? = nil,
         budgetTokens: Int? = nil,
         budgetCostMicros: Int? = nil,
@@ -2063,6 +2065,7 @@ public struct AgentQueuedMessageRoutingSnapshot: Codable, Sendable, Equatable {
         admissionReceiptId: UUID? = nil
     ) {
         self.configuration = configuration
+        self.permissionMode = permissionMode
         self.deadlineAt = deadlineAt
         self.budgetTokens = budgetTokens
         self.budgetCostMicros = budgetCostMicros

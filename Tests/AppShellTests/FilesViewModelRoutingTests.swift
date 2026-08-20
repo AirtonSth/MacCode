@@ -13,6 +13,7 @@ final class FilesViewModelRoutingTests: XCTestCase {
         ]
         var listings: [String: [JSONValue]] = [:]
         var contents: [String: String] = [:]
+        var readIdentities: [String: [String: JSONValue]] = [:]
         var operations: [String] = []
         var sessionPathByID: [String: String] = [:]
         var onApplyPatch: ((String) -> Void)?
@@ -56,7 +57,12 @@ final class FilesViewModelRoutingTests: XCTestCase {
         }
 
         func fsWorkspaceRead(workspace: WorkspaceID, path: String, maxBytes: Int?) throws -> JSONValue {
-            .object(["content": .string(contents[path] ?? "")])
+            operations.append("read:\(path)")
+            var payload: [String: JSONValue] = ["content": .string(contents[path] ?? "")]
+            if let identity = readIdentities[path] {
+                payload["identity"] = .object(identity)
+            }
+            return .object(payload)
         }
 
         func filesEditSave(sessionID: String) throws -> JSONValue {
@@ -229,6 +235,100 @@ final class FilesViewModelRoutingTests: XCTestCase {
             "the first click should open the file exactly once")
         XCTAssertEqual(router.operations.filter { $0 == "open:README.md" }.count, 1,
             "tap handling and List selection changes can both fire, but the same selected file must not reopen a second edit session")
+    }
+
+    func test_selectUnknownTextUsesContentIdentityAndOpensEditor() throws {
+        // WHY: extensionless text such as Dockerfile is intentionally cheap-classified as
+        // unknown in directory listings, but selecting it must promote the content-based
+        // identity and open the source editor without treating arbitrary binaries as text.
+        let router = FakeFilesRouter()
+        router.listings[""] = [.object([
+            "name": .string("Dockerfile"),
+            "path": .string("/workspace/Dockerfile"),
+            "relative_path": .string("Dockerfile"),
+            "type": .string("file"),
+            "size": .number(12),
+            "is_hidden": .bool(false),
+            "identity": .object([
+                "kind": .string("unknown"),
+                "mime": .string("application/octet-stream"),
+                "is_editable": .bool(false),
+                "editability_reason": .string("binary or unknown file")
+            ])
+        ])]
+        router.contents["Dockerfile"] = "FROM debian\n"
+        router.readIdentities["Dockerfile"] = [
+            "kind": .string("text"),
+            "mime": .string("text/plain"),
+            "is_editable": .bool(true),
+            "editability_reason": .string("editable text")
+        ]
+        let model = makeModel(router: router)
+        defer { model.close() }
+
+        model.loadDirectory("")
+        let listed = try XCTUnwrap(model.entries.first)
+        XCTAssertFalse(listed.isEditable, "the listing must stay byte-free and conservative")
+        model.select(listed)
+
+        XCTAssertEqual(model.selectedEntry?.kind, "text")
+        XCTAssertTrue(model.selectedEntry?.isEditable == true)
+        XCTAssertEqual(model.draftText, "FROM debian\n")
+        XCTAssertEqual(
+            router.operations.filter { $0 == "open:Dockerfile" }.count,
+            1,
+            "content-confirmed text must receive a real edit session"
+        )
+    }
+
+    func test_reselectUnknownTextRestoresDirtyDraftWithoutReopening() throws {
+        // WHY: content-based promotion happens after selection. Returning to an
+        // extensionless file must still honor the same dirty-session cache as files
+        // whose editable identity was already known from the directory listing.
+        let router = FakeFilesRouter()
+        let unknown: JSONValue = .object([
+            "name": .string("Dockerfile"),
+            "path": .string("/workspace/Dockerfile"),
+            "relative_path": .string("Dockerfile"),
+            "type": .string("file"),
+            "size": .number(12),
+            "is_hidden": .bool(false),
+            "identity": .object([
+                "kind": .string("unknown"),
+                "mime": .string("application/octet-stream"),
+                "is_editable": .bool(false),
+                "editability_reason": .string("binary or unknown file")
+            ])
+        ])
+        router.listings[""] = [unknown, FakeFilesRouter.fileEntry("notes.txt")]
+        router.contents["Dockerfile"] = "FROM debian\n"
+        router.contents["notes.txt"] = "notes"
+        router.readIdentities["Dockerfile"] = [
+            "kind": .string("text"),
+            "mime": .string("text/plain"),
+            "is_editable": .bool(true),
+            "editability_reason": .string("editable text")
+        ]
+        let model = makeModel(router: router)
+        defer { model.close() }
+
+        model.loadDirectory("")
+        let dockerfile = try XCTUnwrap(model.entries.first { $0.name == "Dockerfile" })
+        let notes = try XCTUnwrap(model.entries.first { $0.name == "notes.txt" })
+        model.loadFile(dockerfile)
+        model.draftText = "FROM debian\nRUN echo local\n"
+        model.editorChanged(model.draftText)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        model.loadFile(notes)
+        router.operations.removeAll()
+
+        model.loadFile(dockerfile)
+
+        XCTAssertEqual(model.draftText, "FROM debian\nRUN echo local\n")
+        XCTAssertFalse(
+            router.operations.contains("open:Dockerfile"),
+            "reselection must restore the dirty session instead of replacing it"
+        )
     }
 
     func test_createFileTrimsNameCreatesUnderCurrentDirectoryAndOpensIt() {

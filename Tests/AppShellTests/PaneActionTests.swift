@@ -1018,11 +1018,10 @@ final class PaneActionTests: XCTestCase {
         XCTAssertFalse(titleLabels.isEmpty,
                        "the visible-sidebar chrome must still show the selected workspace title over the workspace area")
 
-        let split = try XCTUnwrap(allSubviews(of: content).first { $0 is NSSplitView } as? NSSplitView)
-        let splitTop = try XCTUnwrap(content.constraints.first {
-            ($0.firstItem as? NSSplitView) === split && $0.firstAttribute == .top && $0.secondAttribute == .top
-        })
-        XCTAssertEqual(splitTop.constant, 0, accuracy: 0.1,
+        let columns = try XCTUnwrap(
+            allSubviews(of: content).first { $0.accessibilityIdentifier() == "shell.columns" }
+        )
+        XCTAssertEqual(columns.frame.maxY, content.bounds.maxY, accuracy: 0.1,
                        "the sidebar background must reach the top edge while the workspace area handles its own title inset")
 
         let rootPane = try XCTUnwrap(allSubviews(of: content).first { $0 is PaneRootView } as? PaneRootView)
@@ -1084,11 +1083,15 @@ final class PaneActionTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
 
         let content = try XCTUnwrap(controller.window.contentView)
-        let buttons = visibleSubviews(of: content).compactMap { $0 as? NSButton }
-        let toggle = try XCTUnwrap(buttons.first { $0.toolTip == "Toggle sidebar" },
-                                   "collapsed header must expose a left-side sidebar toggle")
-        let plus = try XCTUnwrap(buttons.first { $0.toolTip == "New workspace" },
-                                 "collapsed header must keep the workspace + on the right")
+        let buttons = allSubviews(of: content).compactMap { $0 as? NSButton }
+        let toggle = try XCTUnwrap(
+            buttons.first { $0.accessibilityIdentifier() == "shell.collapsed.toggleSidebar" },
+            "collapsed header must expose a left-side sidebar toggle"
+        )
+        let plus = try XCTUnwrap(
+            buttons.first { $0.accessibilityIdentifier() == "shell.collapsed.newWorkspace" },
+            "collapsed header must keep the workspace + on the right"
+        )
         let toggleFrame = toggle.convert(toggle.bounds, to: content)
         let plusFrame = plus.convert(plus.bounds, to: content)
 
@@ -1099,11 +1102,10 @@ final class PaneActionTests: XCTestCase {
         XCTAssertLessThan(toggleFrame.maxX, plusFrame.minX,
                           "toggle and + must stay on opposite sides of the hidden-sidebar header")
 
-        let split = try XCTUnwrap(allSubviews(of: content).first { $0 is NSSplitView } as? NSSplitView)
-        let splitTop = try XCTUnwrap(content.constraints.first {
-            ($0.firstItem as? NSSplitView) === split && $0.firstAttribute == .top && $0.secondAttribute == .top
-        })
-        XCTAssertEqual(splitTop.constant, 34, accuracy: 0.1,
+        let columns = try XCTUnwrap(
+            allSubviews(of: content).first { $0.accessibilityIdentifier() == "shell.columns" }
+        )
+        XCTAssertEqual(content.bounds.maxY - columns.frame.maxY, 34, accuracy: 0.1,
                        "collapsed mode still needs a full-width header so the user can restore the sidebar")
     }
 
@@ -1122,20 +1124,190 @@ final class PaneActionTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
 
         let content = try XCTUnwrap(controller.window.contentView)
-        let split = try XCTUnwrap(allSubviews(of: content).first { $0 is NSSplitView } as? NSSplitView)
-        let sidebar = try XCTUnwrap(split.subviews.first,
-                                    "restoring the sidebar must keep the sidebar arranged inside the split view")
-        let splitFrame = split.convert(split.bounds, to: content)
+        let columns = try XCTUnwrap(
+            allSubviews(of: content).first { $0.accessibilityIdentifier() == "shell.columns" }
+        )
+        let sidebar = try XCTUnwrap(
+            allSubviews(of: content).first { $0.accessibilityIdentifier() == "shell.sidebar" },
+            "restoring the sidebar must keep the glass panel in the columns host"
+        )
+        let columnsFrame = columns.convert(columns.bounds, to: content)
         let sidebarFrame = sidebar.convert(sidebar.bounds, to: content)
 
         XCTAssertFalse(sidebar.isHidden,
                        "showing the sidebar again must unhide the glass sidebar view")
-        XCTAssertEqual(splitFrame.minY, content.bounds.minY, accuracy: 0.5,
-                       "the split view must remain pinned to the window bottom after hide/show")
+        XCTAssertGreaterThanOrEqual(
+            sidebarFrame.width,
+            ShellSidebarToggleMotion.minimumSidebarWidth,
+            "restoring the sidebar must return a usable width, not a 0pt column that ate the toggle"
+        )
+        XCTAssertEqual(columnsFrame.minY, content.bounds.minY, accuracy: 0.5,
+                       "the columns host must remain pinned to the window bottom after hide/show")
         XCTAssertEqual(sidebarFrame.minY, content.bounds.minY, accuracy: 0.5,
                        "the restored sidebar glass must reach the bottom instead of leaving a black strip")
-        XCTAssertEqual(sidebarFrame.height, splitFrame.height, accuracy: 0.5,
-                       "the restored sidebar material must cover the split height")
+        XCTAssertEqual(sidebarFrame.height, columnsFrame.height, accuracy: 0.5,
+                       "the restored sidebar material must cover the columns height")
+    }
+
+    func test_sidebarToggleRemainsReachableAcrossRepeatedHideShowCycles_becauseTransparentHeaderCannotInterceptClicks() throws {
+        // WHY: the collapsed header spans the full title row. Fading it to
+        // alpha zero without hiding it leaves an invisible hit-test layer over
+        // the restored sidebar controls, so the next toggle click does nothing.
+        let (ctx, router) = try makeContext()
+        _ = try router.createWorkspace(name: "repeat-toggle", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        controller.window.setFrame(NSRect(x: 0, y: 0, width: 1200, height: 720), display: false)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        let content = try XCTUnwrap(controller.window.contentView)
+
+        for cycle in 1...2 {
+            NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+            content.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
+
+            let restore = try XCTUnwrap(
+                allSubviews(of: content).compactMap { $0 as? NSButton }
+                    .first { $0.accessibilityIdentifier() == "shell.collapsed.toggleSidebar" }
+            )
+            let collapsedHeader = try XCTUnwrap(restore.superview)
+            XCTAssertFalse(collapsedHeader.isHidden)
+
+            restore.performClick(nil)
+            content.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
+
+            XCTAssertTrue(collapsedHeader.isHidden,
+                          "restored cycle \(cycle) must remove the transparent collapsed header from hit testing")
+            XCTAssertNil(collapsedHeader.hitTest(
+                NSPoint(x: collapsedHeader.bounds.midX, y: collapsedHeader.bounds.midY)
+            ))
+        }
+    }
+
+    func test_sidebarSeamStaysSeamlessAndExactAcrossToggleCycle_becauseDriftDrewAStrayLine() throws {
+        // WHY: the old NSSplitView toggle drew a 1px near-black divider
+        // strip (the reported "strange line") and landed off target after
+        // hide/show (439.5 for 444) — a half-pixel seam that antialiased
+        // into a blurry line and drifted the user's width every toggle.
+        // The slide rewrite must keep the glass touching the content and
+        // land back exactly where it started, on a whole pixel.
+        let (ctx, router) = try makeContext()
+        _ = try router.createWorkspace(name: "seam", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        controller.window.setFrame(NSRect(x: 0, y: 0, width: 1200, height: 720), display: false)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        drainMainQueue(seconds: 0.3)
+
+        let content = try XCTUnwrap(controller.window.contentView)
+        let sidebar = try XCTUnwrap(
+            allSubviews(of: content).first { $0.accessibilityIdentifier() == "shell.sidebar" }
+        )
+        let workspace = try XCTUnwrap(sidebar.superview?.subviews.first { view in
+            view !== sidebar && view.frame.width > 100
+        })
+
+        XCTAssertEqual(workspace.frame.minX - sidebar.frame.maxX, 0, accuracy: 0.01,
+                       "the glass sidebar must touch the content — a divider strip reads as a stray border")
+        let freshWidth = sidebar.frame.width
+        XCTAssertEqual(freshWidth, freshWidth.rounded(), accuracy: 0.01,
+                       "the sidebar edge must sit on a whole pixel or the seam antialiases")
+
+        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.15))
+        XCTAssertLessThanOrEqual(sidebar.frame.maxX, 0.01,
+                                 "hidden = the panel parked fully outside the leading edge")
+        XCTAssertEqual(workspace.frame.minX, 0, accuracy: 0.01,
+                       "with the panel parked outside, the content column owns the full width")
+
+        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.4))
+
+        XCTAssertEqual(workspace.frame.minX - sidebar.frame.maxX, 0, accuracy: 0.01,
+                       "hide/show must not open a divider strip in the seam")
+        XCTAssertEqual(sidebar.frame.width, freshWidth, accuracy: 0.01,
+                       "hide/show must restore the exact pre-hide width, not a drifted half-pixel one")
+        XCTAssertEqual(sidebar.frame.minX, 0, accuracy: 0.01,
+                       "the restored panel must land exactly on the leading edge")
+    }
+
+    func test_collapsedSidebarToggleRestoresUsableWidth_becauseZeroWidthLeavesNoEscape() throws {
+        // WHY: the SwiftUI header (toggle / bug / settings / account) lives
+        // in the sidebar. Collapse hides that cluster. The 34pt bar is the
+        // only restore control. Clicking it used to flip sidebarCollapsed,
+        // hide the bar, and leave the split at 0pt — no sidebar, no toggle.
+        let (ctx, router) = try makeContext()
+        _ = try router.createWorkspace(name: "restore", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        controller.window.setFrame(NSRect(x: 0, y: 0, width: 1200, height: 720), display: false)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+
+        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
+
+        let content = try XCTUnwrap(controller.window.contentView)
+        let toggle = try XCTUnwrap(
+            allSubviews(of: content).compactMap { $0 as? NSButton }
+                .first { $0.accessibilityIdentifier() == "shell.collapsed.toggleSidebar" },
+            "collapsed chrome must keep a restore control after the sidebar header is gone"
+        )
+        XCTAssertFalse(toggle.isHidden)
+        toggle.performClick(nil)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.15))
+
+        let sidebar = try XCTUnwrap(
+            allSubviews(of: content).first { $0.accessibilityIdentifier() == "shell.sidebar" }
+        )
+        XCTAssertGreaterThanOrEqual(
+            sidebar.frame.width,
+            ShellSidebarToggleMotion.minimumSidebarWidth,
+            "the collapsed toggle must open a usable sidebar, not a 0pt column"
+        )
+        XCTAssertGreaterThanOrEqual(sidebar.frame.minX, -0.01,
+                                    "the restored panel must slide back inside the window")
+        XCTAssertFalse(sidebar.isHidden)
+        XCTAssertGreaterThan(sidebar.alphaValue, 0.5)
+    }
+
+    func test_botsCollapsedSidebarToggleRestoresUsableWidth_becauseDeskAteTheEscape() throws {
+        // WHY: Bots hides the shell workspace header. Collapse then only
+        // has the 34pt bar. The same 0pt expand bug left Desk full-bleed
+        // with no way back to Agentic / Bots / Settings.
+        let (ctx, router) = try makeContext()
+        _ = try router.createWorkspace(name: "bots-restore", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        controller.window.setFrame(NSRect(x: 0, y: 0, width: 1200, height: 720), display: false)
+        controller.presentBotsInMainContent()
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+
+        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.1))
+
+        let content = try XCTUnwrap(controller.window.contentView)
+        let toggle = try XCTUnwrap(
+            allSubviews(of: content).compactMap { $0 as? NSButton }
+                .first { $0.accessibilityIdentifier() == "shell.collapsed.toggleSidebar" },
+            "Bots still needs the 34pt restore bar when the sidebar header is gone"
+        )
+        toggle.performClick(nil)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(ShellSidebarToggleMotion.duration + 0.15))
+
+        let sidebar = try XCTUnwrap(
+            allSubviews(of: content).first { $0.accessibilityIdentifier() == "shell.sidebar" }
+        )
+        XCTAssertGreaterThanOrEqual(
+            sidebar.frame.width,
+            ShellSidebarToggleMotion.minimumSidebarWidth,
+            "restoring from Bots must bring the sidebar back, not leave Desk full-bleed"
+        )
+        XCTAssertGreaterThanOrEqual(sidebar.frame.minX, -0.01,
+                                    "restoring from Bots must slide the panel back inside the window")
     }
 
     func test_openWorkspaceInNewWindow_usesSidebarlessHeaderWithBackButton() throws {

@@ -87,6 +87,73 @@ public enum AgentChatTranscriptChrome {
     }()
 }
 
+/// Full-width transcript status card. Run headers and work-log rows occupy
+/// one complete line — they are not chat bubbles and must not hug content
+/// or sit beside a timestamp gutter.
+public struct AgentChatStatusCard: View {
+    public let title: String
+    public let detail: String
+    public let statusLabel: String
+    public let statusTone: DSPill.Tone
+    public let createdAt: Date
+    public var iconName: String
+    public var accessibilityIdentifier: String
+    public var accessibilityLabel: String
+
+    public init(
+        title: String,
+        detail: String,
+        statusLabel: String,
+        statusTone: DSPill.Tone,
+        createdAt: Date,
+        iconName: String = "list.bullet.rectangle",
+        accessibilityIdentifier: String,
+        accessibilityLabel: String
+    ) {
+        self.title = title
+        self.detail = detail
+        self.statusLabel = statusLabel
+        self.statusTone = statusTone
+        self.createdAt = createdAt
+        self.iconName = iconName
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.accessibilityLabel = accessibilityLabel
+    }
+
+    public var body: some View {
+        HStack(alignment: .center, spacing: DS.Space.md) {
+            Image(systemName: iconName)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Text(createdAt, style: .time)
+                .font(DS.Font.caption2.monospacedDigit())
+                .foregroundColor(DS.Palette.textTertiary)
+                .fixedSize(horizontal: true, vertical: true)
+                .help(AgentChatTranscriptChrome.absoluteTimestamp(createdAt))
+            DSPill(statusLabel, tone: statusTone)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .dsPanel(padding: DS.Space.lg)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(accessibilityIdentifier)
+        .accessibilityLabel(accessibilityLabel)
+    }
+}
+
 public struct AgentChatUserBubble: View {
     public let text: String
     public let createdAt: Date

@@ -110,6 +110,26 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View {
     }
 }
 
+/// Provider monogram chip at the leading edge of a thread row. Agent
+/// App and Desk mount the same chip — the rails must not fork it.
+public struct AgentThreadProviderMonogram: View {
+    public let provider: AgentProvider
+
+    public init(provider: AgentProvider) {
+        self.provider = provider
+    }
+
+    public var body: some View {
+        Text(AgentThreadRailRowCopy.monogram(for: provider))
+            .font(.system(size: 9, weight: .bold, design: .rounded))
+            .foregroundColor(DS.Palette.textSecondary)
+            .frame(width: 16, height: 16)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .accessibilityHidden(true)
+    }
+}
+
 public extension AgentChatThreadRow where Leading == EmptyView, Trailing == EmptyView {
     init(
         title: String,
@@ -277,6 +297,65 @@ public struct AgentChatWorkingPill: View {
     }
 }
 
+public struct AgentChatPeerActivityRow: View {
+    public let snapshot: BotPeerActivitySnapshot
+    public let startedAt: Date
+
+    public init(snapshot: BotPeerActivitySnapshot, startedAt: Date) {
+        self.snapshot = snapshot
+        self.startedAt = startedAt
+    }
+
+    public var body: some View {
+        TimelineView(AgentChatElapsedTickSchedule(start: startedAt)) { context in
+            let seconds = max(0, Int(context.date.timeIntervalSince(startedAt)))
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                stateIcon
+                    .frame(width: 14, height: 14)
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    Text(AgentPeerActivityPresentation.title(for: snapshot))
+                        .font(DS.Font.body.weight(.medium))
+                        .foregroundColor(titleColor)
+                    Text(AgentPeerActivityPresentation.detail(
+                        for: snapshot,
+                        elapsedSeconds: seconds
+                    ))
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(AgentPeerActivityPresentation.accessibilityLabel(
+                for: snapshot,
+                elapsedSeconds: seconds
+            ))
+            .accessibilityIdentifier("agent.peerActivity")
+        }
+    }
+
+    @ViewBuilder
+    private var stateIcon: some View {
+        switch snapshot.phase {
+        case .waiting:
+            ProgressView()
+                .controlSize(.small)
+                .tint(DS.Palette.accent)
+                .accessibilityHidden(true)
+        case .needsAttention:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Palette.danger)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private var titleColor: Color {
+        snapshot.phase == .needsAttention ? DS.Palette.danger : DS.Palette.text
+    }
+}
+
 /// Shared thread rail chrome. Agent App and dest mount this so hide,
 /// Clear All, +, and search stay one control.
 public struct AgentChatThreadRail<Content: View>: View {
@@ -338,6 +417,7 @@ public struct AgentChatThreadRail<Content: View>: View {
             DSSectionHeaderG(title) {
                 HStack(spacing: Self.headerControlSpacing) {
                     hideButton
+                        .padding(.horizontal, -DSIconButton.visualPackInset)
                     if AgentChatThreadRailCopy.showsClearAll(isEmpty: isEmpty) {
                         Button(AgentChatThreadRailCopy.clearAllTitle, action: onClearAll)
                             .buttonStyle(.plain)
@@ -349,6 +429,7 @@ public struct AgentChatThreadRail<Content: View>: View {
                             .help(AgentChatThreadRailCopy.clearAllHelp)
                     }
                     DSIconButton("plus", help: newHelp, action: onNew)
+                        .padding(.horizontal, -DSIconButton.visualPackInset)
                         .accessibilityIdentifier(newIdentifier)
                 }
                 .fixedSize(horizontal: true, vertical: false)
@@ -381,11 +462,9 @@ public struct AgentChatThreadRail<Content: View>: View {
         }
     }
 
-    /// DSIconButton lays out at 44pt; pack the glyphs like dest dest dest / workspace
-    /// header icons so "Clear All" stays one line.
-    private static var headerControlSpacing: CGFloat {
-        DS.Space.xs - (DSIconButton.hitTargetSize - DSIconButton.visualSize.width)
-    }
+    /// Gap between hide, Clear All, and +. Icons keep a 44pt hit box via
+    /// `visualPackInset`; this spacing is the visible air between glyphs.
+    private static var headerControlSpacing: CGFloat { DS.Space.md }
 
     private var hideButton: some View {
         DSIconButton("sidebar.left", help: AgentChatThreadRailCopy.hideHelp, action: onHide)

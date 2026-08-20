@@ -353,13 +353,26 @@ public final class AppContext {
     public var state = LayoutState()
 
     public let coordinator: AgentRunCoordinator
+    lazy var botPeerHandoffAuthority = BotPeerHandoffAuthority(
+        botStore: botStore,
+        threadRepo: threadRepo,
+        runRepo: runRepo,
+        messageRepo: messageRepo,
+        queuedMessageRepo: queuedMessageRepo,
+        checkpointRepo: turnCheckpointRepo,
+        settingsRepo: settingsRepo,
+        coordinator: coordinator,
+        appSupportDirectory: appSupportDirectory
+    )
     private var tokenSaverCodexAdapter: CodexAppServerAdapter
     public var router: AppCommandRouter! {
         didSet {
+            botPeerHandoffAuthority.router = router
             drainRecoveredForkPrunedThreadIDsIfPossible()
             refreshActiveAgentWorkspaceProjection()
             startBotBrowserPendingOpenObserver()
             try? router?.reconcileBotBrowserOpens()
+            router?.reconcileBotComputerActions()
         }
     }
     private var botBrowserOpenObserver: NSObjectProtocol?
@@ -1385,6 +1398,7 @@ public final class AppContext {
                 // makes the adapter idle. Wait through that bounded cancellation
                 // window; otherwise Force gets one premature drain and the promoted
                 // message remains stranded with no later lifecycle callback.
+                self.cancelQueueDrainWaiter(threadId: tid)
                 self.ensureQueueDrainWaiterIfNeeded(threadId: tid)
                 // Main agent only: nested/subagent workers must not fire
                 // system or private push banners (parent owns user-facing UX).
@@ -1985,6 +1999,13 @@ public final class AppContext {
                 )
             }
             do {
+                try installer.installBotComputerMCP()
+            } catch {
+                NSLog(
+                    "RemoteCode: installBotComputerMCP before agent turn failed: \(error.localizedDescription)"
+                )
+            }
+            do {
                 try installer.installBotWebMCP()
             } catch {
                 NSLog(
@@ -2109,6 +2130,13 @@ public final class AppContext {
         } catch {
             NSLog(
                 "RemoteCode: installBotBrowserMCP before subagent env failed: \(error.localizedDescription)"
+            )
+        }
+        do {
+            try installer.installBotComputerMCP()
+        } catch {
+            NSLog(
+                "RemoteCode: installBotComputerMCP before subagent env failed: \(error.localizedDescription)"
             )
         }
         do {
@@ -2607,6 +2635,13 @@ public final class AppContext {
         ) { [weak self] _ in
             Task { await self?.router?.reconcileBotBrowserActions() }
         }
+        DistributedNotificationCenter.default().addObserver(
+            forName: BotComputerHost.pendingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.router?.reconcileBotComputerActions()
+        }
     }
 
     func reconcileComputerUseMCP() {
@@ -2625,6 +2660,11 @@ public final class AppContext {
             try installer.installBotBrowserMCP()
         } catch {
             NSLog("RemoteCode: installBotBrowserMCP failed: \(error.localizedDescription)")
+        }
+        do {
+            try installer.installBotComputerMCP()
+        } catch {
+            NSLog("RemoteCode: installBotComputerMCP failed: \(error.localizedDescription)")
         }
         do {
             try installer.installBotWebMCP()

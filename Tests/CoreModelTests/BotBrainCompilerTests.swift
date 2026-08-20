@@ -107,6 +107,45 @@ final class BotBrainCompilerTests: XCTestCase {
         )
     }
 
+    func test_desktopKindsAdmitDifferentTools_becauseTheOwnerPicksTheBrowser() {
+        // WHY: this Mac default browser must keep macos-harness. Bot browser
+        // must not send HID to the owner's Chrome. Docker must not fall back
+        // to this Mac.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        func revision(_ kind: BotDesktopKind) -> BotRevision {
+            BotRevision(
+                botID: bot.id,
+                revisionNumber: 1,
+                name: "Piper",
+                title: "Scout",
+                description: "",
+                soul: "",
+                provider: .claude,
+                providerInstanceID: "claude",
+                model: "opus",
+                reasoningEffort: .medium,
+                compatibleRouteSet: ["default"],
+                permissionMode: .supervised,
+                desktopKind: kind,
+                digest: "x"
+            )
+        }
+        let host = BotBrainCompiler.assemble(bot: bot, revision: revision(.logicalExecutionSpace), userText: "Hi")
+        XCTAssertTrue(host.compiledPayload.contains(BotStandingInstructions.macosHarnessTool))
+        XCTAssertTrue(host.compiledPayload.contains(BotStandingInstructions.openBrowserTool))
+
+        let owned = BotBrainCompiler.assemble(bot: bot, revision: revision(.botOwnedBrowser), userText: "Hi")
+        XCTAssertFalse(owned.compiledPayload.contains(BotStandingInstructions.macosHarnessTool))
+        XCTAssertTrue(owned.compiledPayload.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertTrue(owned.compiledPayload.contains(BotDesktopKind.botOwnedBrowser.displayTitle))
+
+        let docker = BotBrainCompiler.assemble(bot: bot, revision: revision(.dockerDesktop), userText: "Hi")
+        XCTAssertFalse(docker.compiledPayload.contains(BotStandingInstructions.generatedMacOSHarnessLine))
+        XCTAssertFalse(docker.compiledPayload.contains(BotStandingInstructions.generatedBrowserLine))
+        XCTAssertTrue(docker.compiledPayload.contains(BotStandingInstructions.computerObserveTool))
+        XCTAssertTrue(docker.compiledPayload.contains(BotDesktopKind.dockerDesktop.displayTitle))
+    }
+
     func test_workingSpaceCompilesForCustomSoul_becauseIsolationHonestyIsNotAnEscapeHatch() {
         // WHY: Studio already shows desktop honesty to the owner. The model
         // never saw it, so "are you isolated?" invented a VM. A written soul
@@ -494,6 +533,43 @@ final class BotBrainCompilerTests: XCTestCase {
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")
                 .contains(BotBrainCompiler.approvalsHonesty),
             "approvals honesty is a compiler layer, not starter soul"
+        )
+    }
+
+    func test_liveFullAccessChipCompilesFullAccessHonesty_becauseComposerIsTheRunMode() {
+        // WHY: Desk send already forwarded fullAccess to the provider while
+        // Approval mode still said Supervised. Host-brokered writes stay off
+        // made the model refuse a Full access turn.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Just write the file",
+            liveRunMode: .fullAccess
+        )
+        XCTAssertEqual(receipt.permissionMode, .fullAccess)
+        XCTAssertTrue(receipt.compiledPayload.contains("Full access. Run tools without asking."))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotPermission.honestyLabel))
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .permission })?.reason,
+            "Live composer chip. Host-assigned. Not a self-config write."
         )
     }
 

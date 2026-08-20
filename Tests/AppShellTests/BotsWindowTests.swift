@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import CoreModel
 import AgentRuntime
 @testable import AppShell
@@ -26,12 +27,17 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.searchText")
         UserDefaults.standard.removeObject(forKey: "bots.deskRouting")
         UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+        UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
+        UserDefaults.standard.removeObject(forKey: "bots.studioFilesLocations")
         UserDefaults.standard.removeObject(forKey: "bots.unpublishedNewBotIDs")
         UserDefaults.standard.removeObject(forKey: "bots.deskThreadRail")
         UserDefaults.standard.removeObject(forKey: "bots.deskThreadRailWidth")
     }
 
     override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: "bots.studioFilesLocations")
+        UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+        UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
         if let directory {
             try? FileManager.default.removeItem(atPath: directory)
         }
@@ -676,12 +682,72 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(header.contains("AgentChatThreadRailCopy.newHelp"))
     }
 
+    func test_deskAlwaysDropsTitlebarInsetsInMainShell_becauseTheHeaderMustHugTheTrafficLightRow() throws {
+        // WHY: the sidebar (open) or the 34pt restore bar (collapsed) owns
+        // the traffic lights. Keeping the .top inset while the sidebar was
+        // open parked the Ceo header a full titlebar below the traffic
+        // lights — the vertical padding in the bug report. The edge set is
+        // also state-independent so Desk stays still during the toggle.
+        XCTAssertEqual(
+            BotsViewModel.ignoredSafeAreaEdges(
+                embedsRosterRail: false,
+                presentsAsDetachedWindow: false
+            ),
+            [.top, .leading, .trailing],
+            "main-shell Desk owns its whole pane: no titlebar strip, no traffic-light gutter"
+        )
+        XCTAssertEqual(
+            BotsViewModel.deskIdentityLeadingPadding(shellSidebarCollapsed: false),
+            BotsViewModel.deskIdentityLeadingPadding(shellSidebarCollapsed: true),
+            "Ceo leading padding must match open and collapsed — the gutter is not padding"
+        )
+        XCTAssertTrue(
+            BotsViewModel.cancelsWindowLeadingTitlebarGutter(presentsAsDetachedWindow: false),
+            "main-shell Desk must drop the window traffic-light inset"
+        )
+        XCTAssertFalse(
+            BotsViewModel.cancelsWindowLeadingTitlebarGutter(presentsAsDetachedWindow: true)
+        )
+        XCTAssertEqual(
+            BotsViewModel.addedLeadingInsetBeyondIdentityPadding(
+                windowTitlebarLeading: 78,
+                presentsAsDetachedWindow: false
+            ),
+            0,
+            "open sidebar must not still reserve the titlebar gutter on Desk"
+        )
+        XCTAssertEqual(
+            BotsViewModel.addedLeadingInsetBeyondIdentityPadding(
+                windowTitlebarLeading: 78,
+                presentsAsDetachedWindow: true
+            ),
+            78
+        )
+        let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
+        XCTAssertTrue(
+            main.contains("ContentColumnHostingView"),
+            "NSHostingView must override safeAreaInsets — ignoresSafeArea alone leaves the gutter"
+        )
+        XCTAssertTrue(main.contains("cancelHorizontalTitlebarGutter"))
+        XCTAssertTrue(
+            BotsViewModel.ignoredSafeAreaEdges(
+                embedsRosterRail: false,
+                presentsAsDetachedWindow: true
+            ).isEmpty,
+            "a detached Desk window has its own titlebar and must keep its insets"
+        )
+        let context = try makeContext()
+        try context.settingsRepo.set(MainWindowController.sidebarCollapsedSettingsKey, "1")
+        let vm = BotsViewModel(context: context)
+        XCTAssertTrue(vm.isShellSidebarCollapsed)
+    }
+
     func test_deskHeaderIsToolbarSized_becauseTheShellTitlebarAlreadyWentAway() throws {
         // WHY: Removing the shell "Bots" bar left Desk in the titlebar
         // inset with title2 + xl padding. That read as a second titlebar.
         // Identity must sit in a 44pt chrome strip like a workspace row.
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("ignoresSafeArea(.container, edges: .top)"))
+        XCTAssertTrue(source.contains("ignoresSafeArea(.container, edges:"))
         guard let start = source.range(of: "private func deskHeader") else {
             return XCTFail("desk header must exist")
         }
@@ -691,8 +757,47 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(slice.contains("DS.Font.bodyStrong"))
         XCTAssertTrue(slice.contains("size: 22"))
         XCTAssertTrue(slice.contains(".frame(height: 44)"))
+        XCTAssertTrue(
+            slice.contains("deskIdentityLeadingPadding"),
+            "Desk identity must use the shared leading padding, not a sidebar-open gutter"
+        )
         XCTAssertFalse(slice.contains("DS.Font.title2"))
         XCTAssertFalse(slice.contains("padding(.vertical, DS.Space.xl)"))
+    }
+
+    func test_deskThreadRowsMatchAgentAppRail_becauseTheDeskMustNotForkTheChrome() throws {
+        // WHY: the Desk rail read as a different app — no provider
+        // monogram, a time-only subtitle, no resting status dot. Desk and
+        // Agent App mount the same AgentChatThreadRow, so the row inputs
+        // must stay the Agent App ones (bug report: "deveria ser
+        // exatamente igual ao do agent app").
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private func deskThreadRow") else {
+            return XCTFail("desk thread row must exist")
+        }
+        let rest = source[start.upperBound...]
+        let end = rest.range(of: "\n    private var deskQueuedFollowUps")?.lowerBound ?? rest.endIndex
+        let slice = String(source[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("AgentThreadProviderMonogram(provider:"),
+                      "desk rows need the same provider monogram chip as the Agent App rail")
+        XCTAssertTrue(slice.contains("AgentThreadRailRowCopy.subtitle"),
+                      "desk rows need the provider · model · time subtitle, not time alone")
+        XCTAssertTrue(slice.contains("pin.fill"))
+        XCTAssertTrue(slice.contains("circle.fill"),
+                      "resting rows show the same neutral dot as the Agent App rail")
+        XCTAssertTrue(slice.contains("AgentThreadTitle.display"))
+        XCTAssertFalse(slice.contains("AgentChatTranscriptChrome.relativeTimestamp"),
+                       "the time-only subtitle was the fork")
+        let agent = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
+        XCTAssertTrue(agent.contains("AgentThreadProviderMonogram(provider: t.provider)"),
+                      "Agent App must mount the shared monogram, not an inline copy")
+
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let conversation = BotConversation(botID: BotID(), title: "never ran")
+        let routing = vm.deskThreadRailRouting(for: conversation)
+        XCTAssertEqual(routing.provider, vm.deskRunProvider,
+                       "a never-run conversation must show the routing the desk would use today")
     }
 
     func test_deskHeaderOpenInNewWindowSitsAfterStudioCog() throws {
@@ -750,6 +855,32 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(vm.presentsAsDetachedWindow)
     }
 
+    func test_openBotGuestDesktopInNewWindowReusesWindow() throws {
+        // WHY: Open in New Window on the Linux desktop must pop only that
+        // screen, and a second click must focus the same window.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        let controller = MainWindowController(context: context, router: router)
+        router.windowController = controller
+        defer {
+            controller.botGuestDesktopWindow(for: bot.id)?.orderOut(nil)
+            controller.window.orderOut(nil)
+        }
+        controller.openBotGuestDesktopInNewWindow(bot.id)
+        let first = try XCTUnwrap(controller.botGuestDesktopWindow(for: bot.id))
+        XCTAssertEqual(first.accessibilityIdentifier(), "bots.desk.desktop.window")
+        controller.openBotGuestDesktopInNewWindow(bot.id)
+        XCTAssertTrue(controller.botGuestDesktopWindow(for: bot.id) === first)
+        XCTAssertEqual(vm.selectedBotID, bot.id)
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("class BotGuestDesktopWindowController"))
+        XCTAssertTrue(source.contains("BotGuestDesktopRoot"))
+    }
+
     func test_botsHidesShellWorkspaceHeader_becauseDeskAlreadyHasTheBotHeader() throws {
         // WHY: The shell "Bots" bar sat above Desk's identity header.
         // Desk is the title. Hide that chrome row when the sidebar is open;
@@ -757,7 +888,7 @@ final class BotsWindowTests: XCTestCase {
         let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
         XCTAssertTrue(main.contains("applyWorkspaceHeaderVisibility"))
         XCTAssertTrue(
-            main.contains("sidebarCollapsed || shellContentMode == .bots"),
+            main.contains("showCollapsed || shellContentMode == .bots"),
             "Bots must drop the visible workspace header, not only when the sidebar is collapsed"
         )
         XCTAssertTrue(
@@ -3233,9 +3364,17 @@ final class BotsWindowTests: XCTestCase {
             bots.contains("ForEach(BotStudioTab.allCases.filter(\\.isUserFacing))"),
             "Brain stays on the enum for leftover persist; the Studio strip must not render it"
         )
+        // Routines is the only user-facing inspector tab, so the Desk shows a
+        // static section header instead of a one-chip tab strip. Brain stays
+        // unreachable: there is no strip to render it, and the header title
+        // resolves through the leftover-persist remap.
+        XCTAssertFalse(
+            bots.contains("ForEach(BotDeskInspectorTab.allCases"),
+            "A single user-facing tab must render as a header, not a dead one-chip strip"
+        )
         XCTAssertTrue(
-            bots.contains("ForEach(BotDeskInspectorTab.allCases.filter(\\.isUserFacing))"),
-            "Brain stays on the enum for leftover persist; the Desk inspector strip must not render it"
+            bots.contains("Text(resolvedInspectorTab.title)"),
+            "The Desk inspector header must resolve through the leftover-persist remap"
         )
     }
 
@@ -3307,6 +3446,164 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_studioDockerFilesSurfaceUsesPersistentGuestHome() throws {
+        // WHY: Docker's real home is the existing /home/remotecode bind.
+        // Studio must edit that exact host directory, including ordinary
+        // files whose names are generated projections only in Bot files.
+        let (_, vm, bot, _) = try makeDockerStudio()
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        defer { model.close() }
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        let expected = BotComputerGuestSpec.guestHomeURL(
+            appSupport: URL(fileURLWithPath: directory, isDirectory: true),
+            botID: bot.id
+        )
+        XCTAssertEqual(vm.studioFilesLocation, .dockerHome)
+        XCTAssertEqual(model.root, expected.path)
+
+        _ = try router.fsWorkspaceCreateFile(
+            workspace: router.workspaceID,
+            path: BotHome.identityName,
+            content: "ordinary docker file"
+        )
+        model.loadDirectory("")
+        let identity = try XCTUnwrap(model.entries.first { $0.name == BotHome.identityName })
+        XCTAssertTrue(identity.isEditable)
+        let opened = try router.filesEditOpen(
+            surface: SurfaceID(bot.id.value),
+            path: BotHome.identityName
+        )
+        let sessionID = try XCTUnwrap(opened.objectValue?["session_id"]?.stringValue)
+        let original = opened.objectValue?["content"]?.stringValue ?? ""
+        _ = try router.filesEditApplyPatch(
+            sessionID: sessionID,
+            baseDraftRevision: opened.objectValue?["draft_revision"]?.intValue ?? 1,
+            rangeLocation: 0,
+            rangeLength: (original as NSString).length,
+            replacement: "edited through Files",
+            deviceID: "test"
+        )
+        _ = try router.filesEditSave(sessionID: sessionID)
+        XCTAssertEqual(
+            try String(contentsOf: expected.appendingPathComponent(BotHome.identityName), encoding: .utf8),
+            "edited through Files"
+        )
+        _ = try? router.filesEditClose(sessionID: sessionID)
+    }
+
+    func test_studioDockerFilesSeedsRootDockerfileAndOpensItAsText() throws {
+        // WHY: Dockerfile is per bot and extensionless. Studio must place it at the
+        // exact persisted guest-home root, then promote it from unknown to editable text.
+        let (context, vm, bot, docker) = try makeDockerStudio()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL(),
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        defer { model.close() }
+        model.loadDirectory("")
+
+        let dockerfile = try XCTUnwrap(model.entries.first { $0.name == "Dockerfile" })
+        XCTAssertEqual(dockerfile.relativePath, "Dockerfile")
+        XCTAssertEqual(
+            dockerfile.path,
+            BotComputerGuestSpec.guestHomeURL(
+                appSupport: context.appSupportDirectory,
+                botID: bot.id
+            ).appendingPathComponent("Dockerfile").path
+        )
+        XCTAssertFalse(dockerfile.isEditable, "directory listing should not read every file")
+
+        model.select(dockerfile)
+
+        XCTAssertEqual(model.selectedEntry?.kind, "text")
+        XCTAssertTrue(model.selectedEntry?.isEditable == true)
+        XCTAssertTrue(model.draftText.contains("FROM debian"))
+    }
+
+    func test_studioDockerFilesCanSwitchBackToBotHome() throws {
+        // WHY: Docker home is the default, but the owner must be able to
+        // return to the versioned bot configuration and keep that choice.
+        let (context, vm, bot, _) = try makeDockerStudio()
+        vm.attachHomeFilesSurface(for: bot)
+        XCTAssertEqual(vm.studioFilesLocation, .dockerHome)
+
+        vm.setStudioFilesLocation(.botFiles, for: bot)
+        XCTAssertEqual(vm.studioFilesLocation, .botFiles)
+        XCTAssertEqual(vm.homeFilesModel?.root, vm.botHome(for: bot).root.path)
+
+        let reopened = BotsViewModel(context: context)
+        reopened.dockerGuestReadyOverrideForTesting = true
+        reopened.openStudio(bot)
+        reopened.attachHomeFilesSurface(for: bot)
+        XCTAssertEqual(reopened.studioFilesLocation, .botFiles)
+        XCTAssertEqual(reopened.homeFilesModel?.root, reopened.botHome(for: bot).root.path)
+        reopened.homeFilesModel?.close()
+    }
+
+    func test_dockerFilesPersistAcrossReopenUntilExplicitClear() throws {
+        // WHY: Stop and ordinary reopen preserve the bind. Only the confirmed
+        // destructive action may tear it down and replace it with an empty home.
+        let (context, vm, bot, docker) = try makeDockerStudio()
+        vm.attachHomeFilesSurface(for: bot)
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        _ = try router.fsWorkspaceCreateFile(
+            workspace: router.workspaceID,
+            path: "sentinel.txt",
+            content: "keep me"
+        )
+        let guestHome = BotComputerGuestSpec.guestHomeURL(
+            appSupport: context.appSupportDirectory,
+            botID: bot.id
+        )
+        let sentinel = guestHome.appendingPathComponent("sentinel.txt")
+        vm.rememberGuestScreen(
+            url: try XCTUnwrap(URL(string: "http://127.0.0.1:49152/vnc.html")),
+            botID: bot.id,
+            running: true
+        )
+        vm.stopDockerGuest(botID: bot.id)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+
+        let reopened = BotsViewModel(context: context)
+        reopened.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        reopened.dockerGuestReadyOverrideForTesting = true
+        reopened.openStudio(bot)
+        reopened.attachHomeFilesSurface(for: bot)
+        XCTAssertEqual(reopened.homeFilesModel?.root, guestHome.path)
+        XCTAssertEqual(try String(contentsOf: sentinel, encoding: .utf8), "keep me")
+        let beforeClear = reopened.homeFilesModel
+        reopened.rememberGuestScreen(
+            url: try XCTUnwrap(URL(string: "http://127.0.0.1:49152/vnc.html")),
+            botID: bot.id,
+            running: true
+        )
+
+        reopened.confirmClearDockerData(for: bot)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sentinel.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: guestHome.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: guestHome.path), [])
+        XCTAssertEqual(reopened.homeFilesModel?.root, guestHome.path)
+        XCTAssertFalse(reopened.homeFilesModel === beforeClear)
+        XCTAssertFalse(reopened.isGuestRunning(bot.id))
+        XCTAssertNil(reopened.guestScreenURL(for: bot.id))
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("pendingDockerDataClear"))
+        XCTAssertTrue(source.contains("bots.studio.files.docker.clear"))
+        reopened.homeFilesModel?.close()
+    }
+
     func test_studioFilesSurfaceLocksIdentityOnly() throws {
         // WHY: IDENTITY.md is still generated. MEMORY.md is the bot's
         // own file — locking it would send Forget/Correct back to a store.
@@ -3325,6 +3622,55 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(memory.isEditable)
         XCTAssertTrue(soul.isEditable)
         XCTAssertEqual(BotHome.memoryName, "MEMORY.md")
+    }
+
+    func test_studioFilesIdentityOpensReadOnly_becauseGeneratedProjectionMustNotDumpRPCError() throws {
+        // WHY: listing locks IDENTITY.md. Opening it used to re-read identity
+        // as editable, call filesEditOpen, and replace the editor with
+        // JSONRPCError "Generated projection".
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openStudio(bot)
+        vm.attachHomeFilesSurface(for: bot)
+        let model = try XCTUnwrap(vm.homeFilesModel)
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        defer { model.close() }
+        model.loadDirectory("")
+        let identity = try XCTUnwrap(model.entries.first { $0.name == BotHome.identityName })
+        XCTAssertFalse(identity.isEditable)
+
+        let read = try router.fsWorkspaceRead(
+            workspace: router.workspaceID,
+            path: BotHome.identityName,
+            maxBytes: nil
+        )
+        XCTAssertEqual(
+            read.objectValue?["identity"]?.objectValue?["is_editable"]?.boolValue,
+            false,
+            "read identity must stay locked so loadFile does not call filesEditOpen"
+        )
+        XCTAssertEqual(
+            read.objectValue?["identity"]?.objectValue?["editability_reason"]?.stringValue,
+            "Generated projection"
+        )
+        XCTAssertThrowsError(
+            try router.filesEditOpen(surface: SurfaceID(bot.id.value), path: BotHome.identityName)
+        ) { error in
+            XCTAssertTrue(
+                String(describing: error).contains("Generated projection"),
+                "edit-open must still refuse IDENTITY.md"
+            )
+        }
+
+        model.select(identity)
+        XCTAssertNil(
+            model.errorText,
+            "IDENTITY.md must open as a read-only projection, not a Files error overlay"
+        )
+        XCTAssertFalse(try XCTUnwrap(model.selectedEntry).isEditable)
+        XCTAssertTrue(model.visibleText.contains("Name: Piper"))
+        XCTAssertFalse(model.isDirty)
     }
 
     func test_studioSkillsLiveInFilesNotASkillsTab() throws {
@@ -3398,15 +3744,18 @@ final class BotsWindowTests: XCTestCase {
     func test_openHomeFileRevealsOwnedSkillInStudioFiles() throws {
         // WHY: Skills Open used to write homeDraft only. Studio Files now
         // hosts FilesSurfaceRoot, so that path left the preview on
-        // "No file selected" instead of skills/<id>/SKILL.md.
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        // "No file selected" instead of skills/<id>/SKILL.md. A Docker bot
+        // must also leave its default Docker root before revealing Bot files.
+        let (_, vm, bot, _) = try makeDockerStudio()
         vm.openStudio(bot)
+        vm.attachHomeFilesSurface(for: bot)
+        XCTAssertEqual(vm.studioFilesLocation, .dockerHome)
         vm.thisBotSkillDraft = "night-scan"
         vm.createThisBotSkill()
         let path = "skills/night-scan/SKILL.md"
         XCTAssertNil(vm.errorMessage, vm.errorMessage ?? "")
+        XCTAssertEqual(vm.studioFilesLocation, .botFiles)
+        XCTAssertEqual(vm.homeFilesModel?.root, vm.botHome(for: bot).root.path)
         let model = try XCTUnwrap(vm.homeFilesModel)
         defer { model.close() }
         XCTAssertEqual(model.selectedPath, path)
@@ -4289,10 +4638,14 @@ final class BotsWindowTests: XCTestCase {
         let rest = source[start.lowerBound...]
         let end = rest.range(of: "\n    private func followLinkedRun")?.lowerBound ?? rest.endIndex
         let slice = String(source[start.lowerBound..<end])
-        XCTAssertTrue(slice.contains("provider: deskRouting.provider"))
-        XCTAssertTrue(slice.contains("permissionMode: deskRouting.permissionMode"))
+        XCTAssertTrue(slice.contains("provider: routing.provider"))
+        XCTAssertTrue(slice.contains("permissionMode: routing.permissionMode"))
+        XCTAssertTrue(
+            slice.contains("liveRunMode: routing.permissionMode"),
+            "Desk assemble must compile the composer chip, not leftover Supervised honesty"
+        )
         XCTAssertTrue(slice.contains("reasoningEffort: effort"))
-        XCTAssertTrue(slice.contains("runAsUser: deskRunAsUser"))
+        XCTAssertTrue(source.contains("runAsUser: routing.runAsUser"))
         XCTAssertTrue(slice.contains("workspace: nil"))
         XCTAssertFalse(
             slice.contains("provider: revision.provider"),
@@ -4572,6 +4925,119 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("fresh start") })
     }
 
+    func test_clearAllDeskThreadsRetiresOnlyVictimActiveHandoffWithoutResurrectionOrV1Rewrite() async throws {
+        // WHY: Clear All is a real deletion boundary, not a cosmetic rail reset.
+        // It must cancel the deleted conversation's exact continuation while a
+        // sibling Bot handoff and the downgrade-readable v1 bytes remain intact.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let piperHostRunner = ControlledBotHandoffRunner(provider: .codex)
+        let roryHostRunner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: piperHostRunner)
+        context.coordinator.replaceProvider(.grok, runner: roryHostRunner)
+        let viewModel = BotsViewModel(context: context, router: router)
+        router.botsViewModel = viewModel
+        let piper = try viewModel.create(name: "Piper", title: "Seller", provider: .codex)
+        let rory = try viewModel.create(name: "Rory", title: "Researcher", provider: .grok)
+        let quinn = try viewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        viewModel.openDesk(quinn)
+        viewModel.setDeskProvider(.claude)
+        viewModel.openDesk(piper)
+        viewModel.setDeskProvider(.codex)
+        viewModel.openDesk(rory)
+        viewModel.setDeskProvider(.grok)
+
+        viewModel.openDesk(piper)
+        viewModel.createDeskThread()
+        let victimConversation = try XCTUnwrap(viewModel.selectedConversation)
+        XCTAssertTrue(viewModel.send("@\(quinn.handle) T005_CLEAR_VICTIM"))
+        let victimStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_CLEAR_VICTIM") }
+        }
+        XCTAssertTrue(victimStarted)
+
+        viewModel.openDesk(rory)
+        viewModel.createDeskThread()
+        let siblingConversation = try XCTUnwrap(viewModel.selectedConversation)
+        XCTAssertTrue(viewModel.send("@\(quinn.handle) T005_CLEAR_SIBLING"))
+        let siblingStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_CLEAR_SIBLING") }
+        }
+        XCTAssertTrue(siblingStarted)
+        let victim = try XCTUnwrap(viewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: victimConversation.id,
+            originThreadID: nil
+        ).first)
+        let sibling = try XCTUnwrap(viewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: siblingConversation.id,
+            originThreadID: nil
+        ).first)
+        let victimRunID = try XCTUnwrap(victim.peerRunID)
+        let siblingRunID = try XCTUnwrap(sibling.peerRunID)
+        let legacyBytes = Data(#"{"t005":"leave-v1-byte-exact"}"#.utf8)
+        UserDefaults.standard.set(legacyBytes, forKey: "bots.peerTurns")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        viewModel.openDesk(piper)
+        viewModel.selectDeskThread(victimConversation.id)
+        viewModel.clearAllDeskThreads()
+        let victimCancelled = await waitUntil(timeout: 2) {
+            (try? context.runRepo.get(id: victimRunID)?.status) == .cancelled
+        }
+        XCTAssertTrue(victimCancelled, "Clear All must cancel the deleted origin's exact live run")
+        XCTAssertTrue(viewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: victimConversation.id,
+            originThreadID: nil
+        ).isEmpty)
+        XCTAssertEqual(
+            viewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: siblingConversation.id,
+                originThreadID: nil
+            ).first?.peerRunID,
+            siblingRunID,
+            "the sibling handoff must remain owned and running"
+        )
+        XCTAssertEqual(try context.runRepo.get(id: siblingRunID)?.status, .running)
+        XCTAssertFalse(
+            peerRunner.finish(runID: victimRunID, status: .completed, reply: "LATE_VICTIM_REPLY"),
+            "provider cancellation must retire the victim callback so it cannot resurrect"
+        )
+        viewModel.reconcilePeerHandoffsForTesting()
+        let reloaded = BotsViewModel(context: context, router: router)
+        XCTAssertTrue(reloaded.peerHandoffSnapshotsForTesting(
+            originConversationID: victimConversation.id,
+            originThreadID: nil
+        ).isEmpty)
+        XCTAssertEqual(
+            reloaded.peerHandoffSnapshotsForTesting(
+                originConversationID: siblingConversation.id,
+                originThreadID: nil
+            ).first?.peerRunID,
+            siblingRunID
+        )
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+
+        XCTAssertTrue(peerRunner.finish(
+            runID: siblingRunID,
+            status: .completed,
+            reply: "sibling remains exact"
+        ))
+        let siblingHostStarted = await waitUntil(timeout: 5) { !roryHostRunner.requests.isEmpty }
+        XCTAssertTrue(siblingHostStarted)
+        let siblingHostRunID = try XCTUnwrap(reloaded.peerHandoffSnapshotsForTesting(
+            originConversationID: siblingConversation.id,
+            originThreadID: nil
+        ).first?.hostRunID)
+        XCTAssertTrue(roryHostRunner.finish(
+            runID: siblingHostRunID,
+            status: .cancelled,
+            reply: nil
+        ))
+    }
+
     func test_sendContinuesSelectedConversation() throws {
         // WHY: two ordinary sends on one dest thread must stay one row.
         let context = try makeContext()
@@ -4601,8 +5067,22 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(outbound.role, .user)
         XCTAssertEqual(outbound.peer?.direction, .messaged)
         XCTAssertEqual(outbound.peer?.botID, quinn.id)
-        XCTAssertEqual(outbound.peer?.caption, "Messaged Quinn - CRM Controller - \(quinn.handle)")
+        XCTAssertEqual(outbound.peer?.caption, "To Quinn")
+        XCTAssertEqual(outbound.peer?.avatarSymbol, quinn.avatarSymbol)
         XCTAssertTrue(outbound.text.contains("@quinn"))
+    }
+
+    func test_sendMentionInheritsCallerFullAccessChip() throws {
+        // WHY: @mention used the peer's saved chip (default Supervised) even
+        // when the caller composer was Full access. The invocation chip wins.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        vm.setDeskPermissionMode(.fullAccess)
+        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp"))
+        XCTAssertEqual(vm.lastDeskRunPermissionForTesting, .fullAccess)
     }
 
     func test_sendWithMentionStartsPeerProviderRun() async throws {
@@ -4623,6 +5103,1201 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.lastSendStartedProviderRun)
     }
 
+    func test_botMentionShowsNamedWaitingThenClearsWhenReplyArrives() async throws {
+        // WHY: the originating Desk must name the teammate during the peer
+        // run and clear that state only once the imported reply exists.
+        let (vm, piper, quinn) = try makeMentionPair(peerReply: "PONG from Quinn")
+        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp"))
+        let outboundID = try XCTUnwrap(
+            vm.deskTranscriptForTesting(botID: piper.id)
+                .last(where: { $0.peer?.direction == .messaged })?.id
+        )
+        let waiting = try XCTUnwrap(
+            vm.deskTranscriptForTesting(botID: piper.id).first { $0.id == outboundID }
+        )
+        XCTAssertEqual(waiting.peer?.name, "Quinn")
+        XCTAssertEqual(waiting.peer?.activityPhase, .waiting)
+
+        let receivedReply = await waitUntil(timeout: 8) {
+            vm.deskTranscriptForTesting(botID: piper.id).contains {
+                $0.peer?.direction == .fromPeer && $0.text == "PONG from Quinn"
+            }
+        }
+        XCTAssertTrue(receivedReply)
+        let settled = try XCTUnwrap(
+            vm.deskTranscriptForTesting(botID: piper.id).first { $0.id == outboundID }
+        )
+        XCTAssertNil(settled.peer?.activityPhase)
+        XCTAssertEqual(
+            vm.deskTranscriptForTesting(botID: piper.id).filter {
+                $0.peer?.direction == .fromPeer && $0.text == "PONG from Quinn"
+            }.count,
+            1,
+            "settling the exact request must not duplicate the imported reply"
+        )
+    }
+
+    func test_botMentionNeedsAttentionSurvivesReload() throws {
+        // WHY: a setup failure must replace the spinner with durable truth,
+        // including after a new view model restores the same peer ledger.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp"))
+        let failed = try XCTUnwrap(
+            vm.deskTranscriptForTesting(botID: piper.id)
+                .last(where: { $0.peer?.direction == .messaged })
+        )
+        XCTAssertEqual(failed.peer?.activityPhase, .needsAttention)
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(piper)
+        let restored = try XCTUnwrap(
+            reopened.deskTranscriptForTesting(botID: piper.id).first { $0.id == failed.id }
+        )
+        XCTAssertEqual(restored.peer?.name, "Quinn")
+        XCTAssertEqual(restored.peer?.activityPhase, .needsAttention)
+    }
+
+    func test_legacyPeerTurnsRemainByteExactButNeverRenderIntoAnArbitraryConversation() throws {
+        // WHY: v1 rows name only a Bot, not an owning conversation. Restoring
+        // them into either of two threads invents ownership and mixes chats;
+        // an upgrade must quarantine those bytes without rewriting them.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        let first = BotConversation(
+            botID: piper.id,
+            title: "First origin",
+            updatedAt: Date(timeIntervalSinceReferenceDate: 10)
+        )
+        let second = BotConversation(
+            botID: piper.id,
+            title: "Second origin",
+            updatedAt: Date(timeIntervalSinceReferenceDate: 20)
+        )
+        try context.botStore.upsertConversation(first)
+        try context.botStore.upsertConversation(second)
+
+        let legacyID = UUID()
+        let legacyPayload: [String: Any] = [
+            piper.id.value.uuidString.lowercased(): [[
+                "id": legacyID.uuidString,
+                "role": "user",
+                "text": "@quinn legacy request with no conversation owner",
+                "createdAt": 0,
+                "direction": "messaged",
+                "peerBotID": quinn.id.value.uuidString,
+                "name": quinn.name,
+                "title": quinn.title,
+                "handle": quinn.handle,
+                "activityPhase": "waiting",
+            ]],
+        ]
+        let legacyBytes = try JSONSerialization.data(
+            withJSONObject: legacyPayload,
+            options: [.sortedKeys]
+        )
+        UserDefaults.standard.set(legacyBytes, forKey: "bots.peerTurns")
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(piper)
+        reopened.selectDeskThread(first.id)
+        XCTAssertFalse(
+            reopened.deskMessages.contains { $0.id == legacyID },
+            "a BotID-only v1 row cannot be attributed to the first conversation"
+        )
+        reopened.selectDeskThread(second.id)
+        XCTAssertFalse(
+            reopened.deskMessages.contains { $0.id == legacyID },
+            "the same ambiguous row cannot be copied into a sibling conversation"
+        )
+        XCTAssertEqual(
+            UserDefaults.standard.data(forKey: "bots.peerTurns"),
+            legacyBytes,
+            "v2 rollout must leave the reversible v1 payload byte-for-byte unchanged"
+        )
+    }
+
+    func test_malformedAndFutureV2AreQuarantinedWhileV1AndUnknownFieldsRemainByteExact() async throws {
+        // WHY: rollout and downgrade must be reversible. A malformed/future v2
+        // envelope cannot be rendered or rewritten, v1 remains available to an
+        // older build, and an unknown additive v2 field must survive a read.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let bootstrap = BotsViewModel(context: context, router: router)
+        let piper = try bootstrap.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try bootstrap.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        bootstrap.openDesk(quinn)
+        bootstrap.setDeskProvider(.claude)
+        bootstrap.openDesk(piper)
+        bootstrap.setDeskProvider(.codex)
+        bootstrap.createDeskThread()
+        let origin = try XCTUnwrap(bootstrap.selectedConversation)
+
+        let legacyMessageID = UUID()
+        let legacyPayload: [String: Any] = [
+            piper.id.value.uuidString.lowercased(): [[
+                "id": legacyMessageID.uuidString,
+                "role": "user",
+                "text": "@quinn legacy downgrade row",
+                "createdAt": 0,
+                "direction": "messaged",
+                "peerBotID": quinn.id.value.uuidString,
+                "name": quinn.name,
+                "title": quinn.title,
+                "handle": quinn.handle,
+                "activityPhase": "waiting",
+            ]],
+        ]
+        let legacyBytes = try JSONSerialization.data(
+            withJSONObject: legacyPayload,
+            options: [.sortedKeys]
+        )
+        let malformedV2 = Data(#"{"truncated": "#.utf8)
+        UserDefaults.standard.set(legacyBytes, forKey: "bots.peerTurns")
+        UserDefaults.standard.set(malformedV2, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        let malformedRestore = BotsViewModel(context: context, router: router)
+        malformedRestore.openDesk(piper)
+        malformedRestore.selectDeskThread(origin.id)
+        XCTAssertTrue(malformedRestore.peerHandoffSnapshotsForTesting().isEmpty)
+        XCTAssertFalse(malformedRestore.deskMessages.contains { $0.id == legacyMessageID })
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"), malformedV2)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+
+        UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(malformedRestore.send("@\(quinn.handle) COMPAT_V2_RECORD"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("COMPAT_V2_RECORD") }
+        }
+        XCTAssertTrue(peerStarted)
+        XCTAssertTrue(peerRunner.finish(
+            promptContaining: "COMPAT_V2_RECORD",
+            status: .failed,
+            reply: nil
+        ))
+        let settled = await waitUntil(timeout: 5) {
+            malformedRestore.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase == .needsAttention
+        }
+        XCTAssertTrue(settled)
+        XCTAssertEqual(
+            UserDefaults.standard.data(forKey: "bots.peerTurns"),
+            legacyBytes,
+            "creating and settling v2 must not consume the v1 downgrade payload"
+        )
+
+        let validV2 = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"))
+        var additiveEntries = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: validV2) as? [Any]
+        )
+        let recordIndex = try XCTUnwrap(additiveEntries.firstIndex { $0 is [String: Any] })
+        var additiveRecord = try XCTUnwrap(additiveEntries[recordIndex] as? [String: Any])
+        additiveRecord["futureAdditiveField"] = ["opaque": "preserve-for-newer-build"]
+        additiveEntries[recordIndex] = additiveRecord
+        let additiveBytes = try JSONSerialization.data(
+            withJSONObject: additiveEntries,
+            options: [.sortedKeys]
+        )
+        UserDefaults.standard.set(additiveBytes, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        let additiveRestore = BotsViewModel(context: context, router: router)
+        XCTAssertEqual(
+            additiveRestore.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase,
+            .needsAttention,
+            "a downgrade reader must accept an additive field it does not understand"
+        )
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"), additiveBytes)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+
+        var futureEntries = additiveEntries
+        var futureRecord = try XCTUnwrap(futureEntries[recordIndex] as? [String: Any])
+        futureRecord["version"] = 3
+        futureEntries[recordIndex] = futureRecord
+        let futureVersionBytes = try JSONSerialization.data(
+            withJSONObject: futureEntries,
+            options: [.sortedKeys]
+        )
+        UserDefaults.standard.set(futureVersionBytes, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        let futureRestore = BotsViewModel(context: context, router: router)
+        XCTAssertTrue(
+            futureRestore.peerHandoffSnapshotsForTesting().isEmpty,
+            "an unsupported future envelope is quarantined instead of mis-rendered"
+        )
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"), futureVersionBytes)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+    }
+
+    func test_waitingHandoffProjectsBothBotsActiveDespiteUnrelatedOriginAttention() async throws {
+        // WHY: Active Bots describes live endpoints. A leftover Needs you on
+        // another origin thread must not hide the waiting host from the live
+        // roster or replace its Working spinner.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "host settled"))
+        )
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+        vm.createDeskThread()
+        let unrelated = try XCTUnwrap(vm.selectedConversation)
+        vm.applyFollowThroughForTests(bot: piper, conversation: unrelated, status: .failed)
+        vm.createDeskThread()
+        let origin = try XCTUnwrap(vm.selectedConversation)
+
+        XCTAssertTrue(vm.send("@\(quinn.handle) DUAL_ACTIVE wait for release"))
+        let peerBecameActive = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("DUAL_ACTIVE") }
+                && vm.peerHandoffSnapshotsForTesting(
+                    originConversationID: origin.id,
+                    originThreadID: nil
+                ).contains { $0.phase == .peerRunning }
+        }
+        XCTAssertTrue(peerBecameActive)
+
+        XCTAssertEqual(
+            vm.attentionState(for: piper),
+            .working,
+            "a live wait outranks leftover Needs you so the origin roster stays active"
+        )
+        XCTAssertTrue(BotsChrome.rosterShowsBusySpinner(for: vm.attentionState(for: piper)))
+        XCTAssertEqual(
+            Set(vm.liveWorkingBots().map(\.id)),
+            Set([piper.id, quinn.id]),
+            "the exact waiting origin and running peer both belong in Active Bots"
+        )
+        let handoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertEqual(handoff.originConversationID, origin.id)
+        XCTAssertEqual(handoff.peerBotID, quinn.id)
+        XCTAssertEqual(
+            handoff.peerRunID,
+            peerRunner.requests.first { $0.prompt.contains("DUAL_ACTIVE") }?.runId,
+            "the active projection must be backed by the exact pre-bound provider run"
+        )
+
+        XCTAssertTrue(peerRunner.finish(promptContaining: "DUAL_ACTIVE", reply: "released"))
+        let handoffCompleted = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).contains { $0.phase == .completed }
+        }
+        XCTAssertTrue(handoffCompleted)
+    }
+
+    func test_samePeerOutOfOrderRepliesStayInTheirCapturedOriginConversations() async throws {
+        // WHY: two Piper threads may ask the same Quinn concurrently. Finishing
+        // them out of order while thread B is selected must not let Bot-global
+        // "latest conversation/assistant" state choose either reply endpoint.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "host settled"))
+        )
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+
+        vm.createDeskThread()
+        let originA = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertTrue(vm.send("@\(quinn.handle) SAME_PEER_A"))
+        let firstPeerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("SAME_PEER_A") }
+        }
+        XCTAssertTrue(firstPeerStarted)
+
+        vm.createDeskThread()
+        let originB = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertNotEqual(originA.id, originB.id)
+        XCTAssertTrue(vm.send("@\(quinn.handle) SAME_PEER_B"))
+        let secondPeerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("SAME_PEER_B") }
+        }
+        XCTAssertTrue(secondPeerStarted)
+
+        XCTAssertTrue(peerRunner.finish(promptContaining: "SAME_PEER_B", reply: "REPLY_B"))
+        let secondReplyArrived = await waitUntil(timeout: 5) {
+            vm.deskMessages.contains {
+                $0.peer?.direction == .fromPeer && $0.text == "REPLY_B"
+            }
+        }
+        XCTAssertTrue(secondReplyArrived)
+        XCTAssertFalse(vm.deskMessages.contains { $0.text == "REPLY_A" })
+
+        // Keep B selected while A terminates. Settlement must still use A's
+        // immutable conversation/run/checkpoint tuple.
+        XCTAssertEqual(vm.selectedConversation?.id, originB.id)
+        XCTAssertTrue(peerRunner.finish(promptContaining: "SAME_PEER_A", reply: "REPLY_A"))
+        let firstHandoffCompleted = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: originA.id,
+                originThreadID: nil
+            ).contains { $0.phase == .completed }
+        }
+        XCTAssertTrue(firstHandoffCompleted)
+        XCTAssertEqual(vm.selectedConversation?.id, originB.id)
+        XCTAssertFalse(vm.deskMessages.contains { $0.text == "REPLY_A" })
+
+        vm.selectDeskThread(originA.id)
+        XCTAssertTrue(vm.deskMessages.contains {
+            $0.peer?.direction == .fromPeer && $0.text == "REPLY_A"
+        })
+        XCTAssertFalse(vm.deskMessages.contains { $0.text == "REPLY_B" })
+        vm.selectDeskThread(originB.id)
+        XCTAssertTrue(vm.deskMessages.contains {
+            $0.peer?.direction == .fromPeer && $0.text == "REPLY_B"
+        })
+        XCTAssertFalse(vm.deskMessages.contains { $0.text == "REPLY_A" })
+
+        let handoffA = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: originA.id,
+            originThreadID: nil
+        ).first)
+        let handoffB = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: originB.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertNotEqual(handoffA.peerConversationID, handoffB.peerConversationID)
+        XCTAssertNotEqual(handoffA.peerThreadID, handoffB.peerThreadID)
+        XCTAssertNotEqual(handoffA.peerRunID, handoffB.peerRunID)
+        XCTAssertEqual(
+            handoffA.peerRunID,
+            peerRunner.requests.first { $0.prompt.contains("SAME_PEER_A") }?.runId
+        )
+        XCTAssertEqual(
+            handoffB.peerRunID,
+            peerRunner.requests.first { $0.prompt.contains("SAME_PEER_B") }?.runId
+        )
+    }
+
+    func test_initiatingWindowDeallocatesWhileAuthorityFinishesItsExactPlanAndPreservesSibling() async throws {
+        // WHY: a Bot handoff is durable work owned by the shared context, not
+        // by the window that happened to submit it. Closing VM A while two
+        // peers are pending must release that VM immediately; VM B may receive
+        // unrelated selection/coordinator events without stealing either plan.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let quinnRunner = ControlledBotHandoffRunner(provider: .claude)
+        let roryRunner = ControlledBotHandoffRunner(provider: .grok)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: quinnRunner)
+        context.coordinator.replaceProvider(.grok, runner: roryRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+
+        var initiatingVM: BotsViewModel? = BotsViewModel(context: context, router: router)
+        router.botsViewModel = initiatingVM
+        let piper = try XCTUnwrap(initiatingVM).create(
+            name: "Piper",
+            title: "Seller",
+            provider: .codex
+        )
+        let quinn = try XCTUnwrap(initiatingVM).create(
+            name: "Quinn",
+            title: "CRM Controller",
+            provider: .claude
+        )
+        let rory = try XCTUnwrap(initiatingVM).create(
+            name: "Rory",
+            title: "Research Controller",
+            provider: .grok
+        )
+        initiatingVM?.openDesk(quinn)
+        initiatingVM?.setDeskProvider(.claude)
+        initiatingVM?.openDesk(rory)
+        initiatingVM?.setDeskProvider(.grok)
+        initiatingVM?.openDesk(piper)
+        initiatingVM?.setDeskProvider(.codex)
+
+        initiatingVM?.createDeskThread()
+        let mainOrigin = try XCTUnwrap(initiatingVM?.selectedConversation)
+        XCTAssertTrue(try XCTUnwrap(initiatingVM).send("@\(quinn.handle) WINDOW_OWNER_MAIN"))
+        let mainStarted = await waitUntil(timeout: 5) {
+            quinnRunner.requests.contains { $0.prompt.contains("WINDOW_OWNER_MAIN") }
+        }
+        XCTAssertTrue(mainStarted)
+
+        initiatingVM?.createDeskThread()
+        let siblingOrigin = try XCTUnwrap(initiatingVM?.selectedConversation)
+        XCTAssertTrue(try XCTUnwrap(initiatingVM).send("@\(rory.handle) WINDOW_OWNER_SIBLING"))
+        let siblingStarted = await waitUntil(timeout: 5) {
+            roryRunner.requests.contains { $0.prompt.contains("WINDOW_OWNER_SIBLING") }
+        }
+        XCTAssertTrue(siblingStarted)
+
+        let mainHandoff = try XCTUnwrap(initiatingVM?.peerHandoffSnapshotsForTesting(
+            originConversationID: mainOrigin.id,
+            originThreadID: nil
+        ).first)
+        let siblingHandoff = try XCTUnwrap(initiatingVM?.peerHandoffSnapshotsForTesting(
+            originConversationID: siblingOrigin.id,
+            originThreadID: nil
+        ).first)
+        let mainPeerRunID = try XCTUnwrap(mainHandoff.peerRunID)
+        let mainHostRunID = try XCTUnwrap(mainHandoff.hostRunID)
+        let siblingPeerRunID = try XCTUnwrap(siblingHandoff.peerRunID)
+        let siblingHostRunID = try XCTUnwrap(siblingHandoff.hostRunID)
+
+        let observingVM = BotsViewModel(context: context, router: router)
+        router.botsViewModel = observingVM
+        observingVM.openDesk(rory)
+        observingVM.openActiveBots()
+        weak var releasedInitiator = initiatingVM
+        initiatingVM = nil
+
+        let initiatorDeallocated = await waitUntil(timeout: 1) {
+            releasedInitiator == nil
+        }
+        if !initiatorDeallocated {
+            _ = quinnRunner.finish(runID: mainPeerRunID, status: .cancelled, reply: nil)
+            _ = roryRunner.finish(runID: siblingPeerRunID, status: .cancelled, reply: nil)
+            _ = await waitUntil(timeout: 2) { releasedInitiator == nil }
+            XCTFail(
+                "VM A must deallocate while both exact peer runs remain pending; lifecycle continuation belongs to context authority"
+            )
+            return
+        }
+
+        XCTAssertEqual(try context.runRepo.get(id: mainPeerRunID)?.status, .running)
+        XCTAssertEqual(try context.runRepo.get(id: siblingPeerRunID)?.status, .running)
+        XCTAssertTrue(quinnRunner.finish(
+            runID: mainPeerRunID,
+            status: .completed,
+            reply: "authority-owned peer reply"
+        ))
+        let exactHostStarted = await waitUntil(timeout: 5) {
+            hostRunner.requests.contains { $0.runId == mainHostRunID }
+        }
+        XCTAssertTrue(exactHostStarted)
+        XCTAssertEqual(hostRunner.requests.filter { $0.runId == mainHostRunID }.count, 1)
+        XCTAssertFalse(hostRunner.requests.contains { $0.runId == siblingHostRunID })
+        XCTAssertTrue(hostRunner.finish(
+            runID: mainHostRunID,
+            status: .completed,
+            reply: "authority-owned host outcome"
+        ))
+
+        let mainCompletedInNonOwner = await waitUntil(timeout: 5) {
+            observingVM.peerHandoffSnapshotsForTesting(
+                originConversationID: mainOrigin.id,
+                originThreadID: nil
+            ).first?.phase == .completed
+        }
+        XCTAssertTrue(
+            mainCompletedInNonOwner,
+            "VM B must receive the exact authority delta without becoming execution owner"
+        )
+        let preservedSibling = try XCTUnwrap(observingVM.peerHandoffSnapshotsForTesting(
+            originConversationID: siblingOrigin.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertEqual(preservedSibling.activityID, siblingHandoff.activityID)
+        XCTAssertEqual(preservedSibling.peerRunID, siblingPeerRunID)
+        XCTAssertEqual(preservedSibling.phase, .peerRunning)
+        XCTAssertFalse(hostRunner.requests.contains { $0.runId == siblingHostRunID })
+
+        XCTAssertTrue(roryRunner.finish(
+            runID: siblingPeerRunID,
+            status: .cancelled,
+            reply: nil
+        ))
+        let siblingSettled = await waitUntil(timeout: 5) {
+            observingVM.peerHandoffSnapshotsForTesting(
+                originConversationID: siblingOrigin.id,
+                originThreadID: nil
+            ).first?.phase == .needsAttention
+        }
+        XCTAssertTrue(siblingSettled)
+    }
+
+    func test_authorityDeltaUpdatesTwoLiveWindowsWithoutReplacingLocalUIState() async throws {
+        // WHY: peer handoff progress belongs to the shared context authority.
+        // Its deltas must reach every live Bots window without using a whole-VM
+        // reload that steals either window's selection or unsent local work.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
+            let model = BotsViewModel.defaultModel(for: provider)
+            return AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: model, label: model, provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        })
+
+        let originWindow = BotsViewModel(context: context, router: router)
+        let piper = try originWindow.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try originWindow.create(
+            name: "Quinn",
+            title: "CRM Controller",
+            provider: .claude
+        )
+        let rory = try originWindow.create(
+            name: "Rory",
+            title: "Research Controller",
+            provider: .grok
+        )
+        originWindow.openDesk(quinn)
+        originWindow.setDeskProvider(.claude)
+        originWindow.openDesk(piper)
+        originWindow.setDeskProvider(.codex)
+        originWindow.createDeskThread()
+        let originConversation = try XCTUnwrap(originWindow.selectedConversation)
+
+        let siblingWindow = BotsViewModel(context: context, router: router)
+        siblingWindow.openStudio(rory)
+        router.botsViewModel = originWindow
+
+        XCTAssertTrue(originWindow.send("@\(quinn.handle) TWO_LIVE_WINDOWS"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("TWO_LIVE_WINDOWS") }
+        }
+        XCTAssertTrue(peerStarted)
+        let running = try XCTUnwrap(originWindow.peerHandoffSnapshotsForTesting(
+            originConversationID: originConversation.id,
+            originThreadID: nil
+        ).first)
+        let peerRunID = try XCTUnwrap(running.peerRunID)
+        let hostRunID = try XCTUnwrap(running.hostRunID)
+        XCTAssertEqual(
+            siblingWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first,
+            running,
+            "both windows must observe the same exact authority row"
+        )
+
+        let originAttachmentPath = (directory as NSString).appendingPathComponent("origin-window.txt")
+        let siblingAttachmentPath = (directory as NSString).appendingPathComponent("sibling-window.txt")
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: originAttachmentPath,
+            contents: Data("origin".utf8)
+        ))
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: siblingAttachmentPath,
+            contents: Data("sibling".utf8)
+        ))
+
+        originWindow.openDesk(piper)
+        originWindow.selectDeskThread(originConversation.id)
+        originWindow.composerText = "ORIGIN_WINDOW_COMPOSER"
+        originWindow.attachments = [AgentAttachment(
+            path: originAttachmentPath,
+            displayName: "origin-window.txt",
+            kind: .file
+        )]
+        originWindow.memoryDraft = "ORIGIN_MEMORY_DRAFT"
+        originWindow.skillDraft = "origin-skill-draft"
+        originWindow.routineName = "Origin routine"
+        originWindow.routinePrompt = "Origin routine prompt"
+        originWindow.routineScheduleNote = "Origin routine schedule"
+
+        siblingWindow.openStudio(rory)
+        siblingWindow.composerText = "SIBLING_WINDOW_COMPOSER"
+        siblingWindow.attachments = [AgentAttachment(
+            path: siblingAttachmentPath,
+            displayName: "sibling-window.txt",
+            kind: .file
+        )]
+        siblingWindow.memoryDraft = "SIBLING_MEMORY_DRAFT"
+        siblingWindow.skillDraft = "sibling-skill-draft"
+        siblingWindow.routineName = "Sibling routine"
+        siblingWindow.routinePrompt = "Sibling routine prompt"
+        siblingWindow.routineScheduleNote = "Sibling routine schedule"
+
+        let originReloadCounts = fullReloadCounts(originWindow)
+        let siblingReloadCounts = fullReloadCounts(siblingWindow)
+        let originDeskRestoreCount = originWindow.deskRestoreInvokedCountForTesting
+        let siblingDeskRestoreCount = siblingWindow.deskRestoreInvokedCountForTesting
+        let originSelection = originWindow.selectedBotID
+        let siblingSelection = siblingWindow.selectedBotID
+        let originScreen = originWindow.screen
+        let siblingScreen = siblingWindow.screen
+        let originAttachments = originWindow.attachments
+        let siblingAttachments = siblingWindow.attachments
+
+        XCTAssertTrue(peerRunner.finish(
+            runID: peerRunID,
+            status: .completed,
+            reply: "TWO_WINDOW_EXACT_REPLY"
+        ))
+        let bothObservedHost = await waitUntil(timeout: 5) {
+            originWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first?.phase == .hostRunning
+                && siblingWindow.peerHandoffSnapshotsForTesting(
+                    originConversationID: originConversation.id,
+                    originThreadID: nil
+                ).first?.phase == .hostRunning
+        }
+        XCTAssertTrue(bothObservedHost)
+        let hostSnapshot = try XCTUnwrap(originWindow.peerHandoffSnapshotsForTesting(
+            originConversationID: originConversation.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertEqual(
+            siblingWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first,
+            hostSnapshot
+        )
+        XCTAssertEqual(hostSnapshot.activityID, running.activityID)
+        XCTAssertEqual(hostSnapshot.peerRunID, peerRunID)
+        XCTAssertEqual(hostSnapshot.hostRunID, hostRunID)
+        XCTAssertEqual(hostRunner.requests.filter { $0.runId == hostRunID }.count, 1)
+        XCTAssertEqual(
+            originWindow.deskMessages.filter {
+                $0.peer?.direction == .fromPeer && $0.text == "TWO_WINDOW_EXACT_REPLY"
+            }.count,
+            1,
+            "the selected origin window must paint one stable reply row"
+        )
+        XCTAssertEqual(
+            try context.botStore.conversation(id: hostSnapshot.peerConversationID)?.attentionState,
+            .unreadActivity,
+            "the peer conversation attention must settle while the host continuation runs"
+        )
+
+        XCTAssertTrue(hostRunner.finish(
+            runID: hostRunID,
+            status: .completed,
+            reply: "TWO_WINDOW_HOST_COMPLETE"
+        ))
+        let bothCompleted = await waitUntil(timeout: 5) {
+            originWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first?.phase == .completed
+                && siblingWindow.peerHandoffSnapshotsForTesting(
+                    originConversationID: originConversation.id,
+                    originThreadID: nil
+                ).first?.phase == .completed
+        }
+        XCTAssertTrue(bothCompleted)
+        XCTAssertEqual(
+            siblingWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first,
+            originWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first
+        )
+        XCTAssertEqual(
+            try context.botStore.conversation(id: originConversation.id)?.attentionState,
+            .unreadActivity,
+            "the exact host conversation attention must settle after its terminal"
+        )
+
+        XCTAssertEqual(originWindow.selectedBotID, originSelection)
+        XCTAssertEqual(siblingWindow.selectedBotID, siblingSelection)
+        XCTAssertEqual(originWindow.screen, originScreen)
+        XCTAssertEqual(siblingWindow.screen, siblingScreen)
+        XCTAssertEqual(originWindow.composerText, "ORIGIN_WINDOW_COMPOSER")
+        XCTAssertEqual(siblingWindow.composerText, "SIBLING_WINDOW_COMPOSER")
+        XCTAssertEqual(originWindow.attachments, originAttachments)
+        XCTAssertEqual(siblingWindow.attachments, siblingAttachments)
+        XCTAssertEqual(originWindow.memoryDraft, "ORIGIN_MEMORY_DRAFT")
+        XCTAssertEqual(siblingWindow.memoryDraft, "SIBLING_MEMORY_DRAFT")
+        XCTAssertEqual(originWindow.skillDraft, "origin-skill-draft")
+        XCTAssertEqual(siblingWindow.skillDraft, "sibling-skill-draft")
+        XCTAssertEqual(originWindow.routineName, "Origin routine")
+        XCTAssertEqual(siblingWindow.routineName, "Sibling routine")
+        XCTAssertEqual(originWindow.routinePrompt, "Origin routine prompt")
+        XCTAssertEqual(siblingWindow.routinePrompt, "Sibling routine prompt")
+        XCTAssertEqual(originWindow.routineScheduleNote, "Origin routine schedule")
+        XCTAssertEqual(siblingWindow.routineScheduleNote, "Sibling routine schedule")
+        XCTAssertEqual(fullReloadCounts(originWindow), originReloadCounts)
+        XCTAssertEqual(fullReloadCounts(siblingWindow), siblingReloadCounts)
+        XCTAssertGreaterThan(
+            originWindow.deskRestoreInvokedCountForTesting,
+            originDeskRestoreCount,
+            "exact terminal events may refresh the owning Desk projection without reloading the VM"
+        )
+        XCTAssertGreaterThan(
+            siblingWindow.deskRestoreInvokedCountForTesting,
+            siblingDeskRestoreCount,
+            "the second window may refresh its targeted Desk cache without losing local UI state"
+        )
+    }
+
+    func test_peerHandoffMutationWithOneThousandRowsRetainsNineHundredNinetyNineUnderFiftyMillisecondP95() throws {
+        // WHY: every authority mutation re-encodes and atomically commits the
+        // complete v2 envelope. A large retained history must not turn one
+        // background handoff delta into a visible main-thread stall.
+        let settingsKey = "bots.peerTurns.v2"
+        let targetOriginBotID = BotID()
+        let (payload, targetActivityID, siblingActivityID) = try peerHandoffPerformancePayload(
+            rowCount: 1_000,
+            targetOriginBotID: targetOriginBotID
+        )
+        defer { UserDefaults.standard.removeObject(forKey: settingsKey) }
+
+        _ = try measurePeerHandoffDeletion(
+            label: "warmup",
+            payload: payload,
+            targetOriginBotID: targetOriginBotID,
+            targetActivityID: targetActivityID,
+            siblingActivityID: siblingActivityID
+        )
+
+        var samples: [Double] = []
+        for sample in 0..<20 {
+            samples.append(try measurePeerHandoffDeletion(
+                label: "sample-\(sample)",
+                payload: payload,
+                targetOriginBotID: targetOriginBotID,
+                targetActivityID: targetActivityID,
+                siblingActivityID: siblingActivityID
+            ))
+        }
+
+        let p95 = percentile(samples, fraction: 0.95)
+        let rawSamples = samples.map { String(format: "%.3f", $0) }.joined(separator: ",")
+        let evidence = "samples_ms=[\(rawSamples)] p95_ms=\(String(format: "%.3f", p95))"
+        XCTAssertLessThan(p95, 50, evidence)
+    }
+
+    func test_exactCheckpointAssistantBeatsNewerAmbientAssistantInsertedBeforeTerminalFanout() async throws {
+        // WHY: a thread-global "latest assistant" can belong to unrelated work.
+        // Insert that adversary after the exact minimal checkpoint write but
+        // before didFinish; only the checkpoint-owned assistant may cross Bots.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        let viewModel = BotsViewModel(context: context, router: router)
+        router.botsViewModel = viewModel
+        let piper = try viewModel.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try viewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        viewModel.openDesk(quinn)
+        viewModel.setDeskProvider(.claude)
+        viewModel.openDesk(piper)
+        viewModel.setDeskProvider(.codex)
+        viewModel.createDeskThread()
+        let origin = try XCTUnwrap(viewModel.selectedConversation)
+
+        XCTAssertTrue(viewModel.send("@\(quinn.handle) T005_EXACT_ORACLE"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_EXACT_ORACLE") }
+        }
+        XCTAssertTrue(peerStarted)
+        let pending = try XCTUnwrap(viewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first)
+        let peerRunID = try XCTUnwrap(pending.peerRunID)
+        let peerThreadID = try XCTUnwrap(pending.peerThreadID)
+        let ambientMessageID = AgentMessageID()
+        try context.db.execute("""
+            CREATE TRIGGER insert_t005_newer_ambient_assistant
+            AFTER INSERT ON agent_turn_checkpoints
+            WHEN NEW.run_id = '\(peerRunID.value.uuidString)'
+            BEGIN
+                INSERT INTO agent_messages(
+                    id, thread_id, role, content, created_at, attachments_json,
+                    body_sha256, body_bytes, body_revision
+                ) VALUES(
+                    '\(ambientMessageID.value.uuidString)',
+                    '\(peerThreadID.value.uuidString)',
+                    'assistant',
+                    'NEWER_AMBIENT_MUST_LOSE',
+                    '9999-12-31T23:59:59Z',
+                    '[]',
+                    't005-ambient',
+                    23,
+                    1
+                );
+            END;
+        """)
+        defer { try? context.db.execute("DROP TRIGGER insert_t005_newer_ambient_assistant;") }
+
+        XCTAssertTrue(peerRunner.finish(
+            runID: peerRunID,
+            status: .completed,
+            reply: "EXACT_CHECKPOINT_REPLY"
+        ))
+        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+        let checkpoint = try XCTUnwrap(
+            context.turnCheckpointRepo.list(threadId: peerThreadID)
+                .first { $0.runId == peerRunID }
+        )
+        let checkpointMessageID = try XCTUnwrap(checkpoint.assistantMessageId)
+        XCTAssertNotEqual(checkpointMessageID, ambientMessageID)
+        XCTAssertEqual(
+            try context.messageRepo.get(id: checkpointMessageID)?.content,
+            "EXACT_CHECKPOINT_REPLY"
+        )
+        XCTAssertEqual(
+            try context.messageRepo.list(threadId: peerThreadID).last?.id,
+            ambientMessageID,
+            "precondition: the unrelated assistant is observably newer on the same thread"
+        )
+        XCTAssertTrue(viewModel.deskMessages.contains {
+            $0.peer?.direction == .fromPeer && $0.text == "EXACT_CHECKPOINT_REPLY"
+        })
+        XCTAssertFalse(viewModel.deskMessages.contains { $0.text == "NEWER_AMBIENT_MUST_LOSE" })
+        let exactHostRunID = try XCTUnwrap(viewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first?.hostRunID)
+        XCTAssertEqual(hostRunner.requests.first?.runId, exactHostRunID)
+        XCTAssertTrue(hostRunner.finish(runID: exactHostRunID, status: .cancelled, reply: nil))
+    }
+
+    func test_peerFailureAndCancellationSettleOnlyTheirExactOwningHandoffs() async throws {
+        // WHY: two concurrent requests can share the same peer provider. A
+        // failure or cancellation is scoped by the durable run ID, not by the
+        // currently selected Bot, so neither terminal may settle its sibling.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+
+        vm.createDeskThread()
+        let failureOrigin = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertTrue(vm.send("@\(quinn.handle) FAIL_ONLY_OWNER"))
+        let failureStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("FAIL_ONLY_OWNER") }
+        }
+        XCTAssertTrue(failureStarted)
+
+        vm.createDeskThread()
+        let cancellationOrigin = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertTrue(vm.send("@\(quinn.handle) CANCEL_ONLY_OWNER"))
+        let cancellationStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("CANCEL_ONLY_OWNER") }
+        }
+        XCTAssertTrue(cancellationStarted)
+
+        let failureHandoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: failureOrigin.id,
+            originThreadID: nil
+        ).first)
+        let cancellationHandoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: cancellationOrigin.id,
+            originThreadID: nil
+        ).first)
+        let failureRunID = try XCTUnwrap(failureHandoff.peerRunID)
+        let cancellationRunID = try XCTUnwrap(cancellationHandoff.peerRunID)
+        XCTAssertNotEqual(failureRunID, cancellationRunID)
+
+        XCTAssertTrue(peerRunner.finish(runID: failureRunID, status: .failed, reply: nil))
+        let failureSettled = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: failureOrigin.id,
+                originThreadID: nil
+            ).first?.phase == .needsAttention
+        }
+        XCTAssertTrue(failureSettled)
+        XCTAssertEqual(try context.runRepo.get(id: failureRunID)?.status, .failed)
+        XCTAssertEqual(
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: cancellationOrigin.id,
+                originThreadID: nil
+            ).first?.phase,
+            .peerRunning,
+            "failure of the first exact run must leave its sibling armed and running"
+        )
+        XCTAssertEqual(try context.runRepo.get(id: cancellationRunID)?.status, .running)
+
+        XCTAssertTrue(peerRunner.finish(runID: cancellationRunID, status: .cancelled, reply: nil))
+        let cancellationSettled = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: cancellationOrigin.id,
+                originThreadID: nil
+            ).first?.phase == .needsAttention
+        }
+        XCTAssertTrue(cancellationSettled)
+        XCTAssertEqual(try context.runRepo.get(id: cancellationRunID)?.status, .cancelled)
+        XCTAssertEqual(
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: failureOrigin.id,
+                originThreadID: nil
+            ).first?.phase,
+            .needsAttention,
+            "cancellation of the sibling exact run must not rewrite the first terminal"
+        )
+
+        for origin in [failureOrigin, cancellationOrigin] {
+            vm.selectDeskThread(origin.id)
+            XCTAssertFalse(
+                vm.deskMessages.contains { $0.peer?.direction == .fromPeer },
+                "failed/cancelled peers have no stable reply to leak into either origin"
+            )
+        }
+    }
+
+    func test_handoffOlderThanSixtyFiveLogicalSecondsStillSettlesFromExactTerminalsWithoutWallTimeout() async throws {
+        // WHY: the former 120 x 500 ms polling loop fabricated a one-minute
+        // boundary. Durable run age is not failure evidence; both legs must
+        // remain owned until their exact terminal/checkpoint arrives.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+        vm.createDeskThread()
+        let origin = try XCTUnwrap(vm.selectedConversation)
+
+        let wallStart = Date()
+        XCTAssertTrue(vm.send("@\(quinn.handle) LOGICAL_65_SECONDS"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("LOGICAL_65_SECONDS") }
+        }
+        XCTAssertTrue(peerStarted)
+        let peerRunID = try XCTUnwrap(
+            peerRunner.requests.first { $0.prompt.contains("LOGICAL_65_SECONDS") }?.runId
+        )
+        let peerRunning = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase == .peerRunning
+        }
+        XCTAssertTrue(peerRunning, "the peer start must persist .peerRunning before logical age is applied")
+        var peerRun = try XCTUnwrap(try context.runRepo.get(id: peerRunID))
+        let peerLogicalNow = Date()
+        peerRun.startedAt = peerLogicalNow.addingTimeInterval(-66)
+        try context.runRepo.upsert(peerRun)
+        XCTAssertGreaterThan(peerLogicalNow.timeIntervalSince(peerRun.startedAt), 65)
+        XCTAssertEqual(
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase,
+            .peerRunning,
+            "logical age alone must not settle the peer leg"
+        )
+
+        XCTAssertTrue(peerRunner.finish(runID: peerRunID, status: .completed, reply: "reply after 65s"))
+        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+        let hostBound = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase == .hostRunning
+        }
+        XCTAssertTrue(hostBound)
+        let handoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first)
+        let hostRunID = try XCTUnwrap(handoff.hostRunID)
+        var hostRun = try XCTUnwrap(try context.runRepo.get(id: hostRunID))
+        let hostLogicalNow = Date()
+        hostRun.startedAt = hostLogicalNow.addingTimeInterval(-66)
+        try context.runRepo.upsert(hostRun)
+        XCTAssertGreaterThan(hostLogicalNow.timeIntervalSince(hostRun.startedAt), 65)
+        XCTAssertEqual(handoff.phase, .hostRunning)
+
+        XCTAssertTrue(hostRunner.finish(runID: hostRunID, status: .completed, reply: "host after 65s"))
+        let settled = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase == .completed
+        }
+        XCTAssertTrue(settled)
+        XCTAssertLessThan(
+            Date().timeIntervalSince(wallStart),
+            10,
+            "the >65-second proof advances durable logical time and must never wall-sleep for the old timeout"
+        )
+        XCTAssertEqual(
+            vm.deskTranscriptForTesting(botID: piper.id).filter {
+                $0.peer?.direction == .fromPeer && $0.text == "reply after 65s"
+            }.count,
+            1
+        )
+    }
+
+    func test_setPhaseCASMismatchPublishesCanonicalSnapshotNotFailedCandidate() async throws {
+        // WHY: a failed authority CAS must not install the unpersisted phase
+        // into the ViewModel map. A later full-map persist would otherwise
+        // retry that candidate and clobber the canonical sibling.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+        vm.createDeskThread()
+        let origin = try XCTUnwrap(vm.selectedConversation)
+
+        var persistCount = 0
+        context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = { data in
+            persistCount += 1
+            if persistCount > 1 {
+                throw NSError(domain: "setPhaseCASMismatch", code: 1)
+            }
+            UserDefaults.standard.set(data, forKey: "bots.peerTurns.v2")
+            guard UserDefaults.standard.synchronize(),
+                  UserDefaults.standard.data(forKey: "bots.peerTurns.v2") == data else {
+                throw NSError(domain: "setPhaseCASMismatch", code: 2)
+            }
+        }
+
+        XCTAssertTrue(vm.send("@\(quinn.handle) SETPHASE_CAS_MUST_KEEP_CANONICAL"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("SETPHASE_CAS_MUST_KEEP_CANONICAL") }
+        }
+        XCTAssertTrue(peerStarted)
+        let phaseHeld = await waitUntil(timeout: 5) { persistCount >= 2 }
+        XCTAssertTrue(phaseHeld, "execute must attempt the peerRunning persist after send")
+        XCTAssertEqual(
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase,
+            .peerPrepared,
+            "CAS failure must rehydrate the ViewModel from canonical storage, not the failed peerRunning candidate"
+        )
+
+        if let peerRunID = peerRunner.requests.first?.runId {
+            _ = peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
+        }
+        context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
+    }
+
+    func test_routeMutationAfterDurablePrebindCannotRerouteEitherHandoffLeg() async throws {
+        // WHY: the user can change the visible Desk route while a teammate is
+        // starting. Both peer and host legs must use the snapshots bound at
+        // admission, not whichever provider is ambient after suspension.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let claude = ControlledBotHandoffRunner(provider: .claude)
+        let codex = ControlledBotHandoffRunner(provider: .codex)
+        let grok = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.claude, runner: claude)
+        context.coordinator.replaceProvider(.codex, runner: codex)
+        context.coordinator.replaceProvider(.grok, runner: grok)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+        vm.createDeskThread()
+        let origin = try XCTUnwrap(vm.selectedConversation)
+
+        var dispatches = 0
+        vm.beforeBotRunDispatchForTesting = { _ in
+            dispatches += 1
+            vm.setDeskProvider(.grok)
+        }
+        XCTAssertTrue(vm.send("@\(quinn.handle) ROUTE_FREEZE"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            claude.requests.contains { $0.prompt.contains("ROUTE_FREEZE") }
+        }
+        XCTAssertTrue(peerStarted)
+        XCTAssertTrue(grok.requests.isEmpty)
+        XCTAssertTrue(claude.finish(promptContaining: "ROUTE_FREEZE", reply: "frozen reply"))
+        let hostStarted = await waitUntil(timeout: 5) { !codex.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+
+        let handoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertEqual(handoff.peerProvider, .claude)
+        XCTAssertEqual(handoff.hostProvider, .codex)
+        XCTAssertEqual(handoff.peerRunID, claude.requests.first?.runId)
+        XCTAssertEqual(handoff.hostRunID, codex.requests.first?.runId)
+        XCTAssertGreaterThanOrEqual(dispatches, 2)
+        XCTAssertTrue(grok.requests.isEmpty, "ambient mutation must not start either leg on Grok")
+
+        XCTAssertTrue(codex.finish(runID: try XCTUnwrap(handoff.hostRunID), status: .completed, reply: "done"))
+        let handoffCompleted = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).contains { $0.phase == .completed }
+        }
+        XCTAssertTrue(handoffCompleted)
+        vm.beforeBotRunDispatchForTesting = nil
+    }
+
     func test_hopRelayOmitsMentionToken() async throws {
         // WHY: hop used to embed (@handle). Mention-send would loop, or
         // lastAssistantText was empty and the host never saw the reply.
@@ -4633,16 +6308,63 @@ final class BotsWindowTests: XCTestCase {
         let hop = try XCTUnwrap(vm.lastHopUserTextForTesting)
         XCTAssertEqual(
             hop,
-            BotPeerTranscript.hostHopPrompt(peerName: quinn.name, reply: "inbox is clear")
+            BotPeerTranscript.hostHopPrompt(
+                peerName: quinn.name,
+                reply: "inbox is clear",
+                userText: "@\(quinn.handle) what is in the inbox?"
+            )
         )
         XCTAssertTrue(hop.contains("inbox is clear"))
         XCTAssertFalse(BotPeerTranscript.containsMentionToken(hop, handle: quinn.handle))
         XCTAssertFalse(hop.contains("@\(quinn.handle)"))
-        XCTAssertTrue(vm.supervisedRunBotIDsForTesting.contains(piper.id), "hop must start the host, not mention-send")
-        let imported = vm.deskTranscriptForTesting(botID: piper.id).contains {
-            $0.role == .assistant && $0.peer?.direction == .fromPeer && $0.text.contains("inbox is clear")
+        let hostStarted = await waitUntil(timeout: 5) {
+            guard let handoff = vm.peerHandoffSnapshotsForTesting().first(where: {
+                $0.originBotID == piper.id && $0.peerBotID == quinn.id
+            }) else { return false }
+            return handoff.hostRunID != nil
+                && (handoff.phase == .hostRunning || handoff.phase == .completed)
         }
-        XCTAssertTrue(imported, "host desk must show the Message from peer reply")
+        let observedHandoff = vm.peerHandoffSnapshotsForTesting().first {
+            $0.originBotID == piper.id && $0.peerBotID == quinn.id
+        }
+        XCTAssertTrue(
+            hostStarted,
+            "hop must start the exact host, not mention-send; phase=\(String(describing: observedHandoff?.phase)) peerRunID=\(String(describing: observedHandoff?.peerRunID)) hostRunID=\(String(describing: observedHandoff?.hostRunID))"
+        )
+        let imported = await waitUntil(timeout: 5) {
+            vm.deskTranscriptForTesting(botID: piper.id).contains {
+                $0.role == .assistant
+                    && $0.peer?.direction == .fromPeer
+                    && $0.text.contains("inbox is clear")
+            }
+        }
+        let observedHandoffs = vm.peerHandoffSnapshotsForTesting()
+        let exactHandoff = observedHandoffs.first {
+            $0.originBotID == piper.id && $0.peerBotID == quinn.id
+        }
+        let piperTranscript = vm.deskTranscriptForTesting(botID: piper.id)
+        XCTAssertEqual(
+            piperTranscript.filter {
+                $0.role == .user
+                    && $0.peer?.direction == .messaged
+                    && $0.peer?.botID == quinn.id
+                    && $0.text == "@\(quinn.handle) what is in the inbox?"
+            }.count,
+            1
+        )
+        XCTAssertEqual(
+            piperTranscript.filter {
+                $0.role == .assistant
+                    && $0.peer?.direction == .fromPeer
+                    && $0.peer?.botID == quinn.id
+                    && $0.text == "inbox is clear"
+            }.count,
+            1
+        )
+        XCTAssertTrue(
+            imported,
+            "host desk must show the Message from peer reply; selectedConversationID=\(String(describing: vm.selectedConversation?.id)) observerSnapshotCount=\(observedHandoffs.count) phase=\(String(describing: exactHandoff?.phase)) inboundID=\(String(describing: exactHandoff?.inboundMessageID)) peerRunID=\(String(describing: exactHandoff?.peerRunID)) hostRunID=\(String(describing: exactHandoff?.hostRunID))"
+        )
     }
 
     func test_runMentionedPromptTargetsPeerFromAgentApp() async throws {
@@ -4812,6 +6534,635 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, 1)
     }
 
+    private final class RecordingDocker: BotComputerDockerClienting, @unchecked Sendable {
+        var created: [String] = []
+        var builds: [URL] = []
+        var png = BotComputerGuestObserve.pngSignature + Data(repeating: 1, count: 16)
+        var containers: [String: BotComputerContainerInspect] = [:]
+        var startError: Error?
+        var startCallCount = 0
+        var blocksBuild = false
+        let buildStarted = DispatchSemaphore(value: 0)
+        let allowBuild = DispatchSemaphore(value: 0)
+
+        func info() throws -> String { "ok" }
+        func imageExists(tag: String) throws -> Bool { true }
+        func imageLabel(tag: String, key: String) throws -> String {
+            key == BotComputerGuestSpec.recipeLabelKey ? BotComputerGuestSpec.recipeRevision : ""
+        }
+        func imageID(tag: String) throws -> String { "img" }
+        func build(context: URL, tag: String) throws {
+            builds.append(context)
+            if blocksBuild {
+                buildStarted.signal()
+                _ = allowBuild.wait(timeout: .now() + 2)
+            }
+        }
+        func create(options: BotComputerContainerCreateOptions) throws -> String {
+            created.append(options.name)
+            containers[options.name] = BotComputerContainerInspect(running: false, imageID: "img", hostPort: 49152)
+            return options.name
+        }
+        func start(name: String) throws {
+            startCallCount += 1
+            if let startError { throw startError }
+            containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49152)
+        }
+        func stop(name: String) throws {
+            if var value = containers[name] {
+                value.running = false
+                containers[name] = value
+            }
+        }
+        func inspect(name: String) throws -> BotComputerContainerInspect {
+            guard let value = containers[name] else { throw BotComputerGuestError.notReady }
+            return value
+        }
+        func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data { png }
+        func rename(from: String, to: String) throws {
+            containers[to] = containers[from]
+            containers[from] = nil
+        }
+        func ensureNetwork(name: String) throws {}
+        func remove(name: String) throws { containers[name] = nil }
+        func removeMatching(namePrefix: String) throws {
+            for name in containers.keys where name.hasPrefix(namePrefix) {
+                containers[name] = nil
+            }
+        }
+    }
+
+    func test_e2eThreeRuntimesUseShippedStudioSaveAndSend() throws {
+        // WHY: the owner must persist and send on all three advertised
+        // runtimes. this-Mac paths stay live without Docker; Docker-with-GUI
+        // only after shipped proveReady + this-bot PNG.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.dockerGuestReadyOverrideForTesting = false
+
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .logicalExecutionSpace
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .logicalExecutionSpace)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Open https://example.com in the default macOS browser."))
+        XCTAssertEqual(
+            BotStandingInstructions.admittedToolsText(for: .logicalExecutionSpace)
+                .contains(BotStandingInstructions.macosHarnessTool),
+            true
+        )
+
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .botOwnedBrowser
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .botOwnedBrowser)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Open https://example.com in this teammate's own browser."))
+        XCTAssertFalse(
+            BotStandingInstructions.admittedToolsText(for: .botOwnedBrowser)
+                .contains(BotStandingInstructions.generatedMacOSHarnessLine)
+        )
+
+        guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1" else {
+            vm.openStudio(piper)
+            vm.studioDraft.desktopKind = .dockerDesktop
+            XCTAssertThrowsError(try vm.saveStudio())
+            return
+        }
+        let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
+        let service = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: BotComputerDockerCLI(),
+            recipeContext: recipe
+        )
+        vm.computerGuestService = service
+        vm.dockerGuestReadyOverrideForTesting = nil
+        XCTAssertTrue(service.proveReady(), service.lastReason)
+        XCTAssertEqual(service.lastReady?.pngMagic, "89504e47")
+        XCTAssertEqual(service.lastReady?.screenURL.host, "127.0.0.1")
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .dockerDesktop
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
+        XCTAssertEqual(vm.lastGuestScreenURL?.host, "127.0.0.1")
+        let shot = try service.observe(botID: piper.id)
+        XCTAssertEqual(shot.magic, "89504e47")
+        print("E2E_LOGICAL=1 E2E_BOT_BROWSER=1 E2E_DOCKER=1 PNG_MAGIC=\(shot.magic)")
+        service.teardown(botID: piper.id)
+    }
+
+    func test_ensureDockerGuestProvisionsThisBotOnLoopback() throws {
+        // WHY: Save of Docker-with-GUI must provision THIS bot and keep a
+        // 127.0.0.1 viewer URL. Tests that inject ready=true skip Docker.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        try vm.ensureDockerGuest(botID: piper.id)
+        XCTAssertEqual(vm.lastGuestScreenURL?.host, "127.0.0.1")
+        XCTAssertTrue(fake.created.contains(BotComputerGuestSpec.containerName(botID: piper.id)))
+        XCTAssertEqual(vm.guestScreenURL(for: piper.id)?.host, "127.0.0.1")
+        XCTAssertTrue(vm.isGuestRunning(piper.id))
+    }
+
+    func test_presentGuestDesktopPublishesLaunchProgressAndSupportsRetry() async throws {
+        // WHY: a slow or failed Docker launch must acknowledge the user's click
+        // immediately, reject duplicate starts, and leave a working retry path.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let fake = RecordingDocker()
+        fake.startError = BotComputerGuestError.dockerUnavailable
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+
+        vm.presentGuestDesktop(botID: piper.id)
+        XCTAssertEqual(vm.guestLaunchState(for: piper.id), .starting)
+        vm.presentGuestDesktop(botID: piper.id)
+
+        var deadline = Date().addingTimeInterval(2)
+        while vm.guestLaunchState(for: piper.id) == .starting, Date() < deadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(
+            vm.guestLaunchState(for: piper.id),
+            .failed("Could not start the Linux desktop. Make sure Docker is running, then try again.")
+        )
+        XCTAssertEqual(fake.startCallCount, 1, "an acknowledged start must suppress duplicate work")
+        XCTAssertFalse(vm.isGuestRunning(piper.id))
+
+        fake.startError = nil
+        vm.presentGuestDesktop(botID: piper.id)
+        XCTAssertEqual(vm.guestLaunchState(for: piper.id), .starting)
+
+        deadline = Date().addingTimeInterval(2)
+        while !vm.isGuestRunning(piper.id), Date() < deadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(vm.isGuestRunning(piper.id))
+        XCTAssertEqual(vm.guestLaunchState(for: piper.id), .idle)
+        XCTAssertEqual(fake.startCallCount, 2)
+        XCTAssertEqual(vm.guestScreenURL(for: piper.id)?.host, "127.0.0.1")
+    }
+
+    func test_dockerDesktopAdmissionStartsGuestOffMainAndFailsClosedUntilReady() async throws {
+        // WHY: pressing Send must never provision Docker synchronously on the
+        // SwiftUI main thread; admission stays closed while the shared launch
+        // task prepares and validates this bot's guest screen.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.desktopKindOverrideForTesting = .dockerDesktop
+        vm.dockerGuestReadyOverrideForTesting = nil
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+
+        XCTAssertThrowsError(try vm.admitDesktopSend(bot: piper))
+        XCTAssertEqual(vm.guestLaunchState(for: piper.id), .starting)
+        XCTAssertFalse(vm.send("open the linux screen"))
+        XCTAssertEqual(vm.errorMessage, "Linux desktop is starting. Try again when it is ready.")
+
+        let deadline = Date().addingTimeInterval(2)
+        while !vm.isGuestRunning(piper.id), Date() < deadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(vm.isGuestRunning(piper.id))
+        XCTAssertEqual(vm.guestLaunchState(for: piper.id), .idle)
+        XCTAssertEqual(fake.startCallCount, 1, "repeated admission must share the active launch")
+        XCTAssertNoThrow(try vm.admitDesktopSend(bot: piper))
+    }
+
+    func test_deskDockerGuestScreenLivesOnMainCanvas() throws {
+        // WHY: the live Linux screen belongs in the inspector desktop
+        // pane, not above the chat timeline.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let chat = source.range(of: "private func deskChat") else {
+            return XCTFail("desk chat must exist")
+        }
+        let paneStart = source.range(of: "private func deskDesktopPane")?.lowerBound ?? source.endIndex
+        let chatSlice = String(source[chat.lowerBound..<paneStart])
+        XCTAssertFalse(chatSlice.contains("BotComputerGuestCanvas"))
+        let pane = String(source[paneStart...].prefix(2200))
+        XCTAssertTrue(pane.contains("BotComputerGuestCanvas"))
+        XCTAssertTrue(pane.contains("bots.desk.desktop.guestScreen"))
+        XCTAssertTrue(pane.contains("bots.desk.desktop.start"))
+        XCTAssertTrue(source.contains("openGuestDesktopInNewWindow"))
+        let canvas = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotComputerGuestScreenView.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(canvas.contains("struct BotComputerGuestCanvas"))
+        XCTAssertTrue(canvas.contains("rectangle.on.rectangle"))
+        XCTAssertTrue(canvas.contains("bots.desk.desktop.openInNewWindow"))
+        XCTAssertTrue(canvas.contains("acceptsFirstResponder"))
+        XCTAssertFalse(canvas.contains("View-only noVNC"))
+    }
+
+    func test_guestCanvasAcknowledgesSlowStartAndOffersRetryAfterFailure() throws {
+        // WHY: Docker may need minutes to prepare the first desktop. The click
+        // must remain visibly acknowledged, and a failed launch must explain
+        // the recovery path instead of leaving the unchanged Start screen.
+        let canvas = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotComputerGuestScreenView.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(canvas.contains("ProgressView()"))
+        XCTAssertTrue(canvas.contains("Starting…"))
+        XCTAssertTrue(canvas.contains("Try Again"))
+        XCTAssertTrue(canvas.contains("First launch can take a few minutes"))
+    }
+
+    func test_filesLocationBarClaimsFullWidthForBothLocations() throws {
+        // WHY: Docker home happened to expand the bar through its explanatory
+        // HStack, while Bot files collapsed the same bar to the picker's width
+        // and floated it above only the editor pane.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private var filesTab") else {
+            return XCTFail("files tab must exist")
+        }
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n            Group {")?.lowerBound ?? rest.endIndex
+        let bar = String(rest[..<end])
+
+        XCTAssertTrue(
+            bar.contains(".frame(maxWidth: .infinity, alignment: .leading)"),
+            "the location bar must claim the full Files width even when Bot files has no descriptive row"
+        )
+    }
+
+    func test_guestCanvasOffersRebuildBeforeStopAndNoTerminalControl() throws {
+        // WHY: Dockerfile changes need an explicit safe apply action beside the
+        // running desktop; Terminal is unrelated and consumed scarce chrome.
+        let source = try String(
+            contentsOf: sourceURL("Sources/AppShell/BotComputerGuestScreenView.swift"),
+            encoding: .utf8
+        )
+        guard let start = source.range(of: "struct BotComputerGuestCanvas") else {
+            return XCTFail("guest canvas must exist")
+        }
+        let canvas = String(source[start.lowerBound...])
+        let rebuild = try XCTUnwrap(canvas.range(of: "Text(rebuilding ? \"Rebuilding…\" : \"Rebuild\")")?.lowerBound)
+        let stop = try XCTUnwrap(canvas.range(of: "Button(\"Stop\"")?.lowerBound)
+        XCTAssertLessThan(rebuild, stop, "Rebuild must sit immediately before Stop")
+        XCTAssertFalse(canvas.contains("Button(\"Terminal\""))
+    }
+
+    func test_detachedGuestDesktopPresentsRebuildFailureAlert() throws {
+        // WHY: the shared Rebuild control is also mounted in the detached
+        // desktop window, whose root must not silently swallow vm.errorMessage.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "private struct BotGuestDesktopRoot") else {
+            return XCTFail("detached guest root must exist")
+        }
+        let root = String(source[start.lowerBound...])
+        XCTAssertTrue(root.contains(".alert(\"Bots\""))
+        XCTAssertTrue(root.contains("vm.errorMessage"))
+    }
+
+    func test_rebuildDockerGuestPublishesProgressAndRejectsDuplicateWork() async throws {
+        // WHY: image builds can take minutes. The first click must acknowledge
+        // work immediately and a second click must not start a competing build.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        try vm.ensureDockerGuest(botID: bot.id)
+        fake.blocksBuild = true
+
+        vm.rebuildDockerGuest(botID: bot.id)
+        XCTAssertTrue(vm.isGuestRebuilding(bot.id))
+        XCTAssertEqual(fake.buildStarted.wait(timeout: .now() + 1), .success)
+        vm.rebuildDockerGuest(botID: bot.id)
+        XCTAssertEqual(fake.builds.count, 1, "a visible in-flight rebuild must reject duplicate clicks")
+        fake.allowBuild.signal()
+
+        let completed = await waitUntil(timeout: 2) { !vm.isGuestRebuilding(bot.id) }
+        XCTAssertTrue(completed)
+        XCTAssertEqual(
+            fake.builds,
+            [BotComputerGuestSpec.recipeURL(appSupport: context.appSupportDirectory, botID: bot.id)]
+        )
+        XCTAssertTrue(vm.isGuestRunning(bot.id))
+        XCTAssertEqual(vm.guestScreenURL(for: bot.id)?.host, "127.0.0.1")
+    }
+
+    func test_rebuildDockerGuestFailureKeepsCurrentDesktopRunning() async throws {
+        // WHY: a bad Dockerfile must report failure without taking down the
+        // already-running desktop that the user can still repair.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        try vm.ensureDockerGuest(botID: bot.id)
+        fake.startError = BotComputerGuestError.dockerUnavailable
+
+        vm.rebuildDockerGuest(botID: bot.id)
+
+        let completed = await waitUntil(timeout: 2) { !vm.isGuestRebuilding(bot.id) }
+        XCTAssertTrue(completed)
+        XCTAssertTrue(vm.isGuestRunning(bot.id), "the canonical desktop must survive a failed replacement")
+        XCTAssertEqual(
+            vm.errorMessage,
+            "Could not rebuild the Linux desktop. The current desktop is still running."
+        )
+    }
+
+    func test_guestCanvasStartingStateRendersOffscreen() throws {
+        // WHY: the acknowledged launch state must produce a real macOS view,
+        // not only compile-time copy that never reaches the rendered canvas.
+        let canvas = BotComputerGuestCanvas(
+            url: nil,
+            running: false,
+            rebuilding: false,
+            launchState: .starting,
+            startIdentifier: "test.desktop.start",
+            rebuildIdentifier: "test.desktop.rebuild",
+            stopIdentifier: "test.desktop.stop",
+            screenIdentifier: "test.desktop.screen",
+            onStart: {},
+            onRebuild: {},
+            onStop: {}
+        )
+        .frame(width: 360, height: 220)
+        let hosting = NSHostingView(rootView: canvas)
+        hosting.frame = NSRect(x: 0, y: 0, width: 360, height: 220)
+        hosting.wantsLayer = true
+        let window = NSWindow(
+            contentRect: hosting.bounds,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.layoutIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        guard let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
+            return XCTFail("starting canvas must create an offscreen bitmap")
+        }
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        XCTAssertGreaterThan(png.count, 2_000)
+        if let artifact = ProcessInfo.processInfo.environment["REMOTE_CODE_BOT_GUEST_ARTIFACT"] {
+            try png.write(to: URL(fileURLWithPath: artifact), options: .atomic)
+        }
+    }
+
+    func test_filesLocationBarRendersFullStudioWidthOffscreen() throws {
+        // WHY: the modifier contract is also rendered through the real Studio
+        // hierarchy so a passing source assertion cannot hide a broken view tree.
+        let (_, vm, bot, _) = try makeDockerStudio()
+        vm.setStudioFilesLocation(.botFiles, for: bot)
+        vm.studioTab = .files
+        let root = BotsRootView(vm: vm, embedsRosterRail: false)
+            .frame(width: 1_100, height: 760)
+        let hosting = NSHostingView(rootView: root)
+        hosting.frame = NSRect(x: 0, y: 0, width: 1_100, height: 760)
+        hosting.wantsLayer = true
+        let window = NSWindow(
+            contentRect: hosting.bounds,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.layoutIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+
+        let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        XCTAssertGreaterThan(png.count, 10_000)
+        if let artifact = ProcessInfo.processInfo.environment["REMOTE_CODE_BOT_FILES_LAYOUT_ARTIFACT"] {
+            try png.write(to: URL(fileURLWithPath: artifact), options: .atomic)
+        }
+    }
+
+    func test_guestCanvasRunningControlsRenderOffscreen() throws {
+        // WHY: Rebuild and Stop must materialize as macOS chrome, not only as
+        // source copy that disappears under a conditional running branch.
+        let canvas = BotComputerGuestCanvas(
+            url: nil,
+            running: true,
+            rebuilding: false,
+            launchState: .idle,
+            startIdentifier: "test.desktop.start",
+            rebuildIdentifier: "test.desktop.rebuild",
+            stopIdentifier: "test.desktop.stop",
+            screenIdentifier: "test.desktop.screen",
+            onStart: {},
+            onRebuild: {},
+            onStop: {}
+        )
+        .frame(width: 640, height: 220)
+        .background(Color.black)
+        .environment(\.colorScheme, .dark)
+        let hosting = NSHostingView(rootView: canvas)
+        hosting.frame = NSRect(x: 0, y: 0, width: 640, height: 220)
+        hosting.wantsLayer = true
+        let window = NSWindow(
+            contentRect: hosting.bounds,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.layoutIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        XCTAssertGreaterThan(png.count, 2_000)
+        if let artifact = ProcessInfo.processInfo.environment["REMOTE_CODE_BOT_GUEST_CONTROLS_ARTIFACT"] {
+            try png.write(to: URL(fileURLWithPath: artifact), options: .atomic)
+        }
+    }
+
+    func test_viewModelWiresBundledComputerGuestRecipe() throws {
+        // WHY: recipeContext=nil left Studio unable to build the bundled
+        // ComputerGuest image, so the Docker radio never enabled.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let wired = try XCTUnwrap(vm.computerGuestService?.recipeContextURL)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: wired.appendingPathComponent("Dockerfile").path)
+        )
+        let dockerfile = try String(
+            contentsOf: wired.appendingPathComponent("Dockerfile"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(dockerfile.lowercased().contains("debian"))
+    }
+
+    func test_thisMacRuntimesPersistWhenDockerIsUnavailable() throws {
+        // WHY: this-Mac create/save/send must work with Docker forced off.
+        // Docker-with-GUI Save/Send must be refused without a PNG.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.dockerGuestReadyOverrideForTesting = false
+        vm.computerGuestService = nil
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .logicalExecutionSpace
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .logicalExecutionSpace)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("use the default browser"))
+
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .botOwnedBrowser
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .botOwnedBrowser)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("use my own browser"))
+
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .dockerDesktop
+        XCTAssertThrowsError(try vm.saveStudio())
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .botOwnedBrowser)
+        vm.desktopKindOverrideForTesting = .dockerDesktop
+        XCTAssertFalse(vm.send("open the linux screen"))
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+    }
+
+    func test_saveStudioPersistsIdentityWhenPublishedDockerGuestIsNotReady() throws {
+        // WHY: LinkedIn Controller already published Docker GUI. Save Bot on
+        // Profile still threw notReady whenever the global proveReady probe
+        // had not finished, so name/description/instructions never persisted.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(piper)
+        vm.dockerGuestReadyOverrideForTesting = true
+        vm.studioDraft.desktopKind = .dockerDesktop
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
+
+        vm.dockerGuestReadyOverrideForTesting = false
+        vm.computerGuestService = nil
+        vm.studioDraft.name = "Piper Prime"
+        vm.studioDraft.title = "Night scout"
+        vm.studioDraft.description = "Identity only"
+        vm.studioDraft.soul = "Do the job. Ask when blocked."
+        let saved = try vm.saveStudio()
+        XCTAssertEqual(saved.name, "Piper Prime")
+        XCTAssertEqual(saved.title, "Night scout")
+        XCTAssertEqual(saved.description, "Identity only")
+        XCTAssertEqual(vm.selectedRevision?.soul, "Do the job. Ask when blocked.")
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
+        XCTAssertNil(vm.errorMessage)
+    }
+
+    func test_saveBotAlertKeepsStudioErrorCopy_becauseRawNotReadyMustNotSurface() throws {
+        // WHY: Save Bot overwrote saveStudio's "Docker desktop is not ready."
+        // with String(describing: BotComputerGuestError.notReady) → "notReady".
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.errorMessage = "Docker desktop is not ready."
+        vm.presentAlertError(BotComputerGuestError.notReady)
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+
+        vm.errorMessage = nil
+        vm.presentAlertError(BotComputerGuestError.notReady)
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+        XCTAssertNotEqual(vm.errorMessage, "notReady")
+
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("vm.presentAlertError(error)"))
+        XCTAssertTrue(source.contains("bots.studio.save"))
+    }
+
+    func test_leftoverDedicatedLocalVMDoesNotBecomeDockerWhenGuestReady() throws {
+        // WHY: leftover Dedicated local VM must stay leftover. A passing
+        // probe must not rewrite it into Docker with GUI.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(piper)
+        vm.dockerGuestReadyOverrideForTesting = true
+        vm.studioDraft.desktopKind = .dedicatedLocalVM
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .logicalExecutionSpace)
+        XCTAssertNotEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
+        XCTAssertFalse(
+            BotDesktopKind.dedicatedLocalVM.isSelectable(
+                flags: BotControlPlaneFlags(botsControlPlaneEnabled: true),
+                guestReady: true
+            )
+        )
+    }
+
+    func test_studioSavesBotOwnedAndDockerWhenReady() throws {
+        // WHY: the owner must persist this Mac bot browser without Docker,
+        // and Docker desktop only after the radio is enabled.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(piper)
+        vm.studioDraft.desktopKind = .botOwnedBrowser
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .botOwnedBrowser)
+
+        vm.dockerGuestReadyOverrideForTesting = true
+        vm.studioDraft.desktopKind = .dockerDesktop
+        try vm.saveStudio()
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
+    }
+
+    func test_dockerDesktopSendFailsClosedWithoutGuestPNG() throws {
+        // WHY: Codex advisor: published dockerDesktop must not compile/send
+        // HID on this Mac when the guest cannot return a PNG.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        vm.dockerGuestReadyOverrideForTesting = false
+        vm.desktopKindOverrideForTesting = .dockerDesktop
+        XCTAssertFalse(vm.send("open chrome"))
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+        vm.desktopKindOverrideForTesting = nil
+        vm.dockerGuestReadyOverrideForTesting = true
+        XCTAssertTrue(vm.send("open chrome"))
+    }
+
     func test_desktopLabelContainsNotIsolated_becauseP1aMustNotClaimAVM() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -4821,7 +7172,7 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(
             vm.desktopHonestyLabel,
-            "Same macOS account; not isolated. Not a dedicated Desktop."
+            BotDesktopKind.logicalExecutionSpaceHonestyLabel
         )
         XCTAssertTrue(
             BotDesktopKind.logicalExecutionSpaceHonestyLabel.lowercased().contains("not isolated")
@@ -5246,6 +7597,27 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(try store.refresh().items.filter { $0.route == .botsDesk(botID: piper.id) }.isEmpty)
     }
 
+    func test_deskWorkLogCardIsFullWidthOnItsOwnLine_becauseStatusCardsAreNotChatBubbles() throws {
+        // WHY: a 56pt timestamp gutter beside the Supervised-run panel left a
+        // hugging card. Status cards occupy one complete line at column width.
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = bots.range(of: "private func deskWorkLogRow") else {
+            return XCTFail("deskWorkLogRow must exist")
+        }
+        let rest = bots[start.lowerBound...]
+        let end = rest.range(of: "\n    private func workLogTone")?.lowerBound ?? rest.endIndex
+        let slice = String(bots[start.lowerBound..<end])
+        XCTAssertTrue(slice.contains("AgentChatStatusCard("))
+        XCTAssertFalse(
+            slice.contains("frame(width: 56"),
+            "work-log must not keep a timestamp column beside the panel"
+        )
+        XCTAssertFalse(
+            slice.contains("style: .time"),
+            "time lives inside the shared full-width card, not a Desk gutter"
+        )
+    }
+
     func test_deskTimelineUsesSharedAgentAppScrollContainer_becauseChatMustFollowTheSamePin() throws {
         // WHY: Desk used a plain ScrollView. Agent App pin/FAB/BOTTOM lived
         // only in AgentAppSurface, so send did not auto-scroll. Same control
@@ -5332,7 +7704,11 @@ final class BotsWindowTests: XCTestCase {
         guard case .workLog(let row) = withRun[1] else {
             return XCTFail("linked run must insert a work-log between You and the assistant")
         }
-        XCTAssertEqual(row.title, "Supervised run")
+        XCTAssertEqual(row.title, "\(AgentPermissionMode.supervised.displayName) run")
+        XCTAssertEqual(
+            BotsDeskFollowThrough.workLogRow(for: run, mode: .fullAccess).title,
+            "\(AgentPermissionMode.fullAccess.displayName) run"
+        )
         XCTAssertEqual(row.detail, "Claude · opus")
         XCTAssertEqual(row.statusLabel, "Working")
         XCTAssertEqual(BotsDeskFollowThrough.workLogStatusLabel(for: .completed), "Done")
@@ -6058,6 +8434,227 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.deskMessages.contains { $0.text == "P1a desk send check" })
     }
 
+    func test_askedBotDeskShowsFromHostChromeNotAskPrompt() throws {
+        // WHY: the asked bot Desk painted "Ceo asked you:" as a raw user
+        // bubble. It must show From <host> chrome and the actual ask.
+        let (vm, piper, quinn) = try makeMentionPair(peerReply: "PONG from Quinn")
+        XCTAssertTrue(vm.send("@\(quinn.handle) Pergunte ao bot seu nome e função"))
+        let inbound = try XCTUnwrap(
+            vm.deskTranscriptForTesting(botID: quinn.id).first { $0.role == .user }
+        )
+        XCTAssertEqual(inbound.peer?.direction, .fromPeer)
+        XCTAssertEqual(inbound.peer?.name, piper.name)
+        XCTAssertEqual(inbound.peer?.handle, piper.handle)
+        XCTAssertEqual(inbound.peer?.avatarSymbol, piper.avatarSymbol)
+        XCTAssertFalse(inbound.peer?.avatarSymbol.isEmpty == true)
+        XCTAssertEqual(inbound.peer?.caption, "From \(piper.name)")
+        XCTAssertEqual(inbound.text, "@\(quinn.handle) Pergunte ao bot seu nome e função")
+        XCTAssertFalse(inbound.text.contains("asked you:"))
+        XCTAssertFalse(BotPeerTranscript.isPeerAskUserText(inbound.text))
+    }
+
+    func test_restoreHidesPeerAskPromptAndKeepsFromHostChrome() throws {
+        // WHY: the asked bot's thread stores the internal "Piper asked you:"
+        // provider line. Reload must not paint that wrapper, and must keep
+        // From-host chrome from the handoff.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("@\(quinn.handle) Pergunte ao bot seu nome e função"))
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(quinn)
+        XCTAssertFalse(
+            reopened.deskMessages.contains { BotPeerTranscript.isPeerAskUserText($0.text) },
+            "internal peer-ask prompt must not paint as a Desk bubble"
+        )
+        let inbound = try XCTUnwrap(reopened.deskMessages.first { $0.role == .user })
+        XCTAssertEqual(inbound.peer?.direction, .fromPeer)
+        XCTAssertEqual(inbound.peer?.name, piper.name)
+        XCTAssertEqual(inbound.peer?.handle, piper.handle)
+        XCTAssertEqual(inbound.peer?.avatarSymbol, piper.avatarSymbol)
+        XCTAssertTrue(inbound.text.contains("Pergunte ao bot seu nome e função"))
+        XCTAssertFalse(inbound.text.contains("asked you:"))
+    }
+
+    func test_waitingOriginRosterShowsWorkingSpinner() async throws {
+        // WHY: Ceo stayed Needs you in the roster while the transcript
+        // already said Waiting for Bot. Both endpoints of a live wait
+        // must show Working with the busy spinner.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.claude)
+        XCTAssertTrue(vm.send("@\(quinn.handle) WAIT_SPINNER ask the peer"))
+        let peerBecameActive = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("WAIT_SPINNER") }
+                && vm.peerHandoffSnapshotsForTesting().contains { $0.phase == .peerRunning }
+        }
+        XCTAssertTrue(peerBecameActive, "the peer start must persist .peerRunning before roster is judged")
+        XCTAssertEqual(vm.attentionState(for: piper), .working)
+        XCTAssertEqual(vm.attentionState(for: quinn), .working)
+        XCTAssertTrue(BotsChrome.rosterShowsBusySpinner(for: vm.attentionState(for: piper)))
+        XCTAssertTrue(BotsChrome.rosterShowsBusySpinner(for: vm.attentionState(for: quinn)))
+    }
+
+    func test_sendWithMentionStoresPeerAvatar() throws {
+        // WHY: hop chrome used initials because BotDeskPeer dropped the
+        // blobatar token. The peer row must carry the published symbol.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp"))
+        let outbound = try XCTUnwrap(vm.deskMessages.last)
+        XCTAssertEqual(outbound.peer?.avatarSymbol, quinn.avatarSymbol)
+        XCTAssertFalse(outbound.peer?.avatarSymbol.isEmpty == true)
+    }
+
+    func test_restoreDeskMessagesHidesHostHopPrompt() throws {
+        // WHY: the host hop is an internal prompt. Restoring it as a user
+        // bubble showed raw markdown ("Bot replied: **Nome:**") on Desk.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let thread = AgentThread(title: "Ask", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "Pergunte ao bot seu nome",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: BotPeerTranscript.hostHopPrompt(
+                peerName: "Bot",
+                reply: "**Nome:** Bot\n**Cargo:** vazio",
+                userText: "Pergunte ao bot seu nome"
+            ),
+            createdAt: Date(timeIntervalSince1970: 1_700_000_010)
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Pergunte ao bot seu nome", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.deskMessages.contains { $0.text == "Pergunte ao bot seu nome" })
+        XCTAssertFalse(
+            vm.deskMessages.contains { BotPeerTranscript.isHostHopUserText($0.text) },
+            "internal hop prompt must not paint as a Desk bubble"
+        )
+        XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("**Nome:**") })
+    }
+
+    func test_openingAnotherThreadDoesNotKeepPreviousLiveTurns_becauseEachConversationOwnsItsThread() throws {
+        // WHY: liveTimelineByBot kept a hop's Worked rows after the user
+        // opened a new Desk thread on the same teammate.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+
+        let mentionThread = AgentThread(title: "Mention", provider: .claude, model: "opus")
+        let oiThread = AgentThread(title: "oi", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(mentionThread)
+        try context.threadRepo.upsert(oiThread)
+        let mentionRun = AgentRun(
+            threadId: mentionThread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_010),
+            finishedAt: Date(timeIntervalSince1970: 1_700_000_040)
+        )
+        let oiRun = AgentRun(
+            threadId: oiThread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_110),
+            finishedAt: Date(timeIntervalSince1970: 1_700_000_120)
+        )
+        try context.runRepo.upsert(mentionRun)
+        try context.runRepo.upsert(oiRun)
+        try persistStreamEvents(
+            context: context,
+            run: mentionRun,
+            events: [
+                .turnStarted(turnId: "mention-turn"),
+                .itemStarted(item: AssistantItem(
+                    id: "mention-tool",
+                    turnId: "mention-turn",
+                    type: .tool,
+                    state: .completed,
+                    summary: "Bash",
+                    startedAtMs: 1_700_000_010_000,
+                    finishedAtMs: 1_700_000_020_000
+                )),
+                .turnCompleted(turnId: "mention-turn", finalMessage: "I'll treat this as a CEO test run"),
+            ]
+        )
+        try persistStreamEvents(
+            context: context,
+            run: oiRun,
+            events: [
+                .turnStarted(turnId: "oi-turn"),
+                .turnCompleted(turnId: "oi-turn", finalMessage: "Oi. Sou o Ceo."),
+            ]
+        )
+        try context.messageRepo.append(AgentMessage(
+            threadId: mentionThread.id,
+            role: .user,
+            content: "Pergunte ao bot",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        try context.messageRepo.append(AgentMessage(
+            threadId: oiThread.id,
+            role: .user,
+            content: "oi",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_100)
+        ))
+        let mentionConversation = BotConversation(
+            botID: piper.id,
+            title: "Pergunte ao bot",
+            linkedAgentThreadID: mentionThread.id
+        )
+        let oiConversation = BotConversation(
+            botID: piper.id,
+            title: "oi",
+            linkedAgentThreadID: oiThread.id
+        )
+        try context.botStore.upsertConversation(mentionConversation)
+        try context.botStore.upsertConversation(oiConversation)
+
+        vm.openDesk(piper)
+        vm.selectDeskThread(mentionConversation.id)
+        XCTAssertTrue(
+            vm.deskLiveTimeline.turns.contains { $0.finalAssistantMessage == "I'll treat this as a CEO test run" },
+            "mention thread must replay its own live turn"
+        )
+
+        vm.selectDeskThread(oiConversation.id)
+        XCTAssertFalse(
+            vm.deskLiveTimeline.turns.contains { $0.finalAssistantMessage == "I'll treat this as a CEO test run" },
+            "oi must not inherit the mention thread's richer live timeline"
+        )
+        XCTAssertTrue(
+            vm.deskLiveTimeline.turns.contains { $0.finalAssistantMessage == "Oi. Sou o Ceo." }
+        )
+        XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("Pergunte") })
+        XCTAssertTrue(vm.deskMessages.contains { $0.text == "oi" })
+    }
+
     func test_deskTimelineKeepsEachTurnBesideItsUser_becauseChatIsNotTwoColumns() {
         // WHY: replay used Date() as turnStarted, so every Worked row sorted
         // to now and all user bubbles stacked on the right.
@@ -6521,7 +9118,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
         XCTAssertEqual(saved.notificationsEnabled, false)
         XCTAssertEqual(vm.studioRouteLabel, "Grok")
-        XCTAssertEqual(vm.studioDesktopSummary, "Logical execution space")
+        XCTAssertEqual(vm.studioDesktopSummary, BotDesktopKind.logicalExecutionSpace.displayTitle)
         XCTAssertEqual(vm.studioApprovalLabel, "Supervised")
     }
 
@@ -6774,7 +9371,7 @@ final class BotsWindowTests: XCTestCase {
         vm.beginEdit(bot)
         vm.studioDraft.desktopKind = .dedicatedLocalVM
         XCTAssertEqual(vm.displayedDesktopKind, .logicalExecutionSpace)
-        XCTAssertEqual(vm.studioDesktopSummary, "Logical execution space")
+        XCTAssertEqual(vm.studioDesktopSummary, BotDesktopKind.logicalExecutionSpace.displayTitle)
         XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
 
         let saved = try vm.saveStudio()
@@ -6855,7 +9452,7 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
         XCTAssertEqual(vm.displayedDesktopKind, .logicalExecutionSpace)
-        XCTAssertEqual(vm.studioDesktopSummary, "Logical execution space")
+        XCTAssertEqual(vm.studioDesktopSummary, BotDesktopKind.logicalExecutionSpace.displayTitle)
     }
 
     func test_studioDoesNotPersistManagedRemoteMac_becauseItIsNotAdvertised() throws {
@@ -7136,12 +9733,13 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(chatChrome.contains("arrow.up"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.timeline\")"))
-        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.workLog\")"))
+        XCTAssertTrue(bots.contains("AgentChatStatusCard("))
+        XCTAssertTrue(bots.contains("\"bots.desk.workLog\""))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop.honesty\")"))
         XCTAssertTrue(
-            bots.contains(".accessibilityElement(children: .ignore)"),
-            "Desk desktop pane must be one VoiceOver name, not the honesty line four times"
+            bots.contains("bots.desk.desktop.guestScreen"),
+            "Docker GUI must expose the live screen in the inspector desktop pane"
         )
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.name\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.handle\")"))
@@ -7154,9 +9752,13 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.inspector\")"))
         XCTAssertTrue(bots.contains("bots.studio.tab.brain"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.brain"))
+        XCTAssertFalse(
+            bots.contains("ForEach(BotDeskInspectorTab.allCases"),
+            "A single user-facing tab must render as a header, not a dead one-chip strip"
+        )
         XCTAssertTrue(
-            bots.contains("ForEach(BotDeskInspectorTab.allCases.filter(\\.isUserFacing))"),
-            "Brain stays on the enum for leftover persist; the Desk inspector strip must not render it"
+            bots.contains("Text(resolvedInspectorTab.title)"),
+            "The Desk inspector header must resolve through the leftover-persist remap"
         )
         XCTAssertFalse(bots.contains("bots.desk.inspector.tab.memory"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.routines"))
@@ -7219,6 +9821,13 @@ final class BotsWindowTests: XCTestCase {
             sidebar.contains("BotsModeSwitcher"),
             "Bots is entered from the Agentic/Bots switcher, not a dest row"
         )
+    }
+
+    func test_modeSwitcherShowsWorkspaces_becauseUsersSeeWorkspaceModeNotInternalAgenticName() {
+        // WHY: the left mode is the workspace list. Shipping "Agentic" as the
+        // visible tab name was product jargon; the control must say Workspaces.
+        XCTAssertEqual(BotsChrome.Label.agentic, "Workspaces")
+        XCTAssertEqual(BotsChrome.Label.bots, "Bots")
     }
 
     func test_botsRosterMenusMatchAgentic_becauseBotsChromeMirrorsWorkspaceActions() throws {
@@ -7376,6 +9985,158 @@ final class BotsWindowTests: XCTestCase {
         }
     }
 
+    private func fullReloadCounts(_ viewModel: BotsViewModel) -> [Int] {
+        [
+            viewModel.fleetReloadCountForTesting,
+            viewModel.studioSupportReloadCountForTesting,
+        ]
+    }
+
+    private func peerHandoffPerformancePayload(
+        rowCount: Int,
+        targetOriginBotID: BotID
+    ) throws -> (data: Data, targetActivityID: UUID, siblingActivityID: UUID) {
+        precondition(rowCount >= 2)
+        let targetActivityID = UUID()
+        let siblingActivityID = UUID()
+        let retainedOriginBotID = BotID()
+        let route = T005PeerHandoffRouteFixture(
+            provider: .codex,
+            providerInstanceID: "codex",
+            model: "t005-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            serviceTier: .auto,
+            runAsUser: AgentRunAsUser(
+                generatedUID: "t005-fixture",
+                shortName: "fixture",
+                uid: 0,
+                gid: 0,
+                homePath: "/tmp/t005-fixture"
+            ),
+            routingConfiguration: nil
+        )
+        var rows: [UUID: T005PeerHandoffRecordFixture] = [:]
+        rows.reserveCapacity(rowCount)
+        for index in 0..<rowCount {
+            let activityID: UUID
+            if index == 0 {
+                activityID = targetActivityID
+            } else if index == 1 {
+                activityID = siblingActivityID
+            } else {
+                activityID = UUID()
+            }
+            rows[activityID] = T005PeerHandoffRecordFixture(
+                version: 2,
+                activityID: activityID,
+                originBotID: index == 0 ? targetOriginBotID : retainedOriginBotID,
+                originConversationID: nil,
+                originAgentThreadID: nil,
+                peerBotID: BotID(),
+                peerConversationID: BotConversationID(),
+                peerThreadID: nil,
+                peerRunID: nil,
+                inboundMessageID: activityID,
+                peerName: "Peer \(index)",
+                peerTitle: "Performance fixture",
+                peerHandle: "peer-\(index)",
+                outboundText: "retained row \(index)",
+                createdAt: Date(timeIntervalSinceReferenceDate: Double(index)),
+                peerRoute: route,
+                hostThreadID: nil,
+                hostRunID: nil,
+                hostRoute: nil,
+                replyText: "completed row \(index)",
+                replyCreatedAt: Date(timeIntervalSinceReferenceDate: Double(index + 1)),
+                phase: .completed
+            )
+        }
+        return (
+            try JSONEncoder().encode(rows),
+            targetActivityID,
+            siblingActivityID
+        )
+    }
+
+    private func measurePeerHandoffDeletion(
+        label: String,
+        payload: Data,
+        targetOriginBotID: BotID,
+        targetActivityID: UUID,
+        siblingActivityID: UUID
+    ) throws -> Double {
+        let root = URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent("peer-perf-\(label)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        UserDefaults.standard.set(payload, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+        let (_, db) = try Bootstrap(
+            channel: .debug,
+            appSupportOverride: root.path
+        ).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedMessageRepo = AgentQueuedMessageRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let settingsRepo = SettingsRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            checkpointRepo: checkpointRepo,
+            providers: [:]
+        )
+        var authority: BotPeerHandoffAuthority? = BotPeerHandoffAuthority(
+            botStore: BotStore(db: db),
+            threadRepo: threadRepo,
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            queuedMessageRepo: queuedMessageRepo,
+            checkpointRepo: checkpointRepo,
+            settingsRepo: settingsRepo,
+            coordinator: coordinator,
+            appSupportDirectory: root
+        )
+        weak var releasedAuthority = authority
+        let deletion = try XCTUnwrap(authority).beginDeletion(originBotID: targetOriginBotID)
+
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let committed = try XCTUnwrap(authority).commitDeletion(deletion)
+        let finishedAt = DispatchTime.now().uptimeNanoseconds
+        XCTAssertTrue(committed, "\(label) must commit through the production authority path")
+
+        let storedPayload = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"))
+        let retained = try JSONDecoder().decode(
+            [UUID: T005PeerHandoffRecordFixture].self,
+            from: storedPayload
+        )
+        XCTAssertEqual(retained.count, 999, "\(label) must retain exactly 999 supported v2 rows")
+        XCTAssertNil(retained[targetActivityID], "\(label) must delete the exact selected row")
+        XCTAssertNotNil(retained[siblingActivityID], "\(label) must preserve an unrelated sibling")
+        XCTAssertEqual(
+            try settingsRepo.get("bots.peerTurns.v2"),
+            "base64:\(storedPayload.base64EncodedString())",
+            "\(label) SQLite and mirror must describe the same committed envelope"
+        )
+
+        authority = nil
+        XCTAssertNil(releasedAuthority, "\(label) must not accumulate an authority between samples")
+        return Double(finishedAt - startedAt) / 1_000_000
+    }
+
+    private func percentile(_ samples: [Double], fraction: Double) -> Double {
+        let sorted = samples.sorted()
+        let index = max(0, Int(ceil(Double(sorted.count) * fraction)) - 1)
+        return sorted[index]
+    }
+
     private func makeContext() throws -> AppContext {
         try AppContext(channel: .debug, appSupportOverride: directory)
     }
@@ -7396,6 +10157,24 @@ final class BotsWindowTests: XCTestCase {
         return (vm, piper, quinn)
     }
 
+    private func makeDockerStudio() throws -> (AppContext, BotsViewModel, BotDefinition, RecordingDocker) {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let docker = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = true
+        let created = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openStudio(created)
+        vm.studioDraft.desktopKind = .dockerDesktop
+        let bot = try vm.saveStudio()
+        return (context, vm, bot, docker)
+    }
+
     private func waitUntil(timeout: TimeInterval, _ predicate: () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -7411,5 +10190,167 @@ final class BotsWindowTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent(relative)
+    }
+}
+
+private struct T005PeerHandoffRouteFixture: Codable, Equatable {
+    let provider: AgentProvider
+    let providerInstanceID: String
+    let model: String
+    let permissionMode: AgentPermissionMode
+    let reasoningEffort: AgentReasoningEffort
+    let serviceTier: AgentServiceTier
+    let runAsUser: AgentRunAsUser
+    let routingConfiguration: AgentRoutingConfiguration?
+}
+
+private struct T005PeerHandoffRecordFixture: Codable, Equatable {
+    let version: Int
+    let activityID: UUID
+    let originBotID: BotID?
+    let originConversationID: BotConversationID?
+    let originAgentThreadID: AgentThreadID?
+    let peerBotID: BotID
+    let peerConversationID: BotConversationID
+    let peerThreadID: AgentThreadID?
+    let peerRunID: AgentRunID?
+    let inboundMessageID: UUID
+    let peerName: String
+    let peerTitle: String
+    let peerHandle: String
+    let outboundText: String
+    let createdAt: Date
+    let peerRoute: T005PeerHandoffRouteFixture
+    let hostThreadID: AgentThreadID?
+    let hostRunID: AgentRunID?
+    let hostRoute: T005PeerHandoffRouteFixture?
+    let replyText: String?
+    let replyCreatedAt: Date?
+    let phase: BotPeerHandoffPhase
+}
+
+final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider
+
+    private struct PendingRun {
+        let request: AgentRunRequest
+        let turnID: String
+        let onEvent: @Sendable (AgentRunEvent) -> Void
+    }
+
+    private let lock = NSLock()
+    private var pendingByRunID: [AgentRunID: PendingRun] = [:]
+    private var capturedRequests: [AgentRunRequest] = []
+    private var capturedCancellationRequests: [AgentRunID] = []
+    private let defersCancellationForTesting: Bool
+
+    init(provider: AgentProvider, defersCancellationForTesting: Bool = false) {
+        self.provider = provider
+        self.defersCancellationForTesting = defersCancellationForTesting
+    }
+
+    var requests: [AgentRunRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedRequests
+    }
+
+    var cancellationRequestedRunIDs: [AgentRunID] {
+        lock.withLock { capturedCancellationRequests }
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        let turnID = "turn-\(request.runId.value.uuidString.lowercased())"
+        lock.lock()
+        capturedRequests.append(request)
+        pendingByRunID[request.runId] = PendingRun(
+            request: request,
+            turnID: turnID,
+            onEvent: onEvent
+        )
+        lock.unlock()
+
+        let providerThreadID = request.providerThreadId ?? request.threadId.value.uuidString
+        onEvent(.status(.running))
+        onEvent(.event(.threadStarted(
+            threadId: providerThreadID,
+            providerThreadId: providerThreadID
+        )))
+        onEvent(.event(.turnStarted(turnId: turnID)))
+        return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
+            guard let self else { return }
+            if self.defersCancellationForTesting {
+                self.lock.withLock {
+                    self.capturedCancellationRequests.append(request.runId)
+                }
+                return
+            }
+            _ = self.finish(runID: request.runId, status: .cancelled, reply: nil)
+        }
+    }
+
+    @discardableResult
+    func finish(
+        promptContaining marker: String,
+        status: AgentRunStatus = .completed,
+        reply: String?
+    ) -> Bool {
+        let runID: AgentRunID?
+        lock.lock()
+        runID = capturedRequests.first {
+            $0.prompt.contains(marker) && pendingByRunID[$0.runId] != nil
+        }?.runId
+        lock.unlock()
+        guard let runID else { return false }
+        return finish(runID: runID, status: status, reply: reply)
+    }
+
+    @discardableResult
+    func finish(
+        runID: AgentRunID,
+        status: AgentRunStatus,
+        reply: String?
+    ) -> Bool {
+        let pending: PendingRun?
+        lock.lock()
+        pending = pendingByRunID.removeValue(forKey: runID)
+        lock.unlock()
+        guard let pending else { return false }
+
+        let providerThreadID = pending.request.providerThreadId
+            ?? pending.request.threadId.value.uuidString
+        if status == .completed, let reply {
+            let itemID = "assistant-\(runID.value.uuidString.lowercased())"
+            pending.onEvent(.event(.itemStarted(item: AssistantItem(
+                id: itemID,
+                turnId: pending.turnID,
+                type: .assistantMessage,
+                startedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            ))))
+            pending.onEvent(.event(.itemDelta(
+                itemId: itemID,
+                bodyAppend: reply,
+                outputAppend: nil,
+                summary: nil
+            )))
+            pending.onEvent(.event(.itemCompleted(itemId: itemID, finalState: .completed)))
+            pending.onEvent(.event(.turnCompleted(turnId: pending.turnID, finalMessage: reply)))
+        } else if status == .completed {
+            pending.onEvent(.event(.turnCompleted(turnId: pending.turnID, finalMessage: nil)))
+        } else if status == .failed {
+            pending.onEvent(.event(.error(message: "controlled failure", recoverable: false)))
+        }
+        pending.onEvent(.status(status))
+        pending.onEvent(.finished(
+            status,
+            finalMessage: status == .completed ? reply : nil,
+            providerThreadId: providerThreadID
+        ))
+        return true
     }
 }

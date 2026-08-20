@@ -129,6 +129,42 @@ enum AppShellResourceBundle {
         return urls
     }
 
+    /// First-party Docker guest recipe (`Dockerfile` + start scripts).
+    /// Prefer the packaged AppShell resource bundle; fall back to the
+    /// source tree so Studio can build `remotecode/computer:local` in
+    /// `swift test` and local checkouts without `Bundle.module`.
+    static func computerGuestRecipeURL(
+        fileManager: FileManager = .default
+    ) -> URL? {
+        var candidates: [URL] = []
+        if let bundle = try? bundle() {
+            if let url = bundle.url(forResource: "ComputerGuest", withExtension: nil) {
+                candidates.append(url)
+            }
+            if let resources = bundle.resourceURL {
+                candidates.append(resources.appendingPathComponent("ComputerGuest"))
+            }
+            candidates.append(bundle.bundleURL.appendingPathComponent("ComputerGuest"))
+        }
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources", isDirectory: true)
+            .appendingPathComponent("ComputerGuest", isDirectory: true)
+        candidates.append(source)
+
+        var seen = Set<String>()
+        for url in candidates {
+            let path = url.standardizedFileURL.path
+            if seen.contains(path) { continue }
+            seen.insert(path)
+            let dockerfile = url.appendingPathComponent("Dockerfile")
+            if fileManager.fileExists(atPath: dockerfile.path) {
+                return url
+            }
+        }
+        return nil
+    }
+
     static func locate(
         main: Bundle = .main,
         fileManager: FileManager = .default,

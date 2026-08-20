@@ -146,7 +146,8 @@ let package = Package(
             path: "Sources/AppShell",
             exclude: ["RemoteCode.entitlements"],
             resources: [
-                .copy("Resources/Pet")
+                .copy("Resources/Pet"),
+                .copy("Resources/ComputerGuest")
             ],
             linkerSettings: [
                 .linkedFramework("IOKit")

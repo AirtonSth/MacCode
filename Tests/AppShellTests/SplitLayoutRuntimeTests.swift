@@ -21,9 +21,9 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         return nil
     }
 
-    private func findRootSplit(_ v: NSView) -> NSSplitView? {
-        if let s = v as? NSSplitView { return s }
-        for sub in v.subviews { if let f = findRootSplit(sub) { return f } }
+    private func findShellSidebar(_ v: NSView) -> NSView? {
+        if v.accessibilityIdentifier() == "shell.sidebar" { return v }
+        for sub in v.subviews { if let f = findShellSidebar(sub) { return f } }
         return nil
     }
 
@@ -156,20 +156,20 @@ final class SplitLayoutRuntimeTests: XCTestCase {
                              "the pane must be visibly expanded again after restore")
     }
 
-    func test_sidebarDividerCanResizeWorkspaceList() throws {
+    func test_sidebarSeamHandleCanResizeWorkspaceList() throws {
         let (ctx, _, wc) = try makeWindowController()
         _ = ctx
         defer { closeAndUnregisterAllSurfaces() }
         wc.window.setContentSize(NSSize(width: 1200, height: 800))
         drainMainQueue()
         wc.window.contentView?.layoutSubtreeIfNeeded()
-        let split = try XCTUnwrap(findRootSplit(wc.window.contentView!))
+        let sidebar = try XCTUnwrap(findShellSidebar(wc.window.contentView!))
 
-        split.setPosition(340, ofDividerAt: 0)
-        split.layoutSubtreeIfNeeded()
+        wc.sidebarDragUpdated(toWidth: 340)
+        wc.window.contentView?.layoutSubtreeIfNeeded()
 
-        XCTAssertEqual(split.subviews.first?.frame.width ?? 0, 340, accuracy: 2,
-                       "the workspace sidebar divider must be resizable; a fixed sidebar width makes the user drag do nothing")
+        XCTAssertEqual(sidebar.frame.width, 340, accuracy: 0.01,
+                       "the seam handle must resize the sidebar; a fixed sidebar width makes the user drag do nothing")
     }
 
     func test_sidebarDefaultWidthMatchesDesignUntilUserResizes() throws {
@@ -179,10 +179,10 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         wc.window.setContentSize(NSSize(width: 1200, height: 800))
         drainMainQueue()
         wc.window.contentView?.layoutSubtreeIfNeeded()
-        let split = try XCTUnwrap(findRootSplit(wc.window.contentView!))
+        let sidebar = try XCTUnwrap(findShellSidebar(wc.window.contentView!))
 
-        XCTAssertEqual(split.subviews.first?.frame.width ?? 0, 444, accuracy: 2,
-                       "fresh windows must use the product sidebar width instead of inheriting a transient oversized split width")
+        XCTAssertEqual(sidebar.frame.width, 444, accuracy: 0.01,
+                       "fresh windows must use the product sidebar width instead of inheriting a transient oversized width")
     }
 
     func test_sidebarUserWidthPersistsAcrossWindowRecreation() throws {
@@ -198,23 +198,23 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         first.window.setContentSize(NSSize(width: 1200, height: 800))
         drainMainQueue()
         first.window.contentView?.layoutSubtreeIfNeeded()
-        let split = try XCTUnwrap(findRootSplit(first.window.contentView!))
-        split.setPosition(360, ofDividerAt: 0)
-        split.layoutSubtreeIfNeeded()
-        drainMainQueue(seconds: 0.35)
-        XCTAssertEqual(split.subviews.first?.frame.width ?? 0, 360, accuracy: 2,
+        let sidebar = try XCTUnwrap(findShellSidebar(first.window.contentView!))
+        first.sidebarDragUpdated(toWidth: 360)
+        first.sidebarDragEnded()
+        first.window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertEqual(sidebar.frame.width, 360, accuracy: 0.01,
                        "the first window must finish the user resize before persistence is evaluated")
-        XCTAssertEqual(MainWindowController.storedSidebarWidth(context: ctx), 360, accuracy: 2,
-                       "the debounced width must be durable before a replacement window reads it")
+        XCTAssertEqual(MainWindowController.storedSidebarWidth(context: ctx), 360, accuracy: 0.01,
+                       "the drag-end width must be durable before a replacement window reads it")
 
         let second = MainWindowController(context: ctx, router: router)
         Self.retainedWindowControllers.append(second)
         second.window.setContentSize(NSSize(width: 1200, height: 800))
         drainMainQueue()
         second.window.contentView?.layoutSubtreeIfNeeded()
-        let restored = try XCTUnwrap(findRootSplit(second.window.contentView!))
+        let restored = try XCTUnwrap(findShellSidebar(second.window.contentView!))
 
-        XCTAssertEqual(restored.subviews.first?.frame.width ?? 0, 360, accuracy: 2,
+        XCTAssertEqual(restored.frame.width, 360, accuracy: 0.01,
                        "after the user resizes the sidebar, later windows must restore that user-defined width")
     }
 }

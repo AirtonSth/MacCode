@@ -432,6 +432,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var acquireQueueDrainSuppression: ((AgentThreadID) async -> UUID)?
     public var acquireQueueDrainSuppressions: (([AgentThreadID]) async -> [(AgentThreadID, UUID)])?
     public var releaseQueueDrainSuppression: ((AgentThreadID, UUID) -> Void)?
+    /// Process-local bot handoff fence spanning provider stop and relational delete.
+    /// The host commits the exact retirement only after the source delete succeeds.
+    public var beginBotPeerHandoffDeletion: ((Set<AgentThreadID>) -> UUID)?
+    public var finishBotPeerHandoffDeletion: ((UUID, Bool) -> Void)?
     /// UX-MAC_AGENT-OPEN-SPLIT: wired by AppCommandRouter. A clicked file mention
     /// (absolute path, already resolved) opens — or reuses — a Files split panel
     /// to the right of this surface.
@@ -5216,6 +5220,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func deleteThreads(_ ids: Set<AgentThreadID>) async -> Bool {
         guard !ids.isEmpty else { return true }
         let orderedIDs = ids.sorted { $0.value.uuidString < $1.value.uuidString }
+        let handoffDeletion = beginBotPeerHandoffDeletion?(ids)
+        var didFinishHandoffDeletion = false
+        defer {
+            if let handoffDeletion, !didFinishHandoffDeletion {
+                finishBotPeerHandoffDeletion?(handoffDeletion, false)
+            }
+        }
         let suppressionLeases: [(AgentThreadID, UUID)]
         if let acquireQueueDrainSuppressions {
             suppressionLeases = await acquireQueueDrainSuppressions(orderedIDs)
@@ -5264,6 +5275,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } catch {
             statusMessage = "Could not delete thread data: \(error)"
             return false
+        }
+        if let handoffDeletion {
+            finishBotPeerHandoffDeletion?(handoffDeletion, true)
+            didFinishHandoffDeletion = true
         }
         let undo = ThreadDeletionUndo(
             snapshots: relationalSnapshot.threads.map { .init(thread: $0, messages: []) },
@@ -6178,51 +6193,107 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         Task { await onDispatchBotMentions(peers, text, threadId) }
     }
 
-    public func presentBotPeerMessage(peer: BotDefinition, text: String, threadId: AgentThreadID) {
+    @discardableResult
+    public func presentBotPeerActivity(
+        peer: BotDefinition,
+        phase: BotPeerActivityPhase,
+        threadId: AgentThreadID,
+        replacing replacementID: AgentMessageID? = nil
+    ) -> AgentMessageID? {
+        presentBotPeerContent(
+            BotPeerTranscript.encodeActivity(peer: peer, phase: phase),
+            threadId: threadId,
+            replacing: replacementID
+        )
+    }
+
+    @discardableResult
+    public func presentBotPeerMessage(
+        peer: BotDefinition,
+        text: String,
+        threadId: AgentThreadID,
+        replacing replacementID: AgentMessageID? = nil
+    ) -> AgentMessageID? {
+        presentBotPeerContent(
+            BotPeerTranscript.encode(peer: peer, text: text),
+            threadId: threadId,
+            replacing: replacementID
+        )
+    }
+
+    /// Applies one already-verified durable peer row without changing the
+    /// selected thread, composer draft, or focus state.
+    public func applyPersistedBotPeerMessage(
+        messageID: AgentMessageID,
+        threadId: AgentThreadID
+    ) {
+        guard let thread = try? threadRepo.get(id: threadId),
+              thread.workspaceId == workspaceID,
+              let message = try? messageRepo.get(id: messageID),
+              message.threadId == threadId,
+              message.role == .assistant else { return }
+        if selectedThreadId == threadId {
+            if let index = messages.firstIndex(where: { $0.id == messageID }) {
+                messages[index] = message
+            } else {
+                messages.append(message)
+            }
+        }
+        scheduleReloadThreads(delayMilliseconds: 0)
+    }
+
+    private func presentBotPeerContent(
+        _ content: String,
+        threadId: AgentThreadID,
+        replacing replacementID: AgentMessageID?
+    ) -> AgentMessageID? {
+        let messageID = replacementID ?? AgentMessageID()
+        let existing = messages.first(where: { $0.id == messageID })
+            ?? (try? messageRepo.get(id: messageID))
         let message = AgentMessage(
+            id: messageID,
             threadId: threadId,
             role: .assistant,
-            content: BotPeerTranscript.encode(peer: peer, text: text)
+            content: content,
+            createdAt: existing?.createdAt ?? Date()
         )
         do {
             try messageRepo.append(message)
+            guard let stored = try messageRepo.get(id: messageID),
+                  stored.threadId == threadId,
+                  stored.role == .assistant,
+                  stored.content == content else {
+                statusMessage = "The bot reply could not be verified."
+                return nil
+            }
         } catch {
             statusMessage = String(describing: error)
-            return
+            return nil
         }
-        guard selectedThreadId == threadId else { return }
-        messages.append(message)
-    }
-
-    /// Hop-1 after a mentioned bot replies. No `@handle` so dispatch cannot loop.
-    /// Queues without consuming the composer draft when this thread is live.
-    public func sendBotPeerFollowUp(text: String, threadId: AgentThreadID) async {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, selectedThreadId == threadId else { return }
-        if selectedThreadCanQueuePrompt, let queuedMessageRepo {
+        guard selectedThreadId == threadId else {
             do {
-                let routing = (try? threadRepo.get(id: threadId))?.effectiveRoutingConfiguration
-                    ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
-                let queued = try queuedMessageRepo.enqueue(
-                    threadId: threadId,
-                    text: trimmed,
-                    attachments: [],
-                    interactionMode: interactionMode,
-                    routingSnapshot: AgentQueuedMessageRoutingSnapshot(configuration: routing)
-                )
-                reloadQueuedMessages()
-                onQueuedMessageEvent?(AgentQueueEventKinds.queued, queued)
+                guard var thread = try threadRepo.get(id: threadId) else {
+                    statusMessage = "The bot reply thread is no longer available."
+                    return nil
+                }
+                if !thread.hasUnread {
+                    thread.hasUnread = true
+                    thread.updatedAt = Date()
+                    try threadRepo.upsert(thread)
+                    scheduleReloadThreads(delayMilliseconds: 0)
+                }
             } catch {
                 statusMessage = String(describing: error)
+                return nil
             }
-            return
+            return messageID
         }
-        _ = await startProviderRun(
-            text: trimmed,
-            attached: [],
-            recordHistory: false,
-            interactionMode: interactionMode
-        )
+        if let index = messages.firstIndex(where: { $0.id == messageID }) {
+            messages[index] = message
+        } else {
+            messages.append(message)
+        }
+        return messageID
     }
 
     /// Puts the draft back only when send never started a turn and the composer
@@ -10739,10 +10810,29 @@ public struct AgentAppView: View {
         text
     }
 
+    static func messagedPeer(in text: String, bots: [BotDefinition]) -> BotDefinition? {
+        guard !BotPeerTranscript.isHostHopUserText(text) else { return nil }
+        return BotMentionParser.mentionedBots(in: text, bots: bots, excluding: nil).first
+    }
+
+    nonisolated static func isInternalPeerHopUserMessage(_ message: AgentMessage) -> Bool {
+        guard message.role == .user else { return false }
+        return BotPeerTranscript.isHostHopUserText(message.content)
+    }
+
+    static func resolvedPeerAvatarSymbol(
+        handle: String,
+        encoded: String,
+        bots: [BotDefinition]
+    ) -> String? {
+        if !encoded.isEmpty { return encoded }
+        return bots.first {
+            $0.handle.caseInsensitiveCompare(handle) == .orderedSame
+        }?.avatarSymbol
+    }
+
     static func messagedCaption(in text: String, bots: [BotDefinition]) -> String? {
-        guard let bot = BotMentionParser.mentionedBots(in: text, bots: bots, excluding: nil).first else {
-            return nil
-        }
+        guard let bot = messagedPeer(in: text, bots: bots) else { return nil }
         return BotPeerTranscript.messagedCaption(for: bot)
     }
 
@@ -11055,7 +11145,10 @@ public struct AgentAppView: View {
     /// canonical ordering — only the path that produces it gets cheaper.
     nonisolated static func mergeTranscriptEntries(messages: [AgentMessage],
                                                   turns: [AssistantTurnSnapshot]) -> [TranscriptEntry] {
-        let messageEntries = messages.map(TranscriptEntry.message)
+        let messageEntries = messages.compactMap { message -> TranscriptEntry? in
+            guard !isInternalPeerHopUserMessage(message) else { return nil }
+            return TranscriptEntry.message(message)
+        }
         // Turns are few; sort defensively so the merge precondition always holds.
         let turnEntries = turns.map(TranscriptEntry.turn).sorted(by: transcriptEntryOrdersBefore)
         guard isOrderedByTranscriptOrder(messageEntries) else {
@@ -11186,6 +11279,27 @@ public struct AgentAppView: View {
         )
     }
 
+    private var activeBotPeerReviewName: String? {
+        guard vm.selectedThreadRunIsStartingOrRunning,
+              let runStartedAt = vm.runStartedAt else { return nil }
+        var newestUserMessageAt: Date?
+        var newestPeerReply: (createdAt: Date, name: String)?
+        for entry in visibleTranscriptEntries {
+            guard case .message(let message) = entry else { continue }
+            if message.role == .user {
+                newestUserMessageAt = message.createdAt
+            } else if message.role == .assistant,
+                      let reply = BotPeerTranscript.parse(message.content) {
+                newestPeerReply = (message.createdAt, reply.name)
+            }
+        }
+        guard let newestUserMessageAt,
+              let newestPeerReply,
+              newestPeerReply.createdAt >= newestUserMessageAt,
+              newestPeerReply.createdAt <= runStartedAt else { return nil }
+        return newestPeerReply.name
+    }
+
     /// Pure seam: which transcript entries the eager VStack renders.
     ///
     /// - Running / pending: prefer the slice from the newest user message
@@ -11242,7 +11356,9 @@ public struct AgentAppView: View {
         precedingContextCount: Int = followUpPrecedingContextCount
     ) -> [TranscriptEntry]? {
         guard let anchor = entries.lastIndex(where: {
-            if case .message(let message) = $0 { return message.role == .user }
+            if case .message(let message) = $0 {
+                return message.role == .user && !isInternalPeerHopUserMessage(message)
+            }
             return false
         }) else { return nil }
         let start = max(0, anchor - max(0, precedingContextCount))
@@ -11805,13 +11921,7 @@ public struct AgentAppView: View {
                 runningIdentifier: "agent.thread.row.running.\(t.id.value.uuidString)",
                 onSelect: { selectThreadRow(t) },
                 leading: {
-                    Text(AgentThreadRailRowCopy.monogram(for: t.provider))
-                        .font(.system(size: 9, weight: .bold, design: .rounded))
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .frame(width: 16, height: 16)
-                        .background(DS.Palette.surfaceRaised)
-                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                        .accessibilityHidden(true)
+                    AgentThreadProviderMonogram(provider: t.provider)
                 },
                 trailing: {
                     if AgentThreadRowPresentation.showsSelectionCheck(
@@ -12257,6 +12367,7 @@ public struct AgentAppView: View {
                         )
                         let historyEntries = split.history
                         let liveTail = split.liveTail
+                        let mentionBots = vm.mentionableBotsProvider()
                         VStack(alignment: .leading, spacing: 32) {
                             if vm.messageHistoryIsPartial {
                                 VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -12302,23 +12413,47 @@ public struct AgentAppView: View {
                             // boundary. Larger windows retain viewport virtualization.
                             if Self.usesLazyTranscriptHistoryLayout(entryCount: historyEntries.count) {
                                 LazyVStack(alignment: .leading, spacing: 32) {
-                                    ForEach(historyEntries) { entry in
-                                        transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
-                                            .id(entry.id)
+                                    ForEach(Array(historyEntries.enumerated()), id: \.element.id) { index, entry in
+                                        transcriptEntryRow(
+                                            entry,
+                                            columnWidth: timelineColumnWidth,
+                                            groupHeader: peerHopGroupHeader(
+                                                at: index,
+                                                entries: paintSequence,
+                                                bots: mentionBots
+                                            )
+                                        )
+                                        .id(entry.id)
                                     }
                                 }
                             } else {
                                 VStack(alignment: .leading, spacing: 32) {
-                                    ForEach(historyEntries) { entry in
-                                        transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
-                                            .id(entry.id)
+                                    ForEach(Array(historyEntries.enumerated()), id: \.element.id) { index, entry in
+                                        transcriptEntryRow(
+                                            entry,
+                                            columnWidth: timelineColumnWidth,
+                                            groupHeader: peerHopGroupHeader(
+                                                at: index,
+                                                entries: paintSequence,
+                                                bots: mentionBots
+                                            )
+                                        )
+                                        .id(entry.id)
                                     }
                                 }
                             }
                             // Live streaming turns — eager, outside Lazy.
-                            ForEach(liveTail) { entry in
-                                transcriptEntryRow(entry, columnWidth: timelineColumnWidth)
-                                    .id(entry.id)
+                            ForEach(Array(liveTail.enumerated()), id: \.element.id) { index, entry in
+                                transcriptEntryRow(
+                                    entry,
+                                    columnWidth: timelineColumnWidth,
+                                    groupHeader: peerHopGroupHeader(
+                                        at: historyEntries.count + index,
+                                        entries: paintSequence,
+                                        bots: mentionBots
+                                    )
+                                )
+                                .id(entry.id)
                             }
                             // B-1: one chip for the whole thread, after the newest
                             // finished answer — never N copies under every final.
@@ -12343,6 +12478,9 @@ public struct AgentAppView: View {
                                 AgentChatWorkingStatusStrip(
                                     startedAt: vm.runStartedAt ?? Date(),
                                     isStopping: vm.isStopping,
+                                    context: activeBotPeerReviewName.map {
+                                        AgentChatWorkingContext.reviewing(peerName: $0)
+                                    },
                                     onStop: { vm.stop() }
                                 )
                                 .id("agent.workingStatus")
@@ -13496,6 +13634,9 @@ public struct AgentAppView: View {
     private func messageRow(_ msg: AgentMessage, columnWidth: CGFloat = 10_000) -> some View {
         switch msg.role {
         case .user:
+            if Self.isInternalPeerHopUserMessage(msg) {
+                EmptyView()
+            } else {
             let wireRequest = vm.tokenSaverWireRequestText(for: msg.id)
             let hasWireTranslation = vm.tokenSaverOptimizedMessageIds.contains(msg.id)
                 && wireRequest.map(RCWireProtocol.isWire) == true
@@ -13505,7 +13646,7 @@ public struct AgentAppView: View {
                 wireRequest: wireRequest,
                 mode: tokenSaverDisplayMode(for: displayIdentifier, messageId: msg.id)
             )
-            let caption = Self.messagedCaption(
+            let mentioned = Self.messagedPeer(
                 in: displayText,
                 bots: vm.mentionableBotsProvider()
             )
@@ -13516,12 +13657,16 @@ public struct AgentAppView: View {
                 accessibilityIdentifier: "agent.userMessageBubble",
                 roleIdentifier: "agent.role.user",
                 copyIdentifier: "agent.userMessage.copy.\(msg.id.value.uuidString)",
-                header: caption.map { text in
+                header: mentioned.map { bot in
                     AnyView(
-                        Text(text)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .accessibilityIdentifier("agent.peer.messaged")
+                        AgentChatPeerIdentityHeader(
+                            name: bot.name,
+                            handle: bot.handle,
+                            symbol: bot.avatarSymbol,
+                            trailing: true,
+                            caption: BotPeerTranscript.messagedCaption(for: bot),
+                            accessibilityIdentifier: "agent.peer.messaged"
+                        )
                     )
                 },
                 belowBubble: {
@@ -13538,6 +13683,7 @@ public struct AgentAppView: View {
                     )
                 }()
             )
+            }
         case .assistant:
             if !hiddenPersistedAssistantMessageIDs.contains(msg.id) {
                 if msg.content.isEmpty {
@@ -13548,6 +13694,42 @@ public struct AgentAppView: View {
                         .italic()
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityLabel("Content omitted: message body was too large to display")
+                } else if let activity = BotPeerTranscript.parseActivity(msg.content) {
+                    AgentChatPeerActivityRow(snapshot: activity, startedAt: msg.createdAt)
+                } else if let parsed = BotPeerTranscript.parse(msg.content) {
+                    let showBadge = Self.showsTokenSaverOptimizedBadge(
+                        wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)
+                    )
+                    let bots = vm.mentionableBotsProvider()
+                    AgentChatAssistantReply(
+                        text: parsed.body,
+                        roleIdentifier: "agent.role.assistant",
+                        copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
+                        content: AnyView(
+                            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                                if showBadge {
+                                    Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
+                                        .font(DS.Font.caption2)
+                                        .foregroundColor(DS.Palette.textTertiary)
+                                        .accessibilityLabel("Token Saver optimized this reply")
+                                        .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(msg.id.value.uuidString)")
+                                }
+                                AgentChatPeerIdentityHeader(
+                                    name: parsed.name,
+                                    handle: parsed.handle,
+                                    symbol: Self.resolvedPeerAvatarSymbol(
+                                        handle: parsed.handle,
+                                        encoded: parsed.avatarSymbol,
+                                        bots: bots
+                                    ),
+                                    trailing: false,
+                                    caption: parsed.caption,
+                                    accessibilityIdentifier: "agent.peer.from"
+                                )
+                                assistantProse(parsed.body)
+                            }
+                        )
+                    )
                 } else {
                     let showBadge = Self.showsTokenSaverOptimizedBadge(
                         wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)
@@ -13574,28 +13756,6 @@ public struct AgentAppView: View {
                                     messageId: msg.id,
                                     retryMessageId: msg.id
                                 )
-                            )
-                        )
-                    } else if let parsed = BotPeerTranscript.parse(msg.content) {
-                        AgentChatAssistantReply(
-                            text: parsed.body,
-                            roleIdentifier: "agent.role.assistant",
-                            copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
-                            content: AnyView(
-                                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                                    if showBadge {
-                                        Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
-                                            .font(DS.Font.caption2)
-                                            .foregroundColor(DS.Palette.textTertiary)
-                                            .accessibilityLabel("Token Saver optimized this reply")
-                                            .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(msg.id.value.uuidString)")
-                                    }
-                                    Text(parsed.caption)
-                                        .font(DS.Font.caption)
-                                        .foregroundColor(DS.Palette.textTertiary)
-                                        .accessibilityIdentifier("agent.peer.from")
-                                    assistantProse(parsed.body)
-                                }
                             )
                         )
                     } else {
@@ -13810,13 +13970,75 @@ public struct AgentAppView: View {
     }
 
     @ViewBuilder
-    private func transcriptEntryRow(_ entry: TranscriptEntry, columnWidth: CGFloat) -> some View {
-        switch entry {
-        case .message(let message):
-            messageRow(message, columnWidth: columnWidth)
-        case .turn(let turn):
-            turnView(turn)
+    private func transcriptEntryRow(
+        _ entry: TranscriptEntry,
+        columnWidth: CGFloat,
+        groupHeader: AgentChatPeerGroupHeader? = nil
+    ) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            if let groupHeader {
+                groupHeader
+            }
+            switch entry {
+            case .message(let message):
+                messageRow(message, columnWidth: columnWidth)
+            case .turn(let turn):
+                turnView(turn)
+            }
         }
+    }
+
+    private func peerHopIdentity(
+        for entry: TranscriptEntry,
+        bots: [BotDefinition]
+    ) -> (name: String, handle: String, symbol: String?)? {
+        switch entry {
+        case .message(let message) where message.role == .user:
+            guard let bot = Self.messagedPeer(in: message.content, bots: bots) else { return nil }
+            return (bot.name, bot.handle, bot.avatarSymbol)
+        case .message(let message) where message.role == .assistant:
+            guard let parsed = BotPeerTranscript.parse(message.content) else { return nil }
+            return (
+                parsed.name,
+                parsed.handle,
+                Self.resolvedPeerAvatarSymbol(
+                    handle: parsed.handle,
+                    encoded: parsed.avatarSymbol,
+                    bots: bots
+                )
+            )
+        default:
+            return nil
+        }
+    }
+
+    private func peerHopGroupHeader(
+        at index: Int,
+        entries: [TranscriptEntry],
+        bots: [BotDefinition]
+    ) -> AgentChatPeerGroupHeader? {
+        guard entries.indices.contains(index),
+              let peer = peerHopIdentity(for: entries[index], bots: bots) else { return nil }
+        if index > 0, let previous = peerHopIdentity(for: entries[index - 1], bots: bots),
+           previous.handle.caseInsensitiveCompare(peer.handle) == .orderedSame {
+            return nil
+        }
+        var count = 0
+        for later in entries[index...] {
+            guard let next = peerHopIdentity(for: later, bots: bots),
+                  next.handle.caseInsensitiveCompare(peer.handle) == .orderedSame else { break }
+            count += 1
+        }
+        guard count >= 2 else { return nil }
+        return AgentChatPeerGroupHeader(
+            hostName: "",
+            hostHandle: "",
+            peerName: peer.name,
+            peerHandle: peer.handle,
+            peerSymbol: peer.symbol,
+            count: count,
+            accessibilityIdentifier: "agent.peer.group"
+        )
     }
 
     @ViewBuilder

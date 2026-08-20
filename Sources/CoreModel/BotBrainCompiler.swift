@@ -275,7 +275,8 @@ public enum BotBrainCompiler {
         browser: BotBrowserTarget? = nil,
         conversationID: BotConversationID? = nil,
         runID: AgentRunID? = nil,
-        now: Date = Date()
+        now: Date = Date(),
+        liveRunMode: AgentPermissionMode? = nil
     ) -> ContextAssemblyReceipt {
         let payload = composeRunPrompt(
             bot: bot,
@@ -286,7 +287,8 @@ public enum BotBrainCompiler {
             ownedSkills: ownedSkills,
             routines: routines,
             workspace: workspace,
-            browser: browser
+            browser: browser,
+            liveRunMode: liveRunMode
         )
         return ContextAssemblyReceipt(
             botID: bot.id,
@@ -297,7 +299,7 @@ public enum BotBrainCompiler {
             revisionDigest: revision.digest,
             provider: revision.provider,
             model: revision.model,
-            permissionMode: BotPermission.advertisedOrSupervised(revision.permissionMode),
+            permissionMode: effectiveRunMode(revision: revision, liveRunMode: liveRunMode),
             desktopKind: revision.desktopKind.advertisedOrLogical,
             compiledPayload: payload,
             payloadDigest: BotDigest.sha256Hex(payload),
@@ -310,7 +312,8 @@ public enum BotBrainCompiler {
                 ownedSkills: ownedSkills,
                 routines: routines,
                 workspace: workspace,
-                browser: browser
+                browser: browser,
+                liveRunMode: liveRunMode
             ),
             assembledAt: now
         )
@@ -326,7 +329,8 @@ public enum BotBrainCompiler {
         ownedSkills: [BotOwnedSkillText] = [],
         routines: [BotRoutine] = [],
         workspace: BotWorkspaceHonesty? = nil,
-        browser: BotBrowserTarget? = nil
+        browser: BotBrowserTarget? = nil,
+        liveRunMode: AgentPermissionMode? = nil
     ) -> String {
         var lines: [String] = []
         if let identity = identityLine(
@@ -352,9 +356,9 @@ public enum BotBrainCompiler {
         // once" cannot invent a grant. Host-assigned honesty stays so
         // first-chat cannot invent a set_settings write. Dest Source
         // title stays Permission.
-        lines.append("Approval mode: \(approvalModeText())")
+        lines.append("Approval mode: \(approvalModeText(for: effectiveRunMode(revision: revision, liveRunMode: liveRunMode)))")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
-        lines.append(BotStandingInstructions.admittedToolsText)
+        lines.append(BotStandingInstructions.admittedToolsText(for: revision.desktopKind))
         if let browser = browserLine(browser) {
             lines.append(browser)
         }
@@ -419,8 +423,26 @@ public enum BotBrainCompiler {
     /// Approvals Allow once / Deny stay off plus host-assigned so
     /// first-chat cannot invent a persist or a grant. Leftover
     /// full_access / auto_accept_edits still compile as supervised.
-    static func approvalModeText() -> String {
-        "\(BotPermission.honestyLabel) \(approvalsHonesty) \(approvalModeHostAssignedHonesty)"
+    static func effectiveRunMode(
+        revision: BotRevision,
+        liveRunMode: AgentPermissionMode?
+    ) -> AgentPermissionMode {
+        liveRunMode ?? BotPermission.advertisedOrSupervised(revision.permissionMode)
+    }
+
+    static func approvalModeText(for mode: AgentPermissionMode = .supervised) -> String {
+        "\(honestyLabel(for: mode)) \(approvalsHonesty) \(approvalModeHostAssignedHonesty)"
+    }
+
+    static func honestyLabel(for mode: AgentPermissionMode) -> String {
+        switch mode {
+        case .supervised:
+            return BotPermission.honestyLabel
+        case .autoAcceptEdits:
+            return "Auto-edit. Apply edits without asking."
+        case .fullAccess:
+            return "Full access. Run tools without asking."
+        }
     }
 
     /// Studio already says Desktop. Compile display title + isolation so
@@ -600,7 +622,8 @@ public enum BotBrainCompiler {
         ownedSkills: [BotOwnedSkillText] = [],
         routines: [BotRoutine],
         workspace: BotWorkspaceHonesty? = nil,
-        browser: BotBrowserTarget? = nil
+        browser: BotBrowserTarget? = nil,
+        liveRunMode: AgentPermissionMode? = nil
     ) -> [BotContextLayer] {
         var layers: [BotContextLayer] = []
         if let identity = identityLine(
@@ -659,9 +682,11 @@ public enum BotBrainCompiler {
                 id: "permission",
                 kind: .permission,
                 title: "Permission",
-                text: approvalModeText(),
+                text: approvalModeText(for: effectiveRunMode(revision: revision, liveRunMode: liveRunMode)),
                 included: true,
-                reason: "Advertised supervised route. Leftover full-access kinds compile as supervised."
+                reason: liveRunMode == nil
+                    ? "Advertised supervised route. Leftover full-access kinds compile as supervised."
+                    : "Live composer chip. Host-assigned. Not a self-config write."
             )
         )
 
@@ -692,7 +717,7 @@ public enum BotBrainCompiler {
                 id: "tools",
                 kind: .tools,
                 title: "Admitted tools",
-                text: BotStandingInstructions.admittedToolsText,
+                text: BotStandingInstructions.admittedToolsText(for: revision.desktopKind),
                 included: true,
                 reason: "Desk-admitted tools. Custom soul must not hide them."
             )

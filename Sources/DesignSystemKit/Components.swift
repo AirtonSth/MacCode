@@ -21,9 +21,11 @@ public extension View {
 
 public extension View {
     /// Panel: the dense card used for changed-files, plan, feed rows.
+    /// Occupies the full proposed width (one complete line); content stays leading.
     func dsPanel(padding: CGFloat = DS.Space.lg, raised: Bool = false) -> some View {
         self
             .padding(padding)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(raised ? DS.Palette.surfaceRaised : DS.Palette.surface)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             .overlay(
@@ -113,6 +115,11 @@ public struct DSIconButton: View {
     nonisolated public static let hitTargetSize: CGFloat = 44
     /// Visual icon frame (narrower than hit target).
     nonisolated public static let visualSize: CGSize = CGSize(width: 26, height: 22)
+    /// Inset that collapses the 44pt layout box to the glyph so HStack
+    /// spacing is measured between icons, not hit boxes.
+    nonisolated public static var visualPackInset: CGFloat {
+        (hitTargetSize - visualSize.width) / 2
+    }
 
     public init(_ systemName: String, help: String = "", action: @escaping () -> Void) {
         self.systemName = systemName; self.help = help; self.action = action

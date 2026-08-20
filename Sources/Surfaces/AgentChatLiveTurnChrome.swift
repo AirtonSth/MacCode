@@ -845,26 +845,40 @@ public struct AgentChatLoadingStatusStrip: View {
 public struct AgentChatWorkingStatusStrip: View {
     public let startedAt: Date
     public let isStopping: Bool
+    public let context: AgentChatWorkingContext?
     public let onStop: () -> Void
 
-    public init(startedAt: Date, isStopping: Bool, onStop: @escaping () -> Void) {
+    public init(
+        startedAt: Date,
+        isStopping: Bool,
+        context: AgentChatWorkingContext? = nil,
+        onStop: @escaping () -> Void
+    ) {
         self.startedAt = startedAt
         self.isStopping = isStopping
+        self.context = context
         self.onStop = onStop
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            TimelineView(AgentChatElapsedTickSchedule(start: startedAt)) { context in
-                let seconds = max(0, Int(context.date.timeIntervalSince(startedAt)))
+            TimelineView(AgentChatElapsedTickSchedule(start: startedAt)) { timeline in
+                let seconds = max(0, Int(timeline.date.timeIntervalSince(startedAt)))
                 let seed = UInt64(max(0, startedAt.timeIntervalSince1970 * 1000))
                 HStack(spacing: DS.Space.sm) {
                     ProgressView()
                         .controlSize(.small)
                         .accessibilityLabel("Running")
-                    Text(AgentWorkingCatCopy.statusLabel(elapsedSeconds: seconds, seed: seed))
+                    Text(AgentChatWorkingCopy.statusLabel(
+                        context: context,
+                        elapsedSeconds: seconds,
+                        seed: seed
+                    ))
                         .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
-                        .accessibilityLabel(AgentWorkingCatCopy.accessibilityLabel(elapsedSeconds: seconds))
+                        .accessibilityLabel(AgentChatWorkingCopy.accessibilityLabel(
+                            context: context,
+                            elapsedSeconds: seconds
+                        ))
                         .accessibilityIdentifier("agent.workingStatus")
                     Button(isStopping ? "Stopping… (click to force)" : "Stop", action: onStop)
                         .buttonStyle(.plain)

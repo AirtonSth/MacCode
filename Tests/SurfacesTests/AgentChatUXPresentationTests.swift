@@ -51,6 +51,68 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertNil(AgentWorkingStripPresentation.label(phase: .idle, elapsedSeconds: 10))
     }
 
+    func test_peerActivityCopyNamesWaitingBotAndWork() {
+        let waiting = BotPeerActivitySnapshot(
+            phase: .waiting,
+            name: "Quinn",
+            title: "CRM Controller",
+            handle: "quinn"
+        )
+        XCTAssertEqual(AgentPeerActivityPresentation.title(for: waiting), "Waiting for Quinn")
+        XCTAssertEqual(
+            AgentPeerActivityPresentation.detail(for: waiting, elapsedSeconds: 95),
+            "Quinn is working for 1m 35s"
+        )
+
+        let attention = BotPeerActivitySnapshot(
+            phase: .needsAttention,
+            name: "Quinn",
+            title: "CRM Controller",
+            handle: "quinn"
+        )
+        XCTAssertEqual(AgentPeerActivityPresentation.title(for: attention), "Quinn needs attention")
+        XCTAssertEqual(
+            AgentPeerActivityPresentation.detail(for: attention, elapsedSeconds: 95),
+            "The run stopped before Quinn could reply."
+        )
+    }
+
+    func test_contextualWorkingCopyNamesAgentAndReviewedPeer() {
+        XCTAssertEqual(
+            AgentChatWorkingCopy.statusLabel(context: nil, elapsedSeconds: 95, seed: 42),
+            AgentWorkingCatCopy.statusLabel(elapsedSeconds: 95, seed: 42),
+            "ordinary runs must retain the existing rotating cat copy"
+        )
+        XCTAssertEqual(
+            AgentChatWorkingCopy.accessibilityLabel(context: nil, elapsedSeconds: 95),
+            AgentWorkingCatCopy.accessibilityLabel(elapsedSeconds: 95),
+            "ordinary runs must retain the existing stable accessibility copy"
+        )
+        XCTAssertEqual(
+            AgentChatWorkingCopy.statusLabel(
+                context: .agent(name: "Quinn"),
+                elapsedSeconds: 95,
+                seed: 42
+            ),
+            "Quinn is working for 1m 35s"
+        )
+        XCTAssertEqual(
+            AgentChatWorkingCopy.statusLabel(
+                context: .reviewing(peerName: "Quinn"),
+                elapsedSeconds: 95,
+                seed: 42
+            ),
+            "Reviewing Quinn's reply for 1m 35s"
+        )
+        XCTAssertEqual(
+            AgentChatWorkingCopy.accessibilityLabel(
+                context: .reviewing(peerName: "Quinn"),
+                elapsedSeconds: 95
+            ),
+            "Reviewing Quinn's reply for 1m 35s"
+        )
+    }
+
     func test_workingCatCopy_hasOneHundredEnglishActivities() {
         // WHY: product asks for 100 kitten activities rotating every 15s.
         XCTAssertEqual(AgentWorkingCatCopy.activities.count, 100)
@@ -707,5 +769,11 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertTrue(chrome.contains(".lineLimit(1)"))
         XCTAssertTrue(chrome.contains(".fixedSize(horizontal: true, vertical: false)"))
         XCTAssertTrue(chrome.contains("headerControlSpacing"))
+        XCTAssertTrue(chrome.contains("DS.Space.md"))
+        XCTAssertTrue(chrome.contains("DSIconButton.visualPackInset"))
+        XCTAssertFalse(
+            chrome.contains("DS.Space.xs - (DSIconButton.hitTargetSize"),
+            "Clear All is text; packing 44pt hit boxes against it mashed the cluster"
+        )
     }
 }
