@@ -1026,14 +1026,18 @@ public final class DistillHTTPServer: @unchecked Sendable {
             let body = try decoder.decode(LibrarianHTTPBody.self, from: request.body)
             let store = LibrarianHandleStore()
             var text = body.input ?? ""
-            if let handle = body.handle, !handle.isEmpty {
-                if text.isEmpty, let data = try? reversibleStore?.retrieveOriginal(handle),
+            if let handle = body.handle, !handle.isEmpty, text.isEmpty {
+                if let context = recoveryContext(headers: request.headers, requiresOperationID: false),
+                   let data = try? scopedRecoveryStore?.retrieveOriginal(capability: handle, context: context),
                    let original = String(data: data, encoding: .utf8) {
                     text = original
+                } else if let data = try? reversibleStore?.retrieveOriginal(handle),
+                          let original = String(data: data, encoding: .utf8) {
+                    text = original
                 }
-                if !text.isEmpty {
-                    _ = store.put(text, handle: handle)
-                }
+            }
+            if let handle = body.handle, !handle.isEmpty, !text.isEmpty {
+                _ = store.put(text, handle: handle)
             } else if !text.isEmpty {
                 _ = store.put(text)
             }
