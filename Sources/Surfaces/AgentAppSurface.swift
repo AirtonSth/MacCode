@@ -432,6 +432,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var acquireQueueDrainSuppression: ((AgentThreadID) async -> UUID)?
     public var acquireQueueDrainSuppressions: (([AgentThreadID]) async -> [(AgentThreadID, UUID)])?
     public var releaseQueueDrainSuppression: ((AgentThreadID, UUID) -> Void)?
+    /// Process-local bot handoff fence spanning provider stop and relational delete.
+    /// The host commits the exact retirement only after the source delete succeeds.
+    public var beginBotPeerHandoffDeletion: ((Set<AgentThreadID>) -> UUID)?
+    public var finishBotPeerHandoffDeletion: ((UUID, Bool) -> Void)?
     /// UX-MAC_AGENT-OPEN-SPLIT: wired by AppCommandRouter. A clicked file mention
     /// (absolute path, already resolved) opens — or reuses — a Files split panel
     /// to the right of this surface.
@@ -5216,6 +5220,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func deleteThreads(_ ids: Set<AgentThreadID>) async -> Bool {
         guard !ids.isEmpty else { return true }
         let orderedIDs = ids.sorted { $0.value.uuidString < $1.value.uuidString }
+        let handoffDeletion = beginBotPeerHandoffDeletion?(ids)
+        var didFinishHandoffDeletion = false
+        defer {
+            if let handoffDeletion, !didFinishHandoffDeletion {
+                finishBotPeerHandoffDeletion?(handoffDeletion, false)
+            }
+        }
         let suppressionLeases: [(AgentThreadID, UUID)]
         if let acquireQueueDrainSuppressions {
             suppressionLeases = await acquireQueueDrainSuppressions(orderedIDs)
@@ -5264,6 +5275,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } catch {
             statusMessage = "Could not delete thread data: \(error)"
             return false
+        }
+        if let handoffDeletion {
+            finishBotPeerHandoffDeletion?(handoffDeletion, true)
+            didFinishHandoffDeletion = true
         }
         let undo = ThreadDeletionUndo(
             snapshots: relationalSnapshot.threads.map { .init(thread: $0, messages: []) },
@@ -6206,6 +6221,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
     }
 
+    /// Applies one already-verified durable peer row without changing the
+    /// selected thread, composer draft, or focus state.
+    public func applyPersistedBotPeerMessage(
+        messageID: AgentMessageID,
+        threadId: AgentThreadID
+    ) {
+        guard let thread = try? threadRepo.get(id: threadId),
+              thread.workspaceId == workspaceID,
+              let message = try? messageRepo.get(id: messageID),
+              message.threadId == threadId,
+              message.role == .assistant else { return }
+        if selectedThreadId == threadId {
+            if let index = messages.firstIndex(where: { $0.id == messageID }) {
+                messages[index] = message
+            } else {
+                messages.append(message)
+            }
+        }
+        scheduleReloadThreads(delayMilliseconds: 0)
+    }
+
     private func presentBotPeerContent(
         _ content: String,
         threadId: AgentThreadID,
@@ -6223,48 +6259,41 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
         do {
             try messageRepo.append(message)
+            guard let stored = try messageRepo.get(id: messageID),
+                  stored.threadId == threadId,
+                  stored.role == .assistant,
+                  stored.content == content else {
+                statusMessage = "The bot reply could not be verified."
+                return nil
+            }
         } catch {
             statusMessage = String(describing: error)
             return nil
         }
-        guard selectedThreadId == threadId else { return messageID }
+        guard selectedThreadId == threadId else {
+            do {
+                guard var thread = try threadRepo.get(id: threadId) else {
+                    statusMessage = "The bot reply thread is no longer available."
+                    return nil
+                }
+                if !thread.hasUnread {
+                    thread.hasUnread = true
+                    thread.updatedAt = Date()
+                    try threadRepo.upsert(thread)
+                    scheduleReloadThreads(delayMilliseconds: 0)
+                }
+            } catch {
+                statusMessage = String(describing: error)
+                return nil
+            }
+            return messageID
+        }
         if let index = messages.firstIndex(where: { $0.id == messageID }) {
             messages[index] = message
         } else {
             messages.append(message)
         }
         return messageID
-    }
-
-    /// Hop-1 after a mentioned bot replies. No `@handle` so dispatch cannot loop.
-    /// Queues without consuming the composer draft when this thread is live.
-    public func sendBotPeerFollowUp(text: String, threadId: AgentThreadID) async {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, selectedThreadId == threadId else { return }
-        if selectedThreadCanQueuePrompt, let queuedMessageRepo {
-            do {
-                let routing = (try? threadRepo.get(id: threadId))?.effectiveRoutingConfiguration
-                    ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
-                let queued = try queuedMessageRepo.enqueue(
-                    threadId: threadId,
-                    text: trimmed,
-                    attachments: [],
-                    interactionMode: interactionMode,
-                    routingSnapshot: AgentQueuedMessageRoutingSnapshot(configuration: routing)
-                )
-                reloadQueuedMessages()
-                onQueuedMessageEvent?(AgentQueueEventKinds.queued, queued)
-            } catch {
-                statusMessage = String(describing: error)
-            }
-            return
-        }
-        _ = await startProviderRun(
-            text: trimmed,
-            attached: [],
-            recordHistory: false,
-            interactionMode: interactionMode
-        )
     }
 
     /// Puts the draft back only when send never started a turn and the composer

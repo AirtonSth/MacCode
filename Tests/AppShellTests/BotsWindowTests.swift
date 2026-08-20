@@ -27,6 +27,7 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.searchText")
         UserDefaults.standard.removeObject(forKey: "bots.deskRouting")
         UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+        UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
         UserDefaults.standard.removeObject(forKey: "bots.studioFilesLocations")
         UserDefaults.standard.removeObject(forKey: "bots.unpublishedNewBotIDs")
         UserDefaults.standard.removeObject(forKey: "bots.deskThreadRail")
@@ -35,6 +36,8 @@ final class BotsWindowTests: XCTestCase {
 
     override func tearDown() {
         UserDefaults.standard.removeObject(forKey: "bots.studioFilesLocations")
+        UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+        UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
         if let directory {
             try? FileManager.default.removeItem(atPath: directory)
         }
@@ -4635,10 +4638,10 @@ final class BotsWindowTests: XCTestCase {
         let rest = source[start.lowerBound...]
         let end = rest.range(of: "\n    private func followLinkedRun")?.lowerBound ?? rest.endIndex
         let slice = String(source[start.lowerBound..<end])
-        XCTAssertTrue(slice.contains("provider: deskRouting.provider"))
-        XCTAssertTrue(slice.contains("permissionMode: deskRouting.permissionMode"))
+        XCTAssertTrue(slice.contains("provider: routing.provider"))
+        XCTAssertTrue(slice.contains("permissionMode: routing.permissionMode"))
         XCTAssertTrue(slice.contains("reasoningEffort: effort"))
-        XCTAssertTrue(slice.contains("runAsUser: deskRunAsUser"))
+        XCTAssertTrue(source.contains("runAsUser: routing.runAsUser"))
         XCTAssertTrue(slice.contains("workspace: nil"))
         XCTAssertFalse(
             slice.contains("provider: revision.provider"),
@@ -4918,6 +4921,119 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("fresh start") })
     }
 
+    func test_clearAllDeskThreadsRetiresOnlyVictimActiveHandoffWithoutResurrectionOrV1Rewrite() async throws {
+        // WHY: Clear All is a real deletion boundary, not a cosmetic rail reset.
+        // It must cancel the deleted conversation's exact continuation while a
+        // sibling Bot handoff and the downgrade-readable v1 bytes remain intact.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let piperHostRunner = ControlledBotHandoffRunner(provider: .codex)
+        let roryHostRunner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: piperHostRunner)
+        context.coordinator.replaceProvider(.grok, runner: roryHostRunner)
+        let viewModel = BotsViewModel(context: context, router: router)
+        router.botsViewModel = viewModel
+        let piper = try viewModel.create(name: "Piper", title: "Seller", provider: .codex)
+        let rory = try viewModel.create(name: "Rory", title: "Researcher", provider: .grok)
+        let quinn = try viewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        viewModel.openDesk(quinn)
+        viewModel.setDeskProvider(.claude)
+        viewModel.openDesk(piper)
+        viewModel.setDeskProvider(.codex)
+        viewModel.openDesk(rory)
+        viewModel.setDeskProvider(.grok)
+
+        viewModel.openDesk(piper)
+        viewModel.createDeskThread()
+        let victimConversation = try XCTUnwrap(viewModel.selectedConversation)
+        XCTAssertTrue(viewModel.send("@\(quinn.handle) T005_CLEAR_VICTIM"))
+        let victimStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_CLEAR_VICTIM") }
+        }
+        XCTAssertTrue(victimStarted)
+
+        viewModel.openDesk(rory)
+        viewModel.createDeskThread()
+        let siblingConversation = try XCTUnwrap(viewModel.selectedConversation)
+        XCTAssertTrue(viewModel.send("@\(quinn.handle) T005_CLEAR_SIBLING"))
+        let siblingStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_CLEAR_SIBLING") }
+        }
+        XCTAssertTrue(siblingStarted)
+        let victim = try XCTUnwrap(viewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: victimConversation.id,
+            originThreadID: nil
+        ).first)
+        let sibling = try XCTUnwrap(viewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: siblingConversation.id,
+            originThreadID: nil
+        ).first)
+        let victimRunID = try XCTUnwrap(victim.peerRunID)
+        let siblingRunID = try XCTUnwrap(sibling.peerRunID)
+        let legacyBytes = Data(#"{"t005":"leave-v1-byte-exact"}"#.utf8)
+        UserDefaults.standard.set(legacyBytes, forKey: "bots.peerTurns")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        viewModel.openDesk(piper)
+        viewModel.selectDeskThread(victimConversation.id)
+        viewModel.clearAllDeskThreads()
+        let victimCancelled = await waitUntil(timeout: 2) {
+            (try? context.runRepo.get(id: victimRunID)?.status) == .cancelled
+        }
+        XCTAssertTrue(victimCancelled, "Clear All must cancel the deleted origin's exact live run")
+        XCTAssertTrue(viewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: victimConversation.id,
+            originThreadID: nil
+        ).isEmpty)
+        XCTAssertEqual(
+            viewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: siblingConversation.id,
+                originThreadID: nil
+            ).first?.peerRunID,
+            siblingRunID,
+            "the sibling handoff must remain owned and running"
+        )
+        XCTAssertEqual(try context.runRepo.get(id: siblingRunID)?.status, .running)
+        XCTAssertFalse(
+            peerRunner.finish(runID: victimRunID, status: .completed, reply: "LATE_VICTIM_REPLY"),
+            "provider cancellation must retire the victim callback so it cannot resurrect"
+        )
+        viewModel.reconcilePeerHandoffsForTesting()
+        let reloaded = BotsViewModel(context: context, router: router)
+        XCTAssertTrue(reloaded.peerHandoffSnapshotsForTesting(
+            originConversationID: victimConversation.id,
+            originThreadID: nil
+        ).isEmpty)
+        XCTAssertEqual(
+            reloaded.peerHandoffSnapshotsForTesting(
+                originConversationID: siblingConversation.id,
+                originThreadID: nil
+            ).first?.peerRunID,
+            siblingRunID
+        )
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+
+        XCTAssertTrue(peerRunner.finish(
+            runID: siblingRunID,
+            status: .completed,
+            reply: "sibling remains exact"
+        ))
+        let siblingHostStarted = await waitUntil(timeout: 5) { !roryHostRunner.requests.isEmpty }
+        XCTAssertTrue(siblingHostStarted)
+        let siblingHostRunID = try XCTUnwrap(reloaded.peerHandoffSnapshotsForTesting(
+            originConversationID: siblingConversation.id,
+            originThreadID: nil
+        ).first?.hostRunID)
+        XCTAssertTrue(roryHostRunner.finish(
+            runID: siblingHostRunID,
+            status: .cancelled,
+            reply: nil
+        ))
+    }
+
     func test_sendContinuesSelectedConversation() throws {
         // WHY: two ordinary sends on one dest thread must stay one row.
         let context = try makeContext()
@@ -5027,6 +5143,1138 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(restored.peer?.activityPhase, .needsAttention)
     }
 
+    func test_legacyPeerTurnsRemainByteExactButNeverRenderIntoAnArbitraryConversation() throws {
+        // WHY: v1 rows name only a Bot, not an owning conversation. Restoring
+        // them into either of two threads invents ownership and mixes chats;
+        // an upgrade must quarantine those bytes without rewriting them.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        let first = BotConversation(
+            botID: piper.id,
+            title: "First origin",
+            updatedAt: Date(timeIntervalSinceReferenceDate: 10)
+        )
+        let second = BotConversation(
+            botID: piper.id,
+            title: "Second origin",
+            updatedAt: Date(timeIntervalSinceReferenceDate: 20)
+        )
+        try context.botStore.upsertConversation(first)
+        try context.botStore.upsertConversation(second)
+
+        let legacyID = UUID()
+        let legacyPayload: [String: Any] = [
+            piper.id.value.uuidString.lowercased(): [[
+                "id": legacyID.uuidString,
+                "role": "user",
+                "text": "@quinn legacy request with no conversation owner",
+                "createdAt": 0,
+                "direction": "messaged",
+                "peerBotID": quinn.id.value.uuidString,
+                "name": quinn.name,
+                "title": quinn.title,
+                "handle": quinn.handle,
+                "activityPhase": "waiting",
+            ]],
+        ]
+        let legacyBytes = try JSONSerialization.data(
+            withJSONObject: legacyPayload,
+            options: [.sortedKeys]
+        )
+        UserDefaults.standard.set(legacyBytes, forKey: "bots.peerTurns")
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(piper)
+        reopened.selectDeskThread(first.id)
+        XCTAssertFalse(
+            reopened.deskMessages.contains { $0.id == legacyID },
+            "a BotID-only v1 row cannot be attributed to the first conversation"
+        )
+        reopened.selectDeskThread(second.id)
+        XCTAssertFalse(
+            reopened.deskMessages.contains { $0.id == legacyID },
+            "the same ambiguous row cannot be copied into a sibling conversation"
+        )
+        XCTAssertEqual(
+            UserDefaults.standard.data(forKey: "bots.peerTurns"),
+            legacyBytes,
+            "v2 rollout must leave the reversible v1 payload byte-for-byte unchanged"
+        )
+    }
+
+    func test_malformedAndFutureV2AreQuarantinedWhileV1AndUnknownFieldsRemainByteExact() async throws {
+        // WHY: rollout and downgrade must be reversible. A malformed/future v2
+        // envelope cannot be rendered or rewritten, v1 remains available to an
+        // older build, and an unknown additive v2 field must survive a read.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let bootstrap = BotsViewModel(context: context, router: router)
+        let piper = try bootstrap.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try bootstrap.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        bootstrap.openDesk(quinn)
+        bootstrap.setDeskProvider(.claude)
+        bootstrap.openDesk(piper)
+        bootstrap.setDeskProvider(.codex)
+        bootstrap.createDeskThread()
+        let origin = try XCTUnwrap(bootstrap.selectedConversation)
+
+        let legacyMessageID = UUID()
+        let legacyPayload: [String: Any] = [
+            piper.id.value.uuidString.lowercased(): [[
+                "id": legacyMessageID.uuidString,
+                "role": "user",
+                "text": "@quinn legacy downgrade row",
+                "createdAt": 0,
+                "direction": "messaged",
+                "peerBotID": quinn.id.value.uuidString,
+                "name": quinn.name,
+                "title": quinn.title,
+                "handle": quinn.handle,
+                "activityPhase": "waiting",
+            ]],
+        ]
+        let legacyBytes = try JSONSerialization.data(
+            withJSONObject: legacyPayload,
+            options: [.sortedKeys]
+        )
+        let malformedV2 = Data(#"{"truncated": "#.utf8)
+        UserDefaults.standard.set(legacyBytes, forKey: "bots.peerTurns")
+        UserDefaults.standard.set(malformedV2, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        let malformedRestore = BotsViewModel(context: context, router: router)
+        malformedRestore.openDesk(piper)
+        malformedRestore.selectDeskThread(origin.id)
+        XCTAssertTrue(malformedRestore.peerHandoffSnapshotsForTesting().isEmpty)
+        XCTAssertFalse(malformedRestore.deskMessages.contains { $0.id == legacyMessageID })
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"), malformedV2)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+
+        UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(malformedRestore.send("@\(quinn.handle) COMPAT_V2_RECORD"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("COMPAT_V2_RECORD") }
+        }
+        XCTAssertTrue(peerStarted)
+        XCTAssertTrue(peerRunner.finish(
+            promptContaining: "COMPAT_V2_RECORD",
+            status: .failed,
+            reply: nil
+        ))
+        let settled = await waitUntil(timeout: 5) {
+            malformedRestore.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase == .needsAttention
+        }
+        XCTAssertTrue(settled)
+        XCTAssertEqual(
+            UserDefaults.standard.data(forKey: "bots.peerTurns"),
+            legacyBytes,
+            "creating and settling v2 must not consume the v1 downgrade payload"
+        )
+
+        let validV2 = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"))
+        var additiveEntries = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: validV2) as? [Any]
+        )
+        let recordIndex = try XCTUnwrap(additiveEntries.firstIndex { $0 is [String: Any] })
+        var additiveRecord = try XCTUnwrap(additiveEntries[recordIndex] as? [String: Any])
+        additiveRecord["futureAdditiveField"] = ["opaque": "preserve-for-newer-build"]
+        additiveEntries[recordIndex] = additiveRecord
+        let additiveBytes = try JSONSerialization.data(
+            withJSONObject: additiveEntries,
+            options: [.sortedKeys]
+        )
+        UserDefaults.standard.set(additiveBytes, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        let additiveRestore = BotsViewModel(context: context, router: router)
+        XCTAssertEqual(
+            additiveRestore.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase,
+            .needsAttention,
+            "a downgrade reader must accept an additive field it does not understand"
+        )
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"), additiveBytes)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+
+        var futureEntries = additiveEntries
+        var futureRecord = try XCTUnwrap(futureEntries[recordIndex] as? [String: Any])
+        futureRecord["version"] = 3
+        futureEntries[recordIndex] = futureRecord
+        let futureVersionBytes = try JSONSerialization.data(
+            withJSONObject: futureEntries,
+            options: [.sortedKeys]
+        )
+        UserDefaults.standard.set(futureVersionBytes, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        let futureRestore = BotsViewModel(context: context, router: router)
+        XCTAssertTrue(
+            futureRestore.peerHandoffSnapshotsForTesting().isEmpty,
+            "an unsupported future envelope is quarantined instead of mis-rendered"
+        )
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"), futureVersionBytes)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+    }
+
+    func test_waitingHandoffProjectsBothBotsActiveDespiteUnrelatedOriginAttention() async throws {
+        // WHY: Active Bots describes live endpoints, while Needs you describes
+        // a different unresolved conversation. Badge precedence must not hide
+        // either participant in the handoff that is actually running.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "host settled"))
+        )
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+        vm.createDeskThread()
+        let unrelated = try XCTUnwrap(vm.selectedConversation)
+        vm.applyFollowThroughForTests(bot: piper, conversation: unrelated, status: .failed)
+        vm.createDeskThread()
+        let origin = try XCTUnwrap(vm.selectedConversation)
+
+        XCTAssertTrue(vm.send("@\(quinn.handle) DUAL_ACTIVE wait for release"))
+        let peerBecameActive = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("DUAL_ACTIVE") }
+                && vm.peerHandoffSnapshotsForTesting(
+                    originConversationID: origin.id,
+                    originThreadID: nil
+                ).contains { $0.phase == .peerRunning }
+        }
+        XCTAssertTrue(peerBecameActive)
+
+        XCTAssertEqual(vm.attentionState(for: piper), .needsAttention)
+        XCTAssertEqual(
+            Set(vm.liveWorkingBots().map(\.id)),
+            Set([piper.id, quinn.id]),
+            "the exact waiting origin and running peer both belong in Active Bots"
+        )
+        let handoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertEqual(handoff.originConversationID, origin.id)
+        XCTAssertEqual(handoff.peerBotID, quinn.id)
+        XCTAssertEqual(
+            handoff.peerRunID,
+            peerRunner.requests.first { $0.prompt.contains("DUAL_ACTIVE") }?.runId,
+            "the active projection must be backed by the exact pre-bound provider run"
+        )
+
+        XCTAssertTrue(peerRunner.finish(promptContaining: "DUAL_ACTIVE", reply: "released"))
+        let handoffCompleted = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).contains { $0.phase == .completed }
+        }
+        XCTAssertTrue(handoffCompleted)
+    }
+
+    func test_samePeerOutOfOrderRepliesStayInTheirCapturedOriginConversations() async throws {
+        // WHY: two Piper threads may ask the same Quinn concurrently. Finishing
+        // them out of order while thread B is selected must not let Bot-global
+        // "latest conversation/assistant" state choose either reply endpoint.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "host settled"))
+        )
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+
+        vm.createDeskThread()
+        let originA = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertTrue(vm.send("@\(quinn.handle) SAME_PEER_A"))
+        let firstPeerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("SAME_PEER_A") }
+        }
+        XCTAssertTrue(firstPeerStarted)
+
+        vm.createDeskThread()
+        let originB = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertNotEqual(originA.id, originB.id)
+        XCTAssertTrue(vm.send("@\(quinn.handle) SAME_PEER_B"))
+        let secondPeerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("SAME_PEER_B") }
+        }
+        XCTAssertTrue(secondPeerStarted)
+
+        XCTAssertTrue(peerRunner.finish(promptContaining: "SAME_PEER_B", reply: "REPLY_B"))
+        let secondReplyArrived = await waitUntil(timeout: 5) {
+            vm.deskMessages.contains {
+                $0.peer?.direction == .fromPeer && $0.text == "REPLY_B"
+            }
+        }
+        XCTAssertTrue(secondReplyArrived)
+        XCTAssertFalse(vm.deskMessages.contains { $0.text == "REPLY_A" })
+
+        // Keep B selected while A terminates. Settlement must still use A's
+        // immutable conversation/run/checkpoint tuple.
+        XCTAssertEqual(vm.selectedConversation?.id, originB.id)
+        XCTAssertTrue(peerRunner.finish(promptContaining: "SAME_PEER_A", reply: "REPLY_A"))
+        let firstHandoffCompleted = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: originA.id,
+                originThreadID: nil
+            ).contains { $0.phase == .completed }
+        }
+        XCTAssertTrue(firstHandoffCompleted)
+        XCTAssertEqual(vm.selectedConversation?.id, originB.id)
+        XCTAssertFalse(vm.deskMessages.contains { $0.text == "REPLY_A" })
+
+        vm.selectDeskThread(originA.id)
+        XCTAssertTrue(vm.deskMessages.contains {
+            $0.peer?.direction == .fromPeer && $0.text == "REPLY_A"
+        })
+        XCTAssertFalse(vm.deskMessages.contains { $0.text == "REPLY_B" })
+        vm.selectDeskThread(originB.id)
+        XCTAssertTrue(vm.deskMessages.contains {
+            $0.peer?.direction == .fromPeer && $0.text == "REPLY_B"
+        })
+        XCTAssertFalse(vm.deskMessages.contains { $0.text == "REPLY_A" })
+
+        let handoffA = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: originA.id,
+            originThreadID: nil
+        ).first)
+        let handoffB = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: originB.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertNotEqual(handoffA.peerConversationID, handoffB.peerConversationID)
+        XCTAssertNotEqual(handoffA.peerThreadID, handoffB.peerThreadID)
+        XCTAssertNotEqual(handoffA.peerRunID, handoffB.peerRunID)
+        XCTAssertEqual(
+            handoffA.peerRunID,
+            peerRunner.requests.first { $0.prompt.contains("SAME_PEER_A") }?.runId
+        )
+        XCTAssertEqual(
+            handoffB.peerRunID,
+            peerRunner.requests.first { $0.prompt.contains("SAME_PEER_B") }?.runId
+        )
+    }
+
+    func test_initiatingWindowDeallocatesWhileAuthorityFinishesItsExactPlanAndPreservesSibling() async throws {
+        // WHY: a Bot handoff is durable work owned by the shared context, not
+        // by the window that happened to submit it. Closing VM A while two
+        // peers are pending must release that VM immediately; VM B may receive
+        // unrelated selection/coordinator events without stealing either plan.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let quinnRunner = ControlledBotHandoffRunner(provider: .claude)
+        let roryRunner = ControlledBotHandoffRunner(provider: .grok)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: quinnRunner)
+        context.coordinator.replaceProvider(.grok, runner: roryRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+
+        var initiatingVM: BotsViewModel? = BotsViewModel(context: context, router: router)
+        router.botsViewModel = initiatingVM
+        let piper = try XCTUnwrap(initiatingVM).create(
+            name: "Piper",
+            title: "Seller",
+            provider: .codex
+        )
+        let quinn = try XCTUnwrap(initiatingVM).create(
+            name: "Quinn",
+            title: "CRM Controller",
+            provider: .claude
+        )
+        let rory = try XCTUnwrap(initiatingVM).create(
+            name: "Rory",
+            title: "Research Controller",
+            provider: .grok
+        )
+        initiatingVM?.openDesk(quinn)
+        initiatingVM?.setDeskProvider(.claude)
+        initiatingVM?.openDesk(rory)
+        initiatingVM?.setDeskProvider(.grok)
+        initiatingVM?.openDesk(piper)
+        initiatingVM?.setDeskProvider(.codex)
+
+        initiatingVM?.createDeskThread()
+        let mainOrigin = try XCTUnwrap(initiatingVM?.selectedConversation)
+        XCTAssertTrue(try XCTUnwrap(initiatingVM).send("@\(quinn.handle) WINDOW_OWNER_MAIN"))
+        let mainStarted = await waitUntil(timeout: 5) {
+            quinnRunner.requests.contains { $0.prompt.contains("WINDOW_OWNER_MAIN") }
+        }
+        XCTAssertTrue(mainStarted)
+
+        initiatingVM?.createDeskThread()
+        let siblingOrigin = try XCTUnwrap(initiatingVM?.selectedConversation)
+        XCTAssertTrue(try XCTUnwrap(initiatingVM).send("@\(rory.handle) WINDOW_OWNER_SIBLING"))
+        let siblingStarted = await waitUntil(timeout: 5) {
+            roryRunner.requests.contains { $0.prompt.contains("WINDOW_OWNER_SIBLING") }
+        }
+        XCTAssertTrue(siblingStarted)
+
+        let mainHandoff = try XCTUnwrap(initiatingVM?.peerHandoffSnapshotsForTesting(
+            originConversationID: mainOrigin.id,
+            originThreadID: nil
+        ).first)
+        let siblingHandoff = try XCTUnwrap(initiatingVM?.peerHandoffSnapshotsForTesting(
+            originConversationID: siblingOrigin.id,
+            originThreadID: nil
+        ).first)
+        let mainPeerRunID = try XCTUnwrap(mainHandoff.peerRunID)
+        let mainHostRunID = try XCTUnwrap(mainHandoff.hostRunID)
+        let siblingPeerRunID = try XCTUnwrap(siblingHandoff.peerRunID)
+        let siblingHostRunID = try XCTUnwrap(siblingHandoff.hostRunID)
+
+        let observingVM = BotsViewModel(context: context, router: router)
+        router.botsViewModel = observingVM
+        observingVM.openDesk(rory)
+        observingVM.openActiveBots()
+        weak var releasedInitiator = initiatingVM
+        initiatingVM = nil
+
+        let initiatorDeallocated = await waitUntil(timeout: 1) {
+            releasedInitiator == nil
+        }
+        if !initiatorDeallocated {
+            _ = quinnRunner.finish(runID: mainPeerRunID, status: .cancelled, reply: nil)
+            _ = roryRunner.finish(runID: siblingPeerRunID, status: .cancelled, reply: nil)
+            _ = await waitUntil(timeout: 2) { releasedInitiator == nil }
+            XCTFail(
+                "VM A must deallocate while both exact peer runs remain pending; lifecycle continuation belongs to context authority"
+            )
+            return
+        }
+
+        XCTAssertEqual(try context.runRepo.get(id: mainPeerRunID)?.status, .running)
+        XCTAssertEqual(try context.runRepo.get(id: siblingPeerRunID)?.status, .running)
+        XCTAssertTrue(quinnRunner.finish(
+            runID: mainPeerRunID,
+            status: .completed,
+            reply: "authority-owned peer reply"
+        ))
+        let exactHostStarted = await waitUntil(timeout: 5) {
+            hostRunner.requests.contains { $0.runId == mainHostRunID }
+        }
+        XCTAssertTrue(exactHostStarted)
+        XCTAssertEqual(hostRunner.requests.filter { $0.runId == mainHostRunID }.count, 1)
+        XCTAssertFalse(hostRunner.requests.contains { $0.runId == siblingHostRunID })
+        XCTAssertTrue(hostRunner.finish(
+            runID: mainHostRunID,
+            status: .completed,
+            reply: "authority-owned host outcome"
+        ))
+
+        let mainCompletedInNonOwner = await waitUntil(timeout: 5) {
+            observingVM.peerHandoffSnapshotsForTesting(
+                originConversationID: mainOrigin.id,
+                originThreadID: nil
+            ).first?.phase == .completed
+        }
+        XCTAssertTrue(
+            mainCompletedInNonOwner,
+            "VM B must receive the exact authority delta without becoming execution owner"
+        )
+        let preservedSibling = try XCTUnwrap(observingVM.peerHandoffSnapshotsForTesting(
+            originConversationID: siblingOrigin.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertEqual(preservedSibling.activityID, siblingHandoff.activityID)
+        XCTAssertEqual(preservedSibling.peerRunID, siblingPeerRunID)
+        XCTAssertEqual(preservedSibling.phase, .peerRunning)
+        XCTAssertFalse(hostRunner.requests.contains { $0.runId == siblingHostRunID })
+
+        XCTAssertTrue(roryRunner.finish(
+            runID: siblingPeerRunID,
+            status: .cancelled,
+            reply: nil
+        ))
+        let siblingSettled = await waitUntil(timeout: 5) {
+            observingVM.peerHandoffSnapshotsForTesting(
+                originConversationID: siblingOrigin.id,
+                originThreadID: nil
+            ).first?.phase == .needsAttention
+        }
+        XCTAssertTrue(siblingSettled)
+    }
+
+    func test_authorityDeltaUpdatesTwoLiveWindowsWithoutReplacingLocalUIState() async throws {
+        // WHY: peer handoff progress belongs to the shared context authority.
+        // Its deltas must reach every live Bots window without using a whole-VM
+        // reload that steals either window's selection or unsent local work.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
+            let model = BotsViewModel.defaultModel(for: provider)
+            return AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: model, label: model, provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        })
+
+        let originWindow = BotsViewModel(context: context, router: router)
+        let piper = try originWindow.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try originWindow.create(
+            name: "Quinn",
+            title: "CRM Controller",
+            provider: .claude
+        )
+        let rory = try originWindow.create(
+            name: "Rory",
+            title: "Research Controller",
+            provider: .grok
+        )
+        originWindow.openDesk(quinn)
+        originWindow.setDeskProvider(.claude)
+        originWindow.openDesk(piper)
+        originWindow.setDeskProvider(.codex)
+        originWindow.createDeskThread()
+        let originConversation = try XCTUnwrap(originWindow.selectedConversation)
+
+        let siblingWindow = BotsViewModel(context: context, router: router)
+        siblingWindow.openStudio(rory)
+        router.botsViewModel = originWindow
+
+        XCTAssertTrue(originWindow.send("@\(quinn.handle) TWO_LIVE_WINDOWS"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("TWO_LIVE_WINDOWS") }
+        }
+        XCTAssertTrue(peerStarted)
+        let running = try XCTUnwrap(originWindow.peerHandoffSnapshotsForTesting(
+            originConversationID: originConversation.id,
+            originThreadID: nil
+        ).first)
+        let peerRunID = try XCTUnwrap(running.peerRunID)
+        let hostRunID = try XCTUnwrap(running.hostRunID)
+        XCTAssertEqual(
+            siblingWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first,
+            running,
+            "both windows must observe the same exact authority row"
+        )
+
+        let originAttachmentPath = (directory as NSString).appendingPathComponent("origin-window.txt")
+        let siblingAttachmentPath = (directory as NSString).appendingPathComponent("sibling-window.txt")
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: originAttachmentPath,
+            contents: Data("origin".utf8)
+        ))
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: siblingAttachmentPath,
+            contents: Data("sibling".utf8)
+        ))
+
+        originWindow.openDesk(piper)
+        originWindow.selectDeskThread(originConversation.id)
+        originWindow.composerText = "ORIGIN_WINDOW_COMPOSER"
+        originWindow.attachments = [AgentAttachment(
+            path: originAttachmentPath,
+            displayName: "origin-window.txt",
+            kind: .file
+        )]
+        originWindow.memoryDraft = "ORIGIN_MEMORY_DRAFT"
+        originWindow.skillDraft = "origin-skill-draft"
+        originWindow.routineName = "Origin routine"
+        originWindow.routinePrompt = "Origin routine prompt"
+        originWindow.routineScheduleNote = "Origin routine schedule"
+
+        siblingWindow.openStudio(rory)
+        siblingWindow.composerText = "SIBLING_WINDOW_COMPOSER"
+        siblingWindow.attachments = [AgentAttachment(
+            path: siblingAttachmentPath,
+            displayName: "sibling-window.txt",
+            kind: .file
+        )]
+        siblingWindow.memoryDraft = "SIBLING_MEMORY_DRAFT"
+        siblingWindow.skillDraft = "sibling-skill-draft"
+        siblingWindow.routineName = "Sibling routine"
+        siblingWindow.routinePrompt = "Sibling routine prompt"
+        siblingWindow.routineScheduleNote = "Sibling routine schedule"
+
+        let originReloadCounts = fullReloadCounts(originWindow)
+        let siblingReloadCounts = fullReloadCounts(siblingWindow)
+        let originDeskRestoreCount = originWindow.deskRestoreInvokedCountForTesting
+        let siblingDeskRestoreCount = siblingWindow.deskRestoreInvokedCountForTesting
+        let originSelection = originWindow.selectedBotID
+        let siblingSelection = siblingWindow.selectedBotID
+        let originScreen = originWindow.screen
+        let siblingScreen = siblingWindow.screen
+        let originAttachments = originWindow.attachments
+        let siblingAttachments = siblingWindow.attachments
+
+        XCTAssertTrue(peerRunner.finish(
+            runID: peerRunID,
+            status: .completed,
+            reply: "TWO_WINDOW_EXACT_REPLY"
+        ))
+        let bothObservedHost = await waitUntil(timeout: 5) {
+            originWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first?.phase == .hostRunning
+                && siblingWindow.peerHandoffSnapshotsForTesting(
+                    originConversationID: originConversation.id,
+                    originThreadID: nil
+                ).first?.phase == .hostRunning
+        }
+        XCTAssertTrue(bothObservedHost)
+        let hostSnapshot = try XCTUnwrap(originWindow.peerHandoffSnapshotsForTesting(
+            originConversationID: originConversation.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertEqual(
+            siblingWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first,
+            hostSnapshot
+        )
+        XCTAssertEqual(hostSnapshot.activityID, running.activityID)
+        XCTAssertEqual(hostSnapshot.peerRunID, peerRunID)
+        XCTAssertEqual(hostSnapshot.hostRunID, hostRunID)
+        XCTAssertEqual(hostRunner.requests.filter { $0.runId == hostRunID }.count, 1)
+        XCTAssertEqual(
+            originWindow.deskMessages.filter {
+                $0.peer?.direction == .fromPeer && $0.text == "TWO_WINDOW_EXACT_REPLY"
+            }.count,
+            1,
+            "the selected origin window must paint one stable reply row"
+        )
+        XCTAssertEqual(
+            try context.botStore.conversation(id: hostSnapshot.peerConversationID)?.attentionState,
+            .unreadActivity,
+            "the peer conversation attention must settle while the host continuation runs"
+        )
+
+        XCTAssertTrue(hostRunner.finish(
+            runID: hostRunID,
+            status: .completed,
+            reply: "TWO_WINDOW_HOST_COMPLETE"
+        ))
+        let bothCompleted = await waitUntil(timeout: 5) {
+            originWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first?.phase == .completed
+                && siblingWindow.peerHandoffSnapshotsForTesting(
+                    originConversationID: originConversation.id,
+                    originThreadID: nil
+                ).first?.phase == .completed
+        }
+        XCTAssertTrue(bothCompleted)
+        XCTAssertEqual(
+            siblingWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first,
+            originWindow.peerHandoffSnapshotsForTesting(
+                originConversationID: originConversation.id,
+                originThreadID: nil
+            ).first
+        )
+        XCTAssertEqual(
+            try context.botStore.conversation(id: originConversation.id)?.attentionState,
+            .unreadActivity,
+            "the exact host conversation attention must settle after its terminal"
+        )
+
+        XCTAssertEqual(originWindow.selectedBotID, originSelection)
+        XCTAssertEqual(siblingWindow.selectedBotID, siblingSelection)
+        XCTAssertEqual(originWindow.screen, originScreen)
+        XCTAssertEqual(siblingWindow.screen, siblingScreen)
+        XCTAssertEqual(originWindow.composerText, "ORIGIN_WINDOW_COMPOSER")
+        XCTAssertEqual(siblingWindow.composerText, "SIBLING_WINDOW_COMPOSER")
+        XCTAssertEqual(originWindow.attachments, originAttachments)
+        XCTAssertEqual(siblingWindow.attachments, siblingAttachments)
+        XCTAssertEqual(originWindow.memoryDraft, "ORIGIN_MEMORY_DRAFT")
+        XCTAssertEqual(siblingWindow.memoryDraft, "SIBLING_MEMORY_DRAFT")
+        XCTAssertEqual(originWindow.skillDraft, "origin-skill-draft")
+        XCTAssertEqual(siblingWindow.skillDraft, "sibling-skill-draft")
+        XCTAssertEqual(originWindow.routineName, "Origin routine")
+        XCTAssertEqual(siblingWindow.routineName, "Sibling routine")
+        XCTAssertEqual(originWindow.routinePrompt, "Origin routine prompt")
+        XCTAssertEqual(siblingWindow.routinePrompt, "Sibling routine prompt")
+        XCTAssertEqual(originWindow.routineScheduleNote, "Origin routine schedule")
+        XCTAssertEqual(siblingWindow.routineScheduleNote, "Sibling routine schedule")
+        XCTAssertEqual(fullReloadCounts(originWindow), originReloadCounts)
+        XCTAssertEqual(fullReloadCounts(siblingWindow), siblingReloadCounts)
+        XCTAssertGreaterThan(
+            originWindow.deskRestoreInvokedCountForTesting,
+            originDeskRestoreCount,
+            "exact terminal events may refresh the owning Desk projection without reloading the VM"
+        )
+        XCTAssertGreaterThan(
+            siblingWindow.deskRestoreInvokedCountForTesting,
+            siblingDeskRestoreCount,
+            "the second window may refresh its targeted Desk cache without losing local UI state"
+        )
+    }
+
+    func test_peerHandoffMutationWithOneThousandRowsRetainsNineHundredNinetyNineUnderFiftyMillisecondP95() throws {
+        // WHY: every authority mutation re-encodes and atomically commits the
+        // complete v2 envelope. A large retained history must not turn one
+        // background handoff delta into a visible main-thread stall.
+        let settingsKey = "bots.peerTurns.v2"
+        let targetOriginBotID = BotID()
+        let (payload, targetActivityID, siblingActivityID) = try peerHandoffPerformancePayload(
+            rowCount: 1_000,
+            targetOriginBotID: targetOriginBotID
+        )
+        defer { UserDefaults.standard.removeObject(forKey: settingsKey) }
+
+        _ = try measurePeerHandoffDeletion(
+            label: "warmup",
+            payload: payload,
+            targetOriginBotID: targetOriginBotID,
+            targetActivityID: targetActivityID,
+            siblingActivityID: siblingActivityID
+        )
+
+        var samples: [Double] = []
+        for sample in 0..<20 {
+            samples.append(try measurePeerHandoffDeletion(
+                label: "sample-\(sample)",
+                payload: payload,
+                targetOriginBotID: targetOriginBotID,
+                targetActivityID: targetActivityID,
+                siblingActivityID: siblingActivityID
+            ))
+        }
+
+        let p95 = percentile(samples, fraction: 0.95)
+        let rawSamples = samples.map { String(format: "%.3f", $0) }.joined(separator: ",")
+        let evidence = "samples_ms=[\(rawSamples)] p95_ms=\(String(format: "%.3f", p95))"
+        XCTAssertLessThan(p95, 50, evidence)
+    }
+
+    func test_exactCheckpointAssistantBeatsNewerAmbientAssistantInsertedBeforeTerminalFanout() async throws {
+        // WHY: a thread-global "latest assistant" can belong to unrelated work.
+        // Insert that adversary after the exact minimal checkpoint write but
+        // before didFinish; only the checkpoint-owned assistant may cross Bots.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        let viewModel = BotsViewModel(context: context, router: router)
+        router.botsViewModel = viewModel
+        let piper = try viewModel.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try viewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        viewModel.openDesk(quinn)
+        viewModel.setDeskProvider(.claude)
+        viewModel.openDesk(piper)
+        viewModel.setDeskProvider(.codex)
+        viewModel.createDeskThread()
+        let origin = try XCTUnwrap(viewModel.selectedConversation)
+
+        XCTAssertTrue(viewModel.send("@\(quinn.handle) T005_EXACT_ORACLE"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_EXACT_ORACLE") }
+        }
+        XCTAssertTrue(peerStarted)
+        let pending = try XCTUnwrap(viewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first)
+        let peerRunID = try XCTUnwrap(pending.peerRunID)
+        let peerThreadID = try XCTUnwrap(pending.peerThreadID)
+        let ambientMessageID = AgentMessageID()
+        try context.db.execute("""
+            CREATE TRIGGER insert_t005_newer_ambient_assistant
+            AFTER INSERT ON agent_turn_checkpoints
+            WHEN NEW.run_id = '\(peerRunID.value.uuidString)'
+            BEGIN
+                INSERT INTO agent_messages(
+                    id, thread_id, role, content, created_at, attachments_json,
+                    body_sha256, body_bytes, body_revision
+                ) VALUES(
+                    '\(ambientMessageID.value.uuidString)',
+                    '\(peerThreadID.value.uuidString)',
+                    'assistant',
+                    'NEWER_AMBIENT_MUST_LOSE',
+                    '9999-12-31T23:59:59Z',
+                    '[]',
+                    't005-ambient',
+                    23,
+                    1
+                );
+            END;
+        """)
+        defer { try? context.db.execute("DROP TRIGGER insert_t005_newer_ambient_assistant;") }
+
+        XCTAssertTrue(peerRunner.finish(
+            runID: peerRunID,
+            status: .completed,
+            reply: "EXACT_CHECKPOINT_REPLY"
+        ))
+        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+        let checkpoint = try XCTUnwrap(
+            context.turnCheckpointRepo.list(threadId: peerThreadID)
+                .first { $0.runId == peerRunID }
+        )
+        let checkpointMessageID = try XCTUnwrap(checkpoint.assistantMessageId)
+        XCTAssertNotEqual(checkpointMessageID, ambientMessageID)
+        XCTAssertEqual(
+            try context.messageRepo.get(id: checkpointMessageID)?.content,
+            "EXACT_CHECKPOINT_REPLY"
+        )
+        XCTAssertEqual(
+            try context.messageRepo.list(threadId: peerThreadID).last?.id,
+            ambientMessageID,
+            "precondition: the unrelated assistant is observably newer on the same thread"
+        )
+        XCTAssertTrue(viewModel.deskMessages.contains {
+            $0.peer?.direction == .fromPeer && $0.text == "EXACT_CHECKPOINT_REPLY"
+        })
+        XCTAssertFalse(viewModel.deskMessages.contains { $0.text == "NEWER_AMBIENT_MUST_LOSE" })
+        let exactHostRunID = try XCTUnwrap(viewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first?.hostRunID)
+        XCTAssertEqual(hostRunner.requests.first?.runId, exactHostRunID)
+        XCTAssertTrue(hostRunner.finish(runID: exactHostRunID, status: .cancelled, reply: nil))
+    }
+
+    func test_peerFailureAndCancellationSettleOnlyTheirExactOwningHandoffs() async throws {
+        // WHY: two concurrent requests can share the same peer provider. A
+        // failure or cancellation is scoped by the durable run ID, not by the
+        // currently selected Bot, so neither terminal may settle its sibling.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+
+        vm.createDeskThread()
+        let failureOrigin = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertTrue(vm.send("@\(quinn.handle) FAIL_ONLY_OWNER"))
+        let failureStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("FAIL_ONLY_OWNER") }
+        }
+        XCTAssertTrue(failureStarted)
+
+        vm.createDeskThread()
+        let cancellationOrigin = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertTrue(vm.send("@\(quinn.handle) CANCEL_ONLY_OWNER"))
+        let cancellationStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("CANCEL_ONLY_OWNER") }
+        }
+        XCTAssertTrue(cancellationStarted)
+
+        let failureHandoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: failureOrigin.id,
+            originThreadID: nil
+        ).first)
+        let cancellationHandoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: cancellationOrigin.id,
+            originThreadID: nil
+        ).first)
+        let failureRunID = try XCTUnwrap(failureHandoff.peerRunID)
+        let cancellationRunID = try XCTUnwrap(cancellationHandoff.peerRunID)
+        XCTAssertNotEqual(failureRunID, cancellationRunID)
+
+        XCTAssertTrue(peerRunner.finish(runID: failureRunID, status: .failed, reply: nil))
+        let failureSettled = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: failureOrigin.id,
+                originThreadID: nil
+            ).first?.phase == .needsAttention
+        }
+        XCTAssertTrue(failureSettled)
+        XCTAssertEqual(try context.runRepo.get(id: failureRunID)?.status, .failed)
+        XCTAssertEqual(
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: cancellationOrigin.id,
+                originThreadID: nil
+            ).first?.phase,
+            .peerRunning,
+            "failure of the first exact run must leave its sibling armed and running"
+        )
+        XCTAssertEqual(try context.runRepo.get(id: cancellationRunID)?.status, .running)
+
+        XCTAssertTrue(peerRunner.finish(runID: cancellationRunID, status: .cancelled, reply: nil))
+        let cancellationSettled = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: cancellationOrigin.id,
+                originThreadID: nil
+            ).first?.phase == .needsAttention
+        }
+        XCTAssertTrue(cancellationSettled)
+        XCTAssertEqual(try context.runRepo.get(id: cancellationRunID)?.status, .cancelled)
+        XCTAssertEqual(
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: failureOrigin.id,
+                originThreadID: nil
+            ).first?.phase,
+            .needsAttention,
+            "cancellation of the sibling exact run must not rewrite the first terminal"
+        )
+
+        for origin in [failureOrigin, cancellationOrigin] {
+            vm.selectDeskThread(origin.id)
+            XCTAssertFalse(
+                vm.deskMessages.contains { $0.peer?.direction == .fromPeer },
+                "failed/cancelled peers have no stable reply to leak into either origin"
+            )
+        }
+    }
+
+    func test_handoffOlderThanSixtyFiveLogicalSecondsStillSettlesFromExactTerminalsWithoutWallTimeout() async throws {
+        // WHY: the former 120 x 500 ms polling loop fabricated a one-minute
+        // boundary. Durable run age is not failure evidence; both legs must
+        // remain owned until their exact terminal/checkpoint arrives.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+        vm.createDeskThread()
+        let origin = try XCTUnwrap(vm.selectedConversation)
+
+        let wallStart = Date()
+        XCTAssertTrue(vm.send("@\(quinn.handle) LOGICAL_65_SECONDS"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("LOGICAL_65_SECONDS") }
+        }
+        XCTAssertTrue(peerStarted)
+        let peerRunID = try XCTUnwrap(
+            peerRunner.requests.first { $0.prompt.contains("LOGICAL_65_SECONDS") }?.runId
+        )
+        let peerRunning = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase == .peerRunning
+        }
+        XCTAssertTrue(peerRunning, "the peer start must persist .peerRunning before logical age is applied")
+        var peerRun = try XCTUnwrap(try context.runRepo.get(id: peerRunID))
+        let peerLogicalNow = Date()
+        peerRun.startedAt = peerLogicalNow.addingTimeInterval(-66)
+        try context.runRepo.upsert(peerRun)
+        XCTAssertGreaterThan(peerLogicalNow.timeIntervalSince(peerRun.startedAt), 65)
+        XCTAssertEqual(
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase,
+            .peerRunning,
+            "logical age alone must not settle the peer leg"
+        )
+
+        XCTAssertTrue(peerRunner.finish(runID: peerRunID, status: .completed, reply: "reply after 65s"))
+        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+        let hostBound = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase == .hostRunning
+        }
+        XCTAssertTrue(hostBound)
+        let handoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first)
+        let hostRunID = try XCTUnwrap(handoff.hostRunID)
+        var hostRun = try XCTUnwrap(try context.runRepo.get(id: hostRunID))
+        let hostLogicalNow = Date()
+        hostRun.startedAt = hostLogicalNow.addingTimeInterval(-66)
+        try context.runRepo.upsert(hostRun)
+        XCTAssertGreaterThan(hostLogicalNow.timeIntervalSince(hostRun.startedAt), 65)
+        XCTAssertEqual(handoff.phase, .hostRunning)
+
+        XCTAssertTrue(hostRunner.finish(runID: hostRunID, status: .completed, reply: "host after 65s"))
+        let settled = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase == .completed
+        }
+        XCTAssertTrue(settled)
+        XCTAssertLessThan(
+            Date().timeIntervalSince(wallStart),
+            10,
+            "the >65-second proof advances durable logical time and must never wall-sleep for the old timeout"
+        )
+        XCTAssertEqual(
+            vm.deskTranscriptForTesting(botID: piper.id).filter {
+                $0.peer?.direction == .fromPeer && $0.text == "reply after 65s"
+            }.count,
+            1
+        )
+    }
+
+    func test_setPhaseCASMismatchPublishesCanonicalSnapshotNotFailedCandidate() async throws {
+        // WHY: a failed authority CAS must not install the unpersisted phase
+        // into the ViewModel map. A later full-map persist would otherwise
+        // retry that candidate and clobber the canonical sibling.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+        vm.createDeskThread()
+        let origin = try XCTUnwrap(vm.selectedConversation)
+
+        var persistCount = 0
+        context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = { data in
+            persistCount += 1
+            if persistCount > 1 {
+                throw NSError(domain: "setPhaseCASMismatch", code: 1)
+            }
+            UserDefaults.standard.set(data, forKey: "bots.peerTurns.v2")
+            guard UserDefaults.standard.synchronize(),
+                  UserDefaults.standard.data(forKey: "bots.peerTurns.v2") == data else {
+                throw NSError(domain: "setPhaseCASMismatch", code: 2)
+            }
+        }
+
+        XCTAssertTrue(vm.send("@\(quinn.handle) SETPHASE_CAS_MUST_KEEP_CANONICAL"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("SETPHASE_CAS_MUST_KEEP_CANONICAL") }
+        }
+        XCTAssertTrue(peerStarted)
+        let phaseHeld = await waitUntil(timeout: 5) { persistCount >= 2 }
+        XCTAssertTrue(phaseHeld, "execute must attempt the peerRunning persist after send")
+        XCTAssertEqual(
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).first?.phase,
+            .peerPrepared,
+            "CAS failure must rehydrate the ViewModel from canonical storage, not the failed peerRunning candidate"
+        )
+
+        if let peerRunID = peerRunner.requests.first?.runId {
+            _ = peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
+        }
+        context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
+    }
+
+    func test_routeMutationAfterDurablePrebindCannotRerouteEitherHandoffLeg() async throws {
+        // WHY: the user can change the visible Desk route while a teammate is
+        // starting. Both peer and host legs must use the snapshots bound at
+        // admission, not whichever provider is ambient after suspension.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let claude = ControlledBotHandoffRunner(provider: .claude)
+        let codex = ControlledBotHandoffRunner(provider: .codex)
+        let grok = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.claude, runner: claude)
+        context.coordinator.replaceProvider(.codex, runner: codex)
+        context.coordinator.replaceProvider(.grok, runner: grok)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+        vm.createDeskThread()
+        let origin = try XCTUnwrap(vm.selectedConversation)
+
+        var dispatches = 0
+        vm.beforeBotRunDispatchForTesting = { _ in
+            dispatches += 1
+            vm.setDeskProvider(.grok)
+        }
+        XCTAssertTrue(vm.send("@\(quinn.handle) ROUTE_FREEZE"))
+        let peerStarted = await waitUntil(timeout: 5) {
+            claude.requests.contains { $0.prompt.contains("ROUTE_FREEZE") }
+        }
+        XCTAssertTrue(peerStarted)
+        XCTAssertTrue(grok.requests.isEmpty)
+        XCTAssertTrue(claude.finish(promptContaining: "ROUTE_FREEZE", reply: "frozen reply"))
+        let hostStarted = await waitUntil(timeout: 5) { !codex.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+
+        let handoff = try XCTUnwrap(vm.peerHandoffSnapshotsForTesting(
+            originConversationID: origin.id,
+            originThreadID: nil
+        ).first)
+        XCTAssertEqual(handoff.peerProvider, .claude)
+        XCTAssertEqual(handoff.hostProvider, .codex)
+        XCTAssertEqual(handoff.peerRunID, claude.requests.first?.runId)
+        XCTAssertEqual(handoff.hostRunID, codex.requests.first?.runId)
+        XCTAssertGreaterThanOrEqual(dispatches, 2)
+        XCTAssertTrue(grok.requests.isEmpty, "ambient mutation must not start either leg on Grok")
+
+        XCTAssertTrue(codex.finish(runID: try XCTUnwrap(handoff.hostRunID), status: .completed, reply: "done"))
+        let handoffCompleted = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: origin.id,
+                originThreadID: nil
+            ).contains { $0.phase == .completed }
+        }
+        XCTAssertTrue(handoffCompleted)
+        vm.beforeBotRunDispatchForTesting = nil
+    }
+
     func test_hopRelayOmitsMentionToken() async throws {
         // WHY: hop used to embed (@handle). Mention-send would loop, or
         // lastAssistantText was empty and the host never saw the reply.
@@ -5042,11 +6290,54 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(hop.contains("inbox is clear"))
         XCTAssertFalse(BotPeerTranscript.containsMentionToken(hop, handle: quinn.handle))
         XCTAssertFalse(hop.contains("@\(quinn.handle)"))
-        XCTAssertTrue(vm.supervisedRunBotIDsForTesting.contains(piper.id), "hop must start the host, not mention-send")
-        let imported = vm.deskTranscriptForTesting(botID: piper.id).contains {
-            $0.role == .assistant && $0.peer?.direction == .fromPeer && $0.text.contains("inbox is clear")
+        let hostStarted = await waitUntil(timeout: 5) {
+            guard let handoff = vm.peerHandoffSnapshotsForTesting().first(where: {
+                $0.originBotID == piper.id && $0.peerBotID == quinn.id
+            }) else { return false }
+            return handoff.hostRunID != nil
+                && (handoff.phase == .hostRunning || handoff.phase == .completed)
         }
-        XCTAssertTrue(imported, "host desk must show the Message from peer reply")
+        let observedHandoff = vm.peerHandoffSnapshotsForTesting().first {
+            $0.originBotID == piper.id && $0.peerBotID == quinn.id
+        }
+        XCTAssertTrue(
+            hostStarted,
+            "hop must start the exact host, not mention-send; phase=\(String(describing: observedHandoff?.phase)) peerRunID=\(String(describing: observedHandoff?.peerRunID)) hostRunID=\(String(describing: observedHandoff?.hostRunID))"
+        )
+        let imported = await waitUntil(timeout: 5) {
+            vm.deskTranscriptForTesting(botID: piper.id).contains {
+                $0.role == .assistant
+                    && $0.peer?.direction == .fromPeer
+                    && $0.text.contains("inbox is clear")
+            }
+        }
+        let observedHandoffs = vm.peerHandoffSnapshotsForTesting()
+        let exactHandoff = observedHandoffs.first {
+            $0.originBotID == piper.id && $0.peerBotID == quinn.id
+        }
+        let piperTranscript = vm.deskTranscriptForTesting(botID: piper.id)
+        XCTAssertEqual(
+            piperTranscript.filter {
+                $0.role == .user
+                    && $0.peer?.direction == .messaged
+                    && $0.peer?.botID == quinn.id
+                    && $0.text == "@\(quinn.handle) what is in the inbox?"
+            }.count,
+            1
+        )
+        XCTAssertEqual(
+            piperTranscript.filter {
+                $0.role == .assistant
+                    && $0.peer?.direction == .fromPeer
+                    && $0.peer?.botID == quinn.id
+                    && $0.text == "inbox is clear"
+            }.count,
+            1
+        )
+        XCTAssertTrue(
+            imported,
+            "host desk must show the Message from peer reply; selectedConversationID=\(String(describing: vm.selectedConversation?.id)) observerSnapshotCount=\(observedHandoffs.count) phase=\(String(describing: exactHandoff?.phase)) inboundID=\(String(describing: exactHandoff?.inboundMessageID)) peerRunID=\(String(describing: exactHandoff?.peerRunID)) hostRunID=\(String(describing: exactHandoff?.hostRunID))"
+        )
     }
 
     func test_runMentionedPromptTargetsPeerFromAgentApp() async throws {
@@ -8442,6 +9733,158 @@ final class BotsWindowTests: XCTestCase {
         }
     }
 
+    private func fullReloadCounts(_ viewModel: BotsViewModel) -> [Int] {
+        [
+            viewModel.fleetReloadCountForTesting,
+            viewModel.studioSupportReloadCountForTesting,
+        ]
+    }
+
+    private func peerHandoffPerformancePayload(
+        rowCount: Int,
+        targetOriginBotID: BotID
+    ) throws -> (data: Data, targetActivityID: UUID, siblingActivityID: UUID) {
+        precondition(rowCount >= 2)
+        let targetActivityID = UUID()
+        let siblingActivityID = UUID()
+        let retainedOriginBotID = BotID()
+        let route = T005PeerHandoffRouteFixture(
+            provider: .codex,
+            providerInstanceID: "codex",
+            model: "t005-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            serviceTier: .auto,
+            runAsUser: AgentRunAsUser(
+                generatedUID: "t005-fixture",
+                shortName: "fixture",
+                uid: 0,
+                gid: 0,
+                homePath: "/tmp/t005-fixture"
+            ),
+            routingConfiguration: nil
+        )
+        var rows: [UUID: T005PeerHandoffRecordFixture] = [:]
+        rows.reserveCapacity(rowCount)
+        for index in 0..<rowCount {
+            let activityID: UUID
+            if index == 0 {
+                activityID = targetActivityID
+            } else if index == 1 {
+                activityID = siblingActivityID
+            } else {
+                activityID = UUID()
+            }
+            rows[activityID] = T005PeerHandoffRecordFixture(
+                version: 2,
+                activityID: activityID,
+                originBotID: index == 0 ? targetOriginBotID : retainedOriginBotID,
+                originConversationID: nil,
+                originAgentThreadID: nil,
+                peerBotID: BotID(),
+                peerConversationID: BotConversationID(),
+                peerThreadID: nil,
+                peerRunID: nil,
+                inboundMessageID: activityID,
+                peerName: "Peer \(index)",
+                peerTitle: "Performance fixture",
+                peerHandle: "peer-\(index)",
+                outboundText: "retained row \(index)",
+                createdAt: Date(timeIntervalSinceReferenceDate: Double(index)),
+                peerRoute: route,
+                hostThreadID: nil,
+                hostRunID: nil,
+                hostRoute: nil,
+                replyText: "completed row \(index)",
+                replyCreatedAt: Date(timeIntervalSinceReferenceDate: Double(index + 1)),
+                phase: .completed
+            )
+        }
+        return (
+            try JSONEncoder().encode(rows),
+            targetActivityID,
+            siblingActivityID
+        )
+    }
+
+    private func measurePeerHandoffDeletion(
+        label: String,
+        payload: Data,
+        targetOriginBotID: BotID,
+        targetActivityID: UUID,
+        siblingActivityID: UUID
+    ) throws -> Double {
+        let root = URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent("peer-perf-\(label)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        UserDefaults.standard.set(payload, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+        let (_, db) = try Bootstrap(
+            channel: .debug,
+            appSupportOverride: root.path
+        ).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedMessageRepo = AgentQueuedMessageRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let settingsRepo = SettingsRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            checkpointRepo: checkpointRepo,
+            providers: [:]
+        )
+        var authority: BotPeerHandoffAuthority? = BotPeerHandoffAuthority(
+            botStore: BotStore(db: db),
+            threadRepo: threadRepo,
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            queuedMessageRepo: queuedMessageRepo,
+            checkpointRepo: checkpointRepo,
+            settingsRepo: settingsRepo,
+            coordinator: coordinator,
+            appSupportDirectory: root
+        )
+        weak var releasedAuthority = authority
+        let deletion = try XCTUnwrap(authority).beginDeletion(originBotID: targetOriginBotID)
+
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let committed = try XCTUnwrap(authority).commitDeletion(deletion)
+        let finishedAt = DispatchTime.now().uptimeNanoseconds
+        XCTAssertTrue(committed, "\(label) must commit through the production authority path")
+
+        let storedPayload = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"))
+        let retained = try JSONDecoder().decode(
+            [UUID: T005PeerHandoffRecordFixture].self,
+            from: storedPayload
+        )
+        XCTAssertEqual(retained.count, 999, "\(label) must retain exactly 999 supported v2 rows")
+        XCTAssertNil(retained[targetActivityID], "\(label) must delete the exact selected row")
+        XCTAssertNotNil(retained[siblingActivityID], "\(label) must preserve an unrelated sibling")
+        XCTAssertEqual(
+            try settingsRepo.get("bots.peerTurns.v2"),
+            "base64:\(storedPayload.base64EncodedString())",
+            "\(label) SQLite and mirror must describe the same committed envelope"
+        )
+
+        authority = nil
+        XCTAssertNil(releasedAuthority, "\(label) must not accumulate an authority between samples")
+        return Double(finishedAt - startedAt) / 1_000_000
+    }
+
+    private func percentile(_ samples: [Double], fraction: Double) -> Double {
+        let sorted = samples.sorted()
+        let index = max(0, Int(ceil(Double(sorted.count) * fraction)) - 1)
+        return sorted[index]
+    }
+
     private func makeContext() throws -> AppContext {
         try AppContext(channel: .debug, appSupportOverride: directory)
     }
@@ -8495,5 +9938,167 @@ final class BotsWindowTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent(relative)
+    }
+}
+
+private struct T005PeerHandoffRouteFixture: Codable, Equatable {
+    let provider: AgentProvider
+    let providerInstanceID: String
+    let model: String
+    let permissionMode: AgentPermissionMode
+    let reasoningEffort: AgentReasoningEffort
+    let serviceTier: AgentServiceTier
+    let runAsUser: AgentRunAsUser
+    let routingConfiguration: AgentRoutingConfiguration?
+}
+
+private struct T005PeerHandoffRecordFixture: Codable, Equatable {
+    let version: Int
+    let activityID: UUID
+    let originBotID: BotID?
+    let originConversationID: BotConversationID?
+    let originAgentThreadID: AgentThreadID?
+    let peerBotID: BotID
+    let peerConversationID: BotConversationID
+    let peerThreadID: AgentThreadID?
+    let peerRunID: AgentRunID?
+    let inboundMessageID: UUID
+    let peerName: String
+    let peerTitle: String
+    let peerHandle: String
+    let outboundText: String
+    let createdAt: Date
+    let peerRoute: T005PeerHandoffRouteFixture
+    let hostThreadID: AgentThreadID?
+    let hostRunID: AgentRunID?
+    let hostRoute: T005PeerHandoffRouteFixture?
+    let replyText: String?
+    let replyCreatedAt: Date?
+    let phase: BotPeerHandoffPhase
+}
+
+final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider
+
+    private struct PendingRun {
+        let request: AgentRunRequest
+        let turnID: String
+        let onEvent: @Sendable (AgentRunEvent) -> Void
+    }
+
+    private let lock = NSLock()
+    private var pendingByRunID: [AgentRunID: PendingRun] = [:]
+    private var capturedRequests: [AgentRunRequest] = []
+    private var capturedCancellationRequests: [AgentRunID] = []
+    private let defersCancellationForTesting: Bool
+
+    init(provider: AgentProvider, defersCancellationForTesting: Bool = false) {
+        self.provider = provider
+        self.defersCancellationForTesting = defersCancellationForTesting
+    }
+
+    var requests: [AgentRunRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedRequests
+    }
+
+    var cancellationRequestedRunIDs: [AgentRunID] {
+        lock.withLock { capturedCancellationRequests }
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        let turnID = "turn-\(request.runId.value.uuidString.lowercased())"
+        lock.lock()
+        capturedRequests.append(request)
+        pendingByRunID[request.runId] = PendingRun(
+            request: request,
+            turnID: turnID,
+            onEvent: onEvent
+        )
+        lock.unlock()
+
+        let providerThreadID = request.providerThreadId ?? request.threadId.value.uuidString
+        onEvent(.status(.running))
+        onEvent(.event(.threadStarted(
+            threadId: providerThreadID,
+            providerThreadId: providerThreadID
+        )))
+        onEvent(.event(.turnStarted(turnId: turnID)))
+        return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
+            guard let self else { return }
+            if self.defersCancellationForTesting {
+                self.lock.withLock {
+                    self.capturedCancellationRequests.append(request.runId)
+                }
+                return
+            }
+            _ = self.finish(runID: request.runId, status: .cancelled, reply: nil)
+        }
+    }
+
+    @discardableResult
+    func finish(
+        promptContaining marker: String,
+        status: AgentRunStatus = .completed,
+        reply: String?
+    ) -> Bool {
+        let runID: AgentRunID?
+        lock.lock()
+        runID = capturedRequests.first {
+            $0.prompt.contains(marker) && pendingByRunID[$0.runId] != nil
+        }?.runId
+        lock.unlock()
+        guard let runID else { return false }
+        return finish(runID: runID, status: status, reply: reply)
+    }
+
+    @discardableResult
+    func finish(
+        runID: AgentRunID,
+        status: AgentRunStatus,
+        reply: String?
+    ) -> Bool {
+        let pending: PendingRun?
+        lock.lock()
+        pending = pendingByRunID.removeValue(forKey: runID)
+        lock.unlock()
+        guard let pending else { return false }
+
+        let providerThreadID = pending.request.providerThreadId
+            ?? pending.request.threadId.value.uuidString
+        if status == .completed, let reply {
+            let itemID = "assistant-\(runID.value.uuidString.lowercased())"
+            pending.onEvent(.event(.itemStarted(item: AssistantItem(
+                id: itemID,
+                turnId: pending.turnID,
+                type: .assistantMessage,
+                startedAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+            ))))
+            pending.onEvent(.event(.itemDelta(
+                itemId: itemID,
+                bodyAppend: reply,
+                outputAppend: nil,
+                summary: nil
+            )))
+            pending.onEvent(.event(.itemCompleted(itemId: itemID, finalState: .completed)))
+            pending.onEvent(.event(.turnCompleted(turnId: pending.turnID, finalMessage: reply)))
+        } else if status == .completed {
+            pending.onEvent(.event(.turnCompleted(turnId: pending.turnID, finalMessage: nil)))
+        } else if status == .failed {
+            pending.onEvent(.event(.error(message: "controlled failure", recoverable: false)))
+        }
+        pending.onEvent(.status(status))
+        pending.onEvent(.finished(
+            status,
+            finalMessage: status == .completed ? reply : nil,
+            providerThreadId: providerThreadID
+        ))
+        return true
     }
 }

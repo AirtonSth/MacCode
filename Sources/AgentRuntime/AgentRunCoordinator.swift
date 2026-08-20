@@ -1076,6 +1076,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     var lateRunValidationRetryDelayNanosecondsForTesting: UInt64?
     var deletedThreadRetirementRetryDelayNanosecondsForTesting: UInt64?
     var lateRunValidationSweepStartsForTesting = 0
+    /// Seam-only barrier at the current checkpoint capture boundary. The
+    /// T-005 correction moves this invocation after terminal callbacks.
+    var checkpointEnrichmentBarrierForTesting: ((AgentRunID) async -> Void)?
 #endif
     private var pendingReceiptFinalizations: [AgentRunID: PendingOrchestrationReceiptFinalization] = [:]
     private var receiptFinalizationRetryScheduled: Set<AgentRunID> = []
@@ -1105,6 +1108,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// terminal row or mirror notification overtake its preceding events.
     private var pendingTerminalEvents: [AgentRunID: PendingTerminalEvent] = [:]
     private var terminalRetryScheduled: Set<AgentRunID> = []
+    /// Exact critical-section ownership from the first terminal graph write
+    /// through minimal checkpoint identity persistence. Durable stale-release
+    /// must not synthesize a callback while this attempt is still authoritative.
+    private var terminalCheckpointAttempts: Set<AgentRunID> = []
     /// A provider start can fail while SQLite is temporarily unavailable. Keep
     /// the complete failure transition until its run/thread/session/error graph
     /// commits; a new run on the same thread must not overtake it.
@@ -1378,6 +1385,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         observerRefs.removeAll { $0.value == nil || $0.value === observer }
         lock.unlock()
     }
+
+#if DEBUG
+    func terminalCheckpointAttemptIsActiveForTesting(_ runId: AgentRunID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return terminalCheckpointAttempts.contains(runId)
+    }
+#endif
 
     /// Marks orphaned in-process runs/threads interrupted after relaunch.
     /// - Parameter preservingThreadIDs: threads owned by another process
@@ -4012,6 +4026,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         providerThreadId: String?
     ) -> Bool {
         lock.lock()
+        guard !terminalCheckpointAttempts.contains(runId) else {
+            lock.unlock()
+            return false
+        }
         let ownsRun = active[runId] != nil || activeThreads[threadId] == runId
         guard ownsRun else {
             lock.unlock()
@@ -6516,6 +6534,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
                 return
             }
+            lock.lock()
+            terminalCheckpointAttempts.insert(runId)
+            lock.unlock()
             let terminalPersistence: TerminalPersistenceContext
             do {
                 // pendingTerminal.status is already policy-reconciled.
@@ -6525,6 +6546,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     threadId: threadId
                 )
             } catch {
+                lock.lock()
+                terminalCheckpointAttempts.remove(runId)
+                lock.unlock()
                 emitPersistenceIssue("run.terminal_graph.commit", error: error, runId: runId, threadId: threadId)
                 scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
                 return
@@ -6574,15 +6598,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                let assistantMessage = pendingTerminal.assistantMessage {
                 onMessageAppended?(assistantMessage)
             }
-            if status == .completed {
-                captureCheckpoint(
+            let minimalCheckpoint = status == .completed
+                ? persistMinimalCheckpointIdentity(
                     threadId: threadId,
                     runId: runId,
                     turnId: completedTurnId,
-                    cwd: runMetadata?.cwd,
                     assistantMessageId: assistantMessageId
                 )
-            }
+                : nil
+            let minimalCheckpointFailed = status == .completed
+                && checkpointRepo != nil
+                && minimalCheckpoint == nil
+            let callbackFinalMessage = minimalCheckpointFailed ? nil : finalMessage
+            let callbackProviderThreadId = minimalCheckpointFailed ? nil : providerThreadId
             lock.lock()
             orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
             externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
@@ -6598,6 +6626,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             finishingRuns.remove(runId)
             pendingTerminalEvents.removeValue(forKey: runId)
             terminalRetryScheduled.remove(runId)
+            terminalCheckpointAttempts.remove(runId)
             deferredProviderTerminalEvents.removeValue(forKey: runId)
             deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
             providerTextTranslationsInFlight.removeValue(forKey: runId)
@@ -6680,9 +6709,24 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             )
             lock.unlock()
             for observer in observersSnapshot() {
-                observer.runCoordinator(self, didFinish: runId, threadId: threadId, status: status, finalMessage: finalMessage, providerThreadId: providerThreadId)
+                observer.runCoordinator(
+                    self,
+                    didFinish: runId,
+                    threadId: threadId,
+                    status: status,
+                    finalMessage: callbackFinalMessage,
+                    providerThreadId: callbackProviderThreadId
+                )
             }
             onRunFinished?(threadId, runId, status)
+            if let minimalCheckpoint {
+                Task { [weak self] in
+                    await self?.enrichCheckpoint(
+                        minimalCheckpoint,
+                        cwd: runMetadata?.cwd
+                    )
+                }
+            }
         case .error(let m):
             // F22: route the error through the .event path so it is PERSISTED as a
             // stream event (same batched appendStreamEvent flow as every other
@@ -7629,23 +7673,51 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return trimmed
     }
 
-    private func captureCheckpoint(
+    private func persistMinimalCheckpointIdentity(
         threadId: AgentThreadID,
         runId: AgentRunID,
         turnId rawTurnId: String?,
-        cwd: String?,
         assistantMessageId: AgentMessageID?
-    ) {
-        guard let checkpointRepo else { return }
+    ) -> AgentTurnCheckpointSummary? {
+        guard let checkpointRepo else { return nil }
         let turnId = rawTurnId?.isEmpty == false ? rawTurnId! : "run-\(runId.value.uuidString)"
         let count: Int
         do {
             count = try checkpointRepo.nextTurnCount(threadId: threadId)
         } catch {
             emitPersistenceIssue("checkpoint.next_turn_count", error: error, runId: runId, threadId: threadId)
-            return
+            return nil
         }
-        let checkpointRef = "local-diff:\(runId.value.uuidString):\(turnId)"
+        let summary = AgentTurnCheckpointSummary(
+            threadId: threadId,
+            runId: runId,
+            turnId: turnId,
+            checkpointTurnCount: count,
+            checkpointRef: "local-diff:\(runId.value.uuidString):\(turnId)",
+            status: .missing,
+            files: [],
+            assistantMessageId: assistantMessageId
+        )
+        do {
+            try checkpointRepo.upsert(summary)
+            agentRunLog.info("checkpoint.identity_captured thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) count=\(count, privacy: .public)")
+            return summary
+        } catch {
+            emitPersistenceIssue("checkpoint.upsert", error: error, runId: runId, threadId: threadId)
+            return nil
+        }
+    }
+
+    private func enrichCheckpoint(
+        _ identity: AgentTurnCheckpointSummary,
+        cwd: String?
+    ) async {
+        guard let checkpointRepo else { return }
+#if DEBUG
+        if let barrier = checkpointEnrichmentBarrierForTesting {
+            await barrier(identity.runId)
+        }
+#endif
         let summary: AgentTurnCheckpointSummary
         if let cwd, !cwd.isEmpty {
             let gitSummary = GitDiff.summary(in: cwd)
@@ -7659,49 +7731,57 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     )
                 }
                 summary = AgentTurnCheckpointSummary(
-                    threadId: threadId,
-                    runId: runId,
-                    turnId: turnId,
-                    checkpointTurnCount: count,
-                    checkpointRef: checkpointRef,
+                    threadId: identity.threadId,
+                    runId: identity.runId,
+                    turnId: identity.turnId,
+                    checkpointTurnCount: identity.checkpointTurnCount,
+                    checkpointRef: identity.checkpointRef,
                     status: .ready,
                     files: files,
                     fileSnapshots: captureFileSnapshots(files: files, cwd: cwd),
                     diffPatch: GitDiff.diff(in: cwd, path: nil),
                     fileDiffs: captureFileDiffs(files: files, cwd: cwd),
-                    assistantMessageId: assistantMessageId
+                    assistantMessageId: identity.assistantMessageId,
+                    completedAt: identity.completedAt
                 )
             } else {
                 summary = AgentTurnCheckpointSummary(
-                    threadId: threadId,
-                    runId: runId,
-                    turnId: turnId,
-                    checkpointTurnCount: count,
-                    checkpointRef: checkpointRef,
+                    threadId: identity.threadId,
+                    runId: identity.runId,
+                    turnId: identity.turnId,
+                    checkpointTurnCount: identity.checkpointTurnCount,
+                    checkpointRef: identity.checkpointRef,
                     status: .missing,
                     files: [],
-                    assistantMessageId: assistantMessageId,
-                    errorMessage: "Not a git repository."
+                    assistantMessageId: identity.assistantMessageId,
+                    errorMessage: "Not a git repository.",
+                    completedAt: identity.completedAt
                 )
             }
         } else {
             summary = AgentTurnCheckpointSummary(
-                threadId: threadId,
-                runId: runId,
-                turnId: turnId,
-                checkpointTurnCount: count,
-                checkpointRef: checkpointRef,
+                threadId: identity.threadId,
+                runId: identity.runId,
+                turnId: identity.turnId,
+                checkpointTurnCount: identity.checkpointTurnCount,
+                checkpointRef: identity.checkpointRef,
                 status: .missing,
                 files: [],
-                assistantMessageId: assistantMessageId,
-                errorMessage: "Run workspace is missing."
+                assistantMessageId: identity.assistantMessageId,
+                errorMessage: "Run workspace is missing.",
+                completedAt: identity.completedAt
             )
         }
         do {
             try checkpointRepo.upsert(summary)
-            agentRunLog.info("checkpoint.captured thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) count=\(count, privacy: .public) status=\(summary.status.rawValue, privacy: .public) files=\(summary.files.count, privacy: .public)")
+            agentRunLog.info("checkpoint.enriched thread=\(identity.threadId.value.uuidString, privacy: .public) run=\(identity.runId.value.uuidString, privacy: .public) count=\(identity.checkpointTurnCount, privacy: .public) status=\(summary.status.rawValue, privacy: .public) files=\(summary.files.count, privacy: .public)")
         } catch {
-            emitPersistenceIssue("checkpoint.upsert", error: error, runId: runId, threadId: threadId)
+            emitPersistenceIssue(
+                "checkpoint.enrichment.upsert",
+                error: error,
+                runId: identity.runId,
+                threadId: identity.threadId
+            )
         }
     }
 

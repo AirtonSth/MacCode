@@ -22,6 +22,24 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
     }
 
+    private func waitUntil(timeout: TimeInterval, _ predicate: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if predicate() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return predicate()
+    }
+
+    private func isTerminal(_ status: AgentRunStatus?) -> Bool {
+        switch status {
+        case .completed, .failed, .cancelled, .interrupted:
+            return true
+        case .pending, .running, nil:
+            return false
+        }
+    }
+
     /// WHY: Auto admission and sudo -u spawn must resolve the same Claude binary
     /// for a foreign run-as-user (Settings absolute path + target home).
     func test_resolveProviderBinaryPathUsesForeignRunAsUserHome() throws {
@@ -1030,6 +1048,371 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastEventKind, "run.finished")
     }
 
+    func test_queuedPermissionSnapshotUpgradesLegacyRowsAndRemainsDowngradeReadable() throws {
+        // WHY: permission was added to the existing queue-routing JSON without
+        // a schema migration. New hosts must read legacy bare configurations,
+        // while old hosts must keep decoding rows written by the new host.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root.path).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let queueRepo = AgentQueuedMessageRepository(db: db)
+        let thread = AgentThread(
+            title: "permission compatibility",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        try threadRepo.upsert(thread)
+        let routing = thread.effectiveRoutingConfiguration
+
+        let legacy = try queueRepo.enqueue(
+            threadId: thread.id,
+            text: "legacy routing row",
+            attachments: [],
+            interactionMode: .default,
+            routingSnapshot: AgentQueuedMessageRoutingSnapshot(
+                configuration: routing,
+                permissionMode: .fullAccess
+            )
+        )
+        let legacyData = try JSONEncoder().encode(routing)
+        let legacyJSON = try XCTUnwrap(String(data: legacyData, encoding: .utf8))
+        let replaceWithLegacy = try db.prepare("""
+            UPDATE agent_queued_message_routing
+            SET configuration_json = ?
+            WHERE queued_message_id = ?;
+        """)
+        try replaceWithLegacy.bind(1, legacyJSON)
+        try replaceWithLegacy.bind(2, legacy.id.value.uuidString)
+        _ = try replaceWithLegacy.step()
+
+        let upgradedLegacy = try XCTUnwrap(queueRepo.routingSnapshot(id: legacy.id))
+        XCTAssertEqual(upgradedLegacy.configuration, routing)
+        XCTAssertNil(
+            upgradedLegacy.permissionMode,
+            "a pre-upgrade queue row has no frozen permission and must preserve the legacy fallback contract"
+        )
+
+        let frozen = AgentQueuedMessageRoutingSnapshot(
+            configuration: routing,
+            permissionMode: .autoAcceptEdits
+        )
+        let modern = try queueRepo.enqueue(
+            threadId: thread.id,
+            text: "modern routing row",
+            attachments: [],
+            interactionMode: .default,
+            routingSnapshot: frozen
+        )
+        XCTAssertEqual(
+            try queueRepo.routingSnapshot(id: modern.id),
+            frozen,
+            "an explicit permission must survive the real queue repository round trip"
+        )
+
+        let readModernJSON = try db.prepare("""
+            SELECT configuration_json
+            FROM agent_queued_message_routing
+            WHERE queued_message_id = ?;
+        """)
+        try readModernJSON.bind(1, modern.id.value.uuidString)
+        XCTAssertTrue(try readModernJSON.step())
+        let modernJSON = try XCTUnwrap(readModernJSON.columnText(0))
+        let modernData = try XCTUnwrap(modernJSON.data(using: .utf8))
+        let modernObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: modernData) as? [String: Any]
+        )
+        XCTAssertEqual(modernObject["permissionMode"] as? String, AgentPermissionMode.autoAcceptEdits.rawValue)
+        XCTAssertEqual(
+            try JSONDecoder().decode(AgentRoutingConfiguration.self, from: modernData),
+            routing,
+            "the additive flat permission key must remain readable by the pre-upgrade routing decoder"
+        )
+    }
+
+    func test_preallocatedDirectRunIdentityReachesTheProviderUnchanged() async throws {
+        // WHY: a handoff binds its run before provider spawn. Replacing that ID
+        // inside the ordinary direct-send path breaks waiter, checkpoint, and
+        // reply ownership even when the provider itself succeeds.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .codex,
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: AgentProvider.codex.rawValue
+            )
+        ])
+        let workspace = try router.createWorkspace(name: "prebound-direct", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "prebound direct",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let futureRunID = AgentRunID()
+
+        let result = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "use the bound direct id",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil,
+            requestedRunID: futureRunID,
+            routingSnapshot: AgentQueuedMessageRoutingSnapshot(
+                configuration: thread.effectiveRoutingConfiguration
+            )
+        )
+
+        XCTAssertEqual(result.status, .started)
+        XCTAssertEqual(result.runId, futureRunID)
+        XCTAssertEqual(runner.lastRequest?.runId, futureRunID)
+        XCTAssertEqual(try ctx.runRepo.get(id: futureRunID)?.threadId, thread.id)
+    }
+
+    func test_preallocatedQueuedRunIdentitySurvivesQueueDrainUnchanged() async throws {
+        // WHY: a busy Agent App thread queues the host continuation. Its queue
+        // row UUID is the already-bound future run UUID, so draining must not
+        // allocate a second identity that the handoff waiter cannot observe.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = ControlledBotHandoffRunner(provider: .codex)
+        ctx.coordinator.replaceProviderAdapter(
+            .codex,
+            adapter: TerminalRetiringOneShotAdapter(runner: runner)
+        )
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .codex,
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: AgentProvider.codex.rawValue
+            )
+        ])
+        let workspace = try router.createWorkspace(name: "prebound-queued", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "prebound queued",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let active = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "occupy the thread",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let activeRunID = try XCTUnwrap(active.runId)
+        let futureRunID = AgentRunID()
+
+        let queued = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "bound continuation",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil,
+            requestedRunID: futureRunID,
+            routingSnapshot: AgentQueuedMessageRoutingSnapshot(
+                configuration: thread.effectiveRoutingConfiguration
+            )
+        )
+
+        XCTAssertEqual(queued.status, .queued)
+        XCTAssertEqual(queued.runId, futureRunID)
+        XCTAssertEqual(queued.queuedMessage?.id, AgentQueuedMessageID(futureRunID.value))
+        XCTAssertEqual(
+            try ctx.queuedMessageRepo.get(id: AgentQueuedMessageID(futureRunID.value))?.text,
+            "bound continuation"
+        )
+
+        XCTAssertTrue(runner.finish(runID: activeRunID, status: .completed, reply: "first complete"))
+        let firstRunSettled = await waitUntil(timeout: 5) {
+            isTerminal(try? ctx.runRepo.get(id: activeRunID)?.status)
+                && isTerminal(try? ctx.threadRepo.get(id: thread.id)?.status)
+        }
+        let firstRun = try ctx.runRepo.get(id: activeRunID)
+        let firstRunStatus = firstRun?.status
+        let firstThreadStatus = try ctx.threadRepo.get(id: thread.id)?.status
+        let providerSessionRemains = ctx.coordinator.hasProviderSession(threadId: thread.id)
+        XCTAssertTrue(
+            firstRunSettled,
+            "first run must become durably terminal before drain; run=\(String(describing: firstRunStatus)) "
+                + "thread=\(String(describing: firstThreadStatus)) session=\(providerSessionRemains) "
+                + "error=\(String(describing: firstRun?.errorMessage))"
+        )
+        guard firstRunSettled else { return }
+        XCTAssertFalse(
+            providerSessionRemains,
+            "a provider session remaining after durable terminal state prevents automatic queue drain"
+        )
+        let drained = await waitUntil(timeout: 5) { runner.requests.count >= 2 }
+        let queuedAfterTerminal = try ctx.queuedMessageRepo.get(id: AgentQueuedMessageID(futureRunID.value))
+        XCTAssertTrue(
+            drained,
+            "the exact preallocated queue row must drain after terminal; firstRun=\(String(describing: firstRunStatus)) "
+                + "thread=\(String(describing: firstThreadStatus)) session=\(providerSessionRemains) "
+                + "waiters=\(ctx.queueDrainWaiterCountForTesting) "
+                + "queue=\(String(describing: queuedAfterTerminal))"
+        )
+        guard drained else { return }
+        XCTAssertEqual(runner.requests.last?.runId, futureRunID)
+        XCTAssertEqual(try ctx.runRepo.get(id: futureRunID)?.threadId, thread.id)
+        let exactQueueRowRemoved = await waitUntil(timeout: 5) {
+            (try? ctx.queuedMessageRepo.get(id: AgentQueuedMessageID(futureRunID.value))) == nil
+        }
+        XCTAssertTrue(
+            exactQueueRowRemoved,
+            "provider start and durable queue acknowledgement may interleave, but the exact row must be removed"
+        )
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: AgentQueuedMessageID(futureRunID.value)))
+        XCTAssertTrue(runner.finish(runID: futureRunID, status: .completed, reply: "second complete"))
+    }
+
+    func test_normalBusySendFreezesPermissionBeforeQueuedThreadMutation() async throws {
+        // WHY: Agent App can queue a host continuation on a legacy thread that
+        // has no stored routing row. A later picker change must not silently
+        // broaden or narrow the already-admitted provider request.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = ControlledBotHandoffRunner(provider: .codex)
+        ctx.coordinator.replaceProviderAdapter(
+            .codex,
+            adapter: TerminalRetiringOneShotAdapter(runner: runner)
+        )
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .codex,
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: AgentProvider.codex.rawValue
+            )
+        ])
+        let workspace = try router.createWorkspace(
+            name: "queued-permission",
+            cwd: workspaceDir.path
+        )
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "queued permission",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        XCTAssertNil(
+            thread.routingConfiguration,
+            "the regression requires the ordinary legacy-thread path, not an explicit routing fixture"
+        )
+
+        let active = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "occupy permission thread",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let activeRunID = try XCTUnwrap(active.runId)
+        let queued = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "keep supervised permission",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let queuedMessage = try XCTUnwrap(queued.queuedMessage)
+
+        XCTAssertEqual(queued.status, .queued)
+        XCTAssertEqual(queuedMessage.routingSnapshot?.permissionMode, .supervised)
+        XCTAssertEqual(
+            try ctx.queuedMessageRepo.routingSnapshot(id: queuedMessage.id)?.permissionMode,
+            .supervised,
+            "the permission must be durable before a post-bind picker mutation"
+        )
+        let mutated = try router.configureAgentThread(
+            thread: thread.id,
+            provider: nil,
+            model: nil,
+            permissionMode: .fullAccess,
+            reasoningEffort: nil
+        )
+        XCTAssertEqual(mutated.permissionMode, .fullAccess)
+
+        XCTAssertTrue(runner.finish(runID: activeRunID, status: .completed, reply: "first complete"))
+        let firstRunSettled = await waitUntil(timeout: 5) {
+            isTerminal(try? ctx.runRepo.get(id: activeRunID)?.status)
+                && isTerminal(try? ctx.threadRepo.get(id: thread.id)?.status)
+        }
+        XCTAssertTrue(firstRunSettled, "the active run must become terminal before its queued successor drains")
+        guard firstRunSettled else { return }
+
+        let drained = await waitUntil(timeout: 5) {
+            runner.requests.contains { $0.prompt.contains("keep supervised permission") }
+        }
+        XCTAssertTrue(drained, "the normal queue waiter must drain the already-bound continuation")
+        guard drained else { return }
+        let drainedRequest = try XCTUnwrap(
+            runner.requests.first { $0.prompt.contains("keep supervised permission") }
+        )
+        XCTAssertEqual(
+            drainedRequest.permissionMode,
+            .supervised,
+            "post-bind thread changes must not alter the permission sent to the provider"
+        )
+        XCTAssertEqual(drainedRequest.runId, AgentRunID(queuedMessage.id.value))
+        let queueRemoved = await waitUntil(timeout: 5) {
+            (try? ctx.queuedMessageRepo.get(id: queuedMessage.id)) == nil
+        }
+        let queuedAfterDrain = try ctx.queuedMessageRepo.get(id: queuedMessage.id)
+        XCTAssertTrue(
+            queueRemoved,
+            "accepted queued work must be acknowledged after provider start; row=\(String(describing: queuedAfterDrain))"
+        )
+        XCTAssertTrue(
+            runner.finish(runID: drainedRequest.runId, status: .completed, reply: "second complete")
+        )
+    }
+
     func test_sendAgentMessageStartsPendingNewThreadInsteadOfQueueing() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -1830,6 +2213,928 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             1
         )
         runner.finishRun(ordinal: 2, status: .completed)
+    }
+
+    func test_deleteAgentThreadRetiresOnlyVictimQueuedHandoffWithoutRedispatchOrV1Rewrite() async throws {
+        // WHY: deleting an Agent thread is an authoritative lifecycle boundary.
+        // A future-ID host continuation queued on that thread must retire before
+        // drain, while the sibling queue row and v1 downgrade bytes survive.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-delete-agent-handoff-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDirectory = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let context = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProviderAdapter(
+            .codex,
+            adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
+        )
+        router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: "fake-model", label: "Fake Model", provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        })
+        let botsViewModel = BotsViewModel(context: context, router: router)
+        router.botsViewModel = botsViewModel
+        let quinn = try botsViewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        botsViewModel.openDesk(quinn)
+        botsViewModel.setDeskProvider(.claude)
+        let workspace = try router.createWorkspace(name: "t005 agent delete", cwd: workspaceDirectory.path)
+        let victimThread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "Victim queued handoff",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let siblingThread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "Sibling queued handoff",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let surface = AgentAppSurface(
+            workspaceID: workspace.id,
+            cwd: workspaceDirectory.path,
+            coordinator: context.coordinator,
+            threadRepo: context.threadRepo,
+            messageRepo: context.messageRepo,
+            queuedMessageRepo: context.queuedMessageRepo,
+            providerSessionRepo: context.providerSessionRuntimeRepo,
+            checkpointRepo: context.turnCheckpointRepo,
+            initialThreadId: victimThread.id
+        )
+        surface.viewModel.mentionableBotsProvider = { botsViewModel.bots }
+        let victimOccupyingResult = try await router.sendAgentMessage(
+            thread: victimThread.id,
+            text: "occupy victim",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let victimOccupying = try XCTUnwrap(victimOccupyingResult.runId)
+        let siblingOccupyingResult = try await router.sendAgentMessage(
+            thread: siblingThread.id,
+            text: "occupy sibling",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let siblingOccupying = try XCTUnwrap(siblingOccupyingResult.runId)
+
+        async let victimDispatch: Void = router.dispatchAgentAppBotMentions(
+            peers: [quinn],
+            text: "@\(quinn.handle) T005_DELETE_AGENT_VICTIM",
+            threadId: victimThread.id,
+            onto: surface
+        )
+        async let siblingDispatch: Void = router.dispatchAgentAppBotMentions(
+            peers: [quinn],
+            text: "@\(quinn.handle) T005_DELETE_AGENT_SIBLING",
+            threadId: siblingThread.id,
+            onto: surface
+        )
+        let bothPeersStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_DELETE_AGENT_VICTIM") }
+                && peerRunner.requests.contains { $0.prompt.contains("T005_DELETE_AGENT_SIBLING") }
+        }
+        XCTAssertTrue(bothPeersStarted)
+        XCTAssertTrue(peerRunner.finish(
+            promptContaining: "T005_DELETE_AGENT_VICTIM",
+            reply: "victim queued reply"
+        ))
+        XCTAssertTrue(peerRunner.finish(
+            promptContaining: "T005_DELETE_AGENT_SIBLING",
+            reply: "sibling queued reply"
+        ))
+        let bothHostsQueued = await waitUntil(timeout: 5) {
+            let victim = botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: victimThread.id
+            ).first
+            let sibling = botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: siblingThread.id
+            ).first
+            guard let victimRunID = victim?.hostRunID,
+                  let siblingRunID = sibling?.hostRunID else { return false }
+            return (try? context.queuedMessageRepo.get(id: AgentQueuedMessageID(victimRunID.value))) != nil
+                && (try? context.queuedMessageRepo.get(id: AgentQueuedMessageID(siblingRunID.value))) != nil
+        }
+        XCTAssertTrue(bothHostsQueued)
+        _ = await (victimDispatch, siblingDispatch)
+        let victimHandoff = try XCTUnwrap(botsViewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: victimThread.id
+        ).first)
+        let siblingHandoff = try XCTUnwrap(botsViewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: siblingThread.id
+        ).first)
+        let victimFutureRunID = try XCTUnwrap(victimHandoff.hostRunID)
+        let siblingFutureRunID = try XCTUnwrap(siblingHandoff.hostRunID)
+        XCTAssertNotEqual(victimFutureRunID, victimOccupying)
+        XCTAssertNotEqual(siblingFutureRunID, siblingOccupying)
+        let legacyBytes = Data(#"{"t005":"agent-delete-v1-exact"}"#.utf8)
+        UserDefaults.standard.set(legacyBytes, forKey: "bots.peerTurns")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        try await router.deleteAgentThread(thread: victimThread.id)
+        let victimRetired = await waitUntil(timeout: 2) {
+            botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: victimThread.id
+            ).isEmpty
+        }
+        XCTAssertTrue(victimRetired, "the production router deletion must retire the victim authority row")
+        XCTAssertNil(try context.threadRepo.get(id: victimThread.id))
+        XCTAssertNil(try context.queuedMessageRepo.get(id: AgentQueuedMessageID(victimFutureRunID.value)))
+        XCTAssertFalse(
+            hostRunner.requests.contains { $0.runId == victimFutureRunID },
+            "deletion suppression must prevent the victim future run from reaching the provider"
+        )
+        XCTAssertEqual(
+            botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: siblingThread.id
+            ).first?.hostRunID,
+            siblingFutureRunID
+        )
+        XCTAssertNotNil(try context.queuedMessageRepo.get(id: AgentQueuedMessageID(siblingFutureRunID.value)))
+        XCTAssertEqual(try context.runRepo.get(id: siblingOccupying)?.status, .running)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+
+        botsViewModel.reconcilePeerHandoffsForTesting()
+        let reloaded = BotsViewModel(context: context, router: router)
+        XCTAssertTrue(reloaded.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: victimThread.id
+        ).isEmpty)
+        XCTAssertEqual(
+            reloaded.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: siblingThread.id
+            ).first?.hostRunID,
+            siblingFutureRunID,
+            "fresh authority state must preserve the sibling without resurrecting the victim"
+        )
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+        try await router.deleteAgentThread(thread: siblingThread.id)
+    }
+
+    func test_agentAppSurfaceRelationalDeleteRetiresQueuedVictimWhileActiveSiblingSurvives() async throws {
+        // WHY: the Agent App rail uses its relational-snapshot delete entrypoint,
+        // not AppCommandRouter.deleteAgentThread. That production path must retire
+        // the same queued authority row without cancelling an active sibling.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-surface-delete-handoff-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDirectory = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let context = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProviderAdapter(
+            .codex,
+            adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
+        )
+        router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: "fake-model", label: "Fake Model", provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        })
+        let botsViewModel = BotsViewModel(context: context, router: router)
+        router.botsViewModel = botsViewModel
+        let quinn = try botsViewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        botsViewModel.openDesk(quinn)
+        botsViewModel.setDeskProvider(.claude)
+        let workspace = try router.createWorkspace(name: "t005 surface delete", cwd: workspaceDirectory.path)
+        let victimThread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "Surface victim",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let siblingThread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "Surface sibling",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let descriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "T005 Agent App"
+        )
+        let surface = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface
+        )
+        surface.viewModel.selectThread(victimThread.id)
+        let occupyingResult = try await router.sendAgentMessage(
+            thread: victimThread.id,
+            text: "occupy victim for queued host",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let occupyingRunID = try XCTUnwrap(occupyingResult.runId)
+
+        async let victimDispatch: Void = router.dispatchAgentAppBotMentions(
+            peers: [quinn],
+            text: "@\(quinn.handle) T005_SURFACE_DELETE_VICTIM",
+            threadId: victimThread.id,
+            onto: surface
+        )
+        async let siblingDispatch: Void = router.dispatchAgentAppBotMentions(
+            peers: [quinn],
+            text: "@\(quinn.handle) T005_SURFACE_DELETE_SIBLING",
+            threadId: siblingThread.id,
+            onto: surface
+        )
+        let bothPeersStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_SURFACE_DELETE_VICTIM") }
+                && peerRunner.requests.contains { $0.prompt.contains("T005_SURFACE_DELETE_SIBLING") }
+        }
+        XCTAssertTrue(bothPeersStarted)
+        XCTAssertTrue(peerRunner.finish(
+            promptContaining: "T005_SURFACE_DELETE_VICTIM",
+            reply: "victim future host reply"
+        ))
+        let victimQueued = await waitUntil(timeout: 5) {
+            guard let futureRunID = botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: victimThread.id
+            ).first?.hostRunID else { return false }
+            return (try? context.queuedMessageRepo.get(id: AgentQueuedMessageID(futureRunID.value))) != nil
+        }
+        XCTAssertTrue(victimQueued)
+        let siblingRunning = await waitUntil(timeout: 5) {
+            botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: siblingThread.id
+            ).first?.phase == .peerRunning
+        }
+        XCTAssertTrue(siblingRunning)
+        let victimHandoff = try XCTUnwrap(botsViewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: victimThread.id
+        ).first)
+        let siblingHandoff = try XCTUnwrap(botsViewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: siblingThread.id
+        ).first)
+        let victimFutureRunID = try XCTUnwrap(victimHandoff.hostRunID)
+        let siblingPeerRunID = try XCTUnwrap(siblingHandoff.peerRunID)
+        let legacyBytes = Data(#"{"t005":"surface-delete-v1-exact"}"#.utf8)
+        UserDefaults.standard.set(legacyBytes, forKey: "bots.peerTurns")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        let deleted = await surface.viewModel.deleteThread(victimThread.id)
+        XCTAssertTrue(deleted, "the real relational delete must commit before authority retirement")
+        let victimRetired = await waitUntil(timeout: 2) {
+            botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: victimThread.id
+            ).isEmpty
+        }
+        XCTAssertTrue(victimRetired, "Agent App relational deletion must retire the victim authority row")
+        XCTAssertNil(try context.threadRepo.get(id: victimThread.id))
+        XCTAssertNil(try context.queuedMessageRepo.get(id: AgentQueuedMessageID(victimFutureRunID.value)))
+        XCTAssertFalse(hostRunner.requests.contains { $0.runId == victimFutureRunID })
+        XCTAssertNil(try context.runRepo.get(id: occupyingRunID))
+        XCTAssertFalse(
+            hostRunner.finish(runID: occupyingRunID, status: .completed, reply: "late occupying reply"),
+            "relational deletion must stop the provider before its cascaded run row disappears"
+        )
+        XCTAssertFalse(context.coordinator.hasProviderSession(threadId: victimThread.id))
+        XCTAssertEqual(
+            botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: siblingThread.id
+            ).first?.peerRunID,
+            siblingPeerRunID
+        )
+        XCTAssertEqual(try context.runRepo.get(id: siblingPeerRunID)?.status, .running)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+
+        botsViewModel.reconcilePeerHandoffsForTesting()
+        let reloaded = BotsViewModel(context: context, router: router)
+        XCTAssertTrue(reloaded.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: victimThread.id
+        ).isEmpty)
+        XCTAssertEqual(
+            reloaded.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: siblingThread.id
+            ).first?.peerRunID,
+            siblingPeerRunID
+        )
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+        _ = await victimDispatch
+        XCTAssertTrue(peerRunner.finish(
+            runID: siblingPeerRunID,
+            status: .cancelled,
+            reply: nil
+        ))
+        _ = await siblingDispatch
+        try await router.deleteAgentThread(thread: siblingThread.id)
+    }
+
+    func test_routerDeleteRollbackResumesExactTerminalHandoffAfterSourceFailureWithoutRedispatch() async throws {
+        // WHY: deletion fencing starts before provider shutdown can suspend.
+        // If the exact peer finishes inside that window but source deletion
+        // fails, rollback must release that same durable result—not strand it,
+        // retire it, or launch the peer a second time—while a sibling stays live.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-delete-rollback-fence-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(
+            provider: .codex,
+            defersCancellationForTesting: true
+        )
+        let fixture = try makeT005AgentMentionFixture(
+            root: root,
+            peerRunner: peerRunner,
+            hostRunner: hostRunner
+        )
+        fixture.context.coordinator.replaceProviderAdapter(
+            .codex,
+            adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
+        )
+        let victimThread = try XCTUnwrap(fixture.context.threadRepo.get(id: fixture.threadID))
+        let workspaceID = try XCTUnwrap(victimThread.workspaceId)
+        let siblingThread = try fixture.router.createAgentThread(
+            workspace: workspaceID,
+            title: "T005 rollback sibling",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let occupying = try await fixture.router.sendAgentMessage(
+            thread: fixture.threadID,
+            text: "occupy deletion target until rollback cut",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let occupyingRunID = try XCTUnwrap(occupying.runId)
+
+        async let victimDispatch: Void = fixture.router.dispatchAgentAppBotMentions(
+            peers: [fixture.peer],
+            text: "@\(fixture.peer.handle) T005_ROLLBACK_VICTIM",
+            threadId: fixture.threadID,
+            onto: fixture.surface
+        )
+        async let siblingDispatch: Void = fixture.router.dispatchAgentAppBotMentions(
+            peers: [fixture.peer],
+            text: "@\(fixture.peer.handle) T005_ROLLBACK_SIBLING",
+            threadId: siblingThread.id,
+            onto: fixture.surface
+        )
+        let bothPeersStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_ROLLBACK_VICTIM") }
+                && peerRunner.requests.contains { $0.prompt.contains("T005_ROLLBACK_SIBLING") }
+        }
+        XCTAssertTrue(bothPeersStarted)
+        let bothPeersDurablyRunning = await waitUntil(timeout: 2) {
+            fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: fixture.threadID
+            ).first?.phase == .peerRunning
+                && fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+                    originConversationID: nil,
+                    originThreadID: siblingThread.id
+                ).first?.phase == .peerRunning
+        }
+        XCTAssertTrue(
+            bothPeersDurablyRunning,
+            "the deletion cut begins only after both accepted provider starts are durably peerRunning"
+        )
+        let victimHandoff = try XCTUnwrap(fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: fixture.threadID
+        ).first)
+        let siblingHandoff = try XCTUnwrap(fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: siblingThread.id
+        ).first)
+        let victimPeerRunID = try XCTUnwrap(victimHandoff.peerRunID)
+        let victimPeerThreadID = try XCTUnwrap(victimHandoff.peerThreadID)
+        let victimHostRunID = try XCTUnwrap(victimHandoff.hostRunID)
+        let siblingPeerRunID = try XCTUnwrap(siblingHandoff.peerRunID)
+        let legacyBytes = Data(#"{"t005":"rollback-v1-exact"}"#.utf8)
+        UserDefaults.standard.set(legacyBytes, forKey: "bots.peerTurns")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        try fixture.context.db.execute("""
+            CREATE TRIGGER fail_t005_router_source_delete
+            BEFORE DELETE ON agent_threads
+            WHEN OLD.id = '\(fixture.threadID.value.uuidString)'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced T005 source delete failure');
+            END;
+        """)
+        defer { try? fixture.context.db.execute("DROP TRIGGER fail_t005_router_source_delete;") }
+
+        let deletionFinished = QueueDrainAsyncSignal()
+        let deletion = Task { @MainActor () -> Error? in
+            do {
+                try await fixture.router.deleteAgentThread(thread: fixture.threadID)
+                await deletionFinished.signal()
+                return nil
+            } catch {
+                await deletionFinished.signal()
+                return error
+            }
+        }
+        let cancellationReachedFence = await waitUntil(timeout: 2) {
+            hostRunner.cancellationRequestedRunIDs.contains(occupyingRunID)
+        }
+        XCTAssertTrue(cancellationReachedFence)
+        let deletionFinishedBeforeTerminal = await deletionFinished.isSignalled
+        XCTAssertFalse(deletionFinishedBeforeTerminal)
+
+        XCTAssertTrue(peerRunner.finish(
+            runID: victimPeerRunID,
+            status: .completed,
+            reply: "EXACT_REPLY_DURING_DELETE_FENCE"
+        ))
+        let exactTerminalPersisted = await waitUntil(timeout: 2) {
+            guard (try? fixture.context.runRepo.get(id: victimPeerRunID)?.status) == .completed,
+                  let checkpoint = try? fixture.context.turnCheckpointRepo
+                    .list(threadId: victimPeerThreadID)
+                    .first(where: { $0.runId == victimPeerRunID }) else { return false }
+            return checkpoint.assistantMessageId != nil
+        }
+        XCTAssertTrue(exactTerminalPersisted)
+        let deletionFinishedAfterTerminal = await deletionFinished.isSignalled
+        XCTAssertFalse(deletionFinishedAfterTerminal)
+        XCTAssertEqual(
+            fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: fixture.threadID
+            ).first?.phase,
+            .peerRunning,
+            "the terminal must wait behind the deletion fence until commit or rollback"
+        )
+
+        XCTAssertTrue(hostRunner.finish(
+            runID: occupyingRunID,
+            status: .cancelled,
+            reply: nil
+        ))
+        let deletionError = await deletion.value
+        XCTAssertNotNil(deletionError, "the SQLite trigger must reject the source delete")
+        XCTAssertNotNil(try fixture.context.threadRepo.get(id: fixture.threadID))
+
+        let exactHostStarted = await waitUntil(timeout: 5) {
+            hostRunner.requests.contains { $0.runId == victimHostRunID }
+        }
+        XCTAssertTrue(exactHostStarted, "rollback must resume the fenced exact handoff")
+        XCTAssertEqual(
+            peerRunner.requests.filter { $0.runId == victimPeerRunID }.count,
+            1,
+            "rollback must never redispatch the already-terminal peer"
+        )
+        XCTAssertEqual(hostRunner.requests.filter { $0.runId == victimHostRunID }.count, 1)
+        let inbound = try XCTUnwrap(
+            try fixture.context.messageRepo.get(id: AgentMessageID(victimHandoff.inboundMessageID))
+        )
+        XCTAssertEqual(
+            BotPeerTranscript.parse(inbound.content)?.body,
+            "EXACT_REPLY_DURING_DELETE_FENCE"
+        )
+        XCTAssertTrue(hostRunner.finish(
+            runID: victimHostRunID,
+            status: .completed,
+            reply: "EXACT_HOST_AFTER_ROLLBACK"
+        ))
+        let victimCompleted = await waitUntil(timeout: 5) {
+            fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: fixture.threadID
+            ).first?.phase == .completed
+        }
+        XCTAssertTrue(victimCompleted)
+
+        let preservedSibling = try XCTUnwrap(fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: siblingThread.id
+        ).first)
+        XCTAssertEqual(preservedSibling.activityID, siblingHandoff.activityID)
+        XCTAssertEqual(preservedSibling.peerRunID, siblingPeerRunID)
+        XCTAssertEqual(preservedSibling.phase, .peerRunning)
+        XCTAssertEqual(peerRunner.requests.filter { $0.runId == siblingPeerRunID }.count, 1)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
+
+        _ = await victimDispatch
+        XCTAssertTrue(peerRunner.finish(
+            runID: siblingPeerRunID,
+            status: .cancelled,
+            reply: nil
+        ))
+        _ = await siblingDispatch
+    }
+
+    func test_peerHandoffAtomicCommitCutsConvergeSQLiteMirrorAndFreshAuthoritiesBeforeDispatch() async throws {
+        // WHY: UserDefaults set/synchronize/readback cannot roll back a mirror
+        // write. SQLite must remain the one commit authority at every crash cut,
+        // and a fresh process must repair the raw mirror before it can dispatch.
+        enum Cut: String, CaseIterable {
+            case beforeMirrorSet
+            case afterMirrorSetBeforeGateReturn
+            case sqliteCommit
+        }
+
+        let suiteRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-peer-atomic-cuts-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: suiteRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: suiteRoot) }
+        defer {
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
+        }
+        let settingsKey = "bots.peerTurns.v2"
+        let baselineBytes = Data("[]".utf8)
+        let baselineSQLite = "base64:\(baselineBytes.base64EncodedString())"
+
+        for cut in Cut.allCases {
+            let root = suiteRoot.appendingPathComponent(cut.rawValue, isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let v1Bytes = Data("{\"t005\":\"atomic-\(cut.rawValue)-v1\"}".utf8)
+            UserDefaults.standard.set(v1Bytes, forKey: "bots.peerTurns")
+            UserDefaults.standard.set(baselineBytes, forKey: settingsKey)
+            XCTAssertTrue(UserDefaults.standard.synchronize())
+
+            var dispatches: [AgentRunID] = []
+            let fixture = try makeT005PeerPersistenceContext(root: root) {
+                dispatches.append($0)
+            }
+            let piper = try fixture.viewModel.create(
+                name: "Piper \(cut.rawValue)",
+                title: "Atomic origin",
+                provider: .codex
+            )
+            let quinn = try fixture.viewModel.create(
+                name: "Quinn \(cut.rawValue)",
+                title: "Atomic peer",
+                provider: .claude
+            )
+            fixture.viewModel.openDesk(quinn)
+            fixture.viewModel.setDeskProvider(.claude)
+            fixture.viewModel.openDesk(piper)
+            fixture.viewModel.setDeskProvider(.codex)
+            fixture.viewModel.createDeskThread()
+
+            var capturedCandidate: Data?
+            var failCommit = false
+            fixture.context.db.beforeExecuteForTesting = { sql in
+                guard failCommit, sql == "COMMIT;" else { return }
+                failCommit = false
+                fixture.context.db.injectedResultCodesForTesting.append(10) // SQLITE_IOERR
+            }
+            fixture.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = { data in
+                capturedCandidate = data
+                if cut == .beforeMirrorSet {
+                    throw NSError(domain: "T005.AtomicCut", code: 1)
+                }
+                UserDefaults.standard.set(data, forKey: settingsKey)
+                guard UserDefaults.standard.synchronize(),
+                      UserDefaults.standard.data(forKey: settingsKey) == data else {
+                    throw NSError(domain: "T005.AtomicCut", code: 2)
+                }
+                if cut == .afterMirrorSetBeforeGateReturn {
+                    throw NSError(domain: "T005.AtomicCut", code: 3)
+                }
+                failCommit = true
+            }
+
+            let accepted = fixture.viewModel.send("@\(quinn.handle) T005_ATOMIC_\(cut.rawValue)")
+            fixture.context.db.beforeExecuteForTesting = nil
+            fixture.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
+            failCommit = false
+            XCTAssertNotNil(capturedCandidate, "\(cut.rawValue) must reach the exact candidate mirror gate")
+            XCTAssertFalse(accepted, "\(cut.rawValue) must reject the uncommitted handoff")
+
+            _ = await waitUntil(timeout: 0.2) { !dispatches.isEmpty }
+            XCTAssertTrue(dispatches.isEmpty, "\(cut.rawValue) must not cross the provider boundary")
+            if let peerRunID = fixture.peerRunner.requests.first?.runId {
+                _ = fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
+                _ = await waitUntil(timeout: 1) {
+                    (try? fixture.context.runRepo.get(id: peerRunID)?.status) == .cancelled
+                }
+            }
+
+            XCTAssertTrue(fixture.viewModel.peerHandoffSnapshotsForTesting().isEmpty)
+            XCTAssertEqual(try fixture.context.settingsRepo.get(settingsKey), baselineSQLite)
+            XCTAssertEqual(UserDefaults.standard.data(forKey: settingsKey), baselineBytes)
+            XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), v1Bytes)
+
+            var firstRelaunchDispatches: [AgentRunID] = []
+            let firstRelaunch = try makeT005PeerPersistenceContext(root: root) {
+                firstRelaunchDispatches.append($0)
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            XCTAssertTrue(firstRelaunchDispatches.isEmpty)
+            XCTAssertTrue(firstRelaunch.viewModel.peerHandoffSnapshotsForTesting().isEmpty)
+            XCTAssertTrue(firstRelaunch.viewModel.liveWorkingBots().isEmpty)
+            XCTAssertEqual(try firstRelaunch.context.settingsRepo.get(settingsKey), baselineSQLite)
+            XCTAssertEqual(UserDefaults.standard.data(forKey: settingsKey), baselineBytes)
+            XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), v1Bytes)
+
+            var secondRelaunchDispatches: [AgentRunID] = []
+            let secondRelaunch = try makeT005PeerPersistenceContext(root: root) {
+                secondRelaunchDispatches.append($0)
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            XCTAssertTrue(secondRelaunchDispatches.isEmpty)
+            XCTAssertTrue(secondRelaunch.viewModel.peerHandoffSnapshotsForTesting().isEmpty)
+            XCTAssertTrue(secondRelaunch.viewModel.liveWorkingBots().isEmpty)
+            XCTAssertEqual(try secondRelaunch.context.settingsRepo.get(settingsKey), baselineSQLite)
+            XCTAssertEqual(UserDefaults.standard.data(forKey: settingsKey), baselineBytes)
+            XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), v1Bytes)
+        }
+    }
+
+    func test_peerHandoffFutureMirrorDivergenceStaysByteExactAndMutationFailsClosed() async throws {
+        // WHY: an older build must never repair over bytes owned by a newer
+        // envelope. Even with a valid SQLite baseline, a divergent future raw
+        // mirror is opaque and blocks mutation/provider launch byte-for-byte.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-peer-future-divergence-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer {
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
+        }
+        let settingsKey = "bots.peerTurns.v2"
+        let baselineBytes = Data("[]".utf8)
+        let baselineSQLite = "base64:\(baselineBytes.base64EncodedString())"
+        let v1Bytes = Data(#"{"t005":"future-divergence-v1-exact"}"#.utf8)
+        UserDefaults.standard.set(v1Bytes, forKey: "bots.peerTurns")
+        UserDefaults.standard.set(baselineBytes, forKey: settingsKey)
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        var initialDispatches: [AgentRunID] = []
+        let fixture = try makeT005PeerPersistenceContext(root: root) {
+            initialDispatches.append($0)
+        }
+        try fixture.context.settingsRepo.set(settingsKey, baselineSQLite)
+        let piper = try fixture.viewModel.create(
+            name: "Piper future divergence",
+            title: "Opaque origin",
+            provider: .codex
+        )
+        let quinn = try fixture.viewModel.create(
+            name: "Quinn future divergence",
+            title: "Opaque peer",
+            provider: .claude
+        )
+        fixture.viewModel.openDesk(quinn)
+        fixture.viewModel.setDeskProvider(.claude)
+        fixture.viewModel.openDesk(piper)
+        fixture.viewModel.setDeskProvider(.codex)
+        fixture.viewModel.createDeskThread()
+        var candidateBytes: Data?
+        fixture.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = { data in
+            candidateBytes = data
+            throw NSError(domain: "T005.FutureFixture", code: 1)
+        }
+        XCTAssertFalse(fixture.viewModel.send("@\(quinn.handle) T005_CAPTURE_FUTURE_CANDIDATE"))
+        fixture.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
+        XCTAssertTrue(initialDispatches.isEmpty)
+
+        var entries = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: try XCTUnwrap(candidateBytes)) as? [Any]
+        )
+        let recordIndex = try XCTUnwrap(entries.firstIndex { $0 is [String: Any] })
+        var futureRecord = try XCTUnwrap(entries[recordIndex] as? [String: Any])
+        futureRecord["version"] = 3
+        futureRecord["futureOpaqueField"] = ["owner": "newer-build", "preserve": true]
+        entries[recordIndex] = futureRecord
+        let futureBytes = try JSONSerialization.data(withJSONObject: entries, options: [.sortedKeys])
+        UserDefaults.standard.set(futureBytes, forKey: settingsKey)
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        var relaunchDispatches: [AgentRunID] = []
+        let relaunch = try makeT005PeerPersistenceContext(root: root) {
+            relaunchDispatches.append($0)
+        }
+        XCTAssertTrue(relaunch.viewModel.peerHandoffSnapshotsForTesting().isEmpty)
+        XCTAssertEqual(try relaunch.context.settingsRepo.get(settingsKey), baselineSQLite)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: settingsKey), futureBytes)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), v1Bytes)
+
+        relaunch.viewModel.openDesk(quinn)
+        relaunch.viewModel.setDeskProvider(.claude)
+        relaunch.viewModel.openDesk(piper)
+        relaunch.viewModel.setDeskProvider(.codex)
+        relaunch.viewModel.createDeskThread()
+        let accepted = relaunch.viewModel.send("@\(quinn.handle) T005_FUTURE_MUST_NOT_MUTATE")
+        XCTAssertFalse(accepted, "future/opaque divergence must refuse a down-level mutation")
+        _ = await waitUntil(timeout: 0.2) { !relaunchDispatches.isEmpty }
+        XCTAssertTrue(relaunchDispatches.isEmpty, "fail-closed restore must precede provider dispatch")
+        XCTAssertTrue(relaunch.viewModel.peerHandoffSnapshotsForTesting().isEmpty)
+        XCTAssertEqual(try relaunch.context.settingsRepo.get(settingsKey), baselineSQLite)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: settingsKey), futureBytes)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), v1Bytes)
+
+        if let peerRunID = relaunch.peerRunner.requests.first?.runId {
+            _ = relaunch.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
+        }
+    }
+
+    func test_peerHandoffPostCacheOpaqueMirrorDriftFailsClosedWithoutOverwriteOrDispatch() async throws {
+        // WHY: a future writer can replace the compatibility mirror after this
+        // authority cached a supported row. The next mutation must inspect raw
+        // mirror identity before CAS and must never overwrite opaque bytes.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-peer-post-cache-opaque-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer {
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
+        }
+        let v1Bytes = Data(#"{"t005":"post-cache-opaque-v1"}"#.utf8)
+        let fixture = try makeT005CachedPeerHandoffFixture(root: root, v1Bytes: v1Bytes)
+        let canonicalValue = "base64:\(fixture.seedBytes.base64EncodedString())"
+        let futureBytes = try t005PeerHandoffPayload(
+            fixture.seedBytes,
+            replacingVersion: 3,
+            addingOpaqueField: true
+        )
+        UserDefaults.standard.set(futureBytes, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        var mirrorGateCalls = 0
+        fixture.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = { data in
+            mirrorGateCalls += 1
+            UserDefaults.standard.set(data, forKey: "bots.peerTurns.v2")
+            guard UserDefaults.standard.synchronize(),
+                  UserDefaults.standard.data(forKey: "bots.peerTurns.v2") == data else {
+                throw NSError(domain: "T005.PostCacheOpaqueMirror", code: 1)
+            }
+        }
+        let accepted = fixture.viewModel.send("@\(fixture.quinn.handle) POST_CACHE_OPAQUE_MUST_FAIL")
+        XCTAssertFalse(accepted)
+        _ = await waitUntil(timeout: 0.2) { !fixture.dispatches.runIDs.isEmpty }
+        XCTAssertEqual(mirrorGateCalls, 0)
+        XCTAssertTrue(fixture.dispatches.runIDs.isEmpty)
+        XCTAssertTrue(fixture.peerRunner.requests.isEmpty)
+        XCTAssertEqual(try fixture.context.settingsRepo.get("bots.peerTurns.v2"), canonicalValue)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"), futureBytes)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), v1Bytes)
+    }
+
+    func test_peerHandoffCachedSQLiteCASMismatchRejectsStaleCandidateAndAdoptsCanonicalExactly() async throws {
+        // WHY: another writer can commit a new canonical sibling after this
+        // authority cached its candidate. The first stale mutation must lose,
+        // refresh the exact newer snapshot, and only a newly-built candidate
+        // may proceed through the mirror gate.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-peer-cached-cas-mismatch-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer {
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
+        }
+        let v1Bytes = Data(#"{"t005":"cached-cas-v1"}"#.utf8)
+        let fixture = try makeT005CachedPeerHandoffFixture(root: root, v1Bytes: v1Bytes)
+        let (newerBytes, siblingActivityID) = try t005PeerHandoffPayloadAddingSibling(
+            fixture.seedBytes
+        )
+        let newerCanonical = "base64:\(newerBytes.base64EncodedString())"
+        try fixture.context.settingsRepo.set("bots.peerTurns.v2", newerCanonical)
+        UserDefaults.standard.set(newerBytes, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        var mirrorGateCalls = 0
+        fixture.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = { data in
+            mirrorGateCalls += 1
+            UserDefaults.standard.set(data, forKey: "bots.peerTurns.v2")
+            guard UserDefaults.standard.synchronize(),
+                  UserDefaults.standard.data(forKey: "bots.peerTurns.v2") == data else {
+                throw NSError(domain: "T005.CachedCASMismatch", code: 1)
+            }
+        }
+        let staleAccepted = fixture.viewModel.send("@\(fixture.quinn.handle) STALE_CANDIDATE_MUST_LOSE")
+        guard !staleAccepted else {
+            if let peerRunID = fixture.peerRunner.requests.first?.runId {
+                _ = fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
+            }
+            return XCTFail("a stale candidate must not overwrite the newer canonical sibling")
+        }
+        XCTAssertEqual(mirrorGateCalls, 0)
+        XCTAssertTrue(fixture.dispatches.runIDs.isEmpty)
+        XCTAssertEqual(try fixture.context.settingsRepo.get("bots.peerTurns.v2"), newerCanonical)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"), newerBytes)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), v1Bytes)
+        XCTAssertNotNil(
+            fixture.viewModel.peerHandoffSnapshotsForTesting().first {
+                $0.activityID == siblingActivityID
+            },
+            "refresh must adopt the exact externally committed sibling"
+        )
+
+        XCTAssertTrue(fixture.viewModel.send("@\(fixture.quinn.handle) FRESH_CANDIDATE_MAY_WIN"))
+        let dispatched = await waitUntil(timeout: 5) { fixture.dispatches.runIDs.count == 1 }
+        XCTAssertTrue(dispatched)
+        XCTAssertEqual(mirrorGateCalls, 1)
+        if let peerRunID = fixture.peerRunner.requests.first?.runId {
+            XCTAssertTrue(fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil))
+        }
+    }
+
+    func test_peerHandoffSupportedMirrorDivergenceRepairsCanonicalWithoutApplyingFirstStaleMutation() async throws {
+        // WHY: a supported but stale mirror is repairable from SQLite, yet the
+        // candidate built before that refresh is stale too. Repair and mutation
+        // must be two separate attempts so the first never drops canonical rows.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-peer-supported-mirror-drift-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer {
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
+            UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
+        }
+        let v1Bytes = Data(#"{"t005":"supported-mirror-drift-v1"}"#.utf8)
+        let fixture = try makeT005CachedPeerHandoffFixture(root: root, v1Bytes: v1Bytes)
+        let canonicalValue = "base64:\(fixture.seedBytes.base64EncodedString())"
+        let supportedButStaleMirror = Data("[]".utf8)
+        UserDefaults.standard.set(supportedButStaleMirror, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        var mirrorGateCalls = 0
+        fixture.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = { data in
+            mirrorGateCalls += 1
+            UserDefaults.standard.set(data, forKey: "bots.peerTurns.v2")
+            guard UserDefaults.standard.synchronize(),
+                  UserDefaults.standard.data(forKey: "bots.peerTurns.v2") == data else {
+                throw NSError(domain: "T005.SupportedMirrorDrift", code: 1)
+            }
+        }
+        let staleAccepted = fixture.viewModel.send("@\(fixture.quinn.handle) REPAIR_BEFORE_MUTATION")
+        guard !staleAccepted else {
+            if let peerRunID = fixture.peerRunner.requests.first?.runId {
+                _ = fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
+            }
+            return XCTFail("repair must not apply the candidate built against the stale mirror")
+        }
+        XCTAssertEqual(mirrorGateCalls, 0)
+        XCTAssertTrue(fixture.dispatches.runIDs.isEmpty)
+        XCTAssertEqual(try fixture.context.settingsRepo.get("bots.peerTurns.v2"), canonicalValue)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns.v2"), fixture.seedBytes)
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), v1Bytes)
+        XCTAssertNotNil(
+            fixture.viewModel.peerHandoffSnapshotsForTesting().first {
+                $0.activityID == fixture.seedActivityID
+            }
+        )
+
+        XCTAssertTrue(fixture.viewModel.send("@\(fixture.quinn.handle) FRESH_AFTER_REPAIR"))
+        let dispatched = await waitUntil(timeout: 5) { fixture.dispatches.runIDs.count == 1 }
+        XCTAssertTrue(dispatched)
+        XCTAssertEqual(mirrorGateCalls, 1)
+        if let peerRunID = fixture.peerRunner.requests.first?.runId {
+            XCTAssertTrue(fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil))
+        }
     }
 
     func test_deleteThreadSuppressesQueuedDrainBeforeAwaitingProviderTermination() async throws {
@@ -4115,6 +5420,492 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
       }
     }
 
+    func test_checkpointEnrichmentBlockedAfterCallbackCannotDelayExactHostSettlement() async throws {
+        // WHY: Git/file enrichment is optional metadata, while didFinish and the
+        // exact host waiter are user-visible terminal ownership. A blocked Git
+        // read must not keep an Agent App Bot handoff running or dispatch twice.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-blocked-checkpoint-enrichment-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        let fixture = try makeT005AgentMentionFixture(
+            root: root,
+            peerRunner: peerRunner,
+            hostRunner: hostRunner
+        )
+        let barrier = T005CheckpointEnrichmentBarrier()
+
+        let dispatch = Task { @MainActor in
+            await fixture.router.dispatchAgentAppBotMentions(
+                peers: [fixture.peer],
+                text: "@\(fixture.peer.handle) T005_BLOCK_ENRICHMENT",
+                threadId: fixture.threadID,
+                onto: fixture.surface
+            )
+        }
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_BLOCK_ENRICHMENT") }
+        }
+        XCTAssertTrue(peerStarted)
+        XCTAssertTrue(peerRunner.finish(
+            promptContaining: "T005_BLOCK_ENRICHMENT",
+            reply: "checkpoint-owned peer reply"
+        ))
+        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+        let handoff = try XCTUnwrap(fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: fixture.threadID
+        ).first)
+        let hostRunID = try XCTUnwrap(handoff.hostRunID)
+        XCTAssertEqual(hostRunner.requests.first?.runId, hostRunID)
+
+        barrier.target(hostRunID)
+        fixture.context.coordinator.checkpointEnrichmentBarrierForTesting = { runID in
+            await barrier.waitIfTarget(runID)
+        }
+        defer {
+            barrier.release()
+            fixture.context.coordinator.checkpointEnrichmentBarrierForTesting = nil
+        }
+        let finishes = T005RunFinishRecorder(targetRunID: hostRunID)
+        fixture.context.coordinator.addObserver(finishes)
+        defer { fixture.context.coordinator.removeObserver(finishes) }
+        let hostFinish = Task.detached {
+            hostRunner.finish(
+                runID: hostRunID,
+                status: .completed,
+                reply: "checkpoint-owned host outcome"
+            )
+        }
+
+        let enrichmentIsBlocked = await waitUntil(timeout: 1) { barrier.didEnter }
+        XCTAssertTrue(enrichmentIsBlocked, "the test must hold the exact host run before optional Git enrichment")
+        let callbackArrived = await waitUntil(timeout: 1) { finishes.records.count == 1 }
+        XCTAssertTrue(callbackArrived, "didFinish must precede optional checkpoint enrichment")
+        let hostSettled = await waitUntil(timeout: 1) {
+            fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: fixture.threadID
+            ).first?.phase == .completed
+        }
+        XCTAssertTrue(hostSettled, "the exact host waiter must settle while enrichment remains blocked")
+
+        let minimal = try XCTUnwrap(
+            fixture.context.turnCheckpointRepo.list(threadId: fixture.threadID)
+                .first { $0.runId == hostRunID }
+        )
+        let exactAssistantID = try XCTUnwrap(minimal.assistantMessageId)
+        XCTAssertEqual(
+            try fixture.context.messageRepo.get(id: exactAssistantID)?.content,
+            "checkpoint-owned host outcome",
+            "the pre-callback minimal checkpoint must already own the exact assistant"
+        )
+        XCTAssertEqual(hostRunner.requests.filter { $0.runId == hostRunID }.count, 1)
+        XCTAssertEqual(finishes.records.first?.finalMessage, "checkpoint-owned host outcome")
+        barrier.release()
+        let hostFinishReturned = await hostFinish.value
+        XCTAssertTrue(hostFinishReturned)
+        await dispatch.value
+    }
+
+    func test_minimalCheckpointUpsertFailurePublishesOneNilIdentityAndNeedsAttention() async throws {
+        // WHY: terminal status alone does not own a reply. If the minimal exact
+        // checkpoint cannot commit, the one authoritative callback must carry
+        // nil identity and the Bot handoff must fail closed instead of hanging.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-minimal-checkpoint-failure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        let fixture = try makeT005AgentMentionFixture(
+            root: root,
+            peerRunner: peerRunner,
+            hostRunner: hostRunner
+        )
+
+        let dispatch = Task { @MainActor in
+            await fixture.router.dispatchAgentAppBotMentions(
+                peers: [fixture.peer],
+                text: "@\(fixture.peer.handle) T005_FAIL_MINIMAL_CHECKPOINT",
+                threadId: fixture.threadID,
+                onto: fixture.surface
+            )
+        }
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("T005_FAIL_MINIMAL_CHECKPOINT") }
+        }
+        XCTAssertTrue(peerStarted)
+        XCTAssertTrue(peerRunner.finish(
+            promptContaining: "T005_FAIL_MINIMAL_CHECKPOINT",
+            reply: "peer reply still has exact ownership"
+        ))
+        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+        let handoff = try XCTUnwrap(fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: fixture.threadID
+        ).first)
+        let hostRunID = try XCTUnwrap(handoff.hostRunID)
+        let finishes = T005RunFinishRecorder(targetRunID: hostRunID)
+        fixture.context.coordinator.addObserver(finishes)
+        defer { fixture.context.coordinator.removeObserver(finishes) }
+
+        try fixture.context.db.execute("""
+            CREATE TRIGGER fail_t005_minimal_checkpoint
+            BEFORE INSERT ON agent_turn_checkpoints
+            WHEN NEW.run_id = '\(hostRunID.value.uuidString)'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced minimal checkpoint failure');
+            END;
+        """)
+        defer { try? fixture.context.db.execute("DROP TRIGGER fail_t005_minimal_checkpoint;") }
+        XCTAssertTrue(hostRunner.finish(
+            runID: hostRunID,
+            status: .completed,
+            reply: "unowned host assistant"
+        ))
+
+        let callbackArrived = await waitUntil(timeout: 1) { finishes.records.count == 1 }
+        XCTAssertTrue(callbackArrived, "checkpoint failure must not suppress terminal cleanup or didFinish")
+        let durableTerminal = await waitUntil(timeout: 1) {
+            (try? fixture.context.runRepo.get(id: hostRunID)?.status) == .completed
+        }
+        XCTAssertTrue(durableTerminal)
+        XCTAssertTrue(
+            try fixture.context.turnCheckpointRepo.list(threadId: fixture.threadID)
+                .allSatisfy { $0.runId != hostRunID },
+            "the injected failure must leave no counterfeit exact checkpoint"
+        )
+        let record = try XCTUnwrap(finishes.records.first)
+        XCTAssertNil(record.finalMessage, "failed ownership persistence must publish no reply identity")
+        XCTAssertNil(record.providerThreadID, "failed ownership persistence must publish no provider identity")
+        let needsAttention = await waitUntil(timeout: 1) {
+            fixture.botsViewModel.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: fixture.threadID
+            ).first?.phase == .needsAttention
+        }
+        XCTAssertTrue(needsAttention, "the exact owning activity must settle needsAttention without hanging")
+        await dispatch.value
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(finishes.records.count, 1, "one terminal attempt must fan out one authoritative callback")
+        XCTAssertEqual(hostRunner.requests.filter { $0.runId == hostRunID }.count, 1)
+    }
+
+    func test_terminalGraphFailureClearsAttemptMarkerSoDurableStaleReleaseFiresOnce() async throws {
+        // WHY: a failed terminal transaction is not provenance forever. Its
+        // exact attempt marker must retire on the failure return, allowing a
+        // separately durable terminal row to release ownership exactly once.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("t005-terminal-attempt-marker-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let workspaceDirectory = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDirectory, withIntermediateDirectories: true)
+        let context = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(name: "t005 terminal marker", cwd: workspaceDirectory.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "T005 terminal marker",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let send = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "hold terminal graph",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let runID = try XCTUnwrap(send.runId)
+        let finishes = T005RunFinishRecorder(targetRunID: runID)
+        context.coordinator.addObserver(finishes)
+        defer { context.coordinator.removeObserver(finishes) }
+        try context.db.execute("""
+            CREATE TRIGGER fail_t005_terminal_graph
+            BEFORE INSERT ON agent_runs
+            WHEN NEW.id = '\(runID.value.uuidString)' AND NEW.status = 'completed'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced terminal graph failure');
+            END;
+        """)
+        defer { try? context.db.execute("DROP TRIGGER fail_t005_terminal_graph;") }
+
+        let writeGate = T005SynchronousStepGate()
+        context.db.beforeStatementStepForTesting = { sql in
+            guard sql.contains("INSERT INTO agent_runs") else { return }
+            writeGate.enterAndWait()
+        }
+        defer {
+            writeGate.release()
+            context.db.beforeStatementStepForTesting = nil
+        }
+        let finishTask = Task.detached {
+            runner.finish(runID: runID, status: .completed, reply: "terminal graph reply")
+        }
+        let writeWasReached = await writeGate.waitUntilEntered(timeout: 1)
+        XCTAssertTrue(writeWasReached, "the fixture must stop inside the exact terminal graph attempt")
+        XCTAssertTrue(
+            context.coordinator.terminalCheckpointAttemptIsActiveForTesting(runID),
+            "the attempt marker must cover terminal persistence and minimal checkpoint identity"
+        )
+        writeGate.release()
+        let finishReturned = await finishTask.value
+        XCTAssertTrue(finishReturned)
+        context.db.beforeStatementStepForTesting = nil
+
+        let markerCleared = await waitUntil(timeout: 0.05) {
+            !context.coordinator.terminalCheckpointAttemptIsActiveForTesting(runID)
+        }
+        XCTAssertTrue(markerCleared, "every terminal-graph failure return must retire the exact attempt marker")
+        XCTAssertTrue(finishes.records.isEmpty, "failed durability cannot present a terminal callback")
+        XCTAssertEqual(try context.runRepo.get(id: runID)?.status, .running)
+
+        var durableRun = try XCTUnwrap(context.runRepo.get(id: runID))
+        durableRun.status = .failed
+        durableRun.finishedAt = Date()
+        durableRun.errorMessage = "separately durable terminal"
+        try context.runRepo.upsert(durableRun)
+        var durableThread = try XCTUnwrap(context.threadRepo.get(id: thread.id))
+        durableThread.status = .failed
+        durableThread.updatedAt = Date()
+        try context.threadRepo.upsert(durableThread)
+
+        XCTAssertEqual(context.coordinator.reconcileStaleActiveOwnershipWithDurableState(), 1)
+        let staleReleaseArrived = await waitUntil(timeout: 1) { finishes.records.count == 1 }
+        XCTAssertTrue(staleReleaseArrived)
+        XCTAssertEqual(finishes.records.first?.status, .failed)
+        XCTAssertNil(finishes.records.first?.finalMessage)
+        XCTAssertNil(finishes.records.first?.providerThreadID)
+        XCTAssertEqual(context.coordinator.reconcileStaleActiveOwnershipWithDurableState(), 0)
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(finishes.records.count, 1, "a retained retry must not duplicate the stale terminal release")
+    }
+
+    private func makeT005AgentMentionFixture(
+        root: URL,
+        peerRunner: ControlledBotHandoffRunner,
+        hostRunner: ControlledBotHandoffRunner
+    ) throws -> (
+        context: AppContext,
+        router: AppCommandRouter,
+        botsViewModel: BotsViewModel,
+        surface: AgentAppSurface,
+        peer: BotDefinition,
+        threadID: AgentThreadID
+    ) {
+        let workspaceDirectory = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDirectory, withIntermediateDirectories: true)
+        let context = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        context.coordinator.replaceProvider(
+            .grok,
+            runner: FakeProviderRunner(provider: .grok, scenario: .simpleAssistant(reply: "unused"))
+        )
+        router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: "fake-model", label: "Fake Model", provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        })
+        let botsViewModel = BotsViewModel(context: context, router: router)
+        router.botsViewModel = botsViewModel
+        let peer = try botsViewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        botsViewModel.openDesk(peer)
+        botsViewModel.setDeskProvider(.claude)
+        let workspace = try router.createWorkspace(name: "t005 checkpoint", cwd: workspaceDirectory.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "T005 checkpoint host",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let surface = AgentAppSurface(
+            workspaceID: workspace.id,
+            cwd: workspaceDirectory.path,
+            coordinator: context.coordinator,
+            threadRepo: context.threadRepo,
+            messageRepo: context.messageRepo,
+            queuedMessageRepo: context.queuedMessageRepo,
+            providerSessionRepo: context.providerSessionRuntimeRepo,
+            checkpointRepo: context.turnCheckpointRepo,
+            initialThreadId: thread.id
+        )
+        surface.viewModel.mentionableBotsProvider = { botsViewModel.bots }
+        surface.viewModel.selectThread(thread.id)
+        return (context, router, botsViewModel, surface, peer, thread.id)
+    }
+
+    private func makeT005PeerPersistenceContext(
+        root: URL,
+        onDispatch: @escaping (AgentRunID) -> Void
+    ) throws -> (
+        context: AppContext,
+        router: AppCommandRouter,
+        viewModel: BotsViewModel,
+        peerRunner: ControlledBotHandoffRunner,
+        hostRunner: ControlledBotHandoffRunner
+    ) {
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        context.coordinator.replaceProvider(
+            .grok,
+            runner: FakeProviderRunner(provider: .grok, scenario: .simpleAssistant(reply: "unused"))
+        )
+        router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: "fake-model", label: "Fake Model", provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        })
+        context.botPeerHandoffAuthority.beforeBotRunDispatchForTesting = onDispatch
+        let viewModel = BotsViewModel(context: context, router: router)
+        router.botsViewModel = viewModel
+        return (context, router, viewModel, peerRunner, hostRunner)
+    }
+
+    private func makeT005CachedPeerHandoffFixture(
+        root: URL,
+        v1Bytes: Data
+    ) throws -> T005CachedPeerHandoffFixture {
+        let emptyBytes = Data("[]".utf8)
+        UserDefaults.standard.set(v1Bytes, forKey: "bots.peerTurns")
+        UserDefaults.standard.set(emptyBytes, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+
+        let dispatches = T005PeerDispatchRecorder()
+        let base = try makeT005PeerPersistenceContext(root: root) {
+            dispatches.record($0)
+        }
+        let piper = try base.viewModel.create(
+            name: "Piper cached authority",
+            title: "Cached origin",
+            provider: .codex
+        )
+        let quinn = try base.viewModel.create(
+            name: "Quinn cached authority",
+            title: "Cached peer",
+            provider: .claude
+        )
+        base.viewModel.openDesk(quinn)
+        base.viewModel.setDeskProvider(.claude)
+        base.viewModel.openDesk(piper)
+        base.viewModel.setDeskProvider(.codex)
+        base.viewModel.createDeskThread()
+
+        var candidateBytes: Data?
+        base.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = { data in
+            candidateBytes = data
+            throw NSError(domain: "T005.CachedPeerFixture", code: 1)
+        }
+        XCTAssertFalse(base.viewModel.send("@\(quinn.handle) CAPTURE_SUPPORTED_CACHE_ROW"))
+        base.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
+        XCTAssertTrue(dispatches.runIDs.isEmpty)
+        XCTAssertTrue(base.peerRunner.requests.isEmpty)
+
+        var entries = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: try XCTUnwrap(candidateBytes)) as? [Any]
+        )
+        let recordIndex = try XCTUnwrap(entries.firstIndex { $0 is [String: Any] })
+        var record = try XCTUnwrap(entries[recordIndex] as? [String: Any])
+        let seedActivityID = try XCTUnwrap(
+            (record["activityID"] as? String).flatMap(UUID.init(uuidString:))
+        )
+        record["phase"] = BotPeerHandoffPhase.needsAttention.rawValue
+        entries[recordIndex] = record
+        let seedBytes = try JSONSerialization.data(withJSONObject: entries, options: [.sortedKeys])
+        try base.context.settingsRepo.set(
+            "bots.peerTurns.v2",
+            "base64:\(seedBytes.base64EncodedString())"
+        )
+        UserDefaults.standard.set(seedBytes, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+        base.viewModel.reconcilePeerHandoffsForTesting()
+        XCTAssertNotNil(
+            base.viewModel.peerHandoffSnapshotsForTesting().first {
+                $0.activityID == seedActivityID && $0.phase == .needsAttention
+            }
+        )
+
+        return T005CachedPeerHandoffFixture(
+            context: base.context,
+            router: base.router,
+            viewModel: base.viewModel,
+            peerRunner: base.peerRunner,
+            hostRunner: base.hostRunner,
+            piper: piper,
+            quinn: quinn,
+            seedBytes: seedBytes,
+            seedActivityID: seedActivityID,
+            dispatches: dispatches
+        )
+    }
+
+    private func t005PeerHandoffPayload(
+        _ data: Data,
+        replacingVersion version: Int,
+        addingOpaqueField: Bool
+    ) throws -> Data {
+        var entries = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [Any])
+        let recordIndex = try XCTUnwrap(entries.firstIndex { $0 is [String: Any] })
+        var record = try XCTUnwrap(entries[recordIndex] as? [String: Any])
+        record["version"] = version
+        if addingOpaqueField {
+            record["futureOpaqueField"] = ["owner": "newer-build", "preserve": true] as [String: Any]
+        }
+        entries[recordIndex] = record
+        return try JSONSerialization.data(withJSONObject: entries, options: [.sortedKeys])
+    }
+
+    private func t005PeerHandoffPayloadAddingSibling(
+        _ data: Data
+    ) throws -> (Data, UUID) {
+        var entries = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [Any])
+        let recordIndex = try XCTUnwrap(entries.firstIndex { $0 is [String: Any] })
+        var sibling = try XCTUnwrap(entries[recordIndex] as? [String: Any])
+        let siblingActivityID = UUID()
+        sibling["activityID"] = siblingActivityID.uuidString.lowercased()
+        sibling["inboundMessageID"] = UUID().uuidString.lowercased()
+        sibling["outboundText"] = "EXTERNALLY_COMMITTED_SIBLING"
+        sibling["phase"] = BotPeerHandoffPhase.needsAttention.rawValue
+        entries.append(siblingActivityID.uuidString.lowercased())
+        entries.append(sibling)
+        return (
+            try JSONSerialization.data(withJSONObject: entries, options: [.sortedKeys]),
+            siblingActivityID
+        )
+    }
+
     private static func causalQueueFakeClaudeBridge(
         commandLogPath: String,
         releaseFIFOPath: String
@@ -4205,6 +5996,164 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             prompt: "existing turn"
         )) { _ in }
         return (ctx, router, adapter, thread)
+    }
+}
+
+private struct T005CachedPeerHandoffFixture {
+    let context: AppContext
+    let router: AppCommandRouter
+    let viewModel: BotsViewModel
+    let peerRunner: ControlledBotHandoffRunner
+    let hostRunner: ControlledBotHandoffRunner
+    let piper: BotDefinition
+    let quinn: BotDefinition
+    let seedBytes: Data
+    let seedActivityID: UUID
+    let dispatches: T005PeerDispatchRecorder
+}
+
+private final class T005PeerDispatchRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [AgentRunID] = []
+
+    var runIDs: [AgentRunID] {
+        lock.withLock { stored }
+    }
+
+    func record(_ runID: AgentRunID) {
+        lock.withLock { stored.append(runID) }
+    }
+}
+
+private final class T005CheckpointEnrichmentBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private var targetRunID: AgentRunID?
+    private var entered = false
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    var didEnter: Bool {
+        lock.withLock { entered }
+    }
+
+    func target(_ runID: AgentRunID) {
+        lock.withLock {
+            targetRunID = runID
+            entered = false
+            released = false
+        }
+    }
+
+    func waitIfTarget(_ runID: AgentRunID) async {
+        let shouldWait = lock.withLock { targetRunID == runID && !released }
+        guard shouldWait else { return }
+        await withCheckedContinuation { continuation in
+            let shouldResume = lock.withLock { () -> Bool in
+                entered = true
+                if released { return true }
+                self.continuation = continuation
+                return false
+            }
+            if shouldResume { continuation.resume() }
+        }
+    }
+
+    func release() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            released = true
+            let pending = self.continuation
+            self.continuation = nil
+            return pending
+        }
+        continuation?.resume()
+    }
+}
+
+private final class T005RunFinishRecorder: AgentRunObserver, @unchecked Sendable {
+    struct Record {
+        let status: AgentRunStatus
+        let finalMessage: String?
+        let providerThreadID: String?
+    }
+
+    private let targetRunID: AgentRunID
+    private let lock = NSLock()
+    private var stored: [Record] = []
+
+    init(targetRunID: AgentRunID) {
+        self.targetRunID = targetRunID
+    }
+
+    var records: [Record] {
+        lock.withLock { stored }
+    }
+
+    func runCoordinator(
+        _ coordinator: AgentRunCoordinator,
+        didReceive event: AssistantEvent,
+        run: AgentRunID,
+        threadId: AgentThreadID
+    ) {}
+
+    func runCoordinator(
+        _ coordinator: AgentRunCoordinator,
+        didFinish runID: AgentRunID,
+        threadId: AgentThreadID,
+        status: AgentRunStatus,
+        finalMessage: String?,
+        providerThreadId: String?
+    ) {
+        guard runID == targetRunID else { return }
+        lock.withLock {
+            stored.append(Record(
+                status: status,
+                finalMessage: finalMessage,
+                providerThreadID: providerThreadId
+            ))
+        }
+    }
+
+    func runCoordinator(
+        _ coordinator: AgentRunCoordinator,
+        didChangeStatus status: AgentRunStatus,
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) {}
+}
+
+private final class T005SynchronousStepGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let enteredSignal = DispatchSemaphore(value: 0)
+    private let releaseSignal = DispatchSemaphore(value: 0)
+    private var hasEntered = false
+    private var hasReleased = false
+
+    func enterAndWait() {
+        let shouldWait = lock.withLock { () -> Bool in
+            guard !hasEntered else { return false }
+            hasEntered = true
+            enteredSignal.signal()
+            return !hasReleased
+        }
+        if shouldWait {
+            _ = releaseSignal.wait(timeout: .now() + 2)
+        }
+    }
+
+    func waitUntilEntered(timeout: TimeInterval) async -> Bool {
+        if lock.withLock({ hasEntered }) { return true }
+        return await Task.detached { [enteredSignal] in
+            enteredSignal.wait(timeout: .now() + timeout) == .success
+        }.value
+    }
+
+    func release() {
+        let shouldSignal = lock.withLock { () -> Bool in
+            guard !hasReleased else { return false }
+            hasReleased = true
+            return true
+        }
+        if shouldSignal { releaseSignal.signal() }
     }
 }
 
@@ -4370,6 +6319,7 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
     let provider: AgentProvider
     private let lock = NSLock()
     private var starts = 0
+    private var runIDs: [AgentRunID] = []
     private var callbacks: [Int: @Sendable (AgentRunEvent) -> Void] = [:]
     private var startWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var finishWasMainThread = true
@@ -4383,6 +6333,9 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
     var startCount: Int {
         lock.withLock { starts }
     }
+    var startedRunIDs: [AgentRunID] {
+        lock.withLock { runIDs }
+    }
     var lastFinishWasMainThread: Bool {
         lock.withLock { finishWasMainThread }
     }
@@ -4395,6 +6348,7 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
     ) async throws -> AgentRunHandle {
         let ordinal = lock.withLock { () -> Int in
             starts += 1
+            runIDs.append(request.runId)
             callbacks[starts] = onEvent
             let ready = startWaiters.filter { $0.0 <= starts }
             startWaiters.removeAll { $0.0 <= starts }
@@ -4830,6 +6784,102 @@ private final class PromptWriteFailureGrokPeer {
             ofItemAtPath: script.path
         )
         path = script.path
+    }
+}
+
+final class TerminalRetiringOneShotAdapter: AgentProviderAdapter, @unchecked Sendable {
+    private let inner: OneShotProviderAdapter
+    private let lock = NSLock()
+    private var retiredThreadIDs = Set<AgentThreadID>()
+
+    init(runner: AgentProviderRunner) {
+        inner = OneShotProviderAdapter(runner: runner)
+    }
+
+    var provider: AgentProvider { inner.provider }
+
+    func listModels() async -> [AgentModelDescriptor] { await inner.listModels() }
+
+    func startSession(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        _ = lock.withLock { retiredThreadIDs.remove(request.threadId) }
+        return try await inner.startSession(request, onEvent: onEvent)
+    }
+
+    func sendTurn(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        _ = lock.withLock { retiredThreadIDs.remove(request.threadId) }
+        return try await inner.sendTurn(request, onEvent: onEvent)
+    }
+
+    func interruptTurn(threadId: AgentThreadID) throws {
+        try inner.interruptTurn(threadId: threadId)
+    }
+
+    func respondToRequest(
+        threadId: AgentThreadID,
+        requestId: String,
+        response: AgentProviderRequestResponse
+    ) async throws {
+        try await inner.respondToRequest(threadId: threadId, requestId: requestId, response: response)
+    }
+
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+        try inner.respondToUserInput(threadId: threadId, requestId: requestId, text: text)
+    }
+
+    func stopSession(threadId: AgentThreadID) throws {
+        let terminalWithoutHandle = inner.listSessions().contains {
+            $0.threadId == threadId && $0.status != .pending && $0.status != .running
+        }
+        if terminalWithoutHandle {
+            _ = lock.withLock { retiredThreadIDs.insert(threadId) }
+            return
+        }
+        try inner.stopSession(threadId: threadId)
+        _ = lock.withLock { retiredThreadIDs.insert(threadId) }
+    }
+
+    func recoverSession(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws {
+        _ = lock.withLock { retiredThreadIDs.remove(request.threadId) }
+        try await inner.recoverSession(request, onEvent: onEvent)
+    }
+
+    func listSessions() -> [AgentProviderSessionSummary] {
+        let retired = lock.withLock { retiredThreadIDs }
+        return inner.listSessions().filter { !retired.contains($0.threadId) }
+    }
+
+    func hasSession(threadId: AgentThreadID) -> Bool {
+        !lock.withLock { retiredThreadIDs.contains(threadId) }
+            && inner.hasSession(threadId: threadId)
+    }
+
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
+        try await inner.readThread(threadId: threadId)
+    }
+
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
+        try await inner.rollbackThread(threadId: threadId, toTurnId: toTurnId)
+    }
+
+    func stopAll() {
+        inner.stopAll()
+        lock.withLock { retiredThreadIDs.removeAll() }
+    }
+
+    func streamEvents(
+        threadId: AgentThreadID,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) throws {
+        try inner.streamEvents(threadId: threadId, onEvent: onEvent)
     }
 }
 
