@@ -12,15 +12,18 @@ public struct ManagedRetrieveMCP: Sendable {
     public typealias SearchFn = @Sendable (_ query: String, _ topK: Int) async -> [CCRSearchResult]
     public typealias StatsFn = @Sendable () async -> DistillStatsSnapshot?
     public typealias CompressFn = @Sendable (_ request: DistillRequest) async -> DistillResponse?
+    public typealias AskFn = @Sendable (_ op: String, _ input: String, _ question: String, _ handle: String?) async -> String?
 
     public static let toolName = "rc_retrieve"
     public static let searchToolName = "rc_search"
     public static let statsToolName = "rc_stats"
     public static let compressToolName = "rc_compress"
+    public static let askToolName = "rc_ask"
     private let retrieve: RetrieveFn
     private let search: SearchFn
     private let stats: StatsFn
     private let compress: CompressFn?
+    private let ask: AskFn?
     private let scopedRecoveryAvailable: Bool
 
     public init(
@@ -28,12 +31,14 @@ public struct ManagedRetrieveMCP: Sendable {
         search: @escaping SearchFn = { _, _ in [] },
         stats: @escaping StatsFn = { nil },
         compress: CompressFn? = nil,
+        ask: AskFn? = nil,
         scopedRecoveryAvailable: Bool = false
     ) {
         self.retrieve = retrieve
         self.search = search
         self.stats = stats
         self.compress = compress
+        self.ask = ask
         self.scopedRecoveryAvailable = scopedRecoveryAvailable
     }
 
@@ -70,6 +75,35 @@ public struct ManagedRetrieveMCP: Sendable {
                     "properties": [String: Any](),
                 ],
             ]]
+            tools.append([
+                "name": Self.searchToolName,
+                "description": "Search Token Saver reversible handles by query. Miss is not evidence of absence.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "query": ["type": "string"],
+                        "topK": ["type": "integer"],
+                    ],
+                    "required": ["query"],
+                ],
+            ])
+            tools.append([
+                "name": Self.askToolName,
+                "description": "Run a Token Saver catalog function from 01-catalogo.html on the user's selected Distill model (Settings 1.7B / E4B / OpenAI-compat). op is a catalog id. Host-only ops return unavailable; forbidden ops are refused.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "op": [
+                            "type": "string",
+                            "enum": LibrarianCatalog.implementedIDs,
+                        ],
+                        "input": ["type": "string"],
+                        "question": ["type": "string"],
+                        "handle": ["type": "string"],
+                    ],
+                    "required": ["op"],
+                ],
+            ])
             if scopedRecoveryAvailable {
                 tools.append([
                     "name": Self.toolName,
@@ -99,7 +133,10 @@ public struct ManagedRetrieveMCP: Sendable {
             let params = msg["params"] as? [String: Any]
             let args = params?["arguments"] as? [String: Any]
             let name = params?["name"] as? String
-            guard name == Self.statsToolName || (scopedRecoveryAvailable && (name == Self.toolName || name == Self.compressToolName)) else {
+            guard name == Self.statsToolName
+                    || name == Self.searchToolName
+                    || name == Self.askToolName
+                    || (scopedRecoveryAvailable && (name == Self.toolName || name == Self.compressToolName)) else {
                 return errorReply(
                     id: id,
                     code: -32602,
@@ -126,6 +163,44 @@ public struct ManagedRetrieveMCP: Sendable {
                 let results = await search(query, max(1, min(20, topK)))
                 return reply(id: id, result: [
                     "content": [["type": "text", "text": encodeJSON(results) ?? "[]"]],
+                    "isError": false,
+                ])
+            }
+            if name == Self.askToolName {
+                guard let op = args?["op"] as? String, !op.isEmpty else {
+                    return errorReply(id: id, code: -32602, message: "missing op")
+                }
+                let input = args?["input"] as? String ?? ""
+                let question = args?["question"] as? String ?? op
+                let handle = args?["handle"] as? String
+                let text: String
+                if let ask {
+                    guard let answered = await ask(op, input, question, handle) else {
+                        return reply(id: id, result: [
+                            "content": [["type": "text", "text": "catalog generate unavailable"]],
+                            "isError": true,
+                        ])
+                    }
+                    text = answered
+                } else {
+                    let store = LibrarianHandleStore()
+                    if !input.isEmpty {
+                        _ = store.put(input, handle: handle)
+                    } else if let handle, let recovered = await retrieve(handle) {
+                        _ = store.put(recovered, handle: handle)
+                    }
+                    let dispatcher = LibrarianDispatcher(store: store)
+                    let result = await dispatcher.dispatch(LibrarianRequest(
+                        id: op,
+                        input: input,
+                        question: question,
+                        handle: handle,
+                        admitted: true
+                    ))
+                    text = result.envelope?.jsonString() ?? result.text
+                }
+                return reply(id: id, result: [
+                    "content": [["type": "text", "text": text]],
                     "isError": false,
                 ])
             }

@@ -85,6 +85,33 @@ public struct DeadlineDistillRuntime: DistillRuntime {
         }
     }
 
+    public func rawGenerate(system: String, user: String, maxTokens: Int) async -> String? {
+        let wrapped = self.wrapped
+        let deadline = self.deadline
+        do {
+            return try await withCheckedThrowingContinuation { continuation in
+                let oneShot = OneShot()
+                let runtimeTask = Task {
+                    let out = await wrapped.rawGenerate(system: system, user: user, maxTokens: maxTokens)
+                    oneShot.fire { continuation.resume(returning: out) }
+                }
+                Task {
+                    try? await Task.sleep(for: deadline)
+                    guard !Task.isCancelled else { return }
+                    oneShot.fire {
+                        runtimeTask.cancel()
+                        continuation.resume(throwing: DeadlineExceeded())
+                    }
+                }
+            }
+        } catch {
+            if let onFallback {
+                await onFallback()
+            }
+            return nil
+        }
+    }
+
     public func warmup() async throws {
         try await wrapped.warmup()
     }

@@ -1,0 +1,290 @@
+import CryptoKit
+import Foundation
+
+/// ChatML JSONL writer for Distill generate (SFT + rejected split).
+public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
+    public static let schemaVersion = 1
+    public static let maxFileBytes = 64 * 1_024 * 1_024
+
+    private let root: URL
+    private let fileManager: FileManager
+    private let lock = NSLock()
+    private var seen = Set<String>()
+
+    public init(root: URL, fileManager: FileManager = .default) {
+        self.root = root
+        self.fileManager = fileManager
+    }
+
+    public static func defaultRoot(appSupportDirectory: URL) -> URL {
+        appSupportDirectory
+            .appendingPathComponent("TokenSaver", isDirectory: true)
+            .appendingPathComponent("training", isDirectory: true)
+    }
+
+    public func record(
+        request: DistillRequest,
+        output: String,
+        stage: TokenSaverRouteStage?,
+        modelID: String,
+        source: String
+    ) {
+        guard stage == .llmMLX else { return }
+        let assistant = stripThink(output)
+        let failOpen = output == request.input || assistant.isEmpty
+        if failOpen {
+            appendRejected(
+                request: request,
+                modelID: modelID,
+                source: source,
+                reason: assistant.isEmpty ? "think_only" : "fail_open"
+            )
+        } else {
+            appendSFT(request: request, assistant: assistant, modelID: modelID, source: source)
+        }
+    }
+
+    /// Catalog / raw chat generate: always write SFT or rejected, independent of HTTP.
+    public func recordRaw(
+        system: String,
+        user: String,
+        assistant: String?,
+        modelID: String,
+        source: String
+    ) {
+        let stripped = stripThink(assistant ?? "")
+        if stripped.isEmpty {
+            appendRawRejected(
+                system: system,
+                user: user,
+                modelID: modelID,
+                source: source,
+                reason: assistant == nil ? "generate_nil" : "think_only"
+            )
+        } else {
+            appendRawSFT(system: system, user: user, assistant: stripped, modelID: modelID, source: source)
+        }
+    }
+
+    private func appendSFT(
+        request: DistillRequest,
+        assistant: String,
+        modelID: String,
+        source: String
+    ) {
+        let sha = sha256(request.input)
+        let dedup = "\(request.mode.rawValue)|\(sha)"
+        lock.lock()
+        if seen.contains(dedup) {
+            lock.unlock()
+            return
+        }
+        seen.insert(dedup)
+        lock.unlock()
+
+        let record: [String: Any] = [
+            "messages": [
+                ["role": "system", "content": redact(DistillPrompt.systemInstructions(for: request.mode))],
+                ["role": "user", "content": redact(DistillPrompt.userPrompt(for: request))],
+                ["role": "assistant", "content": redact(assistant)],
+            ],
+            "metadata": [
+                "mode": request.mode.rawValue,
+                "model": modelID,
+                "source": source,
+                "input_sha256": sha,
+                "created_at": ISO8601DateFormatter().string(from: Date()),
+            ],
+        ]
+        appendJSONL(record, to: sftURL(for: request.mode), split: "sft")
+    }
+
+    private func appendRejected(
+        request: DistillRequest,
+        modelID: String,
+        source: String,
+        reason: String
+    ) {
+        let day = Self.dayStamp(Date())
+        let record: [String: Any] = [
+            "messages": [
+                ["role": "system", "content": redact(DistillPrompt.systemInstructions(for: request.mode))],
+                ["role": "user", "content": redact(DistillPrompt.userPrompt(for: request))],
+            ],
+            "metadata": [
+                "mode": request.mode.rawValue,
+                "model": modelID,
+                "source": source,
+                "reason": reason,
+                "input_sha256": sha256(request.input),
+                "created_at": ISO8601DateFormatter().string(from: Date()),
+            ],
+        ]
+        appendJSONL(record, to: root.appendingPathComponent("rejected", isDirectory: true).appendingPathComponent("\(day).jsonl"), split: "rejected")
+    }
+
+    private func appendRawSFT(
+        system: String,
+        user: String,
+        assistant: String,
+        modelID: String,
+        source: String
+    ) {
+        let sha = sha256(system + "\n" + user)
+        let dedup = "catalogOp|\(sha)"
+        lock.lock()
+        if seen.contains(dedup) {
+            lock.unlock()
+            return
+        }
+        seen.insert(dedup)
+        lock.unlock()
+        let record: [String: Any] = [
+            "messages": [
+                ["role": "system", "content": redact(system)],
+                ["role": "user", "content": redact(user)],
+                ["role": "assistant", "content": redact(assistant)],
+            ],
+            "metadata": [
+                "mode": "catalogOp",
+                "model": modelID,
+                "source": source,
+                "input_sha256": sha,
+                "created_at": ISO8601DateFormatter().string(from: Date()),
+            ],
+        ]
+        appendJSONL(
+            record,
+            to: root.appendingPathComponent("sft", isDirectory: true).appendingPathComponent("catalogOp.jsonl"),
+            split: "sft"
+        )
+    }
+
+    private func appendRawRejected(
+        system: String,
+        user: String,
+        modelID: String,
+        source: String,
+        reason: String
+    ) {
+        let day = Self.dayStamp(Date())
+        let record: [String: Any] = [
+            "messages": [
+                ["role": "system", "content": redact(system)],
+                ["role": "user", "content": redact(user)],
+            ],
+            "metadata": [
+                "mode": "catalogOp",
+                "model": modelID,
+                "source": source,
+                "reason": reason,
+                "input_sha256": sha256(system + "\n" + user),
+                "created_at": ISO8601DateFormatter().string(from: Date()),
+            ],
+        ]
+        appendJSONL(
+            record,
+            to: root.appendingPathComponent("rejected", isDirectory: true).appendingPathComponent("\(day).jsonl"),
+            split: "rejected"
+        )
+    }
+
+    private func sftURL(for mode: DistillMode) -> URL {
+        let name: String
+        switch mode {
+        case .commandOutput: name = "commandOutput.jsonl"
+        case .longText: name = "longText.jsonl"
+        case .watchSummary: name = "watchSummary.jsonl"
+        case .wireEncode: name = "wireEncode.jsonl"
+        default: name = "other.jsonl"
+        }
+        return root.appendingPathComponent("sft", isDirectory: true).appendingPathComponent(name)
+    }
+
+    private func appendJSONL(_ record: [String: Any], to url: URL, split: String) {
+        guard JSONSerialization.isValidJSONObject(record),
+              let data = try? JSONSerialization.data(withJSONObject: record),
+              var line = String(data: data, encoding: .utf8) else {
+            return
+        }
+        line.append("\n")
+        guard let payload = line.data(using: .utf8) else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        do {
+            try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            var target = url
+            if fileManager.fileExists(atPath: target.path),
+               let attrs = try? fileManager.attributesOfItem(atPath: target.path),
+               let size = attrs[.size] as? NSNumber,
+               size.intValue + payload.count > Self.maxFileBytes {
+                let stem = url.deletingPathExtension().lastPathComponent
+                target = url.deletingLastPathComponent().appendingPathComponent("\(stem)-2.jsonl")
+            }
+            if !fileManager.fileExists(atPath: target.path) {
+                fileManager.createFile(atPath: target.path, contents: nil, attributes: [.posixPermissions: 0o600])
+            }
+            let handle = try FileHandle(forWritingTo: target)
+            defer { try? handle.close() }
+            handle.seekToEndOfFile()
+            handle.write(payload)
+            try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+            updateManifestLocked(split: split, file: target)
+        } catch {
+            return
+        }
+    }
+
+    private func updateManifestLocked(split: String, file: URL) {
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        var obj: [String: Any] = [:]
+        if let data = try? Data(contentsOf: manifestURL),
+           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            obj = parsed
+        }
+        obj["schema_version"] = Self.schemaVersion
+        obj["last_write"] = ISO8601DateFormatter().string(from: Date())
+        var counts = obj["counts"] as? [String: Int] ?? [:]
+        counts[split, default: 0] += 1
+        obj["counts"] = counts
+        obj["last_file"] = file.lastPathComponent
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else {
+            return
+        }
+        let tmp = manifestURL.appendingPathExtension("tmp")
+        try? data.write(to: tmp, options: .atomic)
+        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+        _ = try? fileManager.replaceItem(at: manifestURL, withItemAt: tmp, backupItemName: nil, options: [], resultingItemURL: nil)
+    }
+
+    private func sha256(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func stripThink(_ text: String) -> String {
+        var s = text
+        if let regex = try? NSRegularExpression(pattern: "<think>[\\s\\S]*?</think>", options: [.caseInsensitive]) {
+            s = regex.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "")
+        }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func redact(_ text: String) -> String {
+        var s = text
+        if let live = try? NSRegularExpression(pattern: #"sk_live_[A-Za-z0-9]+"#) {
+            s = live.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "<redacted>")
+        }
+        if let keyed = try? NSRegularExpression(pattern: #"(?i)(api[_-]?key|password|secret|token|bearer)\s*[:=]\s*\S+"#) {
+            s = keyed.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "$1=<redacted>")
+        }
+        return s
+    }
+
+    private static func dayStamp(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: date)
+    }
+}

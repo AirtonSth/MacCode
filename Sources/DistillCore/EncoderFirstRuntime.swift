@@ -70,6 +70,10 @@ public struct EncoderFirstRuntime: DistillRuntime {
         return try await wrapped.distillStaged(request)
     }
 
+    public func rawGenerate(system: String, user: String, maxTokens: Int) async -> String? {
+        await wrapped.rawGenerate(system: system, user: user, maxTokens: maxTokens)
+    }
+
     public func warmup() async throws {
         await encoderLane?.warmup()
         try await wrapped.warmup()

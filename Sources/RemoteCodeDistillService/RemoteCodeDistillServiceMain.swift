@@ -281,7 +281,21 @@ struct RemoteCodeDistillServiceMain {
 
             let configuration = try DistillServiceConfiguration.parse(arguments: programArguments)
             let runtimeResolution = try await runtime(for: configuration)
-            let baseRuntime = runtimeResolution.runtime
+            let trainingRoot = TokenSaverTrainingDatasetWriter.defaultRoot(
+                appSupportDirectory: URL(fileURLWithPath: configuration.appSupportDirectory, isDirectory: true)
+            )
+            let trainingWriter = configuration.saveTrainingPrompts
+                ? TokenSaverTrainingDatasetWriter(root: trainingRoot)
+                : nil
+            let trainingModelID = configuration.generateModel.isEmpty ? configuration.modelID : configuration.generateModel
+            let trainingSource = configuration.generateBaseURL.isEmpty ? "local" : "openaiCompat"
+            let recordedRuntime = TrainingRecordingRuntime(
+                wrapping: runtimeResolution.runtime,
+                writer: trainingWriter,
+                modelID: trainingModelID,
+                source: trainingSource
+            )
+            let baseRuntime = recordedRuntime
             if let fallbackReason = runtimeResolution.fallbackReason {
                 FileHandle.standardError.write(Data("RemoteCodeDistillService MLX runtime failed; using deterministic fallback: \(fallbackReason)\n".utf8))
             }
@@ -358,6 +372,13 @@ struct RemoteCodeDistillServiceMain {
                     FileHandle.standardError.write(Data("RemoteCodeDistillService savings record failed: \(error)\n".utf8))
                 }
             }
+            let librarianGenerate = LibrarianDistillRuntimeAdapter(
+                runtime: DeadlineDistillRuntime(
+                    wrapping: recordedRuntime,
+                    deadlineMilliseconds: configuration.mlxCallDeadlineMS,
+                    onFallback: { await sharedMetrics.recordFallback() }
+                )
+            )
             let server = DistillHTTPServer(
                 configuration: configuration,
                 scheduler: scheduler,
@@ -394,6 +415,7 @@ struct RemoteCodeDistillServiceMain {
                         FileHandle.standardError.write(Data("RemoteCodeDistillService audit event failed: \(error)\n".utf8))
                     }
                 },
+                librarianGenerate: librarianGenerate,
                 distillAdmission: { liveDistillAdmission?.isAdmitted() == true }
             )
             let ready = try await server.start()
@@ -705,6 +727,33 @@ struct RemoteCodeDistillServiceMain {
                 mcpCodecLock.lock()
                 defer { mcpCodecLock.unlock() }
                 return try? mcpDecoder.decode(DistillResponse.self, from: data)
+            },
+            ask: { op, input, question, handle in
+                guard admission?.isAdmitted() == true else { return nil }
+                guard let state, let url = URL(string: state.baseURL + "/v1/librarian") else { return nil }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                applyRecoveryHeaders(to: &request, environment: environment)
+                var payload: [String: Any] = [
+                    "id": op,
+                    "op": op,
+                    "input": input,
+                    "question": question,
+                    "provider": environment["REMOTE_CODE_AGENT_PROVIDER"] ?? "unknown",
+                    "thread_id": environment["RC_TOKEN_SAVER_THREAD_ID"] ?? "",
+                ]
+                if let handle, !handle.isEmpty {
+                    payload["handle"] = handle
+                }
+                request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+                guard let (data, response) = try? await session.data(for: request),
+                      (response as? HTTPURLResponse)?.statusCode == 200,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    return nil
+                }
+                return (obj["envelope"] as? String) ?? (obj["text"] as? String)
             },
             scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment)
         )

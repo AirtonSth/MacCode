@@ -69,17 +69,20 @@ public struct TokenSaverDistillLaunchInput: Sendable, Equatable {
     public let isSubscribed: Bool
     public let tokenSaverEnabled: Bool
     public let modelValidation: TokenSaverModelValidation
+    public let allowsExternalGenerate: Bool
 
     public init(
         hasPrivateAccount: Bool,
         isSubscribed: Bool,
         tokenSaverEnabled: Bool,
-        modelValidation: TokenSaverModelValidation
+        modelValidation: TokenSaverModelValidation,
+        allowsExternalGenerate: Bool = false
     ) {
         self.hasPrivateAccount = hasPrivateAccount
         self.isSubscribed = isSubscribed
         self.tokenSaverEnabled = tokenSaverEnabled
         self.modelValidation = modelValidation
+        self.allowsExternalGenerate = allowsExternalGenerate
     }
 }
 
@@ -94,8 +97,10 @@ public enum TokenSaverDistillLaunchPlanner {
         guard input.tokenSaverEnabled else {
             return .skip(reason: "token saver disabled")
         }
-        guard input.modelValidation.state == .installed else {
-            return .requireModel(reason: input.modelValidation.reason)
+        if !input.allowsExternalGenerate {
+            guard input.modelValidation.state == .installed else {
+                return .requireModel(reason: input.modelValidation.reason)
+            }
         }
         return .start
     }
@@ -560,6 +565,7 @@ public final class TokenSaverDistillServiceController {
     private let jsonDecoder = JSONDecoder()
     private let jsonEncoder = JSONEncoder()
     private var process: Process?
+    private var lastStartSettings: AppSettings?
     private var processOwnershipTag: SpawnedProcessTag?
     private var terminatingProcess: Process?
     private var terminationTask: Task<Void, Never>?
@@ -700,11 +706,15 @@ public final class TokenSaverDistillServiceController {
         settings: AppSettings,
         modelValidation: TokenSaverModelValidation
     ) {
+        lastStartSettings = settings
+        let allowsExternal: Bool
+        if case .openaiCompatible = settings.tokenSaverGenerateTarget { allowsExternal = true } else { allowsExternal = false }
         let decision = TokenSaverDistillLaunchPlanner.decide(TokenSaverDistillLaunchInput(
             hasPrivateAccount: session != nil,
             isSubscribed: session?.user.subscribed == true,
             tokenSaverEnabled: settings.tokenSaverEnabled,
-            modelValidation: modelValidation
+            modelValidation: modelValidation,
+            allowsExternalGenerate: allowsExternal
         ))
 
         switch decision {
@@ -899,12 +909,16 @@ public final class TokenSaverDistillServiceController {
         stderrOutputHandle = nil
         stderrOutputBuffer.removeAll(keepingCapacity: false)
         lastStderrLine = nil
-        let manifest = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory).loadManifest()
-        let model = manifest.flatMap {
-            TokenSaverApprovedModels.approved(id: $0.modelID, url: $0.modelURL, runtime: $0.runtime)
-        } ?? TokenSaverApprovedModels.defaultModel
+        let settings = lastStartSettings ?? AppSettings()
+        let localModel = settings.tokenSaverLocalModel
+        let model: TokenSaverApprovedModel
+        if case .openaiCompatible = settings.tokenSaverGenerateTarget {
+            model = localModel
+        } else {
+            model = localModel
+        }
         let memoryProfile = memoryProfileProvider()
-        let arguments = [
+        var arguments = [
             "--auth-token", token,
             "--app-support-dir", appSupportDirectory.path,
             "--host", "127.0.0.1",
@@ -917,6 +931,15 @@ public final class TokenSaverDistillServiceController {
             "--max-queue-wait-ms", String(memoryProfile.sidecarMaxQueueWaitMilliseconds),
             "--idle-timeout-ms", String(idleTimeoutMS)
         ]
+        if case let .openaiCompatible(url, apiModel, apiToken) = settings.tokenSaverGenerateTarget {
+            arguments += ["--generate-base-url", url.absoluteString, "--generate-model", apiModel]
+            if !apiToken.isEmpty {
+                arguments += ["--generate-token", apiToken]
+            }
+        }
+        if settings.tokenSaverSaveTrainingPrompts {
+            arguments += ["--save-training-prompts", "true"]
+        }
 
         do {
             let spawned = try processSpawner.spawn(executableURL: executableURL, arguments: arguments)

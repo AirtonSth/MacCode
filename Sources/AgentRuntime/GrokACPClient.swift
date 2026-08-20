@@ -625,8 +625,13 @@ public final class GrokACPClient: @unchecked Sendable {
             command: resolved,
             environment: environment
         )
-        return BotComputerMCPAdmit.admitGrokACP(
+        let withDistill = DistillMCPAdmit.admitGrokACP(
             existing: withWeb,
+            command: resolved,
+            environment: environment
+        )
+        return BotComputerMCPAdmit.admitGrokACP(
+            existing: withDistill,
             command: resolved,
             environment: environment
         )
