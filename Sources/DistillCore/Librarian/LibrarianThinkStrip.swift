@@ -24,6 +24,20 @@ public enum LibrarianThinkStrip {
         strip(text)
     }
 
+    /// Always-succeeding strip for training JSONL (user/system, leftover tags).
+    /// Assistant rows still use `strip` so unclosed think is rejected, not saved.
+    public static func stripLenient(_ text: String) -> String {
+        var out = text
+        out = stripTagged(out, open: "<think>", close: "</think>")
+        out = stripTagged(out, open: "<thinking>", close: "</thinking>")
+        out = stripJSONKey(out, key: "reasoning_content")
+        out = out.replacingOccurrences(of: "<think>", with: "", options: .caseInsensitive)
+        out = out.replacingOccurrences(of: "</think>", with: "", options: .caseInsensitive)
+        out = out.replacingOccurrences(of: "<thinking>", with: "", options: .caseInsensitive)
+        out = out.replacingOccurrences(of: "</thinking>", with: "", options: .caseInsensitive)
+        return out
+    }
+
     private static func stripTagged(_ text: String, open: String, close: String) -> String {
         var result = text
         while let start = result.range(of: open, options: .caseInsensitive) {

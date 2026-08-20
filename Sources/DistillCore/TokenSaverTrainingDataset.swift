@@ -30,16 +30,16 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         source: String
     ) {
         guard stage == .llmMLX else { return }
-        let assistant = stripThink(output)
-        let failOpen = output == request.input || assistant.isEmpty
+        let assistant = datasetAssistant(output)
+        let failOpen = output == request.input || assistant == nil
         if failOpen {
             appendRejected(
                 request: request,
                 modelID: modelID,
                 source: source,
-                reason: assistant.isEmpty ? "think_only" : "fail_open"
+                reason: assistant == nil ? "think_only" : "fail_open"
             )
-        } else {
+        } else if let assistant {
             appendSFT(request: request, assistant: assistant, modelID: modelID, source: source)
         }
     }
@@ -52,8 +52,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         modelID: String,
         source: String
     ) {
-        let stripped = stripThink(assistant ?? "")
-        if stripped.isEmpty {
+        guard let stripped = datasetAssistant(assistant ?? "") else {
             appendRawRejected(
                 system: system,
                 user: user,
@@ -61,9 +60,9 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
                 source: source,
                 reason: assistant == nil ? "generate_nil" : "think_only"
             )
-        } else {
-            appendRawSFT(system: system, user: user, assistant: stripped, modelID: modelID, source: source)
+            return
         }
+        appendRawSFT(system: system, user: user, assistant: stripped, modelID: modelID, source: source)
     }
 
     private func appendSFT(
@@ -84,9 +83,9 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
 
         let record: [String: Any] = [
             "messages": [
-                ["role": "system", "content": redact(DistillPrompt.systemInstructions(for: request.mode))],
-                ["role": "user", "content": redact(DistillPrompt.userPrompt(for: request))],
-                ["role": "assistant", "content": redact(assistant)],
+                ["role": "system", "content": sanitize(DistillPrompt.systemInstructions(for: request.mode))],
+                ["role": "user", "content": sanitize(DistillPrompt.userPrompt(for: request))],
+                ["role": "assistant", "content": sanitize(assistant)],
             ],
             "metadata": [
                 "mode": request.mode.rawValue,
@@ -108,8 +107,8 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         let day = Self.dayStamp(Date())
         let record: [String: Any] = [
             "messages": [
-                ["role": "system", "content": redact(DistillPrompt.systemInstructions(for: request.mode))],
-                ["role": "user", "content": redact(DistillPrompt.userPrompt(for: request))],
+                ["role": "system", "content": sanitize(DistillPrompt.systemInstructions(for: request.mode))],
+                ["role": "user", "content": sanitize(DistillPrompt.userPrompt(for: request))],
             ],
             "metadata": [
                 "mode": request.mode.rawValue,
@@ -141,9 +140,9 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         lock.unlock()
         let record: [String: Any] = [
             "messages": [
-                ["role": "system", "content": redact(system)],
-                ["role": "user", "content": redact(user)],
-                ["role": "assistant", "content": redact(assistant)],
+                ["role": "system", "content": sanitize(system)],
+                ["role": "user", "content": sanitize(user)],
+                ["role": "assistant", "content": sanitize(assistant)],
             ],
             "metadata": [
                 "mode": "catalogOp",
@@ -170,8 +169,8 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         let day = Self.dayStamp(Date())
         let record: [String: Any] = [
             "messages": [
-                ["role": "system", "content": redact(system)],
-                ["role": "user", "content": redact(user)],
+                ["role": "system", "content": sanitize(system)],
+                ["role": "user", "content": sanitize(user)],
             ],
             "metadata": [
                 "mode": "catalogOp",
@@ -261,12 +260,15 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    private func stripThink(_ text: String) -> String {
-        var s = text
-        if let regex = try? NSRegularExpression(pattern: "<think>[\\s\\S]*?</think>", options: [.caseInsensitive]) {
-            s = regex.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "")
-        }
-        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Strict: unclosed think / leftover traces are not SFT material.
+    private func datasetAssistant(_ text: String) -> String? {
+        guard let stripped = LibrarianThinkStrip.strip(text) else { return nil }
+        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func sanitize(_ text: String) -> String {
+        redact(LibrarianThinkStrip.stripLenient(text))
     }
 
     private func redact(_ text: String) -> String {
