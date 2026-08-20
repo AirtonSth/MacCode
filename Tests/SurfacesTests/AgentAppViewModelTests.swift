@@ -2899,10 +2899,9 @@ final class AgentAppViewModelTests: XCTestCase {
     }
 
     func test_persistedLastMessageRendersOnceWhilePreamblesStayInWorkLog() {
-        // After the run finishes, the durable persisted answer is the LAST message
-        // only. The timeline shows the preambles in the Worked disclosure and the
-        // persisted bubble shows the answer — the answer must render exactly once,
-        // never duplicated between the persisted row and the timeline.
+        // After the run finishes, the turn final is the chat answer. Preambles
+        // stay in the Worked disclosure; the persisted bubble must not paint
+        // the same last message beside it.
         let threadId = AgentThreadID()
         let persisted = AgentMessage(
             threadId: threadId,
@@ -2920,9 +2919,10 @@ final class AgentAppViewModelTests: XCTestCase {
             finished: true
         )
 
-        XCTAssertTrue(
-            AgentAppView.hiddenPersistedAssistantMessageIDs(messages: [persisted], timelineTurns: [turn]).isEmpty,
-            "the persisted last message must stay visible: the timeline now shows only the preambles, never the answer, so there is nothing to dedup against"
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(messages: [persisted], timelineTurns: [turn]),
+            [persisted.id],
+            "the turn final is the chat answer after Work so far; the persisted copy must not paint beside it"
         )
 
         // Once the persisted answer has filtered the matching last item out of the
@@ -3196,9 +3196,34 @@ final class AgentAppViewModelTests: XCTestCase {
             finished: true
         )
 
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(messages: [persisted], timelineTurns: [turn]),
+            [persisted.id],
+            "the turn final is the chat answer; the persisted copy must not paint beside it"
+        )
         XCTAssertTrue(
-            AgentAppView.hiddenPersistedAssistantMessageIDs(messages: [persisted], timelineTurns: [turn]).isEmpty,
-            "when the live assistant item is itself suppressed as a duplicate persisted final, the persisted answer must remain visible"
+            AgentAppView.keepsTokenSaverPersistedHidden(
+                requiresDurableRow: true,
+                messageText: persisted.content,
+                turns: [turn]
+            ),
+            "Token Saver must not un-hide a persisted row the live turn already paints"
+        )
+        XCTAssertTrue(
+            AgentAppView.keepsTokenSaverPersistedHidden(
+                requiresDurableRow: false,
+                messageText: persisted.content,
+                turns: [turn]
+            ),
+            "without a Token Saver durable-row claim the hide set already owns the duplicate"
+        )
+        XCTAssertFalse(
+            AgentAppView.keepsTokenSaverPersistedHidden(
+                requiresDurableRow: true,
+                messageText: "a different durable answer",
+                turns: [turn]
+            ),
+            "Token Saver may show the durable row only when the live turn does not already own that text"
         )
     }
 

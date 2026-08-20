@@ -101,7 +101,15 @@ public enum AgentChatLiveTurnChrome {
                 work.append(item)
             }
         }
-        return (reasoning, work, deduplicatedAssistantItems(split.outside))
+        var outside = deduplicatedAssistantItems(split.outside)
+        if turn.finished,
+           let final = turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !final.isEmpty {
+            outside.removeAll {
+                $0.type == .assistantMessage && assistantTextsMatch($0.body, final)
+            }
+        }
+        return (reasoning, work, outside)
     }
 
     /// Claude often emits a streaming assistantMessage and then a snapshot
@@ -200,8 +208,8 @@ public enum AgentChatLiveTurnChrome {
         guard turn.finished else { return false }
         let final = turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !final.isEmpty else { return false }
-        return !turn.items.contains {
-            $0.type == .assistantMessage && !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return !compose(turn).outside.contains {
+            $0.type == .assistantMessage && assistantTextsMatch($0.body, final)
         }
     }
 

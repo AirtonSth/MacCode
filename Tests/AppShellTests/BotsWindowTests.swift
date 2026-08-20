@@ -8320,9 +8320,13 @@ final class BotsWindowTests: XCTestCase {
                 return message.text
             case .liveTurn(let live, let hide):
                 XCTAssertFalse(hide)
-                let outside = AgentChatLiveTurnChrome.compose(live).outside
-                XCTAssertEqual(outside.map(\.body), [answer])
-                return outside.first?.body
+                let composition = AgentChatLiveTurnChrome.compose(live)
+                XCTAssertTrue(
+                    composition.outside.isEmpty,
+                    "matching assistant items must yield to the turn final so Desk and Agent App paint one reply"
+                )
+                XCTAssertTrue(AgentChatLiveTurnChrome.shouldRenderFinalMessage(live))
+                return live.finalAssistantMessage
             default:
                 return nil
             }

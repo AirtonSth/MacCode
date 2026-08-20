@@ -10748,10 +10748,7 @@ public struct AgentAppView: View {
             let visibleAssistantText = renderableAssistantItemBodies(in: turn, persistedAssistantTexts: persistedTexts)
                 .joined(separator: "\n")
             hidden.formUnion(lookup.ids(equalTo: visibleAssistantText))
-            // Hide the durable transcript row when the turn owns Work so far +
-            // the same final after it — prevents answer-above-work on open.
-            if let final = turn.finalAssistantMessage, !final.isEmpty,
-               turnHasWorkDisclosureContent(turn, finalText: final) {
+            if let final = turn.finalAssistantMessage, !final.isEmpty {
                 hidden.formUnion(lookup.ids(equalTo: final))
                 for message in assistantMessages where assistantText(message.content, matches: final)
                     || assistantText(final, matches: message.content) {
@@ -11723,9 +11720,7 @@ public struct AgentAppView: View {
         // leave generation still so hide-set is not rehashed at token rate.
         let generation = vm.transcriptState.contentGeneration
         if hiddenPersistedAssistantMessageCache.generation == generation {
-            return Set(hiddenPersistedAssistantMessageCache.ids.filter {
-                !vm.tokenSaverRequiresDurableMessageRow(for: $0)
-            })
+            return visibleHiddenPersistedIDs(hiddenPersistedAssistantMessageCache.ids)
         }
         let key = Self.hiddenPersistedAssistantContentKey(
             messages: vm.messages,
@@ -11733,9 +11728,7 @@ public struct AgentAppView: View {
         )
         if hiddenPersistedAssistantMessageCache.key == key {
             hiddenPersistedAssistantMessageCache.generation = generation
-            return Set(hiddenPersistedAssistantMessageCache.ids.filter {
-                !vm.tokenSaverRequiresDurableMessageRow(for: $0)
-            })
+            return visibleHiddenPersistedIDs(hiddenPersistedAssistantMessageCache.ids)
         }
         let ids = Self.hiddenPersistedAssistantMessageIDs(
             messages: vm.messages,
@@ -11745,7 +11738,28 @@ public struct AgentAppView: View {
         hiddenPersistedAssistantMessageCache.generation = generation
         hiddenPersistedAssistantMessageCache.key = key
         hiddenPersistedAssistantMessageCache.ids = ids
-        return Set(ids.filter { !vm.tokenSaverRequiresDurableMessageRow(for: $0) })
+        return visibleHiddenPersistedIDs(ids)
+    }
+
+    /// Token Saver may need the durable row when the timeline cannot paint
+    /// that answer. If the live turn already owns the same text, keep it hidden.
+    nonisolated static func keepsTokenSaverPersistedHidden(
+        requiresDurableRow: Bool,
+        messageText: String,
+        turns: [AssistantTurnSnapshot]
+    ) -> Bool {
+        guard requiresDurableRow else { return true }
+        return AgentChatLiveTurnChrome.messageDuplicatesTurn(messageText, turns: turns)
+    }
+
+    private func visibleHiddenPersistedIDs(_ ids: Set<AgentMessageID>) -> Set<AgentMessageID> {
+        Set(ids.filter { id in
+            Self.keepsTokenSaverPersistedHidden(
+                requiresDurableRow: vm.tokenSaverRequiresDurableMessageRow(for: id),
+                messageText: vm.messages.first(where: { $0.id == id })?.content ?? "",
+                turns: vm.timeline.turns
+            )
+        })
     }
 
     public var body: some View {
@@ -14041,6 +14055,17 @@ public struct AgentAppView: View {
         )
     }
 
+    private func previousTurns(before turn: AssistantTurnSnapshot) -> [AssistantTurnSnapshot] {
+        var found: [AssistantTurnSnapshot] = []
+        for entry in visibleTranscriptEntries {
+            if case .turn(let other) = entry {
+                if other.turnId == turn.turnId { break }
+                found.append(other)
+            }
+        }
+        return found
+    }
+
     @ViewBuilder
     private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
         let inputs = turnRenderInputs(for: turn)
@@ -14048,7 +14073,10 @@ public struct AgentAppView: View {
         AgentChatLiveTurnView(
             turn: turn,
             live: !turn.finished,
-            hideAssistantOutput: false,
+            hideAssistantOutput: AgentChatLiveTurnChrome.shouldHideAssistantOutput(
+                turn,
+                previousTurns: previousTurns(before: turn)
+            ),
             renderFinal: { final in
                 AnyView(agentTurnFinal(final, turn: turn, durableFinalMessageId: durableFinalMessageId))
             },
