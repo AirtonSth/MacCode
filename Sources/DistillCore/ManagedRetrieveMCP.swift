@@ -78,7 +78,7 @@ public struct ManagedRetrieveMCP: Sendable {
             let params = msg["params"] as? [String: Any]
             let args = params?["arguments"] as? [String: Any]
             let name = params?["name"] as? String
-            guard tokenSaverAdmitted else {
+            if name != Self.statsToolName, !tokenSaverAdmitted {
                 return errorReply(id: id, code: -32602, message: "tool unavailable: token saver inactive")
             }
             let scopedNames: Set<String> = [
@@ -198,7 +198,6 @@ public struct ManagedRetrieveMCP: Sendable {
     }
 
     private func listedTools() -> [[String: Any]] {
-        guard tokenSaverAdmitted else { return [] }
         var tools: [[String: Any]] = [[
             "name": Self.statsToolName,
             "description": "Return local RemoteCode Token Saver measurement stats with their evidence labels.",
@@ -207,6 +206,7 @@ public struct ManagedRetrieveMCP: Sendable {
                 "properties": [String: Any](),
             ],
         ]]
+        guard tokenSaverAdmitted else { return tools }
         guard scopedRecoveryAvailable else { return tools }
         tools.append([
             "name": Self.toolName,

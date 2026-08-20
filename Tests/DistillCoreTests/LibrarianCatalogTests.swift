@@ -249,7 +249,8 @@ final class LibrarianMCPTests: XCTestCase {
         )
         let listed = try parse(await mcp.handle(#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
         let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 0)
+        let names = Set(tools.compactMap { $0["name"] as? String })
+        XCTAssertEqual(names, ["rc_stats"], "Token Saver off keeps stats only; no generate/lossy tools")
     }
 
     func test_compressRejectsBlobInput() async throws {
