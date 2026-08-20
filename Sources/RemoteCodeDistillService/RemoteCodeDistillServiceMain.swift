@@ -706,7 +706,32 @@ struct RemoteCodeDistillServiceMain {
                 defer { mcpCodecLock.unlock() }
                 return try? mcpDecoder.decode(DistillResponse.self, from: data)
             },
-            scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment)
+            ask: { handle, question, op in
+                guard admission?.isAdmitted() == true else { return nil }
+                guard let state, let url = URL(string: state.baseURL + "/v1/librarian") else { return nil }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                applyRecoveryHeaders(to: &request, environment: environment)
+                let payload: [String: Any] = [
+                    "id": op,
+                    "handle": handle,
+                    "question": question,
+                    "op": op,
+                    "provider": environment["REMOTE_CODE_AGENT_PROVIDER"] ?? "unknown",
+                    "thread_id": environment["RC_TOKEN_SAVER_THREAD_ID"] ?? "",
+                ]
+                request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+                guard let (data, response) = try? await session.data(for: request),
+                      (response as? HTTPURLResponse)?.statusCode == 200,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    return nil
+                }
+                return (obj["envelope"] as? String) ?? (obj["text"] as? String)
+            },
+            scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment),
+            tokenSaverAdmitted: admission?.isAdmitted() == true
         )
         while let line = readLine(strippingNewline: true) {
             if let response = await server.handle(line) {

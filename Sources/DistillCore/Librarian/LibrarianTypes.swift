@@ -1,5 +1,26 @@
 import Foundation
 
+public struct LibrarianHTTPBody: Codable, Sendable {
+    public var id: String
+    public var input: String?
+    public var question: String?
+    public var handle: String?
+    public var provider: String?
+    public var threadID: String?
+    public var command: String?
+    public var op: String?
+    public var pattern: String?
+    public var startLine: Int?
+    public var endLine: Int?
+
+    public enum CodingKeys: String, CodingKey {
+        case id, input, question, handle, provider, command, op, pattern
+        case threadID = "thread_id"
+        case startLine = "start_line"
+        case endLine = "end_line"
+    }
+}
+
 public struct LibrarianRequest: Sendable {
     public var id: String
     public var input: String

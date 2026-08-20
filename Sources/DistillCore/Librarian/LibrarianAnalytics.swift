@@ -83,34 +83,18 @@ public enum LibrarianAnalytics {
             && deliveredText != nil
             && deliveredText != original
         let saved = replaced ? max(inputTokens - outputTokens, 0) : 0
-        let record: DistillSavingsRecord?
-        if shouldPersist(status: status) {
-            record = DistillSavingsRecord(
-                provider: provider.isEmpty ? "unknown" : provider,
-                mode: TokenSaverEngineLabel.mode(base: "librarian.\(op)", stage: stage),
-                inputTokens: inputTokens,
-                outputTokens: outputTokens,
-                savedTokens: saved,
-                cacheState: "tool_output_oneshot",
-                routeStage: stage,
-                attributability: "not_prompt_bound",
-                delivered: replaced && saved > 0,
-                threadID: threadID
-            )
-        } else {
-            record = DistillSavingsRecord(
-                provider: provider.isEmpty ? "unknown" : provider,
-                mode: TokenSaverEngineLabel.mode(base: "librarian.\(op)", stage: stage),
-                inputTokens: inputTokens,
-                outputTokens: outputTokens,
-                savedTokens: 0,
-                cacheState: "tool_output_oneshot",
-                routeStage: stage,
-                attributability: "not_prompt_bound",
-                delivered: false,
-                threadID: threadID
-            )
-        }
+        let record = DistillSavingsRecord(
+            provider: provider.isEmpty ? "unknown" : provider,
+            mode: TokenSaverEngineLabel.mode(base: "librarian.\(op)", stage: stage),
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            savedTokens: saved,
+            cacheState: "tool_output_oneshot",
+            routeStage: stage,
+            attributability: "not_prompt_bound",
+            delivered: replaced && saved > 0,
+            threadID: threadID
+        )
         return LibrarianAnalyticsEvent(
             op: op,
             status: status,
@@ -122,15 +106,6 @@ public enum LibrarianAnalytics {
             modelID: modelID,
             record: record
         )
-    }
-
-    /// Persist-shaped row always exists so skips are visible as kept-originals,
-    /// but saved tokens stay zero unless bytes were actually replaced.
-    private static func shouldPersist(status: LibrarianStatus) -> Bool {
-        switch status {
-        case .ok, .lowConfidence: return true
-        case .unavailable, .refused, .skippedNetNegative: return true
-        }
     }
 }
 

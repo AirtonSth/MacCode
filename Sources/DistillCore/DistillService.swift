@@ -984,6 +984,12 @@ public final class DistillHTTPServer: @unchecked Sendable {
             send(status: 200, body: snapshot, connection: connection)
         case ("GET", "/v1/stats"):
             handleStats(connection: connection)
+        case ("POST", "/v1/librarian"):
+            guard distillAdmission() else {
+                denyDistill(connection: connection)
+                return
+            }
+            await handleLibrarian(request: request, connection: connection)
         case ("POST", "/v1/distill"),
              ("POST", "/v1/compress"),
              ("POST", "/v1/rank"),
@@ -1008,6 +1014,67 @@ public final class DistillHTTPServer: @unchecked Sendable {
             handleRetrieve(request: request, connection: connection)
         default:
             send(status: 404, body: ErrorBody(error: "not_found", message: request.path), connection: connection)
+        }
+    }
+
+    private func handleLibrarian(request: HTTPRequest, connection: NWConnection) async {
+        guard distillAdmission() else {
+            denyDistill(connection: connection)
+            return
+        }
+        do {
+            let body = try decoder.decode(LibrarianHTTPBody.self, from: request.body)
+            let store = LibrarianHandleStore()
+            var text = body.input ?? ""
+            if let handle = body.handle, !handle.isEmpty {
+                if text.isEmpty, let data = try? reversibleStore?.retrieveOriginal(handle),
+                   let original = String(data: data, encoding: .utf8) {
+                    text = original
+                }
+                if !text.isEmpty {
+                    _ = store.put(text, handle: handle)
+                }
+            } else if !text.isEmpty {
+                _ = store.put(text)
+            }
+            let dispatcher = LibrarianDispatcher(store: store)
+            var req = LibrarianRequest(
+                id: body.op ?? body.id,
+                input: text,
+                question: body.question,
+                handle: body.handle,
+                provider: body.provider ?? "unknown",
+                threadID: body.threadID ?? "",
+                admitted: true
+            )
+            req.command = body.command
+            req.pattern = body.pattern
+            req.startLine = body.startLine
+            req.endLine = body.endLine
+            let result = await dispatcher.dispatch(req)
+            if let record = result.analytics.record, let onSavingsRecord {
+                await onSavingsRecord(record)
+            }
+            struct LibrarianHTTPResponse: Codable {
+                let status: String
+                let text: String
+                let envelope: String?
+                let saved_tokens: Int
+                let mode: String
+            }
+            send(
+                status: 200,
+                body: LibrarianHTTPResponse(
+                    status: result.status.rawValue,
+                    text: result.text,
+                    envelope: result.envelope?.jsonString(),
+                    saved_tokens: result.analytics.savedTokens,
+                    mode: result.analytics.mode
+                ),
+                connection: connection
+            )
+        } catch {
+            send(status: 400, body: ErrorBody(error: "invalid_librarian_request", message: "\(error)"), connection: connection)
         }
     }
 

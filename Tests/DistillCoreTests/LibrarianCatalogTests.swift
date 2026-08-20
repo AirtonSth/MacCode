@@ -9,6 +9,23 @@ final class LibrarianCatalogTests: XCTestCase {
         XCTAssertEqual(LibrarianCatalog.forbiddenIDs.count, 19)
     }
 
+    func test_persistCallback_emitsLibrarianModeRow() async {
+        var persisted: [DistillSavingsRecord] = []
+        let dispatcher = LibrarianDispatcher(persist: { persisted.append($0) })
+        let original = String(repeating: "ERROR payment failed\n", count: 40)
+        let handle = dispatcher.store.put(original)
+        _ = await dispatcher.dispatch(LibrarianRequest(
+            id: "log_crusher",
+            input: original,
+            handle: handle,
+            provider: "grok"
+        ))
+        XCTAssertEqual(persisted.count, 1)
+        XCTAssertTrue(persisted[0].mode.contains("librarian.log_crusher"))
+        XCTAssertGreaterThan(persisted[0].savedTokens, 0)
+        XCTAssertTrue(persisted[0].delivered)
+    }
+
     func test_retrieve_roundTrip_recordsMeasuredSavingsOnlyWhenReplaced() async {
         let dispatcher = LibrarianDispatcher()
         let original = String(repeating: "ERROR payment failed\n", count: 40)
