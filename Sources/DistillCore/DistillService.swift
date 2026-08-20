@@ -259,6 +259,11 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
     /// Per-call wall-clock deadline for a single distill generation. On exceed, the
     /// runtime fails open to the deterministic fallback so the agent never stalls.
     public let mlxCallDeadlineMS: Int
+    /// OpenAI-compatible generate override (oMLX). Empty = local MLX.
+    public let generateBaseURL: String
+    public let generateModel: String
+    public let generateToken: String
+    public let saveTrainingPrompts: Bool
 
     public init(
         host: String = "127.0.0.1",
@@ -272,7 +277,11 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         maxQueueDepth: Int = 64,
         maxQueueWaitMilliseconds: Int = 0,
         idleTimeoutMS: Int = 300_000,
-        mlxCallDeadlineMS: Int = 20_000
+        mlxCallDeadlineMS: Int = 20_000,
+        generateBaseURL: String = "",
+        generateModel: String = "",
+        generateToken: String = "",
+        saveTrainingPrompts: Bool = false
     ) throws {
         guard host == "127.0.0.1" || host == "localhost" else {
             throw DistillServiceError.unsupportedHost(host)
@@ -302,6 +311,10 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         self.maxQueueWaitMilliseconds = max(0, maxQueueWaitMilliseconds)
         self.idleTimeoutMS = max(1_000, idleTimeoutMS)
         self.mlxCallDeadlineMS = max(1_000, mlxCallDeadlineMS)
+        self.generateBaseURL = generateBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.generateModel = generateModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.generateToken = generateToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.saveTrainingPrompts = saveTrainingPrompts
     }
 
     public static func parse(arguments: [String]) throws -> DistillServiceConfiguration {
@@ -344,7 +357,11 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
             maxQueueDepth: try intValue("max-queue-depth", default: 64),
             maxQueueWaitMilliseconds: try intValue("max-queue-wait-ms", default: 0),
             idleTimeoutMS: try intValue("idle-timeout-ms", default: 300_000),
-            mlxCallDeadlineMS: try intValue("mlx-call-deadline-ms", default: 20_000)
+            mlxCallDeadlineMS: try intValue("mlx-call-deadline-ms", default: 20_000),
+            generateBaseURL: values["generate-base-url"] ?? "",
+            generateModel: values["generate-model"] ?? "",
+            generateToken: values["generate-token"] ?? "",
+            saveTrainingPrompts: ["1", "true", "yes"].contains((values["save-training-prompts"] ?? "").lowercased())
         )
     }
 }
@@ -711,6 +728,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let distillAdmission: DistillAdmission
     private let onSavingsRecord: SavingsRecordHandler?
     private let onAuditEvent: AuditEventHandler?
+    private let librarianGenerate: (any LibrarianGenerating)?
     private let reversibleStore: ReversibleStoring?
     private let scopedRecoveryStore: TokenSaverScopedRecoveryStoring?
     private let statsProvider: DistillStatsProviding?
@@ -734,6 +752,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         onSuccess: SuccessHandler? = nil,
         onSavingsRecord: SavingsRecordHandler? = nil,
         onAuditEvent: AuditEventHandler? = nil,
+        librarianGenerate: (any LibrarianGenerating)? = nil,
         distillAdmission: @escaping DistillAdmission = { true }
     ) {
         self.configuration = configuration
@@ -749,6 +768,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         self.onSuccess = onSuccess
         self.onSavingsRecord = onSavingsRecord
         self.onAuditEvent = onAuditEvent
+        self.librarianGenerate = librarianGenerate
     }
 
     /// Flip readiness on once the runtime is warm. Until then /readyz returns 503
@@ -984,6 +1004,12 @@ public final class DistillHTTPServer: @unchecked Sendable {
             send(status: 200, body: snapshot, connection: connection)
         case ("GET", "/v1/stats"):
             handleStats(connection: connection)
+        case ("POST", "/v1/librarian"):
+            guard distillAdmission() else {
+                denyDistill(connection: connection)
+                return
+            }
+            await handleLibrarian(request: request, connection: connection)
         case ("POST", "/v1/distill"),
              ("POST", "/v1/compress"),
              ("POST", "/v1/rank"),
@@ -1002,12 +1028,81 @@ public final class DistillHTTPServer: @unchecked Sendable {
             }
         case (_, "/v1/distill"), (_, "/v1/compress"):
             send(status: 405, body: ErrorBody(error: "method_not_allowed", message: "use POST"), connection: connection)
+        case (_, "/v1/librarian"):
+            send(status: 405, body: ErrorBody(error: "method_not_allowed", message: "use POST"), connection: connection)
         case (_, "/v1/rank"), (_, "/v1/embed"):
             send(status: 405, body: ErrorBody(error: "method_not_allowed", message: "use POST"), connection: connection)
         case ("GET", let path) where path.hasPrefix("/v1/retrieve/"):
             handleRetrieve(request: request, connection: connection)
         default:
             send(status: 404, body: ErrorBody(error: "not_found", message: request.path), connection: connection)
+        }
+    }
+
+    private func handleLibrarian(request: HTTPRequest, connection: NWConnection) async {
+        do {
+            let body = try decoder.decode(LibrarianHTTPBody.self, from: request.body)
+            let store = LibrarianHandleStore()
+            var text = body.input ?? ""
+            if let handle = body.handle, !handle.isEmpty, text.isEmpty {
+                if let context = recoveryContext(headers: request.headers, requiresOperationID: false),
+                   let data = try? scopedRecoveryStore?.retrieveOriginal(capability: handle, context: context),
+                   let original = String(data: data, encoding: .utf8) {
+                    text = original
+                } else if let data = try? reversibleStore?.retrieveOriginal(handle),
+                          let original = String(data: data, encoding: .utf8) {
+                    text = original
+                }
+            }
+            if let handle = body.handle, !handle.isEmpty, !text.isEmpty {
+                _ = store.put(text, handle: handle)
+            } else if !text.isEmpty {
+                _ = store.put(text)
+            }
+            let dispatcher = LibrarianDispatcher(
+                store: store,
+                generate: librarianGenerate
+            )
+            let op = (body.op?.isEmpty == false ? body.op : nil) ?? body.id
+            var req = LibrarianRequest(
+                id: op,
+                input: text,
+                question: body.question,
+                handle: body.handle,
+                provider: body.provider ?? "unknown",
+                threadID: body.threadID ?? "",
+                admitted: true,
+                retrieveAvailable: reversibleStore != nil || scopedRecoveryStore != nil,
+                graphifyEnabled: ProcessInfo.processInfo.environment["RC_GRAPHIFY_ENABLED"] == "1"
+            )
+            req.command = body.command
+            req.pattern = body.pattern
+            req.startLine = body.startLine
+            req.endLine = body.endLine
+            let result = await dispatcher.dispatch(req)
+            if let record = result.analytics.record, let onSavingsRecord {
+                await onSavingsRecord(record)
+            }
+            struct LibrarianHTTPResponse: Codable {
+                let status: String
+                let text: String
+                let envelope: String?
+                let saved_tokens: Int
+                let mode: String
+            }
+            send(
+                status: 200,
+                body: LibrarianHTTPResponse(
+                    status: result.status.rawValue,
+                    text: result.text,
+                    envelope: result.envelope?.jsonString(),
+                    saved_tokens: result.analytics.savedTokens,
+                    mode: result.analytics.mode
+                ),
+                connection: connection
+            )
+        } catch {
+            send(status: 400, body: ErrorBody(error: "invalid_librarian_request", message: "\(error)"), connection: connection)
         }
     }
 

@@ -31,7 +31,7 @@ public enum TokenSaverApprovedModels {
     /// checkpoint on its own (it threw `keyNotFound`/`mismatchedSize` at load); `MLXDistillRuntime`
     /// installs the patched `RCGemma4ModelOverride` (DistillCore) before loading, which IS verified
     /// to load + generate (see `DistillE4BModelLoadTests` / `DistillE4BRawGenerationProbe`). The
-    /// 16 GB floor keeps it off machines that cannot hold it; those fall back to `distill17B`.
+    /// 16 GiB machines stay on `distill17B`; only hosts with more than 16 GiB default to E4B.
     public static let distillE4B = TokenSaverApprovedModel(
         id: "samuelfaj/distill-E4B-it-4-bit-MLX",
         url: "https://huggingface.co/samuelfaj/distill-E4B-it-4-bit-MLX",
@@ -40,9 +40,7 @@ public enum TokenSaverApprovedModels {
     )
 
     /// Only models the current runtime can ACTUALLY load belong here. `selected()` and
-    /// `approved()` both derive from this list. `selected()` picks the highest-floor model the
-    /// machine can hold, so a ≥16 GB machine gets the E4B model and smaller machines fall back to
-    /// the qwen3 1.7B model — both verified to load + generate.
+    /// `approved()` both derive from this list. RAM default: ≤16 GiB → 1.7B, >16 GiB → E4B.
     public static let all: [TokenSaverApprovedModel] = [
         distill17B,
         distillE4B,
@@ -52,13 +50,75 @@ public enum TokenSaverApprovedModels {
     public static let defaultModel = selected()
 
     public static func selected(totalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> TokenSaverApprovedModel {
-        all
-            .filter { totalMemoryBytes >= $0.minimumMemoryBytes }
-            .max { $0.minimumMemoryBytes < $1.minimumMemoryBytes }
-            ?? fallbackModel
+        if totalMemoryBytes > distillE4B.minimumMemoryBytes {
+            return distillE4B
+        }
+        return distill17B
     }
 
     public static func approved(id: String, url: String, runtime: String) -> TokenSaverApprovedModel? {
         all.first { $0.id == id && $0.url == url && $0.runtime == runtime }
+    }
+
+    /// Local model implied by a Settings source. API is not a local model.
+    public static func resolveLocal(
+        source: TokenSaverModelSource,
+        totalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory
+    ) -> TokenSaverApprovedModel {
+        switch source {
+        case .automatic:
+            return selected(totalMemoryBytes: totalMemoryBytes)
+        case .distill17b:
+            return distill17B
+        case .distillE4B:
+            return distillE4B
+        case .openaiCompat:
+            return selected(totalMemoryBytes: totalMemoryBytes)
+        }
+    }
+}
+
+/// User-visible Token Saver generate source. `automatic` follows RAM.
+public enum TokenSaverModelSource: String, Codable, Sendable, Equatable, CaseIterable {
+    case automatic
+    case distill17b
+    case distillE4B
+    case openaiCompat
+}
+
+/// Where Distill generate should run after resolving Settings + RAM.
+public enum TokenSaverGenerateTarget: Sendable, Equatable {
+    case local(TokenSaverApprovedModel)
+    case openaiCompatible(baseURL: URL, model: String, token: String)
+
+    public static func resolve(
+        source: TokenSaverModelSource,
+        apiBaseURL: String,
+        apiModel: String,
+        apiToken: String,
+        totalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory
+    ) -> TokenSaverGenerateTarget {
+        if source == .openaiCompat,
+           let url = Self.parseAPIBaseURL(apiBaseURL) {
+            let model = apiModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .openaiCompatible(
+                baseURL: url,
+                model: model.isEmpty ? TokenSaverApprovedModels.distill17B.id : model,
+                token: apiToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        return .local(TokenSaverApprovedModels.resolveLocal(source: source, totalMemoryBytes: totalMemoryBytes))
+    }
+
+    public static func parseAPIBaseURL(_ raw: String) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil else {
+            return nil
+        }
+        return url
     }
 }

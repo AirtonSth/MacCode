@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import CoreImage
 import CoreModel
+import DistillCore
 import Persistence
 import AgentRuntime
 import AppLifecycleSupport
@@ -33,6 +34,11 @@ public struct AppSettingsKeys {
         "insomniaAllowSystemSleepWhenDisplayClosed",
         "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
         "tokenSaverEnabled",
+        "tokenSaverModelSource",
+        "tokenSaverAPIBaseURL",
+        "tokenSaverAPIModel",
+        "tokenSaverAPIToken",
+        "tokenSaverSaveTrainingPrompts",
         "terminalFontSize",
         "sessionLearnEnabled",
         "historyCompactionEnabled",
@@ -262,6 +268,14 @@ public enum DistillInstallStatus: Equatable {
     }
 }
 
+/// Settings-only status for the OpenAI-compatible Distill API test button.
+public enum TokenSaverAPIProbeStatus: Equatable {
+    case idle
+    case testing
+    case ok(String)
+    case failed(String)
+}
+
 @MainActor
 public final class SettingsViewModel: ObservableObject {
     public let settingsRepo: SettingsRepository
@@ -296,6 +310,12 @@ public final class SettingsViewModel: ObservableObject {
     /// visible instead of NSLog-only (mirrors serverStartupFailures). Refreshed from
     /// AppContext on every reload (Settings open / notifications) and after a retry.
     @Published public var distillInstallStatus: DistillInstallStatus = .inactive
+    @Published public var tokenSaverAPIProbeStatus: TokenSaverAPIProbeStatus = .idle
+    /// Injected so Settings tests can prove success/failure without a live server.
+    public var tokenSaverAPIProbe: @Sendable (String, String, String) async -> TokenSaverOpenAICompatibleProbe.Outcome = {
+        baseURL, model, token in
+        await TokenSaverOpenAICompatibleProbe.run(baseURL: baseURL, model: model, token: token)
+    }
     @Published public var appSettings: AppSettings = AppSettings()
     /// True while this VM is mid-post for rc2RemoteAccessSettingChanged so the
     /// observer can skip the redundant self-triggered reload (L91 perf fix).
@@ -695,6 +715,97 @@ public final class SettingsViewModel: ObservableObject {
         appSettings = settingsStore.reload()
         appSettings.tokenSaverEnabled = outcome.isEnabled
         refreshDistillInstallStatus()
+    }
+
+    public func setTokenSaverModelSource(_ source: TokenSaverModelSource) {
+        appSettings.tokenSaverModelSource = source
+        settingsStore.update { $0.tokenSaverModelSource = source }
+        resetTokenSaverAPIProbe()
+        context.restartTokenSaverDistillIfRunning()
+    }
+
+    public func setTokenSaverAPIBaseURL(_ value: String) {
+        appSettings.tokenSaverAPIBaseURL = value
+        settingsStore.update { $0.tokenSaverAPIBaseURL = value }
+        resetTokenSaverAPIProbe()
+        scheduleTokenSaverDistillRestart()
+    }
+
+    public func setTokenSaverAPIModel(_ value: String) {
+        appSettings.tokenSaverAPIModel = value
+        settingsStore.update { $0.tokenSaverAPIModel = value }
+        resetTokenSaverAPIProbe()
+        scheduleTokenSaverDistillRestart()
+    }
+
+    public func setTokenSaverAPIToken(_ value: String) {
+        appSettings.tokenSaverAPIToken = value
+        settingsStore.update { $0.tokenSaverAPIToken = value }
+        resetTokenSaverAPIProbe()
+        scheduleTokenSaverDistillRestart()
+    }
+
+    public var canTestTokenSaverAPI: Bool {
+        appSettings.tokenSaverEnabled
+            && appSettings.tokenSaverModelSource == .openaiCompat
+            && tokenSaverAPIProbeStatus != .testing
+            && TokenSaverGenerateTarget.parseAPIBaseURL(appSettings.tokenSaverAPIBaseURL) != nil
+    }
+
+    public func testTokenSaverAPI() {
+        guard appSettings.tokenSaverEnabled, appSettings.tokenSaverModelSource == .openaiCompat else { return }
+        guard tokenSaverAPIProbeStatus != .testing else { return }
+        guard TokenSaverGenerateTarget.parseAPIBaseURL(appSettings.tokenSaverAPIBaseURL) != nil else {
+            tokenSaverAPIProbeStatus = .failed("Enter a URL like http://127.0.0.1:8000/v1")
+            return
+        }
+        tokenSaverAPIProbeStatus = .testing
+        let base = appSettings.tokenSaverAPIBaseURL
+        let model = appSettings.tokenSaverAPIModel
+        let token = appSettings.tokenSaverAPIToken
+        let probe = tokenSaverAPIProbe
+        tokenSaverAPIProbeTask?.cancel()
+        tokenSaverAPIProbeTask = Task { @MainActor in
+            let outcome = await probe(base, model, token)
+            guard !Task.isCancelled else { return }
+            switch outcome {
+            case .ok:
+                tokenSaverAPIProbeStatus = .ok(outcome.message)
+            case .failed(let reason):
+                tokenSaverAPIProbeStatus = .failed(reason)
+            }
+        }
+    }
+
+    public func setTokenSaverSaveTrainingPrompts(_ on: Bool) {
+        appSettings.tokenSaverSaveTrainingPrompts = on
+        settingsStore.update { $0.tokenSaverSaveTrainingPrompts = on }
+        context.restartTokenSaverDistillIfRunning()
+    }
+
+    public func revealTokenSaverTrainingFolder() {
+        let root = TokenSaverTrainingDatasetWriter.defaultRoot(appSupportDirectory: context.appSupportDirectory)
+        NSWorkspace.shared.activateFileViewerSelecting([root])
+    }
+
+    private var tokenSaverRestartTask: Task<Void, Never>?
+    private var tokenSaverAPIProbeTask: Task<Void, Never>?
+
+    private func resetTokenSaverAPIProbe() {
+        tokenSaverAPIProbeTask?.cancel()
+        tokenSaverAPIProbeTask = nil
+        if tokenSaverAPIProbeStatus != .idle {
+            tokenSaverAPIProbeStatus = .idle
+        }
+    }
+
+    private func scheduleTokenSaverDistillRestart() {
+        tokenSaverRestartTask?.cancel()
+        tokenSaverRestartTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            context.restartTokenSaverDistillIfRunning()
+        }
     }
 
     /// Mirrors AppContext's last managed-distill reconcile into a published status
@@ -1719,6 +1830,97 @@ public struct SettingsView: View {
             Text("Compresses large tool output using the local MLX model so fewer tokens reach the remote provider. Settings and the sidebar share the same subscription, model-readiness, and cleanup lifecycle.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
+            settingRow("Distill model") {
+                Picker("", selection: Binding(
+                    get: { vm.appSettings.tokenSaverModelSource },
+                    set: { vm.setTokenSaverModelSource($0) }
+                )) {
+                    Text("Automatic (RAM)").tag(TokenSaverModelSource.automatic)
+                    Text("Distill 1.7B").tag(TokenSaverModelSource.distill17b)
+                    Text("Distill E4B").tag(TokenSaverModelSource.distillE4B)
+                    Text("OpenAI-compatible API").tag(TokenSaverModelSource.openaiCompat)
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(maxWidth: 260)
+                .disabled(!vm.appSettings.tokenSaverEnabled)
+                .accessibilityIdentifier("settings.tokenSaver.modelSource.picker")
+            }
+            Text("Default: 1.7B on 16 GiB or less, E4B when RAM is greater than 16 GiB. Catalog generate and Distill both use this choice.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            if vm.appSettings.tokenSaverModelSource == .openaiCompat {
+                settingRow("API base URL") {
+                    TextField("http://127.0.0.1:8000/v1", text: Binding(
+                        get: { vm.appSettings.tokenSaverAPIBaseURL },
+                        set: { vm.setTokenSaverAPIBaseURL($0) }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 320)
+                    .disabled(!vm.appSettings.tokenSaverEnabled)
+                    .accessibilityIdentifier("settings.tokenSaver.apiBaseURL.field")
+                }
+                settingRow("API model") {
+                    TextField("model id", text: Binding(
+                        get: { vm.appSettings.tokenSaverAPIModel },
+                        set: { vm.setTokenSaverAPIModel($0) }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 320)
+                    .disabled(!vm.appSettings.tokenSaverEnabled)
+                    .accessibilityIdentifier("settings.tokenSaver.apiModel.field")
+                }
+                settingRow("API token") {
+                    SecureField("optional", text: Binding(
+                        get: { vm.appSettings.tokenSaverAPIToken },
+                        set: { vm.setTokenSaverAPIToken($0) }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 320)
+                    .disabled(!vm.appSettings.tokenSaverEnabled)
+                    .accessibilityIdentifier("settings.tokenSaver.apiToken.field")
+                }
+                settingRow("Connection") {
+                    Button {
+                        vm.testTokenSaverAPI()
+                    } label: {
+                        HStack(spacing: DS.Space.sm) {
+                            if case .testing = vm.tokenSaverAPIProbeStatus {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Testing…")
+                            } else {
+                                Text("Test API")
+                            }
+                        }
+                        .frame(minWidth: 108, minHeight: 22)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(!vm.canTestTokenSaverAPI)
+                    .accessibilityLabel(vm.tokenSaverAPIProbeStatus == .testing ? "Testing API" : "Test API")
+                    .accessibilityHint("Sends a short request to the OpenAI-compatible URL to confirm the local model answers.")
+                    .accessibilityIdentifier("settings.tokenSaver.testAPI.button")
+                }
+                tokenSaverAPIProbeStatusRow
+            }
+            settingRow("Save training datasets") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.tokenSaverSaveTrainingPrompts },
+                    set: { vm.setTokenSaverSaveTrainingPrompts($0) }
+                ))
+                .labelsHidden()
+                .disabled(!vm.appSettings.tokenSaverEnabled)
+                .accessibilityIdentifier("settings.tokenSaver.saveTrainingPrompts.toggle")
+            }
+            Text("When on, every local Distill generate (CLI, HTTP, MCP, catalog) writes ChatML JSONL under TokenSaver/training.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+            Button("Show training folder") {
+                vm.revealTokenSaverTrainingFolder()
+            }
+            .disabled(!vm.appSettings.tokenSaverEnabled)
+            .accessibilityIdentifier("settings.tokenSaver.showTrainingFolder.button")
             distillInstallStatusRow
         }
         .dsPanel(padding: DS.Space.lg)
@@ -1789,6 +1991,52 @@ public struct SettingsView: View {
         }
         .dsPanel(padding: DS.Space.lg)
         .accessibilityIdentifier("settings.section.bots")
+    }
+
+    @ViewBuilder
+    private var tokenSaverAPIProbeStatusRow: some View {
+        switch vm.tokenSaverAPIProbeStatus {
+        case .idle:
+            Text("Sends a one-token chat request. Nothing is saved to training.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("settings.tokenSaver.testAPI.idle")
+        case .testing:
+            Text("Waiting for the local API…")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("settings.tokenSaver.testAPI.testing")
+        case .ok(let message):
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundColor(DS.Palette.success)
+                    .accessibilityHidden(true)
+                Text(message)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("API test succeeded. \(message)")
+            .accessibilityIdentifier("settings.tokenSaver.testAPI.ok")
+        case .failed(let message):
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(DS.Palette.danger)
+                    .accessibilityHidden(true)
+                Text(message)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.danger)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("API test failed. \(message)")
+            .accessibilityIdentifier("settings.tokenSaver.testAPI.failed")
+        }
     }
 
     @ViewBuilder

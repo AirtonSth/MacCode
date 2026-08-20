@@ -2306,11 +2306,14 @@ public final class AppContext {
             ?? TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
                 .validateInstalledTokenSaverModels()
         let enabledSettings = settings(enabled: true)
+        let allowsExternal: Bool
+        if case .openaiCompatible = enabledSettings.tokenSaverGenerateTarget { allowsExternal = true } else { allowsExternal = false }
         let decision = TokenSaverDistillLaunchPlanner.decide(.init(
             hasPrivateAccount: session != nil,
             isSubscribed: session?.user.subscribed == true,
             tokenSaverEnabled: true,
-            modelValidation: validation
+            modelValidation: validation,
+            allowsExternalGenerate: allowsExternal
         ))
 
         switch decision {
@@ -2347,6 +2350,21 @@ public final class AppContext {
         )
         reconcileGraphifyHost(settings: enabledSettings)
         return .enabled
+    }
+
+    /// Restart the Distill sidecar so Settings model / API / training changes take effect.
+    public func restartTokenSaverDistillIfRunning() {
+        let settings = SettingsStore(db: db).load()
+        guard settings.tokenSaverEnabled, tokenSaverRuntimeAdmitted else { return }
+        let session = PrivateAccountSessionStore(repo: settingsRepo).load()
+        let validation = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+            .validateInstalledTokenSaverModels()
+        tokenSaverDistillServiceController.stop()
+        tokenSaverDistillServiceController.startIfEligible(
+            session: session,
+            settings: settings,
+            modelValidation: validation
+        )
     }
 
     /// A stored ON preference is only a request. Runtime admission also requires
@@ -2459,11 +2477,15 @@ public final class AppContext {
         let session = PrivateAccountSessionStore(repo: settingsRepo).load()
         let validation = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
             .validateInstalledTokenSaverModels()
+        let currentSettings = SettingsStore(db: db).load()
+        let allowsExternal: Bool
+        if case .openaiCompatible = currentSettings.tokenSaverGenerateTarget { allowsExternal = true } else { allowsExternal = false }
         let decision = TokenSaverDistillLaunchPlanner.decide(.init(
             hasPrivateAccount: session != nil,
             isSubscribed: session?.user.subscribed == true,
             tokenSaverEnabled: true,
-            modelValidation: validation
+            modelValidation: validation,
+            allowsExternalGenerate: allowsExternal
         ))
         switch decision {
         case .start:

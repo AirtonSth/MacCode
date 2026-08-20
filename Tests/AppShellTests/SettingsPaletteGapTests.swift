@@ -245,7 +245,7 @@ final class SettingsPaletteGapTests: XCTestCase {
             "insomniaEnabled", "insomniaAllowDisplaySleep",
             "insomniaAllowSystemSleepWhenDisplayClosed",
             "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
-            "tokenSaverEnabled", "terminalFontSize", "sessionLearnEnabled", "historyCompactionEnabled",
+            "tokenSaverEnabled", "tokenSaverModelSource", "tokenSaverAPIBaseURL", "tokenSaverAPIModel", "tokenSaverAPIToken", "tokenSaverSaveTrainingPrompts", "terminalFontSize", "sessionLearnEnabled", "historyCompactionEnabled",
             "graphifyEnabled", "graphifyBinaryPath", "graphifyAutoEnsure", "graphifyPinnedRoots",
             "graphifyWriteInRepo",
             "petEnabled", "petAnimationsEnabled", "petReadyCounterEnabled",

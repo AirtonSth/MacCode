@@ -41,6 +41,26 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var insomniaAllowSystemSleepWhenDisplayClosed: Bool
     public var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool
     public var tokenSaverEnabled: Bool
+    /// Distill generate source. `automatic` follows RAM (≤16 GiB → 1.7B, >16 GiB → E4B).
+    public var tokenSaverModelSource: TokenSaverModelSource
+    public var tokenSaverAPIBaseURL: String
+    public var tokenSaverAPIModel: String
+    public var tokenSaverAPIToken: String
+    /// When true, every local-LLM generate writes ChatML SFT/rejected JSONL.
+    public var tokenSaverSaveTrainingPrompts: Bool
+
+    public var tokenSaverLocalModel: TokenSaverApprovedModel {
+        TokenSaverApprovedModels.resolveLocal(source: tokenSaverModelSource)
+    }
+
+    public var tokenSaverGenerateTarget: TokenSaverGenerateTarget {
+        TokenSaverGenerateTarget.resolve(
+            source: tokenSaverModelSource,
+            apiBaseURL: tokenSaverAPIBaseURL,
+            apiModel: tokenSaverAPIModel,
+            apiToken: tokenSaverAPIToken
+        )
+    }
     /// Global kill switch for automatic scheduled-task occurrences. When false,
     /// due ticks do not claim or run tasks (travel / temporary pause). Per-task
     /// Pause still applies independently. Default true.
@@ -130,6 +150,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 insomniaAllowSystemSleepWhenDisplayClosed: Bool = false,
                 insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true,
                 tokenSaverEnabled: Bool = false,
+                tokenSaverModelSource: TokenSaverModelSource = .automatic,
+                tokenSaverAPIBaseURL: String = "",
+                tokenSaverAPIModel: String = "",
+                tokenSaverAPIToken: String = "",
+                tokenSaverSaveTrainingPrompts: Bool = false,
                 scheduledTasksActive: Bool = true,
                 terminalFontSize: Double = 0,
                 sessionLearnEnabled: Bool = false,
@@ -161,6 +186,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.insomniaAllowSystemSleepWhenDisplayClosed = insomniaAllowSystemSleepWhenDisplayClosed
         self.insomniaAllowScreenSaverAfter45MinutesOfInactivity = insomniaAllowScreenSaverAfter45MinutesOfInactivity
         self.tokenSaverEnabled = tokenSaverEnabled
+        self.tokenSaverModelSource = tokenSaverModelSource
+        self.tokenSaverAPIBaseURL = tokenSaverAPIBaseURL
+        self.tokenSaverAPIModel = tokenSaverAPIModel
+        self.tokenSaverAPIToken = tokenSaverAPIToken
+        self.tokenSaverSaveTrainingPrompts = tokenSaverSaveTrainingPrompts
         self.scheduledTasksActive = scheduledTasksActive
         self.terminalFontSize = terminalFontSize
         self.sessionLearnEnabled = sessionLearnEnabled
@@ -195,6 +225,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case insomniaAllowSystemSleepWhenDisplayClosed
         case insomniaAllowScreenSaverAfter45MinutesOfInactivity
         case tokenSaverEnabled
+        case tokenSaverModelSource
+        case tokenSaverAPIBaseURL
+        case tokenSaverAPIModel
+        case tokenSaverAPIToken
+        case tokenSaverSaveTrainingPrompts
         case scheduledTasksActive
         case terminalFontSize
         case sessionLearnEnabled
@@ -230,6 +265,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
         insomniaAllowSystemSleepWhenDisplayClosed = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowSystemSleepWhenDisplayClosed) ?? false
         insomniaAllowScreenSaverAfter45MinutesOfInactivity = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowScreenSaverAfter45MinutesOfInactivity) ?? true
         tokenSaverEnabled = try c.decodeIfPresent(Bool.self, forKey: .tokenSaverEnabled) ?? false
+        tokenSaverModelSource = try c.decodeIfPresent(TokenSaverModelSource.self, forKey: .tokenSaverModelSource) ?? .automatic
+        tokenSaverAPIBaseURL = try c.decodeIfPresent(String.self, forKey: .tokenSaverAPIBaseURL) ?? ""
+        tokenSaverAPIModel = try c.decodeIfPresent(String.self, forKey: .tokenSaverAPIModel) ?? ""
+        tokenSaverAPIToken = try c.decodeIfPresent(String.self, forKey: .tokenSaverAPIToken) ?? ""
+        tokenSaverSaveTrainingPrompts = try c.decodeIfPresent(Bool.self, forKey: .tokenSaverSaveTrainingPrompts) ?? false
         scheduledTasksActive = try c.decodeIfPresent(Bool.self, forKey: .scheduledTasksActive) ?? true
         terminalFontSize = try c.decodeIfPresent(Double.self, forKey: .terminalFontSize) ?? 0
         sessionLearnEnabled = try c.decodeIfPresent(Bool.self, forKey: .sessionLearnEnabled) ?? false

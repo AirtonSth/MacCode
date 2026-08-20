@@ -613,6 +613,10 @@ public protocol DistillRuntime: Sendable {
     /// the first real request never blocks on it on a live agent turn. Default no-op.
     /// Throws if the warmup inference fails, so the caller can mark the service degraded.
     func warmup() async throws
+
+    /// Direct chat generate used by the librarian catalog. Skips crushers/BERT.
+    /// Default is nil (no LLM). Wrappers that hold a real model must forward this.
+    func rawGenerate(system: String, user: String, maxTokens: Int) async -> String?
 }
 
 public extension DistillRuntime {
@@ -624,6 +628,8 @@ public extension DistillRuntime {
     func reclaimIdleMemory() {}
     /// Runtimes with no cold-start cost need do nothing.
     func warmup() async throws {}
+    /// Default: no raw generate (deterministic fallback, missing weights).
+    func rawGenerate(system: String, user: String, maxTokens: Int) async -> String? { nil }
 }
 
 /// Maps a distill mode to its Token Saver routing lane (for route telemetry).
@@ -1497,6 +1503,37 @@ public struct MLXDistillRuntime: DistillRuntime {
 
         let raw = try await mlxGeneratedOutput(request)
         return DistillStageResult(output: raw, stage: .llmMLX)
+    }
+
+    public func rawGenerate(system: String, user: String, maxTokens: Int) async -> String? {
+        let tokens = max(32, min(512, maxTokens))
+        let cacheKey = ChatSessionCacheKey(instructions: system, maxTokens: tokens)
+        let parameters = GenerateParameters(
+            maxTokens: tokens,
+            temperature: 0,
+            topP: 0.9,
+            topK: 20
+        )
+        let session = await sessionStore.session(for: cacheKey) {
+            ChatSession(
+                modelContainer,
+                instructions: system,
+                generateParameters: parameters,
+                additionalContext: ["enable_thinking": false]
+            )
+        }
+        await session.clear()
+        await lane.acquire()
+        let raw: String
+        do {
+            raw = try await session.respond(to: user)
+        } catch {
+            await lane.release()
+            return nil
+        }
+        await lane.release()
+        let cleaned = Self.cleanOutput(raw)
+        return cleaned.isEmpty ? nil : cleaned
     }
 
     private func mlxGeneratedOutput(_ request: DistillRequest) async throws -> String {

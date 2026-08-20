@@ -4,12 +4,11 @@ import XCTest
 final class TokenSaverApprovedModelsTests: XCTestCase {
     func test_selectsHighestFloorModelTheMachineCanHold() {
         let gb: UInt64 = 1_024 * 1_024 * 1_024
-        // E4B (gemma4) needs 16 GB; below that the selector must fall back to the qwen3 1.7B
-        // model so Token Saver never picks a model the machine cannot hold. At/above 16 GB it
-        // must prefer E4B — the higher-quality distill model — over the fallback.
+        // RAM default: ≤16 GiB → 1.7B, >16 GiB → E4B.
         XCTAssertEqual(TokenSaverApprovedModels.selected(totalMemoryBytes: 8 * gb), TokenSaverApprovedModels.distill17B)
         XCTAssertEqual(TokenSaverApprovedModels.selected(totalMemoryBytes: 15 * gb), TokenSaverApprovedModels.distill17B)
-        XCTAssertEqual(TokenSaverApprovedModels.selected(totalMemoryBytes: 16 * gb), TokenSaverApprovedModels.distillE4B)
+        XCTAssertEqual(TokenSaverApprovedModels.selected(totalMemoryBytes: 16 * gb), TokenSaverApprovedModels.distill17B)
+        XCTAssertEqual(TokenSaverApprovedModels.selected(totalMemoryBytes: 16 * gb + 1), TokenSaverApprovedModels.distillE4B)
         XCTAssertEqual(TokenSaverApprovedModels.selected(totalMemoryBytes: 128 * gb), TokenSaverApprovedModels.distillE4B)
     }
 
@@ -41,5 +40,32 @@ final class TokenSaverApprovedModelsTests: XCTestCase {
             url: "https://example.invalid/model",
             runtime: TokenSaverApprovedModels.distill17B.runtime
         ))
+    }
+
+    func test_resolveLocalHonorsExplicitSource() {
+        let gb: UInt64 = 1_024 * 1_024 * 1_024
+        XCTAssertEqual(
+            TokenSaverApprovedModels.resolveLocal(source: .distill17b, totalMemoryBytes: 32 * gb),
+            TokenSaverApprovedModels.distill17B
+        )
+        XCTAssertEqual(
+            TokenSaverApprovedModels.resolveLocal(source: .distillE4B, totalMemoryBytes: 8 * gb),
+            TokenSaverApprovedModels.distillE4B
+        )
+    }
+
+    func test_generateTargetParsesOpenAICompatURL() {
+        let target = TokenSaverGenerateTarget.resolve(
+            source: .openaiCompat,
+            apiBaseURL: "http://127.0.0.1:8000/v1",
+            apiModel: "samuelfaj--distill-1.7B-4bit-MLX",
+            apiToken: ""
+        )
+        guard case let .openaiCompatible(url, model, _) = target else {
+            return XCTFail("expected openai compatible target")
+        }
+        XCTAssertEqual(url.absoluteString, "http://127.0.0.1:8000/v1")
+        XCTAssertEqual(model, "samuelfaj--distill-1.7B-4bit-MLX")
+        XCTAssertNil(TokenSaverGenerateTarget.parseAPIBaseURL("not a url"))
     }
 }

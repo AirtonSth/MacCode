@@ -36,7 +36,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
     func test_toolsListExposesOnlyNonRecoveryStatsUntilScopedCapabilitiesExist() async throws {
         let obj = try parse(await server().handle(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
         let tools = try XCTUnwrap((obj["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats"])
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_ask"])
     }
 
     func test_unscopedRetrieveToolIsRejectedEvenWhenLegacyClosureCanReturnOriginal() async throws {
@@ -49,7 +49,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let srv = server(["rcv1.capability": "exact original"], scoped: true)
         let listed = try parse(await srv.handle(#"{"jsonrpc":"2.0","id":20,"method":"tools/list"}"#))
         let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_retrieve", "rc_compress"])
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_ask", "rc_retrieve", "rc_compress"])
 
         let called = try parse(await srv.handle(
             #"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"rc_retrieve","arguments":{"handle":"rcv1.capability"}}}"#
@@ -72,7 +72,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         XCTAssertNotNil(obj["error"], "only retrieve/search/stats/net-positive compress tools are exposed")
     }
 
-    func test_unscopedSearchToolIsRejected() async throws {
+    func test_unscopedSearchToolReturnsHits() async throws {
         let index = CCRSearchIndex(records: [
             CCRSearchRecord(handle: "h1", text: "INFO ok"),
             CCRSearchRecord(handle: "h2", text: "ERROR payment failed at Sources/Billing.swift:12")
@@ -80,7 +80,34 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let srv = ManagedRetrieveMCP(retrieve: { _ in nil }, search: { query, topK in index.search(query, topK: topK) })
         let obj = try parse(await srv.handle(
             #"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"rc_search","arguments":{"query":"payment error","topK":1}}}"#))
-        XCTAssertNotNil(obj["error"])
+        XCTAssertNil(obj["error"])
+        let result = try XCTUnwrap(obj["result"] as? [String: Any])
+        XCTAssertEqual(result["isError"] as? Bool, false)
+    }
+
+    func test_rcAskRunsCatalogOpOnLocalDispatcher() async throws {
+        let listed = try parse(await server().handle(#"{"jsonrpc":"2.0","id":40,"method":"tools/list"}"#))
+        let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+        let ask = try XCTUnwrap(tools.first { ($0["name"] as? String) == "rc_ask" })
+        let schema = try XCTUnwrap(ask["inputSchema"] as? [String: Any])
+        let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+        let op = try XCTUnwrap(properties["op"] as? [String: Any])
+        let enumIDs = try XCTUnwrap(op["enum"] as? [String])
+        XCTAssertEqual(Set(enumIDs), Set(LibrarianCatalog.implementedIDs))
+        XCTAssertTrue(enumIDs.contains("json_crusher"))
+        XCTAssertTrue(enumIDs.contains("ask_handle"))
+        XCTAssertFalse(enumIDs.contains("apply_patch"))
+
+        let original = String(repeating: "ERROR payment failed\n", count: 40)
+        let escaped = original.replacingOccurrences(of: "\n", with: "\\n")
+        let called = try parse(await server().handle(
+            #"{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"rc_ask","arguments":{"op":"log_crusher","input":"\#(escaped)"}}}"#
+        ))
+        let result = try XCTUnwrap(called["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        let text = try XCTUnwrap(content.first?["text"] as? String)
+        XCTAssertTrue(text.contains("log_crusher") || text.contains("[[rc:"), text)
+        XCTAssertEqual(result["isError"] as? Bool, false)
     }
 
     func test_statsToolReturnsSavingsSnapshot() async throws {
