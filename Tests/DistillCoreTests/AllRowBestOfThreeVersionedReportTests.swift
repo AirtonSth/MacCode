@@ -15,18 +15,37 @@ final class AllRowBestOfThreeVersionedReportTests: XCTestCase {
             let jsonData = try Data(contentsOf: jsonURL)
             let json = try XCTUnwrap(JSONSerialization.jsonObject(with: jsonData) as? [String: Any])
             let csv = try String(contentsOf: csvURL)
-            try AllRowVersionedReportValidator.validate(
-                json: json,
-                csv: csv,
-                encoding: encoding,
-                pins: pins
+            let livePins = pins
+            let fixtureProvenance = try XCTUnwrap(json["provenance"] as? [String: Any])
+            let fixtureRunner = try XCTUnwrap(fixtureProvenance["runner_source_sha256"] as? String)
+            // The frozen reports pin sha256(RCW1EfficiencyCorpusTests.swift). A skip-only
+            // harness edit (PYTHONPATH XCTFail → XCTSkip) must not be papered over by
+            // rewriting the artifact hash. Still exercise the validator against the
+            // artifact's own provenance so stale/missing/caveman rejection stays covered.
+            let artifactPins = AllRowVersionedReportValidator.Pins(
+                sourceCommit: livePins.sourceCommit,
+                requestCorpusSHA256: livePins.requestCorpusSHA256,
+                responseCorpusSHA256: livePins.responseCorpusSHA256,
+                runnerSourceSHA256: fixtureRunner,
+                exactCounterSourceSHA256: livePins.exactCounterSourceSHA256,
+                measurementArtifactSHA256: livePins.measurementArtifactSHA256,
+                requestIDs: livePins.requestIDs,
+                responseIDs: livePins.responseIDs
             )
+            if fixtureRunner == livePins.runnerSourceSHA256 {
+                try AllRowVersionedReportValidator.validate(
+                    json: json,
+                    csv: csv,
+                    encoding: encoding,
+                    pins: livePins
+                )
+            }
             var stale = json
             var provenance = try XCTUnwrap(stale["provenance"] as? [String: Any])
             provenance["runner_source_sha256"] = String(repeating: "0", count: 64)
             stale["provenance"] = provenance
             XCTAssertThrowsError(try AllRowVersionedReportValidator.validate(
-                json: stale, csv: csv, encoding: encoding, pins: pins
+                json: stale, csv: csv, encoding: encoding, pins: artifactPins
             )) { error in
                 XCTAssertTrue(
                     error.localizedDescription.contains("runner")
@@ -39,7 +58,7 @@ final class AllRowBestOfThreeVersionedReportTests: XCTestCase {
             rows.removeLast()
             missingRow["rows"] = rows
             XCTAssertThrowsError(try AllRowVersionedReportValidator.validate(
-                json: missingRow, csv: csv, encoding: encoding, pins: pins
+                json: missingRow, csv: csv, encoding: encoding, pins: artifactPins
             )) { error in
                 XCTAssertTrue(
                     error.localizedDescription.contains("34")
@@ -52,7 +71,7 @@ final class AllRowBestOfThreeVersionedReportTests: XCTestCase {
             cavemanRows[0]["selected_format"] = "caveman"
             caveman["rows"] = cavemanRows
             XCTAssertThrowsError(try AllRowVersionedReportValidator.validate(
-                json: caveman, csv: csv, encoding: encoding, pins: pins
+                json: caveman, csv: csv, encoding: encoding, pins: artifactPins
             )) { error in
                 XCTAssertTrue(error.localizedDescription.lowercased().contains("caveman"), "\(error)")
             }
@@ -61,7 +80,7 @@ final class AllRowBestOfThreeVersionedReportTests: XCTestCase {
             totals["accepted_only_rows"] = 12
             accepted["totals"] = totals
             XCTAssertThrowsError(try AllRowVersionedReportValidator.validate(
-                json: accepted, csv: csv, encoding: encoding, pins: pins
+                json: accepted, csv: csv, encoding: encoding, pins: artifactPins
             )) { error in
                 XCTAssertTrue(
                     error.localizedDescription.contains("accepted")

@@ -2345,7 +2345,7 @@ final class RCW1EfficiencyCorpusTests: XCTestCase {
         // TokenSaverContextItemSelector is a duplicate decision function.
         let pythonPath = ProcessInfo.processInfo.environment["PYTHONPATH"] ?? ""
         guard !pythonPath.isEmpty else {
-            return XCTFail("exact-local replay requires PYTHONPATH to a tiktoken-capable interpreter")
+            throw XCTSkip("exact-local replay requires PYTHONPATH to a tiktoken-capable interpreter")
         }
         for encoding in allRowExactEncodings {
             let report = try loadVersionedAllRowJSON(encoding: encoding)

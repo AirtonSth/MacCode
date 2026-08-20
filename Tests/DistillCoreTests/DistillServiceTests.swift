@@ -569,6 +569,97 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertNotEqual(record.inputTokens, request.input.count, "characters must never be recorded as tokens")
     }
 
+    func test_httpLibrarianAskHandleUsesWiredGenerateAndPersistsLibrarianMode() async throws {
+        actor SavingsCapture {
+            var records: [DistillSavingsRecord] = []
+            func add(_ record: DistillSavingsRecord) { records.append(record) }
+            func all() -> [DistillSavingsRecord] { records }
+        }
+        let capture = SavingsCapture()
+        let configuration = try DistillServiceConfiguration(
+            authToken: "librarian-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2),
+            scopedRecoveryStore: TestScopedRecoveryStore(),
+            onSavingsRecord: { record in await capture.add(record) },
+            librarianGenerate: LibrarianScriptedGenerate()
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let original = "ERROR payment failed at Sources/Billing.swift:12\nretry ignored\n"
+        let body = LibrarianHTTPBody(
+            id: "ask_handle",
+            input: original,
+            question: "what failed?",
+            provider: "grok"
+        )
+        let posted = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/librarian",
+            method: "POST",
+            token: "librarian-token",
+            body: try JSONEncoder().encode(body)
+        )
+        XCTAssertEqual(posted.status, 200)
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: posted.data) as? [String: Any])
+        XCTAssertEqual(obj["status"] as? String, "ok")
+        let text = try XCTUnwrap(obj["text"] as? String)
+        XCTAssertFalse(text.contains("<think>"))
+        XCTAssertFalse(text.contains("reasoning_content"))
+        let envelopeRaw = try XCTUnwrap(obj["envelope"] as? String)
+        XCTAssertTrue(envelopeRaw.contains("ask_handle"))
+        XCTAssertTrue(original.contains("payment failed"))
+        let records = await capture.all()
+        let record = try XCTUnwrap(records.first, "POST /v1/librarian must persist a DistillSavingsRecord")
+        XCTAssertTrue(record.mode.contains("librarian.ask_handle"))
+        XCTAssertEqual(record.routeStage, .llmMLX)
+    }
+
+    func test_httpLibrarianForbiddenSavesZeroTokens() async throws {
+        actor SavingsCapture {
+            var records: [DistillSavingsRecord] = []
+            func add(_ record: DistillSavingsRecord) { records.append(record) }
+            func all() -> [DistillSavingsRecord] { records }
+        }
+        let capture = SavingsCapture()
+        let configuration = try DistillServiceConfiguration(
+            authToken: "librarian-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
+            onSavingsRecord: { record in await capture.add(record) },
+            librarianGenerate: LibrarianScriptedGenerate()
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let body = LibrarianHTTPBody(id: "apply_patch", input: "diff --git a/x b/x\n")
+        let posted = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/librarian",
+            method: "POST",
+            token: "librarian-token",
+            body: try JSONEncoder().encode(body)
+        )
+        XCTAssertEqual(posted.status, 200)
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: posted.data) as? [String: Any])
+        XCTAssertEqual(obj["status"] as? String, "refused")
+        XCTAssertEqual(obj["saved_tokens"] as? Int, 0)
+        let records = await capture.all()
+        let record = try XCTUnwrap(records.first)
+        XCTAssertTrue(record.mode.contains("librarian.apply_patch"))
+        XCTAssertEqual(record.savedTokens, 0)
+        XCTAssertFalse(record.delivered)
+    }
+
     func test_clientCompressesViaServerAndReportsMeasuredSavings() async throws {
         let configuration = try DistillServiceConfiguration(
             authToken: "client-token",
@@ -1057,7 +1148,7 @@ final class DistillServiceTests: XCTestCase {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
         }
-        if method == "POST", path == "/v1/distill" || path == "/v1/compress" {
+        if method == "POST", path == "/v1/distill" || path == "/v1/compress" || path == "/v1/librarian" {
             let context = testRecoveryContext()
             request.setValue(context.workspaceID, forHTTPHeaderField: "X-RemoteCode-Workspace-ID")
             request.setValue(context.projectID, forHTTPHeaderField: "X-RemoteCode-Project-ID")

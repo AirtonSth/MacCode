@@ -711,6 +711,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let distillAdmission: DistillAdmission
     private let onSavingsRecord: SavingsRecordHandler?
     private let onAuditEvent: AuditEventHandler?
+    private let librarianGenerate: (any LibrarianGenerating)?
     private let reversibleStore: ReversibleStoring?
     private let scopedRecoveryStore: TokenSaverScopedRecoveryStoring?
     private let statsProvider: DistillStatsProviding?
@@ -734,7 +735,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
         onSuccess: SuccessHandler? = nil,
         onSavingsRecord: SavingsRecordHandler? = nil,
         onAuditEvent: AuditEventHandler? = nil,
-        distillAdmission: @escaping DistillAdmission = { true }
+        distillAdmission: @escaping DistillAdmission = { true },
+        librarianGenerate: (any LibrarianGenerating)? = nil
     ) {
         self.configuration = configuration
         self.scheduler = scheduler
@@ -749,6 +751,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         self.onSuccess = onSuccess
         self.onSavingsRecord = onSavingsRecord
         self.onAuditEvent = onAuditEvent
+        self.librarianGenerate = librarianGenerate
     }
 
     /// Flip readiness on once the runtime is warm. Until then /readyz returns 503
@@ -1041,7 +1044,10 @@ public final class DistillHTTPServer: @unchecked Sendable {
             } else if !text.isEmpty {
                 _ = store.put(text)
             }
-            let dispatcher = LibrarianDispatcher(store: store)
+            let dispatcher = LibrarianDispatcher(
+                store: store,
+                generate: librarianGenerate ?? LibrarianOpenAICompatibleRuntime()
+            )
             var req = LibrarianRequest(
                 id: body.op ?? body.id,
                 input: text,

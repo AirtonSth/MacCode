@@ -36,17 +36,9 @@ public enum LibrarianProbe {
     public static func run(id: String, dispatcher: LibrarianDispatcher) async -> LibrarianProbeRecord {
         let request = fixture(for: id, store: dispatcher.store)
         let result = await dispatcher.dispatch(request)
-        let safety = LibrarianCatalog.function(id: id)?.safety.rawValue ?? "unknown"
-        let mark: String
-        if safety == "forbidden" {
-            mark = (result.status == .refused || result.status == .unavailable) ? "bloqueado" : "pendente"
-        } else if result.status == .ok || result.status == .lowConfidence || result.status == .unavailable {
-            mark = "implementado"
-        } else if result.status == .refused, safety == "forbidden" {
-            mark = "bloqueado"
-        } else {
-            mark = "pendente"
-        }
+        let fn = LibrarianCatalog.function(id: id)
+        let safety = fn?.safety.rawValue ?? "unknown"
+        let mark = mark(for: fn, result: result)
         return LibrarianProbeRecord(
             id: id,
             safety: safety,
@@ -55,6 +47,23 @@ public enum LibrarianProbe {
             savedTokens: result.analytics.savedTokens,
             delivered: result.analytics.delivered
         )
+    }
+
+    /// Generate IDs are implementado only when the wired generate path returned ok.
+    /// Host-tool misses that the handler actually reports as unavailable count as proven.
+    public static func mark(for fn: LibrarianFunction?, result: LibrarianResult) -> String {
+        let safety = fn?.safety ?? .forbidden
+        if safety == .forbidden {
+            return (result.status == .refused || result.status == .unavailable) ? "bloqueado" : "pendente"
+        }
+        if fn?.usesLLM == true, fn?.mcp != "none" {
+            let generated = result.analytics.record?.routeStage == .llmMLX
+            return (result.status == .ok && generated) ? "implementado" : "pendente"
+        }
+        if result.status == .ok || result.status == .unavailable {
+            return "implementado"
+        }
+        return "pendente"
     }
 
     public static func runAll(dispatcher: LibrarianDispatcher) async -> [LibrarianProbeRecord] {

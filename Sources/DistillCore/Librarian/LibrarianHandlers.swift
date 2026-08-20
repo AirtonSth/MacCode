@@ -35,9 +35,9 @@ enum LibrarianHandlers {
         case "toon_codec":
             return crush(resolved, transform: { ToonCodec.encodeIfEfficient($0) }, store: store)
         case "graphify_query":
-            return textNotice(resolved, text: "graphify query deferred to host CLI; index miss is not absence")
+            return unavailableHost(resolved, reason: "graphify_cli_not_executed")
         case "path_wrappers":
-            return textNotice(resolved, text: "PATH wrap catalog: \(WrappedCommandCatalog.commands.prefix(8).joined(separator: ","))")
+            return unavailableHost(resolved, reason: "path_wrap_is_host_PATH")
         case "nli_gate":
             return nliGate(resolved)
         case "notebook_crusher":
@@ -63,7 +63,7 @@ enum LibrarianHandlers {
         case "repo_map_budget":
             return crush(resolved, transform: { SourceCodeSkeletonizer.skeletonize($0, droppedHandle: resolved.handle) }, store: store)
         case "stale_tool_result_evict":
-            return stubHandle(resolved, kind: "stale_tool_result")
+            return unavailableHost(resolved, reason: "host_resume_evict_not_in_sidecar")
         case "retrieve_range":
             return retrieveRange(request, store: store)
         case "handle_grep":
@@ -83,7 +83,7 @@ enum LibrarianHandlers {
         case "padded_table_compact":
             return crush(resolved, transform: compactTable, store: store)
         case "workspace_change_notice":
-            return textNotice(resolved, text: "workspace change notice: re-read cited paths only")
+            return unavailableHost(resolved, reason: "fsevents_watch_is_host")
         case "audio_transcribe_local", "video_keyframe_ocr":
             return unavailableHost(resolved, reason: "media_bytes_required")
         case "screenshot_diff_digest":
@@ -91,11 +91,11 @@ enum LibrarianHandlers {
         case "write_ack_verify":
             return writeAck(resolved)
         case "unchanged_reread_stub":
-            return stubHandle(resolved, kind: "unchanged_reread")
+            return unavailableHost(resolved, reason: "claude_posttooluse_only")
         case "stdout_budget_elide":
             return crush(resolved, transform: { stdoutElide($0, handle: resolved.handle) }, store: store)
         case "predicate_watch":
-            return textNotice(resolved, text: "predicate watch is host-executed; local never suggests the command")
+            return unavailableHost(resolved, reason: "host_watch_not_local_suggested")
         case "attachment_handle_intake", "terminal_scrollback_intake":
             return intake(resolved, store: store)
         case "lsp_query", "ast_grep_query":
@@ -107,9 +107,9 @@ enum LibrarianHandlers {
         case "schema_validate_eval":
             return schemaValidate(request, resolved: resolved)
         case "batch_codemod_apply":
-            return textNotice(resolved, text: "codemod apply is host-executed from a paid-authored rule; local never authors it")
+            return unavailableHost(resolved, reason: "host_codemod_not_local_authored")
         case "stale_tool_args_evict":
-            return stubHandle(resolved, kind: "stale_tool_args")
+            return unavailableHost(resolved, reason: "host_resume_args_evict_not_in_sidecar")
         case "spreadsheet_extract":
             return unavailableHost(resolved, reason: "workbook_bytes_required")
         case "test_baseline_diff":
@@ -253,7 +253,13 @@ enum LibrarianHandlers {
     }
 
     private static func textNotice(_ resolved: Resolved, text: String) -> LibrarianHandlerOutput {
-        LibrarianHandlerOutput(status: .ok, text: text + "\n[[rc:\(resolved.handle)]]", handle: resolved.handle, originalForSavings: resolved.original)
+        LibrarianHandlerOutput(
+            status: .ok,
+            text: resolved.original,
+            handle: resolved.handle,
+            stage: .verbatim,
+            originalForSavings: resolved.original
+        )
     }
 
     private static func unavailableHost(_ resolved: Resolved, reason: String) -> LibrarianHandlerOutput {
@@ -268,16 +274,11 @@ enum LibrarianHandlers {
     }
 
     private static func hostProcess(_ resolved: Resolved, tool: String, extra: [String]) -> LibrarianHandlerOutput {
-        let found = ([tool] + extra).contains { FileManager.default.isExecutableFile(atPath: "/usr/bin/\($0)") || FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/\($0)") }
-        if !found {
-            return unavailableHost(resolved, reason: "\(tool)_missing")
-        }
-        return textNotice(resolved, text: "host extractor \(tool) available; original stays behind handle")
+        unavailableHost(resolved, reason: "\(tool)_not_executed_on_handle")
     }
 
     private static func stubHandle(_ resolved: Resolved, kind: String) -> LibrarianHandlerOutput {
-        let text = "\(kind) stub hash=\(LibrarianHandleStore.makeHandle(resolved.text)) [[rc:\(resolved.handle)]]"
-        return LibrarianHandlerOutput(status: .ok, text: text, handle: resolved.handle, originalForSavings: resolved.original)
+        unavailableHost(resolved, reason: "\(kind)_not_executed")
     }
 
     private static func intake(_ resolved: Resolved, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
@@ -454,54 +455,55 @@ enum LibrarianHandlers {
         store: LibrarianHandleStore,
         generate: (any LibrarianGenerating)?
     ) async -> LibrarianHandlerOutput {
-        let extracted = extractive(function.id, text: resolved.text, question: request.question, claim: request.claim)
-        var answer = extracted.answer
-        var span = extracted.span
-        var stage = TokenSaverRouteStage.deterministic
-        if let generate, function.usesLLM {
-            let prompt = """
-            Op: \(function.id)
-            Question: \(request.question ?? "")
-            Source (cite exact substrings only):
-            \(resolved.text.prefix(6000))
-            Return compact extractive JSON with keys answer, span. Span MUST be a substring of source.
-            """
-            if let raw = await generate.generate(LibrarianGenerateCall(
-                system: "Extract only. Never invent. Never include <think>.",
-                user: String(prompt),
-                maxTokens: 256
-            )), let clean = LibrarianThinkStrip.strip(raw) {
-                if let parsed = parseAnswerSpan(clean, source: resolved.text) {
-                    answer = parsed.0
-                    span = parsed.1
-                    stage = .llmMLX
-                }
-            }
+        guard let generate else {
+            return unavailableHost(resolved, reason: "generate_runtime_unavailable")
         }
-        if function.id == "cite_spans" || function.id == "ask_handle" || function.id == "nli_claim" {
-            if !resolved.text.contains(span) || span.isEmpty {
-                return LibrarianHandlerOutput(
+        let prompt = """
+        Op: \(function.id)
+        Question: \(request.question ?? "")
+        Source (cite exact substrings only):
+        \(resolved.text.prefix(6000))
+        Return compact extractive JSON with keys answer, span. Span MUST be a substring of source.
+        """
+        guard let raw = await generate.generate(LibrarianGenerateCall(
+            system: "Extract only. Never invent. Never include <think>.",
+            user: String(prompt),
+            maxTokens: 256
+        )), let clean = LibrarianThinkStrip.strip(raw),
+              let parsed = parseAnswerSpan(clean, source: resolved.text) else {
+            return LibrarianHandlerOutput(
+                status: .unavailable,
+                text: resolved.original,
+                envelope: .unavailable(op: function.id, reason: "generate_unavailable", handle: resolved.handle),
+                handle: resolved.handle,
+                stage: .verbatim,
+                originalForSavings: resolved.original
+            )
+        }
+        let answer = parsed.0
+        let span = parsed.1
+        if span.isEmpty || !resolved.text.contains(span) {
+            return LibrarianHandlerOutput(
+                status: .lowConfidence,
+                text: resolved.original,
+                envelope: LibrarianEnvelope(
                     status: .lowConfidence,
-                    text: resolved.text,
-                    envelope: LibrarianEnvelope(
-                        status: .lowConfidence,
-                        confidence: 0.2,
-                        op: function.id,
-                        whyUncertain: "span_not_in_original",
-                        fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle)
-                    ),
-                    handle: resolved.handle,
-                    stage: .verbatim,
-                    originalForSavings: resolved.original
-                )
-            }
+                    confidence: 0.2,
+                    op: function.id,
+                    whyUncertain: "span_not_in_original",
+                    fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle)
+                ),
+                handle: resolved.handle,
+                stage: .verbatim,
+                originalForSavings: resolved.original
+            )
         }
         let envelope = LibrarianEnvelope(
             status: .ok,
-            confidence: stage == .llmMLX ? 0.7 : 0.85,
+            confidence: 0.7,
             op: function.id,
             answer: .object(["text": .string(answer)]),
-            evidence: span.isEmpty ? [] : [LibrarianEvidence(handle: resolved.handle, span: span)],
+            evidence: [LibrarianEvidence(handle: resolved.handle, span: span)],
             fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle, question: request.question)
         )
         let paid = function.safety == .candidate
@@ -512,7 +514,7 @@ enum LibrarianHandlers {
             text: paid,
             envelope: envelope,
             handle: resolved.handle,
-            stage: stage,
+            stage: .llmMLX,
             originalForSavings: resolved.original
         )
     }

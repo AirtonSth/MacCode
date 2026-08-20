@@ -24,6 +24,14 @@ final class RCGemma4ModelOverrideTests: XCTestCase {
     func test_registerInstallsPatchedGemma4CreatorThatInstantiatesWithoutCheckpoint() async throws {
         await RCGemma4ModelOverride.register()
 
+        // Instantiating MLX models loads the default metallib. DistillCoreTests often
+        // abort the whole process there (`library not found` in mlx-c/stream.cpp),
+        // which skips later suites. Keep register() as the unguarded proof; the
+        // allocate path stays env-gated.
+        guard ProcessInfo.processInfo.environment["REMOTE_CODE_TOKEN_SAVER_ALLOW_MLX_INSTANTIATE"] == "1" else {
+            throw XCTSkip("MLX metallib is not bundled in DistillCoreTests; set REMOTE_CODE_TOKEN_SAVER_ALLOW_MLX_INSTANTIATE=1 to allocate RCGemma4Model")
+        }
+
         // The registry must now resolve `gemma4` to the patched model, and instantiating it must
         // succeed for a config WITH KV-shared layers — proving Fix A's optional projections and
         // Fix B's Linear allocate cleanly (a regression here would crash or throw at init).

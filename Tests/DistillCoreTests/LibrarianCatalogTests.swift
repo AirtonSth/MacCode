@@ -153,8 +153,23 @@ final class LibrarianCatalogTests: XCTestCase {
         }
     }
 
-    func test_askHandle_envelopeSpanIsSubstring() async {
+    func test_askHandle_withoutGenerateRuntimeIsUnavailable() async {
         let dispatcher = LibrarianDispatcher()
+        let original = "ERROR payment failed at Sources/Billing.swift:12\n"
+        let handle = dispatcher.store.put(original)
+        let result = await dispatcher.dispatch(LibrarianRequest(
+            id: "ask_handle",
+            question: "what failed?",
+            handle: handle,
+            provider: "grok"
+        ))
+        XCTAssertEqual(result.status, LibrarianStatus.unavailable)
+        XCTAssertEqual(result.analytics.savedTokens, 0)
+        XCTAssertFalse(result.analytics.delivered)
+    }
+
+    func test_askHandle_envelopeSpanIsSubstring() async {
+        let dispatcher = LibrarianDispatcher(generate: LibrarianScriptedGenerate())
         let original = "ERROR payment failed at Sources/Billing.swift:12\nretry ignored\n"
         let handle = dispatcher.store.put(original)
         let result = await dispatcher.dispatch(LibrarianRequest(
@@ -181,7 +196,7 @@ final class LibrarianCatalogTests: XCTestCase {
     }
 
     func test_probeAllCatalogIDs() async throws {
-        let dispatcher = LibrarianDispatcher()
+        let dispatcher = LibrarianDispatcher(generate: LibrarianScriptedGenerate())
         let rows = await LibrarianProbe.runAll(dispatcher: dispatcher)
         XCTAssertEqual(rows.count, 188)
         XCTAssertEqual(Set(rows.map(\.id)).count, 188)
@@ -189,8 +204,15 @@ final class LibrarianCatalogTests: XCTestCase {
         XCTAssertEqual(forbidden.count, 19)
         XCTAssertTrue(forbidden.allSatisfy { $0.status == "refused" || $0.status == "unavailable" })
         XCTAssertTrue(forbidden.allSatisfy { $0.mark == "bloqueado" })
-        let pending = rows.filter { $0.mark == "pendente" }
-        XCTAssertTrue(pending.isEmpty, "unmarked: \(pending.map(\.id))")
+        let pendingGenerate = rows.filter { $0.mark == "pendente" && LibrarianCatalog.function(id: $0.id)?.usesLLM == true }
+        XCTAssertTrue(pendingGenerate.isEmpty, "generate IDs not proven via generate path: \(pendingGenerate.map(\.id))")
+        let fakeSavings = rows.filter {
+            $0.delivered && $0.savedTokens > 0 && [
+                "graphify_query", "path_wrappers", "doc_text_extract",
+                "stale_tool_result_evict", "stale_tool_args_evict"
+            ].contains($0.id)
+        }
+        XCTAssertTrue(fakeSavings.isEmpty, "host-tool stubs must not record savings: \(fakeSavings.map(\.id))")
         if let out = ProcessInfo.processInfo.environment["LIBRARIAN_PROBE_OUT"], !out.isEmpty {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
