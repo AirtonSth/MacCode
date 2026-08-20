@@ -4640,6 +4640,10 @@ final class BotsWindowTests: XCTestCase {
         let slice = String(source[start.lowerBound..<end])
         XCTAssertTrue(slice.contains("provider: routing.provider"))
         XCTAssertTrue(slice.contains("permissionMode: routing.permissionMode"))
+        XCTAssertTrue(
+            slice.contains("liveRunMode: routing.permissionMode"),
+            "Desk assemble must compile the composer chip, not leftover Supervised honesty"
+        )
         XCTAssertTrue(slice.contains("reasoningEffort: effort"))
         XCTAssertTrue(source.contains("runAsUser: routing.runAsUser"))
         XCTAssertTrue(slice.contains("workspace: nil"))
@@ -5063,8 +5067,22 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(outbound.role, .user)
         XCTAssertEqual(outbound.peer?.direction, .messaged)
         XCTAssertEqual(outbound.peer?.botID, quinn.id)
-        XCTAssertEqual(outbound.peer?.caption, "Messaged Quinn - CRM Controller - \(quinn.handle)")
+        XCTAssertEqual(outbound.peer?.caption, "To Quinn")
+        XCTAssertEqual(outbound.peer?.avatarSymbol, quinn.avatarSymbol)
         XCTAssertTrue(outbound.text.contains("@quinn"))
+    }
+
+    func test_sendMentionInheritsCallerFullAccessChip() throws {
+        // WHY: @mention used the peer's saved chip (default Supervised) even
+        // when the caller composer was Full access. The invocation chip wins.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        vm.setDeskPermissionMode(.fullAccess)
+        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp"))
+        XCTAssertEqual(vm.lastDeskRunPermissionForTesting, .fullAccess)
     }
 
     func test_sendWithMentionStartsPeerProviderRun() async throws {
@@ -5327,9 +5345,9 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_waitingHandoffProjectsBothBotsActiveDespiteUnrelatedOriginAttention() async throws {
-        // WHY: Active Bots describes live endpoints, while Needs you describes
-        // a different unresolved conversation. Badge precedence must not hide
-        // either participant in the handoff that is actually running.
+        // WHY: Active Bots describes live endpoints. A leftover Needs you on
+        // another origin thread must not hide the waiting host from the live
+        // roster or replace its Working spinner.
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
@@ -5363,7 +5381,12 @@ final class BotsWindowTests: XCTestCase {
         }
         XCTAssertTrue(peerBecameActive)
 
-        XCTAssertEqual(vm.attentionState(for: piper), .needsAttention)
+        XCTAssertEqual(
+            vm.attentionState(for: piper),
+            .working,
+            "a live wait outranks leftover Needs you so the origin roster stays active"
+        )
+        XCTAssertTrue(BotsChrome.rosterShowsBusySpinner(for: vm.attentionState(for: piper)))
         XCTAssertEqual(
             Set(vm.liveWorkingBots().map(\.id)),
             Set([piper.id, quinn.id]),
@@ -6285,7 +6308,11 @@ final class BotsWindowTests: XCTestCase {
         let hop = try XCTUnwrap(vm.lastHopUserTextForTesting)
         XCTAssertEqual(
             hop,
-            BotPeerTranscript.hostHopPrompt(peerName: quinn.name, reply: "inbox is clear")
+            BotPeerTranscript.hostHopPrompt(
+                peerName: quinn.name,
+                reply: "inbox is clear",
+                userText: "@\(quinn.handle) what is in the inbox?"
+            )
         )
         XCTAssertTrue(hop.contains("inbox is clear"))
         XCTAssertFalse(BotPeerTranscript.containsMentionToken(hop, handle: quinn.handle))
@@ -7677,7 +7704,11 @@ final class BotsWindowTests: XCTestCase {
         guard case .workLog(let row) = withRun[1] else {
             return XCTFail("linked run must insert a work-log between You and the assistant")
         }
-        XCTAssertEqual(row.title, "Supervised run")
+        XCTAssertEqual(row.title, "\(AgentPermissionMode.supervised.displayName) run")
+        XCTAssertEqual(
+            BotsDeskFollowThrough.workLogRow(for: run, mode: .fullAccess).title,
+            "\(AgentPermissionMode.fullAccess.displayName) run"
+        )
         XCTAssertEqual(row.detail, "Claude · opus")
         XCTAssertEqual(row.statusLabel, "Working")
         XCTAssertEqual(BotsDeskFollowThrough.workLogStatusLabel(for: .completed), "Done")
@@ -8401,6 +8432,227 @@ final class BotsWindowTests: XCTestCase {
             "Quinn's persisted bubbles must stay on Quinn's thread"
         )
         XCTAssertTrue(vm.deskMessages.contains { $0.text == "P1a desk send check" })
+    }
+
+    func test_askedBotDeskShowsFromHostChromeNotAskPrompt() throws {
+        // WHY: the asked bot Desk painted "Ceo asked you:" as a raw user
+        // bubble. It must show From <host> chrome and the actual ask.
+        let (vm, piper, quinn) = try makeMentionPair(peerReply: "PONG from Quinn")
+        XCTAssertTrue(vm.send("@\(quinn.handle) Pergunte ao bot seu nome e função"))
+        let inbound = try XCTUnwrap(
+            vm.deskTranscriptForTesting(botID: quinn.id).first { $0.role == .user }
+        )
+        XCTAssertEqual(inbound.peer?.direction, .fromPeer)
+        XCTAssertEqual(inbound.peer?.name, piper.name)
+        XCTAssertEqual(inbound.peer?.handle, piper.handle)
+        XCTAssertEqual(inbound.peer?.avatarSymbol, piper.avatarSymbol)
+        XCTAssertFalse(inbound.peer?.avatarSymbol.isEmpty == true)
+        XCTAssertEqual(inbound.peer?.caption, "From \(piper.name)")
+        XCTAssertEqual(inbound.text, "@\(quinn.handle) Pergunte ao bot seu nome e função")
+        XCTAssertFalse(inbound.text.contains("asked you:"))
+        XCTAssertFalse(BotPeerTranscript.isPeerAskUserText(inbound.text))
+    }
+
+    func test_restoreHidesPeerAskPromptAndKeepsFromHostChrome() throws {
+        // WHY: the asked bot's thread stores the internal "Piper asked you:"
+        // provider line. Reload must not paint that wrapper, and must keep
+        // From-host chrome from the handoff.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("@\(quinn.handle) Pergunte ao bot seu nome e função"))
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(quinn)
+        XCTAssertFalse(
+            reopened.deskMessages.contains { BotPeerTranscript.isPeerAskUserText($0.text) },
+            "internal peer-ask prompt must not paint as a Desk bubble"
+        )
+        let inbound = try XCTUnwrap(reopened.deskMessages.first { $0.role == .user })
+        XCTAssertEqual(inbound.peer?.direction, .fromPeer)
+        XCTAssertEqual(inbound.peer?.name, piper.name)
+        XCTAssertEqual(inbound.peer?.handle, piper.handle)
+        XCTAssertEqual(inbound.peer?.avatarSymbol, piper.avatarSymbol)
+        XCTAssertTrue(inbound.text.contains("Pergunte ao bot seu nome e função"))
+        XCTAssertFalse(inbound.text.contains("asked you:"))
+    }
+
+    func test_waitingOriginRosterShowsWorkingSpinner() async throws {
+        // WHY: Ceo stayed Needs you in the roster while the transcript
+        // already said Waiting for Bot. Both endpoints of a live wait
+        // must show Working with the busy spinner.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.claude)
+        XCTAssertTrue(vm.send("@\(quinn.handle) WAIT_SPINNER ask the peer"))
+        let peerBecameActive = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("WAIT_SPINNER") }
+                && vm.peerHandoffSnapshotsForTesting().contains { $0.phase == .peerRunning }
+        }
+        XCTAssertTrue(peerBecameActive, "the peer start must persist .peerRunning before roster is judged")
+        XCTAssertEqual(vm.attentionState(for: piper), .working)
+        XCTAssertEqual(vm.attentionState(for: quinn), .working)
+        XCTAssertTrue(BotsChrome.rosterShowsBusySpinner(for: vm.attentionState(for: piper)))
+        XCTAssertTrue(BotsChrome.rosterShowsBusySpinner(for: vm.attentionState(for: quinn)))
+    }
+
+    func test_sendWithMentionStoresPeerAvatar() throws {
+        // WHY: hop chrome used initials because BotDeskPeer dropped the
+        // blobatar token. The peer row must carry the published symbol.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("@\(quinn.handle) check WhatsApp"))
+        let outbound = try XCTUnwrap(vm.deskMessages.last)
+        XCTAssertEqual(outbound.peer?.avatarSymbol, quinn.avatarSymbol)
+        XCTAssertFalse(outbound.peer?.avatarSymbol.isEmpty == true)
+    }
+
+    func test_restoreDeskMessagesHidesHostHopPrompt() throws {
+        // WHY: the host hop is an internal prompt. Restoring it as a user
+        // bubble showed raw markdown ("Bot replied: **Nome:**") on Desk.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .claude)
+        let thread = AgentThread(title: "Ask", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "Pergunte ao bot seu nome",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: BotPeerTranscript.hostHopPrompt(
+                peerName: "Bot",
+                reply: "**Nome:** Bot\n**Cargo:** vazio",
+                userText: "Pergunte ao bot seu nome"
+            ),
+            createdAt: Date(timeIntervalSince1970: 1_700_000_010)
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Pergunte ao bot seu nome", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.deskMessages.contains { $0.text == "Pergunte ao bot seu nome" })
+        XCTAssertFalse(
+            vm.deskMessages.contains { BotPeerTranscript.isHostHopUserText($0.text) },
+            "internal hop prompt must not paint as a Desk bubble"
+        )
+        XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("**Nome:**") })
+    }
+
+    func test_openingAnotherThreadDoesNotKeepPreviousLiveTurns_becauseEachConversationOwnsItsThread() throws {
+        // WHY: liveTimelineByBot kept a hop's Worked rows after the user
+        // opened a new Desk thread on the same teammate.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+
+        let mentionThread = AgentThread(title: "Mention", provider: .claude, model: "opus")
+        let oiThread = AgentThread(title: "oi", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(mentionThread)
+        try context.threadRepo.upsert(oiThread)
+        let mentionRun = AgentRun(
+            threadId: mentionThread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_010),
+            finishedAt: Date(timeIntervalSince1970: 1_700_000_040)
+        )
+        let oiRun = AgentRun(
+            threadId: oiThread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_110),
+            finishedAt: Date(timeIntervalSince1970: 1_700_000_120)
+        )
+        try context.runRepo.upsert(mentionRun)
+        try context.runRepo.upsert(oiRun)
+        try persistStreamEvents(
+            context: context,
+            run: mentionRun,
+            events: [
+                .turnStarted(turnId: "mention-turn"),
+                .itemStarted(item: AssistantItem(
+                    id: "mention-tool",
+                    turnId: "mention-turn",
+                    type: .tool,
+                    state: .completed,
+                    summary: "Bash",
+                    startedAtMs: 1_700_000_010_000,
+                    finishedAtMs: 1_700_000_020_000
+                )),
+                .turnCompleted(turnId: "mention-turn", finalMessage: "I'll treat this as a CEO test run"),
+            ]
+        )
+        try persistStreamEvents(
+            context: context,
+            run: oiRun,
+            events: [
+                .turnStarted(turnId: "oi-turn"),
+                .turnCompleted(turnId: "oi-turn", finalMessage: "Oi. Sou o Ceo."),
+            ]
+        )
+        try context.messageRepo.append(AgentMessage(
+            threadId: mentionThread.id,
+            role: .user,
+            content: "Pergunte ao bot",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        try context.messageRepo.append(AgentMessage(
+            threadId: oiThread.id,
+            role: .user,
+            content: "oi",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_100)
+        ))
+        let mentionConversation = BotConversation(
+            botID: piper.id,
+            title: "Pergunte ao bot",
+            linkedAgentThreadID: mentionThread.id
+        )
+        let oiConversation = BotConversation(
+            botID: piper.id,
+            title: "oi",
+            linkedAgentThreadID: oiThread.id
+        )
+        try context.botStore.upsertConversation(mentionConversation)
+        try context.botStore.upsertConversation(oiConversation)
+
+        vm.openDesk(piper)
+        vm.selectDeskThread(mentionConversation.id)
+        XCTAssertTrue(
+            vm.deskLiveTimeline.turns.contains { $0.finalAssistantMessage == "I'll treat this as a CEO test run" },
+            "mention thread must replay its own live turn"
+        )
+
+        vm.selectDeskThread(oiConversation.id)
+        XCTAssertFalse(
+            vm.deskLiveTimeline.turns.contains { $0.finalAssistantMessage == "I'll treat this as a CEO test run" },
+            "oi must not inherit the mention thread's richer live timeline"
+        )
+        XCTAssertTrue(
+            vm.deskLiveTimeline.turns.contains { $0.finalAssistantMessage == "Oi. Sou o Ceo." }
+        )
+        XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("Pergunte") })
+        XCTAssertTrue(vm.deskMessages.contains { $0.text == "oi" })
     }
 
     func test_deskTimelineKeepsEachTurnBesideItsUser_becauseChatIsNotTwoColumns() {

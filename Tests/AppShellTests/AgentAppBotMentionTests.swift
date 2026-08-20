@@ -61,7 +61,7 @@ final class AgentAppBotMentionTests: XCTestCase {
         let inbound = try XCTUnwrap(stored.last)
         XCTAssertEqual(inbound.role, .assistant)
         let parsed = try XCTUnwrap(BotPeerTranscript.parse(inbound.content))
-        XCTAssertTrue(parsed.caption.contains("Message from Quinn"))
+        XCTAssertTrue(parsed.caption.contains("From Quinn"))
         XCTAssertEqual(parsed.body, "Inbox is clear.")
     }
 
@@ -133,7 +133,7 @@ final class AgentAppBotMentionTests: XCTestCase {
             )
             return
         }
-        XCTAssertTrue(parsed.caption.contains("Message from Quinn"))
+        XCTAssertTrue(parsed.caption.contains("From Quinn"))
         XCTAssertTrue(parsed.body.contains("PONG from Quinn"))
     }
 
@@ -326,7 +326,11 @@ final class AgentAppBotMentionTests: XCTestCase {
         let hop = try XCTUnwrap(router.lastAgentAppHopTextForTesting)
         XCTAssertEqual(
             hop,
-            BotPeerTranscript.hostHopPrompt(peerName: quinn.name, reply: "inbox is clear")
+            BotPeerTranscript.hostHopPrompt(
+                peerName: quinn.name,
+                reply: "inbox is clear",
+                userText: "@\(quinn.handle) what is in the inbox?"
+            )
         )
         XCTAssertFalse(BotPeerTranscript.containsMentionToken(hop, handle: quinn.handle))
         XCTAssertFalse(hop.contains("@\(quinn.handle)"))
@@ -1113,7 +1117,7 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(reply.id, waitingID)
         XCTAssertEqual(reply.createdAt, waitingCreatedAt)
         let parsedReply = try XCTUnwrap(BotPeerTranscript.parse(reply.content))
-        XCTAssertEqual(parsedReply.caption, "Message from Quinn - CRM Controller - quinn")
+        XCTAssertEqual(parsedReply.caption, "From Quinn")
         XCTAssertEqual(parsedReply.body, "Inbox is clear.")
         XCTAssertEqual(parsedReply.name, "Quinn")
         XCTAssertEqual(parsedReply.title, "CRM Controller")

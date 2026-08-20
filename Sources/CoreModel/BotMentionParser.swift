@@ -124,14 +124,37 @@ public struct BotPeerActivitySnapshot: Sendable, Equatable {
 public enum BotPeerTranscript {
     private static let prefix = "[[rc:bot-from:"
     private static let activityPrefix = "[[rc:bot-activity:"
+    public static let languageInstruction =
+        "Reply in the language of what the user wrote."
+
+    public static func toCaption(name: String) -> String { "To \(name)" }
+    public static func fromCaption(name: String) -> String { "From \(name)" }
+
+    public static func handleLabel(_ handle: String) -> String {
+        handle.hasPrefix("@") ? handle : "@\(handle)"
+    }
+
+    public static func groupCaption(hostName: String, peerName: String, count: Int) -> String {
+        if hostName.isEmpty {
+            return "\(count) messages · \(peerName)"
+        }
+        return "\(count) messages · \(hostName) × \(peerName)"
+    }
 
     public static func encode(peer: BotDefinition, text: String) -> String {
-        "\(prefix)\(peer.handle)|\(peer.name)|\(peer.title)]]\n\(text)"
+        "\(prefix)\(peer.handle)|\(peer.name)|\(peer.title)|\(peer.avatarSymbol)]]\n\(text)"
     }
 
     public static func parse(
         _ content: String
-    ) -> (caption: String, body: String, name: String, title: String, handle: String)? {
+    ) -> (
+        caption: String,
+        body: String,
+        name: String,
+        title: String,
+        handle: String,
+        avatarSymbol: String
+    )? {
         guard content.hasPrefix(prefix),
               let end = content.range(of: "]]") else { return nil }
         let payload = content[content.index(content.startIndex, offsetBy: prefix.count)..<end.lowerBound]
@@ -140,13 +163,11 @@ public enum BotPeerTranscript {
         let handle = parts[0]
         let name = parts[1]
         let title = parts.count > 2 ? parts[2] : ""
-        let identity = [name, title.isEmpty ? nil : title, handle]
-            .compactMap { $0 }
-            .joined(separator: " - ")
+        let avatarSymbol = parts.count > 3 ? parts[3] : ""
         let bodyStart = content.index(end.upperBound, offsetBy: 0)
         var body = String(content[bodyStart...])
         if body.hasPrefix("\n") { body.removeFirst() }
-        return ("Message from \(identity)", body, name, title, handle)
+        return (fromCaption(name: name), body, name, title, handle, avatarSymbol)
     }
 
     public static func encodeActivity(peer: BotDefinition, phase: BotPeerActivityPhase) -> String {
@@ -171,22 +192,60 @@ public enum BotPeerTranscript {
     }
 
     public static func messagedCaption(for bot: BotDefinition) -> String {
-        let identity = [bot.name, bot.title.isEmpty ? nil : bot.title, bot.handle]
-            .compactMap { $0 }
-            .joined(separator: " - ")
-        return "Messaged \(identity)"
+        toCaption(name: bot.name)
     }
+
+    private static let peerAskMarker = " asked you:\n"
 
     /// Prompt the mentioned bot actually runs. No `@handle` so this cannot
     /// re-enter Desk mention send if a later caller routes it through `send`.
     public static func peerAskPrompt(hostName: String, text: String) -> String {
-        "\(hostName) asked you:\n\(text)"
+        strippingAtHandles("\(hostName)\(peerAskMarker)\(text)")
+    }
+
+    /// Internal provider line on the asked bot's thread. Hide it; the Desk
+    /// paints the original ask with From-host chrome instead.
+    public static func isPeerAskUserText(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).contains(peerAskMarker)
+    }
+
+    public static func displayTextFromPeerAsk(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let range = trimmed.range(of: peerAskMarker) else { return trimmed }
+        return String(trimmed[range.upperBound...])
     }
 
     /// Hop-1 host follow-up. Must include the peer reply and must not
-    /// contain `@<handle>` or mention-send will loop.
-    public static func hostHopPrompt(peerName: String, reply: String) -> String {
-        "\(peerName) replied:\n\(reply)"
+    /// contain `@<handle>` or mention-send will loop. Keep the original
+    /// user line so the host answers in that language.
+    public static func hostHopPrompt(
+        peerName: String,
+        reply: String,
+        userText: String = ""
+    ) -> String {
+        var lines: [String] = ["\(peerName) replied:\n\(reply)"]
+        let ask = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !ask.isEmpty {
+            lines.append("The user wrote:\n\(ask)")
+        }
+        lines.append(languageInstruction)
+        return strippingAtHandles(lines.joined(separator: "\n\n"))
+    }
+
+    public static func isHostHopUserText(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return false }
+        if trimmed.contains(languageInstruction) { return true }
+        if trimmed.hasPrefix("The user wrote:\n") { return true }
+        return trimmed.contains(" replied:\n")
+    }
+
+    public static func strippingAtHandles(_ text: String) -> String {
+        var result = text
+        for token in BotMentionParser.mentionTokens(in: text) {
+            result = result.replacingOccurrences(of: "@\(token)", with: token)
+        }
+        return result
     }
 
     public static func containsMentionToken(_ text: String, handle: String) -> Bool {

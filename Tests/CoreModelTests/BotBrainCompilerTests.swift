@@ -536,6 +536,43 @@ final class BotBrainCompilerTests: XCTestCase {
         )
     }
 
+    func test_liveFullAccessChipCompilesFullAccessHonesty_becauseComposerIsTheRunMode() {
+        // WHY: Desk send already forwarded fullAccess to the provider while
+        // Approval mode still said Supervised. Host-brokered writes stay off
+        // made the model refuse a Full access turn.
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            soul: "Own the inbox.",
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "opus",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: "Just write the file",
+            liveRunMode: .fullAccess
+        )
+        XCTAssertEqual(receipt.permissionMode, .fullAccess)
+        XCTAssertTrue(receipt.compiledPayload.contains("Full access. Run tools without asking."))
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.approvalModeHostAssignedHonesty))
+        XCTAssertFalse(receipt.compiledPayload.contains(BotPermission.honestyLabel))
+        XCTAssertEqual(
+            receipt.layers.first(where: { $0.kind == .permission })?.reason,
+            "Live composer chip. Host-assigned. Not a self-config write."
+        )
+    }
+
     func test_approvalsHonestyCompilesForCustomSoul_becauseAllowOnceIsNotAnEscapeHatch() {
         // WHY: Studio Security already says Approvals and Allow once / Deny
         // stay off until P1b. Compile listed Approval mode only, so

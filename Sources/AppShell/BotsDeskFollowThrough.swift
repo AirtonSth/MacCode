@@ -59,15 +59,21 @@ enum BotsDeskFollowThrough {
         return persisted[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    static func workLogRows(for run: AgentRun?) -> [BotDeskWorkLogRow] {
+    static func workLogRows(
+        for run: AgentRun?,
+        mode: AgentPermissionMode = .supervised
+    ) -> [BotDeskWorkLogRow] {
         guard let run else { return [] }
-        return [workLogRow(for: run)]
+        return [workLogRow(for: run, mode: mode)]
     }
 
-    static func workLogRow(for run: AgentRun) -> BotDeskWorkLogRow {
+    static func workLogRow(
+        for run: AgentRun,
+        mode: AgentPermissionMode = .supervised
+    ) -> BotDeskWorkLogRow {
         BotDeskWorkLogRow(
             id: run.id.value,
-            title: "Supervised run",
+            title: "\(mode.displayName) run",
             detail: workLogDetail(provider: run.provider, model: run.model),
             statusLabel: workLogStatusLabel(for: run.status),
             createdAt: run.finishedAt ?? run.startedAt,

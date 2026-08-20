@@ -217,6 +217,7 @@ public struct BotDeskPeer: Equatable, Sendable {
     public var name: String
     public var title: String
     public var handle: String
+    public var avatarSymbol: String
     public var activityPhase: BotPeerActivityPhase?
 
     public init(
@@ -229,6 +230,7 @@ public struct BotDeskPeer: Equatable, Sendable {
         self.name = bot.name
         self.title = bot.title
         self.handle = bot.handle
+        self.avatarSymbol = bot.avatarSymbol
         self.activityPhase = activityPhase
     }
 
@@ -238,6 +240,7 @@ public struct BotDeskPeer: Equatable, Sendable {
         name: String,
         title: String,
         handle: String,
+        avatarSymbol: String = "",
         activityPhase: BotPeerActivityPhase? = nil
     ) {
         self.direction = direction
@@ -245,24 +248,15 @@ public struct BotDeskPeer: Equatable, Sendable {
         self.name = name
         self.title = title
         self.handle = handle
+        self.avatarSymbol = avatarSymbol
         self.activityPhase = activityPhase
-    }
-
-    public var identityLine: String {
-        [name, title.isEmpty ? nil : title, handle]
-            .compactMap { $0 }
-            .joined(separator: " - ")
     }
 
     public var caption: String {
         switch direction {
-        case .messaged: return "Messaged \(identityLine)"
-        case .fromPeer: return "Message from \(identityLine)"
+        case .messaged: return BotPeerTranscript.toCaption(name: name)
+        case .fromPeer: return BotPeerTranscript.fromCaption(name: name)
         }
-    }
-
-    public func groupCaption(count: Int) -> String {
-        "\(count) messages with \(identityLine)"
     }
 }
 
@@ -370,6 +364,7 @@ private struct PersistedBotPeerHandoff: Codable, Equatable {
     let peerName: String
     let peerTitle: String
     let peerHandle: String
+    var peerAvatarSymbol: String? = nil
     let outboundText: String
     let createdAt: Date
     let peerRoute: BotPeerHandoffRoute
@@ -411,7 +406,8 @@ private struct BotPeerRunPlan {
             routines: routines,
             workspace: nil,
             browser: browser,
-            conversationID: started.conversation.id
+            conversationID: started.conversation.id,
+            liveRunMode: started.routing.permissionMode
         )
     }
 }
@@ -473,6 +469,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         "version", "activityID", "originBotID", "originConversationID",
         "originAgentThreadID", "peerBotID", "peerConversationID", "peerThreadID",
         "peerRunID", "inboundMessageID", "peerName", "peerTitle", "peerHandle",
+        "peerAvatarSymbol",
         "outboundText", "createdAt", "peerRoute", "hostThreadID", "hostRunID",
         "hostRoute", "replyText", "replyCreatedAt", "phase",
     ]
@@ -640,6 +637,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 peerName: peer.name,
                 peerTitle: peer.title,
                 peerHandle: peer.handle,
+                peerAvatarSymbol: peer.avatarSymbol,
                 outboundText: display,
                 createdAt: createdAt,
                 peerRoute: BotPeerHandoffRoute(routing),
@@ -1073,7 +1071,11 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             return
         }
 
-        let hop = BotPeerTranscript.hostHopPrompt(peerName: plan.peer.name, reply: replyMessage.content)
+        let hop = BotPeerTranscript.hostHopPrompt(
+            peerName: plan.peer.name,
+            reply: replyMessage.content,
+            userText: handoffs[plan.activityID]?.outboundText ?? ""
+        )
         switch host {
         case .desk(let hostRun):
             setPhase(plan.activityID, .hostPrepared)
@@ -1240,7 +1242,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             handle: handoff.peerHandle,
             name: handoff.peerName,
             title: handoff.peerTitle,
-            description: ""
+            description: "",
+            avatarSymbol: handoff.peerAvatarSymbol ?? "person.crop.circle"
         )
         return persistAgentAppProjection(
             peer: peer,
@@ -2131,8 +2134,8 @@ public final class BotsViewModel: ObservableObject {
     private var lastUpdatedByBot: [BotID: Date] = [:]
     private var lastLinkedRunIDByBot: [BotID: AgentRunID] = [:]
     private var lastStartedConversationByBot: [BotID: BotConversation] = [:]
-    private var liveTimelineByBot: [BotID: AssistantTimelineState] = [:]
-    private var liveStreamCountByBot: [BotID: Int] = [:]
+    private var liveTimelineByThread: [AgentThreadID: AssistantTimelineState] = [:]
+    private var liveStreamCountByThread: [AgentThreadID: Int] = [:]
     private var queuedFollowUpsByBot: [BotID: [BotQueuedFollowUp]] = [:]
     private var composerDraftsByBot: [BotID: BotComposerDraft] = [:]
     private var composerHydrated = false
@@ -3577,6 +3580,7 @@ public final class BotsViewModel: ObservableObject {
         relayHop: Int
     ) -> Bool {
         lastMentionedBotIDForTesting = peer.id
+        lastDeskRunPermissionForTesting = frozenDeskRouting(for: host).permissionMode
         var preparedPeerRunID: AgentRunID?
         var preparedHostRunID: AgentRunID?
         let display = AgentChatTranscriptChrome.displayUserLine(text: text, attachments: attachments)
@@ -3595,7 +3599,20 @@ public final class BotsViewModel: ObservableObject {
                 createNew: true
             )
             appendDeskMessage(
-                BotDeskMessage(role: .user, text: display),
+                BotDeskMessage(
+                    id: outbound.id,
+                    role: .user,
+                    text: display,
+                    createdAt: outbound.createdAt,
+                    peer: deskPeer(
+                        direction: .fromPeer,
+                        botID: host.id,
+                        name: host.name,
+                        title: host.title,
+                        handle: host.handle,
+                        avatarSymbol: host.avatarSymbol
+                    )
+                ),
                 botID: peer.id,
                 conversationID: peerConversation.id
             )
@@ -3611,7 +3628,9 @@ public final class BotsViewModel: ObservableObject {
                 )
                 return true
             }
-            let peerRouting = frozenDeskRouting(for: peer)
+            var peerRouting = frozenDeskRouting(for: peer)
+            peerRouting.permissionMode = frozenDeskRouting(for: host).permissionMode
+            lastDeskRunPermissionForTesting = peerRouting.permissionMode
             let peerPrepared = try prepareSupervisedRun(
                 bot: peer,
                 conversation: peerConversation,
@@ -3621,7 +3640,8 @@ public final class BotsViewModel: ObservableObject {
             preparedPeerRunID = peerPrepared.runID
             let hostRevision = relayHop == 0 ? try currentRevision(for: host) : nil
             let hostBrain = relayHop == 0 ? destBrainInputs(for: host) : nil
-            let hostRouting = relayHop == 0 ? frozenDeskRouting(for: host) : nil
+            var hostRouting = relayHop == 0 ? frozenDeskRouting(for: host) : nil
+            hostRouting?.permissionMode = frozenDeskRouting(for: host).permissionMode
             let hostPrepared = try hostRouting.map {
                 try prepareSupervisedRun(
                     bot: host,
@@ -3645,6 +3665,7 @@ public final class BotsViewModel: ObservableObject {
                 peerName: peer.name,
                 peerTitle: peer.title,
                 peerHandle: peer.handle,
+                peerAvatarSymbol: peer.avatarSymbol,
                 outboundText: display,
                 createdAt: outbound.createdAt,
                 peerRoute: BotPeerHandoffRoute(peerRouting),
@@ -3768,7 +3789,10 @@ public final class BotsViewModel: ObservableObject {
                 recordNeedsAttention(bot: peer, conversation: conversation, userText: display)
                 return nil
             }
-            let routing = frozenDeskRouting(for: peer)
+            var routing = frozenDeskRouting(for: peer)
+            if let originAgentThread {
+                routing.permissionMode = originAgentThread.permissionMode
+            }
             let prepared = try prepareSupervisedRun(
                 bot: peer,
                 conversation: conversation,
@@ -3793,6 +3817,7 @@ public final class BotsViewModel: ObservableObject {
                     peerName: peer.name,
                     peerTitle: peer.title,
                     peerHandle: peer.handle,
+                    peerAvatarSymbol: peer.avatarSymbol,
                     outboundText: display,
                     createdAt: Date(),
                     peerRoute: BotPeerHandoffRoute(routing),
@@ -4518,7 +4543,12 @@ public final class BotsViewModel: ObservableObject {
         for item in attentionItems where item.acknowledgedAt == nil {
             states[item.botID] = .needsAttention
         }
+        let liveHandoffBots = activeHandoffBotIDs()
         for bot in bots {
+            if liveHandoffBots.contains(bot.id) {
+                states[bot.id] = .working
+                continue
+            }
             if states[bot.id] == .needsAttention { continue }
             let dest = destConversations(botID: bot.id)
             if !dest.isEmpty {
@@ -4552,10 +4582,14 @@ public final class BotsViewModel: ObservableObject {
 
     private func applyAttentionState(for botID: BotID, conversations: [BotConversation]) {
         var states = attentionStateByBot
-        let hasOpenAttention = attentionItems.contains {
-            $0.botID == botID && $0.acknowledgedAt == nil
+        if activeHandoffBotIDs().contains(botID) {
+            states[botID] = .working
+        } else {
+            let hasOpenAttention = attentionItems.contains {
+                $0.botID == botID && $0.acknowledgedAt == nil
+            }
+            states[botID] = Self.attentionState(from: conversations, hasOpenAttention: hasOpenAttention)
         }
-        states[botID] = Self.attentionState(from: conversations, hasOpenAttention: hasOpenAttention)
         attentionStateByBot = states
         if screen == .activeBots {
             reloadActiveBotsScreen()
@@ -4746,8 +4780,9 @@ public final class BotsViewModel: ObservableObject {
 
     private func reloadSelectedBot(id: BotID) {
         leaveDeskLiveWatch()
-        deskLiveTimeline = liveTimelineByBot[id] ?? AssistantTimelineState()
-        deskStreamEventCount = liveStreamCountByBot[id] ?? 0
+        let threadID = destConversation(for: id)?.linkedAgentThreadID
+        deskLiveTimeline = threadID.flatMap { liveTimelineByThread[$0] } ?? AssistantTimelineState()
+        deskStreamEventCount = threadID.flatMap { liveStreamCountByThread[$0] } ?? 0
         deskMessages = messagesByBot[id] ?? []
         // Dest first. First paint dest used to dest inspector
         // (conversations, revision, skills, memory, routines,
@@ -5453,8 +5488,34 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func peerAttribution(forUserText text: String, hostID: BotID) -> BotDeskPeer? {
-        guard let peer = mentionedBots(in: text).first else { return nil }
+        guard !BotPeerTranscript.isHostHopUserText(text),
+              let peer = mentionedBots(in: text).first else { return nil }
         return BotDeskPeer(direction: .messaged, bot: peer)
+    }
+
+    private func resolvedPeerAvatarSymbol(botID: BotID, stored: String?) -> String {
+        if let stored, !stored.isEmpty { return stored }
+        return bots.first(where: { $0.id == botID })?.avatarSymbol ?? ""
+    }
+
+    private func deskPeer(
+        direction: BotDeskPeer.Direction,
+        botID: BotID,
+        name: String,
+        title: String,
+        handle: String,
+        avatarSymbol: String? = nil,
+        activityPhase: BotPeerActivityPhase? = nil
+    ) -> BotDeskPeer {
+        BotDeskPeer(
+            direction: direction,
+            botID: botID,
+            name: name,
+            title: title,
+            handle: handle,
+            avatarSymbol: resolvedPeerAvatarSymbol(botID: botID, stored: avatarSymbol),
+            activityPhase: activityPhase
+        )
     }
 
     private func updatePeerActivity(
@@ -5488,7 +5549,8 @@ public final class BotsViewModel: ObservableObject {
         peer: BotDefinition,
         peerConversation: BotConversation
     ) {
-        let routing = frozenDeskRouting(for: peer)
+        var routing = frozenDeskRouting(for: peer)
+        routing.permissionMode = frozenDeskRouting(for: host).permissionMode
         peerHandoffs[outbound.id] = PersistedBotPeerHandoff(
             version: 2,
             activityID: outbound.id,
@@ -5503,6 +5565,7 @@ public final class BotsViewModel: ObservableObject {
             peerName: peer.name,
             peerTitle: peer.title,
             peerHandle: peer.handle,
+            peerAvatarSymbol: peer.avatarSymbol,
             outboundText: outbound.text,
             createdAt: outbound.createdAt,
             peerRoute: BotPeerHandoffRoute(routing),
@@ -5525,47 +5588,82 @@ public final class BotsViewModel: ObservableObject {
         )
     }
 
+    private func hostSidePeerTurns(_ handoff: PersistedBotPeerHandoff) -> [BotDeskMessage] {
+        let peer = deskPeer(
+            direction: .messaged,
+            botID: handoff.peerBotID,
+            name: handoff.peerName,
+            title: handoff.peerTitle,
+            handle: handoff.peerHandle,
+            avatarSymbol: handoff.peerAvatarSymbol,
+            activityPhase: handoff.phase == .needsAttention
+                ? .needsAttention
+                : (handoff.replyText == nil ? .waiting : nil)
+        )
+        var turns = [BotDeskMessage(
+            id: handoff.activityID,
+            role: .user,
+            text: handoff.outboundText,
+            createdAt: handoff.createdAt,
+            peer: peer
+        )]
+        if let reply = handoff.replyText {
+            turns.append(BotDeskMessage(
+                id: handoff.inboundMessageID,
+                role: .assistant,
+                text: reply,
+                createdAt: handoff.replyCreatedAt ?? handoff.createdAt,
+                peer: deskPeer(
+                    direction: .fromPeer,
+                    botID: handoff.peerBotID,
+                    name: handoff.peerName,
+                    title: handoff.peerTitle,
+                    handle: handoff.peerHandle,
+                    avatarSymbol: handoff.peerAvatarSymbol
+                )
+            ))
+        }
+        return turns
+    }
+
+    private func askedBotPeerTurns(_ handoff: PersistedBotPeerHandoff) -> [BotDeskMessage] {
+        let originPeer: BotDeskPeer?
+        if let originID = handoff.originBotID {
+            let origin = bots.first(where: { $0.id == originID })
+            originPeer = deskPeer(
+                direction: .fromPeer,
+                botID: originID,
+                name: origin?.name ?? "Bot",
+                title: origin?.title ?? "",
+                handle: origin?.handle ?? "",
+                avatarSymbol: origin?.avatarSymbol
+            )
+        } else {
+            originPeer = nil
+        }
+        return [BotDeskMessage(
+            id: handoff.activityID,
+            role: .user,
+            text: handoff.outboundText,
+            createdAt: handoff.createdAt,
+            peer: originPeer
+        )]
+    }
+
     private func mergePeerTurns(
         _ messages: [BotDeskMessage],
         conversationID: BotConversationID?
     ) -> [BotDeskMessage] {
         guard let conversationID else { return messages }
         let extras = peerHandoffs.values
-            .filter { $0.originConversationID == conversationID }
             .flatMap { handoff -> [BotDeskMessage] in
-                let peer = BotDeskPeer(
-                    direction: .messaged,
-                    botID: handoff.peerBotID,
-                    name: handoff.peerName,
-                    title: handoff.peerTitle,
-                    handle: handoff.peerHandle,
-                    activityPhase: handoff.phase == .needsAttention
-                        ? .needsAttention
-                        : (handoff.replyText == nil ? .waiting : nil)
-                )
-                var turns = [BotDeskMessage(
-                    id: handoff.activityID,
-                    role: .user,
-                    text: handoff.outboundText,
-                    createdAt: handoff.createdAt,
-                    peer: peer
-                )]
-                if let reply = handoff.replyText {
-                    turns.append(BotDeskMessage(
-                        id: handoff.inboundMessageID,
-                        role: .assistant,
-                        text: reply,
-                        createdAt: handoff.replyCreatedAt ?? handoff.createdAt,
-                        peer: BotDeskPeer(
-                            direction: .fromPeer,
-                            botID: handoff.peerBotID,
-                            name: handoff.peerName,
-                            title: handoff.peerTitle,
-                            handle: handoff.peerHandle
-                        )
-                    ))
+                if handoff.originConversationID == conversationID {
+                    return hostSidePeerTurns(handoff)
                 }
-                return turns
+                if handoff.peerConversationID == conversationID {
+                    return askedBotPeerTurns(handoff)
+                }
+                return []
             }
         guard !extras.isEmpty else { return messages }
         var merged = messages
@@ -6091,11 +6189,20 @@ public final class BotsViewModel: ObservableObject {
             deskMessageRestoreCountForTesting += 1
             persisted = stored.compactMap { message -> BotDeskMessage? in
                 let role: BotDeskMessage.Role
-                let text: String
+                var text: String
                 switch message.role {
                 case .user:
                     role = .user
                     text = BotsDeskFollowThrough.displayUserText(from: message.content)
+                    if BotPeerTranscript.isHostHopUserText(text) { return nil }
+                    if BotPeerTranscript.isPeerAskUserText(text) {
+                        if let conversation, peerHandoffs.values.contains(where: {
+                            $0.peerConversationID == conversation.id
+                        }) {
+                            return nil
+                        }
+                        text = BotPeerTranscript.displayTextFromPeerAsk(text)
+                    }
                 case .assistant:
                     role = .assistant
                     text = message.content
@@ -6151,8 +6258,6 @@ public final class BotsViewModel: ObservableObject {
     private func restoreDeskLiveTurn(botID: BotID) {
         let conversation = conversationForBot(botID)
         guard let threadID = conversation?.linkedAgentThreadID else {
-            liveTimelineByBot[botID] = AssistantTimelineState()
-            liveStreamCountByBot[botID] = 0
             if selectedBotID == botID {
                 deskLiveTimeline = AssistantTimelineState()
                 deskStreamEventCount = 0
@@ -6169,29 +6274,29 @@ public final class BotsViewModel: ObservableObject {
 
     private func applyDeskLiveReplay(botID: BotID, threadID: AgentThreadID, force: Bool = false) {
         let count = context.coordinator.countStreamEvents(threadId: threadID)
-        if !force, liveStreamCountByBot[botID] == count {
+        if !force, liveStreamCountByThread[threadID] == count {
             if selectedBotID == botID {
-                deskLiveTimeline = liveTimelineByBot[botID] ?? deskLiveTimeline
-                deskStreamEventCount = liveStreamCountByBot[botID] ?? count
+                deskLiveTimeline = liveTimelineByThread[threadID] ?? deskLiveTimeline
+                deskStreamEventCount = liveStreamCountByThread[threadID] ?? count
             }
             return
         }
         deskLiveReplayFetchCountForTesting += 1
         let events = context.coordinator.latestStreamEvents(threadId: threadID)
         let state = AgentChatLiveTurnChrome.timelineByReplaying(events)
-        // Only compare against THIS bot's timeline. Using deskLiveTimeline here
-        // kept the previous bot's richer Worked rows after a roster switch.
-        let current = liveTimelineByBot[botID] ?? AssistantTimelineState()
+        // Compare against THIS thread. A per-bot cache kept a richer
+        // hop's Worked rows after the user opened another conversation.
+        let current = liveTimelineByThread[threadID] ?? AssistantTimelineState()
         if AgentChatLiveTurnChrome.isRicher(current, than: state) {
-            liveStreamCountByBot[botID] = max(count, liveStreamCountByBot[botID] ?? 0)
+            liveStreamCountByThread[threadID] = max(count, liveStreamCountByThread[threadID] ?? 0)
             if selectedBotID == botID {
                 deskLiveTimeline = current
-                deskStreamEventCount = liveStreamCountByBot[botID] ?? count
+                deskStreamEventCount = liveStreamCountByThread[threadID] ?? count
             }
             return
         }
-        liveTimelineByBot[botID] = state
-        liveStreamCountByBot[botID] = count
+        liveTimelineByThread[threadID] = state
+        liveStreamCountByThread[threadID] = count
         if selectedBotID == botID {
             deskLiveTimeline = state
             deskStreamEventCount = count
@@ -6200,14 +6305,13 @@ public final class BotsViewModel: ObservableObject {
 
     private func applyIncomingDeskEvent(_ event: AssistantEvent, threadId: AgentThreadID) {
         guard screen == .desk,
-              let botID = selectedBotID,
               selectedConversation?.linkedAgentThreadID == threadId
         else { return }
         var next = deskLiveTimeline
         next.apply(event)
         next.enforceAggregateHotTextBudget()
         deskLiveTimeline = next
-        liveTimelineByBot[botID] = next
+        liveTimelineByThread[threadId] = next
     }
 
     private func refreshDeskLiveTurnIfCountChanged(botID: BotID, threadID: AgentThreadID) {
@@ -6250,7 +6354,9 @@ public final class BotsViewModel: ObservableObject {
         } else {
             run = linkedRun(for: threadID, botID: botID)
         }
-        let rows = BotsDeskFollowThrough.workLogRows(for: run)
+        let mode = (try? context.threadRepo.get(id: threadID))?.permissionMode
+            ?? deskRouting.permissionMode
+        let rows = BotsDeskFollowThrough.workLogRows(for: run, mode: mode)
         if selectedBotID == botID {
             deskWorkLog = rows
         }
@@ -6625,7 +6731,8 @@ public final class BotsViewModel: ObservableObject {
                 routines: routines,
                 workspace: nil,
                 browser: advertisedBrowser,
-                conversationID: prepared.conversation.id
+                conversationID: prepared.conversation.id,
+                liveRunMode: routing.permissionMode
             )
             // Dest already listed Source on open. Stamp that catalog so
             // sendAgentMessage preflight does not rediscover models.
@@ -7193,12 +7300,13 @@ extension BotsViewModel: BotPeerHandoffAuthorityObserver {
                     role: .assistant,
                     text: reply,
                     createdAt: handoff.replyCreatedAt ?? handoff.createdAt,
-                    peer: BotDeskPeer(
+                    peer: deskPeer(
                         direction: .fromPeer,
                         botID: handoff.peerBotID,
                         name: handoff.peerName,
                         title: handoff.peerTitle,
-                        handle: handoff.peerHandle
+                        handle: handoff.peerHandle,
+                        avatarSymbol: handoff.peerAvatarSymbol
                     )
                 )
                 if !(messagesByBot[hostID] ?? []).contains(where: { $0.id == inbound.id }) {
@@ -7206,7 +7314,8 @@ extension BotsViewModel: BotPeerHandoffAuthorityObserver {
                 }
                 lastHopUserTextForTesting = BotPeerTranscript.hostHopPrompt(
                     peerName: handoff.peerName,
-                    reply: reply
+                    reply: reply,
+                    userText: handoff.outboundText
                 )
             }
         }
@@ -8815,14 +8924,7 @@ public struct BotsRootView: View {
                         .padding(.top, DS.Space.xl)
                 }
                 ForEach(Array(vm.deskTimeline.enumerated()), id: \.element.id) { index, item in
-                    if let group = deskPeerGroupCaption(at: index) {
-                        Text(group)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, DS.Space.md)
-                            .accessibilityIdentifier("bots.desk.peer.group")
-                    }
+                    deskPeerGroupHeader(at: index)
                     switch item {
                     case .message(let message):
                         deskBubble(message, columnWidth: columnWidth)
@@ -8851,20 +8953,20 @@ public struct BotsRootView: View {
     }
 
     private func deskBubble(_ message: BotDeskMessage, columnWidth: CGFloat) -> some View {
-        VStack(alignment: .center, spacing: DS.Space.sm) {
+        let trailing = message.peer?.direction != .fromPeer
+        return VStack(alignment: trailing ? .trailing : .leading, spacing: DS.Space.sm) {
             if let peer = message.peer {
-                HStack(spacing: DS.Space.sm) {
-                    Spacer(minLength: 0)
-                    Text(peer.caption)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    BotsAvatarView(name: peer.name, handle: peer.handle, size: 18)
-                }
-                .accessibilityIdentifier(
-                    message.peer?.direction == .messaged
+                AgentChatPeerIdentityHeader(
+                    name: peer.name,
+                    handle: peer.handle,
+                    symbol: peer.avatarSymbol,
+                    trailing: trailing,
+                    caption: peer.caption,
+                    accessibilityIdentifier: peer.direction == .messaged
                         ? "bots.desk.peer.messaged"
                         : "bots.desk.peer.from"
                 )
+                .frame(maxWidth: .infinity, alignment: trailing ? .trailing : .leading)
             }
             Group {
                 if message.role == .user {
@@ -8898,21 +9000,37 @@ public struct BotsRootView: View {
         }
     }
 
-    private func deskPeerGroupCaption(at index: Int) -> String? {
+    @ViewBuilder
+    private func deskPeerGroupHeader(at index: Int) -> some View {
         let items = vm.deskTimeline
-        guard items.indices.contains(index),
-              case .message(let message) = items[index],
-              let peer = message.peer else { return nil }
-        if index > 0, case .message(let previous) = items[index - 1], previous.peer?.botID == peer.botID {
-            return nil
+        if items.indices.contains(index),
+           case .message(let message) = items[index],
+           let peer = message.peer {
+            let startsGroup: Bool = {
+                if index > 0, case .message(let previous) = items[index - 1],
+                   previous.peer?.botID == peer.botID {
+                    return false
+                }
+                return true
+            }()
+            if startsGroup {
+                let count = items[index...].prefix { item in
+                    if case .message(let next) = item { return next.peer?.botID == peer.botID }
+                    return false
+                }.count
+                if count >= 2, let host = vm.selectedBot {
+                    AgentChatPeerGroupHeader(
+                        hostName: host.name,
+                        hostHandle: host.handle,
+                        hostSymbol: host.avatarSymbol,
+                        peerName: peer.name,
+                        peerHandle: peer.handle,
+                        peerSymbol: peer.avatarSymbol,
+                        count: count
+                    )
+                }
+            }
         }
-        var count = 0
-        for later in items[index...] {
-            guard case .message(let next) = later, next.peer?.botID == peer.botID else { break }
-            count += 1
-        }
-        guard count >= 2 else { return nil }
-        return peer.groupCaption(count: count)
     }
 
     private func deskWorkLogRow(_ row: BotDeskWorkLogRow) -> some View {

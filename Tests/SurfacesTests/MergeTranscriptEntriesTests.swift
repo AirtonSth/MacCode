@@ -211,4 +211,41 @@ final class MergeTranscriptEntriesTests: XCTestCase {
             "persisted duplicate must not paint above Work so far"
         )
     }
+
+    func test_merge_omitsInternalHostHopUserMessage() {
+        // WHY: Agent App persisted the host hop as a user bubble, so the
+        // follow-up window anchored on "Quinn replied:" instead of the @mention
+        // and painted raw markdown. Desk already hides that row.
+        let ask = AgentMessage(
+            id: AgentMessageID(),
+            threadId: Self.tid,
+            role: .user,
+            content: "@quinn what is in the inbox?",
+            createdAt: Date(timeIntervalSince1970: 1)
+        )
+        let hop = AgentMessage(
+            id: AgentMessageID(),
+            threadId: Self.tid,
+            role: .user,
+            content: BotPeerTranscript.hostHopPrompt(
+                peerName: "Quinn",
+                reply: "**Nome:** Quinn",
+                userText: "@quinn what is in the inbox?"
+            ),
+            createdAt: Date(timeIntervalSince1970: 2)
+        )
+        XCTAssertTrue(AgentAppView.isInternalPeerHopUserMessage(hop))
+        XCTAssertFalse(AgentAppView.isInternalPeerHopUserMessage(ask))
+        let ids = merged([ask, hop], [])
+        XCTAssertTrue(ids.contains("message-\(ask.id.value.uuidString)"))
+        XCTAssertFalse(
+            ids.contains("message-\(hop.id.value.uuidString)"),
+            "internal hop prompt must not enter the Agent App transcript"
+        )
+        let window = AgentAppView.followUpAnchoredWindow(entries: [
+            .message(ask),
+            .message(hop),
+        ])
+        XCTAssertEqual(window?.first?.id, "message-\(ask.id.value.uuidString)")
+    }
 }
