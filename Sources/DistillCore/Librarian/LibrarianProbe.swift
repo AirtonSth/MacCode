@@ -3,10 +3,17 @@ import Foundation
 public struct LibrarianProbeRecord: Sendable, Equatable, Codable {
     public let id: String
     public let safety: String
+    public let runtime: String
+    public let usesLLM: Bool
     public let status: String
     public let mark: String
     public let savedTokens: Int
     public let delivered: Bool
+    public let paidText: String
+    public let envelopeJSON: String
+    public let latencyMs: Int
+    public let model: String
+    public let generateCalled: Bool
 }
 
 public enum LibrarianProbe {
@@ -33,19 +40,32 @@ public enum LibrarianProbe {
         )
     }
 
-    public static func run(id: String, dispatcher: LibrarianDispatcher) async -> LibrarianProbeRecord {
+    public static func run(
+        id: String,
+        dispatcher: LibrarianDispatcher,
+        model: String = ""
+    ) async -> LibrarianProbeRecord {
+        let instrumented = dispatcher.generate as? LibrarianInstrumentedGenerate
+        let before = instrumented?.callCount ?? 0
         let request = fixture(for: id, store: dispatcher.store)
         let result = await dispatcher.dispatch(request)
         let fn = LibrarianCatalog.function(id: id)
-        let safety = fn?.safety.rawValue ?? "unknown"
-        let mark = mark(for: fn, result: result)
+        let called = (instrumented?.callCount ?? 0) > before
+        let latency = called ? (instrumented?.lastLatencyMs ?? 0) : 0
         return LibrarianProbeRecord(
             id: id,
-            safety: safety,
+            safety: fn?.safety.rawValue ?? "unknown",
+            runtime: fn?.runtime.rawValue ?? "none",
+            usesLLM: fn?.usesLLM ?? false,
             status: result.status.rawValue,
-            mark: mark,
+            mark: mark(for: fn, result: result),
             savedTokens: result.analytics.savedTokens,
-            delivered: result.analytics.delivered
+            delivered: result.analytics.delivered,
+            paidText: result.text,
+            envelopeJSON: result.envelope?.jsonString() ?? "",
+            latencyMs: latency,
+            model: model,
+            generateCalled: called
         )
     }
 
@@ -66,12 +86,38 @@ public enum LibrarianProbe {
         return "pendente"
     }
 
-    public static func runAll(dispatcher: LibrarianDispatcher) async -> [LibrarianProbeRecord] {
+    public static func runAll(
+        dispatcher: LibrarianDispatcher,
+        model: String = ""
+    ) async -> [LibrarianProbeRecord] {
+        if let generate = dispatcher.generate, !(generate is LibrarianInstrumentedGenerate) {
+            dispatcher.generate = LibrarianInstrumentedGenerate(generate)
+        }
         var rows: [LibrarianProbeRecord] = []
         for id in LibrarianCatalog.ids {
-            rows.append(await run(id: id, dispatcher: dispatcher))
+            rows.append(await run(id: id, dispatcher: dispatcher, model: model))
         }
         return rows
+    }
+
+    public static func summary(_ rows: [LibrarianProbeRecord]) -> String {
+        var byStatus: [String: Int] = [:]
+        var byRuntime: [String: Int] = [:]
+        var generate = 0
+        var nonGenerate = 0
+        for row in rows {
+            byStatus[row.status, default: 0] += 1
+            byRuntime[row.runtime, default: 0] += 1
+            if row.generateCalled { generate += 1 } else { nonGenerate += 1 }
+        }
+        let statusLine = byStatus.keys.sorted().map { "\($0)=\(byStatus[$0] ?? 0)" }.joined(separator: " ")
+        let runtimeLine = byRuntime.keys.sorted().map { "\($0)=\(byRuntime[$0] ?? 0)" }.joined(separator: " ")
+        return """
+        n=\(rows.count) unique=\(Set(rows.map(\.id)).count)
+        status \(statusLine)
+        runtime \(runtimeLine)
+        generate_called=\(generate) generate_not_called=\(nonGenerate)
+        """
     }
 
     private static func sampleText(for id: String) -> String {

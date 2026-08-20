@@ -10,6 +10,25 @@ public protocol LibrarianGenerating: Sendable {
     func generate(_ call: LibrarianGenerateCall) async -> String?
 }
 
+/// Counts generate calls and last-call latency for the shipped probe/benchmark path.
+public final class LibrarianInstrumentedGenerate: LibrarianGenerating, @unchecked Sendable {
+    public let inner: any LibrarianGenerating
+    public private(set) var callCount = 0
+    public private(set) var lastLatencyMs = 0
+
+    public init(_ inner: any LibrarianGenerating) {
+        self.inner = inner
+    }
+
+    public func generate(_ call: LibrarianGenerateCall) async -> String? {
+        let start = Date()
+        let out = await inner.generate(call)
+        lastLatencyMs = max(0, Int(Date().timeIntervalSince(start) * 1000))
+        callCount += 1
+        return out
+    }
+}
+
 /// OpenAI-compatible localhost generate (oMLX / Distill sidecar style).
 /// Default-off: only used when `RC_LIBRARIAN_GENERATE_BASE_URL` is set.
 public struct LibrarianOpenAICompatibleRuntime: LibrarianGenerating, Sendable {
@@ -57,11 +76,23 @@ public struct LibrarianOpenAICompatibleRuntime: LibrarianGenerating, Sendable {
               (200..<300).contains(http.statusCode),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = obj["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = message["content"] as? String else {
+              let message = choices.first?["message"] as? [String: Any] else {
             return nil
         }
+        // Paid-facing text is `content` only. Never return `reasoning_content`.
+        let content = Self.messageContent(message)
+        guard !content.isEmpty else { return nil }
         return LibrarianThinkStrip.strip(content)
+    }
+
+    private static func messageContent(_ message: [String: Any]) -> String {
+        if let text = message["content"] as? String {
+            return text
+        }
+        if let parts = message["content"] as? [[String: Any]] {
+            return parts.compactMap { $0["text"] as? String }.joined()
+        }
+        return ""
     }
 }
 

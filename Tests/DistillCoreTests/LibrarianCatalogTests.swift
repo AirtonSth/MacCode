@@ -168,6 +168,44 @@ final class LibrarianCatalogTests: XCTestCase {
         XCTAssertFalse(result.analytics.delivered)
     }
 
+    func test_askHandle_stripsThinkAndReasoningContent() async {
+        let dispatcher = LibrarianDispatcher(generate: LibrarianThinkWrappedGenerate())
+        let original = "ERROR payment failed at Sources/Billing.swift:12\nretry ignored\n"
+        let handle = dispatcher.store.put(original)
+        let result = await dispatcher.dispatch(LibrarianRequest(
+            id: "ask_handle",
+            question: "what failed?",
+            handle: handle,
+            provider: "grok"
+        ))
+        XCTAssertEqual(result.status, .ok)
+        XCTAssertFalse(result.text.contains("<think>"), "paid-facing text leaked think block")
+        XCTAssertFalse(result.text.contains("reasoning_content"))
+        XCTAssertFalse(result.text.contains("secret chain"))
+        let envelope = result.envelope?.jsonString() ?? ""
+        XCTAssertFalse(envelope.contains("<think>"))
+        XCTAssertFalse(envelope.contains("reasoning_content"))
+        XCTAssertGreaterThanOrEqual(result.analytics.savedTokens, 0)
+        XCTAssertNotNil(result.analytics.record)
+        XCTAssertNotNil(result.envelope)
+        let span = result.envelope?.evidence.first?.span ?? ""
+        XCTAssertFalse(span.isEmpty)
+        XCTAssertTrue(original.contains(span))
+    }
+
+    func test_forbidden_doesNotCallGenerate() async {
+        let instrumented = LibrarianInstrumentedGenerate(LibrarianThinkWrappedGenerate())
+        let dispatcher = LibrarianDispatcher(generate: instrumented)
+        let result = await dispatcher.dispatch(LibrarianRequest(
+            id: "apply_patch",
+            input: "diff --git a/x b/x\n",
+            provider: "claude"
+        ))
+        XCTAssertEqual(result.status, LibrarianStatus.refused)
+        XCTAssertEqual(instrumented.callCount, 0, "forbidden IDs must not call generate")
+        XCTAssertEqual(result.analytics.savedTokens, 0)
+    }
+
     func test_askHandle_envelopeSpanIsSubstring() async {
         let dispatcher = LibrarianDispatcher(generate: LibrarianScriptedGenerate())
         let original = "ERROR payment failed at Sources/Billing.swift:12\nretry ignored\n"

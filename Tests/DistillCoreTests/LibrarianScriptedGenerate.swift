@@ -31,3 +31,24 @@ struct LibrarianScriptedGenerate: LibrarianGenerating {
         return text
     }
 }
+
+/// Scripted generate wrapped the way Ornith-1.5 emits reasoning: a `<think>`
+/// block plus a `reasoning_content` JSON key. The shipped strip path must
+/// drop both before paid-facing text is recorded.
+struct LibrarianThinkWrappedGenerate: LibrarianGenerating {
+    let inner = LibrarianScriptedGenerate()
+
+    func generate(_ call: LibrarianGenerateCall) async -> String? {
+        guard let body = await inner.generate(call),
+              let data = body.data(using: .utf8),
+              var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return "<think>hidden chain</think>\n{\"answer\":\"x\",\"span\":\"x\",\"reasoning_content\":\"NOPE\"}"
+        }
+        object["reasoning_content"] = "internal scratch that must never reach paid context"
+        guard let encoded = try? JSONSerialization.data(withJSONObject: object),
+              let json = String(data: encoded, encoding: .utf8) else {
+            return nil
+        }
+        return "<think>secret chain of thought about billing</think>\n" + json
+    }
+}
