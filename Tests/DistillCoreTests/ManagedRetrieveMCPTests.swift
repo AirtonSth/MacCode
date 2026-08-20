@@ -49,7 +49,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let srv = server(["rcv1.capability": "exact original"], scoped: true)
         let listed = try parse(await srv.handle(#"{"jsonrpc":"2.0","id":20,"method":"tools/list"}"#))
         let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_retrieve", "rc_compress"])
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_retrieve", "rc_search", "rc_compress"])
 
         let called = try parse(await srv.handle(
             #"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"rc_retrieve","arguments":{"handle":"rcv1.capability"}}}"#

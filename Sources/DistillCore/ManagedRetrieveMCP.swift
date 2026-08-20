@@ -17,24 +17,33 @@ public struct ManagedRetrieveMCP: Sendable {
     public static let searchToolName = "rc_search"
     public static let statsToolName = "rc_stats"
     public static let compressToolName = "rc_compress"
+    public static let askToolName = "rc_ask"
+    public static let v1ToolNames = [statsToolName, toolName, searchToolName, compressToolName, askToolName]
+    public typealias AskFn = @Sendable (_ handle: String, _ question: String, _ op: String) async -> String?
     private let retrieve: RetrieveFn
     private let search: SearchFn
     private let stats: StatsFn
     private let compress: CompressFn?
+    private let ask: AskFn?
     private let scopedRecoveryAvailable: Bool
+    private let tokenSaverAdmitted: Bool
 
     public init(
         retrieve: @escaping RetrieveFn,
         search: @escaping SearchFn = { _, _ in [] },
         stats: @escaping StatsFn = { nil },
         compress: CompressFn? = nil,
-        scopedRecoveryAvailable: Bool = false
+        ask: AskFn? = nil,
+        scopedRecoveryAvailable: Bool = false,
+        tokenSaverAdmitted: Bool = true
     ) {
         self.retrieve = retrieve
         self.search = search
         self.stats = stats
         self.compress = compress
+        self.ask = ask
         self.scopedRecoveryAvailable = scopedRecoveryAvailable
+        self.tokenSaverAdmitted = tokenSaverAdmitted
     }
 
     /// Handle one JSON-RPC request line. Returns the response line, or nil for notifications
@@ -62,44 +71,20 @@ public struct ManagedRetrieveMCP: Sendable {
                 "serverInfo": ["name": "remotecode-distill-retrieve", "version": "1"],
             ])
         case "tools/list":
-            var tools: [[String: Any]] = [[
-                "name": Self.statsToolName,
-                "description": "Return local RemoteCode Token Saver measurement stats with their evidence labels.",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [String: Any](),
-                ],
-            ]]
-            if scopedRecoveryAvailable {
-                tools.append([
-                    "name": Self.toolName,
-                    "description": "Retrieve a scoped byte-exact original using the current runtime scope.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": ["handle": ["type": "string"]],
-                        "required": ["handle"],
-                    ],
-                ])
-                if compress != nil {
-                    tools.append([
-                        "name": Self.compressToolName,
-                        "description": "Compress input only after scoped durable recovery succeeds.",
-                        "inputSchema": [
-                            "type": "object",
-                            "properties": ["input": ["type": "string"]],
-                            "required": ["input"],
-                        ],
-                    ])
-                }
-            }
             return reply(id: id, result: [
-                "tools": tools,
+                "tools": listedTools(),
             ])
         case "tools/call":
             let params = msg["params"] as? [String: Any]
             let args = params?["arguments"] as? [String: Any]
             let name = params?["name"] as? String
-            guard name == Self.statsToolName || (scopedRecoveryAvailable && (name == Self.toolName || name == Self.compressToolName)) else {
+            guard tokenSaverAdmitted else {
+                return errorReply(id: id, code: -32602, message: "tool unavailable: token saver inactive")
+            }
+            let scopedNames: Set<String> = [
+                Self.toolName, Self.searchToolName, Self.compressToolName, Self.askToolName
+            ]
+            guard name == Self.statsToolName || (scopedRecoveryAvailable && name.map { scopedNames.contains($0) } == true) else {
                 return errorReply(
                     id: id,
                     code: -32602,
@@ -129,9 +114,36 @@ public struct ManagedRetrieveMCP: Sendable {
                     "isError": false,
                 ])
             }
+            if name == Self.askToolName {
+                guard let handle = args?["handle"] as? String else {
+                    return errorReply(id: id, code: -32602, message: "missing handle")
+                }
+                let question = args?["question"] as? String ?? ""
+                let op = args?["op"] as? String ?? "ask_handle"
+                guard let ask else {
+                    return reply(id: id, result: [
+                        "content": [["type": "text", "text": "ask unavailable"]],
+                        "isError": true,
+                    ])
+                }
+                let text = await ask(handle, question, op) ?? "unavailable"
+                return reply(id: id, result: [
+                    "content": [["type": "text", "text": text]],
+                    "isError": false,
+                ])
+            }
             if name == Self.compressToolName {
-                guard let input = args?["input"] as? String else {
-                    return errorReply(id: id, code: -32602, message: "missing input")
+                if args?["input"] != nil && args?["handle"] == nil {
+                    return errorReply(id: id, code: -32602, message: "rc_compress is handle-only; blob input refused")
+                }
+                guard let handle = args?["handle"] as? String else {
+                    return errorReply(id: id, code: -32602, message: "missing handle")
+                }
+                guard let input = await retrieve(handle) else {
+                    return reply(id: id, result: [
+                        "content": [["type": "text", "text": "original unavailable"]],
+                        "isError": true,
+                    ])
                 }
                 let estimatedInputTokens = args?["estimatedInputTokens"] as? Int ?? TokenEstimator.estimate(input)
                 let toolRoundTripTokens = args?["toolRoundTripTokens"] as? Int ?? 200
@@ -183,6 +195,70 @@ public struct ManagedRetrieveMCP: Sendable {
         default:
             return errorReply(id: id, code: -32601, message: "method not found: \(method)")
         }
+    }
+
+    private func listedTools() -> [[String: Any]] {
+        guard tokenSaverAdmitted else { return [] }
+        var tools: [[String: Any]] = [[
+            "name": Self.statsToolName,
+            "description": "Return local RemoteCode Token Saver measurement stats with their evidence labels.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [String: Any](),
+            ],
+        ]]
+        guard scopedRecoveryAvailable else { return tools }
+        tools.append([
+            "name": Self.toolName,
+            "description": "Retrieve a scoped byte-exact original using the current runtime scope.",
+            "inputSchema": [
+                "type": "object",
+                "properties": ["handle": ["type": "string"]],
+                "required": ["handle"],
+            ],
+        ])
+        tools.append([
+            "name": Self.searchToolName,
+            "description": "Search scoped recovery handles by query. Miss is not evidence of absence.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "query": ["type": "string"],
+                    "topK": ["type": "integer"],
+                ],
+                "required": ["query"],
+            ],
+        ])
+        if compress != nil {
+            tools.append([
+                "name": Self.compressToolName,
+                "description": "Compress a scoped handle. Handle-only; blob input is refused.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "handle": ["type": "string"],
+                        "question": ["type": "string"],
+                    ],
+                    "required": ["handle"],
+                ],
+            ])
+        }
+        if ask != nil {
+            tools.append([
+                "name": Self.askToolName,
+                "description": "Extractive ask/extract/pick/digest over a scoped handle. Extra catalog ops use the op argument.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "handle": ["type": "string"],
+                        "question": ["type": "string"],
+                        "op": ["type": "string"],
+                    ],
+                    "required": ["handle", "question"],
+                ],
+            ])
+        }
+        return tools
     }
 
     private func reply(id: Any?, result: [String: Any]) -> String? {
