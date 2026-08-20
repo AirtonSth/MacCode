@@ -10737,16 +10737,17 @@ public struct AgentAppView: View {
     }
 
     static func hiddenPersistedAssistantMessageIDs(messages: [AgentMessage],
-                                                   timelineTurns: [AssistantTurnSnapshot],
-                                                   persistedAssistantTexts: [String]? = nil) -> Set<AgentMessageID> {
+                                                   timelineTurns: [AssistantTurnSnapshot]) -> Set<AgentMessageID> {
         let assistantMessages = messages.filter { $0.role == .assistant && !$0.content.isEmpty }
         guard !assistantMessages.isEmpty, !timelineTurns.isEmpty else { return [] }
-        let persistedTexts = persistedAssistantTexts ?? assistantMessages.map(\.content)
         let lookup = AssistantTextLookup(messages: assistantMessages)
         var hidden: Set<AgentMessageID> = []
         for turn in timelineTurns {
-            let visibleAssistantText = renderableAssistantItemBodies(in: turn, persistedAssistantTexts: persistedTexts)
-                .joined(separator: "\n")
+            let visibleAssistantBodies = renderableAssistantItemBodies(in: turn)
+            for body in visibleAssistantBodies {
+                hidden.formUnion(lookup.ids(equalTo: body))
+            }
+            let visibleAssistantText = visibleAssistantBodies.joined(separator: "\n")
             hidden.formUnion(lookup.ids(equalTo: visibleAssistantText))
             if let final = turn.finalAssistantMessage, !final.isEmpty {
                 hidden.formUnion(lookup.ids(equalTo: final))
@@ -11732,8 +11733,7 @@ public struct AgentAppView: View {
         }
         let ids = Self.hiddenPersistedAssistantMessageIDs(
             messages: vm.messages,
-            timelineTurns: vm.timeline.turns,
-            persistedAssistantTexts: persistedAssistantTexts
+            timelineTurns: vm.timeline.turns
         )
         hiddenPersistedAssistantMessageCache.generation = generation
         hiddenPersistedAssistantMessageCache.key = key

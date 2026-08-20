@@ -3178,6 +3178,52 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    func test_hiddenPersistedAssistantMessageIDsHidesEachPersistedProgressMessageOwnedByTurn() {
+        // WHY: the shared turn chrome paints every assistant progress item. If
+        // those same updates are also durable AgentMessages, keeping both rows
+        // produces the doubled progress text and copy buttons seen in Agent App.
+        let threadId = AgentThreadID()
+        let first = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "State intact. Verifying the unrelated failure."
+        )
+        let second = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "Confirmed pre-existing. Running the isolated suite."
+        )
+        let final = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "Zero failures across every touched module."
+        )
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-progress",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-progress", type: .assistantMessage,
+                              state: .completed, body: first.content, startedAtMs: 1, finishedAtMs: 2),
+                AssistantItem(id: "tool-1", turnId: "turn-progress", type: .commandExecution,
+                              state: .completed, summary: "Bash", startedAtMs: 3, finishedAtMs: 4),
+                AssistantItem(id: "msg-2", turnId: "turn-progress", type: .assistantMessage,
+                              state: .completed, body: second.content, startedAtMs: 5, finishedAtMs: 6),
+                AssistantItem(id: "msg-3", turnId: "turn-progress", type: .assistantMessage,
+                              state: .completed, body: final.content, startedAtMs: 7, finishedAtMs: 8),
+            ],
+            finalAssistantMessage: final.content,
+            finished: true
+        )
+
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(
+                messages: [first, second, final],
+                timelineTurns: [turn]
+            ),
+            [first.id, second.id, final.id],
+            "each durable copy already owned by the turn must be hidden, including intermediate progress"
+        )
+    }
+
     func test_hiddenPersistedAssistantMessageIDsKeepsPersistedAnswerWhenLiveDuplicateIsSuppressed() {
         let threadId = AgentThreadID()
         let persisted = AgentMessage(
