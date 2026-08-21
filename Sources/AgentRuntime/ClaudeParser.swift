@@ -41,6 +41,15 @@ public final class ClaudeParser {
     private var assembledAssistantBodyCompact: String = ""
     private var emittedAssistantBodyNormalizedKeys: Set<String> = []
     private var emittedAssistantBodyCompactKeys: Set<String> = []
+    // CLAUDE-PARTIAL-REPLAY: with --include-partial-messages every API message
+    // arrives twice — streamed (message_start → content_block_*) AND replayed as
+    // whole `assistant` events carrying the SAME message.id, one event per
+    // completed block, emitted BEFORE that block's content_block_stop. Message ids
+    // seen via message_start are recorded here so the replay's text/thinking
+    // blocks are not opened as a second transcript item (the body-equality dedup
+    // below cannot catch them: it records emitted bodies only at
+    // content_block_stop, which has not arrived yet).
+    private var streamedMessageIds: Set<String> = []
 
     public func parseLine(_ line: String) -> [AssistantEvent] {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -108,13 +117,18 @@ public final class ClaudeParser {
 
         switch type {
         case "message_start":
+            let messageId = (obj["message"] as? [String: Any])?["id"] as? String
             if currentTurnId == nil {
-                let msg = obj["message"] as? [String: Any]
-                let id = (msg?["id"] as? String) ?? UUID().uuidString
+                let id = messageId ?? UUID().uuidString
                 currentTurnId = id
                 resetAssistantBodyDedupState()
                 indexToAssistantBody = [:]
                 out.append(.turnStarted(turnId: id))
+            }
+            // CLAUDE-PARTIAL-REPLAY: recorded after the reset above so the first
+            // message's id survives it.
+            if let messageId, !messageId.isEmpty {
+                streamedMessageIds.insert(messageId)
             }
         case "content_block_start":
             let index = obj["index"] as? Int ?? 0
@@ -151,8 +165,10 @@ public final class ClaudeParser {
                 let text = delta["text"] as? String
                 // API-delta path only; the assembled normalized/compact dedup forms
                 // are intentionally NOT updated here — they are read solely by the
-                // whole-message `assistant` path (assembledAssistantBodyMatches), and
-                // a single CLI invocation uses one shape, never both.
+                // whole-message `assistant` path (assembledAssistantBodyMatches).
+                // When both shapes arrive (--include-partial-messages), the whole-
+                // message replay of a streamed message is skipped upstream via
+                // streamedMessageIds (CLAUDE-PARTIAL-REPLAY) and never consults them.
                 if let text { assembledAssistantBody += text }
                 if let text, indexToType[index] == .assistantMessage {
                     indexToAssistantBody[index, default: ""] += text
@@ -214,6 +230,14 @@ public final class ClaudeParser {
             // assistant answer. Only tool_result blocks (which ride on
             // user-role messages) may be processed for user messages.
             let isUserMessage = type == "user" || (msg["role"] as? String) == "user"
+            // CLAUDE-PARTIAL-REPLAY: a whole `assistant` event whose message.id was
+            // already seen via a streamed message_start is a per-block replay of
+            // content the content_block_* path is rendering live. Its text/thinking
+            // blocks must not open a second item. Tool blocks still flow through:
+            // they are keyed by the provider tool id, so both paths converge on one
+            // item, and the usage extraction below must keep running either way.
+            let isStreamedMessageReplay = (msg["id"] as? String)
+                .map { streamedMessageIds.contains($0) } ?? false
             let content = msg["content"] as? [[String: Any]] ?? []
             for block in content {
                 let bt = (block["type"] as? String) ?? "text"
@@ -221,7 +245,7 @@ public final class ClaudeParser {
                 let turnId = currentTurnId ?? ""
                 switch bt {
                 case "text":
-                    if isUserMessage { break }
+                    if isUserMessage || isStreamedMessageReplay { break }
                     let text = block["text"] as? String ?? ""
                     if text.isEmpty { break }
                     if assembledAssistantBodyMatches(text) || hasEmittedAssistantBody(text) { break }
@@ -231,7 +255,7 @@ public final class ClaudeParser {
                     out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
                     out.append(.itemCompleted(itemId: itemId, finalState: .completed))
                 case "thinking":
-                    if isUserMessage { break }
+                    if isUserMessage || isStreamedMessageReplay { break }
                     let text = block["thinking"] as? String ?? ""
                     out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .reasoning, state: .streaming, summary: nil, body: "", startedAtMs: now)))
                     out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
@@ -1098,6 +1122,7 @@ public final class ClaudeParser {
         emittedAssistantBodyNormalizedKeys = []
         emittedAssistantBodyCompactKeys = []
         emittedStructuredUserInputRequestIds = []
+        streamedMessageIds = []
     }
 
     private func deduplicatedStructuredUserInputRequest(_ request: AssistantUserInputRequest) -> [AssistantEvent] {

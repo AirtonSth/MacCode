@@ -493,6 +493,52 @@ final class ClaudeParserCLITests: XCTestCase {
         XCTAssertEqual(finalMessage(evs), final)
     }
 
+    // REGRESSION (live run 2026-08-21, claude CLI 2.1.238, default CLI engine):
+    // with --include-partial-messages every API message arrives TWICE — streamed
+    // (message_start → content_block_start/delta) AND replayed as whole `assistant`
+    // events carrying the SAME message.id, one event per completed block, emitted
+    // BEFORE that block's content_block_stop. Thinking blocks had no dedup at all,
+    // and text dedup keyed off content_block_stop (not yet arrived), so every
+    // thought and answer rendered twice in the Agent App transcript. The replay of
+    // a streamed message must not open a second item; content still renders once.
+    func test_partialMessagesWholeAssistantReplay_doesNotDuplicateThinkingOrText() {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"sess-partial"}"#,
+            #"{"type":"stream_event","session_id":"sess-partial","event":{"type":"message_start","message":{"id":"msg_live1","role":"assistant","content":[]}}}"#,
+            #"{"type":"stream_event","session_id":"sess-partial","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+            #"{"type":"stream_event","session_id":"sess-partial","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Pondering the fix."}}}"#,
+            #"{"type":"assistant","session_id":"sess-partial","message":{"id":"msg_live1","role":"assistant","content":[{"type":"thinking","thinking":"Pondering the fix."}]}}"#,
+            #"{"type":"stream_event","session_id":"sess-partial","event":{"type":"content_block_stop","index":0}}"#,
+            #"{"type":"stream_event","session_id":"sess-partial","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}"#,
+            #"{"type":"stream_event","session_id":"sess-partial","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"All new locators verified."}}}"#,
+            #"{"type":"assistant","session_id":"sess-partial","message":{"id":"msg_live1","role":"assistant","content":[{"type":"text","text":"All new locators verified."}]}}"#,
+            #"{"type":"stream_event","session_id":"sess-partial","event":{"type":"content_block_stop","index":1}}"#,
+            #"{"type":"result","subtype":"success","result":"All new locators verified.","session_id":"sess-partial"}"#
+        ])
+
+        let reasoningStarts = evs.filter {
+            if case .itemStarted(let item) = $0 { return item.type == .reasoning }
+            return false
+        }
+        let assistantMessageStarts = evs.filter {
+            if case .itemStarted(let item) = $0 { return item.type == .assistantMessage }
+            return false
+        }
+        XCTAssertEqual(reasoningStarts.count, 1,
+                       "the whole-assistant replay of a streamed thinking block must not open a second reasoning item — every thought rendered twice")
+        XCTAssertEqual(assistantMessageStarts.count, 1,
+                       "the whole-assistant replay of a streamed text block must not open a second answer item — every answer rendered twice")
+        let bodies = evs.compactMap { event -> String? in
+            if case .itemDelta(_, let body, _, _) = event { return body }
+            return nil
+        }
+        XCTAssertEqual(bodies.filter { $0 == "Pondering the fix." }.count, 1,
+                       "streamed thinking must still render exactly once")
+        XCTAssertEqual(bodies.filter { $0 == "All new locators verified." }.count, 1,
+                       "streamed answer text must still render exactly once")
+        XCTAssertEqual(finalMessage(evs), "All new locators verified.")
+    }
+
     // REGRESSION (Agent App CPU ramp on long Claude runs): `claude --output-format
     // stream-json` emits WHOLE assistant messages and never sends message_start, so
     // the dedup accumulators (assembledAssistantBody + emitted bodies) reset only at
