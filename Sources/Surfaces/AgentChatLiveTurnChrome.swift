@@ -715,6 +715,10 @@ public struct AgentChatLiveTurnView: View {
     public let turn: AssistantTurnSnapshot
     public let live: Bool
     public let hideAssistantOutput: Bool
+    /// False paints the work blocks directly (no "Work so far" disclosure).
+    /// Used by live turn-segment continuations after an interleaved bot
+    /// message so the chat keeps appending instead of stacking headers.
+    public var showsWorkHeader: Bool
     public var renderFinal: ((String) -> AnyView)?
     public var afterWork: AnyView?
 
@@ -728,12 +732,14 @@ public struct AgentChatLiveTurnView: View {
         turn: AssistantTurnSnapshot,
         live: Bool,
         hideAssistantOutput: Bool = false,
+        showsWorkHeader: Bool = true,
         renderFinal: ((String) -> AnyView)? = nil,
         afterWork: AnyView? = nil
     ) {
         self.turn = turn
         self.live = live
         self.hideAssistantOutput = hideAssistantOutput
+        self.showsWorkHeader = showsWorkHeader
         self.renderFinal = renderFinal
         self.afterWork = afterWork
     }
@@ -757,20 +763,35 @@ public struct AgentChatLiveTurnView: View {
                 .accessibilityIdentifier("bots.desk.thought")
             }
             if !composition.work.isEmpty {
-                AgentChatWorkSoFarDisclosure(
-                    turn: turn,
-                    live: live,
-                    blocks: AgentCompletedWorkPresentation.shouldBuildBlocks(
-                        expandCompletedWork: expanded,
-                        workItemCount: blocks.count
-                    ) ? blocks : [],
-                    workBlockCount: blocks.count,
-                    isExpanded: expanded,
-                    onToggle: toggleWork,
-                    expandedReasoning: $expandedReasoning,
-                    expandedTools: $expandedTools,
-                    expandedToolGroups: $expandedToolGroups
-                )
+                if showsWorkHeader {
+                    AgentChatWorkSoFarDisclosure(
+                        turn: turn,
+                        live: live,
+                        blocks: AgentCompletedWorkPresentation.shouldBuildBlocks(
+                            expandCompletedWork: expanded,
+                            workItemCount: blocks.count
+                        ) ? blocks : [],
+                        workBlockCount: blocks.count,
+                        isExpanded: expanded,
+                        onToggle: toggleWork,
+                        expandedReasoning: $expandedReasoning,
+                        expandedTools: $expandedTools,
+                        expandedToolGroups: $expandedToolGroups
+                    )
+                } else {
+                    VStack(alignment: .leading, spacing: DS.Space.lg) {
+                        ForEach(blocks) { block in
+                            AgentChatWorkBlockView(
+                                block: block,
+                                expandedReasoning: $expandedReasoning,
+                                expandedTools: $expandedTools,
+                                expandedToolGroups: $expandedToolGroups
+                            )
+                        }
+                    }
+                    .padding(.leading, DS.Space.md)
+                    .accessibilityIdentifier("agent.work.continuation.\(turn.turnId)")
+                }
             }
             if let afterWork {
                 afterWork

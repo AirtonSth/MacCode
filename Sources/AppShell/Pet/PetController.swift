@@ -983,7 +983,8 @@ public final class PetController {
     }
 
     private func refreshActiveThreadsFromCoordinator() {
-        let threadIDs = Array(context.coordinator.activeThreadIdsSnapshot())
+        // Primary threads only — delegated bot-peer runs show under Subagents.
+        let threadIDs = Array(context.coordinator.primaryActiveThreadIdsSnapshot())
         applyActiveThreadIDs(threadIDs)
         // Reconcile animation active-run set to coordinator truth (not EventBus alone).
         let hostRunIDs = Set(threadIDs.compactMap {

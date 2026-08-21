@@ -362,7 +362,8 @@ public final class AppContext {
         checkpointRepo: turnCheckpointRepo,
         settingsRepo: settingsRepo,
         coordinator: coordinator,
-        appSupportDirectory: appSupportDirectory
+        appSupportDirectory: appSupportDirectory,
+        orchestrationRuntime: orchestrationRuntime
     )
     private var tokenSaverCodexAdapter: CodexAppServerAdapter
     public var router: AppCommandRouter! {

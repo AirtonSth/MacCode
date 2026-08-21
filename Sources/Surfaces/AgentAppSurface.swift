@@ -3194,10 +3194,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// App tabs share the same thread list, and a workspace-wide check made
     /// every tab spin whenever any one of them was running.
     public var hasRunningWorkForChrome: Bool {
-        if hasWaitingBotPeerActivity { return true }
+        if hasWaitingBotPeerActivity,
+           Self.waitingPeerActivityKeepsChromeBusy(threadStatus: status) {
+            return true
+        }
         if selectedThreadRunIsStartingOrRunning { return true }
         return runThreads.values.contains { threadId in
             coordinator.activeRunId(threadId: threadId) != nil
+        }
+    }
+
+    /// A persisted `.waiting` peer row spins the chrome only while the thread
+    /// can still deliver the reply. Cancelled/failed/interrupted threads must
+    /// never latch the tab and workspace spinners on a stale waiting row.
+    /// Completed stays busy on purpose: reply_only tails land after the host
+    /// finishes, and reconciliation settles the row shortly after.
+    nonisolated static func waitingPeerActivityKeepsChromeBusy(
+        threadStatus: AgentRunStatus
+    ) -> Bool {
+        switch threadStatus {
+        case .pending, .running, .completed:
+            return true
+        case .cancelled, .failed, .interrupted:
+            return false
         }
     }
 
@@ -11087,6 +11106,74 @@ public struct AgentAppView: View {
         }
     }
 
+    /// Chat paint row: either an untouched transcript entry, or one segment of
+    /// a turn that was split around interleaved bot peer messages so the chat
+    /// keeps strict arrival order (work → reply → more work → waiting…).
+    enum ChatFlowRow: Identifiable {
+        case entry(TranscriptEntry)
+        case segment(AgentChatTurnSegmentation.TurnSegment)
+
+        var id: String {
+            switch self {
+            case .entry(let entry): return entry.id
+            case .segment(let segment): return segment.rowId
+            }
+        }
+    }
+
+    /// Only bot-peer chrome interleaves a turn: waiting/needs-attention
+    /// activity rows and attributed "From <bot>" replies. Every other message
+    /// (user prompts, the turn's own durable final, system rows) ends boundary
+    /// collection so the existing order for non-bot threads never changes.
+    nonisolated static func messageCanInterleaveTurn(_ message: AgentMessage) -> Bool {
+        guard message.role == .assistant else { return false }
+        return BotPeerTranscript.parseActivity(message.content) != nil
+            || BotPeerTranscript.parse(message.content) != nil
+    }
+
+    /// Pure paint mapping: each `.turn` entry is woven with the peer messages
+    /// that follow it (until the next turn) at item granularity. Turns without
+    /// interleaving boundaries pass through unchanged, so threads with no
+    /// bot-to-bot hops paint exactly as before.
+    nonisolated static func chatFlowRows(_ entries: [TranscriptEntry]) -> [ChatFlowRow] {
+        var rows: [ChatFlowRow] = []
+        rows.reserveCapacity(entries.count)
+        var index = 0
+        while index < entries.count {
+            guard case .turn(let turn) = entries[index] else {
+                rows.append(.entry(entries[index]))
+                index += 1
+                continue
+            }
+            var following: [AgentChatTurnSegmentation.FollowingRow<TranscriptEntry>] = []
+            var next = index + 1
+            var stopped = false
+            while next < entries.count, case .message(let message) = entries[next] {
+                let can = !stopped && messageCanInterleaveTurn(message)
+                if !can { stopped = true }
+                following.append(AgentChatTurnSegmentation.FollowingRow(
+                    timeMs: Int64(message.createdAt.timeIntervalSince1970 * 1000),
+                    canInterleave: can,
+                    row: entries[next]
+                ))
+                next += 1
+            }
+            if let woven = AgentChatTurnSegmentation.interleaved(turn: turn, following: following) {
+                for element in woven {
+                    switch element {
+                    case .segment(let segment): rows.append(.segment(segment))
+                    case .row(let entry): rows.append(.entry(entry))
+                    }
+                }
+            } else {
+                rows.append(.entry(entries[index]))
+                for item in following { rows.append(.entry(item.row)) }
+            }
+            index = next
+        }
+        return rows
+    }
+
     /// Returns the ordered slice of `allItems` not present in `visibleWindow`.
     /// These are the older entries hidden while a run is active, available for
     /// read-only audit when the user taps the "N earlier items hidden" row.
@@ -12484,8 +12571,14 @@ public struct AgentAppView: View {
                             paintSequence,
                             latestLiveTurnId: latestLiveId
                         )
-                        let historyEntries = split.history
-                        let liveTail = split.liveTail
+                        // Chat flow: weave each turn with the bot peer rows that
+                        // arrived mid-turn so every update appends in arrival
+                        // order. The split boundary never cuts a turn from its
+                        // following messages (the live tail starts at the turn),
+                        // so mapping each side independently equals the whole.
+                        let historyRows = Self.chatFlowRows(split.history)
+                        let liveRows = Self.chatFlowRows(split.liveTail)
+                        let allRows = historyRows + liveRows
                         let mentionBots = vm.mentionableBotsProvider()
                         VStack(alignment: .leading, spacing: 32) {
                             if vm.messageHistoryIsPartial {
@@ -12530,49 +12623,49 @@ public struct AgentAppView: View {
                             // Short histories stay mounted so scrolling tall,
                             // self-sizing text rows cannot cross a Lazy rematerialization
                             // boundary. Larger windows retain viewport virtualization.
-                            if Self.usesLazyTranscriptHistoryLayout(entryCount: historyEntries.count) {
+                            if Self.usesLazyTranscriptHistoryLayout(entryCount: historyRows.count) {
                                 LazyVStack(alignment: .leading, spacing: 32) {
-                                    ForEach(Array(historyEntries.enumerated()), id: \.element.id) { index, entry in
-                                        transcriptEntryRow(
-                                            entry,
+                                    ForEach(Array(historyRows.enumerated()), id: \.element.id) { index, row in
+                                        chatFlowRowView(
+                                            row,
                                             columnWidth: timelineColumnWidth,
                                             groupHeader: peerHopGroupHeader(
                                                 at: index,
-                                                entries: paintSequence,
+                                                rows: allRows,
                                                 bots: mentionBots
                                             )
                                         )
-                                        .id(entry.id)
+                                        .id(row.id)
                                     }
                                 }
                             } else {
                                 VStack(alignment: .leading, spacing: 32) {
-                                    ForEach(Array(historyEntries.enumerated()), id: \.element.id) { index, entry in
-                                        transcriptEntryRow(
-                                            entry,
+                                    ForEach(Array(historyRows.enumerated()), id: \.element.id) { index, row in
+                                        chatFlowRowView(
+                                            row,
                                             columnWidth: timelineColumnWidth,
                                             groupHeader: peerHopGroupHeader(
                                                 at: index,
-                                                entries: paintSequence,
+                                                rows: allRows,
                                                 bots: mentionBots
                                             )
                                         )
-                                        .id(entry.id)
+                                        .id(row.id)
                                     }
                                 }
                             }
                             // Live streaming turns — eager, outside Lazy.
-                            ForEach(Array(liveTail.enumerated()), id: \.element.id) { index, entry in
-                                transcriptEntryRow(
-                                    entry,
+                            ForEach(Array(liveRows.enumerated()), id: \.element.id) { index, row in
+                                chatFlowRowView(
+                                    row,
                                     columnWidth: timelineColumnWidth,
                                     groupHeader: peerHopGroupHeader(
-                                        at: historyEntries.count + index,
-                                        entries: paintSequence,
+                                        at: historyRows.count + index,
+                                        rows: allRows,
                                         bots: mentionBots
                                     )
                                 )
-                                .id(entry.id)
+                                .id(row.id)
                             }
                             // B-1: one chip for the whole thread, after the newest
                             // finished answer — never N copies under every final.
@@ -13814,7 +13907,15 @@ public struct AgentAppView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityLabel("Content omitted: message body was too large to display")
                 } else if let activity = BotPeerTranscript.parseActivity(msg.content) {
-                    AgentChatPeerActivityRow(snapshot: activity, startedAt: msg.createdAt)
+                    AgentChatPeerActivityRow(
+                        snapshot: activity,
+                        startedAt: msg.createdAt,
+                        avatarSymbol: Self.resolvedPeerAvatarSymbol(
+                            handle: activity.handle,
+                            encoded: "",
+                            bots: vm.mentionableBotsProvider()
+                        )
+                    )
                 } else if let parsed = BotPeerTranscript.parse(msg.content) {
                     let showBadge = Self.showsTokenSaverOptimizedBadge(
                         wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)
@@ -14107,6 +14208,59 @@ public struct AgentAppView: View {
         }
     }
 
+    @ViewBuilder
+    private func chatFlowRowView(
+        _ row: ChatFlowRow,
+        columnWidth: CGFloat,
+        groupHeader: AgentChatPeerGroupHeader? = nil
+    ) -> some View {
+        switch row {
+        case .entry(let entry):
+            transcriptEntryRow(entry, columnWidth: columnWidth, groupHeader: groupHeader)
+        case .segment(let segment):
+            turnSegmentView(segment)
+        }
+    }
+
+    /// One chronological slice of a turn between interleaved bot peer rows.
+    /// The first segment keeps the turn's normal chrome; live continuations
+    /// paint their blocks headerless so the chat reads as one appended flow;
+    /// only the last segment renders plans and the final answer.
+    @ViewBuilder
+    private func turnSegmentView(_ segment: AgentChatTurnSegmentation.TurnSegment) -> some View {
+        let turn = segment.snapshot
+        let durableFinalMessageId = vm.tokenSaverMessageId(forRCW1TurnId: turn.turnId)
+        let turnPlans: [AssistantProposedPlan] = segment.isLast
+            ? vm.timeline.proposedPlans.filter {
+                $0.turnId == turn.turnId
+                    && !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            : []
+        AgentChatLiveTurnView(
+            turn: turn,
+            live: !turn.finished,
+            hideAssistantOutput: segment.isLast
+                ? AgentChatLiveTurnChrome.shouldHideAssistantOutput(
+                    turn,
+                    previousTurns: previousTurns(before: turn)
+                )
+                : false,
+            showsWorkHeader: segment.isFirst || turn.finished,
+            renderFinal: segment.isLast
+                ? { final in
+                    AnyView(agentTurnFinal(final, turn: turn, durableFinalMessageId: durableFinalMessageId))
+                }
+                : nil,
+            afterWork: (segment.isLast && !vm.suppressesProposedPlanReview && !turnPlans.isEmpty)
+                ? AnyView(
+                    ForEach(turnPlans) { plan in
+                        proposedPlanRow(plan)
+                    }
+                )
+                : nil
+        )
+    }
+
     private func peerHopIdentity(
         for entry: TranscriptEntry,
         bots: [BotDefinition]
@@ -14131,19 +14285,27 @@ public struct AgentAppView: View {
         }
     }
 
+    private func peerHopIdentity(
+        for row: ChatFlowRow,
+        bots: [BotDefinition]
+    ) -> (name: String, handle: String, symbol: String?)? {
+        guard case .entry(let entry) = row else { return nil }
+        return peerHopIdentity(for: entry, bots: bots)
+    }
+
     private func peerHopGroupHeader(
         at index: Int,
-        entries: [TranscriptEntry],
+        rows: [ChatFlowRow],
         bots: [BotDefinition]
     ) -> AgentChatPeerGroupHeader? {
-        guard entries.indices.contains(index),
-              let peer = peerHopIdentity(for: entries[index], bots: bots) else { return nil }
-        if index > 0, let previous = peerHopIdentity(for: entries[index - 1], bots: bots),
+        guard rows.indices.contains(index),
+              let peer = peerHopIdentity(for: rows[index], bots: bots) else { return nil }
+        if index > 0, let previous = peerHopIdentity(for: rows[index - 1], bots: bots),
            previous.handle.caseInsensitiveCompare(peer.handle) == .orderedSame {
             return nil
         }
         var count = 0
-        for later in entries[index...] {
+        for later in rows[index...] {
             guard let next = peerHopIdentity(for: later, bots: bots),
                   next.handle.caseInsensitiveCompare(peer.handle) == .orderedSame else { break }
             count += 1

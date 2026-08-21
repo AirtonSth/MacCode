@@ -517,10 +517,17 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     private let checkpointRepo: AgentTurnCheckpointRepository
     private let settingsRepo: SettingsRepository
     private let coordinator: AgentRunCoordinator
+    /// Telemetry-only Subagents receipts for delegated peer runs. Nil in
+    /// fixtures that predate the wiring; delegation still works without rows.
+    private let orchestrationRuntime: AgentOrchestrationRuntime?
     private let appSupportDirectory: URL
     weak var router: AppCommandRouter?
 
     private var handoffs: [UUID: PersistedBotPeerHandoff] = [:]
+    /// Telemetry receipt id per delegated peer run, so finalization targets the
+    /// exact bot row even when routing admission wrote a second receipt under
+    /// the same runId.
+    private var delegationReceiptIDs: [AgentRunID: UUID] = [:]
     private var tasksByActivityID: [UUID: Task<Void, Never>] = [:]
     private var armedRunIDs: Set<AgentRunID> = []
     private var exactRunWaiters: [AgentRunID: [CheckedContinuation<AgentRun?, Never>]] = [:]
@@ -549,7 +556,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         checkpointRepo: AgentTurnCheckpointRepository,
         settingsRepo: SettingsRepository,
         coordinator: AgentRunCoordinator,
-        appSupportDirectory: URL
+        appSupportDirectory: URL,
+        orchestrationRuntime: AgentOrchestrationRuntime? = nil
     ) {
         self.botStore = botStore
         self.threadRepo = threadRepo
@@ -559,6 +567,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         self.checkpointRepo = checkpointRepo
         self.settingsRepo = settingsRepo
         self.coordinator = coordinator
+        self.orchestrationRuntime = orchestrationRuntime
         self.appSupportDirectory = appSupportDirectory
         coordinator.addObserver(self)
         observePeerQueueLifecycle()
@@ -703,6 +712,47 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 return nil
             }
 
+            if let hostRunID {
+                // Delegated worker, not a primary thread: excluded from the
+                // Active Threads badge and stopped when the host stops. The
+                // thread id lets the cascade arm a stop even before the
+                // provider start finishes (pendingThreadStops).
+                coordinator.registerDelegatedRun(
+                    peerRunID,
+                    threadId: thread.id,
+                    parentRunId: hostRunID
+                )
+                // Telemetry-only Subagents row on the HOST thread (no
+                // capability digests — can never authorize descendants).
+                if let telemetry = try? orchestrationRuntime?.recordBotDelegationTelemetry(
+                    runId: peerRunID,
+                    hostThreadId: originThread.id,
+                    nodeId: "bot.\(peer.handle).\(peerRunID.value.uuidString)",
+                    provider: routing.provider,
+                    providerInstanceId: routing.providerInstanceID,
+                    model: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
+                    reasoningEffort: routing.reasoningEffort,
+                    permissionMode: routing.permissionMode
+                ) {
+                    delegationReceiptIDs[peerRunID] = telemetry.id
+                }
+                // Race guard: a Stop that landed between handoff persist and
+                // registration already fired its cascade without seeing this
+                // child. Abort dispatch only on durable PROOF the host was
+                // stopped — cancelled/interrupted terminal row. Completed and
+                // unknown hosts still dispatch (late replies stay useful).
+                if let hostRun = try? runRepo.get(id: hostRunID),
+                   hostRun.status == .cancelled || hostRun.status == .interrupted {
+                    coordinator.stopRun(threadId: thread.id)
+                    finalizeDelegationTelemetry(runID: peerRunID, status: .cancelled)
+                    markConversationNeedsAttention(conversation, detail: display)
+                    if originConversation == nil {
+                        setPhase(activityID.value, .needsAttention)
+                    }
+                    return nil
+                }
+            }
+
             let home = BotHome(appSupportDirectory: appSupportDirectory, bot: peer)
             let memoryFiles = ((try? home.readBootstrapMemory()) ?? []).map {
                 BotMemoryFileText(path: $0.path, body: $0.body)
@@ -800,6 +850,39 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         }
     }
 
+    /// Marks the delegated peer's Subagents telemetry row terminal, targeting
+    /// the exact receipt id recorded at dispatch. Safe when no row exists
+    /// (fixtures, pre-wiring handoffs, relaunch — the 4h lease demotes those).
+    private func finalizeDelegationTelemetry(runID: AgentRunID, status: AgentRunStatus) {
+        guard let orchestrationRuntime,
+              let receiptID = delegationReceiptIDs.removeValue(forKey: runID) else { return }
+        let terminal: AgentRunStatus
+        switch status {
+        case .completed, .failed, .cancelled, .interrupted:
+            terminal = status
+        case .pending, .running:
+            terminal = .interrupted
+        }
+        try? orchestrationRuntime.finalizeBotDelegationReceipt(id: receiptID, status: terminal)
+    }
+
+    /// A host run that stopped (user Stop / relaunch interrupt) must not leave
+    /// its consulted peers running: their waiting rows would spin forever and
+    /// the bot desks would stay "working" with nobody to consume the reply.
+    /// Completed/failed hosts keep peers alive — a late reply still lands in
+    /// the transcript and is useful. Pre-start children are covered by the
+    /// coordinator's registered-thread cascade; this backstop stops by run.
+    private func stopOrphanedPeerRuns(hostRunID: AgentRunID, status: AgentRunStatus) {
+        guard status == .cancelled || status == .interrupted else { return }
+        for handoff in handoffs.values
+        where handoff.hostRunID == hostRunID
+            && (handoff.phase == .peerPrepared || handoff.phase == .peerRunning) {
+            if let peerRunID = handoff.peerRunID {
+                coordinator.stopRun(peerRunID)
+            }
+        }
+    }
+
     private func agentAppDispatchReachedMilestone(_ activityID: UUID) -> Bool {
         guard let phase = handoffs[activityID]?.phase else { return true }
         return phase == .hostRunning || phase == .completed || phase == .needsAttention
@@ -875,6 +958,9 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             if let peerRunID = handoff.peerRunID {
                 cancelExactRunWait(peerRunID)
                 runIDs.insert(peerRunID)
+                // The execute() loop was cancelled above, so it can no longer
+                // finalize the Subagents telemetry row itself.
+                finalizeDelegationTelemetry(runID: peerRunID, status: .cancelled)
             }
             if let hostRunID = handoff.hostRunID {
                 cancelExactRunWait(hostRunID)
@@ -1130,6 +1216,9 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     private func execute(_ plan: BotPeerExecutionPlan) async {
         guard await awaitDeletionResolution(activityID: plan.activityID) else { return }
         guard await start(plan.peerRun, receipt: plan.peerReceipt, activityID: plan.activityID) else {
+            // The run never started, so no coordinator terminal will ever fire:
+            // settle the Subagents telemetry row here or it stays Working.
+            finalizeDelegationTelemetry(runID: plan.peerRun.started.runID, status: .failed)
             guard await awaitDeletionResolution(activityID: plan.activityID) else { return }
             markConversationNeedsAttention(
                 plan.peerRun.started.conversation,
@@ -1142,6 +1231,10 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         let peerRun = await awaitExactRunTerminal(
             runID: plan.peerRun.started.runID,
             threadID: plan.peerRun.started.thread.id
+        )
+        finalizeDelegationTelemetry(
+            runID: plan.peerRun.started.runID,
+            status: peerRun?.status ?? .cancelled
         )
         guard await awaitDeletionResolution(activityID: plan.activityID) else { return }
         settleConversation(plan.peerRun.started.conversation, run: peerRun)
@@ -1808,6 +1901,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         providerThreadId: String?
     ) {
         Task { @MainActor [weak self] in
+            self?.stopOrphanedPeerRuns(hostRunID: runId, status: status)
             self?.resolveExactRunWaiters(
                 runID: runId,
                 threadID: threadId,
@@ -1854,12 +1948,16 @@ public enum BotDeskTimelineItem: Identifiable, Equatable, Sendable {
     case message(BotDeskMessage)
     case workLog(BotDeskWorkLogRow)
     case liveTurn(AssistantTurnSnapshot, hideAssistantOutput: Bool)
+    /// One chronological slice of a turn split around interleaved peer rows so
+    /// desk chat appends in arrival order (work → peer reply → more work).
+    case liveTurnSegment(AgentChatTurnSegmentation.TurnSegment, hideAssistantOutput: Bool)
 
     public var id: String {
         switch self {
         case .message(let message): return "msg-\(message.id.uuidString)"
         case .workLog(let row): return "log-\(row.id.uuidString)"
         case .liveTurn(let turn, _): return "turn-\(turn.turnId)"
+        case .liveTurnSegment(let segment, _): return segment.rowId
         }
     }
 
@@ -1868,6 +1966,8 @@ public enum BotDeskTimelineItem: Identifiable, Equatable, Sendable {
         case .message(let message): return message.createdAt
         case .workLog(let row): return row.createdAt
         case .liveTurn(let turn, _): return AgentChatLiveTurnChrome.turnSortDate(turn)
+        case .liveTurnSegment(let segment, _):
+            return AgentChatLiveTurnChrome.turnSortDate(segment.snapshot)
         }
     }
 
@@ -1875,7 +1975,7 @@ public enum BotDeskTimelineItem: Identifiable, Equatable, Sendable {
         switch self {
         case .message(let message):
             return message.role == .user ? 0 : 3
-        case .liveTurn:
+        case .liveTurn, .liveTurnSegment:
             return 1
         case .workLog:
             return 2
@@ -8731,6 +8831,13 @@ public struct BotsRootView: View {
                             live: vm.deskRunIsLive && !turn.finished,
                             hideAssistantOutput: hideAssistantOutput
                         )
+                    case .liveTurnSegment(let segment, let hideAssistantOutput):
+                        AgentChatLiveTurnView(
+                            turn: segment.snapshot,
+                            live: vm.deskRunIsLive && !segment.snapshot.finished,
+                            hideAssistantOutput: hideAssistantOutput,
+                            showsWorkHeader: segment.isFirst || segment.snapshot.finished
+                        )
                     }
                 }
                 if vm.deskShowsLoading {
@@ -8789,7 +8896,8 @@ public struct BotsRootView: View {
                         title: peer.title,
                         handle: peer.handle
                     ),
-                    startedAt: message.createdAt
+                    startedAt: message.createdAt,
+                    avatarSymbol: peer.avatarSymbol
                 )
             }
         }

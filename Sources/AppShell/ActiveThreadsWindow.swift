@@ -67,7 +67,8 @@ public final class ActiveThreadsViewModel: ObservableObject {
     }
 
     public func reloadActive() {
-        let threadIDs = Array(context.coordinator.activeThreadIdsSnapshot())
+        // Primary threads only — delegated bot-peer runs show under Subagents.
+        let threadIDs = Array(context.coordinator.primaryActiveThreadIdsSnapshot())
         let activeSet = Set(threadIDs)
         startedAtByThread = startedAtByThread.filter { activeSet.contains($0.key) }
 

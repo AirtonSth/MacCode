@@ -488,10 +488,24 @@ public enum SubagentActivityProjection {
             if let model, !model.isEmpty { return model }
             return "Root - \(providerDisplayName(provider))"
         }
+        if let handle = botDelegationHandle(from: trimmed) {
+            // Delegated bot peer: operators know the teammate by @handle.
+            return "@\(handle)"
+        }
         let kind = kindLabel(from: trimmed)
         let host = providerDisplayName(provider, nodeId: trimmed)
         let tail = lastFourIdentityChars(from: trimmed)
         return "\(kind) - \(host) - \(tail)"
+    }
+
+    /// `bot.<handle>.<runid>` → `<handle>`; nil for every other nodeId shape.
+    public static func botDelegationHandle(from nodeId: String) -> String? {
+        let lower = nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard lower.lowercased().hasPrefix("bot.") else { return nil }
+        let parts = lower.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return nil }
+        let handle = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return handle.isEmpty ? nil : handle
     }
 
     /// `Nested` / `Native` from the durable nodeId prefix; other workers → `Worker`.

@@ -84,7 +84,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case listPeers:
             return "List the live RemoteCode Bots available for AI-authored delegation, including each exact handle and id."
         case askPeer:
-            return "Ask one RemoteCode Bot a focused prompt written by you after interpreting the user's complete request. The `prompt` is sent literally; RemoteCode does not extract, truncate, translate, or otherwise infer it from the user message. Use `consult` when you will continue with the reply, or `reply_only` when the whole user turn belongs to that Bot."
+            return "Ask one RemoteCode Bot a focused prompt written by you after interpreting the user's complete request. The `prompt` is sent literally; RemoteCode does not extract, truncate, translate, or otherwise infer it from the user message. Calls are repeatable: for multi-Bot comparison, debate, mediation, or consensus, use `consult` as often as needed, authoring each new prompt yourself based on real replies and including only the prior-reply context relevant to the next Bot. The primary AI mediates and produces the final synthesis; RemoteCode does not semantically route, sequence, or set a fixed iteration count. `reply_only` is terminal and is valid only when no comparison, follow-up, mediation, or synthesis remains and the whole user turn belongs to that Bot."
         default:
             return name
         }

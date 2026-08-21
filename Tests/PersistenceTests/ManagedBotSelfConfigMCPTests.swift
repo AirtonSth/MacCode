@@ -51,6 +51,27 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
         }
     }
 
+    func test_askPeerCatalogDescribesRepeatableConsultation() {
+        let description = BotSelfConfigCatalog.description(for: BotSelfConfigCatalog.askPeer)
+        let requiredGuidance = [
+            "Calls are repeatable",
+            "use `consult` as often as needed",
+            "authoring each new prompt yourself based on real replies",
+            "including only the prior-reply context relevant to the next Bot",
+            "primary AI mediates and produces the final synthesis",
+            "RemoteCode does not semantically route, sequence, or set a fixed iteration count",
+            "`reply_only` is terminal",
+            "no comparison, follow-up, mediation, or synthesis remains",
+        ]
+
+        for guidance in requiredGuidance {
+            XCTAssertTrue(
+                description.contains(guidance),
+                "ask-peer catalog must tell the primary AI: \(guidance)"
+            )
+        }
+    }
+
     func test_toolsCallUsesShippedStoreHelpers() throws {
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrate(db)

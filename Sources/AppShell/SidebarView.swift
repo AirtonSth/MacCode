@@ -608,7 +608,8 @@ public final class SidebarViewModel: ObservableObject {
             }
         }
         // Live Active Threads badge: host projection count, same source as Pet.
-        let nextActiveCount = ctx.coordinator.activeThreadIdsSnapshot().count
+        // Primary threads only — delegated bot-peer runs show under Subagents.
+        let nextActiveCount = ctx.coordinator.primaryActiveThreadIdsSnapshot().count
         if nextActiveCount != activeThreadCount {
             activeThreadCount = nextActiveCount
         }

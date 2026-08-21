@@ -204,6 +204,254 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(try ctx.botStore.get(id: quinn.id)?.name, "Nova")
     }
 
+    func test_agentAppPrimaryCanMediateMultipleBotsUntilConsensus() async throws {
+        // WHY: a compound request belongs to one primary AI turn. Mentions
+        // identify the peers, while that same active run authors each focused
+        // consultation, carries opposing replies between them, and owns the
+        // single consensus shown after the debate.
+        let (router, botsVM, surface, _, threadId, ctx) = try makeWiredMentionSurface(
+            peerReply: "unused controlled debate reply"
+        )
+        let phpHater = try botsVM.create(
+            name: "PHP Hater",
+            title: "PHP Critic",
+            handle: "php-hater",
+            provider: .claude
+        )
+        let phpLover = try botsVM.create(
+            name: "PHP Lover",
+            title: "PHP Advocate",
+            handle: "php-lover",
+            provider: .grok
+        )
+        surface.viewModel.mentionableBotsProvider = { [phpHater, phpLover] }
+        let haterRunner = ControlledBotHandoffRunner(provider: .claude)
+        let loverRunner = ControlledBotHandoffRunner(provider: .grok)
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.claude, runner: haterRunner)
+        ctx.coordinator.replaceProvider(.grok, runner: loverRunner)
+        ctx.coordinator.replaceProvider(.codex, runner: hostRunner)
+
+        let original = "Peça ao @php-hater e ao @php-lover para debater se devemos adotar PHP no novo serviço. Consulte os dois mais de uma vez, encaminhe a resposta relevante de um ao outro em cada rodada, continue no mesmo turno até conciliarem riscos e benefícios e publique uma única conclusão de consenso em português."
+        XCTAssertEqual(
+            BotMentionParser.mentionedBots(
+                in: original,
+                bots: surface.viewModel.mentionableBotsProvider(),
+                excluding: nil
+            ).map(\.id),
+            [phpHater.id, phpLover.id],
+            "both @handles must resolve as identity before the primary provider interprets the request"
+        )
+        surface.viewModel.prompt = original
+        await surface.viewModel.send()
+
+        let hostStarted = await waitUntil(timeout: 5) { hostRunner.requests.count == 1 }
+        XCTAssertTrue(hostStarted)
+        let hostRequest = try XCTUnwrap(hostRunner.requests.first)
+        XCTAssertEqual(hostRequest.prompt, original, "the complete compound request belongs to the primary run")
+        XCTAssertEqual(
+            hostRequest.environment[BotPeerDelegation.turnContextEnvironmentKey],
+            BotPeerDelegation.turnDirective(mentionedBots: [phpHater, phpLover]),
+            "mentions must travel as identity metadata, not app-authored delegation"
+        )
+        XCTAssertEqual(ctx.coordinator.activeRunId(threadId: threadId), hostRequest.runId)
+        XCTAssertTrue(haterRunner.requests.isEmpty)
+        XCTAssertTrue(loverRunner.requests.isEmpty)
+        XCTAssertTrue(botsVM.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: threadId
+        ).isEmpty, "identity-only mentions must not trigger legacy direct routing")
+
+        let haterOpeningPrompt = "Liste os dois maiores riscos técnicos de adotar PHP neste serviço e proponha critérios objetivos para mitigá-los."
+        let haterOpeningReply = "Os maiores riscos são dívida de tipagem e variação de qualidade; mitigue com análise estática estrita e padrões revisados."
+        let askHaterOpening = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: threadId,
+                callerRun: hostRequest.runId,
+                handle: "@\(phpHater.handle)",
+                prompt: haterOpeningPrompt,
+                replyMode: .consult
+            )
+        }
+        let haterOpeningStarted = await waitUntil(timeout: 5) { haterRunner.requests.count == 1 }
+        XCTAssertTrue(haterOpeningStarted)
+        let haterOpeningRequest = try XCTUnwrap(haterRunner.requests.first)
+        XCTAssertTrue(haterOpeningRequest.prompt.contains(haterOpeningPrompt))
+        XCTAssertFalse(haterOpeningRequest.prompt.contains(original))
+        XCTAssertNotEqual(haterOpeningRequest.runId, hostRequest.runId)
+        XCTAssertEqual(ctx.coordinator.activeRunId(threadId: threadId), hostRequest.runId)
+        XCTAssertTrue(haterRunner.finish(
+            runID: haterOpeningRequest.runId,
+            status: .completed,
+            reply: haterOpeningReply
+        ))
+        let haterOpeningResult = try await askHaterOpening.value
+        XCTAssertEqual(haterOpeningResult.objectValue?["reply"]?.stringValue, haterOpeningReply)
+        XCTAssertEqual(haterOpeningResult.objectValue?["reply_mode"]?.stringValue, "consult")
+        XCTAssertEqual(
+            haterOpeningResult.objectValue?["bot"]?.objectValue?["id"]?.stringValue,
+            phpHater.id.value.uuidString.lowercased()
+        )
+        XCTAssertEqual(
+            haterOpeningResult.objectValue?["bot"]?.objectValue?["handle"]?.stringValue,
+            phpHater.handle
+        )
+
+        let loverOpeningPrompt = "O crítico respondeu: \"\(haterOpeningReply)\" Explique os benefícios concretos de PHP e responda diretamente a esses riscos."
+        let loverOpeningReply = "PHP acelera a entrega e tem ecossistema maduro; aceito análise estática estrita e padrões revisados como requisitos."
+        let askLoverOpening = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: threadId,
+                callerRun: hostRequest.runId,
+                handle: phpLover.handle,
+                prompt: loverOpeningPrompt,
+                replyMode: .consult
+            )
+        }
+        let loverOpeningStarted = await waitUntil(timeout: 5) { loverRunner.requests.count == 1 }
+        XCTAssertTrue(loverOpeningStarted)
+        let loverOpeningRequest = try XCTUnwrap(loverRunner.requests.first)
+        XCTAssertTrue(loverOpeningRequest.prompt.contains(loverOpeningPrompt))
+        XCTAssertFalse(loverOpeningRequest.prompt.contains(original))
+        XCTAssertNotEqual(loverOpeningRequest.runId, hostRequest.runId)
+        XCTAssertEqual(ctx.coordinator.activeRunId(threadId: threadId), hostRequest.runId)
+        XCTAssertTrue(loverRunner.finish(
+            runID: loverOpeningRequest.runId,
+            status: .completed,
+            reply: loverOpeningReply
+        ))
+        let loverOpeningResult = try await askLoverOpening.value
+        XCTAssertEqual(loverOpeningResult.objectValue?["reply"]?.stringValue, loverOpeningReply)
+        XCTAssertEqual(loverOpeningResult.objectValue?["reply_mode"]?.stringValue, "consult")
+        XCTAssertEqual(
+            loverOpeningResult.objectValue?["bot"]?.objectValue?["id"]?.stringValue,
+            phpLover.id.value.uuidString.lowercased()
+        )
+        XCTAssertEqual(
+            loverOpeningResult.objectValue?["bot"]?.objectValue?["handle"]?.stringValue,
+            phpLover.handle
+        )
+
+        let haterFollowUpPrompt = "O defensor respondeu: \"\(loverOpeningReply)\" Revise sua posição e proponha as condições finais para aceitar PHP."
+        let haterFollowUpReply = "Aceito PHP se análise estática estrita, padrões revisados e monitoramento de produção forem gates obrigatórios."
+        let askHaterFollowUp = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: threadId,
+                callerRun: hostRequest.runId,
+                handle: phpHater.handle,
+                prompt: haterFollowUpPrompt,
+                replyMode: .consult
+            )
+        }
+        let haterFollowUpStarted = await waitUntil(timeout: 5) { haterRunner.requests.count == 2 }
+        XCTAssertTrue(haterFollowUpStarted)
+        let haterFollowUpRequest = try XCTUnwrap(haterRunner.requests.last)
+        XCTAssertTrue(haterFollowUpRequest.prompt.contains(haterFollowUpPrompt))
+        XCTAssertFalse(haterFollowUpRequest.prompt.contains(original))
+        XCTAssertNotEqual(haterFollowUpRequest.runId, hostRequest.runId)
+        XCTAssertEqual(ctx.coordinator.activeRunId(threadId: threadId), hostRequest.runId)
+        XCTAssertTrue(haterRunner.finish(
+            runID: haterFollowUpRequest.runId,
+            status: .completed,
+            reply: haterFollowUpReply
+        ))
+        let haterFollowUpResult = try await askHaterFollowUp.value
+        XCTAssertEqual(haterFollowUpResult.objectValue?["reply"]?.stringValue, haterFollowUpReply)
+        XCTAssertEqual(haterFollowUpResult.objectValue?["reply_mode"]?.stringValue, "consult")
+
+        let loverFollowUpPrompt = "O crítico agora aceita nestas condições: \"\(haterFollowUpReply)\" Confirme quais aceita e formule um consenso curto."
+        let loverFollowUpReply = "Concordo com os três gates e com uma adoção gradual; esse é o nosso consenso."
+        let askLoverFollowUp = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: threadId,
+                callerRun: hostRequest.runId,
+                handle: "@\(phpLover.handle)",
+                prompt: loverFollowUpPrompt,
+                replyMode: .consult
+            )
+        }
+        let loverFollowUpStarted = await waitUntil(timeout: 5) { loverRunner.requests.count == 2 }
+        XCTAssertTrue(loverFollowUpStarted)
+        let loverFollowUpRequest = try XCTUnwrap(loverRunner.requests.last)
+        XCTAssertTrue(loverFollowUpRequest.prompt.contains(loverFollowUpPrompt))
+        XCTAssertFalse(loverFollowUpRequest.prompt.contains(original))
+        XCTAssertNotEqual(loverFollowUpRequest.runId, hostRequest.runId)
+        XCTAssertEqual(ctx.coordinator.activeRunId(threadId: threadId), hostRequest.runId)
+        XCTAssertTrue(loverRunner.finish(
+            runID: loverFollowUpRequest.runId,
+            status: .completed,
+            reply: loverFollowUpReply
+        ))
+        let loverFollowUpResult = try await askLoverFollowUp.value
+        XCTAssertEqual(loverFollowUpResult.objectValue?["reply"]?.stringValue, loverFollowUpReply)
+        XCTAssertEqual(loverFollowUpResult.objectValue?["reply_mode"]?.stringValue, "consult")
+
+        let focusedPrompts = [
+            haterOpeningPrompt,
+            loverOpeningPrompt,
+            haterFollowUpPrompt,
+            loverFollowUpPrompt,
+        ]
+        let peerReplies = [
+            haterOpeningReply,
+            loverOpeningReply,
+            haterFollowUpReply,
+            loverFollowUpReply,
+        ]
+        let handoffs = botsVM.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: threadId
+        )
+        XCTAssertEqual(handoffs.count, 4, "two peers consulted twice must produce four independent handoffs")
+        XCTAssertEqual(Set(handoffs.map(\.outboundText)), Set(focusedPrompts))
+        XCTAssertTrue(handoffs.allSatisfy { $0.hostInstructionText == $0.outboundText })
+        XCTAssertTrue(handoffs.allSatisfy { !$0.outboundText.contains(original) })
+        XCTAssertTrue(handoffs.allSatisfy { $0.hostThreadID == threadId })
+        XCTAssertTrue(handoffs.allSatisfy { $0.hostRunID == hostRequest.runId })
+        XCTAssertEqual(handoffs.filter { $0.peerBotID == phpHater.id }.count, 2)
+        XCTAssertEqual(handoffs.filter { $0.peerBotID == phpLover.id }.count, 2)
+        XCTAssertEqual(Set(handoffs.map(\.activityID)).count, 4)
+        XCTAssertEqual(Set(handoffs.compactMap(\.peerRunID)).count, 4)
+        XCTAssertEqual(haterRunner.requests.count, 2)
+        XCTAssertEqual(loverRunner.requests.count, 2)
+        XCTAssertTrue((haterRunner.requests + loverRunner.requests).allSatisfy {
+            !$0.prompt.contains(original)
+        }, "no peer provider may receive the complete user request")
+        let importedReplies = try handoffs.map { handoff in
+            let message = try XCTUnwrap(try ctx.messageRepo.get(
+                id: AgentMessageID(handoff.inboundMessageID)
+            ))
+            return try XCTUnwrap(BotPeerTranscript.parse(message.content)?.body)
+        }
+        XCTAssertEqual(Set(importedReplies), Set(peerReplies))
+        XCTAssertEqual(ctx.coordinator.activeRunId(threadId: threadId), hostRequest.runId)
+        XCTAssertEqual(hostRunner.requests.count, 1, "all consultations must remain inside one primary run")
+
+        let consensus = "Consenso: adotar PHP gradualmente, com análise estática estrita, padrões revisados e monitoramento de produção como gates obrigatórios."
+        XCTAssertTrue(hostRunner.finish(
+            runID: hostRequest.runId,
+            status: .completed,
+            reply: consensus
+        ))
+        let completed = await waitUntil(timeout: 5) {
+            surface.viewModel.status == .completed
+                && ctx.coordinator.activeRunId(threadId: threadId) == nil
+        }
+        XCTAssertTrue(completed)
+        XCTAssertEqual(try ctx.runRepo.get(id: hostRequest.runId)?.status, .completed)
+
+        let stored = try ctx.messageRepo.listRecent(threadId: threadId, limit: 32)
+        XCTAssertEqual(stored.filter { $0.role == .user && $0.content == original }.count, 1)
+        let assistantRows = stored.filter { $0.role == .assistant }
+        let attributedReplies = assistantRows.compactMap { BotPeerTranscript.parse($0.content) }
+        XCTAssertEqual(attributedReplies.count, 4)
+        XCTAssertEqual(Set(attributedReplies.map(\.body)), Set(peerReplies))
+        let primaryFinals = assistantRows.filter { BotPeerTranscript.parse($0.content) == nil }
+        XCTAssertEqual(primaryFinals.count, 1, "the primary must publish one consensus after all consultations")
+        XCTAssertEqual(primaryFinals.first?.content, consensus)
+        XCTAssertEqual(hostRunner.requests.count, 1)
+    }
+
     func test_replyOnlyDelegationKeepsOneAttributedReplyAndSuppressesPrimaryDuplicate() async throws {
         // WHY: the AI may decide the whole turn belongs to the named Bot. Once
         // it chooses reply_only, RemoteCode must enforce one visible answer even

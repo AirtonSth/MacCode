@@ -159,6 +159,27 @@ final class BackgroundAwaitContinuationTests: XCTestCase {
         )
     }
 
+    func test_botDelegationDirectiveSupportsIterativeMultiBotMediation() {
+        let directive = BotPeerDelegation.providerDirective
+        let requiredGuidance = [
+            "call `bot_ask_peer` with `consult` as often as the request requires",
+            "including repeatedly for the same or different Bots",
+            "After each real reply, author any follow-up prompt yourself",
+            "only the prior-reply context relevant to the next Bot",
+            "You remain responsible for mediation and final synthesis",
+            "RemoteCode does not semantically route, sequence, or set a fixed iteration count",
+            "`reply_only` is terminal",
+            "never choose it while comparison, follow-up, mediation, or synthesis remains",
+        ]
+
+        for guidance in requiredGuidance {
+            XCTAssertTrue(
+                directive.contains(guidance),
+                "delegation directive must tell the primary AI: \(guidance)"
+            )
+        }
+    }
+
     func test_commandDetachesShellWork_classifier() {
         // Shared pure classifier used by Claude / Codex / Grok adapters when a
         // foreground shell tool backgrounds children the provider will not track.

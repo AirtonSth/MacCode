@@ -1844,6 +1844,83 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         }
     }
 
+    /// Decision reason for telemetry-only bot-peer delegation rows. These
+    /// receipts carry no capability digests, so per the receipt contract they
+    /// can never authorize descendants — they exist so a delegated bot run
+    /// appears in the host thread's Subagents panel with a real lifecycle.
+    public static let botDelegationDecisionReason = "bot-peer-delegation"
+    /// Backstop lease so a crash-orphaned bot receipt demotes to `.unknown`
+    /// during reconciliation instead of claiming Working forever.
+    public static let botDelegationLeaseDuration: TimeInterval = 4 * 60 * 60
+
+    /// Records a telemetry-only receipt for a bot peer run consulted by a
+    /// primary agent (`bot_ask_peer`). `threadId` is the HOST thread so the
+    /// row scopes to the host's Subagents panel; `runId` is the peer's run so
+    /// the coordinator's active set refines its Working phase. Idempotent for
+    /// the same runId.
+    @discardableResult
+    public func recordBotDelegationTelemetry(
+        runId: AgentRunID,
+        hostThreadId: AgentThreadID,
+        nodeId: String,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        model: String,
+        reasoningEffort: AgentReasoningEffort? = nil,
+        permissionMode: AgentPermissionMode
+    ) throws -> AgentOrchestrationAdmissionReceipt {
+        do {
+            return try repository.withReceiptMutation {
+                if let existing = try repository.receiptUnlocked(runId: runId) {
+                    return existing
+                }
+                let admittedAt = now()
+                let receipt = AgentOrchestrationAdmissionReceipt(
+                    runId: runId,
+                    threadId: hostThreadId,
+                    nodeId: nodeId,
+                    attemptId: runId.value,
+                    routingRevision: 0,
+                    policyDigest: "bot-delegation",
+                    policyVersion: Self.policyContractVersion,
+                    packageRevision: "bot-delegation",
+                    provider: provider,
+                    providerInstanceId: providerInstanceId,
+                    model: model,
+                    reasoningEffort: reasoningEffort,
+                    capabilitySnapshotId: "bot-delegation",
+                    decisionReason: Self.botDelegationDecisionReason,
+                    admittedAt: admittedAt,
+                    lifecycleStatus: .accepted,
+                    deadlineAt: admittedAt.addingTimeInterval(Self.botDelegationLeaseDuration),
+                    permissionMode: permissionMode
+                )
+                try repository.appendAdmissionUnlocked(receipt)
+                return receipt
+            }
+        } catch let error as AgentOrchestrationAdmissionError {
+            throw error
+        } catch {
+            throw AgentOrchestrationAdmissionError.receiptPersistenceFailed(String(describing: error))
+        }
+    }
+
+    /// Finalizes exactly one bot-delegation telemetry row by its receipt id.
+    /// WHY: an auto-routed peer run can also gain a routing-admission receipt
+    /// under the same runId; runId-keyed finalization would then pick one of
+    /// the two arbitrarily and could leave the Subagents row Working. Guarded
+    /// to bot-delegation rows so this API cannot finalize admission receipts.
+    public func finalizeBotDelegationReceipt(id: UUID, status: AgentRunStatus) throws {
+        let reservationId = try repository.withReceiptMutation { () -> String? in
+            guard let receipt = try repository.receiptUnlocked(id: id),
+                  receipt.decisionReason == Self.botDelegationDecisionReason else {
+                return nil
+            }
+            return try finalizeReceiptUnlocked(receipt, status: status, usage: nil, qualityOutcome: nil)
+        }
+        if let reservationId { releaseReservation(reservationId) }
+    }
+
     public func finalizeReceipt(
         runId: AgentRunID,
         status: AgentRunStatus,

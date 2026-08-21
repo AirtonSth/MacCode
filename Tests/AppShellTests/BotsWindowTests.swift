@@ -5178,6 +5178,156 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(originRows.filter { $0.role == .assistant }.count, 1)
     }
 
+    func test_botPrimaryCanMediateMultiplePeersUntilConsensus() async throws {
+        // WHY: a Bot-owned primary turn must be able to gather real input from
+        // multiple peers without replacing its run or duplicating the durable
+        // attributed replies when it publishes the mediated answer.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        let quinnRunner = ControlledBotHandoffRunner(provider: .claude)
+        let roryRunner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.codex, runner: hostRunner)
+        context.coordinator.replaceProvider(.claude, runner: quinnRunner)
+        context.coordinator.replaceProvider(.grok, runner: roryRunner)
+        router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: "fake-model", label: "Fake Model", provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        })
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let piper = try vm.create(name: "Piper", title: "Mediator", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        let rory = try vm.create(name: "Rory", title: "Researcher", provider: .grok)
+        vm.openDesk(piper)
+        vm.setDeskProvider(.codex)
+
+        let original = "Consulte @\(quinn.handle) e @\(rory.handle), confronte as propostas e publique um consenso final."
+        XCTAssertTrue(vm.send(original))
+        let hostStarted = await waitUntil(timeout: 5) { !hostRunner.requests.isEmpty }
+        XCTAssertTrue(hostStarted)
+        let hostRequest = try XCTUnwrap(hostRunner.requests.first)
+        let originConversation = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertTrue(hostRequest.prompt.hasSuffix("User request:\n\n\(original)"))
+        let turnDirective = try XCTUnwrap(BotPeerDelegation.turnDirective(mentionedBots: [quinn, rory]))
+        XCTAssertTrue(hostRequest.prompt.contains(turnDirective))
+        XCTAssertTrue(quinnRunner.requests.isEmpty)
+        XCTAssertTrue(roryRunner.requests.isEmpty)
+
+        let quinnPrompt = "Proponha uma política de contato em uma frase e explique o principal benefício."
+        let askQuinn = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: hostRequest.threadId,
+                callerRun: hostRequest.runId,
+                handle: quinn.handle,
+                prompt: quinnPrompt,
+                replyMode: .consult
+            )
+        }
+        let quinnStarted = await waitUntil(timeout: 5) { quinnRunner.requests.count == 1 }
+        XCTAssertTrue(quinnStarted)
+        let quinnRequest = try XCTUnwrap(quinnRunner.requests.first)
+        XCTAssertTrue(quinnRequest.prompt.contains(quinnPrompt))
+        XCTAssertFalse(quinnRequest.prompt.contains(original))
+        let quinnWireReply = "Priorize clientes com consentimento recente para reduzir contato indesejado."
+        XCTAssertTrue(quinnRunner.finish(
+            runID: quinnRequest.runId,
+            status: .completed,
+            reply: quinnWireReply
+        ))
+        let quinnResult = try await askQuinn.value
+        let quinnReply = try XCTUnwrap(quinnResult.objectValue?["reply"]?.stringValue)
+        XCTAssertEqual(quinnReply, quinnWireReply)
+        XCTAssertEqual(quinnResult.objectValue?["reply_mode"]?.stringValue, "consult")
+        XCTAssertEqual(quinnResult.objectValue?["attributed_reply_already_displayed"]?.boolValue, true)
+        XCTAssertEqual(context.coordinator.activeRunId(threadId: hostRequest.threadId), hostRequest.runId)
+
+        let roryPrompt = "Quinn respondeu: \"\(quinnReply)\" Compare essa proposta com a evidência disponível e recomende um ajuste."
+        let askRory = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: hostRequest.threadId,
+                callerRun: hostRequest.runId,
+                handle: "@\(rory.handle)",
+                prompt: roryPrompt,
+                replyMode: .consult
+            )
+        }
+        let roryStarted = await waitUntil(timeout: 5) { roryRunner.requests.count == 1 }
+        XCTAssertTrue(roryStarted)
+        let roryRequest = try XCTUnwrap(roryRunner.requests.first)
+        XCTAssertTrue(roryRequest.prompt.contains(roryPrompt))
+        XCTAssertTrue(roryRequest.prompt.contains(quinnReply), "the follow-up must use Quinn's real reply")
+        XCTAssertFalse(roryRequest.prompt.contains(original))
+        let roryWireReply = "Mantenha o consentimento recente e acrescente um limite semanal mensurável."
+        XCTAssertTrue(roryRunner.finish(
+            runID: roryRequest.runId,
+            status: .completed,
+            reply: roryWireReply
+        ))
+        let roryResult = try await askRory.value
+        let roryReply = try XCTUnwrap(roryResult.objectValue?["reply"]?.stringValue)
+        XCTAssertEqual(roryReply, roryWireReply)
+        XCTAssertEqual(roryResult.objectValue?["reply_mode"]?.stringValue, "consult")
+        XCTAssertEqual(roryResult.objectValue?["attributed_reply_already_displayed"]?.boolValue, true)
+        XCTAssertEqual(hostRunner.requests.count, 1, "both consultations must keep the original primary run")
+        XCTAssertEqual(context.coordinator.activeRunId(threadId: hostRequest.threadId), hostRequest.runId)
+
+        let consensus = "Consenso: usar consentimento recente e limitar cada cliente a um contato por semana."
+        XCTAssertTrue(consensus.contains("consentimento recente"), "the consensus must retain Quinn's recommendation")
+        XCTAssertTrue(consensus.contains("um contato por semana"), "the consensus must apply Rory's adjustment")
+        XCTAssertTrue(hostRunner.finish(
+            runID: hostRequest.runId,
+            status: .completed,
+            reply: consensus
+        ))
+        let hostCompleted = await waitUntil(timeout: 5) {
+            context.coordinator.activeRunId(threadId: hostRequest.threadId) == nil
+        }
+        XCTAssertTrue(hostCompleted)
+
+        let handoffs = vm.peerHandoffSnapshotsForTesting(
+            originConversationID: originConversation.id,
+            originThreadID: nil
+        )
+        XCTAssertEqual(handoffs.count, 2)
+        XCTAssertEqual(Set(handoffs.map(\.peerBotID)), Set([quinn.id, rory.id]))
+        XCTAssertTrue(handoffs.allSatisfy {
+            $0.originBotID == piper.id
+                && $0.originConversationID == originConversation.id
+                && $0.originThreadID == nil
+                && $0.hostRunID == hostRequest.runId
+                && $0.phase == .completed
+        })
+
+        let restored = BotsViewModel(context: context, router: router)
+        restored.openDesk(piper)
+        let transcript = restored.deskTranscriptForTesting(botID: piper.id)
+        XCTAssertEqual(transcript.filter {
+            $0.role == .assistant
+                && $0.peer?.direction == .fromPeer
+                && $0.peer?.botID == quinn.id
+                && $0.text == quinnReply
+        }.count, 1)
+        XCTAssertEqual(transcript.filter {
+            $0.role == .assistant
+                && $0.peer?.direction == .fromPeer
+                && $0.peer?.botID == rory.id
+                && $0.text == roryReply
+        }.count, 1)
+        XCTAssertEqual(transcript.filter {
+            $0.role == .assistant && $0.peer == nil && $0.text == consensus
+        }.count, 1)
+        let originRows = try context.messageRepo.listRecent(threadId: hostRequest.threadId, limit: 32)
+        XCTAssertEqual(originRows.filter { $0.role == .user && $0.content.contains(original) }.count, 1)
+        XCTAssertEqual(originRows.filter { $0.role == .assistant && $0.content == consensus }.count, 1)
+    }
+
     func test_deskReplyOnlyShowsOneAttributedBotReplyWithoutPrimaryDuplicate() async throws {
         // WHY: the primary AI may decide that the named Bot's answer completes
         // the whole turn. The Bot row is then the answer; any generic primary

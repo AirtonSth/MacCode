@@ -151,11 +151,73 @@ enum BotsDeskFollowThrough {
                 previousTurns.append(turn)
                 return .liveTurn(turn, hideAssistantOutput: hide)
             }
-        return composeConversationOrder(
+        return interleavingTurnSegments(composeConversationOrder(
             messages: visibleMessages,
             workLog: logs,
             liveTurns: liveItems
-        )
+        ))
+    }
+
+    /// Chat flow: weave each turn with the peer rows (Mentions/From bubbles,
+    /// waiting indicators) that arrived mid-turn so desk chat appends in
+    /// arrival order. Turns without interleaving boundaries pass through
+    /// unchanged, so plain conversations paint exactly as before.
+    static func interleavingTurnSegments(_ items: [BotDeskTimelineItem]) -> [BotDeskTimelineItem] {
+        var out: [BotDeskTimelineItem] = []
+        out.reserveCapacity(items.count)
+        var index = 0
+        while index < items.count {
+            guard case .liveTurn(let turn, let hideAssistantOutput) = items[index] else {
+                out.append(items[index])
+                index += 1
+                continue
+            }
+            var following: [AgentChatTurnSegmentation.FollowingRow<BotDeskTimelineItem>] = []
+            var next = index + 1
+            var stopped = false
+            scan: while next < items.count {
+                switch items[next] {
+                case .message(let message):
+                    // Only peer chrome interleaves; a plain user prompt or
+                    // unattributed assistant reply ends boundary collection.
+                    let can = !stopped && message.peer != nil
+                    if !can { stopped = true }
+                    following.append(AgentChatTurnSegmentation.FollowingRow(
+                        timeMs: Int64(message.createdAt.timeIntervalSince1970 * 1000),
+                        canInterleave: can,
+                        row: items[next]
+                    ))
+                case .workLog(let row):
+                    stopped = true
+                    following.append(AgentChatTurnSegmentation.FollowingRow(
+                        timeMs: Int64(row.createdAt.timeIntervalSince1970 * 1000),
+                        canInterleave: false,
+                        row: items[next]
+                    ))
+                case .liveTurn, .liveTurnSegment:
+                    break scan
+                }
+                next += 1
+            }
+            if let woven = AgentChatTurnSegmentation.interleaved(turn: turn, following: following) {
+                for element in woven {
+                    switch element {
+                    case .segment(let segment):
+                        out.append(.liveTurnSegment(
+                            segment,
+                            hideAssistantOutput: segment.isLast ? hideAssistantOutput : false
+                        ))
+                    case .row(let item):
+                        out.append(item)
+                    }
+                }
+            } else {
+                out.append(items[index])
+                for item in following { out.append(item.row) }
+            }
+            index = next
+        }
+        return out
     }
 
     /// User bubble, then that turn's work, then the answer — never a pile of
@@ -205,7 +267,7 @@ enum BotsDeskFollowThrough {
                 guard let item = next else { return }
                 result.append(item)
                 switch item {
-                case .liveTurn: turnIndex += 1
+                case .liveTurn, .liveTurnSegment: turnIndex += 1
                 case .message: assistantIndex += 1
                 case .workLog: logIndex += 1
                 }

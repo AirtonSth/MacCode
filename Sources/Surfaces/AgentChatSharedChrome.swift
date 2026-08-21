@@ -300,16 +300,30 @@ public struct AgentChatWorkingPill: View {
 public struct AgentChatPeerActivityRow: View {
     public let snapshot: BotPeerActivitySnapshot
     public let startedAt: Date
+    /// The waiting bot's avatar. Falls back to initials when the bot has no
+    /// Blobatar/symbol so the row always shows who is being waited on.
+    public var avatarSymbol: String?
 
-    public init(snapshot: BotPeerActivitySnapshot, startedAt: Date) {
+    public init(
+        snapshot: BotPeerActivitySnapshot,
+        startedAt: Date,
+        avatarSymbol: String? = nil
+    ) {
         self.snapshot = snapshot
         self.startedAt = startedAt
+        self.avatarSymbol = avatarSymbol
     }
 
     public var body: some View {
         TimelineView(AgentChatElapsedTickSchedule(start: startedAt)) { context in
             let seconds = max(0, Int(context.date.timeIntervalSince(startedAt)))
             HStack(alignment: .top, spacing: DS.Space.sm) {
+                BotsAvatarView(
+                    name: snapshot.name,
+                    handle: snapshot.handle,
+                    symbol: avatarSymbol,
+                    size: 22
+                )
                 stateIcon
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     Text(AgentPeerActivityPresentation.title(for: snapshot))

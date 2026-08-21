@@ -1144,6 +1144,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var awaitingTerminationRuns: Set<AgentRunID> = []
     private var providerTerminatedRuns: Set<AgentRunID> = []
     private var pendingGracefulStopFallbacks: Set<AgentRunID> = []
+    /// Delegated child run → the primary run that spawned it + its own thread
+    /// (bot peer consults). Drives the Active Threads badge exclusion, the
+    /// user-facing run projection filter, and the Stop cascade.
+    struct DelegatedRunLink {
+        let parentRunId: AgentRunID
+        let threadId: AgentThreadID
+    }
+    private var delegatedRuns: [AgentRunID: DelegatedRunLink] = [:]
+    /// Cascade re-entrancy guard so a (defensive) parent cycle cannot loop stops.
+    private var cascadeStopsInFlight: Set<AgentRunID> = []
     /// Run start and native fork must not snapshot one parent concurrently.
     private var exclusiveThreadMutations: Set<AgentThreadID> = []
     /// Relaunch reconciliation for fork intents is asynchronous because the
@@ -2514,6 +2524,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             stopRun(threadId: threadId)
         } else {
             handle?.cancel()
+            // Even without a live thread mapping, delegated children of this
+            // run must not survive it (bot peers spawned by a stopped host).
+            stopDelegatedChildRuns(of: runId)
         }
     }
 
@@ -2526,6 +2539,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let handle = runId.flatMap { active[$0] }
         let pendingStart = pendingProviderStarts[threadId]
         lock.unlock()
+        // Stop cascades to delegated bot-peer runs on every exit path: a host
+        // stopped mid `bot_ask_peer` must not leave its workers running with
+        // spinners pinned in Active Threads / Bots.
+        defer {
+            if let runId { stopDelegatedChildRuns(of: runId) }
+        }
         _ = pendingStart?.invalidateAcceptance()
         if let runId, let handle {
             var deliveredNativeInterrupt = false
@@ -3940,6 +3959,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if activeThreads.removeValue(forKey: threadId) != nil {
                 activeProjection = activeRunProjectionLocked()
             }
+            delegatedRuns.removeValue(forKey: runId)
             activeRunMetadata.removeValue(forKey: runId)
             activeWireRequestTexts.removeValue(forKey: runId)
             activeTurnIds.removeValue(forKey: runId)
@@ -4056,6 +4076,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if activeThreads[threadId] == runId {
             activeThreads.removeValue(forKey: threadId)
         }
+        delegatedRuns.removeValue(forKey: runId)
         activeRunMetadata.removeValue(forKey: runId)
         activeWireRequestTexts.removeValue(forKey: runId)
         latestTokenUsage.removeValue(forKey: runId)
@@ -4986,9 +5007,81 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return Set(activeThreads.keys)
     }
 
+    /// Active threads excluding delegated child runs (bot peers consulted by a
+    /// primary agent). The sidebar Active Threads badge/window and Pet count
+    /// these; delegated workers surface in the Subagents panel instead.
+    public func primaryActiveThreadIdsSnapshot() -> Set<AgentThreadID> {
+        lock.lock(); defer { lock.unlock() }
+        return Self.primaryActiveThreadIds(
+            activeThreads: activeThreads,
+            delegatedRunParents: delegatedRuns.mapValues(\.parentRunId)
+        )
+    }
+
+    /// Pure seam for the snapshot filter (unit-testable without a coordinator).
+    nonisolated static func primaryActiveThreadIds(
+        activeThreads: [AgentThreadID: AgentRunID],
+        delegatedRunParents: [AgentRunID: AgentRunID]
+    ) -> Set<AgentThreadID> {
+        Set(activeThreads.compactMap { threadId, runId in
+            delegatedRunParents[runId] == nil ? threadId : nil
+        })
+    }
+
+    /// Marks `runId` (on `threadId`) as a delegated child of `parentRunId` — a
+    /// bot peer run started on behalf of a primary run. Registration happens
+    /// before dispatch so the badge filter and the Stop cascade cover the child
+    /// even while its provider start is still in preflight (thread-based stop
+    /// arms `pendingThreadStops`, so a not-yet-started child cannot spawn
+    /// orphaned). Idempotent; self-parenting is refused.
+    public func registerDelegatedRun(
+        _ runId: AgentRunID,
+        threadId: AgentThreadID,
+        parentRunId: AgentRunID
+    ) {
+        guard runId != parentRunId else { return }
+        lock.lock()
+        delegatedRuns[runId] = DelegatedRunLink(parentRunId: parentRunId, threadId: threadId)
+        // Bound the map: registrations whose child run never started (failed
+        // dispatch) have no teardown hook, so cap-prune dead rows here.
+        if delegatedRuns.count > 512 {
+            let live = Set(activeThreads.values).union(active.keys)
+            delegatedRuns = delegatedRuns.filter {
+                live.contains($0.key) || $0.key == runId
+            }
+        }
+        lock.unlock()
+    }
+
+    /// Stops every delegated child of `runId` by THREAD, including children
+    /// whose provider start is still in preflight. Direct children are stopped
+    /// through the normal stop path, which cascades again for deeper chains
+    /// (bot asking bot); `cascadeStopsInFlight` breaks accidental cycles.
+    private func stopDelegatedChildRuns(of runId: AgentRunID) {
+        lock.lock()
+        guard !cascadeStopsInFlight.contains(runId) else {
+            lock.unlock()
+            return
+        }
+        cascadeStopsInFlight.insert(runId)
+        let childThreadIds = delegatedRuns.compactMap { _, link -> AgentThreadID? in
+            link.parentRunId == runId ? link.threadId : nil
+        }
+        lock.unlock()
+        defer {
+            lock.lock()
+            cascadeStopsInFlight.remove(runId)
+            lock.unlock()
+        }
+        childThreadIds.forEach { stopRun(threadId: $0) }
+    }
+
     private func activeRunProjectionLocked() -> ActiveRunProjection {
-        ActiveRunProjection(runs: activeThreads.map {
-            ActiveRunProjection.Run(threadId: $0.key, runId: $0.value)
+        // User-facing projection (Pet, Live Activity): primary runs only.
+        // Delegated bot-peer workers surface in the Subagents panel instead.
+        ActiveRunProjection(runs: activeThreads.compactMap {
+            guard delegatedRuns[$0.value] == nil else { return nil }
+            return ActiveRunProjection.Run(threadId: $0.key, runId: $0.value)
         })
     }
 
