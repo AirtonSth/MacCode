@@ -2190,6 +2190,14 @@ public enum BotDeskTimelineItem: Identifiable, Equatable, Sendable {
         }
     }
 
+    var turnID: String? {
+        switch self {
+        case .liveTurn(let turn, _): return turn.turnId
+        case .liveTurnSegment(let segment, _): return segment.snapshot.turnId
+        case .message, .workLog: return nil
+        }
+    }
+
     var stableOrder: Int {
         switch self {
         case .message(let message):
@@ -9217,6 +9225,15 @@ public struct BotsRootView: View {
 
     private func deskTimeline(_ bot: BotDefinition) -> some View {
         let items = vm.deskTimeline
+        let latestLiveTurnID = vm.deskRunIsLive
+            ? vm.deskLiveTimeline.turns.last(where: { !$0.finished })?.turnId
+            : nil
+        let split = BotsDeskFollowThrough.splitLiveTail(
+            items,
+            latestLiveTurnID: latestLiveTurnID
+        )
+        let historyItems = split.history
+        let liveItems = split.liveTail
         let liveTurnItemCount = vm.deskLiveTimeline.turns.reduce(0) { $0 &+ $1.items.count }
         return AgentChatTimelineScrollContainer(
             rejoinToken: vm.deskTimelineRejoinToken,
@@ -9230,15 +9247,27 @@ public struct BotsRootView: View {
             verticalPadding: DS.Space.xl,
             columnGutter: AgentChatTranscriptChrome.userMessageBubbleLeadingGutter
         ) { columnWidth in
-            // Short self-sizing Desk histories stay mounted. Always-Lazy
-            // placement of tall text rows can cycle in AttributeGraph and
-            // starve host-catalog MainActor hops.
-            if AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: items.count) {
-                LazyVStack(alignment: .leading, spacing: DS.Space.xl) {
-                    if items.isEmpty {
-                        deskTimelineEmptyState(bot)
+            VStack(alignment: .leading, spacing: DS.Space.xl) {
+                if items.isEmpty {
+                    deskTimelineEmptyState(bot)
+                }
+                // Match Agent App: stable history may virtualize, but the
+                // mutating live-turn suffix stays eager. Lazy placement of a
+                // tall streaming MCP row can cycle in AttributeGraph and starve
+                // both UI events and host-catalog MainActor hops.
+                if AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: historyItems.count) {
+                    LazyVStack(alignment: .leading, spacing: DS.Space.xl) {
+                        ForEach(Array(historyItems.enumerated()), id: \.element.id) { index, item in
+                            deskTimelineEntry(
+                                item,
+                                index: index,
+                                items: items,
+                                columnWidth: columnWidth
+                            )
+                        }
                     }
-                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                } else {
+                    ForEach(Array(historyItems.enumerated()), id: \.element.id) { index, item in
                         deskTimelineEntry(
                             item,
                             index: index,
@@ -9246,23 +9275,16 @@ public struct BotsRootView: View {
                             columnWidth: columnWidth
                         )
                     }
-                    deskTimelineStatusChrome()
                 }
-            } else {
-                VStack(alignment: .leading, spacing: DS.Space.xl) {
-                    if items.isEmpty {
-                        deskTimelineEmptyState(bot)
-                    }
-                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                        deskTimelineEntry(
-                            item,
-                            index: index,
-                            items: items,
-                            columnWidth: columnWidth
-                        )
-                    }
-                    deskTimelineStatusChrome()
+                ForEach(Array(liveItems.enumerated()), id: \.element.id) { index, item in
+                    deskTimelineEntry(
+                        item,
+                        index: historyItems.count + index,
+                        items: items,
+                        columnWidth: columnWidth
+                    )
                 }
+                deskTimelineStatusChrome()
             }
         }
     }

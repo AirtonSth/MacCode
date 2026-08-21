@@ -54,7 +54,7 @@ public enum RemoteCodeHostCatalog: Sendable {
     }
 
     public static let providerDirective = """
-    Built-in RemoteCode intents (create or list workspaces, Agent App threads, Bots, Bot desk threads, and owned Bot skills) must call the named tools \(workspaceCreate), \(workspaceList), \(threadCreate), \(threadList), \(botCreate), \(botList), \(botOpen), \(botSend), \(botThreadCreate), \(botSkillCreate), and \(botSkillView). Never invent a generic host-call tool. Do not use Computer Use, macos-harness, Accessibility (AX), or clicking the RemoteCode UI as a fallback for these intents. Every mutation must supply a unique `operation_id`. If a mutation reply is lost, read back with the matching list/view tool instead of retrying with a new id.
+    Built-in RemoteCode intents (create or list workspaces, Agent App threads, Bots, Bot desk threads, and owned Bot skills) must call the named tools \(workspaceCreate), \(workspaceList), \(threadCreate), \(threadList), \(botCreate), \(botList), \(botOpen), \(botSend), \(botThreadCreate), \(botSkillCreate), and \(botSkillView). For a consulted Bot's skill files, use \(botSkillCreate) and \(botSkillView); `bot_write_home_file` is only for the calling Bot's own home. Never invent a generic host-call tool. Do not use Computer Use, macos-harness, Accessibility (AX), or clicking the RemoteCode UI as a fallback for these intents. Every mutation must supply a unique `operation_id`. If a mutation reply is lost, read back with the matching list/view tool instead of retrying with a new id.
     """
 
     public static var toolNames: [String] {
@@ -134,9 +134,9 @@ public enum RemoteCodeHostCatalog: Sendable {
         case botThreadCreate:
             return "Create a Desk thread for one RemoteCode Bot through the live host. Requires operation_id."
         case botSkillCreate:
-            return "Create skills/<slug>/SKILL.md on a Bot this authenticated run created, or on the calling Bot. Requires operation_id. Returns body and digest."
+            return "Create skills/<slug>/SKILL.md on a Bot this authenticated run created or consulted, or on the calling Bot. Requires operation_id. Returns body and digest."
         case botSkillView:
-            return "Read skills/<slug>/SKILL.md for a Bot this authenticated run created, or the calling Bot. Returns body and digest so the exact contents can be proven."
+            return "Read skills/<slug>/SKILL.md for a Bot this authenticated run created or consulted, or the calling Bot. Returns body and digest so the exact contents can be proven."
         default:
             return name
         }

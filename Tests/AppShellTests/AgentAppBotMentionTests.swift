@@ -4,6 +4,7 @@ import CoreModel
 @testable import AppShell
 @testable import Persistence
 @testable import Surfaces
+@testable import SocketServer
 
 /// Agent App `@bot` mentions must dispatch to the shared teammate runner.
 @MainActor
@@ -245,6 +246,7 @@ final class AgentAppBotMentionTests: XCTestCase {
         let (router, botsVM, surface, quinn, threadId, ctx) = try makeWiredMentionSurface(
             peerReply: "unused controlled reply"
         )
+        surface.viewModel.setPermissionMode(.fullAccess)
         let untouched = try botsVM.create(name: "Untouched", title: "Observer", provider: .grok)
         surface.viewModel.mentionableBotsProvider = { [quinn, untouched] }
         let peerRunner = ControlledBotHandoffRunner(provider: .claude)
@@ -315,6 +317,56 @@ final class AgentAppBotMentionTests: XCTestCase {
         )
         XCTAssertEqual(try ctx.botStore.get(id: quinn.id)?.name, "Nova")
         XCTAssertEqual(try ctx.botStore.get(id: untouched.id)?.name, "Untouched")
+
+        let skillBody = "---\nname: consulted-proof\n---\nUse the exact consulted Bot grant.\n"
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let createdSkill = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: RemoteCodeHostCatalog.botSkillCreateRPC,
+            params: [
+                "thread_id": .string(hostRequest.threadId.value.uuidString.lowercased()),
+                "run_id": .string(hostRequest.runId.value.uuidString.lowercased()),
+                BotPeerDelegation.capabilityRPCParameterKey: .string(try XCTUnwrap(
+                    hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
+                )),
+                "client_request_id": .string("consulted-skill-create"),
+                "bot_id": .string(quinn.id.value.uuidString.lowercased()),
+                "skill_id": .string("consulted-proof"),
+                "body": .string(skillBody),
+            ]
+        ))
+        XCTAssertNil(createdSkill.error)
+        XCTAssertEqual(
+            createdSkill.result?.objectValue?["body"]?.stringValue,
+            skillBody,
+            "the exact authenticated Unix route must honor the consultation grant without waiting on UI permission"
+        )
+        let deniedSkill = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: RemoteCodeHostCatalog.botSkillCreateRPC,
+            params: [
+                "thread_id": .string(hostRequest.threadId.value.uuidString.lowercased()),
+                "run_id": .string(hostRequest.runId.value.uuidString.lowercased()),
+                BotPeerDelegation.capabilityRPCParameterKey: .string(try XCTUnwrap(
+                    hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
+                )),
+                "client_request_id": .string("not-consulted-skill-create"),
+                "bot_id": .string(untouched.id.value.uuidString.lowercased()),
+                "skill_id": .string("not-consulted"),
+                "body": .string("denied"),
+            ]
+        ))
+        XCTAssertEqual(
+            deniedSkill.error?.code,
+            -32095,
+            "the receipt layer must fence a rejected cross-object mutation as an unknown outcome"
+        )
+        XCTAssertEqual(
+            deniedSkill.error?.data?.objectValue?["requiresSnapshot"]?.boolValue,
+            true
+        )
 
         XCTAssertTrue(hostRunner.finish(
             runID: hostRequest.runId,

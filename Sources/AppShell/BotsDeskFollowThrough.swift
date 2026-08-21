@@ -178,6 +178,22 @@ enum BotsDeskFollowThrough {
         ))
     }
 
+    /// Keep the current streaming turn and every later chronological row out
+    /// of LazyVStack. This matches Agent App's history/live-tail layout split.
+    static func splitLiveTail(
+        _ items: [BotDeskTimelineItem],
+        latestLiveTurnID: String?
+    ) -> (history: [BotDeskTimelineItem], liveTail: [BotDeskTimelineItem]) {
+        guard let latestLiveTurnID,
+              let index = items.firstIndex(where: { $0.turnID == latestLiveTurnID }) else {
+            return (items, [])
+        }
+        return (
+            Array(items.prefix(index)),
+            Array(items.suffix(from: index))
+        )
+    }
+
     /// Chat flow: weave each turn with the peer rows (Mentions/From bubbles,
     /// waiting indicators) that arrived mid-turn so desk chat appends in
     /// arrival order. Turns without interleaving boundaries pass through

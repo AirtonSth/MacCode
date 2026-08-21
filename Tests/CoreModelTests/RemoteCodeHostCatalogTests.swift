@@ -55,6 +55,8 @@ final class RemoteCodeHostCatalogTests: XCTestCase {
         XCTAssertTrue(directive.contains("Computer Use"))
         XCTAssertTrue(directive.contains("macos-harness"))
         XCTAssertTrue(directive.contains("Accessibility"))
+        XCTAssertTrue(directive.contains("consulted Bot"))
+        XCTAssertTrue(directive.contains("bot_write_home_file"))
         XCTAssertTrue(BotPeerDelegation.providerDirective.contains(directive))
     }
 

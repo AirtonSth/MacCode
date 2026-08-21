@@ -2861,6 +2861,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if hostCatalogCreatedBots[callerRun]?.contains(botID) == true {
             return botID
         }
+        if let context,
+           let delegatedID = context.botPeerHandoffAuthority.delegatedBotID(
+               forHostRunID: callerRun,
+               requestedBotID: botID
+           ) {
+            return delegatedID
+        }
         throw JSONRPCError(
             code: -32046,
             message: "This active run has no matching Bot grant."

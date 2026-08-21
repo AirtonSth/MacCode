@@ -8681,8 +8681,61 @@ final class BotsWindowTests: XCTestCase {
             slice.contains("LazyVStack(alignment: .leading, spacing: DS.Space.xl) {\n                if vm.deskTimeline.isEmpty"),
             "Desk must not always-Lazy the self-sizing timeline"
         )
-        XCTAssertTrue(slice.contains("ForEach(Array(items.enumerated())"))
+        XCTAssertTrue(slice.contains("let split = BotsDeskFollowThrough.splitLiveTail"))
+        XCTAssertTrue(slice.contains("ForEach(Array(historyItems.enumerated())"))
+        XCTAssertTrue(slice.contains("ForEach(Array(liveItems.enumerated())"))
         XCTAssertFalse(slice.contains("ForEach(Array(vm.deskTimeline.enumerated())"))
+    }
+
+    func test_deskTimelineKeepsCurrentLiveTurnOutsideLazyHistory() {
+        // WHY: the real Grok reproduction had more than eight transcript rows.
+        // Putting the mutating live turn inside LazyVStack caused an AttributeGraph
+        // placement loop that starved MainActor and timed out host MCP commands.
+        let history: [BotDeskTimelineItem] = (0..<9).map { index in
+            .message(BotDeskMessage(
+                role: .assistant,
+                text: "history-\(index)",
+                createdAt: Date(timeIntervalSince1970: TimeInterval(index))
+            ))
+        }
+        let live = AssistantTurnSnapshot(
+            turnId: "current-live",
+            items: [AssistantItem(
+                id: "tool-live",
+                turnId: "current-live",
+                type: .mcpToolCall,
+                state: .streaming,
+                startedAtMs: 10_000
+            )],
+            finished: false
+        )
+        let afterLive = BotDeskTimelineItem.message(BotDeskMessage(
+            role: .assistant,
+            text: "peer reply after work",
+            createdAt: Date(timeIntervalSince1970: 11)
+        ))
+        let items = history + [.liveTurn(live, hideAssistantOutput: false), afterLive]
+
+        let split = BotsDeskFollowThrough.splitLiveTail(
+            items,
+            latestLiveTurnID: live.turnId
+        )
+
+        XCTAssertEqual(split.history.map(\.id), history.map(\.id))
+        XCTAssertEqual(
+            split.liveTail.map(\.id),
+            ["turn-current-live", afterLive.id],
+            "everything from the current turn onward must remain eager and chronological"
+        )
+        XCTAssertEqual(
+            (split.history + split.liveTail).map(\.id),
+            items.map(\.id),
+            "splitting layout ownership must not change transcript order"
+        )
+        XCTAssertTrue(
+            AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: split.history.count),
+            "stable history may still use viewport virtualization"
+        )
     }
 
     func test_deskTimelineUsesSharedAgentAppScrollContainer_becauseChatMustFollowTheSamePin() throws {
