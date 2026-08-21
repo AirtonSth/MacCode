@@ -9,6 +9,12 @@ import SwiftUI
 /// Work so far (Thinking…/Thought + tools) → final markdown — from the linked
 /// thread's persisted stream events. A composer Thinking pill is not enough.
 public enum AgentChatLiveTurnChrome {
+    /// A split turn is still one turn: only its first chronological slice owns
+    /// the shared Work/Worked heading, including after the turn finishes.
+    public static func showsWorkHeader(for segment: AgentChatTurnSegmentation.TurnSegment) -> Bool {
+        segment.isFirst
+    }
+
     public static func timelineByReplaying(_ events: [AssistantEvent]) -> AssistantTimelineState {
         var next = AssistantTimelineState()
         for event in events {

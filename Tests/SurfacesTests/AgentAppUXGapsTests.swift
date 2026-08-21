@@ -826,13 +826,27 @@ final class AgentAppUXGapsTests: XCTestCase {
     /// from lazy rematerialization. Crossing that lazy boundary while scrolling used
     /// to enter an unbounded AttributeGraph layout loop and grow RSS continuously.
     func test_shortTranscriptUsesEagerHistoryLayoutToKeepScrollBounded() {
+        XCTAssertEqual(
+            AgentAppView.eagerTranscriptHistoryEntryLimit,
+            AgentChatTimelineHistoryLayout.eagerEntryLimit,
+            "Agent App must reuse the shared eager-history threshold"
+        )
         XCTAssertFalse(
             AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 6),
             "the six-row real-world reproduction must stay mounted while scrolling"
         )
+        XCTAssertFalse(
+            AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 6),
+            "the shared policy is what keeps a short self-sizing timeline mounted"
+        )
         XCTAssertTrue(
             AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 9),
             "larger transcript windows still need viewport virtualization"
+        )
+        XCTAssertTrue(AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 9))
+        XCTAssertEqual(
+            AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 8),
+            AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 8)
         )
     }
 

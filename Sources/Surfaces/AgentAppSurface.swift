@@ -10902,7 +10902,8 @@ public struct AgentAppView: View {
     nonisolated static let idleTranscriptWindowCount = 20
     /// Very small histories stay mounted. Lazy rematerialization of tall,
     /// self-sizing NSTextView rows can cycle in AttributeGraph during scroll.
-    nonisolated static let eagerTranscriptHistoryEntryLimit = 8
+    nonisolated static let eagerTranscriptHistoryEntryLimit =
+        AgentChatTimelineHistoryLayout.eagerEntryLimit
     nonisolated static let hiddenTranscriptRevealPageCount = 50
     /// Entries kept *before* the newest user message during a follow-up.
     /// 0 = start clean at the user's bubble (prior history via reveal row).
@@ -11536,7 +11537,7 @@ public struct AgentAppView: View {
     }
 
     nonisolated static func usesLazyTranscriptHistoryLayout(entryCount: Int) -> Bool {
-        entryCount > eagerTranscriptHistoryEntryLimit
+        AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: entryCount)
     }
 
     /// Entries from the last user message (minus optional preceding context) to end.
@@ -14246,7 +14247,7 @@ public struct AgentAppView: View {
                     previousTurns: previousTurns(before: turn)
                 )
                 : false,
-            showsWorkHeader: segment.isFirst || turn.finished,
+            showsWorkHeader: AgentChatLiveTurnChrome.showsWorkHeader(for: segment),
             renderFinal: segment.isLast
                 ? { final in
                     AnyView(agentTurnFinal(final, turn: turn, durableFinalMessageId: durableFinalMessageId))

@@ -2,6 +2,18 @@ import AppKit
 import DesignSystemKit
 import SwiftUI
 
+/// Shared Agent App / Desk adaptive history layout.
+///
+/// Short self-sizing transcripts stay mounted. Lazy rematerialization of tall
+/// text rows can cycle in AttributeGraph during scroll and starve MainActor.
+public enum AgentChatTimelineHistoryLayout {
+    public static let eagerEntryLimit = 8
+
+    public static func usesLazyLayout(entryCount: Int) -> Bool {
+        entryCount > eagerEntryLimit
+    }
+}
+
 /// Shared Agent App / Desk timeline viewport constants.
 public enum AgentChatTimelineScrollChrome {
     public static let bottomAnchorID = "BOTTOM"

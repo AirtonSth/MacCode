@@ -123,6 +123,11 @@ final class AgentChatTurnSegmentationTests: XCTestCase {
         XCTAssertFalse(segments[0].isLast)
         XCTAssertTrue(segments[1].isLast)
         XCTAssertTrue(segments.allSatisfy(\.snapshot.finished))
+        XCTAssertEqual(
+            segments.map(AgentChatLiveTurnChrome.showsWorkHeader(for:)),
+            [true, false],
+            "finishing a split turn must not duplicate its Work header below an interleaved row"
+        )
     }
 
     func test_interleaved_rowIds_firstKeepsTurnRowIdentity_laterKeyOnFirstItem() throws {

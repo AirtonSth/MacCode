@@ -36,7 +36,9 @@ final class AgentAppPerfBundleTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeVM(provider: AgentProviderRunner? = nil) throws -> (AgentAppViewModel, AgentThreadRepository) {
+    private func makeVMWithRunRepository(
+        provider: AgentProviderRunner? = nil
+    ) throws -> (AgentAppViewModel, AgentThreadRepository, AgentRunRepository) {
         let tmp = NSTemporaryDirectory() + "rc2-perf-bundle-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -68,6 +70,11 @@ final class AgentAppPerfBundleTests: XCTestCase {
                 authenticated: true
             )
         ]
+        return (vm, threadRepo, runRepo)
+    }
+
+    private func makeVM(provider: AgentProviderRunner? = nil) throws -> (AgentAppViewModel, AgentThreadRepository) {
+        let (vm, threadRepo, _) = try makeVMWithRunRepository(provider: provider)
         return (vm, threadRepo)
     }
 
@@ -325,18 +332,52 @@ final class AgentAppPerfBundleTests: XCTestCase {
         //
         // Same-thread re-select is a soft path (keeps the painted live timeline).
         // Force a true full open by switching away and back.
-        let runner = ReplayBenchmarkRunner(turns: 1_200)
-        let (vm, _) = try makeVM(provider: runner)
+        let (vm, _, runRepo) = try makeVMWithRunRepository()
         vm.createThread(title: "bounded replay")
         let threadId = try XCTUnwrap(vm.selectedThreadId)
-
-        vm.prompt = "generate replay benchmark"
-        await vm.send()
-        await waitAsync("6,000-event run completes", timeout: 60) {
-            vm.status == .completed && vm.timeline.latestAssistantMessage == "REPLAY_1199"
+        let run = AgentRun(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .completed,
+            finishedAt: Date()
+        )
+        try runRepo.upsert(run)
+        let encoder = JSONEncoder()
+        var writes: [AgentRunRepository.StreamWriteIntent] = []
+        writes.reserveCapacity(6_000)
+        for index in 0..<1_200 {
+            let turnId = "replay-turn-\(index)"
+            let itemId = "replay-item-\(index)"
+            let startedAt = Int64(index)
+            let events: [AssistantEvent] = [
+                .turnStarted(turnId: turnId),
+                .itemStarted(item: AssistantItem(
+                    id: itemId,
+                    turnId: turnId,
+                    type: .assistantMessage,
+                    startedAtMs: startedAt
+                )),
+                .itemDelta(itemId: itemId, bodyAppend: "REPLAY_\(index)", outputAppend: nil, summary: nil),
+                .itemCompleted(itemId: itemId, finalState: .completed),
+                .turnCompleted(turnId: turnId, finalMessage: "REPLAY_\(index)"),
+            ]
+            for event in events {
+                let payload = String(decoding: try encoder.encode(event), as: UTF8.self)
+                writes.append(.init(
+                    seq: writes.count + 1,
+                    kind: event.debugDescription,
+                    payloadJSON: payload,
+                    providerEvent: nil
+                ))
+            }
         }
-        XCTAssertEqual(vm.timeline.turns.count, 1_200,
-                       "the live run must build the full transcript before the bounded thread-open replay")
+        try runRepo.persistStreamBatch(
+            runId: run.id,
+            threadId: threadId,
+            items: writes,
+            shouldPruneStreamEvents: true
+        )
 
         vm.createThread(title: "switch-away")
         let otherId = try XCTUnwrap(vm.selectedThreadId)
@@ -2096,42 +2137,4 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
-}
-
-private final class ReplayBenchmarkRunner: AgentProviderRunner, @unchecked Sendable {
-    let provider: AgentProvider = .codex
-    private let turns: Int
-
-    init(turns: Int) {
-        self.turns = turns
-    }
-
-    func listModels() async -> [AgentModelDescriptor] { [] }
-
-    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
-        let turns = self.turns
-        Task.detached {
-            let providerThreadId = request.providerThreadId ?? UUID().uuidString
-            let startedAt = Int64(Date().timeIntervalSince1970 * 1000)
-            onEvent(.status(.running))
-            onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
-            for index in 0..<turns {
-                let turnId = "replay-turn-\(index)"
-                let itemId = "replay-item-\(index)"
-                onEvent(.event(.turnStarted(turnId: turnId)))
-                onEvent(.event(.itemStarted(item: AssistantItem(
-                    id: itemId,
-                    turnId: turnId,
-                    type: .assistantMessage,
-                    startedAtMs: startedAt + Int64(index)
-                ))))
-                onEvent(.event(.itemDelta(itemId: itemId, bodyAppend: "REPLAY_\(index)", outputAppend: nil, summary: nil)))
-                onEvent(.event(.itemCompleted(itemId: itemId, finalState: .completed)))
-                onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: "REPLAY_\(index)")))
-            }
-            onEvent(.status(.completed))
-            onEvent(.finished(.completed, finalMessage: "REPLAY_\(max(turns - 1, 0))", providerThreadId: providerThreadId))
-        }
-        return AgentRunHandle(runId: request.runId, process: nil) {}
-    }
 }
