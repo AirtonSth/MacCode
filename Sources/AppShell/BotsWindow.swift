@@ -6886,30 +6886,26 @@ public final class BotsViewModel: ObservableObject {
         humanText: String,
         attachments: [AgentAttachment],
         wireRequest: String
-    ) {
+    ) throws {
         let messageID = AgentMessageID(runID.value)
         let human = AgentChatTranscriptChrome.displayUserLine(
             text: humanText,
             attachments: attachments
         )
-        do {
-            if try context.messageRepo.get(id: messageID) == nil {
-                try context.messageRepo.append(AgentMessage(
-                    id: messageID,
-                    threadId: threadID,
-                    role: .user,
-                    content: human,
-                    attachments: attachments
-                ))
-            }
-            guard RCWireProtocol.isWire(wireRequest) else { return }
-            try context.messageRepo.upsertRCW1RequestTranslation(
-                messageId: messageID,
-                wireRequestText: wireRequest
-            )
-        } catch {
-            NSLog("RemoteCode Desk Token Saver RCW1 persist failed: \(error)")
+        if try context.messageRepo.get(id: messageID) == nil {
+            try context.messageRepo.append(AgentMessage(
+                id: messageID,
+                threadId: threadID,
+                role: .user,
+                content: human,
+                attachments: attachments
+            ))
         }
+        guard RCWireProtocol.isWire(wireRequest) else { return }
+        try context.messageRepo.upsertRCW1RequestTranslation(
+            messageId: messageID,
+            wireRequestText: wireRequest
+        )
     }
 
     /// Dest first. First paint dest used to dest dest thread before
@@ -7528,7 +7524,7 @@ public final class BotsViewModel: ObservableObject {
             if !providers.isEmpty {
                 router.rememberProviderSnapshotsForSend(providers)
             }
-            persistDeskTokenSaverUserTranslation(
+            try persistDeskTokenSaverUserTranslation(
                 threadID: prepared.thread.id,
                 runID: prepared.runID,
                 humanText: userText,

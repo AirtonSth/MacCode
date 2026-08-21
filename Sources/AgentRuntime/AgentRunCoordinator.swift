@@ -926,7 +926,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     private func captureCanonicalContextSnapshot(
         threadId: AgentThreadID,
-        excludingCurrentUserText: String
+        excludingCurrentUserText: String,
+        excludingCurrentUserMessageId: AgentMessageID? = nil
     ) throws -> TokenSaverCanonicalConversationSnapshot? {
         let messages = try messageRepo.list(threadId: threadId)
         let assistantIds = messages.filter { $0.role == .assistant }.map(\.id)
@@ -941,7 +942,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return TokenSaverCanonicalConversationSnapshot.capture(
             messages: messages,
             persistedRCW1ByMessageId: wires,
-            excludingCurrentUserText: excludingCurrentUserText
+            excludingCurrentUserText: excludingCurrentUserText,
+            excludingCurrentUserMessageId: excludingCurrentUserMessageId
         )
     }
 
@@ -1975,9 +1977,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let adapterKey = providerAdapterKey(runner)
         let binaryIdentity = providerBinaryIdentity(effectiveRequest.provider, adapter: runner)
         try refreshProviderProcessIfScopeChanged(runner, request: effectiveRequest)
+        let currentUserMessageID = AgentMessageID(effectiveRequest.runId.value)
         let priorSnapshot = try captureCanonicalContextSnapshot(
             threadId: effectiveRequest.threadId,
-            excludingCurrentUserText: preservedUserContent
+            excludingCurrentUserText: preservedUserContent,
+            excludingCurrentUserMessageId: currentUserMessageID
         )
         // persist user message
         if recordUserMessage {
@@ -1996,7 +2000,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if let priorSnapshot {
             let verified = try captureCanonicalContextSnapshot(
                 threadId: effectiveRequest.threadId,
-                excludingCurrentUserText: preservedUserContent
+                excludingCurrentUserText: preservedUserContent,
+                excludingCurrentUserMessageId: currentUserMessageID
             )
             if verified?.digest == priorSnapshot.digest {
                 effectiveRequest.contextSnapshot = priorSnapshot

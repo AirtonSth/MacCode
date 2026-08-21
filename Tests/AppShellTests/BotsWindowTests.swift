@@ -270,6 +270,11 @@ final class BotsWindowTests: XCTestCase {
             request.prompt.contains("User request:"),
             "Desk still compiles the Bot brain around the user turn"
         )
+        let currentUserId = request.runId.value.uuidString
+        XCTAssertFalse(
+            request.contextSnapshot?.items.contains { $0.messageId == currentUserId } ?? false,
+            "canonical seed must exclude the current run-id user row even when Human != compiled prompt"
+        )
         let conversationID = try XCTUnwrap(vm.selectedConversation?.id)
         let hydrated = await waitUntil(timeout: 5) {
             vm.selectDeskThread(conversationID)
