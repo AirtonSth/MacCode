@@ -464,6 +464,25 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(pending.last?.url, "http://127.0.0.1:3000")
     }
 
+    func test_browserAction_postsPendingOpenNotification() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "br-note",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        var posted: [Notification.Name] = []
+        authority.notifyBrowserPendingOpen = { posted.append($0) }
+        _ = try authority.dispatch(method: "bot.link.open", params: [
+            "client_request_id": "br-note-open",
+            "bot_id": botID,
+            "url": "http://127.0.0.1:4000",
+        ])
+        XCTAssertEqual(posted, [BotBrowserHost.pendingOpenNotification])
+        let state = try authority.dispatch(method: "bot.browser.state", params: ["bot_id": botID])
+        XCTAssertEqual(state["url"] as? String, "http://127.0.0.1:4000")
+        XCTAssertEqual(state["host_first"] as? Bool, true)
+    }
+
     func test_dockerClear_wipesGuestHomeOnDisk() throws {
         let created = try authority.dispatch(method: "bot.create", params: [
             "client_request_id": "dock",
@@ -511,6 +530,100 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             )
         )
         XCTAssertEqual((started["readback"] as? [String: Any])?["viewer"] as? String, "/vnc.html")
+        XCTAssertEqual(started["status"] as? String, "accepted")
+        XCTAssertEqual((started["readback"] as? [String: Any])?["status"] as? String, "starting")
+    }
+
+    func test_filesOpenTabAndSplit_requireDiskAndCallLiveSurfaceHook() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "open-src",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let wrote = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "open-w",
+            "bot_id": botID,
+            "path": "notes.txt",
+            "op": "write",
+            "contents": "surface",
+        ])
+        let handle = try XCTUnwrap((wrote["readback"] as? [String: Any])?["handle"] as? String)
+        var opened: [(String, Bool, String)] = []
+        authority.onOpenFile = { _, path, split, root in
+            opened.append((path, split, root))
+        }
+        let tab = try authority.dispatch(method: "bot.files.open_tab", params: [
+            "client_request_id": "open-tab",
+            "bot_id": botID,
+            "handle": handle,
+        ])
+        XCTAssertEqual((tab["readback"] as? [String: Any])?["mounted"] as? Bool, true)
+        XCTAssertEqual((tab["readback"] as? [String: Any])?["split"] as? Bool, false)
+        let split = try authority.dispatch(method: "bot.files.split", params: [
+            "client_request_id": "open-split",
+            "bot_id": botID,
+            "handle": handle,
+        ])
+        XCTAssertEqual((split["readback"] as? [String: Any])?["split"] as? Bool, true)
+        XCTAssertEqual(opened.map(\.0), ["notes.txt", "notes.txt"])
+        XCTAssertEqual(opened.map(\.1), [false, true])
+        XCTAssertThrowsError(
+            try authority.dispatch(method: "bot.files.open_tab", params: [
+                "client_request_id": "open-missing",
+                "bot_id": botID,
+                "handle": "\(botID):bot_home:1:missing.txt",
+            ])
+        )
+    }
+
+    func test_dockerClear_isPartialWhenRuntimeTeardownFails() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "dock-p",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        authority.onDockerClear = { _ in
+            throw BotRemoteControlAuthority.Error(code: -32088, message: "Docker home clear failed.")
+        }
+        let cleared = try authority.dispatch(method: "bot.docker.clear", params: [
+            "client_request_id": "dock-p-c",
+            "bot_id": botID,
+            "confirm": "clear",
+        ])
+        XCTAssertEqual(cleared["status"] as? String, "partial")
+        XCTAssertEqual((cleared["readback"] as? [String: Any])?["partial"] as? Bool, true)
+        XCTAssertEqual((cleared["readback"] as? [String: Any])?["cleared"] as? Bool, true)
+    }
+
+    func test_forceStop_keepsQueueWhenLiveStopHookOwnsDrain() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "live-stop",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "live-stop-1",
+            "bot_id": botID,
+            "text": "go",
+        ])
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "live-stop-2",
+            "bot_id": botID,
+            "text": "queued",
+        ])
+        var stopped = false
+        authority.onStopRun = { _, force in
+            stopped = force
+        }
+        let uuid = try XCTUnwrap(UUID(uuidString: botID))
+        let result = try authority.dispatch(method: "bot.force_stop", params: [
+            "client_request_id": "live-stop-go",
+            "bot_id": botID,
+        ])
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(result["status"] as? String, "accepted")
+        XCTAssertNil((result["readback"] as? [String: Any])?["drained"] as? [String: Any])
+        XCTAssertEqual(try store.listQueuedFollowUps(botID: BotID(uuid)).map(\.text), ["queued"])
     }
 
     func test_forceStop_drainsStoreQueue() throws {

@@ -4403,6 +4403,54 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    public func openRemoteFile(
+        botID: BotID,
+        relativePath: String,
+        split: Bool,
+        root: String
+    ) throws {
+        guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
+            throw BotStoreError.notFound
+        }
+        if selectedBot?.id != bot.id {
+            openStudio(bot)
+        }
+        studioTab = .files
+        setStudioFilesLocation(root == "docker_home" ? .dockerHome : .botFiles, for: bot)
+        attachHomeFilesSurface(for: bot)
+        guard let router = homeFilesRouter else {
+            throw BotStoreError.invalidRow("Bot files surface is unavailable")
+        }
+        let workspaceID = WorkspaceID(bot.id.value)
+        let surfaceID = SurfaceID(bot.id.value)
+        if split {
+            _ = try router.filesSplitTab(
+                workspace: workspaceID,
+                sourceSurface: surfaceID,
+                paneID: nil,
+                direction: .right,
+                path: relativePath
+            )
+            homeFilesModel?.splitFileTab(path: relativePath, direction: .right)
+        } else {
+            _ = try router.filesOpenTab(
+                workspace: workspaceID,
+                sourceSurface: surfaceID,
+                paneID: nil,
+                path: relativePath
+            )
+            homeFilesModel?.reveal(relativePath: relativePath)
+        }
+        if root == "docker_home" {
+            selectedHomePath = relativePath
+        } else {
+            let text = try botHome(for: bot).readFile(relativePath: relativePath)
+            selectedHomePath = relativePath
+            homeDraft = text
+            homeOriginal = text
+        }
+    }
+
     public func discardHomeFile() {
         homeDraft = homeOriginal
     }

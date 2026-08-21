@@ -24,6 +24,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         public let code: Int
         public let message: String
         public var description: String { message }
+        public init(code: Int, message: String) {
+            self.code = code
+            self.message = message
+        }
         public static let invalidParams = Error(code: -32602, message: "Invalid params")
         public static let controlPlaneOff = Error(code: -32081, message: "Bot control plane is off.")
         public static let notFound = Error(code: -32044, message: "RemoteCode Bot was not found.")
@@ -46,8 +50,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onStartGuest: ((BotID, String) -> Void)?
     public var onStopGuest: ((BotID) -> Void)?
     public var onRebuildGuest: ((BotID) -> Void)?
-    public var onDockerClear: ((BotID) -> Void)?
+    public var onDockerClear: ((BotID) throws -> Void)?
     public var onSend: ((BotID, String) throws -> Void)?
+    public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
+    public var notifyBrowserPendingOpen: ((Notification.Name) -> Void)?
 
     private var receipts: [String: [String: Any]] = [:]
     private var unpublished: Set<String> = []
@@ -219,20 +225,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func browserState(params: [String: Any]) throws -> [String: Any] {
         let bot = try requireBot(params)
         let botID = id(bot)
-        if let memory = browser[botID] {
-            return memory
-        }
         if let target = try browserStore.loadTarget(botID: bot.id) {
             return [
                 "bot_id": botID,
                 "url": target.url,
                 "title": target.title,
                 "loading": false,
-                "generation": generation,
+                "generation": (browser[botID]?["generation"] as? Int) ?? generation,
                 "host_first": true,
             ]
         }
-        return [
+        return browser[botID] ?? [
             "bot_id": botID,
             "url": "",
             "title": "",
@@ -557,10 +560,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let botID = id(bot)
         let hadLive = onHasLiveRun?(bot.id) ?? (liveRuns[botID] != nil)
         let run = liveRuns[botID]
+        let liveStop = onStopRun != nil
         onStopRun?(bot.id, force)
         liveRuns[botID] = nil
         var drained: [String: Any]?
-        if let next = try store.dequeueQueuedFollowUp(botID: bot.id) {
+        if !liveStop, let next = try store.dequeueQueuedFollowUp(botID: bot.id) {
             liveRuns[botID] = [
                 "bot_id": botID,
                 "status": "working",
@@ -574,14 +578,19 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "state": drained == nil ? "none" : "working",
             "source": "bot",
         ]
-        return receipt(requestID: requestID, status: .completed, botID: botID, readback: [
-            "accepted": true,
-            "force": force,
-            "terminal": hadLive || run != nil,
-            "run": run as Any,
-            "drained": drained as Any,
-            "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
-        ])
+        return receipt(
+            requestID: requestID,
+            status: liveStop ? .accepted : .completed,
+            botID: botID,
+            readback: [
+                "accepted": true,
+                "force": force,
+                "terminal": hadLive || run != nil,
+                "run": run as Any,
+                "drained": drained as Any,
+                "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
+            ]
+        )
     }
 
     private func conversationCreate(params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -739,11 +748,20 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func filesOpen(params: [String: Any], requestID: String, split: Bool) throws -> [String: Any] {
         let bot = try requireBot(params)
         let handle = string(params, "handle") ?? ""
-        guard let entry = files[handle], entry["bot_id"] as? String == id(bot) else { throw Error.invalidParams }
+        let entry = try resolveFileEntry(bot: bot, handle: handle)
+        let root = (entry["root"] as? String) ?? (filesLocation[id(bot)] ?? "bot_home")
+        let path = entry["path"] as? String ?? ""
+        guard try diskFileExists(bot: bot, root: root, path: path) else {
+            throw Error(code: -32090, message: "Bot file was not found.")
+        }
+        if let onOpenFile {
+            try onOpenFile(bot.id, path, split, root)
+        }
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
             "mounted": true,
             "split": split,
             "handle": handle,
+            "path": path,
             "generation": entry["generation"] as Any,
         ])
     }
@@ -762,10 +780,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         generation += 1
         let url = string(params, "url") ?? (browser[botID]?["url"] as? String) ?? ""
         let title = string(params, "title") ?? url
-        let target = BotBrowserTarget(url: url, title: title)
         do {
-            try browserStore.persistTarget(target, botID: bot.id)
-            try browserStore.enqueuePendingOpen(target, botID: bot.id)
+            _ = try BotBrowserHost.requestOpen(
+                store: browserStore,
+                botID: bot.id,
+                url: url,
+                title: title.isEmpty ? nil : title,
+                notify: notifyBrowserPendingOpen ?? { name in
+                    DistributedNotificationCenter.default().post(name: name, object: nil)
+                }
+            )
         } catch {
             throw Error(code: -32087, message: "Bot browser persist failed.")
         }
@@ -794,18 +818,23 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         _ = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id)
         let recipe = string(params, "recipe") ?? "pointer"
         let status: String
+        let receiptStatus: Status
         switch name {
         case "guest.start":
             onStartGuest?(bot.id, recipe)
-            status = "running"
+            status = "starting"
+            receiptStatus = .accepted
         case "guest.rebuild":
             onRebuildGuest?(bot.id)
-            status = "running"
+            status = "starting"
+            receiptStatus = .accepted
         case "guest.stop":
             onStopGuest?(bot.id)
-            status = "stopped"
+            status = "stopping"
+            receiptStatus = .accepted
         default:
-            status = "running"
+            status = "input"
+            receiptStatus = .accepted
         }
         let state: [String: Any] = [
             "bot_id": botID,
@@ -816,7 +845,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "embed_html_is_not_runtime": true,
         ]
         guest[botID] = state
-        return receipt(requestID: requestID, status: .completed, botID: botID, readback: state)
+        return receipt(requestID: requestID, status: receiptStatus, botID: botID, readback: state)
     }
 
     private func dockerClear(params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -829,20 +858,32 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         do {
             removedPaths = (try? listDiskPaths(bot: bot, root: "docker_home")) ?? []
             try BotGuestHome.wipe(appSupport: appSupport, botID: bot.id)
-            onDockerClear?(bot.id)
         } catch {
             throw Error(code: -32088, message: "Docker home clear failed.")
+        }
+        var partial = false
+        if let onDockerClear {
+            do {
+                try onDockerClear(bot.id)
+            } catch {
+                partial = true
+            }
         }
         let removed = files.keys.filter { key in
             (files[key]?["bot_id"] as? String) == botID && (files[key]?["root"] as? String) == "docker_home"
         }
         for key in removed { files[key] = nil }
         guest[botID] = ["bot_id": botID, "status": "stopped", "viewer": "/vnc.html"]
-        return receipt(requestID: requestID, status: .completed, botID: botID, readback: [
-            "cleared": true,
-            "removed_count": max(removed.count, removedPaths.count),
-            "partial": false,
-        ])
+        return receipt(
+            requestID: requestID,
+            status: partial ? .partial : .completed,
+            botID: botID,
+            readback: [
+                "cleared": true,
+                "removed_count": max(removed.count, removedPaths.count),
+                "partial": partial,
+            ]
+        )
     }
 
     private func notifySet(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
@@ -1049,6 +1090,36 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func botHome(_ bot: BotDefinition) -> BotHome {
         BotHome(appSupportDirectory: appSupport, bot: bot)
+    }
+
+    private func resolveFileEntry(bot: BotDefinition, handle: String) throws -> [String: Any] {
+        if let entry = files[handle], entry["bot_id"] as? String == id(bot) {
+            return entry
+        }
+        let botID = id(bot)
+        let prefix = botID + ":"
+        guard handle.hasPrefix(prefix) else { throw Error.invalidParams }
+        let parts = String(handle.dropFirst(prefix.count))
+            .split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
+            .map(String.init)
+        guard parts.count == 3, parts[0] == "bot_home" || parts[0] == "docker_home" else {
+            throw Error.invalidParams
+        }
+        return [
+            "handle": handle,
+            "bot_id": botID,
+            "root": parts[0],
+            "path": parts[2],
+            "generation": Int(parts[1]) ?? 0,
+        ]
+    }
+
+    private func diskFileExists(bot: BotDefinition, root: String, path: String) throws -> Bool {
+        if root == "docker_home" {
+            let url = try containedURL(root: BotGuestHome.url(appSupport: appSupport, botID: bot.id), path: path)
+            return FileManager.default.fileExists(atPath: url.path)
+        }
+        return FileManager.default.fileExists(atPath: try botHome(bot).resolvedURL(path).path)
     }
 
     private func handleFor(botID: String, root: String, path: String) -> String {

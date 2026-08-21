@@ -2873,7 +2873,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             self?.botsViewModel?.rebuildDockerGuest(botID: id)
         }
         created.onDockerClear = { [weak self] id in
-            self?.botsViewModel?.computerGuestService?.teardown(botID: id)
+            guard let service = self?.botsViewModel?.computerGuestService else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32088,
+                    message: "Docker home clear failed."
+                )
+            }
+            try service.removeGuestRuntime(botID: id)
         }
         created.onSend = { [weak self] id, text in
             guard let vm = self?.botsViewModel else { return }
@@ -2883,6 +2889,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 conversationID: nil,
                 routing: BotDeskRouting()
             )
+        }
+        created.onOpenFile = { [weak self] botID, path, split, root in
+            guard let vm = self?.botsViewModel else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32089,
+                    message: "Bot files surface is unavailable."
+                )
+            }
+            try vm.openRemoteFile(botID: botID, relativePath: path, split: split, root: root)
+        }
+        created.notifyBrowserPendingOpen = { [weak self] name in
+            DistributedNotificationCenter.default().post(name: name, object: nil)
+            try? self?.reconcileBotBrowserOpens()
         }
         pairedBotRemote = created
         return created
