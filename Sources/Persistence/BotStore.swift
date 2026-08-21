@@ -14,6 +14,14 @@ public enum BotStoreError: Error, Equatable, CustomStringConvertible {
 }
 
 public final class BotStore: @unchecked Sendable {
+    // These values satisfy the pre-thread-routing NOT NULL columns only. They
+    // are never decoded into BotRevision or consulted as an execution route.
+    private static let legacyProviderColumnValue: AgentProvider = .codex
+    private static let legacyProviderInstanceColumnValue = ""
+    private static let legacyModelColumnValue = ""
+    private static let legacyReasoningEffortColumnValue: AgentReasoningEffort = .medium
+    private static let legacyCompatibleRouteSetColumnValue = ["default"]
+
     private let db: SQLiteDB
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
@@ -65,11 +73,6 @@ public final class BotStore: @unchecked Sendable {
         handle: String? = nil,
         avatarSymbol: String = "person.crop.circle",
         soul: String = "",
-        provider: AgentProvider,
-        providerInstanceID: String? = nil,
-        model: String = "",
-        reasoningEffort: AgentReasoningEffort = .medium,
-        compatibleRouteSet: [String] = ["default"],
         desktopKind: BotDesktopKind = .logicalExecutionSpace,
         workspaceID: WorkspaceID? = nil,
         notificationsEnabled: Bool = true,
@@ -77,19 +80,11 @@ public final class BotStore: @unchecked Sendable {
     ) throws -> BotDefinition {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { throw BotPublishError.invalidRevision }
-        let routes = normalizedRoutes(compatibleRouteSet)
-        guard !routes.isEmpty else { throw BotPublishError.invalidRevision }
         let draft = BotRevisionDraft(
             name: trimmedName,
             title: title.trimmingCharacters(in: .whitespacesAndNewlines),
             description: description.trimmingCharacters(in: .whitespacesAndNewlines),
             soul: soul,
-            provider: provider,
-            providerInstanceID: (providerInstanceID ?? provider.rawValue)
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            model: model.trimmingCharacters(in: .whitespacesAndNewlines),
-            reasoningEffort: reasoningEffort,
-            compatibleRouteSet: routes,
             permissionMode: .supervised,
             desktopKind: desktopKind
         )
@@ -146,6 +141,38 @@ public final class BotStore: @unchecked Sendable {
         return created
     }
 
+    @available(*, deprecated, message: "Provider routing belongs to AgentThread, not BotStore.create.")
+    public func create(
+        name: String,
+        title: String,
+        description: String,
+        handle: String? = nil,
+        avatarSymbol: String = "person.crop.circle",
+        soul: String = "",
+        provider _: AgentProvider,
+        providerInstanceID _: String? = nil,
+        model _: String = "",
+        reasoningEffort _: AgentReasoningEffort = .medium,
+        compatibleRouteSet _: [String] = ["default"],
+        desktopKind: BotDesktopKind = .logicalExecutionSpace,
+        workspaceID: WorkspaceID? = nil,
+        notificationsEnabled: Bool = true,
+        now: Date = Date()
+    ) throws -> BotDefinition {
+        try create(
+            name: name,
+            title: title,
+            description: description,
+            handle: handle,
+            avatarSymbol: avatarSymbol,
+            soul: soul,
+            desktopKind: desktopKind,
+            workspaceID: workspaceID,
+            notificationsEnabled: notificationsEnabled,
+            now: now
+        )
+    }
+
     public func updateProfile(
         id: BotID,
         name: String? = nil,
@@ -170,11 +197,6 @@ public final class BotStore: @unchecked Sendable {
                 title: title.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? current.title,
                 description: description.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? current.description,
                 soul: current.soul,
-                provider: current.provider,
-                providerInstanceID: current.providerInstanceID,
-                model: current.model,
-                reasoningEffort: current.reasoningEffort,
-                compatibleRouteSet: current.compatibleRouteSet,
                 permissionMode: current.permissionMode,
                 desktopKind: current.desktopKind
             )
@@ -290,11 +312,6 @@ public final class BotStore: @unchecked Sendable {
                 title: current.title,
                 description: current.description,
                 soul: current.soul,
-                provider: current.provider,
-                providerInstanceID: current.providerInstanceID,
-                model: current.model,
-                reasoningEffort: current.reasoningEffort,
-                compatibleRouteSet: current.compatibleRouteSet,
                 permissionMode: current.permissionMode,
                 desktopKind: current.desktopKind
             )
@@ -1258,8 +1275,7 @@ public final class BotStore: @unchecked Sendable {
             throw BotPublishError.revisionConflict
         }
         let trimmedName = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let routes = normalizedRoutes(draft.compatibleRouteSet)
-        guard !trimmedName.isEmpty, !routes.isEmpty else { throw BotPublishError.invalidRevision }
+        guard !trimmedName.isEmpty else { throw BotPublishError.invalidRevision }
         let nextNumber = try nextRevisionNumber(botID: bot.id, database: database)
         let revisionID = BotRevisionID()
         let normalized = BotRevisionDraft(
@@ -1267,11 +1283,6 @@ public final class BotStore: @unchecked Sendable {
             title: draft.title.trimmingCharacters(in: .whitespacesAndNewlines),
             description: draft.description.trimmingCharacters(in: .whitespacesAndNewlines),
             soul: draft.soul,
-            provider: draft.provider,
-            providerInstanceID: draft.providerInstanceID,
-            model: draft.model,
-            reasoningEffort: draft.reasoningEffort,
-            compatibleRouteSet: routes,
             permissionMode: draft.permissionMode,
             desktopKind: draft.desktopKind
         )
@@ -1314,11 +1325,6 @@ public final class BotStore: @unchecked Sendable {
             title: draft.title,
             description: draft.description,
             soul: draft.soul,
-            provider: draft.provider,
-            providerInstanceID: draft.providerInstanceID,
-            model: draft.model,
-            reasoningEffort: draft.reasoningEffort,
-            compatibleRouteSet: draft.compatibleRouteSet,
             permissionMode: draft.permissionMode,
             desktopKind: draft.desktopKind,
             digest: BotRevision.digest(botID: botID, draft: draft),
@@ -1334,17 +1340,6 @@ public final class BotStore: @unchecked Sendable {
         }
         guard let derived = BotHandle.derive(from: fallback) else { throw BotPublishError.handleEmpty }
         return derived
-    }
-
-    private func normalizedRoutes(_ routes: [String]) -> [String] {
-        var seen = Set<String>()
-        var result: [String] = []
-        for route in routes {
-            let trimmed = route.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { continue }
-            result.append(trimmed)
-        }
-        return result
     }
 
     private func assertLiveCapacity(database: SQLiteDB, additional: Int) throws {
@@ -1416,7 +1411,7 @@ public final class BotStore: @unchecked Sendable {
     }
 
     private func insertRevision(_ revision: BotRevision, database: SQLiteDB) throws {
-        let routes = try encodeRoutes(revision.compatibleRouteSet)
+        let routes = try encodeRoutes(Self.legacyCompatibleRouteSetColumnValue)
         let statement = try database.prepare("""
             INSERT INTO bot_revisions(
                 id, bot_id, revision_number, name, title, description, soul, provider,
@@ -1432,10 +1427,10 @@ public final class BotStore: @unchecked Sendable {
         try statement.bind(5, revision.title)
         try statement.bind(6, revision.description)
         try statement.bind(7, revision.soul)
-        try statement.bind(8, revision.provider.rawValue)
-        try statement.bind(9, revision.providerInstanceID)
-        try statement.bind(10, revision.model)
-        try statement.bind(11, revision.reasoningEffort.rawValue)
+        try statement.bind(8, Self.legacyProviderColumnValue.rawValue)
+        try statement.bind(9, Self.legacyProviderInstanceColumnValue)
+        try statement.bind(10, Self.legacyModelColumnValue)
+        try statement.bind(11, Self.legacyReasoningEffortColumnValue.rawValue)
         try statement.bind(12, routes)
         try statement.bind(13, revision.permissionMode.rawValue)
         try statement.bind(14, revision.desktopKind.rawValue)
@@ -1714,11 +1709,6 @@ public final class BotStore: @unchecked Sendable {
             let title = statement.columnText(4),
             let description = statement.columnText(5),
             let soul = statement.columnText(6),
-            let providerRaw = statement.columnText(7), let provider = AgentProvider(rawValue: providerRaw),
-            let instance = statement.columnText(8),
-            let model = statement.columnText(9),
-            let effortRaw = statement.columnText(10), let effort = AgentReasoningEffort(rawValue: effortRaw),
-            let routesRaw = statement.columnText(11),
             let permissionRaw = statement.columnText(12),
             let permission = AgentPermissionMode(rawValue: permissionRaw),
             let desktopRaw = statement.columnText(13),
@@ -1735,11 +1725,6 @@ public final class BotStore: @unchecked Sendable {
             title: title,
             description: description,
             soul: soul,
-            provider: provider,
-            providerInstanceID: instance,
-            model: model,
-            reasoningEffort: effort,
-            compatibleRouteSet: try decodeRoutes(routesRaw),
             permissionMode: permission,
             desktopKind: desktop,
             digest: digest,
@@ -1887,13 +1872,6 @@ public final class BotStore: @unchecked Sendable {
             throw BotStoreError.invalidRow("compatible_route_set is not UTF-8")
         }
         return string
-    }
-
-    private func decodeRoutes(_ string: String) throws -> [String] {
-        guard let data = string.data(using: .utf8) else {
-            throw BotStoreError.invalidRow("compatible_route_set is not UTF-8")
-        }
-        return try decoder.decode([String].self, from: data)
     }
 
     private func string(_ date: Date?) -> String? {

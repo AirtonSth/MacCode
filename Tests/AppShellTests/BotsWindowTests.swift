@@ -26,6 +26,7 @@ final class BotsWindowTests: XCTestCase {
         UserDefaults.standard.removeObject(forKey: "bots.studioDraft")
         UserDefaults.standard.removeObject(forKey: "bots.searchText")
         UserDefaults.standard.removeObject(forKey: "bots.deskRouting")
+        UserDefaults.standard.removeObject(forKey: "bots.deskThreadRouting")
         UserDefaults.standard.removeObject(forKey: "bots.peerTurns")
         UserDefaults.standard.removeObject(forKey: "bots.peerTurns.v2")
         UserDefaults.standard.removeObject(forKey: "bots.studioFilesLocations")
@@ -52,7 +53,7 @@ final class BotsWindowTests: XCTestCase {
         let router = AppCommandRouter(context: context)
         context.router = router
         let vm = BotsViewModel(context: context, router: router)
-        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let bot = try vm.create(name: "Piper", title: "Scout")
         vm.openDesk(bot)
         let file = (directory as NSString).appendingPathComponent("brief.pdf")
         FileManager.default.createFile(atPath: file, contents: Data("hi".utf8))
@@ -98,15 +99,15 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let runner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: runner)
+        let runner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: runner)
         router.rememberProviderSnapshotsForSend([
             AgentProviderSnapshotFactory.snapshot(
-                provider: .claude,
-                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok)],
                 binaryPath: "/usr/bin/true",
                 authenticated: true,
-                id: "claude"
+                id: "grok"
             ),
         ])
         let vm = BotsViewModel(context: context, router: router)
@@ -118,8 +119,6 @@ final class BotsWindowTests: XCTestCase {
             description: "Test everything end to end.",
             handle: "oliver",
             soul: "Never accept an unproven claim.",
-            provider: .claude,
-            model: "opus",
             callerRun: callerRun
         )
         let botID = BotID(try XCTUnwrap(created.objectValue?["id"]?.stringValue.flatMap(UUID.init)))
@@ -133,16 +132,27 @@ final class BotsWindowTests: XCTestCase {
         )
 
         let userText = "Inspect every path in the VM."
+        let caller = try seedBotCaller(
+            context: context,
+            provider: .grok,
+            model: "grok-4.6",
+            permissionMode: .fullAccess
+        )
         let result = try await router.sendHostBot(
             botID: botID,
             text: userText,
-            conversationID: nil
+            conversationID: nil,
+            callerThread: caller.thread.id,
+            callerRun: caller.run.id
         )
         XCTAssertEqual(result.objectValue?["enqueued"]?.boolValue, true)
         XCTAssertEqual(result.objectValue?["queued_follow_up"]?.boolValue, false)
         let started = await waitUntil(timeout: 5) { runner.requests.count == 1 }
         XCTAssertTrue(started)
         let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertEqual(request.provider, .grok, "the Bot must inherit the authenticated caller provider")
+        XCTAssertEqual(request.model, "grok-4.6")
+        XCTAssertEqual(request.permissionMode, .fullAccess)
         XCTAssertTrue(request.prompt.contains(userText))
         XCTAssertTrue(request.prompt.contains(skillMarker))
         XCTAssertTrue(request.prompt.contains("Never accept an unproven claim."))
@@ -179,14 +189,24 @@ final class BotsWindowTests: XCTestCase {
             description: "",
             handle: "oliver-queue",
             soul: "Be exact.",
-            provider: .claude,
-            model: "opus",
             callerRun: AgentRunID()
         )
         let botID = BotID(try XCTUnwrap(created.objectValue?["id"]?.stringValue.flatMap(UUID.init)))
         let other = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude, model: "opus")
+        let caller = try seedBotCaller(
+            context: context,
+            provider: .claude,
+            model: "opus",
+            permissionMode: .fullAccess
+        )
 
-        let first = try await router.sendHostBot(botID: botID, text: "first host task", conversationID: nil)
+        let first = try await router.sendHostBot(
+            botID: botID,
+            text: "first host task",
+            conversationID: nil,
+            callerThread: caller.thread.id,
+            callerRun: caller.run.id
+        )
         let firstStarted = await waitUntil(timeout: 5) { runner.requests.count == 1 }
         XCTAssertTrue(firstStarted)
         let firstRequest = try XCTUnwrap(runner.requests.first)
@@ -197,7 +217,9 @@ final class BotsWindowTests: XCTestCase {
         let queued = try await router.sendHostBot(
             botID: botID,
             text: "second exact follow-up",
-            conversationID: conversationID
+            conversationID: conversationID,
+            callerThread: caller.thread.id,
+            callerRun: caller.run.id
         )
         XCTAssertEqual(queued.objectValue?["queued_follow_up"]?.boolValue, true)
         XCTAssertEqual(runner.requests.count, 1)
@@ -402,7 +424,6 @@ final class BotsWindowTests: XCTestCase {
         vm.openStudio(bot)
         XCTAssertEqual(vm.screen, .studio)
         XCTAssertEqual(vm.studioDraft.name, "Piper")
-        XCTAssertEqual(vm.studioDraft.provider, .grok)
         XCTAssertEqual(
             vm.rosterRevisionFetchCountForTesting,
             afterDesk,
@@ -1309,14 +1330,14 @@ final class BotsWindowTests: XCTestCase {
         // land on Chat so roster/create never park on Goal cards.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
-        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let bot = try vm.create(name: "Piper", title: "Scout")
         vm.openDesk(bot)
         XCTAssertEqual(vm.screen, .desk)
         vm.openHome(bot)
         XCTAssertEqual(vm.screen, .desk)
         XCTAssertEqual(vm.screen, BotsScreen.fleet.resolvedDestination)
         XCTAssertEqual(vm.selectedBotID, bot.id)
-        XCTAssertEqual(vm.providerLabel(for: bot), "Claude")
+        XCTAssertEqual(vm.providerLabel(for: bot), "Codex", "the unopened thread uses the user's composer default")
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).title, "Scout")
     }
 
@@ -2590,16 +2611,29 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNotEqual(vm.selectedBotID, piper.id)
     }
 
-    func test_providerChipFollowsThePublishedRevision_becauseHomeMustNotHardcodeClaude() throws {
-        // WHY: a Grok teammate shown as "Claude" teaches the user the
-        // overview is decorative. The chip is the live route, not a mock.
+    func test_providerChipFollowsTheCallingThread_becauseBotHasNoSavedProvider() throws {
+        // WHY: the provider chip is the user's route for this conversation.
+        // Creating or publishing Bot identity must not choose it implicitly.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
-        let grok = try vm.create(name: "Quinn", title: "Reviewer", provider: .grok)
-        XCTAssertEqual(vm.providerLabel(for: grok), "Grok")
-        vm.openHome(grok)
-        XCTAssertEqual(vm.providerLabel(for: grok), "Grok")
-        XCTAssertEqual(vm.resolvedProvider(for: grok), .grok)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer")
+        vm.openDesk(quinn)
+        XCTAssertEqual(vm.providerLabel(for: quinn), "Codex", "the unbound composer starts on its own default")
+        XCTAssertNil(vm.resolvedProvider(for: quinn), "no conversation thread means no persisted route")
+
+        vm.setDeskProvider(.grok)
+        vm.createDeskThread()
+        XCTAssertEqual(vm.providerLabel(for: quinn), "Grok")
+        XCTAssertEqual(vm.resolvedProvider(for: quinn), .grok)
+
+        let revision = try XCTUnwrap(
+            try context.botStore.getRevision(id: try XCTUnwrap(quinn.currentRevisionID))
+        )
+        let revisionObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(revision)) as? [String: Any]
+        )
+        XCTAssertNil(revisionObject["provider"])
+        XCTAssertNil(revisionObject["model"])
     }
 
     func test_openFleetSelectsFirstTeammate_becauseHomeNeedsASelectedBot() throws {
@@ -3972,6 +4006,28 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(next.compiledPayload.contains("What did you see last night?"))
     }
 
+    func test_previewBrainReassemblesWhenCallingThreadProviderChanges_becauseBotHasNoSavedRoute() throws {
+        // WHY: provider/model belong to the calling thread. Reusing a Bot-keyed
+        // preview after the user changes that thread would advertise and run
+        // the stale provider even though the Bot itself stores no route.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.")
+        vm.openDesk(bot)
+        vm.composerText = "Which provider is running this turn?"
+        vm.setDeskProvider(.codex)
+        let codex = try XCTUnwrap(vm.previewBrain())
+        let afterCodex = vm.previewBrainAssembleCountForTesting
+        XCTAssertEqual(codex.provider, .codex)
+        XCTAssertEqual(codex.model, BotsViewModel.defaultModel(for: .codex))
+
+        vm.setDeskProvider(.grok)
+        let grok = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(vm.previewBrainAssembleCountForTesting, afterCodex + 1)
+        XCTAssertEqual(grok.provider, .grok)
+        XCTAssertEqual(grok.model, BotsViewModel.defaultModel(for: .grok))
+    }
+
     func test_reloadKeepsDesk_becauseRemountMustNotNavigateHome() throws {
         // WHY: installBotsContent remounts with reload() only. reload must
         // refresh the open Desk, not convert a paint into Fleet navigation.
@@ -4751,17 +4807,61 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(decoded.runAsUser.id, AgentRunAsUser.current().id)
     }
 
-    func test_deskRoutingSeedsFromPublishedRoute_becauseComposerStartsOnTheStudioDefault() throws {
-        // WHY: Desk must not invent Codex when Studio published Claude.
-        // The published route is the seed, not a later lock.
+    func test_newDeskThreadDoesNotSeedFromBotRevision_becauseProviderBelongsToTheThread() throws {
+        // WHY: saving a Bot with a legacy Claude revision must never make
+        // Claude that Bot's provider. The user chooses the execution route
+        // on the new thread's composer.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude, model: "opus")
         vm.openDesk(bot)
-        XCTAssertEqual(vm.deskRunProvider, .claude)
-        XCTAssertEqual(vm.deskRunModel, "opus")
+        XCTAssertEqual(vm.deskRunProvider, .codex)
+        XCTAssertEqual(vm.deskRouting.routingMode, .auto)
         XCTAssertEqual(vm.deskRunPermissionMode, .supervised)
-        XCTAssertEqual(vm.resolvedProvider(for: bot), .claude)
+        XCTAssertNil(vm.resolvedProvider(for: bot))
+    }
+
+    func test_deskProviderChoicePersistsPerThread_notPerBot() throws {
+        // WHY: one Bot can be called from Grok in one thread and Claude in
+        // another. Reopening either thread must restore that user's choice
+        // without turning either provider into a Bot property.
+        let context = try makeContext()
+        let bot: BotDefinition
+        let grokThread: BotConversation
+        let claudeThread: BotConversation
+        do {
+            let vm = BotsViewModel(context: context)
+            bot = try vm.create(
+                name: "Piper",
+                title: "Scout",
+                provider: .codex,
+                model: "legacy-only"
+            )
+            vm.openDesk(bot)
+            vm.createDeskThread()
+            vm.setDeskProvider(.grok)
+            vm.setDeskModel("grok-4.6")
+            grokThread = try XCTUnwrap(vm.selectedConversation)
+
+            vm.createDeskThread()
+            vm.setDeskProvider(.claude)
+            vm.setDeskModel("opus")
+            claudeThread = try XCTUnwrap(vm.selectedConversation)
+
+            vm.selectDeskThread(grokThread.id)
+            XCTAssertEqual(vm.deskRunProvider, .grok)
+            XCTAssertEqual(vm.deskRunModel, "grok-4.6")
+            vm.selectDeskThread(claudeThread.id)
+            XCTAssertEqual(vm.deskRunProvider, .claude)
+            XCTAssertEqual(vm.deskRunModel, "opus")
+        }
+
+        let restored = BotsViewModel(context: context)
+        restored.openDesk(bot)
+        restored.selectDeskThread(grokThread.id)
+        XCTAssertEqual(restored.deskRunProvider, .grok)
+        restored.selectDeskThread(claudeThread.id)
+        XCTAssertEqual(restored.deskRunProvider, .claude)
     }
 
     func test_deskSendUsesComposerProvider_notPublishedRoute() throws {
@@ -4778,7 +4878,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskRunProvider, .grok)
         XCTAssertEqual(vm.deskRunModel, BotsViewModel.defaultModel(for: .grok))
         XCTAssertEqual(vm.deskRunPermissionMode, .fullAccess)
-        XCTAssertEqual(vm.resolvedProvider(for: bot), .claude)
+        XCTAssertNil(vm.resolvedProvider(for: bot), "an unsent Bot still has no provider")
         vm.setDeskReasoningEffort(.high)
         XCTAssertEqual(vm.deskRunReasoning, .high)
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
@@ -4862,7 +4962,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskRunProvider, .grok)
         XCTAssertEqual(vm.deskRunModel, BotsViewModel.defaultModel(for: .grok))
         XCTAssertEqual(vm.permissionLabel(for: bot), "Full access")
-        XCTAssertEqual(vm.resolvedProvider(for: bot), .claude)
+        XCTAssertNil(
+            vm.resolvedProvider(for: bot),
+            "an unsent Bot has no resolved provider outside the calling thread"
+        )
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertFalse(source.contains("bots.desk.provider"))
     }
@@ -4899,6 +5002,7 @@ final class BotsWindowTests: XCTestCase {
         let vm = BotsViewModel(context: context)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
         vm.openDesk(piper)
+        vm.setDeskProvider(.grok)
         vm.replaceProvidersForTests([
             AgentProviderSnapshotFactory.snapshot(
                 provider: .grok,
@@ -4921,6 +5025,7 @@ final class BotsWindowTests: XCTestCase {
         let vm = BotsViewModel(context: context)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
         vm.openDesk(piper)
+        vm.setDeskProvider(.grok)
         vm.replaceProvidersForTests([
             AgentProviderSnapshotFactory.snapshot(
                 provider: .grok,
@@ -5082,17 +5187,29 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let piperPeerRunner = ControlledBotHandoffRunner(provider: .codex)
+        let roryPeerRunner = ControlledBotHandoffRunner(provider: .grok)
         let piperHostRunner = ControlledBotHandoffRunner(provider: .codex)
         let roryHostRunner = ControlledBotHandoffRunner(provider: .grok)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProvider(.codex, runner: piperHostRunner)
-        context.coordinator.replaceProvider(.grok, runner: roryHostRunner)
         let viewModel = BotsViewModel(context: context, router: router)
         router.botsViewModel = viewModel
         let piper = try viewModel.create(name: "Piper", title: "Seller", provider: .codex)
         let rory = try viewModel.create(name: "Rory", title: "Researcher", provider: .grok)
         let quinn = try viewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: piperHostRunner,
+                peerRunners: [quinn.id: piperPeerRunner]
+            )
+        )
+        context.coordinator.replaceProvider(
+            .grok,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: roryHostRunner,
+                peerRunners: [quinn.id: roryPeerRunner]
+            )
+        )
         viewModel.openDesk(quinn)
         viewModel.setDeskProvider(.claude)
         viewModel.openDesk(piper)
@@ -5101,6 +5218,7 @@ final class BotsWindowTests: XCTestCase {
         viewModel.setDeskProvider(.grok)
 
         viewModel.openDesk(piper)
+        viewModel.setDeskProvider(.codex)
         viewModel.createDeskThread()
         let victimConversation = try XCTUnwrap(viewModel.selectedConversation)
         let victimMilestone = try submitPeerHandoffForTesting(
@@ -5111,11 +5229,12 @@ final class BotsWindowTests: XCTestCase {
             prompt: "@\(quinn.handle) T005_CLEAR_VICTIM"
         )
         let victimStarted = await waitUntil(timeout: 5) {
-            peerRunner.requests.contains { $0.prompt.contains("T005_CLEAR_VICTIM") }
+            piperPeerRunner.requests.contains { $0.prompt.contains("T005_CLEAR_VICTIM") }
         }
         XCTAssertTrue(victimStarted)
 
         viewModel.openDesk(rory)
+        viewModel.setDeskProvider(.grok)
         viewModel.createDeskThread()
         let siblingConversation = try XCTUnwrap(viewModel.selectedConversation)
         let siblingMilestone = try submitPeerHandoffForTesting(
@@ -5126,7 +5245,7 @@ final class BotsWindowTests: XCTestCase {
             prompt: "@\(quinn.handle) T005_CLEAR_SIBLING"
         )
         let siblingStarted = await waitUntil(timeout: 5) {
-            peerRunner.requests.contains { $0.prompt.contains("T005_CLEAR_SIBLING") }
+            roryPeerRunner.requests.contains { $0.prompt.contains("T005_CLEAR_SIBLING") }
         }
         XCTAssertTrue(siblingStarted)
         let victim = try XCTUnwrap(viewModel.peerHandoffSnapshotsForTesting(
@@ -5164,7 +5283,7 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(try context.runRepo.get(id: siblingRunID)?.status, .running)
         XCTAssertFalse(
-            peerRunner.finish(runID: victimRunID, status: .completed, reply: "LATE_VICTIM_REPLY"),
+            piperPeerRunner.finish(runID: victimRunID, status: .completed, reply: "LATE_VICTIM_REPLY"),
             "provider cancellation must retire the victim callback so it cannot resurrect"
         )
         viewModel.reconcilePeerHandoffsForTesting()
@@ -5182,7 +5301,7 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
 
-        XCTAssertTrue(peerRunner.finish(
+        XCTAssertTrue(roryPeerRunner.finish(
             runID: siblingRunID,
             status: .completed,
             reply: "sibling remains exact"
@@ -5225,9 +5344,7 @@ final class BotsWindowTests: XCTestCase {
         let router = AppCommandRouter(context: context)
         context.router = router
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
             AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
@@ -5241,6 +5358,10 @@ final class BotsWindowTests: XCTestCase {
         router.botsViewModel = vm
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+        )
         vm.openDesk(piper)
         vm.setDeskProvider(.codex)
         vm.setDeskPermissionMode(.fullAccess)
@@ -5265,9 +5386,7 @@ final class BotsWindowTests: XCTestCase {
         let router = AppCommandRouter(context: context)
         context.router = router
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
             AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
@@ -5282,6 +5401,10 @@ final class BotsWindowTests: XCTestCase {
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
         let untouched = try vm.create(name: "Untouched", title: "Observer", provider: .grok)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+        )
         vm.openDesk(quinn)
         vm.setDeskProvider(.claude)
         vm.openDesk(piper)
@@ -5374,11 +5497,8 @@ final class BotsWindowTests: XCTestCase {
         let router = AppCommandRouter(context: context)
         context.router = router
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        let quinnRunner = ControlledBotHandoffRunner(provider: .claude)
-        let roryRunner = ControlledBotHandoffRunner(provider: .grok)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
-        context.coordinator.replaceProvider(.claude, runner: quinnRunner)
-        context.coordinator.replaceProvider(.grok, runner: roryRunner)
+        let quinnRunner = ControlledBotHandoffRunner(provider: .codex)
+        let roryRunner = ControlledBotHandoffRunner(provider: .codex)
         router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
             AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
@@ -5393,6 +5513,13 @@ final class BotsWindowTests: XCTestCase {
         let piper = try vm.create(name: "Piper", title: "Mediator", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
         let rory = try vm.create(name: "Rory", title: "Researcher", provider: .grok)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: hostRunner,
+                peerRunners: [quinn.id: quinnRunner, rory.id: roryRunner]
+            )
+        )
         vm.openDesk(piper)
         vm.setDeskProvider(.codex)
 
@@ -5526,9 +5653,7 @@ final class BotsWindowTests: XCTestCase {
         let router = AppCommandRouter(context: context)
         context.router = router
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
             AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
@@ -5542,6 +5667,10 @@ final class BotsWindowTests: XCTestCase {
         router.botsViewModel = vm
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+        )
         vm.openDesk(quinn)
         vm.setDeskProvider(.claude)
         vm.openDesk(piper)
@@ -5621,8 +5750,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let vm = BotsViewModel(context: context, router: router)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
@@ -5786,8 +5915,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let bootstrap = BotsViewModel(context: context, router: router)
         let piper = try bootstrap.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try bootstrap.create(name: "Quinn", title: "CRM Controller", provider: .claude)
@@ -5915,12 +6044,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProvider(
-            .codex,
-            runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "host settled"))
-        )
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let vm = BotsViewModel(context: context, router: router)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
@@ -5992,12 +6117,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProvider(
-            .codex,
-            runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "host settled"))
-        )
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let vm = BotsViewModel(context: context, router: router)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
@@ -6100,12 +6221,9 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let quinnRunner = ControlledBotHandoffRunner(provider: .claude)
-        let roryRunner = ControlledBotHandoffRunner(provider: .grok)
+        let quinnRunner = ControlledBotHandoffRunner(provider: .codex)
+        let roryRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        context.coordinator.replaceProvider(.claude, runner: quinnRunner)
-        context.coordinator.replaceProvider(.grok, runner: roryRunner)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
 
         var initiatingVM: BotsViewModel? = BotsViewModel(context: context, router: router)
         router.botsViewModel = initiatingVM
@@ -6123,6 +6241,13 @@ final class BotsWindowTests: XCTestCase {
             name: "Rory",
             title: "Research Controller",
             provider: .grok
+        )
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: hostRunner,
+                peerRunners: [quinn.id: quinnRunner, rory.id: roryRunner]
+            )
         )
         initiatingVM?.openDesk(quinn)
         initiatingVM?.setDeskProvider(.claude)
@@ -6242,10 +6367,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
         router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
             let model = BotsViewModel.defaultModel(for: provider)
             return AgentProviderSnapshotFactory.snapshot(
@@ -6268,6 +6391,13 @@ final class BotsWindowTests: XCTestCase {
             name: "Rory",
             title: "Research Controller",
             provider: .grok
+        )
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: hostRunner,
+                peerRunners: [quinn.id: peerRunner]
+            )
         )
         originWindow.openDesk(quinn)
         originWindow.setDeskProvider(.claude)
@@ -6491,14 +6621,19 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
         let viewModel = BotsViewModel(context: context, router: router)
         router.botsViewModel = viewModel
         let piper = try viewModel.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try viewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: hostRunner,
+                peerRunners: [quinn.id: peerRunner]
+            )
+        )
         viewModel.openDesk(quinn)
         viewModel.setDeskProvider(.claude)
         viewModel.openDesk(piper)
@@ -6593,8 +6728,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let vm = BotsViewModel(context: context, router: router)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
@@ -6698,13 +6833,18 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
         let vm = BotsViewModel(context: context, router: router)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: hostRunner,
+                peerRunners: [quinn.id: peerRunner]
+            )
+        )
         vm.openDesk(quinn)
         vm.setDeskProvider(.claude)
         vm.openDesk(piper)
@@ -6783,8 +6923,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let vm = BotsViewModel(context: context, router: router)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
         vm.openDesk(quinn)
@@ -6857,8 +6997,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let vm = BotsViewModel(context: context, router: router)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
         vm.openDesk(quinn)
@@ -6927,6 +7067,9 @@ final class BotsWindowTests: XCTestCase {
         // WHY: the receipt id map is process-local. After a crash, a restored
         // peerPrepared row with no run is known to have failed before provider
         // start, so its exact Bot telemetry row must stop claiming Working.
+        // Existing v2 rows predate service-tier routing, while canonical rows
+        // may omit default route values. Both forms must decode without making
+        // the whole handoff opaque.
         let context = try makeContext()
         let originThread = AgentThread(
             title: "Restored Bot host",
@@ -6947,11 +7090,11 @@ final class BotsWindowTests: XCTestCase {
         let hostRunID = AgentRunID()
         let route = T005PeerHandoffRouteFixture(
             provider: .claude,
-            providerInstanceID: "claude",
+            providerInstanceID: nil,
             model: "fake-model",
-            permissionMode: .supervised,
-            reasoningEffort: .medium,
-            serviceTier: .auto,
+            permissionMode: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
             runAsUser: AgentRunAsUser(
                 generatedUID: "restored-bot-fixture",
                 shortName: "fixture",
@@ -6987,6 +7130,11 @@ final class BotsWindowTests: XCTestCase {
                 phase: .peerPrepared
             ),
         ])
+        let compactRoutePayload = String(decoding: payload, as: UTF8.self)
+        XCTAssertFalse(compactRoutePayload.contains("\"serviceTier\""))
+        XCTAssertFalse(compactRoutePayload.contains("\"providerInstanceID\""))
+        XCTAssertFalse(compactRoutePayload.contains("\"permissionMode\""))
+        XCTAssertFalse(compactRoutePayload.contains("\"reasoningEffort\""))
         UserDefaults.standard.set(payload, forKey: "bots.peerTurns.v2")
         XCTAssertTrue(UserDefaults.standard.synchronize())
         try context.settingsRepo.set(
@@ -7071,11 +7219,12 @@ final class BotsWindowTests: XCTestCase {
             prompt: "@\(quinn.handle) ROUTE_FREEZE"
         )
         let peerStarted = await waitUntil(timeout: 5) {
-            claude.requests.contains { $0.prompt.contains("ROUTE_FREEZE") }
+            codex.requests.contains { $0.prompt.contains("ROUTE_FREEZE") }
         }
         XCTAssertTrue(peerStarted)
+        XCTAssertTrue(claude.requests.isEmpty)
         XCTAssertTrue(grok.requests.isEmpty)
-        XCTAssertTrue(claude.finish(promptContaining: "ROUTE_FREEZE", reply: "frozen reply"))
+        XCTAssertTrue(codex.finish(promptContaining: "ROUTE_FREEZE", reply: "frozen reply"))
         let completed = await waitUntil(timeout: 5) {
             vm.peerHandoffSnapshotsForTesting(
                 originConversationID: origin.id,
@@ -7088,15 +7237,149 @@ final class BotsWindowTests: XCTestCase {
             originConversationID: origin.id,
             originThreadID: nil
         ).first)
-        XCTAssertEqual(handoff.peerProvider, .claude)
+        XCTAssertEqual(handoff.peerProvider, .codex)
         XCTAssertNil(handoff.hostProvider)
-        XCTAssertEqual(handoff.peerRunID, claude.requests.first?.runId)
+        XCTAssertEqual(handoff.peerRunID, codex.requests.first?.runId)
         XCTAssertNil(handoff.hostRunID)
         XCTAssertEqual(dispatches, 1)
-        XCTAssertTrue(codex.requests.isEmpty, "the host must not answer a message addressed to Quinn")
+        XCTAssertEqual(codex.requests.count, 1, "the caller provider must execute only the addressed peer")
+        XCTAssertTrue(claude.requests.isEmpty, "the callee's legacy published provider must be inert")
         XCTAssertTrue(grok.requests.isEmpty, "ambient mutation must not reroute the peer to Grok")
         vm.beforeBotRunDispatchForTesting = nil
         await milestone.value
+    }
+
+    func test_agentAppAndBotHandoffsInheritEachCallerProvider_acrossAllProviders() async throws {
+        // WHY: the callee Bot is identity/brain only. Whether the caller is an
+        // Agent App thread or another Bot, Claude/Codex/Grok must be inherited
+        // from the authenticated caller run, never from the callee revision.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let claude = ControlledBotHandoffRunner(provider: .claude)
+        let codex = ControlledBotHandoffRunner(provider: .codex)
+        let grok = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.claude, runner: claude)
+        context.coordinator.replaceProvider(.codex, runner: codex)
+        context.coordinator.replaceProvider(.grok, runner: grok)
+        let vm = BotsViewModel(context: context, router: router)
+        let peer = try vm.create(
+            name: "Oliver",
+            title: "QA",
+            provider: .claude,
+            model: "legacy-callee-model"
+        )
+
+        func runner(for provider: AgentProvider) -> ControlledBotHandoffRunner {
+            switch provider {
+            case .claude: return claude
+            case .codex: return codex
+            case .grok: return grok
+            }
+        }
+
+        for provider in AgentProvider.allCases {
+            for callerKind in ["agent-app", "bot"] {
+                let model = "caller-\(provider.rawValue)-model"
+                let originThread = AgentThread(
+                    title: "\(callerKind) \(provider.rawValue)",
+                    provider: provider,
+                    providerInstanceId: provider.rawValue,
+                    model: model,
+                    status: .running,
+                    permissionMode: .fullAccess,
+                    reasoningEffort: .high,
+                    serviceTier: .fast
+                )
+                let hostRun = AgentRun(
+                    threadId: originThread.id,
+                    provider: provider,
+                    providerInstanceId: provider.rawValue,
+                    model: model,
+                    status: .running
+                )
+                try context.threadRepo.upsert(originThread)
+                try context.runRepo.upsert(hostRun)
+
+                let originBot: BotDefinition?
+                let originConversation: BotConversation?
+                if callerKind == "bot" {
+                    let bot = try vm.create(
+                        name: "Caller \(provider.rawValue)",
+                        title: "Caller",
+                        provider: provider == .claude ? .grok : .claude
+                    )
+                    var conversation = BotConversation(
+                        botID: bot.id,
+                        title: originThread.title,
+                        linkedAgentThreadID: originThread.id
+                    )
+                    try context.botStore.upsertConversation(conversation)
+                    conversation = try XCTUnwrap(context.botStore.conversation(id: conversation.id))
+                    originBot = bot
+                    originConversation = conversation
+                } else {
+                    originBot = nil
+                    originConversation = nil
+                }
+
+                let marker = "INHERIT_\(callerKind)_\(provider.rawValue)"
+                let activityID = AgentMessageID()
+                let milestone = try XCTUnwrap(
+                    context.botPeerHandoffAuthority.submitAgentAppMention(
+                        peer: peer,
+                        text: marker,
+                        peerText: marker,
+                        originThread: originThread,
+                        activityID: activityID,
+                        hostRunID: hostRun.id,
+                        providerSnapshots: [],
+                        resumeHostAfterPeer: false,
+                        originBot: originBot,
+                        originConversation: originConversation
+                    )
+                )
+                let selectedRunner = runner(for: provider)
+                let started = await waitUntil(timeout: 5) {
+                    selectedRunner.requests.contains { $0.prompt.contains(marker) }
+                }
+                XCTAssertTrue(started, "\(callerKind) \(provider.rawValue) did not start")
+                let request = try XCTUnwrap(
+                    selectedRunner.requests.first { $0.prompt.contains(marker) }
+                )
+                XCTAssertEqual(request.provider, provider)
+                XCTAssertEqual(request.model, model)
+                XCTAssertEqual(request.permissionMode, .fullAccess)
+                XCTAssertEqual(request.serviceTier, .fast)
+                XCTAssertFalse(
+                    [claude, codex, grok]
+                        .filter { $0.provider != provider }
+                        .flatMap(\.requests)
+                        .contains { $0.prompt.contains(marker) },
+                    "the callee or ambient provider must never execute this handoff"
+                )
+                let handoff = try XCTUnwrap(
+                    vm.peerHandoffSnapshotsForTesting(
+                        originConversationID: originConversation?.id,
+                        originThreadID: originConversation == nil ? originThread.id : nil
+                    ).first { $0.activityID == activityID.value }
+                )
+                XCTAssertEqual(handoff.peerProvider, provider)
+                XCTAssertEqual(handoff.peerModel, model)
+                let peerThread = try XCTUnwrap(
+                    try context.threadRepo.get(id: try XCTUnwrap(handoff.peerThreadID))
+                )
+                XCTAssertEqual(peerThread.provider, provider)
+                XCTAssertEqual(peerThread.permissionMode, .fullAccess)
+                XCTAssertEqual(peerThread.reasoningEffort, .high)
+                XCTAssertTrue(selectedRunner.finish(
+                    runID: request.runId,
+                    status: .completed,
+                    reply: "verified \(marker)"
+                ))
+                await milestone.value
+            }
+        }
     }
 
     func test_directPeerReplyDoesNotStartHostHop() async throws {
@@ -7105,8 +7388,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let vm = BotsViewModel(context: context, router: router)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
@@ -8157,10 +8440,7 @@ final class BotsWindowTests: XCTestCase {
             "Configuration summary is gone; it cannot repeat the Desktop honesty block"
         )
         XCTAssertTrue(source.contains("studioAvatarPane"))
-        XCTAssertTrue(
-            BotRoute.fallbackOrderHonesty.contains("not shipped in P1a"),
-            "P1a fallback-order honesty stays on the compiler path after Studio lost the routing panel"
-        )
+        XCTAssertFalse(source.contains("studioRouteLabel"), "Studio must not publish a provider for a Bot")
         XCTAssertFalse(
             source.contains("Guest not running"),
             "Studio must not advertise a Dedicated local VM guest control"
@@ -8322,6 +8602,12 @@ final class BotsWindowTests: XCTestCase {
         let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .grok)
         vm.openDesk(piper)
+        vm.setDeskProvider(.claude)
+        vm.createDeskThread()
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.grok)
+        vm.createDeskThread()
+        vm.openDesk(piper)
         for bot in vm.fleet {
             _ = vm.providerLabel(for: bot)
             _ = vm.modelLabel(for: bot)
@@ -8349,25 +8635,27 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_saveStudioKeepsPublishedRoute_becauseProviderRoutingLivesInDesk() throws {
-        // WHY: Profile no longer owns provider routing. A stale draft value
-        // must not silently replace the route published by Desk controls.
+        // WHY: Profile has no provider field. Saving identity/brain must not
+        // replace the route the user selected on the Desk thread.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .grok)
         vm.openDesk(bot)
+        vm.setDeskProvider(.grok)
+        vm.createDeskThread()
         XCTAssertEqual(vm.providerLabel(for: bot), "Grok")
         let afterOpen = vm.rosterRevisionFetchCountForTesting
         vm.beginEdit(bot)
-        vm.studioDraft.provider = .claude
-        vm.applyDefaultModel(for: .claude)
         _ = try vm.saveStudio()
         let saved = try XCTUnwrap(vm.selectedBot)
         XCTAssertEqual(vm.providerLabel(for: saved), "Grok")
-        XCTAssertEqual(
-            vm.selectedRevision?.provider,
-            .claude,
-            "precondition: the legacy Profile revision changed while Desk routing remained authoritative"
+        let revisionObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(try XCTUnwrap(vm.selectedRevision))
+            ) as? [String: Any]
         )
+        XCTAssertNil(revisionObject["provider"])
+        XCTAssertNil(revisionObject["model"])
         XCTAssertEqual(
             vm.rosterRevisionFetchCountForTesting,
             afterOpen,
@@ -9564,8 +9852,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let vm = BotsViewModel(context: context, router: router)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
@@ -9612,8 +9900,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let vm = BotsViewModel(context: context, router: router)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
@@ -9693,8 +9981,8 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let vm = BotsViewModel(context: context, router: router)
         let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
@@ -10301,8 +10589,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.studioTab, .profile)
         vm.studioDraft.title = "Research lead"
         vm.studioDraft.soul = "Stand up for the brief."
-        vm.studioDraft.provider = .grok
-        vm.applyDefaultModel(for: .grok)
         vm.studioDraft.notificationsEnabled = false
 
         let saved = try vm.saveStudio()
@@ -10314,43 +10600,41 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(revision.revisionNumber, 2)
         XCTAssertEqual(revision.title, "Research lead")
         XCTAssertEqual(revision.soul, "Stand up for the brief.")
-        XCTAssertEqual(revision.provider, .grok)
         XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
         XCTAssertEqual(saved.notificationsEnabled, false)
-        XCTAssertEqual(vm.studioRouteLabel, "Grok")
         XCTAssertEqual(vm.studioDesktopSummary, BotDesktopKind.logicalExecutionSpace.displayTitle)
         XCTAssertEqual(vm.studioApprovalLabel, "Supervised")
     }
 
-    func test_grokEmptyModelUsesCurrentFallbackBeforeProviderCatalogLoads() throws {
-        // WHY: Bots can be created or saved before the asynchronous provider
-        // catalog arrives. Every empty-model path must use the same current
-        // Grok default instead of silently pinning a new Bot to 4.5.
+    func test_botCreateAndSaveDoNotPersistProviderOrModel() throws {
+        // WHY: provider/model belong to the user's execution thread. Neither
+        // creating nor publishing Bot identity may add a hidden route field.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         XCTAssertTrue(vm.providers.isEmpty)
 
-        let created = try vm.create(
-            name: "Quinn",
-            provider: .grok,
-            model: "   "
-        )
+        let created = try vm.create(name: "Quinn")
         let createdRevision = try XCTUnwrap(
             try context.botStore.getRevision(id: try XCTUnwrap(created.currentRevisionID))
         )
-        XCTAssertEqual(createdRevision.model, "grok-4.6")
+        let createdObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(createdRevision)) as? [String: Any]
+        )
+        XCTAssertNil(createdObject["provider"])
+        XCTAssertNil(createdObject["providerInstanceID"])
+        XCTAssertNil(createdObject["model"])
 
         vm.beginEdit(created)
-        vm.studioDraft.model = ""
         let saved = try vm.saveStudio()
         let savedRevision = try XCTUnwrap(
             try context.botStore.getRevision(id: try XCTUnwrap(saved.currentRevisionID))
         )
-        XCTAssertEqual(savedRevision.model, "grok-4.6")
-
-        vm.studioDraft.model = ""
-        vm.applyDefaultModel(for: .grok)
-        XCTAssertEqual(vm.studioDraft.model, "grok-4.6")
+        let savedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(savedRevision)) as? [String: Any]
+        )
+        XCTAssertNil(savedObject["provider"])
+        XCTAssertNil(savedObject["providerInstanceID"])
+        XCTAssertNil(savedObject["model"])
     }
 
     func test_addSkillRejectsPathWithStudioCopy_becauseStoreErrorMustNotReachTheUser() throws {
@@ -10632,8 +10916,6 @@ final class BotsWindowTests: XCTestCase {
         let vm = BotsViewModel(context: context)
         vm.studioDraft.name = "Nova"
         vm.studioDraft.title = "Scout"
-        vm.studioDraft.provider = .claude
-        vm.applyDefaultModel(for: .claude)
 
         let created = try vm.saveStudio()
         let revision = try XCTUnwrap(
@@ -11192,11 +11474,11 @@ final class BotsWindowTests: XCTestCase {
         let retainedOriginBotID = BotID()
         let route = T005PeerHandoffRouteFixture(
             provider: .codex,
-            providerInstanceID: "codex",
+            providerInstanceID: nil,
             model: "t005-model",
-            permissionMode: .supervised,
-            reasoningEffort: .medium,
-            serviceTier: .auto,
+            permissionMode: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
             runAsUser: AgentRunAsUser(
                 generatedUID: "t005-fixture",
                 shortName: "fixture",
@@ -11331,6 +11613,30 @@ final class BotsWindowTests: XCTestCase {
         try AppContext(channel: .debug, appSupportOverride: directory)
     }
 
+    private func seedBotCaller(
+        context: AppContext,
+        provider: AgentProvider,
+        model: String,
+        permissionMode: AgentPermissionMode
+    ) throws -> (thread: AgentThread, run: AgentRun) {
+        let thread = AgentThread(
+            title: "Bot caller",
+            provider: provider,
+            model: model,
+            status: .running,
+            permissionMode: permissionMode
+        )
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: provider,
+            model: model,
+            status: .running
+        )
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(run)
+        return (thread, run)
+    }
+
     /// Exercises the durable handoff authority directly. Product Desk sends
     /// always start the selected Bot's primary AI first; the explicit
     /// `bot.peer.ask` path is covered above. These lifecycle regressions need a
@@ -11348,11 +11654,17 @@ final class BotsWindowTests: XCTestCase {
             viewModel.createDeskThread()
         }
         let originConversation = try XCTUnwrap(viewModel.selectedConversation)
+        let routing = viewModel.deskRouting
         let originThread = AgentThread(
             title: originConversation.title,
-            provider: .codex,
-            model: "fake-model",
-            status: .running
+            provider: routing.provider,
+            providerInstanceId: routing.providerInstanceID,
+            model: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
+            status: .running,
+            permissionMode: routing.permissionMode,
+            reasoningEffort: routing.reasoningEffort,
+            serviceTier: routing.serviceTier,
+            runAsUser: routing.runAsUser
         )
         try context.threadRepo.upsert(originThread)
         router.botsViewModel = viewModel
@@ -11410,11 +11722,11 @@ final class BotsWindowTests: XCTestCase {
 
 private struct T005PeerHandoffRouteFixture: Codable, Equatable {
     let provider: AgentProvider
-    let providerInstanceID: String
+    let providerInstanceID: String?
     let model: String
-    let permissionMode: AgentPermissionMode
-    let reasoningEffort: AgentReasoningEffort
-    let serviceTier: AgentServiceTier
+    let permissionMode: AgentPermissionMode?
+    let reasoningEffort: AgentReasoningEffort?
+    let serviceTier: AgentServiceTier?
     let runAsUser: AgentRunAsUser
     let routingConfiguration: AgentRoutingConfiguration?
 }

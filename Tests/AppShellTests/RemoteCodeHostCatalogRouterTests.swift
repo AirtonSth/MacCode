@@ -111,8 +111,6 @@ final class RemoteCodeHostCatalogRouterTests: XCTestCase {
             description: "Host catalog bot",
             handle: "oliver-qa",
             soul: "Prove skills.",
-            provider: .claude,
-            model: "opus",
             callerRun: harness.runID
         )
         let botID = try XCTUnwrap(created.objectValue?["id"]?.stringValue)
@@ -236,10 +234,9 @@ final class RemoteCodeHostCatalogRouterTests: XCTestCase {
         XCTAssertEqual(created.objectValue?["body"]?.stringValue, body)
     }
 
-    func test_createdBotUsesTheDeskProviderDefaultWhenModelIsOmitted() throws {
-        // WHY: the host catalog is an alternate entry point into the same Bot
-        // product. An omitted model must not persist the provider name (for
-        // example `grok`) as an unusable model identifier.
+    func test_createdBotDoesNotPersistAProviderOrModel() throws {
+        // WHY: host creation defines Bot identity and brain only. Provider and
+        // model are chosen later by the user on the calling thread.
         let harness = try Harness()
         let created = try harness.router.createHostBot(
             name: "Grok QA",
@@ -247,15 +244,20 @@ final class RemoteCodeHostCatalogRouterTests: XCTestCase {
             description: "",
             handle: nil,
             soul: "",
-            provider: .grok,
-            model: "",
             callerRun: harness.runID
         )
         let botID = try XCTUnwrap(created.objectValue?["id"]?.stringValue)
         let bot = try XCTUnwrap(harness.context.botStore.get(id: BotID(UUID(uuidString: botID)!)))
         let revisionID = try XCTUnwrap(bot.currentRevisionID)
         let revision = try XCTUnwrap(harness.context.botStore.getRevision(id: revisionID))
-        XCTAssertEqual(revision.model, BotsViewModel.defaultModel(for: .grok))
+        let revisionObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(revision)) as? [String: Any]
+        )
+        XCTAssertNil(revisionObject["provider"])
+        XCTAssertNil(revisionObject["providerInstanceID"])
+        XCTAssertNil(revisionObject["model"])
+        XCTAssertNil(created.objectValue?["provider"])
+        XCTAssertNil(created.objectValue?["model"])
     }
 
     func test_hostCatalogKillSwitchFailsClosedWithoutDisablingOtherRepairs() throws {

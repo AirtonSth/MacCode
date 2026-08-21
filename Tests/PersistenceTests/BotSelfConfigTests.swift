@@ -85,21 +85,16 @@ final class BotSelfConfigTests: XCTestCase {
         let before = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(before.name, "Piper")
         XCTAssertEqual(before.soul, "Be brief.")
-        XCTAssertEqual(before.provider, AgentProvider.claude.rawValue)
         XCTAssertEqual(before.handle, "piper")
         XCTAssertTrue(before.notificationsEnabled)
 
         let afterSet = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "name": "Piper Prime",
             "soul": "Speak plainly.",
-            "provider": AgentProvider.grok.rawValue,
-            "model": "grok-4",
             "notifications_enabled": false,
         ])
         XCTAssertEqual(afterSet.name, "Piper Prime")
         XCTAssertEqual(afterSet.soul, "Speak plainly.")
-        XCTAssertEqual(afterSet.provider, AgentProvider.grok.rawValue)
-        XCTAssertEqual(afterSet.model, "grok-4")
         // leftover full_access is not live — Desk launches supervised
         XCTAssertEqual(afterSet.permissionMode, AgentPermissionMode.supervised.rawValue)
         XCTAssertEqual(afterSet.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
@@ -153,7 +148,6 @@ final class BotSelfConfigTests: XCTestCase {
         let reread = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(reread.name, "Piper Prime")
         XCTAssertEqual(reread.soul, "Speak plainly.")
-        XCTAssertEqual(reread.provider, AgentProvider.grok.rawValue)
         XCTAssertFalse(reread.memory.contains(where: { $0.content.contains("Prefers light mode") }))
         XCTAssertEqual(reread.skills.map(\.skillID), ["weekly-invoice"])
         XCTAssertEqual(reread.routines.first?.enabled, true)
@@ -206,24 +200,21 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertFalse(description.contains("desktop"))
         let schema = BotSelfConfigCatalog.schema(for: BotSelfConfigCatalog.setSettings)
         let properties = schema["properties"] as? [String: Any]
-        XCTAssertNotNil(properties?["provider"])
-        XCTAssertNotNil(properties?["model"])
+        XCTAssertNil(properties?["provider"], "provider belongs to the calling thread")
+        XCTAssertNil(properties?["provider_instance_id"], "provider account belongs to the calling thread")
+        XCTAssertNil(properties?["model"], "model belongs to the calling thread")
         XCTAssertNotNil(properties?["avatar_symbol"])
         XCTAssertNil(properties?["route"], "route is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["default_route"], "default_route is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["avatar"], "avatar is an advertised alias, not a second schema key")
         XCTAssertNil(properties?["permission_mode"])
         XCTAssertNil(properties?["desktop_kind"])
-        let provider = properties?["provider"] as? [String: Any]
-        XCTAssertEqual(provider?["description"] as? String, "Optional first-send seed. Not a Studio setting.")
         let title = properties?["title"] as? [String: Any]
         let soul = properties?["soul"] as? [String: Any]
-        let model = properties?["model"] as? [String: Any]
         let notify = properties?["notifications_enabled"] as? [String: Any]
         let avatar = properties?["avatar_symbol"] as? [String: Any]
         XCTAssertEqual(title?["description"] as? String, "Role / job. Same field as Studio Role.")
         XCTAssertEqual(soul?["description"] as? String, "Instructions. Same field as Studio Instructions.")
-        XCTAssertEqual(model?["description"] as? String, "Optional first-send seed. Not a Studio setting.")
         XCTAssertEqual(notify?["description"] as? String, "Notifications On/Off.")
         XCTAssertEqual(avatar?["description"] as? String, "Avatar. Same field as Studio Avatar.")
         XCTAssertNil(properties?["notifications"], "notifications is an advertised alias, not a second schema key")
@@ -309,7 +300,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(properties?["admitted"], "admitted is leftover dest title first word, not a schema write key")
         XCTAssertNil(properties?["user_request"], "user_request is advertised dest title, not a schema write key")
         XCTAssertNil(properties?["user_text"], "user_text is leftover compose name, not a schema write key")
-        XCTAssertTrue(description.contains(BotRoute.fallbackOrderHonesty), "catalog names Fallback order honesty")
+        XCTAssertTrue(description.contains(BotSelfConfigCatalog.providerRoutingHonesty), "catalog says routing belongs to the caller thread")
         XCTAssertTrue(description.contains(BotBrainCompiler.handleCreateOnlyHonesty), "catalog names Handle create-only honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.workspaceHostAssignedHonesty), "catalog names Workspace host-assigned honesty")
         XCTAssertTrue(description.contains(BotBrainCompiler.approvalModeHostAssignedHonesty), "catalog names Approval mode host-assigned honesty")
@@ -330,19 +321,14 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(description.contains(BotBrainCompiler.userRequestHonesty), "catalog names User request honesty")
     }
 
-    func test_setSettingsRejectsAdvertisedFallbackOrder_becauseStudioSaysItIsNotShipped() throws {
-        // WHY: Studio already says Fallback order is not shipped. Compile
-        // already labels that honesty. set_settings still accepted
-        // fallback_order as an empty success, so first-chat "if Claude is
-        // down use Grok" invented a persist. Reject the advertised name.
-        // Default route still persists. Schema does not grow a fallback key.
+    func test_setSettingsRejectsProviderRouting_becauseRouteBelongsToCallingThread() throws {
+        // WHY: provider, model, and fallback are thread choices. Accepting any
+        // of them as Bot settings would silently recreate a callee-owned route.
         let bot = try store.create(
             name: "Piper",
             title: "Scout",
             description: "",
-            soul: "Be brief.",
-            provider: .claude,
-            model: "opus"
+            soul: "Be brief."
         )
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
 
@@ -351,14 +337,14 @@ final class BotSelfConfigTests: XCTestCase {
                 "fallback_order": "Grok, Claude",
             ])
         ) { error in
-            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotRoute.fallbackOrderHonesty))
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotSelfConfigCatalog.providerRoutingHonesty))
         }
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
                 "Fallback order": "Grok then Claude",
             ])
         ) { error in
-            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotRoute.fallbackOrderHonesty))
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotSelfConfigCatalog.providerRoutingHonesty))
         }
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
@@ -366,17 +352,15 @@ final class BotSelfConfigTests: XCTestCase {
                 "fallback": "Claude",
             ])
         ) { error in
-            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotRoute.fallbackOrderHonesty))
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotSelfConfigCatalog.providerRoutingHonesty))
         }
-        let still = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(still.provider, AgentProvider.claude.rawValue, "Fallback reject must not persist a route")
-        XCTAssertEqual(still.model, "opus", "Fallback reject must not persist a model")
-
-        let route = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "default_route": "Grok",
-        ])
-        XCTAssertEqual(route.provider, AgentProvider.grok.rawValue)
-        XCTAssertEqual(route.model, BotRoute.defaultModel(for: .grok))
+        XCTAssertThrowsError(
+            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
+                "default_route": "Grok",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotSelfConfigCatalog.providerRoutingHonesty))
+        }
     }
 
     func test_setSettingsRejectsAdvertisedHandle_becauseStudioSaysItIsCreateOnly() throws {
@@ -470,7 +454,6 @@ final class BotSelfConfigTests: XCTestCase {
         }
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Workspace reject must not persist a name")
-        XCTAssertEqual(still.provider, AgentProvider.claude.rawValue)
 
         let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "name": "Piper Prime",
@@ -3424,41 +3407,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertFalse(boolWins.notificationsEnabled, "notifications_enabled wins")
     }
 
-    func test_setSettingsProviderWithoutModelBindsAdvertisedRoute_becauseLeftoverModelIsNotLive() throws {
-        // WHY: Desk-admitted bot_set_settings already publishes route.
-        // A provider-only write kept opus on Grok and the leftover
-        // Claude account id, so first-chat "switch to Grok" invented a hop
-        // or ran the old route. Studio picker already binds the default.
-        let bot = try store.create(name: "Piper", title: "Scout", description: "", soul: "Be brief.", provider: .claude, model: "opus")
-        let service = BotSelfConfigService(callerBotID: bot.id, store: store)
-        let after = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "provider": AgentProvider.grok.rawValue,
-        ])
-        XCTAssertEqual(after.provider, AgentProvider.grok.rawValue)
-        XCTAssertEqual(after.model, BotRoute.defaultModel(for: .grok))
-        XCTAssertEqual(after.providerInstanceID, AgentProvider.grok.rawValue)
-        XCTAssertNotEqual(after.model, "opus")
-        XCTAssertNotEqual(after.providerInstanceID, AgentProvider.claude.rawValue)
-        let explicit = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "provider": AgentProvider.claude.rawValue,
-            "model": "sonnet",
-            "provider_instance_id": "claude-work",
-        ])
-        XCTAssertEqual(explicit.provider, AgentProvider.claude.rawValue)
-        XCTAssertEqual(explicit.model, "sonnet")
-        XCTAssertEqual(explicit.providerInstanceID, "claude-work")
-        let modelOnly = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "model": "opus",
-        ])
-        XCTAssertEqual(modelOnly.provider, AgentProvider.claude.rawValue)
-        XCTAssertEqual(modelOnly.model, "opus")
-        XCTAssertEqual(modelOnly.providerInstanceID, "claude-work")
-    }
-
-    func test_setSettingsAdvertisedRouteNamesPersist_becauseToolsSayGrokNotRawId() throws {
-        // WHY: Studio already says Default route. Tools named route, so
-        // first-chat "change your Default route" invented a hop or left
-        // opus. Canonical provider still wins. Explicit model still wins.
+    func test_setSettingsRejectsProviderKeys_becauseCallerThreadOwnsTheRoute() throws {
+        // WHY: allowing a Bot to persist any route key can silently switch a
+        // later Grok/Codex/Claude caller to the Bot's stale provider.
         let bot = try store.create(
             name: "Piper",
             title: "Scout",
@@ -3468,52 +3419,27 @@ final class BotSelfConfigTests: XCTestCase {
             model: "opus"
         )
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
+        let revisionID = try XCTUnwrap(try store.get(id: bot.id)?.currentRevisionID)
+        let cases: [[String: Any]] = [
+            ["provider": "Grok"],
+            ["provider_instance_id": "grok-work"],
+            ["model": "grok-4.6"],
+            ["route": "Claude"],
+            ["default_route": "Codex"],
+        ]
 
-        let fromTitle = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "provider": "Grok",
-        ])
-        XCTAssertEqual(fromTitle.provider, AgentProvider.grok.rawValue)
-        XCTAssertEqual(fromTitle.model, BotRoute.defaultModel(for: .grok))
-
-        let fromRoute = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "route": "Claude",
-        ])
-        XCTAssertEqual(fromRoute.provider, AgentProvider.claude.rawValue)
-        XCTAssertEqual(fromRoute.model, BotRoute.defaultModel(for: .claude))
-
-        let fromDefaultRoute = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "default_route": "Grok",
-        ])
-        XCTAssertEqual(fromDefaultRoute.provider, AgentProvider.grok.rawValue)
-        XCTAssertEqual(fromDefaultRoute.model, BotRoute.defaultModel(for: .grok))
-
-        let providerWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "provider": "codex",
-            "route": "Grok",
-        ])
-        XCTAssertEqual(providerWins.provider, AgentProvider.codex.rawValue, "provider wins")
-        XCTAssertEqual(providerWins.model, BotRoute.defaultModel(for: .codex))
-
-        let fromCompiled = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "route": "Grok · grok-4.6",
-        ])
-        XCTAssertEqual(fromCompiled.provider, AgentProvider.grok.rawValue)
-        XCTAssertEqual(fromCompiled.model, "grok-4.6")
-
-        let modelWins = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-            "provider": "Claude",
-            "model": "sonnet",
-        ])
-        XCTAssertEqual(modelWins.provider, AgentProvider.claude.rawValue)
-        XCTAssertEqual(modelWins.model, "sonnet")
-
-        XCTAssertThrowsError(
-            try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "route": "ChatGPT",
-            ])
-        ) { error in
-            XCTAssertEqual(error as? BotSelfConfigError, .invalid("Unknown provider: ChatGPT"))
+        for arguments in cases {
+            XCTAssertThrowsError(
+                try service.call(name: BotSelfConfigCatalog.setSettings, arguments: arguments)
+            ) { error in
+                XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotSelfConfigCatalog.providerRoutingHonesty))
+            }
         }
+        XCTAssertEqual(
+            try store.get(id: bot.id)?.currentRevisionID,
+            revisionID,
+            "rejected route keys must publish nothing"
+        )
     }
 
     func test_saveRoutinePersistsSpecFromWhenNote_becauseFleetEditMustNotDefaultDaily() throws {
@@ -3712,11 +3638,15 @@ final class BotSelfConfigTests: XCTestCase {
             "contents": "- Prefers dark mode\n",
         ])
         XCTAssertTrue(durable.memory.contains(where: { $0.id == "MEMORY.md" && $0.content.contains("Prefers dark mode") }))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        let dailyPath = "memory/\(formatter.string(from: Date())).md"
         let daily = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
-            "path": "memory/2026-08-18.md",
+            "path": dailyPath,
             "contents": "Shipped the overnight brief.\n",
         ])
-        XCTAssertTrue(daily.memory.contains(where: { $0.id == "memory/2026-08-18.md" }))
+        XCTAssertTrue(daily.memory.contains(where: { $0.id == dailyPath }))
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
                 "path": "IDENTITY.md",
@@ -3842,34 +3772,40 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(try service.snapshot().routines.first?.scheduleNote, "Weekdays 9:00")
     }
 
-    func test_encodeSnapshotUsesCatalogSettingsKeys_becauseSwiftNamesInventedAHop() throws {
-        // WHY: set_settings requires notifications_enabled / provider_instance_id.
-        // Snapshot used Swift notificationsEnabled / providerInstanceID, so
-        // same-turn "turn notifications off" invented a hop. Hermes agents
-        // reuse the key the last write returned. Canonical Swift fields stay.
+    func test_encodeSnapshotUsesCatalogSettingsKeysAndOmitsRoute_becauseRouteBelongsToThread() throws {
+        // WHY: a self-config snapshot must not teach a Bot that provider/model
+        // are durable Bot settings; notifications remains a real Bot setting.
         // Leftover permission/desktop stay camelCase — catalog omits those writes.
         let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
         let after = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "notifications_enabled": false,
-            "provider_instance_id": "claude-work",
         ])
         XCTAssertFalse(after.notificationsEnabled)
-        XCTAssertEqual(after.providerInstanceID, "claude-work")
         let json = try service.encodeSnapshot(try service.snapshot())
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
         )
         XCTAssertEqual(object["notifications_enabled"] as? Bool, false, "notifications_enabled persists")
         XCTAssertNil(object["notificationsEnabled"], "Swift notificationsEnabled omitted")
-        XCTAssertEqual(object["provider_instance_id"] as? String, "claude-work", "provider_instance_id persists")
-        XCTAssertNil(object["providerInstanceID"], "Swift providerInstanceID omitted")
+        XCTAssertNil(object["provider"], "provider belongs to the calling thread")
+        XCTAssertNil(object["provider_instance_id"], "provider account belongs to the calling thread")
+        XCTAssertNil(object["providerInstanceID"])
+        XCTAssertNil(object["model"], "model belongs to the calling thread")
         XCTAssertEqual(object["permissionMode"] as? String, AgentPermissionMode.supervised.rawValue)
         XCTAssertNil(object["permission_mode"], "leftover permission stays unnamed")
         XCTAssertEqual(object["desktopKind"] as? String, BotDesktopKind.logicalExecutionSpace.rawValue)
         XCTAssertNil(object["desktop_kind"], "leftover desktop stays unnamed")
         XCTAssertEqual(try store.get(id: bot.id)?.notificationsEnabled, false)
-        XCTAssertEqual(try store.getRevision(id: try XCTUnwrap(store.get(id: bot.id)?.currentRevisionID))?.providerInstanceID, "claude-work")
+        let revision = try XCTUnwrap(
+            try store.getRevision(id: try XCTUnwrap(store.get(id: bot.id)?.currentRevisionID))
+        )
+        let revisionObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(revision)) as? [String: Any]
+        )
+        XCTAssertNil(revisionObject["provider"])
+        XCTAssertNil(revisionObject["providerInstanceID"])
+        XCTAssertNil(revisionObject["model"])
     }
 
     func test_writeSoulFilePublishesRevision() throws {

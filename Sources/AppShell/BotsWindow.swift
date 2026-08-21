@@ -17,17 +17,22 @@ public struct BotQueuedFollowUp: Equatable, Identifiable, Codable {
     /// Host-catalog sends pin the exact conversation they were accepted for.
     /// Nil preserves the existing Desk queue behavior across older payloads.
     public var conversationID: BotConversationID?
+    /// Host sends also freeze the authenticated caller's execution route.
+    /// Direct Desk follow-ups keep nil and use the user's current thread chips.
+    public var routing: BotDeskRouting?
 
     public init(
         id: UUID = UUID(),
         text: String,
         attachments: [AgentAttachment] = [],
-        conversationID: BotConversationID? = nil
+        conversationID: BotConversationID? = nil,
+        routing: BotDeskRouting? = nil
     ) {
         self.id = id
         self.text = text
         self.attachments = attachments
         self.conversationID = conversationID
+        self.routing = routing
     }
 }
 
@@ -38,6 +43,7 @@ public struct BotDeskRouting: Equatable, Codable {
     public var routingMode: AgentRoutingMode
     public var permissionMode: AgentPermissionMode
     public var reasoningEffort: AgentReasoningEffort
+    public var serviceTier: AgentServiceTier
     public var runAsUser: AgentRunAsUser
 
     public init(
@@ -47,6 +53,7 @@ public struct BotDeskRouting: Equatable, Codable {
         routingMode: AgentRoutingMode = .auto,
         permissionMode: AgentPermissionMode = .supervised,
         reasoningEffort: AgentReasoningEffort = .medium,
+        serviceTier: AgentServiceTier = .auto,
         runAsUser: AgentRunAsUser? = nil
     ) {
         self.provider = provider
@@ -55,6 +62,7 @@ public struct BotDeskRouting: Equatable, Codable {
         self.routingMode = routingMode
         self.permissionMode = permissionMode
         self.reasoningEffort = reasoningEffort
+        self.serviceTier = serviceTier
         self.runAsUser = runAsUser ?? AgentRunAsUser.current()
     }
 
@@ -66,8 +74,29 @@ public struct BotDeskRouting: Equatable, Codable {
         routingMode = try container.decode(AgentRoutingMode.self, forKey: .routingMode)
         permissionMode = try container.decode(AgentPermissionMode.self, forKey: .permissionMode)
         reasoningEffort = try container.decodeIfPresent(AgentReasoningEffort.self, forKey: .reasoningEffort) ?? .medium
+        serviceTier = try container.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         runAsUser = try container.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
             ?? AgentRunAsUser.current()
+    }
+
+    /// A Bot has no provider of its own. Existing Desk threads restore the
+    /// user's thread route; delegated calls freeze the exact provider/model
+    /// selected for the active caller run so Auto cannot choose a new one.
+    public init(thread: AgentThread, activeRun: AgentRun? = nil) {
+        let run = activeRun?.threadId == thread.id ? activeRun : nil
+        let provider = run?.provider ?? thread.provider
+        self.init(
+            provider: provider,
+            providerInstanceID: run?.providerInstanceId
+                ?? (thread.provider == provider ? thread.providerInstanceId : nil)
+                ?? provider.rawValue,
+            model: run?.model ?? thread.model,
+            routingMode: run == nil ? thread.effectiveRoutingConfiguration.mode : .manual,
+            permissionMode: thread.permissionMode,
+            reasoningEffort: thread.reasoningEffort,
+            serviceTier: thread.serviceTier,
+            runAsUser: thread.runAsUser
+        )
     }
 
     public func resolvedModel(defaultModel: (AgentProvider) -> String) -> String {
@@ -149,9 +178,6 @@ public struct BotStudioDraft: Equatable, Codable {
     public var handle: String
     public var avatarSymbol: String
     public var soul: String
-    public var provider: AgentProvider
-    public var providerInstanceID: String
-    public var model: String
     public var notificationsEnabled: Bool
     public var desktopKind: BotDesktopKind
     public var expectedRevisionID: BotRevisionID?
@@ -166,9 +192,6 @@ public struct BotStudioDraft: Equatable, Codable {
         handle: String = "",
         avatarSymbol: String = BotBlobatarSpec.default.token,
         soul: String = "",
-        provider: AgentProvider = .claude,
-        providerInstanceID: String = "claude",
-        model: String = "",
         notificationsEnabled: Bool = true,
         desktopKind: BotDesktopKind = .logicalExecutionSpace,
         expectedRevisionID: BotRevisionID? = nil,
@@ -181,9 +204,6 @@ public struct BotStudioDraft: Equatable, Codable {
         self.handle = handle
         self.avatarSymbol = avatarSymbol
         self.soul = soul
-        self.provider = provider
-        self.providerInstanceID = providerInstanceID
-        self.model = model
         self.notificationsEnabled = notificationsEnabled
         self.desktopKind = desktopKind
         self.expectedRevisionID = expectedRevisionID
@@ -337,6 +357,17 @@ private struct BotPeerHandoffRoute: Codable, Equatable {
     let runAsUser: AgentRunAsUser
     let routingConfiguration: AgentRoutingConfiguration?
 
+    private enum CodingKeys: String, CodingKey {
+        case provider
+        case providerInstanceID
+        case model
+        case permissionMode
+        case reasoningEffort
+        case serviceTier
+        case runAsUser
+        case routingConfiguration
+    }
+
     @MainActor
     init(_ routing: BotDeskRouting) {
         provider = routing.provider
@@ -344,7 +375,7 @@ private struct BotPeerHandoffRoute: Codable, Equatable {
         model = routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:))
         permissionMode = routing.permissionMode
         reasoningEffort = routing.reasoningEffort
-        serviceTier = .auto
+        serviceTier = routing.serviceTier
         runAsUser = routing.runAsUser
         routingConfiguration = nil
     }
@@ -358,6 +389,44 @@ private struct BotPeerHandoffRoute: Codable, Equatable {
         serviceTier = thread.serviceTier
         runAsUser = thread.runAsUser ?? AgentRunAsUser.current()
         routingConfiguration = thread.routingConfiguration
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try container.decode(AgentProvider.self, forKey: .provider)
+        providerInstanceID = try container.decodeIfPresent(String.self, forKey: .providerInstanceID)
+            ?? provider.rawValue
+        model = try container.decode(String.self, forKey: .model)
+        permissionMode = try container.decodeIfPresent(AgentPermissionMode.self, forKey: .permissionMode)
+            ?? .supervised
+        reasoningEffort = try container.decodeIfPresent(AgentReasoningEffort.self, forKey: .reasoningEffort)
+            ?? .medium
+        serviceTier = try container.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
+        runAsUser = try container.decode(AgentRunAsUser.self, forKey: .runAsUser)
+        routingConfiguration = try container.decodeIfPresent(
+            AgentRoutingConfiguration.self,
+            forKey: .routingConfiguration
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(provider, forKey: .provider)
+        if providerInstanceID != provider.rawValue {
+            try container.encode(providerInstanceID, forKey: .providerInstanceID)
+        }
+        try container.encode(model, forKey: .model)
+        if permissionMode != .supervised {
+            try container.encode(permissionMode, forKey: .permissionMode)
+        }
+        if reasoningEffort != .medium {
+            try container.encode(reasoningEffort, forKey: .reasoningEffort)
+        }
+        if serviceTier != .auto {
+            try container.encode(serviceTier, forKey: .serviceTier)
+        }
+        try container.encode(runAsUser, forKey: .runAsUser)
+        try container.encodeIfPresent(routingConfiguration, forKey: .routingConfiguration)
     }
 }
 
@@ -423,7 +492,9 @@ private struct BotPeerRunPlan {
             workspace: nil,
             browser: browser,
             conversationID: started.conversation.id,
-            liveRunMode: started.routing.permissionMode
+            liveRunMode: started.routing.permissionMode,
+            runProvider: started.routing.provider,
+            runModel: started.routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:))
         )
     }
 }
@@ -717,7 +788,15 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             botID: peer.id,
             title: Self.titleFromFirstMessage(peerDisplay)
         )
-        let routing = Self.persistedRouting(for: peer, revision: revision)
+        let activeCallerRun: AgentRun?
+        if let hostRunID,
+           let run = try? runRepo.get(id: hostRunID),
+           run.threadId == originThread.id {
+            activeCallerRun = run
+        } else {
+            activeCallerRun = nil
+        }
+        let routing = BotDeskRouting(thread: originThread, activeRun: activeCallerRun)
         let peerRunID = AgentRunID()
         do {
             try botStore.upsertConversation(conversation)
@@ -728,6 +807,13 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 model: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
                 permissionMode: routing.permissionMode,
                 reasoningEffort: routing.reasoningEffort,
+                serviceTier: routing.serviceTier,
+                modelSelection: AgentModelSelection(
+                    provider: routing.provider,
+                    modelId: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
+                    reasoningEffort: routing.reasoningEffort,
+                    serviceTier: routing.serviceTier
+                ),
                 providerInstanceId: routing.providerInstanceID,
                 runAsUser: routing.runAsUser,
                 surfaceID: nil,
@@ -762,7 +848,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 hostContinuationRequired: hostRunID != nil,
                 hostThreadID: hostRunID == nil ? nil : originThread.id,
                 hostRunID: hostRunID,
-                hostRoute: hostRunID == nil ? nil : BotPeerHandoffRoute(originThread),
+                hostRoute: hostRunID == nil ? nil : BotPeerHandoffRoute(routing),
                 replyText: nil,
                 replyCreatedAt: nil,
                 phase: .peerPrepared
@@ -964,25 +1050,6 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             .replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return collapsed.count <= 72 ? collapsed : String(collapsed.prefix(72))
-    }
-
-    private static func persistedRouting(
-        for bot: BotDefinition,
-        revision: BotRevision
-    ) -> BotDeskRouting {
-        if let data = UserDefaults.standard.data(forKey: "bots.deskRouting"),
-           let payload = try? JSONDecoder().decode([String: BotDeskRouting].self, from: data),
-           let routing = payload[bot.id.value.uuidString.lowercased()] {
-            return routing
-        }
-        return BotDeskRouting(
-            provider: revision.provider,
-            providerInstanceID: revision.providerInstanceID,
-            model: revision.model,
-            routingMode: revision.model.isEmpty ? .auto : .manual,
-            permissionMode: revision.permissionMode,
-            reasoningEffort: revision.reasoningEffort
-        )
     }
 
     func beginDeletion(originBotID: BotID) -> UUID {
@@ -1247,18 +1314,29 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     }
 
     private func adoptStorageRows(_ candidate: [UUID: PersistedBotPeerHandoff]) {
-        let candidate = candidate.filter { !retiredActivityIDs.contains($0.key) }
+        let adopted: [UUID: PersistedBotPeerHandoff]
+        if retiredActivityIDs.contains(where: { candidate[$0] != nil }) {
+            var filtered = candidate
+            for activityID in retiredActivityIDs {
+                filtered[activityID] = nil
+            }
+            adopted = filtered
+        } else {
+            adopted = candidate
+        }
         let previous = handoffs
-        handoffs = candidate
-        let activityIDs = Set(previous.keys).union(candidate.keys).sorted {
+        handoffs = adopted
+        observers.removeAll { $0.value == nil }
+        guard !observers.isEmpty else { return }
+        let activityIDs = Set(previous.keys).union(adopted.keys).sorted {
             $0.uuidString < $1.uuidString
         }
-        for activityID in activityIDs where previous[activityID] != candidate[activityID] {
+        for activityID in activityIDs where previous[activityID] != adopted[activityID] {
             publish(
                 BotPeerHandoffDelta(
                     activityID: activityID,
                     previous: previous[activityID],
-                    current: candidate[activityID],
+                    current: adopted[activityID],
                     errorMessage: nil
                 )
             )
@@ -1468,6 +1546,15 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                             ),
                             permissionMode: routing.permissionMode,
                             reasoningEffort: routing.reasoningEffort,
+                            serviceTier: routing.serviceTier,
+                            modelSelection: AgentModelSelection(
+                                provider: routing.provider,
+                                modelId: routing.resolvedModel(
+                                    defaultModel: BotsViewModel.defaultModel(for:)
+                                ),
+                                reasoningEffort: routing.reasoningEffort,
+                                serviceTier: routing.serviceTier
+                            ),
                             providerInstanceId: routing.providerInstanceID,
                             attachments: plan.attachments,
                             requestedRunID: runID,
@@ -1513,7 +1600,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 provider: routing.provider,
                 modelId: model,
                 reasoningEffort: routing.reasoningEffort,
-                serviceTier: .auto
+                serviceTier: routing.serviceTier
             ),
             manualProviderInstanceId: routing.providerInstanceID,
             eligibleProviders: [routing.provider],
@@ -2422,7 +2509,8 @@ public final class BotsViewModel: ObservableObject {
     @Published public var attachments: [AgentAttachment] = [] {
         didSet { persistComposerIfHydrated() }
     }
-    /// Per-send routing. Studio Default route seeds this; it does not lock it.
+    /// User-selected route for the current Desk thread. Never sourced from or
+    /// persisted on the Bot definition/revision.
     @Published public var deskRouting = BotDeskRouting() {
         didSet { persistDeskRoutingIfHydrated() }
     }
@@ -2586,7 +2674,7 @@ public final class BotsViewModel: ObservableObject {
     private var isApplyingComposerDraft = false
     private var deskRoutingHydrated = false
     private var isApplyingDeskRouting = false
-    private var deskRoutingByBot: [BotID: BotDeskRouting] = [:]
+    private var deskRoutingByConversation: [BotConversationID: BotDeskRouting] = [:]
     private var peerHandoffs: [UUID: PersistedBotPeerHandoff] = [:]
     private var armedRunIDs: Set<AgentRunID> = []
     private var exactRunWaiters: [AgentRunID: [CheckedContinuation<AgentRun?, Never>]] = [:]
@@ -2647,7 +2735,7 @@ public final class BotsViewModel: ObservableObject {
             applyInspectorDraft(for: selectedBotID)
         }
         if !deskRoutingHydrated {
-            applyDeskRouting(for: selectedBotID)
+            applyDeskRouting(for: selectedConversation)
         }
         context.coordinator.addObserver(self)
     }
@@ -3056,7 +3144,9 @@ public final class BotsViewModel: ObservableObject {
         if bot.id == selectedBotID {
             return deskModelDisplayLabel
         }
-        return trimmedNonEmpty(cachedRevision(for: bot)?.model)
+        return resolvedThreadRouting(for: bot).flatMap {
+            trimmedNonEmpty($0.resolvedModel(defaultModel: Self.defaultModel(for:)))
+        }
     }
 
     public func permissionLabel(for bot: BotDefinition) -> String {
@@ -3097,14 +3187,15 @@ public final class BotsViewModel: ObservableObject {
         if screen.resolvedDestination == .scheduleTasks {
             reloadScheduleTasks()
         }
-        Task { [weak self] in
-            guard let self, let router = self.resolvedRouter() else { return }
+        Task { [weak self, weak router = resolvedRouter()] in
+            guard let router else { return }
             let cached = router.cachedProviderSnapshotsForSend()
             if !cached.isEmpty {
-                self.providers = cached
+                self?.providers = cached
                 return
             }
-            self.providers = await router.listAgentProviderSnapshots()
+            let providers = await router.listAgentProviderSnapshots()
+            self?.providers = providers
         }
     }
 
@@ -3121,7 +3212,7 @@ public final class BotsViewModel: ObservableObject {
         }
         do {
             // New Bot is a configure dest: persist the placeholder, then
-            // open Studio Profile so name/role/provider are set before Chat.
+            // open Studio Profile so name and role are set before Chat.
             // Hermes seeds SOUL.md on first run — do not start a soulless New Agent.
             // The row stays unpublished until Save Bot. Leaving Studio
             // confirms so Back does not keep a teammate the owner never saved.
@@ -3282,17 +3373,11 @@ public final class BotsViewModel: ObservableObject {
             handle: bot.handle,
             avatarSymbol: bot.avatarSymbol,
             soul: revision?.soul ?? "",
-            provider: revision?.provider ?? .claude,
-            providerInstanceID: revision?.providerInstanceID ?? (revision?.provider.rawValue ?? "claude"),
-            model: revision?.model ?? "",
             notificationsEnabled: bot.notificationsEnabled,
             desktopKind: resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace),
             expectedRevisionID: bot.currentRevisionID,
             slugFollowsName: BotHandle.shouldFollowName(handle: bot.handle, name: bot.name)
         )
-        if studioDraft.model.isEmpty {
-            applyDefaultModel(for: studioDraft.provider)
-        }
         applyPersistedStudioDraftIfMatching(bot.id)
         isApplyingStudioDraft = false
         adoptSelectedBot(bot.id)
@@ -3348,6 +3433,8 @@ public final class BotsViewModel: ObservableObject {
         }
         conversations.removeAll { $0.id == conversation.id }
         conversations.insert(conversation, at: 0)
+        deskRoutingByConversation[conversation.id] = deskRouting
+        persistDeskRouting()
         selectDeskThread(conversation.id)
     }
 
@@ -3375,6 +3462,10 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         _ = context.botPeerHandoffAuthority.commitDeletion(handoffDeletion)
+        for conversation in conversations {
+            deskRoutingByConversation[conversation.id] = nil
+        }
+        persistDeskRouting()
         conversations = []
         selectedConversation = nil
         selectedConversationByBot[bot.id] = nil
@@ -3394,8 +3485,10 @@ public final class BotsViewModel: ObservableObject {
 
     public func selectDeskThread(_ id: BotConversationID) {
         guard let conversation = conversations.first(where: { $0.id == id }) else { return }
+        captureDeskRouting()
         selectedConversation = conversation
         selectedConversationByBot[conversation.botID] = conversation.id
+        applyDeskRouting(for: conversation)
         rememberStudioSupport(for: conversation.botID)
         restoreDeskMessages(botID: conversation.botID)
         restoreDeskWorkLog(botID: conversation.botID)
@@ -3544,9 +3637,6 @@ public final class BotsViewModel: ObservableObject {
         description: String = "",
         handle: String? = nil,
         soul: String = "",
-        provider: AgentProvider = .claude,
-        providerInstanceID: String? = nil,
-        model: String = "",
         avatarSymbol: String = "person.crop.circle",
         notificationsEnabled: Bool = true,
         desktopKind: BotDesktopKind = .logicalExecutionSpace
@@ -3555,9 +3645,6 @@ public final class BotsViewModel: ObservableObject {
             errorMessage = "Turn on Bot control plane in Settings"
             throw BotPublishError.controlPlaneDisabled
         }
-        let resolvedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? Self.defaultModel(for: provider)
-            : model
         let bot = try botStore.create(
             name: name,
             title: title,
@@ -3565,9 +3652,6 @@ public final class BotsViewModel: ObservableObject {
             handle: handle,
             avatarSymbol: avatarSymbol,
             soul: soul,
-            provider: provider,
-            providerInstanceID: providerInstanceID ?? provider.rawValue,
-            model: resolvedModel,
             desktopKind: resolvedDesktopKind(desktopKind),
             workspaceID: context.state.window.selectedWorkspaceID,
             notificationsEnabled: notificationsEnabled
@@ -3577,6 +3661,33 @@ public final class BotsViewModel: ObservableObject {
         adoptCreatedBot(bot)
         ensureBotHome(bot)
         return bot
+    }
+
+    @available(*, deprecated, message: "Provider routing belongs to the calling AgentThread.")
+    @discardableResult
+    public func create(
+        name: String,
+        title: String = "",
+        description: String = "",
+        handle: String? = nil,
+        soul: String = "",
+        provider _: AgentProvider,
+        providerInstanceID _: String? = nil,
+        model _: String = "",
+        avatarSymbol: String = "person.crop.circle",
+        notificationsEnabled: Bool = true,
+        desktopKind: BotDesktopKind = .logicalExecutionSpace
+    ) throws -> BotDefinition {
+        try create(
+            name: name,
+            title: title,
+            description: description,
+            handle: handle,
+            soul: soul,
+            avatarSymbol: avatarSymbol,
+            notificationsEnabled: notificationsEnabled,
+            desktopKind: desktopKind
+        )
     }
 
     /// Keep a message already set by saveStudio/send; otherwise use LocalizedError copy.
@@ -3637,11 +3748,6 @@ public final class BotsViewModel: ObservableObject {
                 title: studioDraft.title,
                 description: studioDraft.description,
                 soul: soul,
-                provider: studioDraft.provider,
-                providerInstanceID: studioDraft.providerInstanceID.isEmpty
-                    ? studioDraft.provider.rawValue
-                    : studioDraft.providerInstanceID,
-                model: studioDraft.model.isEmpty ? Self.defaultModel(for: studioDraft.provider) : studioDraft.model,
                 permissionMode: .supervised,
                 desktopKind: desktop
             )
@@ -3681,9 +3787,6 @@ public final class BotsViewModel: ObservableObject {
             description: studioDraft.description,
             handle: handle.isEmpty ? nil : handle,
             soul: soul,
-            provider: studioDraft.provider,
-            providerInstanceID: studioDraft.providerInstanceID.isEmpty ? nil : studioDraft.providerInstanceID,
-            model: studioDraft.model,
             avatarSymbol: studioDraft.avatarSymbol,
             notificationsEnabled: studioDraft.notificationsEnabled,
             desktopKind: desktop
@@ -4009,7 +4112,8 @@ public final class BotsViewModel: ObservableObject {
     func enqueueHostMessage(
         botID: BotID,
         text: String,
-        conversationID: BotConversationID?
+        conversationID: BotConversationID?,
+        routing: BotDeskRouting
     ) throws -> JSONValue {
         guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
             throw BotStoreError.notFound
@@ -4029,7 +4133,11 @@ public final class BotsViewModel: ObservableObject {
             if let threadID = existing.linkedAgentThreadID,
                context.coordinator.activeRunId(threadId: threadID) != nil {
                 enqueueFollowUp(
-                    BotQueuedFollowUp(text: message, conversationID: existing.id),
+                    BotQueuedFollowUp(
+                        text: message,
+                        conversationID: existing.id,
+                        routing: routing
+                    ),
                     botID: bot.id
                 )
                 return .object([
@@ -4060,7 +4168,8 @@ public final class BotsViewModel: ObservableObject {
             bot: bot,
             conversation: conversation,
             userText: message,
-            attachments: []
+            attachments: [],
+            routingOverride: routing
         ) else {
             throw BotStoreError.invalidRow("Bot runtime is unavailable")
         }
@@ -4402,14 +4511,6 @@ public final class BotsViewModel: ObservableObject {
         return url.isEmpty ? nil : target
     }
 
-    public var studioRouteLabel: String {
-        switch studioDraft.provider {
-        case .claude: return "Claude"
-        case .codex: return "Codex"
-        case .grok: return "Grok"
-        }
-    }
-
     public var studioDesktopSummary: String {
         resolvedDesktopKind(studioDraft.desktopKind).displayTitle
     }
@@ -4448,10 +4549,14 @@ public final class BotsViewModel: ObservableObject {
             )
         )
         let memoryFiles = memoryFileTexts(for: bot)
+        let previewProvider = deskRouting.provider
+        let previewModel = deskRouting.resolvedModel(defaultModel: Self.defaultModel(for:))
         let key = [
             bot.id.value.uuidString,
             revision.digest,
             request,
+            previewProvider.rawValue,
+            previewModel,
             memoryFiles.map { "\($0.path):\($0.body)" }.joined(separator: "\u{1e}"),
             skillBindings.map(\.skillID).joined(separator: ","),
             routines.map {
@@ -4479,6 +4584,8 @@ public final class BotsViewModel: ObservableObject {
             workspace: advertisedWorkspace,
             browser: advertisedBrowser,
             conversationID: selectedConversation?.id,
+            runProvider: previewProvider,
+            runModel: previewModel,
             turnDirective: turnDirective
         )
         cachedPreviewBrainKey = key
@@ -4493,8 +4600,6 @@ public final class BotsViewModel: ObservableObject {
             || studioDraft.title != revision.title
             || studioDraft.description != revision.description
             || studioDraft.soul != revision.soul
-            || studioDraft.provider != revision.provider
-            || studioDraft.model != revision.model
             || resolvedDesktopKind(studioDraft.desktopKind) != resolvedDesktopKind(revision.desktopKind)
             || studioDraft.notificationsEnabled != (bot?.notificationsEnabled ?? true)
             || studioDraft.avatarSymbol != (bot?.avatarSymbol ?? "person.crop.circle")
@@ -4628,18 +4733,7 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    public func applyDefaultModel(for provider: AgentProvider) {
-        if let snapshot = providers.first(where: { $0.provider == provider }),
-           let model = snapshot.models.first?.id {
-            studioDraft.model = model
-            studioDraft.providerInstanceID = snapshot.id
-            return
-        }
-        studioDraft.model = Self.defaultModel(for: provider)
-        studioDraft.providerInstanceID = provider.rawValue
-    }
-
-    public static func defaultModel(for provider: AgentProvider) -> String {
+    public nonisolated static func defaultModel(for provider: AgentProvider) -> String {
         switch provider {
         case .claude: return "opus"
         case .codex: return AgentDefaultModelSelection.codexBuiltInDefault
@@ -4828,6 +4922,7 @@ public final class BotsViewModel: ObservableObject {
     private func reloadStudioSupport(id: BotID, force: Bool = false) {
         if !force, let cached = studioSupportByBot[id] {
             applyStudioSupport(cached)
+            applyDeskRouting(for: selectedConversation)
             syncQueuedFollowUps()
             return
         }
@@ -4848,6 +4943,7 @@ public final class BotsViewModel: ObservableObject {
             if let selected = selectedConversation {
                 selectedConversationByBot[id] = selected.id
             }
+            applyDeskRouting(for: selectedConversation)
             if let bot = try botStore.get(id: id) {
                 selectedRevision = try currentRevision(for: bot)
             } else {
@@ -5017,7 +5113,25 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func resolvedProvider(for bot: BotDefinition) -> AgentProvider? {
-        cachedRevision(for: bot)?.provider
+        resolvedThreadRouting(for: bot)?.provider
+    }
+
+    private func resolvedThreadRouting(for bot: BotDefinition) -> BotDeskRouting? {
+        let conversation: BotConversation?
+        if selectedBotID == bot.id {
+            conversation = selectedConversation
+        } else if let remembered = selectedConversationByBot[bot.id] {
+            conversation = studioSupportByBot[bot.id]?.conversations.first { $0.id == remembered }
+        } else {
+            conversation = studioSupportByBot[bot.id]?.selectedConversation
+        }
+        guard let conversation else { return nil }
+        if let saved = deskRoutingByConversation[conversation.id] {
+            return saved
+        }
+        guard let threadID = conversation.linkedAgentThreadID,
+              let thread = try? context.threadRepo.get(id: threadID) else { return nil }
+        return BotDeskRouting(thread: thread)
     }
 
     private static let selectedBotDefaultsKey = "bots.selectedBotID"
@@ -5032,7 +5146,8 @@ public final class BotsViewModel: ObservableObject {
     private static let brainPaneDefaultsKey = "bots.brainPane"
     private static let queuedFollowUpsDefaultsKey = "bots.queuedFollowUps"
     private static let composerDraftsDefaultsKey = "bots.composerDrafts"
-    private static let deskRoutingDefaultsKey = "bots.deskRouting"
+    private static let deskRoutingDefaultsKey = "bots.deskThreadRouting"
+    private static let legacyBotRoutingDefaultsKey = "bots.deskRouting"
     private static let peerHandoffsDefaultsKey = "bots.peerTurns.v2"
     private static let studioFilesLocationsDefaultsKey = "bots.studioFilesLocations"
     private static let inspectorDraftsDefaultsKey = "bots.inspectorDrafts"
@@ -5432,7 +5547,7 @@ public final class BotsViewModel: ObservableObject {
             if deskRoutingHydrated {
                 captureDeskRouting()
             } else {
-                applyDeskRouting(for: id)
+                applyDeskRouting(for: selectedConversation)
             }
             return
         }
@@ -5448,7 +5563,6 @@ public final class BotsViewModel: ObservableObject {
         selectedBotID = id
         applyComposerDraft(for: id)
         applyInspectorDraft(for: id)
-        applyDeskRouting(for: id)
     }
 
     private func captureComposerDraft(for botID: BotID? = nil) {
@@ -5635,27 +5749,19 @@ public final class BotsViewModel: ObservableObject {
         captureDeskRouting()
     }
 
-    private func captureDeskRouting(for botID: BotID? = nil) {
-        guard let botID = botID ?? selectedBotID else { return }
-        deskRoutingByBot[botID] = deskRouting
+    private func captureDeskRouting(for conversationID: BotConversationID? = nil) {
+        guard let conversationID = conversationID ?? selectedConversation?.id else { return }
+        deskRoutingByConversation[conversationID] = deskRouting
         persistDeskRouting()
     }
 
-    private func applyDeskRouting(for botID: BotID?) {
+    private func applyDeskRouting(for conversation: BotConversation?) {
         isApplyingDeskRouting = true
-        if let botID, let saved = deskRoutingByBot[botID] {
+        if let conversation, let saved = deskRoutingByConversation[conversation.id] {
             deskRouting = saved
-        } else if let botID, let bot = bots.first(where: { $0.id == botID })
-                    ?? (try? botStore.get(id: botID)),
-                  let revision = cachedRevision(for: bot) {
-            deskRouting = BotDeskRouting(
-                provider: revision.provider,
-                providerInstanceID: revision.providerInstanceID,
-                model: revision.model,
-                routingMode: revision.model.isEmpty ? .auto : .manual,
-                permissionMode: .supervised,
-                reasoningEffort: revision.reasoningEffort
-            )
+        } else if let threadID = conversation?.linkedAgentThreadID,
+                  let thread = try? context.threadRepo.get(id: threadID) {
+            deskRouting = BotDeskRouting(thread: thread)
             normalizeDeskReasoning()
         } else {
             deskRouting = BotDeskRouting()
@@ -5665,7 +5771,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func persistDeskRouting() {
-        let payload = Dictionary(uniqueKeysWithValues: deskRoutingByBot.map {
+        let payload = Dictionary(uniqueKeysWithValues: deskRoutingByConversation.map {
             ($0.key.value.uuidString.lowercased(), $0.value)
         })
         if payload.isEmpty {
@@ -5678,15 +5784,18 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func restoreDeskRoutingIfNeeded() {
+        // Bot-keyed routing was the defect: it made the callee choose the
+        // provider. Never migrate that state into a thread.
+        UserDefaults.standard.removeObject(forKey: Self.legacyBotRoutingDefaultsKey)
         guard let data = UserDefaults.standard.data(forKey: Self.deskRoutingDefaultsKey),
               let payload = try? JSONDecoder().decode([String: BotDeskRouting].self, from: data)
         else { return }
-        var restored: [BotID: BotDeskRouting] = [:]
+        var restored: [BotConversationID: BotDeskRouting] = [:]
         for (raw, routing) in payload {
             guard let uuid = UUID(uuidString: raw) else { continue }
-            restored[BotID(uuid)] = routing
+            restored[BotConversationID(uuid)] = routing
         }
-        deskRoutingByBot = restored
+        deskRoutingByConversation = restored
     }
 
     private func peerAttribution(forUserText text: String, hostID: BotID) -> BotDeskPeer? {
@@ -6247,11 +6356,6 @@ public final class BotsViewModel: ObservableObject {
             title: studioDraft.title,
             description: studioDraft.description,
             soul: studioDraft.soul,
-            provider: studioDraft.provider,
-            providerInstanceID: studioDraft.providerInstanceID.isEmpty
-                ? studioDraft.provider.rawValue
-                : studioDraft.providerInstanceID,
-            model: studioDraft.model.isEmpty ? Self.defaultModel(for: studioDraft.provider) : studioDraft.model,
             permissionMode: .supervised,
             desktopKind: resolvedDesktopKind(studioDraft.desktopKind)
         )
@@ -6264,11 +6368,6 @@ public final class BotsViewModel: ObservableObject {
             title: draft.title,
             description: draft.description,
             soul: draft.soul,
-            provider: draft.provider,
-            providerInstanceID: draft.providerInstanceID,
-            model: draft.model,
-            reasoningEffort: selectedRevision?.reasoningEffort ?? .medium,
-            compatibleRouteSet: selectedRevision?.compatibleRouteSet ?? ["default"],
             permissionMode: draft.permissionMode,
             desktopKind: draft.desktopKind,
             digest: BotRevision.digest(botID: bot.id, draft: draft),
@@ -6811,22 +6910,18 @@ public final class BotsViewModel: ObservableObject {
         return working
     }
 
-    private func frozenDeskRouting(for bot: BotDefinition) -> BotDeskRouting {
-        if selectedBotID == bot.id {
+    private func frozenDeskRouting(for conversation: BotConversation) -> BotDeskRouting {
+        if selectedConversation?.id == conversation.id {
             return deskRouting
         }
-        if let saved = deskRoutingByBot[bot.id] {
+        if let saved = deskRoutingByConversation[conversation.id] {
             return saved
         }
-        guard let revision = cachedRevision(for: bot) else { return BotDeskRouting() }
-        return BotDeskRouting(
-            provider: revision.provider,
-            providerInstanceID: revision.providerInstanceID,
-            model: revision.model,
-            routingMode: revision.model.isEmpty ? .auto : .manual,
-            permissionMode: revision.permissionMode,
-            reasoningEffort: revision.reasoningEffort
-        )
+        guard let threadID = conversation.linkedAgentThreadID,
+              let thread = try? context.threadRepo.get(id: threadID) else {
+            return BotDeskRouting()
+        }
+        return BotDeskRouting(thread: thread)
     }
 
     private func prepareSupervisedRun(
@@ -6854,6 +6949,13 @@ public final class BotsViewModel: ObservableObject {
                 model: model,
                 permissionMode: routing.permissionMode,
                 reasoningEffort: routing.reasoningEffort,
+                serviceTier: routing.serviceTier,
+                modelSelection: AgentModelSelection(
+                    provider: routing.provider,
+                    modelId: model,
+                    reasoningEffort: routing.reasoningEffort,
+                    serviceTier: routing.serviceTier
+                ),
                 providerInstanceId: routing.providerInstanceID,
                 runAsUser: routing.runAsUser,
                 surfaceID: nil,
@@ -6879,7 +6981,8 @@ public final class BotsViewModel: ObservableObject {
         bot: BotDefinition,
         conversation: BotConversation,
         userText: String,
-        attachments: [AgentAttachment]
+        attachments: [AgentAttachment],
+        routingOverride: BotDeskRouting? = nil
     ) throws -> BotStartedRun? {
         // Dest first. Send used to listMemory/listSkillBindings after the
         // bubble painted. Both Desk and host-catalog sends snapshot the same
@@ -6891,7 +6994,7 @@ public final class BotsViewModel: ObservableObject {
             recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
             return nil
         }
-        let routing = frozenDeskRouting(for: bot)
+        let routing = routingOverride ?? frozenDeskRouting(for: conversation)
         let prepared = try prepareSupervisedRun(
             bot: bot,
             conversation: conversation,
@@ -6964,6 +7067,8 @@ public final class BotsViewModel: ObservableObject {
                 browser: advertisedBrowser,
                 conversationID: prepared.conversation.id,
                 liveRunMode: routing.permissionMode,
+                runProvider: routing.provider,
+                runModel: model,
                 turnDirective: BotPeerDelegation.turnDirective(
                     mentionedBots: BotMentionParser.mentionedBots(
                         in: userText,
@@ -6985,6 +7090,13 @@ public final class BotsViewModel: ObservableObject {
                 model: model,
                 permissionMode: routing.permissionMode,
                 reasoningEffort: effort,
+                serviceTier: routing.serviceTier,
+                modelSelection: AgentModelSelection(
+                    provider: routing.provider,
+                    modelId: model,
+                    reasoningEffort: effort,
+                    serviceTier: routing.serviceTier
+                ),
                 providerInstanceId: routing.providerInstanceID,
                 attachments: attachments,
                 requestedRunID: prepared.runID
@@ -7188,7 +7300,8 @@ public final class BotsViewModel: ObservableObject {
                 bot: bot,
                 conversation: target,
                 userText: next.text,
-                attachments: next.attachments
+                attachments: next.attachments,
+                routingOverride: next.routing
             )
         } catch {
             errorMessage = String(describing: error)

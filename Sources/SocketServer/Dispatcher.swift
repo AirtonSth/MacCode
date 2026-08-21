@@ -181,10 +181,10 @@ public protocol CommandRouting: AnyObject {
     func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, delegationCapability: String?) async throws -> JSONValue
     func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue], delegationCapability: String?) throws -> JSONValue
     func authenticateManagedHostCall(threadID: AgentThreadID, runID: AgentRunID, delegationCapability: String?, mutation: Bool, method: String) throws
-    func createHostBot(name: String, title: String, description: String, handle: String?, soul: String, provider: AgentProvider, model: String, callerRun: AgentRunID) throws -> JSONValue
+    func createHostBot(name: String, title: String, description: String, handle: String?, soul: String, callerRun: AgentRunID) throws -> JSONValue
     func listHostBots() throws -> JSONValue
     func openHostBot(botID: BotID) throws -> JSONValue
-    func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?) async throws -> JSONValue
+    func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?, callerThread: AgentThreadID, callerRun: AgentRunID) async throws -> JSONValue
     func createHostBotThread(botID: BotID, title: String) throws -> JSONValue
     func createHostBotSkill(botID: BotID, skillID: String, body: String?, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue
     func viewHostBotSkill(botID: BotID, skillID: String, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue
@@ -341,7 +341,7 @@ public extension CommandRouting {
         throw JSONRPCError.notSupported("managed host catalog")
     }
 
-    func createHostBot(name: String, title: String, description: String, handle: String?, soul: String, provider: AgentProvider, model: String, callerRun: AgentRunID) throws -> JSONValue {
+    func createHostBot(name: String, title: String, description: String, handle: String?, soul: String, callerRun: AgentRunID) throws -> JSONValue {
         throw JSONRPCError.notSupported("host Bot create")
     }
 
@@ -353,7 +353,7 @@ public extension CommandRouting {
         throw JSONRPCError.notSupported("host Bot open")
     }
 
-    func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?) async throws -> JSONValue {
+    func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?, callerThread: AgentThreadID, callerRun: AgentRunID) async throws -> JSONValue {
         throw JSONRPCError.notSupported("host Bot send")
     }
 
@@ -2450,15 +2450,12 @@ public final class JSONRPCDispatcher {
                       let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init) else {
                     throw JSONRPCError.invalidParams
                 }
-                let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "") ?? .claude
                 let result = try router.createHostBot(
                     name: name,
                     title: params["title"]?.stringValue ?? "",
                     description: params["description"]?.stringValue ?? "",
                     handle: params["handle"]?.stringValue,
                     soul: params["soul"]?.stringValue ?? "",
-                    provider: provider,
-                    model: params["model"]?.stringValue ?? "",
                     callerRun: runID
                 )
                 EventBus.shared.publish(kind: "bot.created", payload: result)
@@ -2472,7 +2469,9 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: try router.openHostBot(botID: botID))
             case "host.bot.send":
                 guard let botID = params["bot_id"]?.stringValue.flatMap(UUID.init).map(BotID.init),
-                      let text = params["text"]?.stringValue else {
+                      let text = params["text"]?.stringValue,
+                      let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init) else {
                     throw JSONRPCError.invalidParams
                 }
                 let conversationID = params["conversation_id"]?.stringValue
@@ -2483,7 +2482,9 @@ public final class JSONRPCDispatcher {
                     result: try await router.sendHostBot(
                         botID: botID,
                         text: text,
-                        conversationID: conversationID
+                        conversationID: conversationID,
+                        callerThread: threadID,
+                        callerRun: runID
                     )
                 )
             case "host.bot.thread.create":

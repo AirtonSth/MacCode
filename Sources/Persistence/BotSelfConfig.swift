@@ -42,6 +42,8 @@ public enum BotSelfConfigCatalog: Sendable {
     public static let askUser = "bot_ask_user"
     public static let listPeers = BotPeerDelegation.listTool
     public static let askPeer = BotPeerDelegation.askTool
+    public static let providerRoutingHonesty =
+        "Provider and model are selected by the user on the calling thread; they are not Bot settings."
 
     public static var toolNames: [String] {
         [
@@ -64,9 +66,9 @@ public enum BotSelfConfigCatalog: Sendable {
     public static func description(for name: String) -> String {
         switch name {
         case getSettings:
-            return "Read this bot's live identity, soul, route, desktop, notifications, memory, skills, and routines."
+            return "Read this bot's live identity, soul, desktop, notifications, memory, skills, and routines."
         case setSettings:
-            return "Publish this bot's own name, Role, Instructions, description, notifications, or avatar. Same path as Studio Save. \(BotRoute.fallbackOrderHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.removeHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty) \(BotBrainCompiler.userRequestHonesty)"
+            return "Publish this bot's own name, Role, Instructions, description, notifications, or avatar. Same path as Studio Save. \(providerRoutingHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.removeHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty) \(BotBrainCompiler.userRequestHonesty)"
         case writeHomeFile:
             return "Write MEMORY.md, USER.md, SOUL.md, memory/YYYY-MM-DD.md, or skills/<slug>/SKILL.md in this bot's Files. Edit the file to remember, forget, correct, add a skill, or update Instructions."
         case removeSkill:
@@ -106,9 +108,6 @@ public enum BotSelfConfigCatalog: Sendable {
                     "title": ["type": "string", "description": "Role / job. Same field as Studio Role."],
                     "description": ["type": "string"],
                     "soul": ["type": "string", "description": "Instructions. Same field as Studio Instructions."],
-                    "provider": ["type": "string", "description": "Optional first-send seed. Not a Studio setting."],
-                    "provider_instance_id": ["type": "string"],
-                    "model": ["type": "string", "description": "Optional first-send seed. Not a Studio setting."],
                     "notifications_enabled": ["type": "boolean", "description": "Notifications On/Off."],
                     "avatar_symbol": ["type": "string", "description": "Avatar. Same field as Studio Avatar."],
                 ]) { _, new in new },
@@ -218,9 +217,6 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
     public var description: String
     public var avatarSymbol: String
     public var soul: String
-    public var provider: String
-    public var providerInstanceID: String
-    public var model: String
     public var permissionMode: String
     public var desktopKind: String
     public var notificationsEnabled: Bool
@@ -228,8 +224,8 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
     public var skills: [Skill]
     public var routines: [Routine]
 
-    // Tools require notifications_enabled / provider_instance_id. Snapshot
-    // used Swift camelCase, so same-turn notify/account persist invented a hop.
+    // Tools require notifications_enabled. Snapshot used Swift camelCase, so
+    // same-turn notify/account persist invented a hop.
     enum CodingKeys: String, CodingKey {
         case id
         case handle
@@ -238,9 +234,6 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
         case description
         case avatarSymbol = "avatar_symbol"
         case soul
-        case provider
-        case providerInstanceID = "provider_instance_id"
-        case model
         case permissionMode
         case desktopKind
         case notificationsEnabled = "notifications_enabled"
@@ -294,9 +287,6 @@ public struct BotSelfConfigPatch: Equatable, Sendable {
     public var description: String?
     public var avatarSymbol: String?
     public var soul: String?
-    public var provider: AgentProvider?
-    public var providerInstanceID: String?
-    public var model: String?
     public var permissionMode: AgentPermissionMode?
     public var desktopKind: BotDesktopKind?
     public var notificationsEnabled: Bool?
@@ -307,9 +297,6 @@ public struct BotSelfConfigPatch: Equatable, Sendable {
         description: String? = nil,
         avatarSymbol: String? = nil,
         soul: String? = nil,
-        provider: AgentProvider? = nil,
-        providerInstanceID: String? = nil,
-        model: String? = nil,
         permissionMode: AgentPermissionMode? = nil,
         desktopKind: BotDesktopKind? = nil,
         notificationsEnabled: Bool? = nil
@@ -319,9 +306,6 @@ public struct BotSelfConfigPatch: Equatable, Sendable {
         self.description = description
         self.avatarSymbol = avatarSymbol
         self.soul = soul
-        self.provider = provider
-        self.providerInstanceID = providerInstanceID
-        self.model = model
         self.permissionMode = permissionMode
         self.desktopKind = desktopKind
         self.notificationsEnabled = notificationsEnabled
@@ -329,7 +313,6 @@ public struct BotSelfConfigPatch: Equatable, Sendable {
 
     public var isEmpty: Bool {
         name == nil && title == nil && description == nil && avatarSymbol == nil && soul == nil
-            && provider == nil && providerInstanceID == nil && model == nil
             && permissionMode == nil && desktopKind == nil && notificationsEnabled == nil
     }
 }
@@ -409,9 +392,6 @@ public struct BotSelfConfigService: Sendable {
             description: bot.description,
             avatarSymbol: bot.avatarSymbol,
             soul: revision?.soul ?? "",
-            provider: (revision?.provider ?? .claude).rawValue,
-            providerInstanceID: revision?.providerInstanceID ?? "",
-            model: revision?.model ?? "",
             permissionMode: BotPermission.advertisedOrSupervised(revision?.permissionMode ?? .supervised).rawValue,
             desktopKind: (revision?.desktopKind ?? .logicalExecutionSpace).advertisedOrLogical.rawValue,
             notificationsEnabled: bot.notificationsEnabled,
@@ -444,34 +424,11 @@ public struct BotSelfConfigService: Sendable {
         let permission = BotPermission.advertisedOrSupervised(
             patch.permissionMode ?? current.permissionMode
         )
-        let provider = patch.provider ?? current.provider
-        let providerChanged = patch.provider != nil && patch.provider != current.provider
-        let requestedModel = patch.model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let model = if !requestedModel.isEmpty {
-            requestedModel
-        } else if providerChanged {
-            BotRoute.defaultModel(for: provider)
-        } else {
-            current.model
-        }
-        let requestedInstance = patch.providerInstanceID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let providerInstanceID = if !requestedInstance.isEmpty {
-            requestedInstance
-        } else if providerChanged {
-            provider.rawValue
-        } else {
-            current.providerInstanceID
-        }
         let draft = BotRevisionDraft(
             name: name,
             title: patch.title ?? current.title,
             description: patch.description ?? current.description,
             soul: patch.soul ?? current.soul,
-            provider: provider,
-            providerInstanceID: providerInstanceID,
-            model: model,
-            reasoningEffort: current.reasoningEffort,
-            compatibleRouteSet: current.compatibleRouteSet,
             permissionMode: permission,
             desktopKind: desktop
         )
@@ -793,12 +750,10 @@ public struct BotSelfConfigService: Sendable {
     }
 
     static func parsePatch(_ arguments: [String: Any]) throws -> BotSelfConfigPatch {
-        // Studio already says Fallback order is not shipped. Compile
-        // already labels that honesty. A leftover fallback_order write
-        // used to return an empty success, so first-chat invented a
-        // persist. Schema does not grow a fallback key.
+        // Provider routing belongs to the calling thread. Legacy route and
+        // fallback writes must fail loudly instead of pretending to persist.
         if arguments.keys.contains(where: Self.isAdvertisedFallbackOrderKey) {
-            throw BotSelfConfigError.invalid(BotRoute.fallbackOrderHonesty)
+            throw BotSelfConfigError.invalid(BotSelfConfigCatalog.providerRoutingHonesty)
         }
         // Studio Handle is create-only after first save. Compile already
         // labels that honesty. A leftover handle write used to return an
@@ -1028,6 +983,12 @@ public struct BotSelfConfigService: Sendable {
         if arguments.keys.contains(where: Self.isAdvertisedUserRequestKey) {
             throw BotSelfConfigError.invalid(BotBrainCompiler.userRequestHonesty)
         }
+        if arguments.keys.contains(where: {
+            ["provider", "provider_instance_id", "model", "route", "default_route"]
+                .contains($0.lowercased())
+        }) {
+            throw BotSelfConfigError.invalid(BotSelfConfigCatalog.providerRoutingHonesty)
+        }
         var patch = BotSelfConfigPatch()
         if let name = arguments["name"] as? String { patch.name = name }
         // Tools and Studio say Avatar. Schema key stays avatar_symbol.
@@ -1046,18 +1007,6 @@ public struct BotSelfConfigService: Sendable {
         if let soul = firstString(arguments, keys: ["soul", "standing_instructions", "instructions"]) {
             patch.soul = soul
         }
-        if let model = arguments["model"] as? String { patch.model = model }
-        if let instance = arguments["provider_instance_id"] as? String { patch.providerInstanceID = instance }
-        // Tools and Studio say Default route / Grok. Schema key stays provider.
-        if let raw = firstString(arguments, keys: ["provider", "route", "default_route"]) {
-            guard let parsed = BotRoute.parse(raw) else {
-                throw BotSelfConfigError.invalid("Unknown provider: \(raw)")
-            }
-            patch.provider = parsed.provider
-            if patch.model == nil, let model = parsed.model {
-                patch.model = model
-            }
-        }
         if arguments["notifications_enabled"] != nil || arguments["notifications"] != nil {
             let value = arguments["notifications_enabled"] ?? arguments["notifications"]
             patch.notificationsEnabled = try parseBool(value, label: "notifications_enabled")
@@ -1065,8 +1014,8 @@ public struct BotSelfConfigService: Sendable {
         return patch
     }
 
-    /// fallback_order is not a schema key. Studio / compile advertise the
-    /// name, so parse must fail loud instead of succeeding empty.
+    /// Legacy fallback routing is not a Bot setting. Fail loud instead of
+    /// accepting it as an empty write.
     static func isAdvertisedFallbackOrderKey(_ key: String) -> Bool {
         let normalized = key.lowercased().replacingOccurrences(of: " ", with: "_")
         return normalized == "fallback" || normalized == "fallback_order"

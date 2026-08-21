@@ -236,58 +236,6 @@ public enum BotPermission {
     }
 }
 
-/// Studio provider picker already binds these models. A provider-only
-/// set_settings write must not keep the leftover model from the old route.
-public enum BotRoute {
-    /// Studio already says this next to Default route. Compile it so
-    /// first-chat cannot invent a second route.
-    public static let fallbackOrderHonesty =
-        "One published route. Fallback order is not shipped in P1a."
-
-    public static func defaultModel(for provider: AgentProvider) -> String {
-        switch provider {
-        case .claude: return "opus"
-        case .codex: return AgentDefaultModelSelection.codexBuiltInDefault
-        case .grok: return "grok-4.6"
-        }
-    }
-
-    /// Studio and compile say Claude / Codex / Grok. Parse must accept
-    /// those titles, not only the raw provider id.
-    public static func advertisedTitle(for provider: AgentProvider) -> String {
-        switch provider {
-        case .claude: return "Claude"
-        case .codex: return "Codex"
-        case .grok: return "Grok"
-        }
-    }
-
-    /// Tools say Default route. Compile says "Grok · grok-4.6". Raw ids stay valid.
-    public static func parse(_ raw: String) -> (provider: AgentProvider, model: String?)? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        if let provider = parseProviderToken(trimmed) {
-            return (provider, nil)
-        }
-        let parts = trimmed.split(separator: "·", maxSplits: 1, omittingEmptySubsequences: true)
-        guard parts.count == 2, let provider = parseProviderToken(String(parts[0])) else {
-            return nil
-        }
-        let model = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
-        return (provider, model.isEmpty ? nil : model)
-    }
-
-    private static func parseProviderToken(_ raw: String) -> AgentProvider? {
-        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let provider = AgentProvider(rawValue: token.lowercased()) {
-            return provider
-        }
-        return AgentProvider.allCases.first {
-            advertisedTitle(for: $0).caseInsensitiveCompare(token) == .orderedSame
-        }
-    }
-}
-
 /// Studio Avatar is a blobatar composer. Leftover SF chips still parse
 /// so published bots and tools keep working.
 public enum BotAvatar {
@@ -518,11 +466,6 @@ public struct BotRevisionDraft: Codable, Sendable, Equatable {
     public var title: String
     public var description: String
     public var soul: String
-    public var provider: AgentProvider
-    public var providerInstanceID: String
-    public var model: String
-    public var reasoningEffort: AgentReasoningEffort
-    public var compatibleRouteSet: [String]
     public var permissionMode: AgentPermissionMode
     public var desktopKind: BotDesktopKind
 
@@ -531,11 +474,6 @@ public struct BotRevisionDraft: Codable, Sendable, Equatable {
         title: String,
         description: String,
         soul: String = "",
-        provider: AgentProvider,
-        providerInstanceID: String,
-        model: String,
-        reasoningEffort: AgentReasoningEffort = .medium,
-        compatibleRouteSet: [String] = ["default"],
         permissionMode: AgentPermissionMode = .supervised,
         desktopKind: BotDesktopKind = .logicalExecutionSpace
     ) {
@@ -543,13 +481,32 @@ public struct BotRevisionDraft: Codable, Sendable, Equatable {
         self.title = title
         self.description = description
         self.soul = soul
-        self.provider = provider
-        self.providerInstanceID = providerInstanceID
-        self.model = model
-        self.reasoningEffort = reasoningEffort
-        self.compatibleRouteSet = compatibleRouteSet
         self.permissionMode = permissionMode
         self.desktopKind = desktopKind
+    }
+
+    @available(*, deprecated, message: "Provider routing belongs to AgentThread, not BotRevisionDraft.")
+    public init(
+        name: String,
+        title: String,
+        description: String,
+        soul: String = "",
+        provider _: AgentProvider,
+        providerInstanceID _: String,
+        model _: String,
+        reasoningEffort _: AgentReasoningEffort = .medium,
+        compatibleRouteSet _: [String] = ["default"],
+        permissionMode: AgentPermissionMode = .supervised,
+        desktopKind: BotDesktopKind = .logicalExecutionSpace
+    ) {
+        self.init(
+            name: name,
+            title: title,
+            description: description,
+            soul: soul,
+            permissionMode: permissionMode,
+            desktopKind: desktopKind
+        )
     }
 }
 
@@ -561,11 +518,6 @@ public struct BotRevision: Codable, Sendable, Equatable {
     public var title: String
     public var description: String
     public var soul: String
-    public var provider: AgentProvider
-    public var providerInstanceID: String
-    public var model: String
-    public var reasoningEffort: AgentReasoningEffort
-    public var compatibleRouteSet: [String]
     public var permissionMode: AgentPermissionMode
     public var desktopKind: BotDesktopKind
     public var digest: String
@@ -580,11 +532,6 @@ public struct BotRevision: Codable, Sendable, Equatable {
         title: String,
         description: String,
         soul: String,
-        provider: AgentProvider,
-        providerInstanceID: String,
-        model: String,
-        reasoningEffort: AgentReasoningEffort,
-        compatibleRouteSet: [String],
         permissionMode: AgentPermissionMode,
         desktopKind: BotDesktopKind,
         digest: String,
@@ -598,16 +545,47 @@ public struct BotRevision: Codable, Sendable, Equatable {
         self.title = title
         self.description = description
         self.soul = soul
-        self.provider = provider
-        self.providerInstanceID = providerInstanceID
-        self.model = model
-        self.reasoningEffort = reasoningEffort
-        self.compatibleRouteSet = compatibleRouteSet
         self.permissionMode = permissionMode
         self.desktopKind = desktopKind
         self.digest = digest
         self.publishedAt = publishedAt
         self.supersedesRevisionID = supersedesRevisionID
+    }
+
+    @available(*, deprecated, message: "Provider routing belongs to AgentThread, not BotRevision.")
+    public init(
+        id: BotRevisionID = BotRevisionID(),
+        botID: BotID,
+        revisionNumber: Int,
+        name: String,
+        title: String,
+        description: String,
+        soul: String,
+        provider _: AgentProvider,
+        providerInstanceID _: String,
+        model _: String,
+        reasoningEffort _: AgentReasoningEffort,
+        compatibleRouteSet _: [String],
+        permissionMode: AgentPermissionMode,
+        desktopKind: BotDesktopKind,
+        digest: String,
+        publishedAt: Date = Date(),
+        supersedesRevisionID: BotRevisionID? = nil
+    ) {
+        self.init(
+            id: id,
+            botID: botID,
+            revisionNumber: revisionNumber,
+            name: name,
+            title: title,
+            description: description,
+            soul: soul,
+            permissionMode: permissionMode,
+            desktopKind: desktopKind,
+            digest: digest,
+            publishedAt: publishedAt,
+            supersedesRevisionID: supersedesRevisionID
+        )
     }
 
     public static func digest(
@@ -616,26 +594,15 @@ public struct BotRevision: Codable, Sendable, Equatable {
         title: String,
         description: String,
         soul: String,
-        provider: AgentProvider,
-        providerInstanceID: String,
-        model: String,
-        reasoningEffort: AgentReasoningEffort,
-        compatibleRouteSet: [String],
         permissionMode: AgentPermissionMode,
         desktopKind: BotDesktopKind
     ) -> String {
-        let routes = compatibleRouteSet.sorted().joined(separator: ",")
         let payload = [
             "bot_id=\(botID.value.uuidString.lowercased())",
             "name=\(name)",
             "title=\(title)",
             "description=\(description)",
             "soul=\(soul)",
-            "provider=\(provider.rawValue)",
-            "provider_instance_id=\(providerInstanceID)",
-            "model=\(model)",
-            "reasoning_effort=\(reasoningEffort.rawValue)",
-            "compatible_route_set=\(routes)",
             "permission_mode=\(permissionMode.rawValue)",
             "desktop_kind=\(desktopKind.rawValue)",
         ].joined(separator: "\n")
@@ -649,13 +616,34 @@ public struct BotRevision: Codable, Sendable, Equatable {
             title: draft.title,
             description: draft.description,
             soul: draft.soul,
-            provider: draft.provider,
-            providerInstanceID: draft.providerInstanceID,
-            model: draft.model,
-            reasoningEffort: draft.reasoningEffort,
-            compatibleRouteSet: draft.compatibleRouteSet,
             permissionMode: draft.permissionMode,
             desktopKind: draft.desktopKind
+        )
+    }
+
+    @available(*, deprecated, message: "Provider routing is not part of a Bot revision digest.")
+    public static func digest(
+        botID: BotID,
+        name: String,
+        title: String,
+        description: String,
+        soul: String,
+        provider _: AgentProvider,
+        providerInstanceID _: String,
+        model _: String,
+        reasoningEffort _: AgentReasoningEffort,
+        compatibleRouteSet _: [String],
+        permissionMode: AgentPermissionMode,
+        desktopKind: BotDesktopKind
+    ) -> String {
+        digest(
+            botID: botID,
+            name: name,
+            title: title,
+            description: description,
+            soul: soul,
+            permissionMode: permissionMode,
+            desktopKind: desktopKind
         )
     }
 }

@@ -43,8 +43,6 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         description: String,
         handle: String?,
         soul: String,
-        provider: AgentProvider,
-        model: String,
         callerRun: AgentRunID
     ) throws -> JSONValue {
         throw JSONRPCError.notSupported("host Bot create")
@@ -58,7 +56,13 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         throw JSONRPCError.notSupported("host Bot open")
     }
 
-    func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?) async throws -> JSONValue {
+    func sendHostBot(
+        botID: BotID,
+        text: String,
+        conversationID: BotConversationID?,
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID
+    ) async throws -> JSONValue {
         throw JSONRPCError.notSupported("host Bot send")
     }
 

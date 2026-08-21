@@ -2733,22 +2733,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         description: String,
         handle: String?,
         soul: String,
-        provider: AgentProvider,
-        model: String,
         callerRun: AgentRunID
     ) throws -> JSONValue {
         guard let ctx = context else { throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.") }
-        let resolvedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? BotsViewModel.defaultModel(for: provider)
-            : model
         let bot = try ctx.botStore.create(
             name: name,
             title: title,
             description: description,
             handle: handle,
             soul: soul,
-            provider: provider,
-            model: resolvedModel,
             workspaceID: ctx.state.window.selectedWorkspaceID
         )
         let home = BotHome(appSupportDirectory: ctx.appSupportDirectory, bot: bot)
@@ -2782,15 +2775,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func sendHostBot(
         botID: BotID,
         text: String,
-        conversationID: BotConversationID?
+        conversationID: BotConversationID?,
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID
     ) async throws -> JSONValue {
-        guard let botsViewModel else {
+        guard let ctx = context,
+              let botsViewModel,
+              let thread = try ctx.threadRepo.get(id: callerThread),
+              let run = try ctx.runRepo.get(id: callerRun),
+              run.threadId == thread.id else {
             throw JSONRPCError(code: -32045, message: "RemoteCode Bot runtime is unavailable.")
         }
         return try botsViewModel.enqueueHostMessage(
             botID: botID,
             text: text,
-            conversationID: conversationID
+            conversationID: conversationID,
+            routing: BotDeskRouting(thread: thread, activeRun: run)
         )
     }
 

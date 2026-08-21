@@ -184,8 +184,6 @@ public enum RemoteCodeHostCatalog: Sendable {
                     "description": ["type": "string"],
                     "handle": ["type": "string"],
                     "soul": ["type": "string"],
-                    "provider": ["type": "string"],
-                    "model": ["type": "string"],
                 ]) { _, new in new },
                 required: ["name", operationIDKey]
             )

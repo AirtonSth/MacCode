@@ -277,6 +277,8 @@ public enum BotBrainCompiler {
         runID: AgentRunID? = nil,
         now: Date = Date(),
         liveRunMode: AgentPermissionMode? = nil,
+        runProvider: AgentProvider = .codex,
+        runModel: String = "",
         turnDirective: String? = nil
     ) -> ContextAssemblyReceipt {
         let payload = composeRunPrompt(
@@ -299,8 +301,8 @@ public enum BotBrainCompiler {
             revisionID: revision.id,
             revisionNumber: revision.revisionNumber,
             revisionDigest: revision.digest,
-            provider: revision.provider,
-            model: revision.model,
+            provider: runProvider,
+            model: runModel,
             permissionMode: effectiveRunMode(revision: revision, liveRunMode: liveRunMode),
             desktopKind: revision.desktopKind.advertisedOrLogical,
             compiledPayload: payload,
@@ -487,26 +489,6 @@ public enum BotBrainCompiler {
         enabled
             ? "On. Alerts stay on this Mac; not an isolated Desktop."
             : "Off. This Mac will not alert the owner."
-    }
-
-    /// Studio already says Default route. Compile provider + model so
-    /// first-chat "what's your Default route?" cannot invent a hop.
-    /// Studio already says Fallback order is not shipped. Compile that
-    /// so first-chat cannot invent a second route. Custom soul must not
-    /// hide advertised routing. Dest Source title stays Route.
-    static func routeLine(provider: AgentProvider, model: String) -> String {
-        let title = BotRoute.advertisedTitle(for: provider)
-        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let route = model.isEmpty ? title : "\(title) · \(model)"
-        return "\(route). \(BotRoute.fallbackOrderHonesty)"
-    }
-
-    /// Studio already says Model. Compile that name so first-chat
-    /// "what's your Model?" cannot invent a hop. Empty stays omitted
-    /// (Desk hides the pill). Dest Source title stays Route.
-    static func modelLine(_ model: String) -> String? {
-        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : "Model: \(trimmed)"
     }
 
     /// Desk already shows `@handle`. Compile it so first-chat "what's your handle?"

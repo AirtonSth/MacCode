@@ -62,7 +62,6 @@ final class BotStoreTests: XCTestCase {
         let revision = try XCTUnwrap(store.getRevision(id: revisionID))
         XCTAssertEqual(revision.permissionMode, .supervised)
         XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
-        XCTAssertEqual(revision.compatibleRouteSet, ["default"])
         XCTAssertEqual(revision.revisionNumber, 1)
         XCTAssertEqual(
             revision.digest,
@@ -70,11 +69,7 @@ final class BotStoreTests: XCTestCase {
                 name: "Piper",
                 title: "Scout",
                 description: "Looks around",
-                soul: "Be brief.",
-                provider: .claude,
-                providerInstanceID: "claude",
-                model: "opus",
-                compatibleRouteSet: ["default"]
+                soul: "Be brief."
             ))
         )
     }

@@ -249,6 +249,20 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
         ))
         XCTAssertEqual(opened.result?.objectValue?["opened"]?.boolValue, true)
 
+        let sent = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(31),
+            method: RemoteCodeHostCatalog.botSendRPC,
+            params: params([
+                "bot_id": .string(botID),
+                "text": .string("Use my exact provider"),
+                "client_request_id": .string("send-1"),
+            ])
+        ))
+        XCTAssertNil(sent.error)
+        XCTAssertEqual(router.lastCallerThread?.value.uuidString.lowercased(), threadID)
+        XCTAssertEqual(router.lastCallerRun?.value.uuidString.lowercased(), runID)
+
         let skill = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
             jsonrpc: "2.0",
             id: .number(4),
@@ -293,6 +307,8 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
     var markNextUnknown = false
     var authorized = true
     var authorizationMutations: [Bool] = []
+    var lastCallerThread: AgentThreadID?
+    var lastCallerRun: AgentRunID?
     private var receipts: [String: Receipt] = [:]
     private var bots: [String: String] = [:]
     private var skills: [String: String] = [:]
@@ -322,8 +338,6 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
         description: String,
         handle: String?,
         soul: String,
-        provider: AgentProvider,
-        model: String,
         callerRun: AgentRunID
     ) throws -> JSONValue {
         createCount += 1
@@ -349,8 +363,16 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
         return .object(["bot_id": .string(botID.value.uuidString.lowercased()), "opened": .bool(true)])
     }
 
-    override func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?) async throws -> JSONValue {
+    override func sendHostBot(
+        botID: BotID,
+        text: String,
+        conversationID: BotConversationID?,
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID
+    ) async throws -> JSONValue {
         lastMethod = "send"
+        lastCallerThread = callerThread
+        lastCallerRun = callerRun
         return .object(["enqueued": .bool(true), "bot_id": .string(botID.value.uuidString.lowercased())])
     }
 

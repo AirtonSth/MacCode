@@ -80,7 +80,7 @@ final class AgentAppBotMentionTests: XCTestCase {
     }
 
     func test_internalBotPeerWithEmptyProviderCacheSkipsCatalogListingAndStartsProvider() async throws {
-        // WHY: peer routing was already bound from the Bot revision. Re-listing
+        // WHY: peer routing is already bound from the calling thread. Re-listing
         // every provider here can hold the durable handoff in peerPrepared for
         // minutes before the exact provider gets a chance to start.
         let root = FileManager.default.temporaryDirectory
@@ -90,8 +90,8 @@ final class AgentAppBotMentionTests: XCTestCase {
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path
         )
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let botsVM = BotsViewModel(context: context)
         // Drain the view model's independent first-paint catalog task while
         // there is intentionally no router. This test measures peer dispatch.
@@ -111,7 +111,12 @@ final class AgentAppBotMentionTests: XCTestCase {
             title: "Empty catalog origin",
             provider: .codex,
             model: "fake-model",
-            status: .completed
+            status: .completed,
+            modelSelection: AgentModelSelection(provider: .codex, modelId: "fake-model"),
+            routingConfiguration: AgentRoutingConfiguration(
+                mode: .auto,
+                manualSelection: AgentModelSelection(provider: .codex, modelId: "fake-model")
+            )
         )
         try context.threadRepo.upsert(originThread)
         XCTAssertTrue(router.cachedProviderSnapshotsForSend().isEmpty)
@@ -171,8 +176,8 @@ final class AgentAppBotMentionTests: XCTestCase {
         let (_, botsVM, _, quinn, threadID, context) = try makeWiredMentionSurface(
             peerReply: "unused deadline reply"
         )
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
         let admission = BlockingBotPeerProviderAdmission()
         context.coordinator.providerAdmissionCheck = { _, _ in
             await admission.wait()
@@ -249,10 +254,12 @@ final class AgentAppBotMentionTests: XCTestCase {
         surface.viewModel.setPermissionMode(.fullAccess)
         let untouched = try botsVM.create(name: "Untouched", title: "Observer", provider: .grok)
         surface.viewModel.mentionableBotsProvider = { [quinn, untouched] }
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.claude, runner: peerRunner)
-        ctx.coordinator.replaceProvider(.codex, runner: hostRunner)
+        ctx.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+        )
         let prompt = "pergunte ao @\(quinn.handle) o nome dele e com base na resposta dê outro nome para ele. Faça a alteração agora sem pedir confirmação e no final diga qual nome foi aplicado."
         XCTAssertEqual(
             BotMentionParser.mentionedBots(
@@ -440,12 +447,16 @@ final class AgentAppBotMentionTests: XCTestCase {
             provider: .grok
         )
         surface.viewModel.mentionableBotsProvider = { [phpHater, phpLover] }
-        let haterRunner = ControlledBotHandoffRunner(provider: .claude)
-        let loverRunner = ControlledBotHandoffRunner(provider: .grok)
+        let haterRunner = ControlledBotHandoffRunner(provider: .codex)
+        let loverRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.claude, runner: haterRunner)
-        ctx.coordinator.replaceProvider(.grok, runner: loverRunner)
-        ctx.coordinator.replaceProvider(.codex, runner: hostRunner)
+        ctx.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: hostRunner,
+                peerRunners: [phpHater.id: haterRunner, phpLover.id: loverRunner]
+            )
+        )
 
         let original = "Peça ao @php-hater e ao @php-lover para debater se devemos adotar PHP no novo serviço. Consulte os dois mais de uma vez, encaminhe a resposta relevante de um ao outro em cada rodada, continue no mesmo turno até conciliarem riscos e benefícios e publique uma única conclusão de consenso em português."
         XCTAssertEqual(
@@ -678,10 +689,12 @@ final class AgentAppBotMentionTests: XCTestCase {
         let (router, botsVM, surface, quinn, threadId, ctx) = try makeWiredMentionSurface(
             peerReply: "unused controlled reply"
         )
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.claude, runner: peerRunner)
-        ctx.coordinator.replaceProvider(.codex, runner: hostRunner)
+        ctx.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+        )
 
         let original = "@\(quinn.handle) você está por aí?"
         surface.viewModel.prompt = original
@@ -817,10 +830,8 @@ final class AgentAppBotMentionTests: XCTestCase {
         )
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
         context.coordinator.replaceProvider(
             .grok,
             runner: FakeProviderRunner(provider: .grok, scenario: .simpleAssistant(reply: "unused"))
@@ -848,6 +859,10 @@ final class AgentAppBotMentionTests: XCTestCase {
             scopedVM.setDeskProvider(.claude)
             return (peer, observerSelection)
         }()
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+        )
         router.botsViewModel = initiatingVM
         let workspace = try router.createWorkspace(
             name: "t005 Agent weak VM",
@@ -1017,10 +1032,12 @@ final class AgentAppBotMentionTests: XCTestCase {
         let (router, botsVM, surface, quinn, threadId, ctx) = try makeWiredMentionSurface(
             peerReply: "unused controlled reply"
         )
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.claude, runner: peerRunner)
-        ctx.coordinator.replaceProvider(.codex, runner: hostRunner)
+        ctx.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+        )
 
         let dispatch = Task {
             await router.dispatchAgentAppBotMentions(
@@ -1156,12 +1173,13 @@ final class AgentAppBotMentionTests: XCTestCase {
         let (router, botsVM, surface, quinn, threadId, ctx) = try makeWiredMentionSurface(
             peerReply: "unused queued reply"
         )
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.claude, runner: peerRunner)
         ctx.coordinator.replaceProviderAdapter(
             .codex,
-            adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
+            adapter: TerminalRetiringOneShotAdapter(
+                runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+            )
         )
 
         let occupying = try await router.sendAgentMessage(
@@ -1520,12 +1538,13 @@ final class AgentAppBotMentionTests: XCTestCase {
         let (router, botsVM, surface, quinn, threadId, ctx) = try makeWiredMentionSurface(
             peerReply: "unused queue cancellation reply"
         )
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.claude, runner: peerRunner)
         ctx.coordinator.replaceProviderAdapter(
             .codex,
-            adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
+            adapter: TerminalRetiringOneShotAdapter(
+                runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+            )
         )
 
         let occupying = try await router.sendAgentMessage(
@@ -1680,14 +1699,17 @@ final class AgentAppBotMentionTests: XCTestCase {
         )
         botsVM.openDesk(rory)
         botsVM.setDeskProvider(.grok)
-        let slowRunner = ControlledBotHandoffRunner(provider: .claude)
-        let fastRunner = ControlledBotHandoffRunner(provider: .grok)
+        let slowRunner = ControlledBotHandoffRunner(provider: .codex)
+        let fastRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.claude, runner: slowRunner)
-        ctx.coordinator.replaceProvider(.grok, runner: fastRunner)
         ctx.coordinator.replaceProviderAdapter(
             .codex,
-            adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
+            adapter: TerminalRetiringOneShotAdapter(
+                runner: CallerThreadHandoffRunner(
+                    hostRunner: hostRunner,
+                    peerRunners: [quinn.id: slowRunner, rory.id: fastRunner]
+                )
+            )
         )
 
         let occupying = try await router.sendAgentMessage(
@@ -2042,10 +2064,8 @@ final class AgentAppBotMentionTests: XCTestCase {
         let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        ctx.coordinator.replaceProvider(.claude, runner: peerRunner)
-        ctx.coordinator.replaceProvider(.codex, runner: hostRunner)
         router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
             let candidateModelIDs = [BotsViewModel.defaultModel(for: provider)]
                 + (provider == .codex ? ["gpt-5.5"] : [])
@@ -2064,6 +2084,10 @@ final class AgentAppBotMentionTests: XCTestCase {
         let botsVM = BotsViewModel(context: ctx, router: router)
         router.botsViewModel = botsVM
         let quinn = try botsVM.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        ctx.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+        )
         botsVM.openDesk(quinn)
         botsVM.setDeskProvider(.claude)
 
@@ -2249,12 +2273,13 @@ final class AgentAppBotMentionTests: XCTestCase {
             viewModel: botsVM,
             surface: surface
         )
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
         context.coordinator.replaceProviderAdapter(
             .codex,
-            adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
+            adapter: TerminalRetiringOneShotAdapter(
+                runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+            )
         )
         let occupying = try await router.sendAgentMessage(
             thread: threadID,
@@ -2398,9 +2423,8 @@ final class AgentAppBotMentionTests: XCTestCase {
         )
         try context.settingsRepo.set(key, "base64:\(rawHandoffs.base64EncodedString())")
         let router = AppCommandRouter(context: context)
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
         context.coordinator.replaceProviderAdapter(
             .codex,
             adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
@@ -2500,6 +2524,40 @@ final class AgentAppBotMentionTests: XCTestCase {
         surface.viewModel.mentionableBotsProvider = { botsVM.bots }
         surface.viewModel.selectThread(thread.id)
         return (router, botsVM, surface, quinn, thread.id, ctx)
+    }
+}
+
+/// Keeps host and peer runs independently controllable while proving that both
+/// enter the one provider selected by the calling thread.
+final class CallerThreadHandoffRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider
+    private let hostRunner: ControlledBotHandoffRunner
+    private let peerRunners: [BotID: ControlledBotHandoffRunner]
+
+    init(
+        hostRunner: ControlledBotHandoffRunner,
+        peerRunners: [BotID: ControlledBotHandoffRunner]
+    ) {
+        provider = hostRunner.provider
+        self.hostRunner = hostRunner
+        self.peerRunners = peerRunners
+        precondition(peerRunners.values.allSatisfy { $0.provider == provider })
+    }
+
+    func listModels() async -> [AgentModelDescriptor] {
+        await hostRunner.listModels()
+    }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        if let rawBotID = request.environment[BotSelfConfigCatalog.callerEnvironmentKey],
+           let uuid = UUID(uuidString: rawBotID),
+           let peerRunner = peerRunners[BotID(uuid)] {
+            return try await peerRunner.startRun(request, onEvent: onEvent)
+        }
+        return try await hostRunner.startRun(request, onEvent: onEvent)
     }
 }
 

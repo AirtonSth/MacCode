@@ -992,10 +992,10 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.macosHarnessTool))
     }
 
-    func test_routeHonestyCompilesForCustomSoul_becauseDeskRouteIsNotAnEscapeHatch() {
-        // WHY: Studio already says Default route. Compile listed Route, so
-        // first-chat "what's your Default route?" invented a hop. Default
-        // route is advertised identity — a written soul must not hide it.
+    func test_receiptUsesCallingRunRouteWithoutCompilingItIntoBotIdentity() {
+        // WHY: provider/model describe this invocation, not the Bot. The
+        // receipt must record the caller's route for audit while the Bot prompt
+        // and identity layers remain route-free.
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
         let revision = BotRevision(
             botID: bot.id,
@@ -1004,80 +1004,6 @@ final class BotBrainCompilerTests: XCTestCase {
             title: "Scout",
             description: "",
             soul: "Own the inbox.",
-            provider: .claude,
-            providerInstanceID: "claude",
-            model: "opus",
-            reasoningEffort: .medium,
-            compatibleRouteSet: ["default"],
-            permissionMode: .supervised,
-            desktopKind: .logicalExecutionSpace,
-            digest: "x"
-        )
-        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What model are you?")
-        XCTAssertFalse(receipt.compiledPayload.contains("Default route:"))
-        XCTAssertFalse(receipt.compiledPayload.contains("Model: opus"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
-        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, false)
-        XCTAssertFalse(
-            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Default route:"),
-            "route layer owns the provider/model"
-        )
-        XCTAssertFalse(
-            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Model:"),
-            "route layer owns Model"
-        )
-    }
-
-    func test_modelHonestyCompilesForCustomSoul_becauseStudioModelIsNotAnEscapeHatch() {
-        // WHY: Studio already says Model. Compile listed it unlabeled after
-        // · on Default route, so first-chat "what's your Model?" invented a
-        // hop. Model is advertised identity — a written soul must not hide it.
-        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
-        let revision = BotRevision(
-            botID: bot.id,
-            revisionNumber: 1,
-            name: "Piper",
-            title: "Scout",
-            description: "",
-            soul: "Own the inbox.",
-            provider: .claude,
-            providerInstanceID: "claude",
-            model: "opus",
-            reasoningEffort: .medium,
-            compatibleRouteSet: ["default"],
-            permissionMode: .supervised,
-            desktopKind: .logicalExecutionSpace,
-            digest: "x"
-        )
-        let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "What's your Model?")
-        XCTAssertFalse(receipt.compiledPayload.contains("Model: opus"))
-        XCTAssertFalse(receipt.compiledPayload.contains("Default route:"))
-        XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
-        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, false)
-        XCTAssertEqual(BotBrainCompiler.modelLine("opus"), "Model: opus")
-        XCTAssertNil(BotBrainCompiler.modelLine("  "))
-    }
-
-    func test_fallbackOrderHonestyCompilesForCustomSoul_becauseStudioFallbackIsNotAHop() {
-        // WHY: Studio already says Fallback order is not shipped. Compile
-        // listed Default route only, so first-chat "if Claude is down use
-        // Grok" invented a second route. Hermes ships one published route.
-        // Dest Source title stays Route. Schema does not grow a fallback tool.
-        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
-        let revision = BotRevision(
-            botID: bot.id,
-            revisionNumber: 1,
-            name: "Piper",
-            title: "Scout",
-            description: "",
-            soul: "Own the inbox.",
-            provider: .claude,
-            providerInstanceID: "claude",
-            model: "opus",
-            reasoningEffort: .medium,
-            compatibleRouteSet: ["default", "grok"],
             permissionMode: .supervised,
             desktopKind: .logicalExecutionSpace,
             digest: "x"
@@ -1085,21 +1011,16 @@ final class BotBrainCompilerTests: XCTestCase {
         let receipt = BotBrainCompiler.assemble(
             bot: bot,
             revision: revision,
-            userText: "If Claude is down use Grok"
+            userText: "What model is running this turn?",
+            runProvider: .grok,
+            runModel: "grok-4.6"
         )
-        XCTAssertFalse(receipt.compiledPayload.contains("Default route:"))
+        XCTAssertEqual(receipt.provider, .grok)
+        XCTAssertEqual(receipt.model, "grok-4.6")
+        XCTAssertFalse(receipt.compiledPayload.contains("Grok"))
+        XCTAssertFalse(receipt.compiledPayload.contains("grok-4.6"))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
-        XCTAssertFalse(receipt.compiledPayload.contains("bot_set_fallback"))
-        XCTAssertFalse(receipt.compiledPayload.contains("compatibleRouteSet"))
-        XCTAssertFalse(
-            BotStandingInstructions.admittedToolsText.contains("Fallback order"),
-            "tools must not advertise a Fallback write"
-        )
-        XCTAssertFalse(
-            BotStandingInstructions.fallback(name: "Piper", title: "Scout").contains("Fallback order"),
-            "compiler layer owns Fallback order"
-        )
-        XCTAssertFalse(receipt.layers.contains { $0.title == "Fallback" })
+        XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .route })?.included, false)
     }
 

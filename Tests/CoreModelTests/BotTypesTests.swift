@@ -27,7 +27,10 @@ final class BotTypesTests: XCTestCase {
         XCTAssertFalse(BotHandle.shouldFollowName(handle: "piper", name: "Scout"))
     }
 
-    func test_revisionDigest_isStableAcrossRouteOrder_becauseRepublishMustNotDriftWithoutContentChange() {
+    func test_revisionEncodingAndDigestExcludeProviderRouting_becauseRouteBelongsToCallingThread() throws {
+        // WHY: selecting Claude, Codex, or Grok is a user choice on a thread.
+        // Publishing the same Bot from different callers must neither persist
+        // that route nor create a fake identity revision.
         let botID = BotID(UUID(uuidString: "00000000-0000-4000-8000-0000000000aa")!)
         let first = BotRevision.digest(
             botID: botID,
@@ -35,25 +38,6 @@ final class BotTypesTests: XCTestCase {
             title: "Scout",
             description: "Looks around",
             soul: "Be brief.",
-            provider: .claude,
-            providerInstanceID: "claude",
-            model: "opus",
-            reasoningEffort: .medium,
-            compatibleRouteSet: ["chat", "plan"],
-            permissionMode: .supervised,
-            desktopKind: .logicalExecutionSpace
-        )
-        let reordered = BotRevision.digest(
-            botID: botID,
-            name: "Piper",
-            title: "Scout",
-            description: "Looks around",
-            soul: "Be brief.",
-            provider: .claude,
-            providerInstanceID: "claude",
-            model: "opus",
-            reasoningEffort: .medium,
-            compatibleRouteSet: ["plan", "chat"],
             permissionMode: .supervised,
             desktopKind: .logicalExecutionSpace
         )
@@ -63,18 +47,33 @@ final class BotTypesTests: XCTestCase {
             title: "Scout",
             description: "Looks around",
             soul: "Be verbose.",
-            provider: .claude,
-            providerInstanceID: "claude",
-            model: "opus",
-            reasoningEffort: .medium,
-            compatibleRouteSet: ["chat", "plan"],
             permissionMode: .supervised,
             desktopKind: .logicalExecutionSpace
         )
+        let revision = BotRevision(
+            botID: botID,
+            revisionNumber: 1,
+            name: "Piper",
+            title: "Scout",
+            description: "Looks around",
+            soul: "Be brief.",
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: first
+        )
+        let encoded = try JSONEncoder().encode(revision)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
 
-        XCTAssertEqual(first, reordered, "route-set order is not identity — users would see a fake revision")
         XCTAssertEqual(first.count, 64)
         XCTAssertNotEqual(first, changedSoul, "soul is published identity; a change must produce a new digest")
+        XCTAssertNil(object["provider"])
+        XCTAssertNil(object["providerInstanceID"])
+        XCTAssertNil(object["provider_instance_id"])
+        XCTAssertNil(object["model"])
+        XCTAssertNil(object["reasoningEffort"])
+        XCTAssertNil(object["compatibleRouteSet"])
     }
 
     func test_desktopLabel_statesSharedAccount_becauseUsersMustNotThinkP1aIsAnIsolatedVM() throws {
@@ -245,24 +244,6 @@ final class BotTypesTests: XCTestCase {
             BotStandingInstructions.resolved(name: "Piper", title: "Scout", soul: "Own the inbox."),
             "Own the inbox."
         )
-    }
-
-    func test_routeDefaultModelMatchesStudioPicker_becauseProviderOnlyWritesMustNotKeepLeftover() {
-        // WHY: Studio already binds opus / gpt-5.6-sol / grok-4.6 when the
-        // owner switches provider. A provider-only set_settings write used
-        // to keep the leftover model, so first-chat "switch to Grok" still
-        // ran opus. Hermes agents land on the advertised model for that route.
-        XCTAssertEqual(BotRoute.defaultModel(for: .claude), "opus")
-        XCTAssertEqual(BotRoute.defaultModel(for: .codex), AgentDefaultModelSelection.codexBuiltInDefault)
-        XCTAssertEqual(BotRoute.defaultModel(for: .grok), "grok-4.6")
-        XCTAssertEqual(BotRoute.advertisedTitle(for: .claude), "Claude")
-        XCTAssertEqual(BotRoute.advertisedTitle(for: .codex), "Codex")
-        XCTAssertEqual(BotRoute.advertisedTitle(for: .grok), "Grok")
-        XCTAssertEqual(BotRoute.parse("Grok")?.provider, .grok)
-        XCTAssertEqual(BotRoute.parse("claude")?.provider, .claude)
-        XCTAssertEqual(BotRoute.parse("Grok · grok-4.6")?.provider, .grok)
-        XCTAssertEqual(BotRoute.parse("Grok · grok-4.6")?.model, "grok-4.6")
-        XCTAssertNil(BotRoute.parse("ChatGPT"))
     }
 
     func test_avatarParseAcceptsStudioNames_becauseToolsMustPersistTheChipLabel() {

@@ -60,6 +60,14 @@ final class RemoteCodeHostCatalogTests: XCTestCase {
         XCTAssertTrue(BotPeerDelegation.providerDirective.contains(directive))
     }
 
+    func test_botCreateDoesNotAcceptProviderOrModel_becauseRouteBelongsToTheCallingThread() throws {
+        let schema = RemoteCodeHostCatalog.schema(for: RemoteCodeHostCatalog.botCreate)
+        let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+        XCTAssertNil(properties["provider"])
+        XCTAssertNil(properties["model"])
+        XCTAssertNotNil(properties["name"])
+    }
+
     func test_bodyDigestIsStableSHA256() {
         let body = "---\nname: qa\n---\nProve this file.\n"
         let digest = RemoteCodeHostCatalog.bodyDigest(body)
