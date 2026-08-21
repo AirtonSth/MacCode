@@ -57,8 +57,11 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
     }
 
     func test_ownershipLedgerRetains257LiveRows() throws {
-        let file = FileManager.default.temporaryDirectory
-            .appendingPathComponent("provider-ledger-257-\(UUID().uuidString).json")
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-ledger-257-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("ownership.json")
         let store = ProviderProcessOwnershipStore(fileURL: file)
         let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
         let base = Date(timeIntervalSince1970: 2_000)
@@ -364,8 +367,11 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
     func test_ownershipLedger_flockSerializesConcurrentAppendsWithoutLostUpdates() throws {
         // Differential proof: independent store instances share one ledger file and
         // must contend on flock (not a single NSLock). Every distinct pgid is retained.
-        let file = FileManager.default.temporaryDirectory
-            .appendingPathComponent("provider-ledger-concurrent-\(UUID().uuidString).json")
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-ledger-concurrent-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("ownership.json")
         let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
         let base = Date(timeIntervalSince1970: 9_000)
         let group = DispatchGroup()

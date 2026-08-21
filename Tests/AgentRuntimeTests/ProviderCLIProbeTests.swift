@@ -1,5 +1,6 @@
 import XCTest
 import CoreModel
+import Darwin
 @testable import AgentRuntime
 
 final class ProviderCLIProbeTests: XCTestCase {
@@ -194,5 +195,43 @@ final class ProviderCLIProbeTests: XCTestCase {
                       "bounded update output must disclose that earlier bytes were discarded")
         XCTAssertFalse(result.stderr.contains("STALE UPDATE PREFIX"),
                        "suffix retention must discard stale prefix bytes while keeping the terminal failure marker")
+    }
+
+    func test_probeReturnsWhenExitedWrapperLeavesAChildHoldingStdoutOpen() throws {
+        // WHY: provider wrappers can fork a long-lived child and exit. Waiting
+        // for pipe EOF after the root is gone made provider snapshots and the
+        // full test suite hang forever despite the probe timeout.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let childPIDFile = dir.appendingPathComponent("child-pid")
+        let binary = dir.appendingPathComponent("codex")
+        try """
+        #!/bin/sh
+        sleep 30 &
+        printf '%s\n' "$!" > "$CHILD_PID_FILE"
+        printf 'codex 0.130.0\n'
+        """.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        let startedAt = Date()
+        let version = ProviderCLIProbe.version(
+            binaryPath: binary.path,
+            environment: ["CHILD_PID_FILE": childPIDFile.path],
+            timeoutSeconds: 1
+        )
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        let childPID = (try? String(contentsOf: childPIDFile, encoding: .utf8))
+            .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        if let childPID { _ = Darwin.kill(childPID, SIGKILL) }
+        XCTAssertEqual(version, "codex 0.130.0")
+        XCTAssertNotNil(childPID, "the fixture must prove a descendant inherited the pipe")
+        XCTAssertLessThan(
+            elapsed,
+            0.9,
+            "a completed probe must not wait for EOF from a long-lived descendant"
+        )
     }
 }

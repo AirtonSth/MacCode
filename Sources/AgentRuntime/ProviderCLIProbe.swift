@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import Darwin
 
 /// Accumulates pipe chunks drained concurrently and decodes to a UTF-8 String.
 /// Pure value helper — no actor state, safe to use on any thread.
@@ -74,6 +75,23 @@ struct PipeAccumulator: Sendable {
 }
 
 public enum ProviderCLIProbe {
+    private final class PipeDrainControl: @unchecked Sendable {
+        private let lock = NSLock()
+        private var deadline: Date?
+
+        func finishRoot() {
+            lock.lock()
+            deadline = Date().addingTimeInterval(BoundedPipeDrain.defaultTimeout)
+            lock.unlock()
+        }
+
+        var shouldStop: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return deadline.map { Date() >= $0 } ?? false
+        }
+    }
+
     public struct AuthStatus: Equatable, Sendable {
         public let authenticated: Bool?
         public let accountLabel: String?
@@ -300,6 +318,7 @@ public enum ProviderCLIProbe {
         var stdoutData = Data()
         var stderrData = Data()
         let outputByteLimit = PipeAccumulator.defaultMaxBytes
+        let drainControl = PipeDrainControl()
         var stdoutTruncated = false
         var stderrTruncated = false
         var renderedStdout = ""
@@ -310,7 +329,8 @@ public enum ProviderCLIProbe {
             let drained = Self.drainCappedResult(
                 from: out.fileHandleForReading,
                 maxBytes: outputByteLimit,
-                retention: retention
+                retention: retention,
+                control: drainControl
             )
             resultLock.lock(); stdoutData = drained.data; stdoutTruncated = drained.truncated; renderedStdout = drained.renderedString; resultLock.unlock()
             drainDone.leave()
@@ -321,7 +341,8 @@ public enum ProviderCLIProbe {
             let drained = Self.drainCappedResult(
                 from: err.fileHandleForReading,
                 maxBytes: outputByteLimit,
-                retention: retention
+                retention: retention,
+                control: drainControl
             )
             resultLock.lock(); stderrData = drained.data; stderrTruncated = drained.truncated; renderedStderr = drained.renderedString; resultLock.unlock()
             drainDone.leave()
@@ -332,18 +353,36 @@ public enum ProviderCLIProbe {
 
         do {
             try proc.run()
+            // The child inherited duplicate write descriptors. Close only the
+            // parent's copies so ordinary probes deliver EOF immediately;
+            // a descendant that inherited a child copy remains bounded by the
+            // post-root drain deadline below.
+            try? out.fileHandleForWriting.close()
+            try? err.fileHandleForWriting.close()
         } catch {
+            try? out.fileHandleForWriting.close()
+            try? err.fileHandleForWriting.close()
+            drainControl.finishRoot()
+            drainDone.wait()
             return nil
         }
 
         if finished.wait(timeout: .now() + timeoutSeconds) == .timedOut {
-            proc.terminate()
+            let foreignUserUID: uid_t? = {
+                guard let uid = runAsUser?.uid, uid != getuid() else { return nil }
+                return uid
+            }()
+            ProcessTerminator.terminateTreeImmediately(proc, foreignUserUID: foreignUserUID)
             _ = finished.wait(timeout: .now() + 0.2)
+            drainControl.finishRoot()
+            drainDone.wait()
             return nil
         }
 
-        // Child has exited; pipe write-ends are now closed; drain tasks will
-        // finish reading to EOF imminently. Wait for them before reading.
+        // A provider wrapper may exit after spawning a descendant that retains
+        // stdout/stderr. Give already-buffered bytes a short drain window, but
+        // never wait forever for EOF from a process the probe does not own.
+        drainControl.finishRoot()
         drainDone.wait()
 
         let stdout = String(decoding: stdoutData, as: UTF8.self)
@@ -371,17 +410,38 @@ public enum ProviderCLIProbe {
         drainCappedResult(from: handle, maxBytes: maxBytes, retention: .prefix).data
     }
 
-    static func drainCappedResult(
+    private static func drainCappedResult(
         from handle: FileHandle,
         maxBytes: Int,
-        retention: PipeAccumulator.Retention
+        retention: PipeAccumulator.Retention,
+        control: PipeDrainControl? = nil
     ) -> DrainedOutput {
+        let descriptor = handle.fileDescriptor
+        let originalFlags = fcntl(descriptor, F_GETFL)
+        guard originalFlags != -1,
+              fcntl(descriptor, F_SETFL, originalFlags | O_NONBLOCK) != -1 else {
+            try? handle.close()
+            return DrainedOutput(data: Data(), truncated: false, renderedString: "")
+        }
+        defer { try? handle.close() }
+
         var acc = PipeAccumulator(maxBytes: maxBytes, retention: retention)
-        let chunkSize = 16 * 1_024
+        var buffer = [UInt8](repeating: 0, count: 16 * 1_024)
         while true {
-            let chunk = handle.readData(ofLength: chunkSize)
-            if chunk.isEmpty { break }
-            acc.append(chunk)
+            if control?.shouldStop == true { break }
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count > 0 {
+                acc.append(Data(buffer.prefix(count)))
+                continue
+            }
+            if count == 0 { break }
+            if errno == EINTR { continue }
+            guard errno == EAGAIN || errno == EWOULDBLOCK else { break }
+
+            var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+            let pollResult = Darwin.poll(&pollDescriptor, 1, 25)
+            if pollResult < 0, errno != EINTR { break }
+            if pollDescriptor.revents & Int16(POLLNVAL) != 0 { break }
         }
         return DrainedOutput(data: acc.data, truncated: acc.truncated, renderedString: acc.renderedString)
     }

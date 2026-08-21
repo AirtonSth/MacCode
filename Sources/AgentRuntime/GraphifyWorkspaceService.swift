@@ -594,8 +594,15 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             }
             // After a cancelled generation drains, still re-kick if enabled and dirty
             // so resumeAfterDisable's replacement request is not lost.
-            let dirtyNow = s.rerunRequested || s.dirtyGeneration > s.builtGeneration
-            let needRerun = service.enabled && dirtyNow
+            // Retry only when work arrived during this build, or when an
+            // explicitly cancelled generation needs its replacement. A failed
+            // or unavailable attempt intentionally stays dirty so a later send
+            // can retry it, but must not spin an immediate unbounded loop.
+            let trailingRerunRequested = s.rerunRequested
+            let cancelledGenerationNeedsReplacement = cancelled
+                && s.dirtyGeneration > s.builtGeneration
+            let needRerun = service.enabled
+                && (trailingRerunRequested || cancelledGenerationNeedsReplacement)
             s.rerunRequested = false
             service.schedules[checkout.scheduleID] = s
             service.globalCLIInFlight = false

@@ -65,6 +65,46 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
         XCTAssertEqual(service.verify(checkout), .unavailable)
     }
 
+    func test_missingBinaryLeavesDirtyWorkForLaterWithoutImmediateRetryLoop() {
+        // WHY: CI and fresh installs legitimately have no Graphify binary. One
+        // forced refresh may probe once, but an unavailable result must not
+        // recursively enqueue work until the process exhausts CPU and memory.
+        service.autoEnsure = true
+        service.binaryPathOverride = "/nonexistent/graphify-\(UUID().uuidString)"
+        let displayRoot = tempRoot.appendingPathComponent("missing-binary", isDirectory: true)
+        try? FileManager.default.createDirectory(at: displayRoot, withIntermediateDirectories: true)
+        let checkout = GraphifyCheckout(
+            key: GraphifyRepoKey(commonDir: displayRoot.appendingPathComponent(".git").path),
+            displayRoot: displayRoot.path
+        )
+        let firstProbe = expectation(description: "single scheduled refresh probe")
+        firstProbe.assertForOverFulfill = false
+        let countLock = NSLock()
+        var probeCount = 0
+        service.headProbe = { _ in
+            countLock.lock()
+            probeCount += 1
+            let count = probeCount
+            countLock.unlock()
+            if count == 1 { firstProbe.fulfill() }
+            return nil
+        }
+
+        service.requestRefresh(checkout: checkout, force: true)
+        wait(for: [firstProbe], timeout: 2)
+        Thread.sleep(forTimeInterval: 0.2)
+        service.enabled = false
+
+        countLock.lock()
+        let finalProbeCount = probeCount
+        countLock.unlock()
+        XCTAssertEqual(
+            finalProbeCount,
+            1,
+            "an unavailable attempt stays dirty for a future send instead of immediately retrying forever"
+        )
+    }
+
     func test_resolveBinaryHonorsOverride() throws {
         let fake = tempRoot.appendingPathComponent("fake-graphify")
         try """
@@ -312,9 +352,13 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
     }
 
     /// startEnsureIfNeeded must not launch CLI if disabled during unlocked head probe.
-    func test_startEnsure_abortsWhenDisabledDuringHeadProbe() {
+    func test_startEnsure_abortsWhenDisabledDuringHeadProbe() throws {
         service.enabled = true
         service.autoEnsure = true
+        let fakeBinary = tempRoot.appendingPathComponent("fake-graphify-disable-mid-head")
+        try "#!/bin/sh\nexit 0\n".write(to: fakeBinary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeBinary.path)
+        service.binaryPathOverride = fakeBinary.path
         let probeEntered = expectation(description: "head probe entered")
         let releaseProbe = DispatchSemaphore(value: 0)
         service.headProbe = { _ in
