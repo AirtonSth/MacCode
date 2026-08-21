@@ -2,6 +2,7 @@
 set -eu
 export DISPLAY="${DISPLAY:-:1}"
 export HOME="${HOME:-/home/remotecode}"
+: "${REMOTECODE_VIEWER_TOKEN:?RemoteCode viewer token is required}"
 mkdir -p "$HOME/.browser-profiles/chromium" /tmp/fluxbox
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 || true
 
@@ -17,11 +18,17 @@ xdpyinfo -display :1 >/dev/null
 fluxbox -display :1 -log /tmp/fluxbox.log >/tmp/fluxbox.out 2>&1 &
 /opt/remotecode-computer/launch-browser.sh || xterm -display :1 &
 
-# Guest VNC stays loopback. Docker NAT publishes 6080 on 127.0.0.1 of the host.
+# Guest VNC stays loopback. The WebSocket proxy admits only the per-Bot token;
+# Docker NAT additionally publishes 6080 on 127.0.0.1 of the host.
 x11vnc -display :1 -rfbport 5900 -localhost -forever -shared -nopw \
     >/tmp/x11vnc.log 2>&1 &
 
-websockify --web /usr/share/novnc 0.0.0.0:6080 127.0.0.1:5900 \
+printf '%s: 127.0.0.1:5900\n' "$REMOTECODE_VIEWER_TOKEN" > /tmp/remotecode-viewer-tokens
+chmod 0600 /tmp/remotecode-viewer-tokens
+websockify --web /usr/share/novnc \
+    --token-plugin TokenFile \
+    --token-source /tmp/remotecode-viewer-tokens \
+    0.0.0.0:6080 \
     >/tmp/websockify.log 2>&1 &
 
 wait -n

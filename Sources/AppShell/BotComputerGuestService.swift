@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import CoreModel
 import Persistence
 
@@ -11,6 +12,9 @@ public struct BotComputerGuestReady: Equatable, Sendable {
 
 public final class BotComputerGuestService: @unchecked Sendable {
     public static let pngMagicHex = "89504e47"
+    private static let viewerTokenLock = NSLock()
+    private static let legacyUnauthenticatedStartScriptSHA256 =
+        "fc19d6b61e02c4ee713dde41886f4dfbae6d8631ce990dbd045f36eced478d8e"
 
     private let appSupport: URL
     private let docker: any BotComputerDockerClienting
@@ -58,19 +62,21 @@ public final class BotComputerGuestService: @unchecked Sendable {
             let botID = BotID()
             probeBotID = botID
             let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
-            try? docker.ensureNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
+            let viewerToken = try viewerToken(botID: botID)
             var options = try BotComputerGuestSpec.containerCreateOptions(
                 botID: botID,
                 guestHome: home.path,
-                appSupport: appSupport
+                appSupport: appSupport,
+                viewerToken: viewerToken
             )
             options.name = name
+            options.network = nil
             _ = try docker.create(options: options)
             try docker.start(name: name)
             let png = try waitForPNG(name: name)
             let hash = try BotComputerGuestObserve.validatePNG(png)
             let inspect = try docker.inspect(name: name)
-            let url = try BotComputerGuestSpec.screenURL(hostPort: inspect.hostPort, token: hash)
+            let url = try BotComputerGuestSpec.screenURL(hostPort: inspect.hostPort, token: viewerToken)
             try BotComputerGuestSpec.validateScreenURL(url)
             lastReady = BotComputerGuestReady(
                 screenURL: url,
@@ -94,26 +100,29 @@ public final class BotComputerGuestService: @unchecked Sendable {
         try seedRecipe(botID: botID)
         try ensureCurrentImage()
         let name = BotComputerGuestSpec.containerName(botID: botID)
-        try docker.ensureNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
+        let network = try availableNetwork(botID: botID)
         let image = try resolvedImage(botID: botID)
         if let existing = try? docker.inspect(name: name) {
-            if imageMatches(existing, tag: image) {
+            if imageMatches(existing, tag: image), networkMatches(existing, network: network) {
                 if existing.running == false {
                     try docker.start(name: name)
                 }
-                return try readyState(name: name, resumed: true)
+                return try readyState(name: name, botID: botID, resumed: true)
             }
             try? docker.remove(name: name)
         }
-        let options = try BotComputerGuestSpec.containerCreateOptions(
+        let viewerToken = try viewerToken(botID: botID)
+        var options = try BotComputerGuestSpec.containerCreateOptions(
             botID: botID,
             guestHome: home.path,
             appSupport: appSupport,
+            viewerToken: viewerToken,
             image: image
         )
+        options.network = network
         _ = try docker.create(options: options)
         try docker.start(name: name)
-        return try readyState(name: name, resumed: false)
+        return try readyState(name: name, botID: botID, resumed: false)
     }
 
     /// Makes the bot's editable build recipe visible without starting Docker.
@@ -158,25 +167,28 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let tag = BotComputerGuestSpec.botImageTag(botID: botID)
         try docker.build(context: recipe, tag: tag)
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
-        try docker.ensureNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
+        let network = try availableNetwork(botID: botID)
         let canonical = BotComputerGuestSpec.containerName(botID: botID)
         let next = BotComputerGuestSpec.nextContainerName(botID: botID)
         try? docker.remove(name: next)
-        let options = try BotComputerGuestSpec.containerCreateOptions(
+        let viewerToken = try viewerToken(botID: botID)
+        var options = try BotComputerGuestSpec.containerCreateOptions(
             botID: botID,
             guestHome: home.path,
             appSupport: appSupport,
+            viewerToken: viewerToken,
             image: tag,
             name: next
         )
+        options.network = network
         _ = try docker.create(options: options)
         do {
             try docker.start(name: next)
-            _ = try readyState(name: next, resumed: false)
+            _ = try readyState(name: next, botID: botID, resumed: false)
             try? docker.stop(name: canonical)
             try? docker.remove(name: canonical)
             try docker.rename(from: next, to: canonical)
-            let renamed = try readyState(name: canonical, resumed: false)
+            let renamed = try readyState(name: canonical, botID: botID, resumed: false)
             lastReady = renamed
             return renamed
         } catch {
@@ -243,11 +255,14 @@ public final class BotComputerGuestService: @unchecked Sendable {
         throw lastError
     }
 
-    private func readyState(name: String, resumed: Bool) throws -> BotComputerGuestReady {
+    private func readyState(name: String, botID: BotID, resumed: Bool) throws -> BotComputerGuestReady {
         let png = try waitForPNG(name: name)
         let hash = try BotComputerGuestObserve.validatePNG(png)
         let inspect = try docker.inspect(name: name)
-        let url = try BotComputerGuestSpec.screenURL(hostPort: inspect.hostPort, token: hash)
+        let url = try BotComputerGuestSpec.screenURL(
+            hostPort: inspect.hostPort,
+            token: try viewerToken(botID: botID)
+        )
         try BotComputerGuestSpec.validateScreenURL(url)
         let ready = BotComputerGuestReady(
             screenURL: url,
@@ -262,8 +277,18 @@ public final class BotComputerGuestService: @unchecked Sendable {
 
     private func resolvedImage(botID: BotID) throws -> String {
         let tag = BotComputerGuestSpec.botImageTag(botID: botID)
-        if try docker.imageExists(tag: tag) { return tag }
+        if try docker.imageExists(tag: tag),
+           try docker.imageLabel(tag: tag, key: BotComputerGuestSpec.recipeLabelKey)
+            == BotComputerGuestSpec.recipeRevision {
+            return tag
+        }
         return BotComputerGuestSpec.imageTag
+    }
+
+    private func availableNetwork(botID: BotID) throws -> String {
+        let name = BotComputerGuestSpec.networkName(botID: botID)
+        try docker.ensureNetwork(name: name)
+        return name
     }
 
     private func ensureCurrentImage() throws {
@@ -288,6 +313,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
             || want.hasSuffix(existing.imageID)
     }
 
+    private func networkMatches(_ existing: BotComputerContainerInspect, network: String) -> Bool {
+        existing.networkNames.isEmpty || existing.networkNames == [network]
+    }
+
     private func seedRecipe(botID: BotID) throws {
         let dest = BotComputerGuestSpec.recipeURL(appSupport: appSupport, botID: botID)
         let fileManager = FileManager.default
@@ -296,7 +325,15 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let legacy = dest.appendingPathComponent("computer", isDirectory: true)
         for name in names {
             let target = dest.appendingPathComponent(name)
-            if fileManager.fileExists(atPath: target.path) { continue }
+            if fileManager.fileExists(atPath: target.path) {
+                if name == "start.sh", let recipeContext {
+                    try refreshLegacyStartScriptIfNeeded(
+                        at: target,
+                        from: recipeContext.appendingPathComponent(name)
+                    )
+                }
+                continue
+            }
             let legacySource = legacy.appendingPathComponent(name)
             if fileManager.fileExists(atPath: legacySource.path) {
                 try fileManager.moveItem(at: legacySource, to: target)
@@ -312,6 +349,30 @@ public final class BotComputerGuestService: @unchecked Sendable {
            (try fileManager.contentsOfDirectory(atPath: legacy.path)).isEmpty {
             try fileManager.removeItem(at: legacy)
         }
+    }
+
+    private func viewerToken(botID: BotID) throws -> String {
+        Self.viewerTokenLock.lock()
+        defer { Self.viewerTokenLock.unlock() }
+        let tokenURL = BotComputerGuestSpec.viewerTokenURL(appSupport: appSupport, botID: botID)
+        if let value = try? String(contentsOf: tokenURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           value.range(of: #"^[a-zA-Z0-9-]{32,128}$"#, options: .regularExpression) != nil {
+            return value
+        }
+        let value = UUID().uuidString.lowercased()
+        try Data((value + "\n").utf8).write(to: tokenURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenURL.path)
+        return value
+    }
+
+    private func refreshLegacyStartScriptIfNeeded(at target: URL, from source: URL) throws {
+        let existing = try Data(contentsOf: target)
+        let digest = SHA256.hash(data: existing).map { String(format: "%02x", $0) }.joined()
+        guard digest == Self.legacyUnauthenticatedStartScriptSHA256,
+              FileManager.default.fileExists(atPath: source.path)
+        else { return }
+        try Data(contentsOf: source).write(to: target, options: .atomic)
     }
 
     public static func pngMagic(_ data: Data) -> String {
@@ -342,6 +403,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
 
     public func teardown(botID: BotID) {
         try? docker.remove(name: BotComputerGuestSpec.containerName(botID: botID))
+        try? docker.removeNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
         try? BotGuestHome.wipe(appSupport: appSupport, botID: botID)
     }
 }

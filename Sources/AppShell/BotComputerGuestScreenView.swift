@@ -159,6 +159,7 @@ struct BotComputerGuestCanvas: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(launchState.isStarting)
                     .accessibilityLabel(startButtonAccessibilityLabel)
+                    .accessibilityHint(startButtonAccessibilityHint)
                     .accessibilityIdentifier(startIdentifier)
                 }
                 if let onOpenInNewWindow {
@@ -212,6 +213,9 @@ struct BotComputerGuestCanvas: View {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
                     .multilineTextAlignment(.center)
+                    .accessibilityLabel(
+                        BotComputerDockerRecovery.matching(message)?.accessibilityLabel ?? message
+                    )
             }
         }
         .padding(DS.Space.lg)
@@ -226,6 +230,18 @@ struct BotComputerGuestCanvas: View {
     }
 
     private var startButtonAccessibilityLabel: String {
-        launchState.isStarting ? "Starting Linux desktop" : startButtonTitle
+        if launchState.isStarting { return "Starting Linux desktop" }
+        if case .failed(let message) = launchState,
+           let recovery = BotComputerDockerRecovery.matching(message) {
+            return recovery.accessibilityAction
+        }
+        return startButtonTitle
+    }
+
+    private var startButtonAccessibilityHint: String {
+        if case .failed(let message) = launchState {
+            return BotComputerDockerRecovery.matching(message)?.accessibilityLabel ?? message
+        }
+        return "Starts the Linux desktop."
     }
 }

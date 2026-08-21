@@ -8,10 +8,12 @@ final class BotComputerGuestSpecTests: XCTestCase {
         let botID = BotID()
         let support = URL(fileURLWithPath: "/tmp/rc-app-support-spec")
         let home = BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: botID).path
+        let viewerToken = String(repeating: "a", count: 32)
         let options = try BotComputerGuestSpec.containerCreateOptions(
             botID: botID,
             guestHome: home,
-            appSupport: support
+            appSupport: support,
+            viewerToken: viewerToken
         )
         XCTAssertEqual(options.hostIP, "127.0.0.1")
         XCTAssertEqual(options.hostPort, 0)
@@ -19,6 +21,10 @@ final class BotComputerGuestSpecTests: XCTestCase {
         XCTAssertEqual(options.labels["remotecode.managed"], "1")
         XCTAssertTrue(options.binds.first?.hasPrefix(home) == true)
         XCTAssertEqual(options.network, BotComputerGuestSpec.networkName(botID: botID))
+        XCTAssertEqual(
+            options.environment["REMOTECODE_VIEWER_TOKEN"],
+            viewerToken
+        )
         XCTAssertGreaterThanOrEqual(options.shmSize, BotComputerGuestSpec.minimumShmBytes)
         let recipe = BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID).path
         XCTAssertEqual(recipe, home,
@@ -35,17 +41,19 @@ final class BotComputerGuestSpecTests: XCTestCase {
             try BotComputerGuestSpec.containerCreateOptions(
                 botID: botID,
                 guestHome: "/tmp/evil",
-                appSupport: support
+                appSupport: support,
+                viewerToken: viewerToken
             )
         )
         XCTAssertThrowsError(
             try BotComputerGuestSpec.containerCreateOptions(
                 botID: botID,
                 guestHome: NSHomeDirectory(),
-                appSupport: support
+                appSupport: support,
+                viewerToken: viewerToken
             )
         )
-        let url = try BotComputerGuestSpec.screenURL(hostPort: 49152, token: "abc")
+        let url = try BotComputerGuestSpec.screenURL(hostPort: 49152, token: viewerToken)
         XCTAssertEqual(url.host, "127.0.0.1")
         XCTAssertEqual(url.path, "/vnc.html")
         XCTAssertTrue(url.query?.contains("autoconnect=1") == true)
@@ -53,6 +61,12 @@ final class BotComputerGuestSpecTests: XCTestCase {
         // WHY: noVNC plays bell.oga whenever the guest xterm rings; the
         // viewer must stay silent (ui.js only plays when bell == "on").
         XCTAssertTrue(url.query?.contains("bell=off") == true)
+        XCTAssertEqual(
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first(where: { $0.name == "path" })?.value,
+            "websockify?token=\(viewerToken)"
+        )
+        XCTAssertThrowsError(try BotComputerGuestSpec.screenURL(hostPort: 49152, token: "guessable"))
         XCTAssertThrowsError(try BotComputerGuestSpec.validateScreenURL(URL(string: "http://0.0.0.0:6080/")!))
         XCTAssertThrowsError(try BotComputerGuestSpec.viewerURL(URL(string: "http://0.0.0.0:6080/")!))
         let loopback = try BotComputerGuestSpec.viewerURL(url)

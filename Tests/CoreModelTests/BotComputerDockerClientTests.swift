@@ -35,6 +35,448 @@ final class BotComputerDockerClientTests: XCTestCase {
         let wait = try XCTUnwrap(source.range(of: "process.waitUntilExit()"))
 
         XCTAssertLessThan(read.lowerBound, wait.lowerBound)
-        XCTAssertTrue(source.contains("process.standardError = FileHandle.nullDevice"))
+        XCTAssertTrue(source.contains("process.standardError = stderr"))
+        XCTAssertFalse(
+            source.contains("arguments: [\"docker\"] + args"),
+            "GUI launches cannot assume /usr/bin/env docker is on PATH"
+        )
+    }
+
+    func test_BotComputerDocker_strippedPATHStillListsAbsoluteDesktopCandidates() {
+        let candidates = BotComputerDockerResolver.defaultCandidates(
+            pathEnvironment: "",
+            homeDirectory: NSHomeDirectory()
+        )
+        XCTAssertTrue(candidates.contains("/usr/local/bin/docker"))
+        XCTAssertTrue(candidates.contains("/opt/homebrew/bin/docker"))
+        XCTAssertTrue(candidates.contains("/Applications/Docker.app/Contents/Resources/bin/docker"))
+        XCTAssertTrue(candidates.contains("/Applications/OrbStack.app/Contents/MacOS/xbin/docker"))
+        XCTAssertTrue(candidates.contains { $0.hasSuffix("/.orbstack/bin/docker") })
+        XCTAssertFalse(candidates.contains("/usr/bin/env"))
+    }
+
+    func test_BotComputerDocker_failingCandidateFallsThroughToHealthy() throws {
+        let resolver = BotComputerDockerResolver(
+            candidates: ["/tmp/remote-code-missing-docker", "/bin/echo"],
+            probeTimeout: 1,
+            probe: { candidate, _ in
+                if candidate.contains("missing") { return .failed }
+                return .healthy
+            }
+        )
+        XCTAssertEqual(try resolver.resolveHealthyExecutable(), "/bin/echo")
+        XCTAssertEqual(try resolver.resolveHealthyExecutable(), "/bin/echo")
+    }
+
+    func test_BotComputerDocker_hungCandidateIsKilledThenHealthyIsCached() throws {
+        let hung = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-code-hung-docker-\(UUID().uuidString)")
+        try """
+        #!/bin/sh
+        sleep 30
+        """.write(to: hung, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hung.path)
+        defer { try? FileManager.default.removeItem(at: hung) }
+
+        var probed: [String] = []
+        let resolver = BotComputerDockerResolver(
+            candidates: [hung.path, "/bin/echo"],
+            probeTimeout: 0.15,
+            probe: { candidate, timeout in
+                probed.append(candidate)
+                if candidate == hung.path {
+                    let result = try BotComputerDockerCLI.runProcess(
+                        executableURL: hung,
+                        arguments: ["info"],
+                        timeout: timeout
+                    )
+                    XCTAssertTrue(result.timedOut)
+                    return .timedOut
+                }
+                return .healthy
+            }
+        )
+        XCTAssertEqual(try resolver.resolveHealthyExecutable(), "/bin/echo")
+        XCTAssertEqual(probed, [hung.path, "/bin/echo"])
+        XCTAssertEqual(try resolver.resolveHealthyExecutable(), "/bin/echo")
+        XCTAssertEqual(probed.count, 2, "a healthy executable must be cached")
+    }
+
+    func test_BotComputerDocker_typedRecoveryCopyIsDistinct() {
+        XCTAssertNotEqual(BotComputerDockerError.cliMissing.description, BotComputerDockerError.daemonUnavailable.description)
+        XCTAssertNotEqual(BotComputerDockerError.daemonUnavailable.description, BotComputerDockerError.probeTimedOut.description)
+        XCTAssertNotEqual(BotComputerDockerError.probeTimedOut.description, BotComputerDockerError.provisioningFailed.description)
+        XCTAssertEqual(BotComputerDockerError.cliMissing.recovery.accessibilityAction, "Install Docker CLI")
+        XCTAssertEqual(BotComputerDockerError.daemonUnavailable.recovery.accessibilityAction, "Start Docker")
+        XCTAssertEqual(BotComputerDockerError.probeTimedOut.recovery.accessibilityAction, "Retry Docker check")
+        XCTAssertEqual(BotComputerDockerError.provisioningFailed.recovery.accessibilityAction, "Retry starting Linux desktop")
+    }
+
+    func test_BotComputerDocker_networkPoolFailureRequiresTheExactDaemonMessage() throws {
+        // WHY: only exhausted predefined subnets justify retrying with a small
+        // explicit network. Permission or daemon errors must fail loud.
+        let exhausted = Data(
+            "Error response from daemon: all predefined address pools have been fully subnetted".utf8
+        )
+        XCTAssertEqual(
+            BotComputerDockerCLI.failureError(
+                for: ["network", "create", "remotecode-bot-1"],
+                stderr: exhausted
+            ),
+            .networkAddressPoolExhausted
+        )
+        XCTAssertEqual(
+            BotComputerDockerCLI.failureError(
+                for: ["network", "create", "--subnet", "10.240.0.0/30", "remotecode-bot-1"],
+                stderr: Data("invalid pool request: Pool overlaps with other one on this address space".utf8)
+            ),
+            .networkSubnetUnavailable
+        )
+        XCTAssertEqual(
+            BotComputerDockerCLI.failureError(
+                for: ["network", "create", "remotecode-bot-1"],
+                stderr: Data("permission denied".utf8)
+            ),
+            .provisioningFailed
+        )
+
+        let result = try BotComputerDockerCLI.runProcess(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "printf 'daemon detail' >&2; exit 1"]
+        )
+        XCTAssertEqual(String(decoding: result.errorData, as: UTF8.self), "daemon detail")
+    }
+
+    func test_BotComputerDocker_stderrRetentionIsBoundedWhileStillDrainingTheChild() throws {
+        // WHY: Docker build can be noisy for minutes. Classification needs only
+        // the final daemon detail, so stderr must be drained without retaining
+        // an unbounded transcript in the app process.
+        let phrase = Data(
+            "all predefined address pools have been fully subnetted".utf8
+        )
+        var noisy = Data(repeating: 0x78, count: 2 * 1_024 * 1_024)
+        noisy.append(phrase)
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-code-docker-stderr-\(UUID().uuidString)")
+        try noisy.write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let result = try BotComputerDockerCLI.runProcess(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "cat \"$1\" >&2", "sh", file.path]
+        )
+
+        XCTAssertEqual(result.terminationStatus, 0)
+        XCTAssertEqual(result.errorData.count, BotComputerDockerCLI.stderrRetentionLimit)
+        XCTAssertTrue(result.errorData.suffix(phrase.count).elementsEqual(phrase))
+        XCTAssertEqual(
+            BotComputerDockerCLI.failureError(
+                for: ["network", "create", "remotecode-bot-1"],
+                stderr: result.errorData
+            ),
+            .networkAddressPoolExhausted
+        )
+    }
+
+    func test_BotComputerDocker_poolExhaustionCreatesAUniqueICCDisabledNetwork() throws {
+        // WHY: pool exhaustion must recover without placing passwordless VNC
+        // services on Docker's shared bridge. Overlapping /30 candidates may be
+        // skipped, but the resulting network stays dedicated and ICC-disabled.
+        let name = "remotecode-bot-00000000-0000-0000-0000-000000000001"
+        let recorder = DockerNetworkRunRecorder(networkName: name)
+        let exhausted = BotComputerDockerCLI { args in
+            try recorder.run(args)
+        }
+
+        try exhausted.ensureNetwork(name: name)
+
+        let explicit = recorder.calls.filter { $0.contains("--subnet") }
+        XCTAssertEqual(explicit.count, 2)
+        XCTAssertEqual(
+            explicit.map { $0[$0.firstIndex(of: "--subnet")! + 1] },
+            Array(BotComputerDockerCLI.isolatedNetworkSubnets(name: name).prefix(2))
+        )
+        XCTAssertTrue(explicit.allSatisfy {
+            $0.contains("com.docker.network.bridge.enable_icc=false")
+                && $0.contains("io.remotecode.bot.network=true")
+                && $0.last == name
+        })
+    }
+
+    func test_BotComputerDocker_explicitSubnetCandidatesAreStableUniqueSlash30s() {
+        let name = "remotecode-bot-00000000-0000-0000-0000-000000000001"
+        let first = BotComputerDockerCLI.isolatedNetworkSubnets(name: name)
+        XCTAssertEqual(first, BotComputerDockerCLI.isolatedNetworkSubnets(name: name))
+        XCTAssertEqual(first.count, 64)
+        XCTAssertEqual(Set(first).count, first.count)
+        XCTAssertTrue(first.allSatisfy { $0.hasPrefix("10.") && $0.hasSuffix("/30") })
+    }
+
+    func test_BotComputerDocker_nonPoolNetworkFailureDoesNotAttemptExplicitFallback() {
+        // WHY: an explicit subnet is not a remedy for authorization or daemon
+        // failures, and must not turn those errors into a weaker success path.
+
+        let denied = BotComputerDockerCLI { _ in
+            throw BotComputerDockerError.provisioningFailed
+        }
+        XCTAssertThrowsError(try denied.ensureNetwork(name: "remotecode-bot-2")) { error in
+            XCTAssertEqual(error as? BotComputerDockerError, .provisioningFailed)
+        }
+    }
+
+    func test_liveCrossBotDesktopRequiresTheTargetBotsViewerToken() throws {
+        guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1" else {
+            throw XCTSkip("set RC_LIVE_DOCKER=1 to exercise cross-Bot viewer authentication")
+        }
+        let suffix = UUID().uuidString.lowercased()
+        let containerA = "remotecode-isolation-a-\(suffix)"
+        let containerB = "remotecode-isolation-b-\(suffix)"
+        let cli = BotComputerDockerCLI()
+        defer {
+            try? cli.remove(name: containerA)
+            try? cli.remove(name: containerB)
+        }
+
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        try cli.build(
+            context: repository.appendingPathComponent("Sources/AppShell/Resources/ComputerGuest"),
+            tag: BotComputerGuestSpec.imageTag
+        )
+        let tokenA = String(repeating: "a", count: 32)
+        let tokenB = String(repeating: "b", count: 32)
+        _ = try BotComputerDockerCLI.defaultRun([
+            "run", "-d", "--name", containerB, "--network", "bridge",
+            "--publish", "127.0.0.1::6080",
+            "--env", "REMOTECODE_VIEWER_TOKEN=\(tokenB)",
+            BotComputerGuestSpec.imageTag,
+        ])
+        _ = try BotComputerDockerCLI.defaultRun([
+            "run", "-d", "--name", containerA, "--network", "bridge",
+            "--env", "REMOTECODE_VIEWER_TOKEN=\(tokenA)",
+            "--entrypoint", "/bin/sleep", BotComputerGuestSpec.imageTag, "30",
+        ])
+        let inspectData = try BotComputerDockerCLI.defaultRun([
+            "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}} "
+                + "{{(index (index .NetworkSettings.Ports \"6080/tcp\") 0).HostPort}}",
+            containerB,
+        ])
+        let inspect = String(decoding: inspectData, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: " ")
+            .map(String.init)
+        let serverIP = try XCTUnwrap(inspect.first)
+        let hostPort = try XCTUnwrap(inspect.dropFirst().first)
+
+        let rfbScript = """
+            import base64, os, socket, struct, sys
+            host, port, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+            path = '/websockify' + (('?token=' + token) if token else '')
+            sock = socket.create_connection((host, port), timeout=3)
+            key = base64.b64encode(os.urandom(16)).decode()
+            request = (f'GET {path} HTTP/1.1\\r\\nHost: {host}:{port}\\r\\n'
+                       'Upgrade: websocket\\r\\nConnection: Upgrade\\r\\n'
+                       f'Sec-WebSocket-Key: {key}\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n')
+            sock.sendall(request.encode())
+            raw = b''
+            while b'\\r\\n\\r\\n' not in raw:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise RuntimeError('closed before WebSocket admission')
+                raw += chunk
+            header, raw = raw.split(b'\\r\\n\\r\\n', 1)
+            if b' 101 ' not in header.split(b'\\r\\n', 1)[0]:
+                raise RuntimeError('WebSocket admission rejected')
+
+            def take(count):
+                global raw
+                while len(raw) < count:
+                    chunk = sock.recv(max(4096, count - len(raw)))
+                    if not chunk:
+                        raise RuntimeError('closed before RFB payload')
+                    raw += chunk
+                value, raw = raw[:count], raw[count:]
+                return value
+
+            def receive_frame():
+                first, second = take(2)
+                length = second & 0x7f
+                if length == 126:
+                    length = struct.unpack('>H', take(2))[0]
+                elif length == 127:
+                    length = struct.unpack('>Q', take(8))[0]
+                mask = take(4) if second & 0x80 else None
+                payload = take(length)
+                if mask:
+                    payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+                if first & 0x0f == 8:
+                    raise RuntimeError('WebSocket closed before RFB')
+                return first & 0x0f, payload
+
+            pending = b''
+            def receive_bytes(count):
+                global pending
+                while len(pending) < count:
+                    opcode, payload = receive_frame()
+                    if opcode in (0, 2):
+                        pending += payload
+                value, pending = pending[:count], pending[count:]
+                return value
+
+            def send_bytes(payload):
+                mask = os.urandom(4)
+                length = len(payload)
+                if length < 126:
+                    header = bytes((0x82, 0x80 | length))
+                elif length <= 0xffff:
+                    header = bytes((0x82, 0xfe)) + struct.pack('>H', length)
+                else:
+                    header = bytes((0x82, 0xff)) + struct.pack('>Q', length)
+                masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+                sock.sendall(header + mask + masked)
+
+            version = receive_bytes(12)
+            if not version.startswith(b'RFB '):
+                raise RuntimeError('missing RFB server version')
+            send_bytes(version)
+            count = receive_bytes(1)[0]
+            security_types = receive_bytes(count)
+            if 1 not in security_types:
+                raise RuntimeError('RFB None security unavailable behind viewer token')
+            send_bytes(b'\\x01')
+            if struct.unpack('>I', receive_bytes(4))[0] != 0:
+                raise RuntimeError('RFB security failed')
+            send_bytes(b'\\x01')
+            server_init = receive_bytes(24)
+            width, height = struct.unpack('>HH', server_init[:4])
+            name_length = struct.unpack('>I', server_init[20:24])[0]
+            receive_bytes(name_length)
+            send_bytes(struct.pack('>BBHi', 2, 0, 1, 0))
+            send_bytes(struct.pack('>BBHH', 5, 0, width // 2, height // 2))
+            send_bytes(struct.pack('>BBHHHH', 3, 0, 0, 0, width, height))
+            if receive_bytes(1) != b'\\x00':
+                raise RuntimeError('missing framebuffer update')
+            print(f'RFB_OK {width}x{height}')
+            """
+
+        func crossBotRFB(token: String) throws {
+            _ = try BotComputerDockerCLI.defaultRun([
+                "exec", containerA, "python3", "-c", rfbScript, serverIP, "6080", token,
+            ])
+        }
+
+        var viewerReady = false
+        for _ in 0..<20 {
+            let result = try BotComputerDockerCLI.runProcess(
+                executableURL: URL(fileURLWithPath: "/usr/bin/env"),
+                arguments: ["python3", "-c", rfbScript, "127.0.0.1", hostPort, tokenB],
+                timeout: 5
+            )
+            if result.terminationStatus == 0,
+               String(decoding: result.data, as: UTF8.self).contains("RFB_OK") {
+                viewerReady = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTAssertTrue(
+            viewerReady,
+            "B's token through its host-published loopback port must reach an RFB framebuffer"
+        )
+        XCTAssertThrowsError(try crossBotRFB(token: ""), "a missing token must not reach B's RFB")
+        XCTAssertThrowsError(
+            try crossBotRFB(token: tokenA),
+            "Bot A's own token must not reach Bot B's RFB"
+        )
+        XCTAssertThrowsError(
+            try crossBotRFB(token: String(repeating: "c", count: 32)),
+            "a random token must not reach Bot B's RFB"
+        )
+        for container in [containerA, containerB] {
+            XCTAssertNoThrow(
+                try BotComputerDockerCLI.defaultRun([
+                    "exec", container, "python3", "-c",
+                    "import urllib.request; urllib.request.urlopen('https://example.com', timeout=3).read(1)",
+                ]),
+                "viewer authentication must not disable either Bot's outbound internet access"
+            )
+        }
+        let listeners = try BotComputerDockerCLI.defaultRun([
+            "exec", containerB, "python3", "-c",
+            """
+            for path in ('/proc/net/tcp', '/proc/net/tcp6'):
+                for line in open(path).read().splitlines()[1:]:
+                    fields = line.split()
+                    if fields[3] != '0A':
+                        continue
+                    raw_ip, raw_port = fields[1].split(':')
+                    if set(raw_ip) == {'0'}:
+                        scope = 'wildcard'
+                    elif raw_ip == '0100007F' or raw_ip == ('0' * 24 + '01000000'):
+                        scope = 'loopback'
+                    else:
+                        scope = 'other'
+                    print(f'{scope}:{int(raw_port, 16)}')
+            """,
+        ])
+        let listenerLines = String(decoding: listeners, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        XCTAssertTrue(listenerLines.contains("loopback:5900"), "x11vnc must stay loopback-only")
+        let nonLoopbackListeners = listenerLines.filter { !$0.hasPrefix("loopback:") }
+        XCTAssertEqual(
+            nonLoopbackListeners,
+            ["wildcard:6080"],
+            "the shipped guest must expose no other TCP listener to peer containers"
+        )
+    }
+
+    func test_BotComputerDocker_timeoutClassificationSeparatesProbeFromProvisioning() {
+        // WHY: a slow image build/start is not a daemon health-check timeout;
+        // recovery copy must tell the user to retry provisioning, not probing.
+        XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: ["info"]), .probeTimedOut)
+        XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: ["build"]), .provisioningFailed)
+        XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: ["start"]), .provisioningFailed)
+    }
+}
+
+private final class DockerNetworkRunRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let networkName: String
+    private var explicitAttemptCount = 0
+    private var recordedCalls: [[String]] = []
+
+    init(networkName: String) {
+        self.networkName = networkName
+    }
+
+    var calls: [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedCalls
+    }
+
+    func run(_ args: [String]) throws -> Data {
+        lock.lock()
+        recordedCalls.append(args)
+        if args.starts(with: ["network", "create"]), args.contains("--subnet") {
+            explicitAttemptCount += 1
+            let attempt = explicitAttemptCount
+            lock.unlock()
+            if attempt == 1 {
+                throw BotComputerDockerError.networkSubnetUnavailable
+            }
+            return Data()
+        }
+        lock.unlock()
+        if args == ["network", "create", networkName] {
+            throw BotComputerDockerError.networkAddressPoolExhausted
+        }
+        if args == ["network", "inspect", networkName] {
+            throw BotComputerDockerError.provisioningFailed
+        }
+        throw BotComputerDockerError.provisioningFailed
     }
 }

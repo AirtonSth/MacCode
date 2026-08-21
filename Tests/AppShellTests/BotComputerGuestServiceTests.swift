@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 import CoreModel
 import Persistence
 @testable import AppShell
@@ -9,6 +10,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var containers: [String: BotComputerContainerInspect] = [:]
     var png = BotComputerGuestObserve.pngSignature + Data(repeating: 1, count: 16)
     var created: [String] = []
+    var createdOptions: [BotComputerContainerCreateOptions] = []
     var removed: [String] = []
     var started: [String] = []
     var stopped: [String] = []
@@ -17,6 +19,8 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var execFailuresRemaining = 0
     var lastExec: (name: String, command: [String], user: String?, detach: Bool)?
     var networks: [String] = []
+    var removedNetworks: [String] = []
+    var networkError: Error?
     var renamed: [(String, String)] = []
     var imageLabels: [String: String] = [
         BotComputerGuestSpec.imageTag: BotComputerGuestSpec.recipeRevision
@@ -39,6 +43,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     }
     func create(options: BotComputerContainerCreateOptions) throws -> String {
         created.append(options.name)
+        createdOptions.append(options)
         containers[options.name] = BotComputerContainerInspect(running: false, imageID: "img", hostPort: 49152)
         return options.name
     }
@@ -73,6 +78,10 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     }
     func ensureNetwork(name: String) throws {
         networks.append(name)
+        if let networkError { throw networkError }
+    }
+    func removeNetwork(name: String) throws {
+        removedNetworks.append(name)
     }
     func remove(name: String) throws {
         removed.append(name)
@@ -101,9 +110,160 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertTrue(service.proveReady())
         XCTAssertEqual(service.lastReady?.screenURL.host, "127.0.0.1")
         XCTAssertEqual(service.lastReady?.pngMagic, BotComputerGuestService.pngMagicHex)
+        XCTAssertTrue(fake.networks.isEmpty)
+        XCTAssertNil(fake.createdOptions.first?.network)
+        let viewerToken = try XCTUnwrap(
+            fake.createdOptions.first?.environment["REMOTECODE_VIEWER_TOKEN"]
+        )
+        XCTAssertEqual(viewerToken.count, 36)
+        XCTAssertEqual(
+            URLComponents(url: try XCTUnwrap(service.lastReady?.screenURL), resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "path" })?.value,
+            "websockify?token=\(viewerToken)"
+        )
         fake.png = Data("jpeg".utf8)
         XCTAssertFalse(service.proveReady())
         XCTAssertTrue(fake.created.allSatisfy { name in fake.removed.contains(name) })
+    }
+
+    func test_provisionAndRebuildAlwaysUseTheBotsDedicatedNetwork() throws {
+        // WHY: separate network names remain useful defense in depth, while
+        // the viewer token is the reliable boundary on runtimes that route
+        // traffic across bridges.
+        let support = makeSupport("rc-guest-network-isolation")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+
+        let ready = try service.provision(botID: botID)
+
+        let rebuilt = try service.rebuild(botID: botID)
+
+        XCTAssertEqual(
+            fake.networks,
+            Array(repeating: BotComputerGuestSpec.networkName(botID: botID), count: 2)
+        )
+        let network = BotComputerGuestSpec.networkName(botID: botID)
+        XCTAssertTrue(fake.createdOptions.allSatisfy { $0.network == network })
+        let viewerTokens = Set(
+            fake.createdOptions.compactMap { $0.environment["REMOTECODE_VIEWER_TOKEN"] }
+        )
+        XCTAssertEqual(viewerTokens.count, 1, "rebuild must preserve the Bot's viewer credential")
+        XCTAssertEqual(ready.screenURL.host, "127.0.0.1")
+        XCTAssertEqual(rebuilt.screenURL.host, "127.0.0.1")
+        service.teardown(botID: botID)
+        XCTAssertEqual(fake.removedNetworks, [network])
+    }
+
+    func test_eachBotPersistsADistinctViewerToken() throws {
+        // WHY: routable container networks must not let one Bot reuse its own
+        // viewer credential to open a different Bot's desktop.
+        let support = makeSupport("rc-guest-viewer-token")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let first = BotID()
+        let second = BotID()
+
+        _ = try service.provision(botID: first)
+        let firstToken = try XCTUnwrap(
+            fake.createdOptions.last?.environment["REMOTECODE_VIEWER_TOKEN"]
+        )
+        service.teardown(botID: first)
+        _ = try service.provision(botID: second)
+        let secondToken = try XCTUnwrap(
+            fake.createdOptions.last?.environment["REMOTECODE_VIEWER_TOKEN"]
+        )
+
+        XCTAssertNotEqual(firstToken, secondToken)
+    }
+
+    func test_resumedContainerKeepsViewerTokenAfterGuestHomeIsCleared() throws {
+        // WHY: the Bot can delete anything inside its mounted home. That must
+        // not rotate the host-owned bearer away from the still-running
+        // websockify process and strand the resumed viewer.
+        let support = makeSupport("rc-guest-viewer-token-resume")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+        _ = try service.provision(botID: botID)
+        let originalToken = try XCTUnwrap(
+            fake.createdOptions.last?.environment["REMOTECODE_VIEWER_TOKEN"]
+        )
+        let home = BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: botID)
+        try service.stop(botID: botID)
+        try FileManager.default.removeItem(at: home)
+
+        let resumed = try service.provision(botID: botID)
+
+        let path = URLComponents(url: resumed.screenURL, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "path" })?.value
+        XCTAssertTrue(resumed.resumed)
+        XCTAssertEqual(fake.createdOptions.count, 1, "resume must keep the existing container")
+        XCTAssertEqual(path, "websockify?token=\(originalToken)")
+        service.teardown(botID: botID)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: BotComputerGuestSpec.viewerTokenURL(appSupport: support, botID: botID).path
+            )
+        )
+    }
+
+    func test_addressPoolFailureNeverFallsBackToTheSharedBridge() throws {
+        // WHY: availability cannot weaken cross-Bot isolation. The real CLI
+        // recovers with an explicit /30; if it cannot, provisioning must fail.
+        let support = makeSupport("rc-guest-network-exhausted")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.networkError = BotComputerDockerError.networkAddressPoolExhausted
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+
+        XCTAssertThrowsError(try service.provision(botID: BotID())) { error in
+            XCTAssertEqual(error as? BotComputerDockerError, .networkAddressPoolExhausted)
+        }
+        XCTAssertTrue(fake.createdOptions.isEmpty)
+    }
+
+    func test_provisionDoesNotHideNonPoolNetworkFailures() throws {
+        // WHY: daemon and permission failures must remain visible instead of
+        // creating a container with weaker-than-requested isolation.
+        let support = makeSupport("rc-guest-network-failure")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.networkError = BotComputerDockerError.provisioningFailed
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+
+        XCTAssertThrowsError(try service.provision(botID: BotID())) { error in
+            XCTAssertEqual(error as? BotComputerDockerError, .provisioningFailed)
+        }
+        XCTAssertTrue(fake.created.isEmpty)
     }
 
     func test_proveReadyBuildsBundledRecipeWhenImageMissing() throws {
@@ -141,8 +301,8 @@ final class BotComputerGuestServiceTests: XCTestCase {
     }
 
     func test_proveReadyRebuildsImageWhenRecipeRevisionIsStale() throws {
-        // WHY: Removing -viewonly from start.sh does nothing if Studio
-        // keeps the old remotecode/computer:local image.
+        // WHY: viewer admission changes do nothing if Studio keeps an older,
+        // unauthenticated remotecode/computer:local image.
         let support = makeSupport("rc-guest-stale")
         defer { try? FileManager.default.removeItem(at: support) }
         let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
@@ -158,6 +318,29 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertTrue(service.proveReady())
         XCTAssertEqual(fake.builds, [recipe])
         XCTAssertEqual(fake.imageLabels[BotComputerGuestSpec.imageTag], BotComputerGuestSpec.recipeRevision)
+    }
+
+    func test_staleCustomImageCannotBypassCurrentViewerAdmission() throws {
+        // WHY: a Bot image built before TokenFile admission must not be resumed
+        // merely because its tag still exists; its editable recipe remains on
+        // disk for an explicit rebuild.
+        let support = makeSupport("rc-guest-stale-custom")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let botID = BotID()
+        let customTag = BotComputerGuestSpec.botImageTag(botID: botID)
+        fake.images.insert(customTag)
+        fake.imageLabels[customTag] = "2"
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+
+        _ = try service.provision(botID: botID)
+
+        XCTAssertEqual(fake.createdOptions.last?.image, BotComputerGuestSpec.imageTag)
     }
 
     func test_provisionRecreatesContainerWhenImageIsStale() throws {
@@ -429,6 +612,74 @@ final class BotComputerGuestServiceTests: XCTestCase {
                 "the root build context must keep every file referenced by Dockerfile"
             )
         }
+    }
+
+    func test_prepareHomeUpgradesOnlyTheKnownUnauthenticatedStartScript() throws {
+        // WHY: shipped recipes must gain TokenFile admission after upgrade,
+        // while an explicitly edited start script remains the user's choice.
+        let support = makeSupport("rc-guest-start-auth-migration")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let botID = BotID()
+        let home = BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: botID)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let legacy = """
+        #!/bin/bash
+        set -eu
+        export DISPLAY="${DISPLAY:-:1}"
+        export HOME="${HOME:-/home/remotecode}"
+        mkdir -p "$HOME/.browser-profiles/chromium" /tmp/fluxbox
+        rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 || true
+
+        Xvfb :1 -screen 0 1280x800x24 -ac +extension RANDR >/tmp/xvfb.log 2>&1 &
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if xdpyinfo -display :1 >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.2
+        done
+        xdpyinfo -display :1 >/dev/null
+
+        fluxbox -display :1 -log /tmp/fluxbox.log >/tmp/fluxbox.out 2>&1 &
+        /opt/remotecode-computer/launch-browser.sh || xterm -display :1 &
+
+        # Guest VNC stays loopback. Docker NAT publishes 6080 on 127.0.0.1 of the host.
+        x11vnc -display :1 -rfbport 5900 -localhost -forever -shared -nopw \\
+            >/tmp/x11vnc.log 2>&1 &
+
+        websockify --web /usr/share/novnc 0.0.0.0:6080 127.0.0.1:5900 \\
+            >/tmp/websockify.log 2>&1 &
+
+        wait -n
+        exit 1
+        """ + "\n"
+        let legacyDigest = SHA256.hash(data: Data(legacy.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        XCTAssertEqual(
+            legacyDigest,
+            "fc19d6b61e02c4ee713dde41886f4dfbae6d8631ce990dbd045f36eced478d8e",
+            "the migration fixture must stay byte-identical to recipe revision 2"
+        )
+        let start = home.appendingPathComponent("start.sh")
+        try legacy.write(to: start, atomically: true, encoding: .utf8)
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: FakeDocker(),
+            recipeContext: repository.appendingPathComponent(
+                "Sources/AppShell/Resources/ComputerGuest",
+                isDirectory: true
+            )
+        )
+
+        try service.prepareHome(botID: botID)
+
+        let migrated = try String(contentsOf: start, encoding: .utf8)
+        XCTAssertTrue(migrated.contains("--token-plugin TokenFile"))
+        XCTAssertTrue(migrated.contains("REMOTECODE_VIEWER_TOKEN"))
     }
 
     private final class SleepCounter: @unchecked Sendable {

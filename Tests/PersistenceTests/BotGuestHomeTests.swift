@@ -15,8 +15,15 @@ final class BotGuestHomeTests: XCTestCase {
         XCTAssertFalse(home.path.contains("/bots/"))
         let mode = try FileManager.default.attributesOfItem(atPath: home.path)[.posixPermissions] as? NSNumber
         XCTAssertEqual(mode?.intValue, 0o700)
+        let viewerToken = BotComputerGuestSpec.viewerTokenURL(appSupport: support, botID: botID)
+        try Data("test-token".utf8).write(to: viewerToken)
+        XCTAssertFalse(
+            viewerToken.path.hasPrefix(home.path + "/"),
+            "the Bot-writable bind must not own its viewer bearer"
+        )
         try BotGuestHome.wipe(appSupport: support, botID: botID)
         XCTAssertFalse(FileManager.default.fileExists(atPath: home.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: viewerToken.path))
         try? FileManager.default.removeItem(at: support)
     }
 }

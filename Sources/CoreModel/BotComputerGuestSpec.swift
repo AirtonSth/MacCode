@@ -4,7 +4,7 @@ public enum BotComputerGuestSpec {
     public static let imageTag = "remotecode/computer:local"
     public static let recipeLabelKey = "remotecode.recipe"
     /// Bump when start.sh / Dockerfile change. Missing label rebuilds the image.
-    public static let recipeRevision = "2"
+    public static let recipeRevision = "3"
     public static let guestUserHome = "/home/remotecode"
     public static let screenPort = 6080
     public static let minimumShmBytes: Int = 256 * 1024 * 1024
@@ -17,10 +17,19 @@ public enum BotComputerGuestSpec {
         appSupport.appendingPathComponent("bot-guests", isDirectory: true)
     }
 
-    public static func guestHomeURL(appSupport: URL, botID: BotID) -> URL {
+    public static func guestBotRootURL(appSupport: URL, botID: BotID) -> URL {
         guestHomeRoot(appSupport: appSupport)
             .appendingPathComponent(botID.value.uuidString.lowercased(), isDirectory: true)
+    }
+
+    public static func guestHomeURL(appSupport: URL, botID: BotID) -> URL {
+        guestBotRootURL(appSupport: appSupport, botID: botID)
             .appendingPathComponent("home", isDirectory: true)
+    }
+
+    public static func viewerTokenURL(appSupport: URL, botID: BotID) -> URL {
+        guestBotRootURL(appSupport: appSupport, botID: botID)
+            .appendingPathComponent("viewer-token")
     }
 
     /// Per-bot Docker build context. Its editable Dockerfile lives at the guest-home root.
@@ -55,10 +64,14 @@ public enum BotComputerGuestSpec {
         botID: BotID,
         guestHome: String,
         appSupport: URL,
+        viewerToken: String,
         image: String = imageTag,
         name: String? = nil
     ) throws -> BotComputerContainerCreateOptions {
         try assertGuestHomePath(guestHome, appSupport: appSupport, botID: botID)
+        guard viewerToken.range(of: #"^[a-zA-Z0-9-]{32,128}$"#, options: .regularExpression) != nil else {
+            throw BotComputerGuestError.invalidScreenURL
+        }
         return BotComputerContainerCreateOptions(
             name: name ?? containerName(botID: botID),
             image: image,
@@ -66,6 +79,7 @@ public enum BotComputerGuestSpec {
                 "remotecode.managed": "1",
                 "remotecode.botId": botID.value.uuidString.lowercased(),
             ],
+            environment: ["REMOTECODE_VIEWER_TOKEN": viewerToken],
             binds: ["\(guestHome):\(guestUserHome)"],
             hostIP: "127.0.0.1",
             hostPort: 0,
@@ -93,7 +107,9 @@ public enum BotComputerGuestSpec {
     }
 
     public static func screenURL(hostPort: Int, token: String) throws -> URL {
-        guard hostPort > 0, !token.isEmpty else { throw BotComputerGuestError.invalidScreenURL }
+        guard hostPort > 0,
+              token.range(of: #"^[a-zA-Z0-9-]{32,128}$"#, options: .regularExpression) != nil
+        else { throw BotComputerGuestError.invalidScreenURL }
         var components = URLComponents()
         components.scheme = "http"
         components.host = "127.0.0.1"
@@ -106,7 +122,7 @@ public enum BotComputerGuestSpec {
             // noVNC plays bell.oga on every RFB Bell (xterm rings it constantly).
             // ui.js only plays when the `bell` config var is exactly "on".
             URLQueryItem(name: "bell", value: "off"),
-            URLQueryItem(name: "token", value: token),
+            URLQueryItem(name: "path", value: "websockify?token=\(token)"),
         ]
         guard let url = components.url else { throw BotComputerGuestError.invalidScreenURL }
         return url
@@ -127,6 +143,7 @@ public struct BotComputerContainerCreateOptions: Equatable, Sendable {
     public var name: String
     public var image: String
     public var labels: [String: String]
+    public var environment: [String: String]
     public var binds: [String]
     public var hostIP: String
     public var hostPort: Int

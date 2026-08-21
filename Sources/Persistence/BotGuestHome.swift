@@ -18,9 +18,9 @@ public enum BotGuestHome {
     }
 
     public static func wipe(appSupport: URL, botID: BotID) throws {
-        let home = url(appSupport: appSupport, botID: botID)
-        if FileManager.default.fileExists(atPath: home.path) {
-            try FileManager.default.removeItem(at: home)
+        let root = BotComputerGuestSpec.guestBotRootURL(appSupport: appSupport, botID: botID)
+        if FileManager.default.fileExists(atPath: root.path) {
+            try FileManager.default.removeItem(at: root)
         }
     }
 }
