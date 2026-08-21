@@ -505,9 +505,21 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let botID = id(bot)
         let run = liveRuns[botID]
         liveRuns[botID] = nil
+        var drained: [String: Any]?
+        if var items = queueByBot[botID], let next = items.first {
+            items.removeFirst()
+            queueByBot[botID] = items.isEmpty ? nil : items
+            liveRuns[botID] = [
+                "bot_id": botID,
+                "status": "working",
+                "text": next["text"] as Any,
+                "from_queue_id": next["id"] as Any,
+            ]
+            drained = next
+        }
         attention[botID] = [
             "bot_id": botID,
-            "state": "none",
+            "state": drained == nil ? "none" : "working",
             "source": "bot",
         ]
         return receipt(requestID: requestID, status: .completed, botID: botID, readback: [
@@ -515,6 +527,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "force": force,
             "terminal": run != nil,
             "run": run as Any,
+            "drained": drained as Any,
+            "queue": queueByBot[botID] ?? [],
         ])
     }
 
@@ -670,7 +684,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func filesOpen(params: [String: Any], requestID: String, split: Bool) throws -> [String: Any] {
         let bot = try requireBot(params)
         let handle = string(params, "handle") ?? ""
-        guard let entry = files[handle] else { throw Error.invalidParams }
+        guard let entry = files[handle], entry["bot_id"] as? String == id(bot) else { throw Error.invalidParams }
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
             "mounted": true,
             "split": split,
