@@ -289,6 +289,111 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
                        "API miss must fall back to the billing log rather than recording 0%")
     }
 
+    func test_claudeOAuthUsage_readsSevenDayPercentAndFiveHourSession() {
+        let usage = AssistantAccountUsageParser.claudeOAuthUsage(from: [
+            "five_hour": ["utilization": 12, "resets_at": "2099-08-21T22:00:00Z"],
+            "seven_day": ["utilization": 57, "resets_at": "2099-08-26T11:00:00Z"]
+        ])
+        XCTAssertEqual(usage?.provider, .claude)
+        XCTAssertEqual(usage?.weeklyUsedPercent, 57)
+        XCTAssertEqual(usage?.currentSessionUsedPercent, 12)
+        XCTAssertNotNil(usage?.weeklyResetsAtMs)
+    }
+
+    func test_claudeOAuthUsage_acceptsFractionalUtilization() {
+        let usage = AssistantAccountUsageParser.claudeOAuthUsage(from: [
+            "seven_day": ["utilization": 0.31]
+        ])
+        XCTAssertEqual(usage?.weeklyUsedPercent, 31)
+    }
+
+    func test_claudeAccessToken_readsClaudeAiOauthObject() {
+        let token = AssistantAccountUsageParser.claudeAccessToken(fromAuthObject: [
+            "claudeAiOauth": ["accessToken": "claude-live-token"]
+        ])
+        XCTAssertEqual(token, "claude-live-token")
+    }
+
+    func test_fetchClaudeUsage_prefersOAuthAPIOverCLI() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-oauth-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let auth = dir.appendingPathComponent("credentials.json")
+        try JSONSerialization.data(withJSONObject: [
+            "claudeAiOauth": ["accessToken": "claude-token"]
+        ]).write(to: auth)
+
+        let refresher = TokenSaverAccountUsageRefresher(
+            timeoutSeconds: 3,
+            jsonAPIFetcher: { _, headers in
+                guard headers["Authorization"] == "Bearer claude-token" else { return nil }
+                return ["seven_day": ["utilization": 26, "resets_at": "2099-08-26T11:00:00Z"]]
+            }
+        )
+        let usages = await refresher.refreshAccountUsage(TokenSaverAccountUsageRefreshRequest(
+            claudeBinary: dir.appendingPathComponent("missing-claude").path,
+            claudeAuthFileURL: auth
+        ))
+        XCTAssertEqual(usages.first(where: { $0.provider == .claude })?.weeklyUsedPercent, 26,
+                       "live oauth/usage must beat spawning claude -p /usage")
+    }
+
+    func test_codexWhamUsage_usesSecondaryWeeklyWindow() {
+        let usage = AssistantAccountUsageParser.codexWhamUsage(from: [
+            "plan_type": "plus",
+            "rate_limit": [
+                "primary_window": [
+                    "used_percent": 11,
+                    "limit_window_seconds": 18_000
+                ],
+                "secondary_window": [
+                    "used_percent": 83,
+                    "limit_window_seconds": 604_800,
+                    "reset_at": 1_781_138_445
+                ]
+            ]
+        ])
+        XCTAssertEqual(usage?.provider, .codex)
+        XCTAssertEqual(usage?.weeklyUsedPercent, 83)
+        XCTAssertEqual(usage?.weeklyWindowDurationMinutes, 10_080)
+        XCTAssertEqual(usage?.currentSessionUsedPercent, 11)
+        XCTAssertEqual(usage?.weeklyResetsAtMs, 1_781_138_445_000)
+    }
+
+    func test_fetchCodexUsage_prefersWhamHTTPOverAppServer() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-codex-wham-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let auth = dir.appendingPathComponent("auth.json")
+        try JSONSerialization.data(withJSONObject: [
+            "tokens": ["access_token": "codex-token", "account_id": "acct-1"]
+        ]).write(to: auth)
+
+        let refresher = TokenSaverAccountUsageRefresher(
+            timeoutSeconds: 3,
+            jsonAPIFetcher: { _, headers in
+                guard headers["Authorization"] == "Bearer codex-token",
+                      headers["ChatGPT-Account-ID"] == "acct-1" else { return nil }
+                return [
+                    "rate_limit": [
+                        "secondary_window": [
+                            "used_percent": 41,
+                            "limit_window_seconds": 604_800
+                        ]
+                    ]
+                ]
+            }
+        )
+        let usages = await refresher.refreshAccountUsage(TokenSaverAccountUsageRefreshRequest(
+            codexBinary: dir.appendingPathComponent("missing-codex").path,
+            codexAuthFileURL: auth
+        ))
+        XCTAssertEqual(usages.first(where: { $0.provider == .codex })?.weeklyUsedPercent, 41,
+                       "live wham/usage must beat spawning codex app-server")
+    }
+
     func test_claudeUsageScreenParsesInteractiveUsageDialog() {
         let output = """
         Settings  Status Config Usage Stats

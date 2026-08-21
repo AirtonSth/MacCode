@@ -1,11 +1,18 @@
 import Foundation
 import Darwin
+import Security
 import CoreModel
 import RemoteCodeCSystem
 
 public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
     public static let defaultGrokCreditsAPIURL = URL(
         string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+    )!
+    public static let defaultClaudeUsageAPIURL = URL(
+        string: "https://api.anthropic.com/api/oauth/usage"
+    )!
+    public static let defaultCodexUsageAPIURL = URL(
+        string: "https://chatgpt.com/backend-api/wham/usage"
     )!
 
     public let codexBinary: String
@@ -18,6 +25,12 @@ public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
     public let grokAuthFileURL: URL?
     /// Override for tests; default is `defaultGrokCreditsAPIURL`.
     public let grokCreditsAPIURL: URL?
+    /// When set, Claude prefers `GET /api/oauth/usage`. Tests leave it nil.
+    public let claudeAuthFileURL: URL?
+    public let claudeUsageAPIURL: URL?
+    /// When set, Codex prefers `GET …/wham/usage`. Tests leave it nil.
+    public let codexAuthFileURL: URL?
+    public let codexUsageAPIURL: URL?
     public let cwd: String
     public let environment: [String: String]
 
@@ -28,6 +41,10 @@ public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
         grokBillingLogURL: URL? = nil,
         grokAuthFileURL: URL? = nil,
         grokCreditsAPIURL: URL? = nil,
+        claudeAuthFileURL: URL? = nil,
+        claudeUsageAPIURL: URL? = nil,
+        codexAuthFileURL: URL? = nil,
+        codexUsageAPIURL: URL? = nil,
         cwd: String = NSHomeDirectory(),
         environment: [String: String] = [:]
     ) {
@@ -37,6 +54,10 @@ public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
         self.grokBillingLogURL = grokBillingLogURL
         self.grokAuthFileURL = grokAuthFileURL
         self.grokCreditsAPIURL = grokCreditsAPIURL
+        self.claudeAuthFileURL = claudeAuthFileURL
+        self.claudeUsageAPIURL = claudeUsageAPIURL
+        self.codexAuthFileURL = codexAuthFileURL
+        self.codexUsageAPIURL = codexUsageAPIURL
         self.cwd = cwd
         self.environment = environment
     }
@@ -302,6 +323,113 @@ public enum AssistantAccountUsageParser {
         }?.token
     }
 
+    /// Claude Code OAuth usage (`GET /api/oauth/usage`).
+    /// `utilization` is either 0–1 (fraction) or 0–100 (percent).
+    public static func claudeOAuthUsage(from payload: [String: Any]) -> AssistantAccountUsage? {
+        let week = payload["seven_day"] as? [String: Any]
+            ?? payload["sevenDay"] as? [String: Any]
+        guard let weeklyUsed = utilizationPercent(week?["utilization"]) else { return nil }
+        let session = payload["five_hour"] as? [String: Any]
+            ?? payload["fiveHour"] as? [String: Any]
+        return AssistantAccountUsage(
+            provider: .claude,
+            weeklyUsedPercent: weeklyUsed,
+            weeklyWindowDurationMinutes: 10_080,
+            weeklyResetsAtMs: parseISO8601Milliseconds(
+                string(week?["resets_at"]) ?? string(week?["resetsAt"])
+            ),
+            currentSessionUsedPercent: utilizationPercent(session?["utilization"]),
+            currentSessionResetsAtMs: parseISO8601Milliseconds(
+                string(session?["resets_at"]) ?? string(session?["resetsAt"])
+            )
+        )
+    }
+
+    public static func claudeAccessToken(fromAuthFile url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return claudeAccessToken(fromAuthObject: obj)
+    }
+
+    public static func claudeAccessToken(fromAuthObject obj: [String: Any]) -> String? {
+        let oauth = obj["claudeAiOauth"] as? [String: Any]
+            ?? obj["claude_ai_oauth"] as? [String: Any]
+            ?? obj
+        return string(oauth["accessToken"]) ?? string(oauth["access_token"])
+    }
+
+    /// macOS Claude Code stores the same JSON in Keychain, not `~/.claude/.credentials.json`.
+    public static func claudeAccessTokenFromKeychain(
+        service: String = "Claude Code-credentials"
+    ) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let data = item as? Data,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return claudeAccessToken(fromAuthObject: obj)
+    }
+
+    /// ChatGPT Codex `GET …/wham/usage` mapped onto the existing app-server parser.
+    public static func codexWhamUsage(from payload: [String: Any]) -> AssistantAccountUsage? {
+        let rate = payload["rate_limit"] as? [String: Any]
+            ?? payload["rateLimit"] as? [String: Any]
+            ?? payload
+        func window(_ raw: Any?) -> [String: Any]? {
+            guard let object = raw as? [String: Any] else { return nil }
+            var mapped: [String: Any] = [:]
+            if let used = object["used_percent"] ?? object["usedPercent"] {
+                mapped["used_percent"] = used
+            } else if let remaining = double(object["remaining_percent"] ?? object["remainingPercent"]) {
+                mapped["used_percent"] = max(0, 100 - remaining)
+            }
+            if let seconds = int(object["limit_window_seconds"] ?? object["limitWindowSeconds"]) {
+                mapped["window_minutes"] = seconds / 60
+            } else if let minutes = object["window_minutes"] ?? object["windowMinutes"] {
+                mapped["window_minutes"] = minutes
+            }
+            if let reset = object["reset_at"] ?? object["resets_at"] ?? object["resetsAt"] {
+                mapped["resets_at"] = reset
+            }
+            return mapped.isEmpty ? nil : mapped
+        }
+        var mapped: [String: Any] = [:]
+        if let primary = window(rate["primary_window"] ?? rate["primaryWindow"] ?? rate["primary"]) {
+            mapped["primary"] = primary
+        }
+        if let secondary = window(rate["secondary_window"] ?? rate["secondaryWindow"] ?? rate["secondary"]) {
+            mapped["secondary"] = secondary
+        }
+        guard !mapped.isEmpty else { return nil }
+        return codex(from: mapped)
+    }
+
+    public static func codexAccessToken(fromAuthFile url: URL) -> (token: String, accountID: String?)? {
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return codexAccessToken(fromAuthObject: obj)
+    }
+
+    public static func codexAccessToken(fromAuthObject obj: [String: Any]) -> (token: String, accountID: String?)? {
+        let tokens = obj["tokens"] as? [String: Any] ?? obj
+        guard let token = string(tokens["access_token"]) ?? string(tokens["accessToken"]) else {
+            return nil
+        }
+        let accountID = string(tokens["account_id"]) ?? string(tokens["accountId"])
+        return (token, accountID)
+    }
+
     /// Scans a Grok unified log file (newest first within the last `maxBytes`) for
     /// the freshest `billing: fetched credits config` entry.
     ///
@@ -544,6 +672,13 @@ public enum AssistantAccountUsageParser {
         }
         return double(value)
     }
+
+    /// Claude OAuth `utilization` is documented as 0–100 and also observed as 0–1.
+    private static func utilizationPercent(_ value: Any?) -> Double? {
+        guard let raw = double(value) else { return nil }
+        if raw > 1 { return min(100, max(0, raw)) }
+        return min(100, max(0, raw * 100))
+    }
 }
 
 public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing, @unchecked Sendable {
@@ -553,14 +688,27 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private let timeoutSeconds: TimeInterval
-    private let grokCreditsFetcher: (@Sendable (URL, String) async -> [String: Any]?)?
+    private let jsonAPIFetcher: (@Sendable (URL, [String: String]) async -> [String: Any]?)?
 
     public init(
         timeoutSeconds: TimeInterval = 18.0,
-        grokCreditsFetcher: (@Sendable (URL, String) async -> [String: Any]?)? = nil
+        grokCreditsFetcher: (@Sendable (URL, String) async -> [String: Any]?)? = nil,
+        jsonAPIFetcher: (@Sendable (URL, [String: String]) async -> [String: Any]?)? = nil
     ) {
         self.timeoutSeconds = timeoutSeconds
-        self.grokCreditsFetcher = grokCreditsFetcher
+        if let jsonAPIFetcher {
+            self.jsonAPIFetcher = jsonAPIFetcher
+        } else if let grokCreditsFetcher {
+            self.jsonAPIFetcher = { url, headers in
+                let token = headers["Authorization"]?
+                    .trimmingCharacters(in: .whitespaces)
+                    .replacingOccurrences(of: "Bearer ", with: "", options: [.anchored])
+                guard let token, !token.isEmpty else { return nil }
+                return await grokCreditsFetcher(url, token)
+            }
+        } else {
+            self.jsonAPIFetcher = nil
+        }
     }
 
     public func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
@@ -604,6 +752,9 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private func fetchCodexUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        if let live = await fetchCodexWhamUsage(request) {
+            return live
+        }
         do {
             let client = try CodexAppServerClient(
                 binary: request.codexBinary,
@@ -625,6 +776,9 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private func fetchClaudeUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        if let live = await fetchClaudeOAuthUsage(request) {
+            return live
+        }
         // Prefer the Process path (waitUntilExit) first — it never leaves PTY zombies.
         // Screen-capture PTY is fallback only when text /usage fails (plan-final W1).
         // Parse with claudeUsageText (which prefers claudeUsageScreen patterns) so
@@ -678,14 +832,73 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private func fetchGrokCreditsJSON(endpoint: URL, token: String) async -> [String: Any]? {
-        if let grokCreditsFetcher {
-            return await grokCreditsFetcher(endpoint, token)
+        await fetchJSON(endpoint: endpoint, headers: [
+            "Authorization": "Bearer \(token)",
+            "X-XAI-Token-Auth": "xai-grok-cli",
+            "Accept": "application/json"
+        ])
+    }
+
+    private func fetchClaudeOAuthUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        guard request.claudeAuthFileURL != nil else { return nil }
+        guard let token = claudeToken(for: request) else { return nil }
+        let endpoint = request.claudeUsageAPIURL
+            ?? TokenSaverAccountUsageRefreshRequest.defaultClaudeUsageAPIURL
+        guard let payload = await fetchJSON(endpoint: endpoint, headers: [
+            "Authorization": "Bearer \(token)",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20"
+        ]) else {
+            return nil
+        }
+        return AssistantAccountUsageParser.claudeOAuthUsage(from: payload)
+    }
+
+    private func fetchCodexWhamUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        guard let authFile = request.codexAuthFileURL,
+              let creds = AssistantAccountUsageParser.codexAccessToken(fromAuthFile: authFile) else {
+            return nil
+        }
+        let endpoint = request.codexUsageAPIURL
+            ?? TokenSaverAccountUsageRefreshRequest.defaultCodexUsageAPIURL
+        var headers = [
+            "Authorization": "Bearer \(creds.token)",
+            "Accept": "application/json",
+            "OpenAI-Beta": "codex-1",
+            "originator": "Codex Desktop"
+        ]
+        if let accountID = creds.accountID {
+            headers["ChatGPT-Account-ID"] = accountID
+        }
+        guard let payload = await fetchJSON(endpoint: endpoint, headers: headers) else {
+            return nil
+        }
+        return AssistantAccountUsageParser.codexWhamUsage(from: payload)
+    }
+
+    private func claudeToken(for request: TokenSaverAccountUsageRefreshRequest) -> String? {
+        guard let authFile = request.claudeAuthFileURL else { return nil }
+        if let token = AssistantAccountUsageParser.claudeAccessToken(fromAuthFile: authFile) {
+            return token
+        }
+        let defaultFile = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/.credentials.json")
+        guard authFile.standardizedFileURL.path == defaultFile.standardizedFileURL.path else {
+            return nil
+        }
+        return AssistantAccountUsageParser.claudeAccessTokenFromKeychain()
+    }
+
+    private func fetchJSON(endpoint: URL, headers: [String: String]) async -> [String: Any]? {
+        if let jsonAPIFetcher {
+            return await jsonAPIFetcher(endpoint, headers)
         }
         var request = URLRequest(url: endpoint, timeoutInterval: min(10, max(2, timeoutSeconds)))
         request.httpMethod = "GET"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("xai-grok-cli", forHTTPHeaderField: "X-XAI-Token-Auth")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        for (field, value) in headers {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse,

@@ -66,6 +66,9 @@ let package = Package(
             path: "Sources/AgentRuntime",
             resources: [
                 .copy("Resources/remote-code-orchestrate")
+            ],
+            linkerSettings: [
+                .linkedFramework("Security")
             ]
         ),
         .target(

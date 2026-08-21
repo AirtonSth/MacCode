@@ -2823,6 +2823,8 @@ public final class AppContext {
             claudeBinary: claudeBinary?.isEmpty == false ? claudeBinary! : "claude",
             grokBinary: grokBinary?.isEmpty == false ? grokBinary! : "grok",
             grokAuthFileURL: Self.defaultGrokAuthFileURL,
+            claudeAuthFileURL: Self.defaultClaudeAuthFileURL,
+            codexAuthFileURL: Self.defaultCodexAuthFileURL,
             cwd: state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
             environment: [:]
         )
@@ -2943,6 +2945,16 @@ public final class AppContext {
     static var defaultGrokAuthFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".grok/auth.json")
+    }
+
+    static var defaultClaudeAuthFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/.credentials.json")
+    }
+
+    static var defaultCodexAuthFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/auth.json")
     }
 
     static func refreshAccountUsageWithTimeout(
