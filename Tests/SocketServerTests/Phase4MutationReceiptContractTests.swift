@@ -2258,7 +2258,11 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             ("agent.user_input.respond", ["thread_id": threadID, "request_id": "input-1", "text": "secret-phase4-answer"], "agent.user_input.resolved"),
             ("agent.plan.implement", ["thread_id": threadID, "plan_id": "plan-1", "markdown": "secret-phase4-plan"], "agent.plan.implemented"),
             ("agent.plan.save", ["thread_id": threadID, "plan_id": "plan-1", "markdown": "secret-phase4-plan"], "agent.plan.saved"),
-            ("agent.plan.notes.save", ["thread_id": threadID, "notes": "secret-phase4-notes"], "agent.plan.notes.updated"),
+            ("agent.plan.notes.save", [
+                "thread_id": threadID,
+                "notes": String(repeating: "N", count: PlanNotesProjectionV1.eventPreviewMaxBytes + 1)
+                    + "secret-phase4-notes",
+            ], "agent.plan.notes.updated"),
             ("agent.checkpoint.revert", ["thread_id": threadID, "turn_count": 1], "agent.checkpoint.reverted"),
             ("agent.attachment.upload", ["workspace_id": workspaceID, "filename": "phase4.txt", "data_base64": attachmentData], "agent.attachment.uploaded"),
             ("agent.attachment.import", ["workspace_id": workspaceID, "relative_path": "docs/phase4.txt"], "agent.attachment.uploaded"),

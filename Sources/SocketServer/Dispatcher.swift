@@ -177,9 +177,17 @@ public protocol CommandRouting: AnyObject {
     func reorderAgentQueuedMessage(thread: AgentThreadID, id: AgentQueuedMessageID, position: Int) throws
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentMessageSendResult
     func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext?) async throws -> AgentMessageSendResult
-    func listBotPeers(callerThread: AgentThreadID, callerRun: AgentRunID) throws -> JSONValue
-    func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode) async throws -> JSONValue
-    func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue]) throws -> JSONValue
+    func listBotPeers(callerThread: AgentThreadID, callerRun: AgentRunID, delegationCapability: String?) throws -> JSONValue
+    func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, delegationCapability: String?) async throws -> JSONValue
+    func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue], delegationCapability: String?) throws -> JSONValue
+    func authenticateManagedHostCall(threadID: AgentThreadID, runID: AgentRunID, delegationCapability: String?, mutation: Bool, method: String) throws
+    func createHostBot(name: String, title: String, description: String, handle: String?, soul: String, provider: AgentProvider, model: String, callerRun: AgentRunID) throws -> JSONValue
+    func listHostBots() throws -> JSONValue
+    func openHostBot(botID: BotID) throws -> JSONValue
+    func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?) async throws -> JSONValue
+    func createHostBotThread(botID: BotID, title: String) throws -> JSONValue
+    func createHostBotSkill(botID: BotID, skillID: String, body: String?, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue
+    func viewHostBotSkill(botID: BotID, skillID: String, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue
     func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID)
     func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String)
     /// Per-thread plan notes (mac plan sidebar). Returns "" when none exist.
@@ -317,16 +325,48 @@ public extension CommandRouting {
         nil
     }
 
-    func listBotPeers(callerThread: AgentThreadID, callerRun: AgentRunID) throws -> JSONValue {
+    func listBotPeers(callerThread: AgentThreadID, callerRun: AgentRunID, delegationCapability: String?) throws -> JSONValue {
         throw JSONRPCError.notSupported("Bot delegation")
     }
 
-    func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode) async throws -> JSONValue {
+    func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, delegationCapability: String?) async throws -> JSONValue {
         throw JSONRPCError.notSupported("Bot delegation")
     }
 
-    func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue]) throws -> JSONValue {
+    func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue], delegationCapability: String?) throws -> JSONValue {
         throw JSONRPCError.notSupported("delegated Bot settings")
+    }
+
+    func authenticateManagedHostCall(threadID: AgentThreadID, runID: AgentRunID, delegationCapability: String?, mutation: Bool, method: String) throws {
+        throw JSONRPCError.notSupported("managed host catalog")
+    }
+
+    func createHostBot(name: String, title: String, description: String, handle: String?, soul: String, provider: AgentProvider, model: String, callerRun: AgentRunID) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot create")
+    }
+
+    func listHostBots() throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot list")
+    }
+
+    func openHostBot(botID: BotID) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot open")
+    }
+
+    func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot send")
+    }
+
+    func createHostBotThread(botID: BotID, title: String) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot thread create")
+    }
+
+    func createHostBotSkill(botID: BotID, skillID: String, body: String?, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot skill create")
+    }
+
+    func viewHostBotSkill(botID: BotID, skillID: String, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot skill view")
     }
 
     /// Safe in-memory default so FakeRouter/test hosts need no SQL body-budget path.
@@ -621,6 +661,14 @@ public final class JSONRPCDispatcher {
     @TaskLocal private static var rpcWireTransport:
         AgentCheckpointListContract.WireTransport = .localTest
     @TaskLocal private static var rpcInBatch = false
+    /// Private provider methods are admitted only after the Unix entry point
+    /// authenticates the exact live run bearer. HTTP, WebSocket, local IPC,
+    /// and nested batches must not reach these aliases.
+    @TaskLocal private static var managedProviderSocketAuthenticated = false
+    private nonisolated static let managedProviderSocketMethods =
+        RemoteCodeHostCatalog.rpcMethods.union([
+            "bot.peer.list", "bot.peer.ask", "bot.peer.self_config",
+        ])
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
     /// store request payloads or secrets — only owner fingerprint + params hash.
     private var volatileUnknownReceipts = BoundedUnknownReceiptCache()
@@ -685,6 +733,13 @@ public final class JSONRPCDispatcher {
         "ssh.transfer.download",
         "project.run_script",
         "agent.open",
+        "host.workspace.create",
+        "host.agent.thread.create",
+        "host.bot.create",
+        "host.bot.open",
+        "host.bot.send",
+        "host.bot.thread.create",
+        "host.bot.skill.create",
         "agent.thread.create",
         "agent.thread.prepare_pr",
         "agent.thread.rollback",
@@ -1083,8 +1138,89 @@ public final class JSONRPCDispatcher {
     /// prior behavior; explicit response_version 1 is refused before work.
     public func dispatchUnixSocket(_ req: JSONRPCRequest) async -> JSONRPCResponse {
         await Self.$rpcWireTransport.withValue(.unix) {
-            await dispatchLocalIPC(req)
+            await dispatchManagedHostUnix(req)
         }
+    }
+
+    private func dispatchManagedHostUnix(_ req: JSONRPCRequest) async -> JSONRPCResponse {
+        let isPeer = req.method == "bot.peer.list"
+            || req.method == "bot.peer.ask"
+            || req.method == "bot.peer.self_config"
+        let isHost = RemoteCodeHostCatalog.rpcMethods.contains(req.method)
+        guard isPeer || isHost else {
+            return await dispatchLocalIPC(req)
+        }
+        let params = req.params ?? [:]
+        // Peer consultation/self-configuration is already constrained by the
+        // exact bearer and Bot grant. It remains available to supervised runs;
+        // only host catalog mutations require full-access admission.
+        let mutation = isHost && RemoteCodeHostCatalog.rpcMutationMethods.contains(req.method)
+        do {
+            try authenticateManagedHostParams(params, mutation: mutation, method: req.method)
+        } catch let error as JSONRPCError {
+            return .init(id: req.id, error: error)
+        } catch {
+            return .init(id: req.id, error: Self.mapDomainError(error, method: req.method))
+        }
+        return await Self.$managedProviderSocketAuthenticated.withValue(true) {
+            if isHost, RemoteCodeHostCatalog.rpcMutationMethods.contains(req.method) {
+                guard let clientRequestId = params["client_request_id"]?.stringValue?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !clientRequestId.isEmpty else {
+                    RemoteCodeHostCatalogDiagnostics.receipt(
+                        decision: "missing_operation_id",
+                        method: req.method,
+                        operationID: "-"
+                    )
+                    return .init(id: req.id, error: JSONRPCError(
+                        code: -32097,
+                        message: "Mutation requires a non-empty client_request_id."
+                    ))
+                }
+                RemoteCodeHostCatalogDiagnostics.receipt(
+                    decision: "claim",
+                    method: req.method,
+                    operationID: clientRequestId
+                )
+                let runID = params["run_id"]?.stringValue ?? ""
+                return await dispatchRemoteMutation(
+                    req,
+                    context: MutationRequestContext(
+                        ownerFingerprint: runID.lowercased(),
+                        hostId: "unix-host-catalog",
+                        bootEpoch: 0
+                    )
+                )
+            }
+            return await dispatchLocalIPC(req)
+        }
+    }
+
+    private func authenticateManagedHostParams(
+        _ params: [String: JSONValue],
+        mutation: Bool,
+        method: String
+    ) throws {
+        guard let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+              let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init) else {
+            RemoteCodeHostCatalogDiagnostics.authorization(
+                decision: "missing_run_context",
+                method: method,
+                runID: params["run_id"]?.stringValue == nil ? "missing" : "present-invalid",
+                threadID: params["thread_id"]?.stringValue == nil ? "missing" : "present-invalid"
+            )
+            throw JSONRPCError(
+                code: -32047,
+                message: "Host catalog requires an authenticated active run."
+            )
+        }
+        try router.authenticateManagedHostCall(
+            threadID: threadID,
+            runID: runID,
+            delegationCapability: params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue,
+            mutation: mutation,
+            method: method
+        )
     }
 
     /// Production HTTP JSON-RPC entry (legacy + explicit v1 checkpoint list).
@@ -1107,6 +1243,10 @@ public final class JSONRPCDispatcher {
         _ req: JSONRPCRequest,
         mutationContext: MutationRequestContext?
     ) async -> JSONRPCResponse {
+        if Self.managedProviderSocketMethods.contains(req.method),
+           !Self.managedProviderSocketAuthenticated {
+            return .init(id: req.id, error: .methodNotFound)
+        }
         guard let mutationContext else { return await dispatchCore(req) }
         if req.method == "command.receipt.status" {
             return commandReceiptStatus(req, context: mutationContext)
@@ -1562,6 +1702,10 @@ public final class JSONRPCDispatcher {
         let id = req.id
         let params = req.params ?? [:]
         do {
+            if Self.managedProviderSocketMethods.contains(req.method),
+               !Self.managedProviderSocketAuthenticated {
+                throw JSONRPCError.methodNotFound
+            }
             // Explicit v1 only: HTTP-only + batch-forbidden before repository work.
             // Legacy checkpoint.list keeps prior Unix/WS/batch admission.
             if req.method == AgentCheckpointListContract.method {
@@ -1933,13 +2077,13 @@ public final class JSONRPCDispatcher {
             case "files.edit.close":
                 guard let sessionID = params["session_id"]?.stringValue else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: try router.filesEditClose(sessionID: sessionID))
-            case "workspace.list":
+            case "workspace.list", "host.workspace.list":
                 let ws = try await router.listWorkspacesAuthoritative()
                 return .init(id: id, result: encode(ws))
             case "workspace.current":
                 let w = try router.currentWindow()
                 return .init(id: id, result: encode(w))
-            case "workspace.create":
+            case "workspace.create", "host.workspace.create":
                 // UX-010: idempotent create — a retried request over a flaky
                 // mobile link must not produce a duplicate workspace.
                 let receiptKey = params["client_request_id"]?.stringValue
@@ -2257,7 +2401,11 @@ public final class JSONRPCDispatcher {
                 }
                 return .init(
                     id: id,
-                    result: try router.listBotPeers(callerThread: threadID, callerRun: runID)
+                    result: try router.listBotPeers(
+                        callerThread: threadID,
+                        callerRun: runID,
+                        delegationCapability: params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue
+                    )
                 )
             case "bot.peer.ask":
                 guard let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
@@ -2275,7 +2423,8 @@ public final class JSONRPCDispatcher {
                         callerRun: runID,
                         handle: handle,
                         prompt: prompt,
-                        replyMode: replyMode
+                        replyMode: replyMode,
+                        delegationCapability: params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue
                     )
                 )
             case "bot.peer.self_config":
@@ -2291,16 +2440,103 @@ public final class JSONRPCDispatcher {
                         callerThread: threadID,
                         callerRun: runID,
                         toolName: toolName,
-                        arguments: arguments
+                        arguments: arguments,
+                        delegationCapability: params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue
                     )
                 )
-            case "agent.thread.list":
+            case "host.bot.create":
+                guard let name = params["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !name.isEmpty,
+                      let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init) else {
+                    throw JSONRPCError.invalidParams
+                }
+                let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "") ?? .claude
+                let result = try router.createHostBot(
+                    name: name,
+                    title: params["title"]?.stringValue ?? "",
+                    description: params["description"]?.stringValue ?? "",
+                    handle: params["handle"]?.stringValue,
+                    soul: params["soul"]?.stringValue ?? "",
+                    provider: provider,
+                    model: params["model"]?.stringValue ?? "",
+                    callerRun: runID
+                )
+                EventBus.shared.publish(kind: "bot.created", payload: result)
+                return .init(id: id, result: result)
+            case "host.bot.list":
+                return .init(id: id, result: try router.listHostBots())
+            case "host.bot.open":
+                guard let botID = params["bot_id"]?.stringValue.flatMap(UUID.init).map(BotID.init) else {
+                    throw JSONRPCError.invalidParams
+                }
+                return .init(id: id, result: try router.openHostBot(botID: botID))
+            case "host.bot.send":
+                guard let botID = params["bot_id"]?.stringValue.flatMap(UUID.init).map(BotID.init),
+                      let text = params["text"]?.stringValue else {
+                    throw JSONRPCError.invalidParams
+                }
+                let conversationID = params["conversation_id"]?.stringValue
+                    .flatMap(UUID.init)
+                    .map(BotConversationID.init)
+                return .init(
+                    id: id,
+                    result: try await router.sendHostBot(
+                        botID: botID,
+                        text: text,
+                        conversationID: conversationID
+                    )
+                )
+            case "host.bot.thread.create":
+                guard let botID = params["bot_id"]?.stringValue.flatMap(UUID.init).map(BotID.init) else {
+                    throw JSONRPCError.invalidParams
+                }
+                return .init(
+                    id: id,
+                    result: try router.createHostBotThread(
+                        botID: botID,
+                        title: params["title"]?.stringValue ?? "New thread"
+                    )
+                )
+            case "host.bot.skill.create":
+                guard let botID = params["bot_id"]?.stringValue.flatMap(UUID.init).map(BotID.init),
+                      let skillID = params["skill_id"]?.stringValue,
+                      let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init),
+                      let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else {
+                    throw JSONRPCError.invalidParams
+                }
+                return .init(
+                    id: id,
+                    result: try router.createHostBotSkill(
+                        botID: botID,
+                        skillID: skillID,
+                        body: params["body"]?.stringValue,
+                        callerRun: runID,
+                        callerThread: threadID
+                    )
+                )
+            case "host.bot.skill.view":
+                guard let botID = params["bot_id"]?.stringValue.flatMap(UUID.init).map(BotID.init),
+                      let skillID = params["skill_id"]?.stringValue,
+                      let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init),
+                      let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else {
+                    throw JSONRPCError.invalidParams
+                }
+                return .init(
+                    id: id,
+                    result: try router.viewHostBotSkill(
+                        botID: botID,
+                        skillID: skillID,
+                        callerRun: runID,
+                        callerThread: threadID
+                    )
+                )
+            case "agent.thread.list", "host.agent.thread.list":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let threads = try await router.listAgentThreadsOffMain(workspace: wid)
                 // PERF-007: one batch query for all threads instead of N per-thread queries.
                 let lockedThreads = (try? await router.threadIdsWithMessagesOffMain()) ?? []
                 return .init(id: id, result: .array(threads.map { encodeThread($0, lockedThreads: lockedThreads) }))
-            case "agent.thread.create":
+            case "agent.thread.create", "host.agent.thread.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let title = params["title"]?.stringValue ?? "New thread"
                 let modelSelection = modelSelection(from: params["model_selection"])

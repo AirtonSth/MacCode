@@ -36,18 +36,45 @@ public struct ManagedBotSelfConfigMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "Delegate to RemoteCode Bots with AI-authored prompts. Bot-owned runs can also read and change their own Studio settings; an Agent App run may change only a Bot consulted by that exact active run.",
+                "instructions": "Delegate to RemoteCode Bots with AI-authored prompts. Bot-owned runs can also read and change their own Studio settings; an Agent App run may change only a Bot consulted by that exact active run. Built-in RemoteCode workspace, thread, Bot, and owned-skill intents must use the named rc_* host tools and must not fall back to Computer Use, macos-harness, or Accessibility.",
             ])
         case "tools/list":
-            return reply(id: id, result: ["tools": BotSelfConfigCatalog.toolCatalog()])
+            return reply(id: id, result: ["tools": BotSelfConfigCatalog.toolCatalog() + RemoteCodeHostCatalog.toolCatalog()])
         case "tools/call":
             let params = message["params"] as? [String: Any]
             let name = params?["name"] as? String ?? ""
             let arguments = params?["arguments"] as? [String: Any] ?? [:]
-            guard BotSelfConfigCatalog.toolNames.contains(name) else {
+            guard BotSelfConfigCatalog.toolNames.contains(name)
+                    || RemoteCodeHostCatalog.toolNames.contains(name) else {
                 return errorReply(id: id, code: -32602, message: "unknown tool: \(name)")
             }
             do {
+                if let rpcMethod = RemoteCodeHostCatalog.rpcMethod(for: name) {
+                    var hostArguments = arguments
+                    if RemoteCodeHostCatalog.isMutation(name) {
+                        guard let operationID = (hostArguments[RemoteCodeHostCatalog.operationIDKey] as? String)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines),
+                              !operationID.isEmpty else {
+                            throw BotSelfConfigError.invalid("operation_id is required.")
+                        }
+                        hostArguments["client_request_id"] = operationID
+                        hostArguments.removeValue(forKey: RemoteCodeHostCatalog.operationIDKey)
+                        RemoteCodeHostCatalogDiagnostics.receipt(
+                            decision: "dispatch",
+                            method: name,
+                            operationID: operationID
+                        )
+                    }
+                    let object = try BotPeerRPCClient(environment: environment).call(
+                        method: rpcMethod,
+                        arguments: hostArguments,
+                        budget: .hostOperation
+                    )
+                    return reply(id: id, result: [
+                        "content": [["type": "text", "text": encodeJSON(object) ?? "{}"]],
+                        "isError": false,
+                    ])
+                }
                 if name == BotSelfConfigCatalog.listPeers || name == BotSelfConfigCatalog.askPeer {
                     let object = try BotPeerRPCClient(environment: environment).call(
                         method: name == BotSelfConfigCatalog.listPeers
@@ -56,7 +83,7 @@ public struct ManagedBotSelfConfigMCP: Sendable {
                         arguments: arguments
                     )
                     return reply(id: id, result: [
-                        "content": [["type": "text", "text": encode(object) ?? "{}"]],
+                        "content": [["type": "text", "text": encodeJSON(object) ?? "{}"]],
                         "isError": false,
                     ])
                 }
@@ -77,7 +104,7 @@ public struct ManagedBotSelfConfigMCP: Sendable {
                         arguments: ["tool_name": name, "arguments": arguments]
                     )
                     return reply(id: id, result: [
-                        "content": [["type": "text", "text": encode(object) ?? "{}"]],
+                        "content": [["type": "text", "text": encodeJSON(object) ?? "{}"]],
                         "isError": false,
                     ])
                 }
@@ -109,7 +136,12 @@ public struct ManagedBotSelfConfigMCP: Sendable {
     }
 
     private func encode(_ object: [String: Any]) -> String? {
-        guard let data = try? JSONSerialization.data(withJSONObject: object, options: []),
+        encodeJSON(object)
+    }
+
+    private func encodeJSON(_ object: Any) -> String? {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object, options: []),
               let text = String(data: data, encoding: .utf8) else {
             return nil
         }

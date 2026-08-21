@@ -282,11 +282,12 @@ final class AgentAppBotMentionTests: XCTestCase {
         let focusedPrompt = "Qual é o seu nome?"
         let ask = Task { @MainActor in
             try await router.askBotPeer(
-                callerThread: threadId,
+                callerThread: hostRequest.threadId,
                 callerRun: hostRequest.runId,
                 handle: "@\(quinn.handle)",
                 prompt: focusedPrompt,
-                replyMode: .consult
+                replyMode: .consult,
+                delegationCapability: hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
             )
         }
         let peerStarted = await waitUntil(timeout: 5) { !peerRunner.requests.isEmpty }
@@ -306,10 +307,11 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(result.objectValue?["reply"]?.stringValue, "Meu nome atual é Quinn.")
 
         _ = try router.invokeDelegatedBotSelfConfig(
-            callerThread: threadId,
+            callerThread: hostRequest.threadId,
             callerRun: hostRequest.runId,
             toolName: BotSelfConfigCatalog.setSettings,
-            arguments: ["name": .string("Nova")]
+            arguments: ["name": .string("Nova")],
+            delegationCapability: hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
         )
         XCTAssertEqual(try ctx.botStore.get(id: quinn.id)?.name, "Nova")
         XCTAssertEqual(try ctx.botStore.get(id: untouched.id)?.name, "Untouched")
@@ -354,10 +356,11 @@ final class AgentAppBotMentionTests: XCTestCase {
 
         XCTAssertThrowsError(
             try router.invokeDelegatedBotSelfConfig(
-                callerThread: threadId,
+                callerThread: hostRequest.threadId,
                 callerRun: hostRequest.runId,
                 toolName: BotSelfConfigCatalog.setSettings,
-                arguments: ["name": .string("Too Late")]
+                arguments: ["name": .string("Too Late")],
+                delegationCapability: hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
             ),
             "the delegated settings grant must expire with the primary run"
         )
@@ -426,11 +429,12 @@ final class AgentAppBotMentionTests: XCTestCase {
         let haterOpeningReply = "Os maiores riscos são dívida de tipagem e variação de qualidade; mitigue com análise estática estrita e padrões revisados."
         let askHaterOpening = Task { @MainActor in
             try await router.askBotPeer(
-                callerThread: threadId,
+                callerThread: hostRequest.threadId,
                 callerRun: hostRequest.runId,
                 handle: "@\(phpHater.handle)",
                 prompt: haterOpeningPrompt,
-                replyMode: .consult
+                replyMode: .consult,
+                delegationCapability: hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
             )
         }
         let haterOpeningStarted = await waitUntil(timeout: 5) { haterRunner.requests.count == 1 }
@@ -461,11 +465,12 @@ final class AgentAppBotMentionTests: XCTestCase {
         let loverOpeningReply = "PHP acelera a entrega e tem ecossistema maduro; aceito análise estática estrita e padrões revisados como requisitos."
         let askLoverOpening = Task { @MainActor in
             try await router.askBotPeer(
-                callerThread: threadId,
+                callerThread: hostRequest.threadId,
                 callerRun: hostRequest.runId,
                 handle: phpLover.handle,
                 prompt: loverOpeningPrompt,
-                replyMode: .consult
+                replyMode: .consult,
+                delegationCapability: hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
             )
         }
         let loverOpeningStarted = await waitUntil(timeout: 5) { loverRunner.requests.count == 1 }
@@ -496,11 +501,12 @@ final class AgentAppBotMentionTests: XCTestCase {
         let haterFollowUpReply = "Aceito PHP se análise estática estrita, padrões revisados e monitoramento de produção forem gates obrigatórios."
         let askHaterFollowUp = Task { @MainActor in
             try await router.askBotPeer(
-                callerThread: threadId,
+                callerThread: hostRequest.threadId,
                 callerRun: hostRequest.runId,
                 handle: phpHater.handle,
                 prompt: haterFollowUpPrompt,
-                replyMode: .consult
+                replyMode: .consult,
+                delegationCapability: hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
             )
         }
         let haterFollowUpStarted = await waitUntil(timeout: 5) { haterRunner.requests.count == 2 }
@@ -523,11 +529,12 @@ final class AgentAppBotMentionTests: XCTestCase {
         let loverFollowUpReply = "Concordo com os três gates e com uma adoção gradual; esse é o nosso consenso."
         let askLoverFollowUp = Task { @MainActor in
             try await router.askBotPeer(
-                callerThread: threadId,
+                callerThread: hostRequest.threadId,
                 callerRun: hostRequest.runId,
                 handle: "@\(phpLover.handle)",
                 prompt: loverFollowUpPrompt,
-                replyMode: .consult
+                replyMode: .consult,
+                delegationCapability: hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
             )
         }
         let loverFollowUpStarted = await waitUntil(timeout: 5) { loverRunner.requests.count == 2 }
@@ -635,11 +642,12 @@ final class AgentAppBotMentionTests: XCTestCase {
         let focused = "Você está por aí?"
         let ask = Task { @MainActor in
             try await router.askBotPeer(
-                callerThread: threadId,
+                callerThread: hostRequest.threadId,
                 callerRun: hostRequest.runId,
                 handle: quinn.handle,
                 prompt: focused,
-                replyMode: .replyOnly
+                replyMode: .replyOnly,
+                delegationCapability: hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
             )
         }
         let peerStarted = await waitUntil(timeout: 5) { !peerRunner.requests.isEmpty }

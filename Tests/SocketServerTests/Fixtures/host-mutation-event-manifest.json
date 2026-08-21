@@ -87,7 +87,6 @@
     {"method": "agent.thread.execution.configure", "family": "agent-thread", "risk": "lowMutation", "eventKinds": ["agent.thread.updated"], "readbackMethods": ["agent.thread.read"]},
     {"method": "agent.thread.mark_read", "family": "agent-thread", "risk": "lowMutation", "eventKinds": ["agent.thread.updated"], "readbackMethods": ["agent.thread.read"]},
     {"method": "agent.thread.select", "family": "agent-thread", "risk": "lowMutation", "eventKinds": ["agent.thread.selected"], "readbackMethods": ["agent.state.current"]},
-
     {"method": "agent.message.send", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.message.accepted"], "readbackMethods": ["agent.message.list", "agent.message.queue.list", "agent.thread.read"]},
     {"method": "agent.message.queue.cancel", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.message.queue.cancelled"], "readbackMethods": ["agent.message.queue.list"]},
     {"method": "agent.message.queue.force_now", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.message.queue.force_requested"], "readbackMethods": ["agent.message.queue.list", "agent.message.list"]},

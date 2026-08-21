@@ -1,5 +1,6 @@
 import XCTest
 import Darwin
+import CoreModel
 @testable import SocketServer
 
 final class UnixSocketServerTests: XCTestCase {
@@ -346,10 +347,27 @@ final class UnixSocketServerTests: XCTestCase {
         XCTAssertTrue(tasksReleased)
     }
 
-    func testAgentMessageSendGetsBoundedLongerLocalDeadline() async throws {
+    func testAgentAndBotSendGetBoundedLongerLocalDeadline() async throws {
         // WHY: provider preflight can legitimately exceed the generic local
         // RPC budget. Closing the socket after the mutation was accepted leaves
         // an orphan thread, while ordinary RPCs must keep their short deadline.
+        // Host-catalog RPCs share that bounded longer Unix deadline so
+        // rc_bot_skill_* cannot die at the 5s default while Bot Desk holds
+        // MainActor; client budget is asserted separately and must outlive it.
+        XCTAssertFalse(
+            RemoteCodeHostCatalog.rpcMethods.contains("agent.message.send"),
+            "agent send is the existing long local hop, not a catalog alias"
+        )
+        XCTAssertFalse(
+            RemoteCodeHostCatalog.rpcMethods.contains("workspace.list"),
+            "ordinary local RPC must stay on the short deadline"
+        )
+        XCTAssertTrue(
+            RemoteCodeHostCatalog.rpcMethods.contains(RemoteCodeHostCatalog.botSkillCreateRPC)
+        )
+        XCTAssertTrue(
+            RemoteCodeHostCatalog.rpcMethods.contains(RemoteCodeHostCatalog.botSkillViewRPC)
+        )
         let socketURL = URL(
             fileURLWithPath: "/tmp/rc2-u-agent-timeout-\(UUID().uuidString.prefix(8)).sock"
         )
@@ -376,14 +394,42 @@ final class UnixSocketServerTests: XCTestCase {
 
         let client = try connectUnix(path: socketURL.path)
         defer { Darwin.close(client) }
-        let request = Data((
-            #"{"jsonrpc":"2.0","id":"agent-long-start","method":"agent.message.send","params":{"thread_id":"00000000-0000-0000-0000-000000000001","text":"hi"}}"#
-                + "\n"
-        ).utf8)
-        try writeAll(fd: client, data: request)
+        let longDeadlineMethods = ["agent.message.send"] + RemoteCodeHostCatalog.rpcMethods.sorted()
+        XCTAssertGreaterThan(
+            longDeadlineMethods.count,
+            1,
+            "every named host-catalog RPC must receive the bounded longer deadline"
+        )
+        for method in longDeadlineMethods {
+            let request = Data((
+                #"{"jsonrpc":"2.0","id":"long-start","method":"\#(method)","params":{"thread_id":"00000000-0000-0000-0000-000000000001","text":"hi"}}"#
+                    + "\n"
+            ).utf8)
+            try writeAll(fd: client, data: request)
 
-        let response = try readLine(fd: client)
-        XCTAssertTrue(response.contains(#""status":"started""#))
+            let response = try readLine(fd: client)
+            XCTAssertTrue(
+                response.contains(#""status":"started""#),
+                "\(method) must outlive the short local deadline"
+            )
+        }
+
+        let ordinary = try connectUnix(path: socketURL.path)
+        defer { Darwin.close(ordinary) }
+        let diagnosticCursor = EventBus.shared.currentSeq
+        try writeAll(
+            fd: ordinary,
+            data: Data((#"{"jsonrpc":"2.0","id":"short","method":"workspace.list","params":{}}"# + "\n").utf8)
+        )
+        XCTAssertTrue(
+            waitForEOF(fd: ordinary, timeout: 1),
+            "ordinary local RPC must keep the short deadline"
+        )
+        let timedOut = await waitUntil(timeout: 1) {
+            EventBus.shared.recentEvents(since: diagnosticCursor, maxBytes: nil).events
+                .contains(where: { $0.kind == "diagnostic.unix_request_timeout" })
+        }
+        XCTAssertTrue(timedOut, "ordinary local RPC must still emit the Unix timeout diagnostic")
     }
 
     @MainActor

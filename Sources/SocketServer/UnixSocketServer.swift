@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CoreModel
 
 /// Pure helper: builds the `server.listener` EventBus event payload for the
 /// Unix-domain socket server. Mirrors `serverListenerEventPayload` in
@@ -26,7 +27,11 @@ public final class UnixSocketServer: @unchecked Sendable {
     static let maxConnectedClients = 64
     static let maxActiveRequests = 64
     private static let defaultLocalRequestTimeout: DispatchTimeInterval = .seconds(5)
-    private static let agentMessageSendLocalRequestTimeout: DispatchTimeInterval = .seconds(120)
+    /// Shared bounded longer Unix deadline for `agent.message.send` and every
+    /// host-catalog RPC. Ordinary local RPC keeps `defaultLocalRequestTimeout`.
+    private static let agentMessageSendLocalRequestTimeout: DispatchTimeInterval = .seconds(
+        Int(RemoteCodeHostCatalog.unixServerDeadline.rounded(.towardZero))
+    )
     private static let botPeerAskLocalRequestTimeout: DispatchTimeInterval = .seconds(600)
 
     public let socketPath: String
@@ -483,7 +488,8 @@ public final class UnixSocketServer: @unchecked Sendable {
         let requestTimeout: DispatchTimeInterval
         if req.method == "bot.peer.ask" {
             requestTimeout = Self.botPeerAskLocalRequestTimeout
-        } else if req.method == "agent.message.send" {
+        } else if req.method == "agent.message.send"
+            || RemoteCodeHostCatalog.usesUnixCatalogDeadline(req.method) {
             requestTimeout = agentMessageSendRequestTimeout
         } else {
             requestTimeout = localRequestTimeout

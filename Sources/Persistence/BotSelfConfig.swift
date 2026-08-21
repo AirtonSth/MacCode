@@ -526,6 +526,35 @@ public struct BotSelfConfigService: Sendable {
             "skill_id": slug,
             "path": path,
             "body": body,
+            "digest": RemoteCodeHostCatalog.bodyDigest(body),
+        ]
+    }
+
+    public func createSkill(skillID: String, body: String?) throws -> [String: Any] {
+        guard let bot = try store.get(id: callerBotID), bot.deletedAt == nil else {
+            throw BotSelfConfigError.notFound
+        }
+        guard let slug = BotHome.normalizeSkillSlug(skillID) else {
+            throw BotSelfConfigError.invalid("Skill id must be a catalog-style slug, not a path.")
+        }
+        let home = botHome(for: bot)
+        try home.ensure(
+            name: bot.name,
+            handle: bot.handle,
+            title: bot.title,
+            description: bot.description,
+            soul: ""
+        )
+        let path = try home.createOwnedSkill(slug: slug)
+        if let body {
+            try home.writeFile(relativePath: path, contents: body)
+        }
+        let written = try home.readFile(relativePath: path)
+        return [
+            "skill_id": slug,
+            "path": path,
+            "body": written,
+            "digest": RemoteCodeHostCatalog.bodyDigest(written),
         ]
     }
 

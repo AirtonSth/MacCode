@@ -78,6 +78,8 @@ final class BotSelfConfigTests: XCTestCase {
             BotSelfConfigCatalog.skillView,
             BotSelfConfigCatalog.recall,
             BotSelfConfigCatalog.askUser,
+            BotSelfConfigCatalog.listPeers,
+            BotSelfConfigCatalog.askPeer,
         ])
 
         let before = try service.call(name: BotSelfConfigCatalog.getSettings)

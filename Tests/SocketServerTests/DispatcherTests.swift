@@ -23,6 +23,67 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         workspaces.append(ws); window.workspaces.append(ws.id); window.selectedWorkspaceID = ws.id
         return ws
     }
+
+    func authenticateManagedHostCall(
+        threadID: AgentThreadID,
+        runID: AgentRunID,
+        delegationCapability: String?,
+        mutation: Bool,
+        method: String
+    ) throws {
+        _ = threadID; _ = runID; _ = mutation; _ = method
+        guard let delegationCapability, !delegationCapability.isEmpty else {
+            throw JSONRPCError(code: -32047, message: "Host catalog requires an authenticated active run.")
+        }
+    }
+
+    func createHostBot(
+        name: String,
+        title: String,
+        description: String,
+        handle: String?,
+        soul: String,
+        provider: AgentProvider,
+        model: String,
+        callerRun: AgentRunID
+    ) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot create")
+    }
+
+    func listHostBots() throws -> JSONValue {
+        .object(["bots": .array([])])
+    }
+
+    func openHostBot(botID: BotID) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot open")
+    }
+
+    func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot send")
+    }
+
+    func createHostBotThread(botID: BotID, title: String) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot thread create")
+    }
+
+    func createHostBotSkill(
+        botID: BotID,
+        skillID: String,
+        body: String?,
+        callerRun: AgentRunID,
+        callerThread: AgentThreadID
+    ) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot skill create")
+    }
+
+    func viewHostBotSkill(
+        botID: BotID,
+        skillID: String,
+        callerRun: AgentRunID,
+        callerThread: AgentThreadID
+    ) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot skill view")
+    }
     func selectWorkspace(_ id: WorkspaceID) throws { window.selectedWorkspaceID = id }
     func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws { workspaces.removeAll { $0.id == id } }
     func renameWorkspace(_ id: WorkspaceID, _ newName: String) throws {}

@@ -20,6 +20,7 @@ public enum BotSelfConfigMCPAdmit: Sendable {
         BotSelfConfigCatalog.getSettings,
         BotSelfConfigCatalog.setSettings,
     ].map { "mcp__\(serverName)__\($0)" }
+        + RemoteCodeHostCatalog.allowedClaudeTools(serverName: serverName)
 
     public static func stdioConfig(command: String) -> [String: Any] {
         [
@@ -71,6 +72,7 @@ public enum BotSelfConfigMCPAdmit: Sendable {
             BotPeerDelegation.threadEnvironmentKey,
             BotPeerDelegation.runEnvironmentKey,
             BotPeerDelegation.socketEnvironmentKey,
+            BotPeerDelegation.capabilityEnvironmentKey,
         ] {
             if let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
                !value.isEmpty {

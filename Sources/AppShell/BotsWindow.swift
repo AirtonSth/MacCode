@@ -14,11 +14,20 @@ public struct BotQueuedFollowUp: Equatable, Identifiable, Codable {
     public let id: UUID
     public var text: String
     public var attachments: [AgentAttachment]
+    /// Host-catalog sends pin the exact conversation they were accepted for.
+    /// Nil preserves the existing Desk queue behavior across older payloads.
+    public var conversationID: BotConversationID?
 
-    public init(id: UUID = UUID(), text: String, attachments: [AgentAttachment] = []) {
+    public init(
+        id: UUID = UUID(),
+        text: String,
+        attachments: [AgentAttachment] = [],
+        conversationID: BotConversationID? = nil
+    ) {
         self.id = id
         self.text = text
         self.attachments = attachments
+        self.conversationID = conversationID
     }
 }
 
@@ -1767,19 +1776,24 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
 
     private func settleConversation(_ conversation: BotConversation, run: AgentRun?) {
         let status = run?.status ?? .interrupted
+        let reason = run?.terminalReason
         var next = conversation
-        next.attentionState = BotsDeskFollowThrough.conversationState(for: status, viewingDesk: false)
+        next.attentionState = BotsDeskFollowThrough.conversationState(
+            for: status,
+            viewingDesk: false,
+            terminalReason: reason
+        )
         next.unread = status == .completed
         next.updatedAt = Date()
         do {
             try botStore.upsertConversation(next)
-            if let kind = BotsDeskFollowThrough.attentionKind(for: status) {
+            if let kind = BotsDeskFollowThrough.attentionKind(for: status, terminalReason: reason) {
                 try botStore.upsertAttention(
                     BotAttentionItem(
                         botID: next.botID,
                         conversationID: next.id,
                         kind: kind,
-                        title: status == .cancelled ? "Run cancelled" : "Run needs you",
+                        title: BotsDeskFollowThrough.attentionTitle(for: status, terminalReason: reason),
                         detail: run?.errorMessage ?? "The supervised turn ended without a clean completion."
                     )
                 )
@@ -3052,6 +3066,7 @@ public final class BotsViewModel: ObservableObject {
 
     public func reload() {
         refreshFlags()
+        repairLegacyUserStopAttentionIfNeeded()
         // Dest first. Remount dest used to scan every teammate's
         // conversations + recent messages before dest dested Chat.
         // Dest already has this teammate's thread and dest cache.
@@ -3585,12 +3600,8 @@ public final class BotsViewModel: ObservableObject {
             throw BotComputerGuestError.notReady
         }
         let desktop = resolvedDesktopKind(studioDraft.desktopKind)
-        // First Docker GUI publish still provisions. Later identity saves do not.
-        if desktop == .dockerDesktop,
-           let botID = studioDraft.botID,
-           publishedDesktop != .dockerDesktop {
-            try ensureDockerGuest(botID: botID)
-        }
+        let startsDockerGuest = desktop == .dockerDesktop
+            && publishedDesktop != .dockerDesktop
         let soul = BotStandingInstructions.resolved(
             name: name,
             title: studioDraft.title,
@@ -3650,6 +3661,9 @@ public final class BotsViewModel: ObservableObject {
             adoptPublishedRevision(published, bot: saved)
             syncPublishedHome(saved, revision: published)
             clearUnpublishedNewBot(botID)
+            if startsDockerGuest {
+                presentGuestDesktop(botID: botID)
+            }
             screen = .studio
             return saved
         }
@@ -3667,7 +3681,7 @@ public final class BotsViewModel: ObservableObject {
             desktopKind: desktop
         )
         if desktop == .dockerDesktop {
-            try ensureDockerGuest(botID: created.id)
+            presentGuestDesktop(botID: created.id)
         }
         beginEdit(created)
         clearUnpublishedNewBot(created.id)
@@ -3760,8 +3774,12 @@ public final class BotsViewModel: ObservableObject {
 
     public func delete(id: BotID, navigate: Bool = true) {
         do {
-            computerGuestService?.teardown(botID: id)
             try botStore.delete(id: id)
+            if let service = computerGuestService {
+                Task.detached { [service] in
+                    service.teardown(botID: id)
+                }
+            }
             let leaving = selectedBotID == id
             unpublishedNewBotIDs.remove(id)
             persistUnpublishedNewBotIDs()
@@ -3897,6 +3915,25 @@ public final class BotsViewModel: ObservableObject {
 
     public func stopDeskRun() {
         guard let threadID = selectedConversation?.linkedAgentThreadID else { return }
+        if isStopping {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.context.coordinator.stopAndAwaitTermination(threadId: threadID)
+                } catch {
+                    self.errorMessage = "Force stop: \(error.localizedDescription)"
+                }
+                if self.context.coordinator.activeRunId(threadId: threadID) == nil {
+                    self.isStopping = false
+                } else {
+                    self.isStopping = false
+                    if self.errorMessage == nil {
+                        self.errorMessage = "Stop is taking longer than expected. Try again or restart the agent."
+                    }
+                }
+            }
+            return
+        }
         isStopping = true
         do {
             try resolvedRouter()?.stopAgentRun(thread: threadID)
@@ -3945,55 +3982,88 @@ public final class BotsViewModel: ObservableObject {
             let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attached)
             let conversation = try persistUserMessage(bot: bot, text: display)
             appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: bot.id, conversationID: conversation.id)
-            // Dest first. Send used to listMemory/listSkillBindings
-            // after dest painted the bubble. Snapshot dest cache here
-            // so dest does not reread the brain.
-            let brain = destBrainInputs(for: bot)
-            lastSendUsedDestBrainForTesting = selectedBotID == bot.id
-            if let router = resolvedRouter(),
-               let revision = try currentRevision(for: bot) {
-                let routing = frozenDeskRouting(for: bot)
-                let prepared = try prepareSupervisedRun(
-                    bot: bot,
-                    conversation: conversation,
-                    routing: routing,
-                    router: router
-                )
-                beginDeskSendInFlight(for: bot.id)
-                Task { [weak self] in
-                    guard let self else { return }
-                    await Task.yield()
-                    let started = await self.startSupervisedRun(
-                        bot: bot,
-                        revision: revision,
-                        prepared: prepared,
-                        userText: message,
-                        attachments: attached,
-                        memoryFiles: brain.memoryFiles,
-                        skills: brain.skills,
-                        routines: brain.routines,
-                        router: router
-                    )
-                    self.clearDeskSendInFlight(for: bot.id)
-                    if let started {
-                        self.lastSendStartedProviderRun = true
-                        self.lastLinkedRunIDByBot[bot.id] = started.runID
-                        self.restoreDeskWorkLog(botID: bot.id)
-                        self.restoreDeskLiveTurn(botID: bot.id)
-                        _ = await self.followLinkedRun(bot: bot, started: started)
-                    } else {
-                        self.deskSendInFlightStartedAt = nil
-                        self.recordNeedsAttention(bot: bot, conversation: conversation, userText: message)
-                    }
-                }
-            } else {
-                recordNeedsAttention(bot: bot, conversation: conversation, userText: message)
-            }
+            _ = try enqueueSupervisedBotRun(
+                bot: bot,
+                conversation: conversation,
+                userText: message,
+                attachments: attached
+            )
             return true
         } catch {
             errorMessage = String(describing: error)
             return false
         }
+    }
+
+    /// Host-catalog Bot sends use the same persisted user line, compiled Bot
+    /// brain, routing, provider start, and follow-through as a Desk send. They
+    /// never change the user's currently selected Bot or conversation.
+    func enqueueHostMessage(
+        botID: BotID,
+        text: String,
+        conversationID: BotConversationID?
+    ) throws -> JSONValue {
+        guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
+            throw BotStoreError.notFound
+        }
+        let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { throw BotStoreError.invalidRow("message is empty") }
+        guard resolvedRouter() != nil, try currentRevision(for: bot) != nil else {
+            throw BotStoreError.invalidRow("Bot runtime is unavailable")
+        }
+        try admitDesktopSend(bot: bot)
+
+        if let conversationID {
+            guard let existing = try botStore.conversation(id: conversationID),
+                  existing.botID == bot.id else {
+                throw BotStoreError.notFound
+            }
+            if let threadID = existing.linkedAgentThreadID,
+               context.coordinator.activeRunId(threadId: threadID) != nil {
+                enqueueFollowUp(
+                    BotQueuedFollowUp(text: message, conversationID: existing.id),
+                    botID: bot.id
+                )
+                return .object([
+                    "bot_id": .string(bot.id.value.uuidString.lowercased()),
+                    "conversation_id": .string(existing.id.value.uuidString.lowercased()),
+                    "thread_id": .string(threadID.value.uuidString.lowercased()),
+                    "run_id": .null,
+                    "enqueued": .bool(true),
+                    "queued_follow_up": .bool(true),
+                ])
+            }
+        }
+
+        let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: [])
+        let conversation = try persistUserMessage(
+            bot: bot,
+            text: display,
+            adoptSelection: false,
+            createNew: conversationID == nil,
+            conversationID: conversationID
+        )
+        appendDeskMessage(
+            BotDeskMessage(role: .user, text: display),
+            botID: bot.id,
+            conversationID: conversation.id
+        )
+        guard let prepared = try enqueueSupervisedBotRun(
+            bot: bot,
+            conversation: conversation,
+            userText: message,
+            attachments: []
+        ) else {
+            throw BotStoreError.invalidRow("Bot runtime is unavailable")
+        }
+        return .object([
+            "bot_id": .string(bot.id.value.uuidString.lowercased()),
+            "conversation_id": .string(prepared.conversation.id.value.uuidString.lowercased()),
+            "thread_id": .string(prepared.thread.id.value.uuidString.lowercased()),
+            "run_id": .string(prepared.runID.value.uuidString.lowercased()),
+            "enqueued": .bool(true),
+            "queued_follow_up": .bool(false),
+        ])
     }
 
     public func addSkill() {
@@ -4246,20 +4316,29 @@ public final class BotsViewModel: ObservableObject {
         homeFilesModel?.close()
         homeFilesModel = nil
         homeFilesRouter = nil
-        computerGuestService?.teardown(botID: bot.id)
         guestScreenURLByBot[bot.id.value] = nil
         guestRunningByBot[bot.id.value] = nil
         guestLaunchStateByBot[bot.id.value] = nil
         if selectedBotID == bot.id {
             lastGuestScreenURL = nil
         }
-        do {
-            _ = try BotGuestHome.ensure(appSupport: context.appSupportDirectory, botID: bot.id)
-            attachHomeFilesSurface(for: bot)
-        } catch {
-            errorMessage = String(describing: error)
-        }
         objectWillChange.send()
+        let service = computerGuestService
+        let appSupport = context.appSupportDirectory
+        Task.detached { [weak self, service] in
+            service?.teardown(botID: bot.id)
+            do {
+                _ = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id)
+                await MainActor.run {
+                    guard let self, self.selectedBotID == bot.id else { return }
+                    self.attachHomeFilesSurface(for: bot)
+                }
+            } catch {
+                await MainActor.run {
+                    self?.errorMessage = String(describing: error)
+                }
+            }
+        }
     }
 
     var homeFilesRouterForTesting: BotHomeFilesRouter? { homeFilesRouter }
@@ -6258,6 +6337,10 @@ public final class BotsViewModel: ObservableObject {
            let stored = try? context.messageRepo.listRecent(threadId: threadID, limit: 80),
            !stored.isEmpty {
             deskMessageRestoreCountForTesting += 1
+            let askedBotHandoff = conversation.flatMap { conversation in
+                peerHandoffs.values.first { $0.peerConversationID == conversation.id }
+            }
+            var hidAskedBotProviderPrompt = false
             persisted = stored.compactMap { message -> BotDeskMessage? in
                 let role: BotDeskMessage.Role
                 var text: String
@@ -6266,6 +6349,14 @@ public final class BotsViewModel: ObservableObject {
                     role = .user
                     text = BotsDeskFollowThrough.displayUserText(from: message.content)
                     if BotPeerTranscript.isHostHopUserText(text) { return nil }
+                    if !hidAskedBotProviderPrompt,
+                       let askedBotHandoff,
+                       text == askedBotHandoff.outboundText {
+                        // The peer thread persists its compiled provider input.
+                        // Desk paints the same ask below with From-host chrome.
+                        hidAskedBotProviderPrompt = true
+                        return nil
+                    }
                     if BotPeerTranscript.isPeerAskUserText(text) {
                         if let conversation, peerHandoffs.values.contains(where: {
                             $0.peerConversationID == conversation.id
@@ -6484,10 +6575,17 @@ public final class BotsViewModel: ObservableObject {
         bot: BotDefinition,
         text: String,
         adoptSelection: Bool = true,
-        createNew: Bool = false
+        createNew: Bool = false,
+        conversationID: BotConversationID? = nil
     ) throws -> BotConversation {
         var conversation: BotConversation
-        if createNew {
+        if let conversationID {
+            guard let requested = try botStore.conversation(id: conversationID),
+                  requested.botID == bot.id else {
+                throw BotStoreError.notFound
+            }
+            conversation = requested
+        } else if createNew {
             conversation = BotConversation(
                 botID: bot.id,
                 title: Self.titleFromFirstMessage(text)
@@ -6768,6 +6866,60 @@ public final class BotsViewModel: ObservableObject {
         )
     }
 
+    @discardableResult
+    private func enqueueSupervisedBotRun(
+        bot: BotDefinition,
+        conversation: BotConversation,
+        userText: String,
+        attachments: [AgentAttachment]
+    ) throws -> BotStartedRun? {
+        // Dest first. Send used to listMemory/listSkillBindings after the
+        // bubble painted. Both Desk and host-catalog sends snapshot the same
+        // cached brain before starting the provider.
+        let brain = destBrainInputs(for: bot)
+        lastSendUsedDestBrainForTesting = selectedBotID == bot.id
+        guard let router = resolvedRouter(),
+              let revision = try currentRevision(for: bot) else {
+            recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
+            return nil
+        }
+        let routing = frozenDeskRouting(for: bot)
+        let prepared = try prepareSupervisedRun(
+            bot: bot,
+            conversation: conversation,
+            routing: routing,
+            router: router
+        )
+        beginDeskSendInFlight(for: bot.id)
+        Task { [weak self] in
+            guard let self else { return }
+            await Task.yield()
+            let started = await self.startSupervisedRun(
+                bot: bot,
+                revision: revision,
+                prepared: prepared,
+                userText: userText,
+                attachments: attachments,
+                memoryFiles: brain.memoryFiles,
+                skills: brain.skills,
+                routines: brain.routines,
+                router: router
+            )
+            self.clearDeskSendInFlight(for: bot.id)
+            if let started {
+                self.lastSendStartedProviderRun = true
+                self.lastLinkedRunIDByBot[bot.id] = started.runID
+                self.restoreDeskWorkLog(botID: bot.id)
+                self.restoreDeskLiveTurn(botID: bot.id)
+                _ = await self.followLinkedRun(bot: bot, started: started)
+            } else {
+                self.deskSendInFlightStartedAt = nil
+                self.recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
+            }
+        }
+        return prepared
+    }
+
     private func startSupervisedRun(
         bot: BotDefinition,
         revision: BotRevision,
@@ -6993,6 +7145,55 @@ public final class BotsViewModel: ObservableObject {
         syncQueuedFollowUps()
     }
 
+    /// Host sends are accepted for an exact conversation even when the user is
+    /// looking at another Bot. Drain those after that conversation's terminal
+    /// transition without borrowing selection/composer state from the UI.
+    private func drainHostQueuedFollowUp(
+        bot: BotDefinition,
+        conversation: BotConversation
+    ) {
+        guard let index = queuedFollowUpsByBot[bot.id]?.firstIndex(where: {
+            $0.conversationID == conversation.id
+        }), let next = queuedFollowUpsByBot[bot.id]?[index] else { return }
+        if let threadID = conversation.linkedAgentThreadID,
+           context.coordinator.activeRunId(threadId: threadID) != nil {
+            return
+        }
+        do {
+            try admitDesktopSend(bot: bot)
+            let display = AgentChatTranscriptChrome.displayUserLine(
+                text: next.text,
+                attachments: next.attachments
+            )
+            let target = try persistUserMessage(
+                bot: bot,
+                text: display,
+                adoptSelection: false,
+                conversationID: conversation.id
+            )
+            appendDeskMessage(
+                BotDeskMessage(role: .user, text: display),
+                botID: bot.id,
+                conversationID: target.id
+            )
+            _ = try enqueueSupervisedBotRun(
+                bot: bot,
+                conversation: target,
+                userText: next.text,
+                attachments: next.attachments
+            )
+        } catch {
+            errorMessage = String(describing: error)
+            return
+        }
+        queuedFollowUpsByBot[bot.id]?.removeAll { $0.id == next.id }
+        if queuedFollowUpsByBot[bot.id]?.isEmpty == true {
+            queuedFollowUpsByBot[bot.id] = nil
+        }
+        persistQueuedFollowUps()
+        syncQueuedFollowUps()
+    }
+
     private func applyFollowThrough(
         bot: BotDefinition,
         conversation: BotConversation,
@@ -7010,8 +7211,13 @@ public final class BotsViewModel: ObservableObject {
         restoreDeskLiveTurn(botID: bot.id)
         refreshPublishedIdentity(for: bot.id)
         let status = run?.status ?? .interrupted
+        let reason = run?.terminalReason
         let viewingDesk = isViewing(bot.id)
-        next.attentionState = BotsDeskFollowThrough.conversationState(for: status, viewingDesk: viewingDesk)
+        next.attentionState = BotsDeskFollowThrough.conversationState(
+            for: status,
+            viewingDesk: viewingDesk,
+            terminalReason: reason
+        )
         if viewingDesk {
             next.unread = false
         } else if status == .completed {
@@ -7026,12 +7232,12 @@ public final class BotsViewModel: ObservableObject {
             // state; dest must not scan the fleet to settle.
             try botStore.upsertConversation(next)
             adoptFollowThroughConversation(next)
-            if let kind = BotsDeskFollowThrough.attentionKind(for: status) {
+            if let kind = BotsDeskFollowThrough.attentionKind(for: status, terminalReason: reason) {
                 let item = BotAttentionItem(
                     botID: bot.id,
                     conversationID: next.id,
                     kind: kind,
-                    title: status == .cancelled ? "Run cancelled" : "Run needs you",
+                    title: BotsDeskFollowThrough.attentionTitle(for: status, terminalReason: reason),
                     detail: run?.errorMessage ?? "The supervised turn ended without a clean completion."
                 )
                 try botStore.upsertAttention(item)
@@ -7049,6 +7255,7 @@ public final class BotsViewModel: ObservableObject {
         clearDeskSendInFlight(for: bot.id)
         if BotsDeskFollowThrough.isTerminal(status) {
             deskSendInFlightStartedAt = nil
+            drainHostQueuedFollowUp(bot: bot, conversation: next)
             if isViewing(bot.id) {
                 drainQueuedFollowUp()
             }
@@ -7118,28 +7325,12 @@ public final class BotsViewModel: ObservableObject {
         objectWillChange.send()
     }
 
-    func ensureDockerGuest(botID: BotID) throws {
-        if dockerGuestReadyOverrideForTesting != nil { return }
-        guard let service = computerGuestService else {
-            errorMessage = "Docker desktop is not ready."
-            throw BotComputerGuestError.notReady
-        }
-        do {
-            let ready = try service.provision(botID: botID)
-            let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
-            rememberGuestScreen(url: url, botID: botID, running: true)
-        } catch {
-            errorMessage = "Docker desktop is not ready."
-            throw BotComputerGuestError.notReady
-        }
-    }
-
     func presentGuestDesktop(botID: BotID) {
         guard guestLaunchState(for: botID) != .starting else { return }
         guard dockerGuestReadyOverrideForTesting == nil,
               let service = computerGuestService else {
             guestLaunchStateByBot[botID.value] = .failed(
-                "Docker is unavailable. Start Docker, then try again."
+                BotComputerDockerError.cliMissing.description
             )
             return
         }
@@ -7156,7 +7347,8 @@ public final class BotsViewModel: ObservableObject {
                     self.dockerGuestProbeReason = String(describing: error)
                     self.guestRunningByBot[botID.value] = false
                     self.guestLaunchStateByBot[botID.value] = .failed(
-                        "Could not start the Linux desktop. Make sure Docker is running, then try again."
+                        (error as? BotComputerDockerError)?.description
+                            ?? BotComputerDockerError.provisioningFailed.description
                     )
                     self.objectWillChange.send()
                 }
@@ -7166,13 +7358,19 @@ public final class BotsViewModel: ObservableObject {
 
     func stopDockerGuest(botID: BotID) {
         guard let service = computerGuestService else { return }
-        do {
-            try service.stop(botID: botID)
-            guestRunningByBot[botID.value] = false
-            guestLaunchStateByBot[botID.value] = .idle
-            objectWillChange.send()
-        } catch {
-            errorMessage = "Could not stop the Linux desktop."
+        Task.detached { [service] in
+            do {
+                try service.stop(botID: botID)
+                await MainActor.run {
+                    self.guestRunningByBot[botID.value] = false
+                    self.guestLaunchStateByBot[botID.value] = .idle
+                    self.objectWillChange.send()
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorMessage = "Could not stop the Linux desktop."
+                }
+            }
         }
     }
 
@@ -7209,8 +7407,9 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func admitDesktopSend(bot: BotDefinition) throws {
+        let revision = try currentRevision(for: bot)
         let kind = desktopKindOverrideForTesting
-            ?? resolvedDesktopKind(selectedRevision?.desktopKind ?? .logicalExecutionSpace)
+            ?? resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace)
         let ready: Bool
         if let dockerGuestReadyOverrideForTesting {
             ready = dockerGuestReadyOverrideForTesting
@@ -7288,6 +7487,18 @@ public final class BotsViewModel: ObservableObject {
         reloadActiveBotsScreen()
     }
 
+    private func repairLegacyUserStopAttentionIfNeeded() {
+        let proofs = (try? context.coordinator.terminalTransitionLedger?.records(reason: .userStop))?.map {
+            BotStore.LegacyUserStopLedgerProof(
+                runId: $0.runId,
+                threadId: $0.threadId,
+                eventTime: $0.eventTime,
+                reason: $0.reason.rawValue
+            )
+        } ?? []
+        try? botStore.repairLegacyUserStopAttention(proofs: proofs)
+    }
+
     private var isSettlingTerminalWorking = false
 
     private func settleTerminalWorkingConversations() {
@@ -7327,7 +7538,8 @@ public final class BotsViewModel: ObservableObject {
     func applyFollowThroughForTests(
         bot: BotDefinition,
         conversation: BotConversation,
-        status: AgentRunStatus
+        status: AgentRunStatus,
+        terminalReason: String? = nil
     ) {
         applyFollowThrough(
             bot: bot,
@@ -7337,7 +7549,8 @@ public final class BotsViewModel: ObservableObject {
                 provider: .claude,
                 model: "test",
                 status: status,
-                finishedAt: Date()
+                finishedAt: Date(),
+                terminalReason: terminalReason
             )
         )
     }
@@ -9003,59 +9216,105 @@ public struct BotsRootView: View {
     }
 
     private func deskTimeline(_ bot: BotDefinition) -> some View {
-        AgentChatTimelineScrollContainer(
+        let items = vm.deskTimeline
+        let liveTurnItemCount = vm.deskLiveTimeline.turns.reduce(0) { $0 &+ $1.items.count }
+        return AgentChatTimelineScrollContainer(
             rejoinToken: vm.deskTimelineRejoinToken,
-            followToken: vm.deskTimeline.count
+            followToken: items.count
                 &+ (vm.deskShowsLoading ? 1 : 0)
                 &+ (vm.deskRunIsLive ? 2 : 0)
-                &+ vm.deskLiveTimeline.turns.reduce(0) { $0 &+ $1.items.count },
+                &+ liveTurnItemCount,
             scrollToBottomIdentifier: "bots.desk.scrollToBottom",
             accessibilityIdentifier: "bots.desk.timeline",
             horizontalPadding: DS.Space.xxl,
             verticalPadding: DS.Space.xl,
             columnGutter: AgentChatTranscriptChrome.userMessageBubbleLeadingGutter
         ) { columnWidth in
-            LazyVStack(alignment: .leading, spacing: DS.Space.xl) {
-                if vm.deskTimeline.isEmpty {
-                    Text("Message \(bot.name) to give it a first task.")
-                        .font(DS.Font.body)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.top, DS.Space.xl)
-                }
-                ForEach(Array(vm.deskTimeline.enumerated()), id: \.element.id) { index, item in
-                    deskPeerGroupHeader(at: index)
-                    switch item {
-                    case .message(let message):
-                        deskBubble(message, columnWidth: columnWidth)
-                    case .workLog(let row):
-                        deskWorkLogRow(row)
-                    case .liveTurn(let turn, let hideAssistantOutput):
-                        AgentChatLiveTurnView(
-                            turn: turn,
-                            live: vm.deskRunIsLive && !turn.finished,
-                            hideAssistantOutput: hideAssistantOutput
-                        )
-                    case .liveTurnSegment(let segment, let hideAssistantOutput):
-                        AgentChatLiveTurnView(
-                            turn: segment.snapshot,
-                            live: vm.deskRunIsLive && !segment.snapshot.finished,
-                            hideAssistantOutput: hideAssistantOutput,
-                            showsWorkHeader: segment.isFirst || segment.snapshot.finished
+            // Short self-sizing Desk histories stay mounted. Always-Lazy
+            // placement of tall text rows can cycle in AttributeGraph and
+            // starve host-catalog MainActor hops.
+            if AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: items.count) {
+                LazyVStack(alignment: .leading, spacing: DS.Space.xl) {
+                    if items.isEmpty {
+                        deskTimelineEmptyState(bot)
+                    }
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                        deskTimelineEntry(
+                            item,
+                            index: index,
+                            items: items,
+                            columnWidth: columnWidth
                         )
                     }
+                    deskTimelineStatusChrome()
                 }
-                if vm.deskShowsLoading {
-                    AgentChatLoadingStatusStrip()
-                } else if vm.deskRunIsLive, let started = vm.deskWorkingStartedAt() {
-                    AgentChatWorkingStatusStrip(
-                        startedAt: started,
-                        isStopping: vm.isStopping,
-                        context: vm.deskWorkingContext,
-                        onStop: { vm.stopDeskRun() }
-                    )
+            } else {
+                VStack(alignment: .leading, spacing: DS.Space.xl) {
+                    if items.isEmpty {
+                        deskTimelineEmptyState(bot)
+                    }
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                        deskTimelineEntry(
+                            item,
+                            index: index,
+                            items: items,
+                            columnWidth: columnWidth
+                        )
+                    }
+                    deskTimelineStatusChrome()
                 }
             }
+        }
+    }
+
+    private func deskTimelineEmptyState(_ bot: BotDefinition) -> some View {
+        Text("Message \(bot.name) to give it a first task.")
+            .font(DS.Font.body)
+            .foregroundColor(DS.Palette.textTertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, DS.Space.xl)
+    }
+
+    @ViewBuilder
+    private func deskTimelineEntry(
+        _ item: BotDeskTimelineItem,
+        index: Int,
+        items: [BotDeskTimelineItem],
+        columnWidth: CGFloat
+    ) -> some View {
+        deskPeerGroupHeader(at: index, items: items)
+        switch item {
+        case .message(let message):
+            deskBubble(message, columnWidth: columnWidth)
+        case .workLog(let row):
+            deskWorkLogRow(row)
+        case .liveTurn(let turn, let hideAssistantOutput):
+            AgentChatLiveTurnView(
+                turn: turn,
+                live: vm.deskRunIsLive && !turn.finished,
+                hideAssistantOutput: hideAssistantOutput
+            )
+        case .liveTurnSegment(let segment, let hideAssistantOutput):
+            AgentChatLiveTurnView(
+                turn: segment.snapshot,
+                live: vm.deskRunIsLive && !segment.snapshot.finished,
+                hideAssistantOutput: hideAssistantOutput,
+                showsWorkHeader: AgentChatLiveTurnChrome.showsWorkHeader(for: segment)
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func deskTimelineStatusChrome() -> some View {
+        if vm.deskShowsLoading {
+            AgentChatLoadingStatusStrip()
+        } else if vm.deskRunIsLive, let started = vm.deskWorkingStartedAt() {
+            AgentChatWorkingStatusStrip(
+                startedAt: started,
+                isStopping: vm.isStopping,
+                context: vm.deskWorkingContext,
+                onStop: { vm.stopDeskRun() }
+            )
         }
     }
 
@@ -9109,8 +9368,7 @@ public struct BotsRootView: View {
     }
 
     @ViewBuilder
-    private func deskPeerGroupHeader(at index: Int) -> some View {
-        let items = vm.deskTimeline
+    private func deskPeerGroupHeader(at index: Int, items: [BotDeskTimelineItem]) -> some View {
         if items.indices.contains(index),
            case .message(let message) = items[index],
            let peer = message.peer {

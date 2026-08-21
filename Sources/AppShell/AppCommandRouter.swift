@@ -2488,11 +2488,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
+    private var hostCatalogCreatedBots: [AgentRunID: Set<BotID>] = [:]
+
     public func listBotPeers(
         callerThread: AgentThreadID,
-        callerRun: AgentRunID
+        callerRun: AgentRunID,
+        delegationCapability: String? = nil
     ) throws -> JSONValue {
-        let ctx = try validatedBotPeerCaller(threadID: callerThread, runID: callerRun)
+        let ctx = try validatedBotPeerCaller(
+            threadID: callerThread,
+            runID: callerRun,
+            delegationCapability: delegationCapability,
+            mutation: false,
+            method: "bot.peer.list"
+        )
         return .object([
             "bots": .array(try ctx.botStore.list().map { bot in
                 .object([
@@ -2510,9 +2519,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         callerRun: AgentRunID,
         handle: String,
         prompt: String,
-        replyMode: BotPeerDelegation.ReplyMode
+        replyMode: BotPeerDelegation.ReplyMode,
+        delegationCapability: String? = nil
     ) async throws -> JSONValue {
-        let ctx = try validatedBotPeerCaller(threadID: callerThread, runID: callerRun)
+        let ctx = try validatedBotPeerCaller(
+            threadID: callerThread,
+            runID: callerRun,
+            delegationCapability: delegationCapability,
+            mutation: false,
+            method: "bot.peer.ask"
+        )
         guard let normalizedHandle = BotHandle.normalize(handle),
               let peer = try ctx.botStore.list().first(where: { $0.handle == normalizedHandle }) else {
             throw JSONRPCError(code: -32044, message: "RemoteCode Bot @\(handle) was not found.")
@@ -2560,9 +2576,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         callerThread: AgentThreadID,
         callerRun: AgentRunID,
         toolName: String,
-        arguments: [String: JSONValue]
+        arguments: [String: JSONValue],
+        delegationCapability: String? = nil
     ) throws -> JSONValue {
-        let ctx = try validatedBotPeerCaller(threadID: callerThread, runID: callerRun)
+        let ctx = try validatedBotPeerCaller(
+            threadID: callerThread,
+            runID: callerRun,
+            delegationCapability: delegationCapability,
+            mutation: false,
+            method: "bot.peer.self_config"
+        )
         guard toolName == BotSelfConfigCatalog.getSettings
                 || toolName == BotSelfConfigCatalog.setSettings else {
             throw JSONRPCError(code: -32602, message: "Tool is not available through a delegated Bot grant.")
@@ -2595,16 +2618,262 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func validatedBotPeerCaller(
         threadID: AgentThreadID,
-        runID: AgentRunID
+        runID: AgentRunID,
+        delegationCapability: String?,
+        mutation: Bool,
+        method: String
     ) throws -> AppContext {
         guard let ctx = context,
-              let thread = try ctx.threadRepo.get(id: threadID) else {
+              try ctx.threadRepo.get(id: threadID) != nil else {
             throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.")
         }
-        guard ctx.coordinator.activeRunId(threadId: thread.id) == runID else {
-            throw JSONRPCError(code: -32047, message: "Bot delegation is limited to the exact active primary run.")
-        }
+        try authenticateManagedHostCall(
+            threadID: threadID,
+            runID: runID,
+            delegationCapability: delegationCapability,
+            mutation: mutation,
+            method: method
+        )
         return ctx
+    }
+
+    public func authenticateManagedHostCall(
+        threadID: AgentThreadID,
+        runID: AgentRunID,
+        delegationCapability: String?,
+        mutation: Bool,
+        method: String
+    ) throws {
+        guard let ctx = context else {
+            throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.")
+        }
+        let runIDText = runID.value.uuidString.lowercased()
+        let threadIDText = threadID.value.uuidString.lowercased()
+        if RemoteCodeHostCatalog.rpcMethods.contains(method),
+           !SettingsStore(db: ctx.db).load().botControlPlaneFlags.isBotControlPlaneActive {
+            RemoteCodeHostCatalogDiagnostics.authorization(
+                decision: "control_plane_off",
+                method: method,
+                runID: runIDText,
+                threadID: threadIDText
+            )
+            throw JSONRPCError(code: -32049, message: "Bot control plane is off.")
+        }
+        guard let capability = delegationCapability?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !capability.isEmpty else {
+            RemoteCodeHostCatalogDiagnostics.authorization(
+                decision: "missing_capability",
+                method: method,
+                runID: runIDText,
+                threadID: threadIDText
+            )
+            throw JSONRPCError(
+                code: -32047,
+                message: "Host catalog requires an authenticated active run."
+            )
+        }
+        let receipt: AgentOrchestrationAdmissionReceipt?
+        do {
+            receipt = try ctx.orchestrationRuntime.activeReceipt(
+                runId: runID,
+                threadId: threadID,
+                delegationCapability: capability
+            )
+        } catch {
+            RemoteCodeHostCatalogDiagnostics.authorization(
+                decision: "receipt_lookup_failed",
+                method: method,
+                runID: runIDText,
+                threadID: threadIDText
+            )
+            throw JSONRPCError(
+                code: -32047,
+                message: "Host catalog requires an authenticated active run."
+            )
+        }
+        guard let receipt else {
+            RemoteCodeHostCatalogDiagnostics.authorization(
+                decision: "inactive_or_mismatched_receipt",
+                method: method,
+                runID: runIDText,
+                threadID: threadIDText
+            )
+            throw JSONRPCError(
+                code: -32047,
+                message: "Host catalog requires an authenticated active run."
+            )
+        }
+        if mutation, receipt.permissionMode != .fullAccess {
+            RemoteCodeHostCatalogDiagnostics.authorization(
+                decision: "captured_permission_denied",
+                method: method,
+                runID: runIDText,
+                threadID: threadIDText,
+                receiptID: receipt.id.uuidString.lowercased(),
+                permission: receipt.permissionMode.rawValue
+            )
+            throw JSONRPCError(
+                code: -32048,
+                message: "Host catalog mutations require the captured fullAccess permission."
+            )
+        }
+        RemoteCodeHostCatalogDiagnostics.authorization(
+            decision: mutation ? "authorized_mutation" : "authorized_read",
+            method: method,
+            runID: runIDText,
+            threadID: threadIDText,
+            receiptID: receipt.id.uuidString.lowercased(),
+            permission: receipt.permissionMode.rawValue
+        )
+    }
+
+    public func createHostBot(
+        name: String,
+        title: String,
+        description: String,
+        handle: String?,
+        soul: String,
+        provider: AgentProvider,
+        model: String,
+        callerRun: AgentRunID
+    ) throws -> JSONValue {
+        guard let ctx = context else { throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.") }
+        let resolvedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? BotsViewModel.defaultModel(for: provider)
+            : model
+        let bot = try ctx.botStore.create(
+            name: name,
+            title: title,
+            description: description,
+            handle: handle,
+            soul: soul,
+            provider: provider,
+            model: resolvedModel,
+            workspaceID: ctx.state.window.selectedWorkspaceID
+        )
+        let home = BotHome(appSupportDirectory: ctx.appSupportDirectory, bot: bot)
+        try? home.ensure(
+            name: bot.name,
+            handle: bot.handle,
+            title: bot.title,
+            description: bot.description,
+            soul: soul
+        )
+        hostCatalogCreatedBots[callerRun, default: []].insert(bot.id)
+        botsViewModel?.reload()
+        return Self.hostBotJSON(bot)
+    }
+
+    public func listHostBots() throws -> JSONValue {
+        guard let ctx = context else { throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.") }
+        return .object([
+            "bots": .array(try ctx.botStore.list().map(Self.hostBotJSON)),
+        ])
+    }
+
+    public func openHostBot(botID: BotID) throws -> JSONValue {
+        let opened = try openBotsDesk(botID: botID)
+        return .object([
+            "bot_id": .string(botID.value.uuidString.lowercased()),
+            "opened": .bool(opened),
+        ])
+    }
+
+    public func sendHostBot(
+        botID: BotID,
+        text: String,
+        conversationID: BotConversationID?
+    ) async throws -> JSONValue {
+        guard let botsViewModel else {
+            throw JSONRPCError(code: -32045, message: "RemoteCode Bot runtime is unavailable.")
+        }
+        return try botsViewModel.enqueueHostMessage(
+            botID: botID,
+            text: text,
+            conversationID: conversationID
+        )
+    }
+
+    public func createHostBotThread(botID: BotID, title: String) throws -> JSONValue {
+        guard let ctx = context else { throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.") }
+        guard let bot = try ctx.botStore.get(id: botID), bot.deletedAt == nil else {
+            throw JSONRPCError(code: -32044, message: "RemoteCode Bot was not found.")
+        }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: trimmed.isEmpty ? "New thread" : trimmed
+        )
+        try ctx.botStore.upsertConversation(conversation)
+        botsViewModel?.reload()
+        return .object([
+            "bot_id": .string(bot.id.value.uuidString.lowercased()),
+            "conversation_id": .string(conversation.id.value.uuidString.lowercased()),
+            "title": .string(conversation.title),
+        ])
+    }
+
+    public func createHostBotSkill(
+        botID: BotID,
+        skillID: String,
+        body: String?,
+        callerRun: AgentRunID,
+        callerThread: AgentThreadID
+    ) throws -> JSONValue {
+        let target = try authorizedHostSkillBot(botID: botID, callerRun: callerRun, callerThread: callerThread)
+        guard let ctx = context else { throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.") }
+        let environment = [
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": ctx.appSupportDirectory.path,
+            BotSelfConfigCatalog.callerEnvironmentKey: target.value.uuidString.lowercased(),
+        ]
+        let service = try BotSelfConfigService.make(environment: environment, store: ctx.botStore)
+        let result = try service.createSkill(skillID: skillID, body: body)
+        botsViewModel?.reload()
+        return JSONValue.from(result)
+    }
+
+    public func viewHostBotSkill(
+        botID: BotID,
+        skillID: String,
+        callerRun: AgentRunID,
+        callerThread: AgentThreadID
+    ) throws -> JSONValue {
+        let target = try authorizedHostSkillBot(botID: botID, callerRun: callerRun, callerThread: callerThread)
+        guard let ctx = context else { throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.") }
+        let environment = [
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": ctx.appSupportDirectory.path,
+            BotSelfConfigCatalog.callerEnvironmentKey: target.value.uuidString.lowercased(),
+        ]
+        let service = try BotSelfConfigService.make(environment: environment, store: ctx.botStore)
+        return JSONValue.from(try service.viewSkill(skillID: skillID))
+    }
+
+    private func authorizedHostSkillBot(
+        botID: BotID,
+        callerRun: AgentRunID,
+        callerThread: AgentThreadID
+    ) throws -> BotID {
+        if let context,
+           let conversation = try context.botStore.conversationLinked(to: callerThread),
+           conversation.botID == botID {
+            return botID
+        }
+        if hostCatalogCreatedBots[callerRun]?.contains(botID) == true {
+            return botID
+        }
+        throw JSONRPCError(
+            code: -32046,
+            message: "This active run has no matching Bot grant."
+        )
+    }
+
+    private nonisolated static func hostBotJSON(_ bot: BotDefinition) -> JSONValue {
+        .object([
+            "id": .string(bot.id.value.uuidString.lowercased()),
+            "handle": .string(bot.handle),
+            "name": .string(bot.name),
+            "title": .string(bot.title),
+        ])
     }
 
     private nonisolated static func botPeerFoundationValue(_ value: JSONValue) -> Any {

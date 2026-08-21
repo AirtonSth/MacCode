@@ -681,9 +681,11 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Change your handle")
-        XCTAssertTrue(receipt.compiledPayload.contains("You are Piper. Role: Scout."))
+        XCTAssertEqual(
+            receipt.compiledPayload.split(separator: "\n").first.map(String.init),
+            "You are Piper. Role: Scout. Avatar: Person."
+        )
         XCTAssertFalse(receipt.compiledPayload.contains(BotBrainCompiler.handleCreateOnlyHonesty))
-        XCTAssertFalse(receipt.compiledPayload.contains("@"))
     }
 
     func test_roleHonestyCompilesForCustomSoul_becauseStudioRoleIsNotAnEscapeHatch() {

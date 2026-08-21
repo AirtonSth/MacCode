@@ -27,7 +27,11 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
             ))
             let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
             let names = tools.compactMap { $0["name"] as? String }
-            XCTAssertEqual(Set(names), Set(BotSelfConfigCatalog.toolNames))
+            XCTAssertEqual(
+                Set(names),
+                Set(BotSelfConfigCatalog.toolNames + RemoteCodeHostCatalog.toolNames)
+            )
+            XCTAssertFalse(names.contains(RemoteCodeHostCatalog.genericHostCallTool))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.getSettings))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.setSettings))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.writeHomeFile))
@@ -35,6 +39,9 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.saveRoutine))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.listPeers))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.askPeer))
+            for tool in RemoteCodeHostCatalog.toolNames {
+                XCTAssertTrue(names.contains(tool), "host catalog must advertise \(tool)")
+            }
 
             let askPeer = try XCTUnwrap(tools.first {
                 ($0["name"] as? String) == BotSelfConfigCatalog.askPeer
@@ -84,7 +91,10 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
 
         let listed = try parse(server.handle(#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
         let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), Set(BotSelfConfigCatalog.toolNames))
+        XCTAssertEqual(
+            Set(tools.compactMap { $0["name"] as? String }),
+            Set(BotSelfConfigCatalog.toolNames + RemoteCodeHostCatalog.toolNames)
+        )
 
         let payload: [String: Any] = [
             "jsonrpc": "2.0",

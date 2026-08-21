@@ -1,10 +1,12 @@
 import CryptoKit
 import Foundation
 import Persistence
+import CoreModel
 
 public enum HostMutationContract {
     public static let transportParamKeys: Set<String> = [
         "client_request_id", "connection_id", "expected_host_id", "expected_boot_epoch",
+        BotPeerDelegation.capabilityRPCParameterKey,
     ]
 
     public static let methods: Set<String> = Set("""
@@ -63,8 +65,6 @@ public enum HostMutationContract {
     agent.attachment.upload
     agent.attachment.import
     agent.provider.update
-    bot.peer.ask
-    bot.peer.self_config
     fs.workspace.create_file
     fs.workspace.delete
     fs.workspace.rename
@@ -135,8 +135,16 @@ public enum HostMutationContract {
         case pushTokenContract
     }
 
+    /// Private managed-provider mutations reuse the same syntactic and durable
+    /// receipt machinery, but they are not part of the public HTTP Phase 4
+    /// catalog. Only the authenticated Unix entry point may route them here.
+    private static let managedProviderMutationMethods =
+        RemoteCodeHostCatalog.rpcMutationMethods
+
     public static func preflight(method: String, params: [String: JSONValue]) throws {
-        guard methods.contains(method) else { throw JSONRPCError.invalidParams }
+        guard methods.contains(method) || managedProviderMutationMethods.contains(method) else {
+            throw JSONRPCError.invalidParams
+        }
         for rule in syntaxRules(for: method) {
             try validate(rule, params: params)
         }
@@ -260,7 +268,7 @@ public enum HostMutationContract {
 
     private static func syntaxRules(for method: String) -> [SyntaxRule] {
         switch method {
-        case "workspace.create", "window.create", "agent.thread.create", "agent.provider.update", "notification.create": return []
+        case "workspace.create", "host.workspace.create", "window.create", "agent.thread.create", "host.agent.thread.create", "agent.provider.update", "notification.create": return []
         case "workspace.rename": return [.uuid("id"), .string("name")]
         case "workspace.close", "workspace.select", "workspace.reorder", "window.close", "window.focus": return [.uuid("id")]
         case "workspace.set_color": return [.uuid("id"), .string("color")]
@@ -300,6 +308,11 @@ public enum HostMutationContract {
         case "agent.attachment.import": return [.uuid("workspace_id"), .string("relative_path", nonempty: true)]
         case "bot.peer.ask": return [.uuid("thread_id"), .uuid("run_id"), .string("handle"), .string("prompt"), .stringEnum("reply_mode", ["consult", "reply_only"])]
         case "bot.peer.self_config": return [.uuid("thread_id"), .uuid("run_id"), .string("tool_name"), .object("arguments")]
+        case "host.bot.create": return [.string("name", nonempty: true)]
+        case "host.bot.open": return [.uuid("bot_id")]
+        case "host.bot.send": return [.uuid("bot_id"), .string("text", nonempty: true)]
+        case "host.bot.thread.create": return [.uuid("bot_id")]
+        case "host.bot.skill.create": return [.uuid("bot_id"), .string("skill_id", nonempty: true)]
         case "fs.workspace.create_file": return [.uuid("workspace_id"), .string("path")]
         case "fs.workspace.delete": return [.uuid("workspace_id")]
         case "fs.workspace.rename": return [.uuid("workspace_id"), .string("path"), .string("new_name")]
