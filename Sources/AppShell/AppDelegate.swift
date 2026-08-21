@@ -119,7 +119,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Menu items whose keyEquivalent is controlled by keybindings.json.
     /// Populated by installMainMenu(); refreshed by reapplyKeybindingOverrides().
     private var keybindableMenuItems: [(item: NSMenuItem, command: String)] = []
-    public static let tokenSaverAccountUsageRefreshInterval: TimeInterval = 5 * 60
+    public static let tokenSaverAccountUsageRefreshInterval: TimeInterval = 60
 
     /// Accumulates server startup failures so Settings can show a status
     /// row rather than relying on NSLog alone (UX-MAC_SOCKET_SERVER-P1).
@@ -647,6 +647,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
+                // Grok first: the full Claude/Codex probe can stay busy for the
+                // whole interval, and its busy-skip must not starve the purple ring.
+                self.context?.refreshGrokTokenSaverAccountUsage(reason: "periodic")
                 self.context?.refreshTokenSaverAccountUsage(reason: "periodic")
             }
         }

@@ -726,13 +726,13 @@ final class TokenSaverAppContextTests: XCTestCase {
                       "provider limit commands must not run before a RemoteCode private account is signed in")
     }
 
-    func test_tokenSaverAccountUsageRefreshIntervalIsFiveMinutes() {
-        XCTAssertEqual(AppDelegate.tokenSaverAccountUsageRefreshInterval, 300)
+    func test_tokenSaverAccountUsageRefreshIntervalIsOneMinute() {
+        XCTAssertEqual(AppDelegate.tokenSaverAccountUsageRefreshInterval, 60)
     }
 
     func test_appContextRefreshesGrokAccountUsageFromBillingLogAfterRun() async throws {
         // WHY: Grok ACP never emits live `.accountUsage`, so the Token Saver
-        // purple ring stayed stale between the 5-minute periodic probes. After
+        // purple ring stayed stale between periodic probes. After
         // a Grok run finishes we re-read the local billing log; this pins that
         // the lightweight path persists creditUsagePercent without Claude/Codex.
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverGrokRunUsage-" + UUID().uuidString
@@ -757,7 +757,7 @@ final class TokenSaverAppContextTests: XCTestCase {
             return snapshot.providers.first(where: { $0.provider == .grok })?.weeklyUsedPercent == 61
         }
         XCTAssertTrue(didPersist,
-                      "post-run Grok billing-log refresh must write weeklyUsedPercent so the purple ring updates without the 5-minute probe")
+                      "post-run Grok billing-log refresh must write weeklyUsedPercent so the purple ring updates without waiting for the periodic probe")
     }
 
     func test_appContextSkipsGrokBillingLogRefreshWhenNotSignedIn() async throws {

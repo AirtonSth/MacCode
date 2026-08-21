@@ -1390,7 +1390,7 @@ public final class AppContext {
                 self.recordSessionLearnFromRun(runId: rid, status: status) // P5 SessionLearn (off by default)
                 // Grok has no live `.accountUsage` stream (Claude/Codex do). Re-read
                 // the local billing snapshot after each Grok run so the Token Saver
-                // purple ring updates without waiting for the 5-minute periodic probe.
+                // purple ring updates without waiting for the next periodic probe.
                 if let run = try? self.runRepo.get(id: rid), run.provider == .grok {
                     self.refreshGrokTokenSaverAccountUsage(reason: "run_finished")
                 }
@@ -2882,8 +2882,8 @@ public final class AppContext {
     /// Grok-only account-usage refresh from the local billing log.
     ///
     /// WHY: Claude/Codex push live `.accountUsage` during a turn. Grok ACP does
-    /// not, so the purple weekly ring stayed stale until launch / 5-minute
-    /// periodic / details-open. Call this after a Grok run finishes (or from
+    /// not, so the purple weekly ring stayed stale until launch / periodic /
+    /// details-open. Call this after a Grok run finishes (or from
     /// tests) to re-read `~/.grok/logs/unified.jsonl` without spawning the slow
     /// Claude/Codex CLI probes. Independent of `tokenSaverAccountUsageRefreshTask`
     /// so a busy full refresh cannot skip Grok.
