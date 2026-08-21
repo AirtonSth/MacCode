@@ -1268,6 +1268,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         let parameterless: Set<String> = [
             "workspace.create", "window.create", "agent.thread.create",
             "agent.provider.update", "notification.create",
+            "bot.create", "bot.scheduler.tick",
         ]
         var covered: Set<String> = []
         var probeCount = 0

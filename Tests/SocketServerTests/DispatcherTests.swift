@@ -88,6 +88,10 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     ) throws -> JSONValue {
         throw JSONRPCError.notSupported("host Bot skill view")
     }
+
+    func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("paired Bot remote control")
+    }
     func selectWorkspace(_ id: WorkspaceID) throws { window.selectedWorkspaceID = id }
     func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws { workspaces.removeAll { $0.id == id } }
     func renameWorkspace(_ id: WorkspaceID, _ newName: String) throws {}

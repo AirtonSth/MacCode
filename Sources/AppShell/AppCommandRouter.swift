@@ -2832,6 +2832,57 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return JSONValue.from(result)
     }
 
+    private var pairedBotRemote: BotRemoteControlAuthority?
+
+    public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
+        let authority = try pairedBotAuthority()
+        let foundation = Self.foundationObject(params)
+        do {
+            let result = try authority.dispatch(method: method, params: foundation)
+            return JSONValue.from(result)
+        } catch let error as BotRemoteControlAuthority.Error {
+            throw JSONRPCError(code: error.code, message: error.message)
+        }
+    }
+
+    private func pairedBotAuthority() throws -> BotRemoteControlAuthority {
+        if let pairedBotRemote { return pairedBotRemote }
+        guard let ctx = context else {
+            throw JSONRPCError(code: -32004, message: "The calling session no longer exists.")
+        }
+        let created = BotRemoteControlAuthority(
+            db: ctx.db,
+            store: ctx.botStore,
+            settings: SettingsStore(db: ctx.db)
+        )
+        pairedBotRemote = created
+        return created
+    }
+
+    private static func foundationObject(_ params: [String: JSONValue]) -> [String: Any] {
+        var out: [String: Any] = [:]
+        for (key, value) in params {
+            out[key] = foundationValue(value)
+        }
+        return out
+    }
+
+    private static func foundationValue(_ value: JSONValue) -> Any {
+        switch value {
+        case .null: return NSNull()
+        case .bool(let flag): return flag
+        case .number(let number): return number
+        case .string(let text): return text
+        case .array(let items): return items.map(foundationValue)
+        case .object(let object):
+            var nested: [String: Any] = [:]
+            for (key, nestedValue) in object {
+                nested[key] = foundationValue(nestedValue)
+            }
+            return nested
+        }
+    }
+
     public func viewHostBotSkill(
         botID: BotID,
         skillID: String,

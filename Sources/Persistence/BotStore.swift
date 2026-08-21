@@ -372,6 +372,7 @@ public final class BotStore: @unchecked Sendable {
                     name: routine.definition.name,
                     prompt: routine.definition.prompt,
                     scheduleNote: routine.definition.scheduleNote,
+                    scheduleSpecJSON: routine.definition.scheduleSpecJSON,
                     createdAt: now,
                     updatedAt: now
                 )

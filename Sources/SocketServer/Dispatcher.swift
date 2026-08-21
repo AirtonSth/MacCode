@@ -188,6 +188,7 @@ public protocol CommandRouting: AnyObject {
     func createHostBotThread(botID: BotID, title: String) throws -> JSONValue
     func createHostBotSkill(botID: BotID, skillID: String, body: String?, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue
     func viewHostBotSkill(botID: BotID, skillID: String, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue
+    func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue
     func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID)
     func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String)
     /// Per-thread plan notes (mac plan sidebar). Returns "" when none exist.
@@ -367,6 +368,10 @@ public extension CommandRouting {
 
     func viewHostBotSkill(botID: BotID, skillID: String, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue {
         throw JSONRPCError.notSupported("host Bot skill view")
+    }
+
+    func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("paired Bot remote control")
     }
 
     /// Safe in-memory default so FakeRouter/test hosts need no SQL body-budget path.
@@ -740,6 +745,15 @@ public final class JSONRPCDispatcher {
         "host.bot.send",
         "host.bot.thread.create",
         "host.bot.skill.create",
+        "bot.create",
+        "bot.save",
+        "bot.delete",
+        "bot.send",
+        "bot.settings.set",
+        "bot.force_stop",
+        "bot.link.open",
+        "bot.files.mutate",
+        "bot.docker.clear",
         "agent.thread.create",
         "agent.thread.prepare_pr",
         "agent.thread.rollback",
@@ -1715,6 +1729,10 @@ public final class JSONRPCDispatcher {
                     inBatch: Self.rpcInBatch,
                     isExplicitV1: AgentCheckpointListContract.isExplicitV1(params: params)
                 )
+            }
+            if req.method.hasPrefix("bot.") {
+                let result = try await router.dispatchPairedBotRemote(method: req.method, params: params)
+                return .init(id: id, result: result)
             }
             switch req.method {
             case "rpc.batch":
@@ -3988,6 +4006,9 @@ public final class JSONRPCDispatcher {
         "git.status", "git.branches", "git.log", "git.diff", "git.pull_request_url", "git.delivery_plan",
         "project.scripts",
         "agent.models.list", "agent.providers.list", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
+        "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list",
+        "bot.routine.list", "bot.files.list", "bot.browser.state", "bot.guest.state",
+        "bot.receipt.status", "bot.peer.receipt.status", "bot.attention.list",
         "browser.url.get", "browser.snapshot", "browser.wait",
         "notification.list",
         "pane.list", "pane.surfaces", "mirror.snapshot",
@@ -4010,7 +4031,7 @@ public final class JSONRPCDispatcher {
         "ssh", "fs", "files",
         "workspace", "window", "surface", "pane",
         "agent", "git", "project", "browser", "mirror",
-        "notification", "private", "sync", "token_saver"
+        "notification", "private", "sync", "token_saver", "bot"
     ]
     // PERF: nested-run RPC params validate subagent_node_id on every nested
     // agent.create/send; `"-_.".unicodeScalars.contains` built a temporary

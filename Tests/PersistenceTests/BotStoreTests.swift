@@ -276,7 +276,8 @@ final class BotStoreTests: XCTestCase {
         try store.upsertConversation(BotConversation(botID: bot.id, title: "Standup"))
         let routine = BotRoutineDefinition(
             botID: bot.id, name: "Morning", prompt: "Summarize overnight",
-            scheduleNote: BotRoutineCopy.testRunHonestyCaption
+            scheduleNote: BotRoutineCopy.testRunHonestyCaption,
+            scheduleSpecJSON: "{\"frequency\":\"daily\"}"
         )
         try store.saveRoutine(routine)
         try store.setRoutineEnabled(id: routine.id, enabled: true)
@@ -304,6 +305,7 @@ final class BotStoreTests: XCTestCase {
         let copiedRoutines = try store.listRoutines(botID: copy.id)
         XCTAssertEqual(copiedRoutines.count, 1)
         XCTAssertEqual(copiedRoutines[0].definition.name, "Morning")
+        XCTAssertEqual(copiedRoutines[0].definition.scheduleSpecJSON, "{\"frequency\":\"daily\"}")
         XCTAssertTrue(copiedRoutines[0].activation.isEnabled)
         XCTAssertNotEqual(copiedRoutines[0].definition.id, routine.id)
 

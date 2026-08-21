@@ -109,6 +109,49 @@ public enum HostMutationContract {
     project.open_in_editor
     project.run_script
     private.push_token.update
+    bot.create
+    bot.discard_new
+    bot.save
+    bot.delete
+    bot.set_pinned
+    bot.set_hidden
+    bot.duplicate
+    bot.settings.set
+    bot.send
+    bot.queue.remove
+    bot.stop
+    bot.force_stop
+    bot.conversation.create
+    bot.conversation.select
+    bot.conversation.clear_all
+    bot.routine.create
+    bot.routine.update
+    bot.routine.enable
+    bot.routine.run
+    bot.routine.delete
+    bot.attachment.stage
+    bot.attachment.remove
+    bot.files.mutate
+    bot.files.open_tab
+    bot.files.split
+    bot.files.location.set
+    bot.browser.action
+    bot.link.open
+    bot.guest.input
+    bot.guest.start
+    bot.guest.stop
+    bot.guest.rebuild
+    bot.docker.clear
+    bot.notify.set
+    bot.desktop.set
+    bot.avatar.set
+    bot.handle.set
+    bot.soul.set
+    bot.routing.set
+    bot.attention.ack
+    bot.peer.ask
+    bot.self_config
+    bot.scheduler.tick
     """.split(separator: "\n").map(String.init))
 
     struct PreflightProbe {
@@ -267,6 +310,16 @@ public enum HostMutationContract {
     }
 
     private static func syntaxRules(for method: String) -> [SyntaxRule] {
+        if method.hasPrefix("bot.") {
+            switch method {
+            case "bot.create", "bot.scheduler.tick":
+                return []
+            case "bot.settings.set":
+                return [.string("key")]
+            default:
+                return [.uuid("bot_id")]
+            }
+        }
         switch method {
         case "workspace.create", "host.workspace.create", "window.create", "agent.thread.create", "host.agent.thread.create", "agent.provider.update", "notification.create": return []
         case "workspace.rename": return [.uuid("id"), .string("name")]
