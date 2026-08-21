@@ -2,6 +2,7 @@ import XCTest
 import SwiftUI
 import CoreModel
 import AgentRuntime
+@testable import DistillCore
 @testable import AppShell
 @testable import Persistence
 import Surfaces
@@ -181,6 +182,111 @@ final class BotsWindowTests: XCTestCase {
             "Token Saver off must not admit Distill on a bot provider turn"
         )
         XCTAssertNil(request.environment["RC_TOKEN_SAVER_POST_TOOL_USE"])
+    }
+
+    func test_deskSendAdmitsTokenSaverWhenEnabled_andRestoreHydratesWireRequest() async throws {
+        // WHY: workspace-less bot threads used to deny wire-encode with
+        // missing_project_scope, so Human/RCW1 never hydrated. Desk send must
+        // admit Distill through the real send() → sendAgentMessage path.
+        let context = try makeContext()
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        let configuration = try DistillServiceConfiguration(
+            authToken: "bot-desk-wire-token",
+            appSupportDirectory: directory
+        )
+        let scheduler = DistillScheduler(
+            runtime: LocalDistillRuntime(),
+            maxConcurrentRequests: 2
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: DeskTokenSaverRecoveryStore(db: context.db)
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(
+            ready: ready,
+            authToken: "bot-desk-wire-token"
+        )
+
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .grok, model: "grok-4.6")
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .grok,
+            providerInstanceID: "grok",
+            model: "grok-4.6",
+            routingMode: .manual
+        )
+        let longPrompt = String(
+            repeating: "A verbose English bot instruction that Token Saver should compact on an admitted Desk turn. ",
+            count: 90
+        )
+        XCTAssertGreaterThan(TokenEstimator.estimate(longPrompt), 80)
+        vm.composerText = longPrompt
+        XCTAssertTrue(vm.send())
+        let started = await waitUntil(timeout: 8) { !runner.requests.isEmpty }
+        XCTAssertTrue(started, "Desk send must reach the provider runner")
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertEqual(
+            request.environment["RC_TOKEN_SAVER_DISTILL_HINT"],
+            "1",
+            "Token Saver on must admit Distill env on a bot provider turn"
+        )
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        let persisted = try XCTUnwrap(context.threadRepo.get(id: threadID))
+        XCTAssertNil(persisted.workspaceId, "bot threads must stay off Agent App workspace rails")
+        let denials = try context.db.prepare("""
+            SELECT object_id FROM token_saver_audit_events
+            WHERE event_kind = 'token_saver_denial' AND thread_id = ?;
+            """)
+        try denials.bind(1, threadID.value.uuidString)
+        var deniedReasons: [String] = []
+        while try denials.step() {
+            if let reason = denials.columnText(0) {
+                deniedReasons.append(reason)
+            }
+        }
+        XCTAssertFalse(
+            deniedReasons.contains("missing_project_scope"),
+            "bot-linked threads must have an exact Token Saver scope; denials=\(deniedReasons)"
+        )
+        XCTAssertTrue(
+            request.prompt.contains("User request:"),
+            "Desk still compiles the Bot brain around the user turn"
+        )
+        let conversationID = try XCTUnwrap(vm.selectedConversation?.id)
+        let hydrated = await waitUntil(timeout: 5) {
+            vm.selectDeskThread(conversationID)
+            return vm.deskMessages.contains {
+                $0.role == .user && $0.tokenSaverWireRequest != nil
+            }
+        }
+        XCTAssertTrue(hydrated, "restore must hydrate the persisted RCW1 request onto the Desk user row")
+        let user = try XCTUnwrap(vm.deskMessages.first { $0.role == .user })
+        let wireRequest = try XCTUnwrap(user.tokenSaverWireRequest)
+        XCTAssertTrue(RCWireProtocol.isWire(wireRequest))
+        XCTAssertFalse(
+            RCWireProtocol.isWire(user.text),
+            "Desk Human must keep the teammate line, not the provider-bound wire"
+        )
+        XCTAssertTrue(user.text.contains("verbose English bot instruction"))
+        XCTAssertEqual(user.agentMessageID?.value, request.runId.value)
     }
 
     func test_deskFooterCalculatorMatchesAgentApp_onIdenticalInputs() {
@@ -12387,6 +12493,87 @@ private struct T005PeerHandoffRecordFixture: Codable, Equatable {
     let replyText: String?
     let replyCreatedAt: Date?
     let phase: BotPeerHandoffPhase
+}
+
+private final class DeskTokenSaverRecoveryStore: TokenSaverScopedRecoveryStoring, @unchecked Sendable {
+    private let store: TokenSaverScopedRecoveryStore
+
+    init(db: SQLiteDB) {
+        store = TokenSaverScopedRecoveryStore(db: db)
+    }
+
+    private func scope(_ context: TokenSaverRecoveryRequestContext) -> TokenSaverPersistentScope {
+        .init(
+            workspaceID: context.workspaceID,
+            projectID: context.projectID,
+            threadID: context.threadID,
+            provider: context.provider,
+            attemptID: context.attemptID
+        )
+    }
+
+    func prepareOriginal(
+        _ data: Data,
+        context: TokenSaverRecoveryRequestContext,
+        lane: String
+    ) throws -> TokenSaverScopedPreparation {
+        let prepared = try store.prepare(
+            data,
+            scope: scope(context),
+            operationID: context.operationID,
+            lane: lane,
+            expiresAt: Date().addingTimeInterval(7 * 86_400),
+            disk: .init(
+                freeBytes: 40 * 1_024 * 1_024 * 1_024,
+                totalBytes: 100 * 1_024 * 1_024 * 1_024
+            )
+        )
+        return .init(
+            capability: prepared.capability,
+            idempotencyKey: prepared.idempotencyKey,
+            readBackVerified: prepared.readBackVerified
+        )
+    }
+
+    func retrieveOriginal(
+        capability: String,
+        context: TokenSaverRecoveryRequestContext
+    ) throws -> Data? {
+        try store.retrieve(capability: capability, scope: scope(context))
+    }
+
+    func markDelivered(
+        capability: String,
+        idempotencyKey: String,
+        context: TokenSaverRecoveryRequestContext,
+        outcome: TokenSaverScopedDeliveryOutcome
+    ) throws -> Bool {
+        let mapped: TokenSaverRecoveryTransportOutcome
+        switch outcome {
+        case .notSent: mapped = .notSent
+        case .sentUnknown: mapped = .sentUnknown
+        case .acked: mapped = .acked
+        case .failed: mapped = .failed
+        }
+        return try store.markDelivered(
+            capability: capability,
+            scope: scope(context),
+            idempotencyKey: idempotencyKey,
+            outcome: mapped
+        )
+    }
+
+    func ack(
+        capability: String,
+        idempotencyKey: String,
+        context: TokenSaverRecoveryRequestContext
+    ) throws -> Bool {
+        try store.ack(
+            capability: capability,
+            scope: scope(context),
+            idempotencyKey: idempotencyKey
+        )
+    }
 }
 
 final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable {

@@ -6787,6 +6787,10 @@ public final class BotsViewModel: ObservableObject {
                 threadID: threadID,
                 messageIds: stored.map(\.id)
             )
+            overlayCachedHumanTextOntoPersistedTokenSaverUsers(
+                cached: cached,
+                persisted: &persisted
+            )
         }
         var visible = BotsDeskFollowThrough.visibleDeskMessages(cached: cached, persisted: persisted)
         visible = mergePeerTurns(visible, conversationID: conversation?.id)
@@ -6838,6 +6842,71 @@ public final class BotsViewModel: ObservableObject {
         }
         if selectedBotID != nil {
             tokenSaverOriginalDisplayMessageIds = originalIds
+        }
+    }
+
+    /// Persist stores the compiled provider envelope (and may wire-encode the
+    /// User request). Desk Human must keep the teammate line that send() already
+    /// painted, then borrow RCW1 from the retained user message.
+    private func overlayCachedHumanTextOntoPersistedTokenSaverUsers(
+        cached: [BotDeskMessage],
+        persisted: inout [BotDeskMessage]
+    ) {
+        guard !cached.isEmpty else { return }
+        for index in persisted.indices {
+            guard persisted[index].role == .user,
+                  let id = persisted[index].agentMessageID,
+                  let live = cached.first(where: {
+                      $0.role == .user && $0.agentMessageID == id
+                  }) else { continue }
+            persisted[index] = BotDeskMessage(
+                id: persisted[index].id,
+                role: .user,
+                text: live.text,
+                createdAt: persisted[index].createdAt,
+                peer: persisted[index].peer ?? live.peer,
+                agentMessageID: id,
+                tokenSaverWireRequest: persisted[index].tokenSaverWireRequest
+                    ?? live.tokenSaverWireRequest,
+                tokenSaverOriginal: persisted[index].tokenSaverOriginal
+                    ?? live.tokenSaverOriginal,
+                tokenSaverTurnId: persisted[index].tokenSaverTurnId
+                    ?? live.tokenSaverTurnId
+            )
+        }
+    }
+
+    /// Coordinator stores the compiled provider envelope as the user row.
+    /// Desk Human/RCW1 needs the teammate line plus the adopted user-turn wire.
+    private func persistDeskTokenSaverUserTranslation(
+        runID: AgentRunID,
+        humanText: String,
+        attachments: [AgentAttachment],
+        wireRequest: String
+    ) {
+        guard RCWireProtocol.isWire(wireRequest) else { return }
+        let messageID = AgentMessageID(runID.value)
+        let human = AgentChatTranscriptChrome.displayUserLine(
+            text: humanText,
+            attachments: attachments
+        )
+        do {
+            try context.messageRepo.upsertRCW1RequestTranslation(
+                messageId: messageID,
+                wireRequestText: wireRequest
+            )
+            guard let stored = try context.messageRepo.get(id: messageID),
+                  stored.role == .user else { return }
+            try context.messageRepo.append(AgentMessage(
+                id: stored.id,
+                threadId: stored.threadId,
+                role: .user,
+                content: human,
+                createdAt: stored.createdAt,
+                attachments: stored.attachments.isEmpty ? attachments : stored.attachments
+            ))
+        } catch {
+            NSLog("RemoteCode Desk Token Saver RCW1 persist failed: \(error)")
         }
     }
 
@@ -7424,10 +7493,16 @@ public final class BotsViewModel: ObservableObject {
             if selectedBotID == bot.id, screen == .desk {
                 startDeskLiveTurnWatch(botID: bot.id, threadID: prepared.thread.id)
             }
+            let compressedUser = await context.tokenSaverCompress(
+                prompt: userText,
+                provider: routing.provider,
+                threadId: prepared.thread.id,
+                runId: prepared.runID
+            )
             var receipt = BotBrainCompiler.assemble(
                 bot: bot,
                 revision: revision,
-                userText: userText,
+                userText: compressedUser,
                 memoryFiles: memoryFiles,
                 skills: skills,
                 ownedSkills: ownedSkillTexts(for: bot),
@@ -7469,6 +7544,12 @@ public final class BotsViewModel: ObservableObject {
                 providerInstanceId: routing.providerInstanceID,
                 attachments: attachments,
                 requestedRunID: prepared.runID
+            )
+            persistDeskTokenSaverUserTranslation(
+                runID: prepared.runID,
+                humanText: userText,
+                attachments: attachments,
+                wireRequest: compressedUser
             )
             // Dest persist cannot unstart a live provider turn.
             _ = try? persistWorkingConversation(prepared.conversation)
