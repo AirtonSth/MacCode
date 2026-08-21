@@ -2545,6 +2545,8 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var tokenSaverThreadMeasuredTokens = 0
     @Published public private(set) var tokenSaverThreadSavedTokens = 0
     @Published public private(set) var tokenSaverOriginalDisplayMessageIds: Set<AgentMessageID> = []
+    private var tokenSaverDisplayModeWriteGeneration: [AgentMessageID: UInt64] = [:]
+    private var tokenSaverDisplayModeWriteTasks: [AgentMessageID: Task<Void, Never>] = [:]
     @Published public private(set) var deskWorkLog: [BotDeskWorkLogRow] = []
     @Published public private(set) var deskLiveTimeline = AssistantTimelineState()
     @Published public private(set) var deskStreamEventCount = 0
@@ -3345,15 +3347,44 @@ public final class BotsViewModel: ObservableObject {
     }
 
     func setTokenSaverDisplaysOriginal(_ displaysOriginal: Bool, for messageId: AgentMessageID) {
+        let previousValue = tokenSaverOriginalDisplayMessageIds.contains(messageId)
+        guard previousValue != displaysOriginal else { return }
         if displaysOriginal {
             tokenSaverOriginalDisplayMessageIds.insert(messageId)
         } else {
             tokenSaverOriginalDisplayMessageIds.remove(messageId)
         }
+        let generation = (tokenSaverDisplayModeWriteGeneration[messageId] ?? 0) &+ 1
+        tokenSaverDisplayModeWriteGeneration[messageId] = generation
+        let previousTask = tokenSaverDisplayModeWriteTasks[messageId]
         let repository = context.messageRepo
         let mode: AgentMessageTokenSaverDisplayMode = displaysOriginal ? .rcw1 : .human
-        Task.detached(priority: .utility) {
-            try? repository.setTokenSaverDisplayMode(messageId: messageId, mode: mode)
+        tokenSaverDisplayModeWriteTasks[messageId] = Task { @MainActor [weak self] in
+            await previousTask?.value
+            do {
+                try await AgentAppViewModel.persistTokenSaverDisplayModeOffMain(
+                    repository: repository,
+                    messageId: messageId,
+                    mode: mode
+                )
+            } catch {
+                guard let self,
+                      self.tokenSaverDisplayModeWriteGeneration[messageId] == generation else {
+                    return
+                }
+                if previousValue {
+                    self.tokenSaverOriginalDisplayMessageIds.insert(messageId)
+                } else {
+                    self.tokenSaverOriginalDisplayMessageIds.remove(messageId)
+                }
+                self.errorMessage = "Token Saver display choice could not be saved: \(error.localizedDescription)"
+            }
+            guard let self,
+                  self.tokenSaverDisplayModeWriteGeneration[messageId] == generation else {
+                return
+            }
+            self.tokenSaverDisplayModeWriteGeneration.removeValue(forKey: messageId)
+            self.tokenSaverDisplayModeWriteTasks.removeValue(forKey: messageId)
         }
     }
 
@@ -3368,8 +3399,20 @@ public final class BotsViewModel: ObservableObject {
 
     func tokenSaverFooterTextForTesting() -> String? { deskTokenSaverFooterText }
 
+    func applyTokenSaverFooterSnapshotForTesting(_ snapshot: TokenSaverThreadFooterReload.Snapshot) {
+        tokenSaverFooterEnabled = snapshot.enabled
+        tokenSaverThreadMeasuredTokens = snapshot.measuredTokens
+        tokenSaverThreadSavedTokens = snapshot.displayTokens
+    }
+
+    func replaceDeskMessagesForTesting(_ messages: [BotDeskMessage]) {
+        deskMessages = messages
+    }
+
     func tokenSaverMessage(forTurnId turnId: String) -> BotDeskMessage? {
-        deskMessages.first { $0.tokenSaverTurnId == turnId }
+        let matches = deskMessages.filter { $0.tokenSaverTurnId == turnId }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
     }
 
     public func beginCreate() {
@@ -3668,6 +3711,10 @@ public final class BotsViewModel: ObservableObject {
         messagesByBot[bot.id] = []
         messagesConversationIDByBot[bot.id] = nil
         deskMessages = []
+        tokenSaverFooterEnabled = false
+        tokenSaverThreadMeasuredTokens = 0
+        tokenSaverThreadSavedTokens = 0
+        tokenSaverOriginalDisplayMessageIds = []
         deskThreadSearchQuery = ""
         attentionItems.removeAll {
             $0.botID == bot.id && $0.conversationID != nil

@@ -786,7 +786,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    nonisolated static func persistTokenSaverDisplayModeOffMain(
+    public nonisolated static func persistTokenSaverDisplayModeOffMain(
         repository: AgentMessageRepository,
         messageId: AgentMessageID,
         mode: AgentMessageTokenSaverDisplayMode

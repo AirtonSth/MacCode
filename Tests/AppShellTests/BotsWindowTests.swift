@@ -222,6 +222,100 @@ final class BotsWindowTests: XCTestCase {
         }
     }
 
+    func test_deskRestoreRebuildsImageMarkersFromCompiledPayload() throws {
+        // WHY: after persist, Desk rereads the compiled provider envelope.
+        // Image markers must come back from the shared displayUserLine using
+        // the stored attachments, not vanish into the brain preamble.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        let png = (directory as NSString).appendingPathComponent("shot.png")
+        FileManager.default.createFile(atPath: png, contents: Data([0x89, 0x50, 0x4E, 0x47]))
+        let attachment = AgentAttachment(
+            path: png,
+            displayName: "shot.png",
+            kind: .image,
+            mimeType: "image/png"
+        )
+        let thread = AgentThread(title: "bot-desk", provider: .codex, model: "test")
+        try context.threadRepo.upsert(thread)
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: "Look at this",
+            linkedAgentThreadID: thread.id
+        )
+        try context.botStore.upsertConversation(conversation)
+        let compiled = """
+        You are Piper — Scout.
+
+        User request:
+
+        Look at this
+        """
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: compiled,
+            attachments: [attachment]
+        ))
+        vm.openDesk(bot)
+        vm.selectDeskThread(conversation.id)
+        let user = try XCTUnwrap(vm.deskMessages.first { $0.role == .user })
+        XCTAssertTrue(user.text.contains("[Image #1]"), "restore must keep the literal image marker")
+        XCTAssertTrue(user.text.contains("Look at this"))
+        XCTAssertFalse(user.text.contains("You are Piper"))
+        XCTAssertEqual(user.agentMessageID != nil, true)
+    }
+
+    func test_tokenSaverTurnMappingFailsClosedOnDuplicateTurnIds() throws {
+        // WHY: Agent App refuses to lend RCW1 to a live turn when the turn id
+        // is ambiguous. Desk must not pick the first duplicate.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let turn = "turn-shared"
+        let first = BotDeskMessage(
+            role: .assistant,
+            text: "first",
+            agentMessageID: AgentMessageID(),
+            tokenSaverOriginal: "RCW1\tA\t1\nO\tfirst\n.\n",
+            tokenSaverTurnId: turn
+        )
+        let second = BotDeskMessage(
+            role: .assistant,
+            text: "second",
+            agentMessageID: AgentMessageID(),
+            tokenSaverOriginal: "RCW1\tA\t1\nO\tsecond\n.\n",
+            tokenSaverTurnId: turn
+        )
+        vm.replaceDeskMessagesForTesting([first, second])
+        XCTAssertNil(vm.tokenSaverMessage(forTurnId: turn))
+        vm.replaceDeskMessagesForTesting([first])
+        XCTAssertEqual(vm.tokenSaverMessage(forTurnId: turn)?.text, "first")
+    }
+
+    func test_clearAllDeskThreadsHidesTokenSaverFooter() throws {
+        // WHY: deleting every conversation must not leave the previous thread's
+        // savings chip on an empty Desk.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        vm.applyTokenSaverFooterSnapshotForTesting(
+            TokenSaverThreadFooterReload.Snapshot(
+                enabled: true,
+                measuredTokens: 12_500,
+                displayTokens: 12_500
+            )
+        )
+        XCTAssertNotNil(vm.tokenSaverFooterTextForTesting())
+        vm.clearAllDeskThreads()
+        XCTAssertFalse(vm.tokenSaverFooterEnabled)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
+        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, 0)
+        XCTAssertNil(vm.tokenSaverFooterTextForTesting())
+    }
+
     func test_hostCatalogBotSendUsesTheFullDeskBrainPipeline() async throws {
         // WHY: a host MCP send must not bypass the Bot's soul/skills/VM routing
         // by forwarding the user's raw text as a generic Agent App prompt.
