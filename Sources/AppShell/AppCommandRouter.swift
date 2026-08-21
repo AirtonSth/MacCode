@@ -4284,6 +4284,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
         }
         sendAgentMessageAfterPreflightProbeForTesting?()
+        if Task.isCancelled {
+            throw CancellationError()
+        }
         if existing.status == .running
             || ctx.coordinator.hasPendingProviderStart(threadId: thread)
             || ctx.coordinator.hasProviderSession(threadId: thread) {

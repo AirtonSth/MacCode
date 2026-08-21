@@ -2541,6 +2541,8 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var deskTimelineRejoinToken = 0
     /// Owner of the in-flight send so roster switch does not paint Loading on the wrong desk.
     private var deskSendInFlightBotID: BotID?
+    private var deskSendTasks: [BotID: Task<Void, Never>] = [:]
+    private var deskStopEpoch: [BotID: Int] = [:]
     /// Test seam: how many times Desk actually decoded stream events.
     public private(set) var deskLiveReplayFetchCountForTesting = 0
     /// Test seam: dest at the moment send first acknowledged the click.
@@ -4082,6 +4084,9 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func stopLiveRuns(for botID: BotID, force: Bool, onSettled: ((Bool) -> Void)? = nil) {
+        deskStopEpoch[botID, default: 0] += 1
+        let sendTask = deskSendTasks.removeValue(forKey: botID)
+        sendTask?.cancel()
         let threadIDs: [AgentThreadID]
         do {
             threadIDs = try liveThreadIDs(for: botID)
@@ -4089,19 +4094,31 @@ public final class BotsViewModel: ObservableObject {
             DispatchQueue.main.async { onSettled?(false) }
             return
         }
-        guard !threadIDs.isEmpty else {
-            DispatchQueue.main.async { onSettled?(true) }
-            return
+        for threadID in threadIDs {
+            context.coordinator.cancelPreparation(threadId: threadID)
         }
         if force {
             isStopping = true
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
+            if let sendTask {
+                await sendTask.value
+            }
+            let remaining: [AgentThreadID]
             do {
-                try await self.context.coordinator.stopAndAwaitTermination(threadIds: threadIDs)
+                remaining = try self.liveThreadIDs(for: botID)
+            } catch {
                 self.isStopping = false
-                onSettled?(!self.hasLiveRun(botID: botID))
+                onSettled?(false)
+                return
+            }
+            do {
+                if !remaining.isEmpty {
+                    try await self.context.coordinator.stopAndAwaitTermination(threadIds: remaining)
+                }
+                self.isStopping = false
+                onSettled?(!self.hasLiveRun(botID: botID) && self.deskSendInFlightBotID != botID)
             } catch {
                 self.isStopping = false
                 self.errorMessage = force
@@ -4113,14 +4130,35 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func liveThreadIDs(for botID: BotID) throws -> [AgentThreadID] {
-        try botStore.listConversations(botID: botID).compactMap { conversation in
-            guard let threadID = conversation.linkedAgentThreadID else { return nil }
-            if context.coordinator.activeRunId(threadId: threadID) != nil { return threadID }
-            if context.coordinator.hasPendingProviderStart(threadId: threadID) { return threadID }
-            if context.coordinator.hasProviderSession(threadId: threadID) { return threadID }
-            if (try? context.coordinator.durableActiveRun(threadId: threadID)) != nil { return threadID }
-            return nil
+        var ids: [AgentThreadID] = []
+        let inFlight = deskSendInFlightBotID == botID
+        for conversation in try botStore.listConversations(botID: botID) {
+            guard let threadID = conversation.linkedAgentThreadID else { continue }
+            if inFlight {
+                ids.append(threadID)
+                continue
+            }
+            if context.coordinator.activeRunId(threadId: threadID) != nil {
+                ids.append(threadID)
+                continue
+            }
+            if context.coordinator.hasPendingProviderStart(threadId: threadID) {
+                ids.append(threadID)
+                continue
+            }
+            if context.coordinator.hasProviderSession(threadId: threadID) {
+                ids.append(threadID)
+                continue
+            }
+            if context.coordinator.isPreparingProviderStart(threadId: threadID) {
+                ids.append(threadID)
+                continue
+            }
+            if try context.coordinator.durableActiveRun(threadId: threadID) != nil {
+                ids.append(threadID)
+            }
         }
+        return ids
     }
 
     public func reloadQueuedFollowUpsFromStore() {
@@ -7223,9 +7261,14 @@ public final class BotsViewModel: ObservableObject {
             router: router
         )
         beginDeskSendInFlight(for: bot.id)
-        Task { [weak self] in
+        let epoch = deskStopEpoch[bot.id] ?? 0
+        let sendTask = Task { [weak self] in
             guard let self else { return }
             await Task.yield()
+            guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
+                self.clearDeskSendInFlight(for: bot.id)
+                return
+            }
             let started = await self.startSupervisedRun(
                 bot: bot,
                 revision: revision,
@@ -7235,9 +7278,11 @@ public final class BotsViewModel: ObservableObject {
                 memoryFiles: brain.memoryFiles,
                 skills: brain.skills,
                 routines: brain.routines,
-                router: router
+                router: router,
+                expectedEpoch: epoch
             )
             self.clearDeskSendInFlight(for: bot.id)
+            self.deskSendTasks[bot.id] = nil
             if let started {
                 self.lastSendStartedProviderRun = true
                 self.lastLinkedRunIDByBot[bot.id] = started.runID
@@ -7249,6 +7294,7 @@ public final class BotsViewModel: ObservableObject {
                 self.recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
             }
         }
+        deskSendTasks[bot.id] = sendTask
         return prepared
     }
 
@@ -7261,8 +7307,12 @@ public final class BotsViewModel: ObservableObject {
         memoryFiles: [BotMemoryFileText],
         skills: [BotSkillBinding],
         routines: [BotRoutine] = [],
-        router: AppCommandRouter
+        router: AppCommandRouter,
+        expectedEpoch: Int
     ) async -> BotStartedRun? {
+        guard !Task.isCancelled, (deskStopEpoch[bot.id] ?? 0) == expectedEpoch else {
+            return nil
+        }
         let routing = prepared.routing
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
         let effort = routing.reasoningEffort
@@ -7304,6 +7354,10 @@ public final class BotsViewModel: ObservableObject {
                 router.rememberProviderSnapshotsForSend(providers)
             }
             beforeBotRunDispatchForTesting?(prepared.runID)
+            guard !Task.isCancelled, (deskStopEpoch[bot.id] ?? 0) == expectedEpoch else {
+                cancelExactRunWait(prepared.runID)
+                return nil
+            }
             let result = try await router.sendAgentMessage(
                 thread: prepared.thread.id,
                 text: receipt.compiledPayload,

@@ -543,6 +543,44 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
                        "successful termination confirmation requires the provider session and its child work to be gone")
     }
 
+    func test_stopAndAwaitTermination_waitsForDurableActiveRun() async throws {
+        // WHY: a LaunchAgent/durable-only running row has no activeThreads
+        // mapping. Returning immediately (nil runId) lets paired bot.stop
+        // complete while the durable run is still live.
+        let (threadRepo, messageRepo, runRepo, sessionRepo, _) = try makeRepos("durable-await")
+        let thread = AgentThread(title: "durable only", provider: .codex, model: "fake-model", status: .running)
+        try threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            status: .running
+        )
+        try runRepo.upsert(run)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: SyncCancelFinishRunner()]
+        )
+        XCTAssertEqual(try coordinator.durableActiveRun(threadId: thread.id)?.id, run.id)
+        coordinator.gracefulStopTimeout = 0.05
+        coordinator.hardStopTimeout = 1.0
+        Task {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            try? runRepo.markStopped(id: run.id, status: .cancelled)
+        }
+        let startedAt = Date()
+        try await coordinator.stopAndAwaitTermination(threadId: thread.id)
+        XCTAssertGreaterThanOrEqual(
+            Date().timeIntervalSince(startedAt),
+            0.12,
+            "durable-only stop must wait for the running row to leave pending/running"
+        )
+        XCTAssertNil(try coordinator.durableActiveRun(threadId: thread.id))
+    }
+
     /// Durable terminal row left activeThreads owned (partial finish / multi-process
     /// reconcile). Stop must release in-memory ownership so Working cannot stick.
     func test_stopRun_whenFinishedAtAlreadySetButActiveInMemory_releasesOwnershipAndNotifiesOnce() async throws {

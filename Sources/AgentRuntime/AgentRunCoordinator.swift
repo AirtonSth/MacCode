@@ -2701,13 +2701,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let activeRunId = activeThreads[threadId]
         let activeHandle = activeRunId.flatMap { active[$0] }
         let pendingResult = settledPendingStart?.result()
-        let runId = activeRunId ?? (pendingResult?.failed == true ? nil : settledPendingStart?.runId)
+        lock.unlock()
+        let durableRun = try durableActiveRun(threadId: threadId)
+        let runId = activeRunId
+            ?? (pendingResult?.failed == true ? nil : settledPendingStart?.runId)
+            ?? durableRun?.id
         let handle = activeHandle ?? pendingResult?.handle
+        let awaitsInMemoryProvider = activeRunId != nil || activeHandle != nil || settledPendingStart != nil
         if let runId {
+            lock.lock()
             awaitingTerminationRuns.insert(runId)
             awaitingRunIds.insert(runId)
+            lock.unlock()
         }
-        lock.unlock()
 
         let adapter = try? adapterForThread(threadId)
         var processTracker: ProcessTerminator.TreeTracker? = {
@@ -2719,26 +2725,33 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         stopRun(threadId: threadId)
         while true {
             lock.lock()
-            let providerTerminated = runId.map(providerTerminatedRuns.contains) ?? true
+            let providerTerminated = runId.map(providerTerminatedRuns.contains) ?? false
+            let pendingStill = pendingProviderStarts[threadId] != nil
             lock.unlock()
             processTracker?.refresh()
             let survivingPIDs = processTracker?.survivingPIDs() ?? []
             let processTreeDead = survivingPIDs.isEmpty
-            let terminationConfirmed = providerTerminated ||
-                (processTracker != nil && processTreeDead) ||
-                runId == nil
+            let durableStillActive = try durableActiveRun(threadId: threadId) != nil
+            let preparing = isPreparingProviderStart(threadId: threadId)
+            let providerSessionAlive = adapter.map {
+                providerSessionIsLive($0, threadId: threadId)
+            } ?? false
 
             // Terminal adapters can intentionally retain resumable sessions.
             // Deletion is different: once terminal is confirmed, release that
             // session before certifying that no provider child work remains.
-            if terminationConfirmed && processTreeDead,
+            if (providerTerminated || processTreeDead),
                adapter?.hasSession(threadId: threadId) == true {
                 try? adapter?.stopSession(threadId: threadId)
             }
-            let providerSessionAlive = adapter.map {
-                providerSessionIsLive($0, threadId: threadId)
-            } ?? false
-            if terminationConfirmed && processTreeDead && !providerSessionAlive {
+            if awaitsInMemoryProvider {
+                let terminationConfirmed = providerTerminated
+                    || (processTracker != nil && processTreeDead)
+                if terminationConfirmed && processTreeDead && !providerSessionAlive {
+                    return
+                }
+            } else if !durableStillActive && !preparing && !pendingStill
+                        && !providerSessionAlive && processTreeDead {
                 return
             }
 

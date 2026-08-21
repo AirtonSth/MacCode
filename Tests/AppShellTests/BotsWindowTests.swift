@@ -4048,6 +4048,94 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(router.lastOpenTabPath, "notes.txt")
     }
 
+    func test_stopDuringInFlightSendDoesNotStartProvider() async throws {
+        // WHY: paired bot.stop during deskSendInFlight must not let the
+        // unstructured send task start the provider after the stop receipt.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        var dispatches = 0
+        vm.beforeBotRunDispatchForTesting = { _ in dispatches += 1 }
+        _ = try vm.enqueueHostMessage(
+            botID: bot.id,
+            text: "go",
+            conversationID: nil,
+            routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        )
+        XCTAssertTrue(vm.deskSendInFlight)
+        let settled = expectation(description: "stop settled after cancelling in-flight send")
+        var settledOK: Bool?
+        vm.stopLiveRuns(for: bot.id, force: true) { ok in
+            settledOK = ok
+            settled.fulfill()
+        }
+        await fulfillment(of: [settled], timeout: 5)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(dispatches, 0, "stop must cancel the send task before provider dispatch")
+        XCTAssertTrue(runner.requests.isEmpty)
+        XCTAssertFalse(vm.lastSendStartedProviderRun)
+        XCTAssertEqual(settledOK, true)
+        vm.beforeBotRunDispatchForTesting = nil
+    }
+
+    func test_stopDuringPreflightDoesNotStartProvider() async throws {
+        // WHY: bot.stop in the sendAgentMessage preflight window must cancel
+        // before startRun, not complete and then let the send continue.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        let settled = expectation(description: "stop settled from preflight")
+        var settledOK: Bool?
+        router.sendAgentMessageAfterPreflightProbeForTesting = {
+            vm.stopLiveRuns(for: bot.id, force: true) { ok in
+                settledOK = ok
+                settled.fulfill()
+            }
+        }
+        _ = try vm.enqueueHostMessage(
+            botID: bot.id,
+            text: "go",
+            conversationID: nil,
+            routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        )
+        await fulfillment(of: [settled], timeout: 5)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(runner.requests.isEmpty, "preflight stop must not reach startRun")
+        XCTAssertFalse(vm.lastSendStartedProviderRun)
+        XCTAssertEqual(settledOK, true)
+        router.sendAgentMessageAfterPreflightProbeForTesting = nil
+    }
+
     func test_openHomeFileRevealsOwnedSkillInStudioFiles() throws {
         // WHY: Skills Open used to write homeDraft only. Studio Files now
         // hosts FilesSurfaceRoot, so that path left the preview on
