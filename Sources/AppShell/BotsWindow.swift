@@ -4412,9 +4412,7 @@ public final class BotsViewModel: ObservableObject {
         guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
             throw BotStoreError.notFound
         }
-        if selectedBot?.id != bot.id {
-            openStudio(bot)
-        }
+        openStudio(bot)
         studioTab = .files
         setStudioFilesLocation(root == "docker_home" ? .dockerHome : .botFiles, for: bot)
         attachHomeFilesSurface(for: bot)

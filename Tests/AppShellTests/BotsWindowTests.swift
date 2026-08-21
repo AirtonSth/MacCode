@@ -4020,6 +4020,34 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNil(model.errorText)
     }
 
+    func test_openRemoteFileFromDeskDestsStudioFilesAndRecordsTabVersusSplit() throws {
+        // WHY: paired files.open_tab must not leave the user on Desk of the
+        // same bot. Studio Files is the live surface; split is a distinct op.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.", provider: .claude)
+        vm.openDesk(bot)
+        XCTAssertEqual(vm.screen, .desk)
+        let home = vm.botHome(for: bot)
+        try home.ensure(
+            name: bot.name,
+            handle: bot.handle,
+            title: bot.title,
+            description: bot.description,
+            soul: "Be brief."
+        )
+        try home.writeFile(relativePath: "notes.txt", contents: "from remote")
+        try vm.openRemoteFile(botID: bot.id, relativePath: "notes.txt", split: false, root: "bot_home")
+        XCTAssertEqual(vm.screen, .studio)
+        XCTAssertEqual(vm.studioTab, .files)
+        let router = try XCTUnwrap(vm.homeFilesRouterForTesting)
+        XCTAssertEqual(router.lastOpenTabPath, "notes.txt")
+        XCTAssertFalse(router.lastOpenWasSplit)
+        try vm.openRemoteFile(botID: bot.id, relativePath: "notes.txt", split: true, root: "bot_home")
+        XCTAssertTrue(router.lastOpenWasSplit)
+        XCTAssertEqual(router.lastOpenTabPath, "notes.txt")
+    }
+
     func test_openHomeFileRevealsOwnedSkillInStudioFiles() throws {
         // WHY: Skills Open used to write homeDraft only. Studio Files now
         // hosts FilesSurfaceRoot, so that path left the preview on
