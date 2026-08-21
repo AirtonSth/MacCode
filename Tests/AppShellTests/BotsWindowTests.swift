@@ -431,6 +431,103 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 8_000)
     }
 
+    func test_switchingDeskThreadsDropsPreviousThreadObservation() async throws {
+        // WHY: selectDeskThread used to reload the footer before restoring the
+        // new thread's live timeline, so thread B could inherit thread A's
+        // cache/turn observation and inflate the displayed savings figure.
+        let context = try makeContext()
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "token",
+            refreshToken: "refresh",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        ))
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        let threadA = AgentThread(title: "thread-a", provider: .codex, model: "test")
+        let threadB = AgentThread(title: "thread-b", provider: .codex, model: "test")
+        try context.threadRepo.upsert(threadA)
+        try context.threadRepo.upsert(threadB)
+        try context.messageRepo.append(AgentMessage(threadId: threadA.id, role: .user, content: "alpha"))
+        try context.messageRepo.append(AgentMessage(threadId: threadB.id, role: .user, content: "beta"))
+        let conversationA = BotConversation(
+            botID: bot.id,
+            title: "Alpha",
+            linkedAgentThreadID: threadA.id
+        )
+        let conversationB = BotConversation(
+            botID: bot.id,
+            title: "Beta",
+            linkedAgentThreadID: threadB.id
+        )
+        try context.botStore.upsertConversation(conversationA)
+        try context.botStore.upsertConversation(conversationB)
+        try context.tokenSaverSavingsRepo.record(
+            provider: "codex",
+            mode: "command-output",
+            inputTokens: 9_000,
+            outputTokens: 1_000,
+            delivered: true,
+            threadID: threadA.id.value.uuidString
+        )
+        try context.tokenSaverSavingsRepo.record(
+            provider: "codex",
+            mode: "command-output",
+            inputTokens: 4_000,
+            outputTokens: 1_000,
+            delivered: true,
+            threadID: threadB.id.value.uuidString
+        )
+        vm.openDesk(bot)
+        vm.selectDeskThread(conversationA.id)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        var fat = AssistantTimelineState()
+        fat.tokenUsage = AssistantTokenUsage(
+            inputTokens: 80_000,
+            outputTokens: 1_000,
+            totalTokens: 81_000,
+            cacheReadInputTokens: 70_000
+        )
+        vm.replaceDeskLiveTimelineForTesting(fat)
+        vm.selectDeskThread(conversationB.id)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 3_000)
+        let expected = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+            measuredDelivered: 3_000,
+            assistantChars: vm.deskMessages.filter { $0.role == .assistant }.reduce(0) { $0 + $1.text.utf8.count },
+            tokenSaverEnabled: true,
+            graphifyActive: false,
+            turnCount: max(vm.deskLiveTimeline.turns.count, vm.deskMessages.filter { $0.role == .user }.count),
+            cacheReadInputTokens: vm.deskLiveTimeline.tokenUsage?.cacheReadInputTokens ?? 0,
+            providerRawTokens: {
+                guard let usage = vm.deskLiveTimeline.tokenUsage else { return 0 }
+                return max(0, usage.inputTokens) + max(0, usage.outputTokens)
+            }(),
+            providerBilledTokenUnits: vm.deskLiveTimeline.tokenUsage.map(\.billedTotalTokenUnits).flatMap { $0 > 0 ? $0 : nil },
+            autoRoutingActive: false
+        )
+        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, expected)
+        let inflated = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+            measuredDelivered: 3_000,
+            assistantChars: 0,
+            tokenSaverEnabled: true,
+            graphifyActive: false,
+            turnCount: 1,
+            cacheReadInputTokens: 70_000,
+            providerRawTokens: 81_000,
+            providerBilledTokenUnits: nil,
+            autoRoutingActive: false
+        )
+        XCTAssertNotEqual(expected, inflated, "B must not inherit A's cache observation")
+    }
+
     func test_hostCatalogBotSendUsesTheFullDeskBrainPipeline() async throws {
         // WHY: a host MCP send must not bypass the Bot's soul/skills/VM routing
         // by forwarding the user's raw text as a generic Agent App prompt.

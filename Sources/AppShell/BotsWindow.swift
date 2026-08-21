@@ -3427,6 +3427,10 @@ public final class BotsViewModel: ObservableObject {
         deskMessages = messages
     }
 
+    func replaceDeskLiveTimelineForTesting(_ timeline: AssistantTimelineState) {
+        deskLiveTimeline = timeline
+    }
+
     func tokenSaverMessage(forTurnId turnId: String) -> BotDeskMessage? {
         let matches = deskMessages.filter { $0.tokenSaverTurnId == turnId }
         guard matches.count == 1 else { return nil }
@@ -3752,6 +3756,7 @@ public final class BotsViewModel: ObservableObject {
         restoreDeskMessages(botID: conversation.botID)
         restoreDeskWorkLog(botID: conversation.botID)
         restoreDeskLiveTurn(botID: conversation.botID)
+        reloadTokenSaverThreadSavings()
         deskTimelineRejoinToken &+= 1
     }
 
