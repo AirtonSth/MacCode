@@ -4074,19 +4074,20 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func hasLiveRun(botID: BotID) -> Bool {
-        let rows = (try? botStore.listConversations(botID: botID)) ?? []
-        return rows.contains { conversation in
-            guard let threadID = conversation.linkedAgentThreadID else { return false }
-            return context.coordinator.activeRunId(threadId: threadID) != nil
+        do {
+            return try liveThreadIDs(for: botID).isEmpty == false
+        } catch {
+            return true
         }
     }
 
     public func stopLiveRuns(for botID: BotID, force: Bool, onSettled: ((Bool) -> Void)? = nil) {
-        let rows = (try? botStore.listConversations(botID: botID)) ?? []
-        let threadIDs: [AgentThreadID] = rows.compactMap { conversation in
-            guard let threadID = conversation.linkedAgentThreadID,
-                  context.coordinator.activeRunId(threadId: threadID) != nil else { return nil }
-            return threadID
+        let threadIDs: [AgentThreadID]
+        do {
+            threadIDs = try liveThreadIDs(for: botID)
+        } catch {
+            DispatchQueue.main.async { onSettled?(false) }
+            return
         }
         guard !threadIDs.isEmpty else {
             DispatchQueue.main.async { onSettled?(true) }
@@ -4094,29 +4095,31 @@ public final class BotsViewModel: ObservableObject {
         }
         if force {
             isStopping = true
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                do {
-                    try await self.context.coordinator.stopAndAwaitTermination(threadIds: threadIDs)
-                    self.isStopping = false
-                    onSettled?(!self.hasLiveRun(botID: botID))
-                } catch {
-                    self.isStopping = false
-                    self.errorMessage = "Force stop: \(error.localizedDescription)"
-                    onSettled?(false)
-                }
-            }
-            return
         }
-        for threadID in threadIDs {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             do {
-                try resolvedRouter()?.stopAgentRun(thread: threadID)
+                try await self.context.coordinator.stopAndAwaitTermination(threadIds: threadIDs)
+                self.isStopping = false
+                onSettled?(!self.hasLiveRun(botID: botID))
             } catch {
-                errorMessage = String(describing: error)
+                self.isStopping = false
+                self.errorMessage = force
+                    ? "Force stop: \(error.localizedDescription)"
+                    : String(describing: error)
+                onSettled?(false)
             }
         }
-        DispatchQueue.main.async { [weak self] in
-            onSettled?(self?.hasLiveRun(botID: botID) == false)
+    }
+
+    private func liveThreadIDs(for botID: BotID) throws -> [AgentThreadID] {
+        try botStore.listConversations(botID: botID).compactMap { conversation in
+            guard let threadID = conversation.linkedAgentThreadID else { return nil }
+            if context.coordinator.activeRunId(threadId: threadID) != nil { return threadID }
+            if context.coordinator.hasPendingProviderStart(threadId: threadID) { return threadID }
+            if context.coordinator.hasProviderSession(threadId: threadID) { return threadID }
+            if (try? context.coordinator.durableActiveRun(threadId: threadID)) != nil { return threadID }
+            return nil
         }
     }
 

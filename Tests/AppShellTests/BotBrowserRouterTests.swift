@@ -84,6 +84,30 @@ final class BotBrowserRouterTests: XCTestCase {
     }
 
     @MainActor
+    func test_reconcileThrowsWhenContextGoneAndKeepsPending() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2BotBrowserNoCtx-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let workspace = try router.createWorkspace(name: "desk", cwd: NSTemporaryDirectory())
+        let bot = try ctx.botStore.create(
+            name: "Piper", title: "", description: "", provider: .claude, workspaceID: workspace.id
+        )
+        let store = BotBrowserStore(appSupportDirectory: URL(fileURLWithPath: appSupport, isDirectory: true))
+        _ = try BotBrowserHost.requestOpen(
+            store: store,
+            botID: bot.id,
+            url: "https://login.example.test/in",
+            title: "Sign in",
+            notify: { _ in }
+        )
+        router.context = nil
+        XCTAssertThrowsError(try router.reconcileBotBrowserOpens())
+        XCTAssertEqual(try store.loadPendingOpens().map(\.url), ["https://login.example.test/in"])
+    }
+
+    @MainActor
     func test_persistBotBrowserCookiesUsesHTTPCookieSnapshot() throws {
         let appSupport = NSTemporaryDirectory() + "RC2BotBrowserCookies-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }

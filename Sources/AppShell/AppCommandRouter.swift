@@ -6879,7 +6879,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Drain MCP pending opens through the same `openBotBrowser` path tests drive.
     @discardableResult
     public func reconcileBotBrowserOpens() throws -> [BotBrowserTarget] {
-        guard let ctx = context else { return [] }
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
         return try BotBrowserHost.applyPendingOpens(store: store) { botID, url, title in
             try self.openBotBrowser(botID: botID, url: url, title: title)
