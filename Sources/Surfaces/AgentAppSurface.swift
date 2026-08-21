@@ -12319,6 +12319,7 @@ public struct AgentAppView: View {
             if !vm.subagentActivity.isEmpty || showSubagentActivity || vm.routingMode == .auto {
                 SubagentActivityBadge(
                     snapshot: vm.subagentActivity,
+                    bots: vm.mentionableBotsProvider(),
                     now: vm.currentTime(),
                     isPresented: $showSubagentActivity,
                     orchestrateActive: vm.routingMode == .auto

@@ -78,6 +78,166 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertFalse(source.contains("BotMentionParser.isDirectAddress"))
     }
 
+    func test_internalBotPeerWithEmptyProviderCacheSkipsCatalogListingAndStartsProvider() async throws {
+        // WHY: peer routing was already bound from the Bot revision. Re-listing
+        // every provider here can hold the durable handoff in peerPrepared for
+        // minutes before the exact provider gets a chance to start.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2EmptyPeerCatalog-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path
+        )
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let botsVM = BotsViewModel(context: context)
+        // Drain the view model's independent first-paint catalog task while
+        // there is intentionally no router. This test measures peer dispatch.
+        await Task.yield()
+        let quinn = try botsVM.create(
+            name: "Quinn",
+            title: "CRM Controller",
+            provider: .claude
+        )
+        botsVM.openDesk(quinn)
+        botsVM.setDeskProvider(.claude)
+        botsVM.setDeskRoutingMode(.auto)
+        XCTAssertEqual(botsVM.deskRouting.routingMode, .auto)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let originThread = AgentThread(
+            title: "Empty catalog origin",
+            provider: .codex,
+            model: "fake-model",
+            status: .completed
+        )
+        try context.threadRepo.upsert(originThread)
+        XCTAssertTrue(router.cachedProviderSnapshotsForSend().isEmpty)
+        XCTAssertEqual(router.listAgentProviderSnapshotsCallCountForTesting, 0)
+
+        let activityID = AgentMessageID()
+        let milestone = try XCTUnwrap(
+            context.botPeerHandoffAuthority.submitAgentAppMention(
+                peer: quinn,
+                text: "EMPTY_CACHE_INTERNAL_PEER",
+                peerText: "EMPTY_CACHE_INTERNAL_PEER",
+                originThread: originThread,
+                activityID: activityID,
+                hostRunID: nil,
+                providerSnapshots: [],
+                resumeHostAfterPeer: false
+            )
+        )
+        let peerStarted = await waitUntil(timeout: 3) {
+            peerRunner.requests.contains { $0.prompt.contains("EMPTY_CACHE_INTERNAL_PEER") }
+        }
+        XCTAssertTrue(peerStarted)
+        let peerThreadID = try XCTUnwrap(
+            botsVM.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: originThread.id
+            ).first?.peerThreadID
+        )
+        XCTAssertEqual(try context.threadRepo.get(id: peerThreadID)?.effectiveRoutingConfiguration.mode, .auto)
+        XCTAssertEqual(
+            router.listAgentProviderSnapshotsCallCountForTesting,
+            0,
+            "the internal peer path must not invoke broad provider discovery"
+        )
+        XCTAssertFalse(router.preflightListedProviderSnapshotsForTesting)
+
+        let peerRunID = try XCTUnwrap(peerRunner.requests.first?.runId)
+        XCTAssertTrue(peerRunner.finish(
+            runID: peerRunID,
+            status: .completed,
+            reply: "empty-cache reply"
+        ))
+        await milestone.value
+        XCTAssertEqual(
+            botsVM.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: originThread.id
+            ).first?.phase,
+            .completed
+        )
+    }
+
+    func test_peerPreStartDeadlineSettlesReceiptAndPreventsLateProviderExecution() async throws {
+        // WHY: a provider admission that never returns must not leave the
+        // accepted handoff/receipt spinning forever, and releasing it after the
+        // deadline must still be unable to spawn the provider.
+        let (_, botsVM, _, quinn, threadID, context) = try makeWiredMentionSurface(
+            peerReply: "unused deadline reply"
+        )
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let admission = BlockingBotPeerProviderAdmission()
+        context.coordinator.providerAdmissionCheck = { _, _ in
+            await admission.wait()
+        }
+        context.botPeerHandoffAuthority.peerRunStartTimeoutForTesting = 0.2
+        defer { admission.release() }
+        let originThread = try XCTUnwrap(try context.threadRepo.get(id: threadID))
+        let activityID = AgentMessageID()
+        let hostRunID = AgentRunID()
+        let milestone = try XCTUnwrap(
+            context.botPeerHandoffAuthority.submitAgentAppMention(
+                peer: quinn,
+                text: "BOUND_STALLED_PEER_START",
+                peerText: "BOUND_STALLED_PEER_START",
+                originThread: originThread,
+                activityID: activityID,
+                hostRunID: hostRunID,
+                providerSnapshots: [],
+                resumeHostAfterPeer: false
+            )
+        )
+        let admissionStarted = await waitUntil(timeout: 2) { admission.didEnter }
+        XCTAssertTrue(admissionStarted)
+        let handoff = try XCTUnwrap(botsVM.peerHandoffSnapshotsForTesting(
+            originConversationID: nil,
+            originThreadID: threadID
+        ).first)
+        let peerRunID = try XCTUnwrap(handoff.peerRunID)
+        XCTAssertEqual(handoff.phase, .peerPrepared)
+        XCTAssertEqual(
+            try context.orchestrationRuntime.recentReceipts(limit: 64).first {
+                $0.runId == peerRunID
+                    && $0.decisionReason == AgentOrchestrationRuntime.botDelegationDecisionReason
+            }?.lifecycleStatus,
+            .accepted
+        )
+
+        let settled = await waitUntil(timeout: 2) {
+            botsVM.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: threadID
+            ).first?.phase == .needsAttention
+        }
+        XCTAssertTrue(settled, "the injected deadline must settle without waiting for admission")
+        await milestone.value
+        let finalized = try XCTUnwrap(
+            context.orchestrationRuntime.recentReceipts(limit: 64).first {
+                $0.runId == peerRunID
+                    && $0.decisionReason == AgentOrchestrationRuntime.botDelegationDecisionReason
+            }
+        )
+        XCTAssertEqual(finalized.lifecycleStatus, .finalized)
+        XCTAssertEqual(finalized.finalRunStatus, .failed)
+        XCTAssertTrue(peerRunner.requests.isEmpty)
+
+        admission.release()
+        let lateStartCancelled = await waitUntil(timeout: 2) {
+            (try? context.runRepo.get(id: peerRunID)?.status) == .cancelled
+        }
+        XCTAssertTrue(lateStartCancelled)
+        XCTAssertTrue(
+            peerRunner.requests.isEmpty,
+            "coordinator cancellation must revoke the late provider spawn"
+        )
+    }
+
     func test_agentAppConsultationContinuesHostOnceAfterAttributedPeerReply() async throws {
         // WHY: only the primary AI may split "ask @bot, then act". The app must
         // transport its new prompt literally, grant the consulted Bot only, and
@@ -2280,6 +2440,40 @@ final class AgentAppBotMentionTests: XCTestCase {
         surface.viewModel.mentionableBotsProvider = { botsVM.bots }
         surface.viewModel.selectThread(thread.id)
         return (router, botsVM, surface, quinn, thread.id, ctx)
+    }
+}
+
+private final class BlockingBotPeerProviderAdmission: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    private var entered = false
+
+    var didEnter: Bool {
+        lock.withLock { entered }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            entered = true
+            if released {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
+    }
+
+    func release() {
+        lock.lock()
+        released = true
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume()
     }
 }
 

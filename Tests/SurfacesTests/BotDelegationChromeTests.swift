@@ -19,6 +19,49 @@ final class BotDelegationChromeTests: XCTestCase {
         )
     }
 
+    func test_botDelegationAvatar_resolvesCurrentBotByNormalizedHandle_andFallsBack() {
+        var ceo = BotDefinition(
+            handle: "CEO",
+            name: "Chief",
+            title: "Chief Executive Officer",
+            description: "",
+            avatarSymbol: "star.fill"
+        )
+
+        XCTAssertEqual(
+            SubagentActivityProjection.delegatedBot(
+                for: "bot.ceo.1234",
+                among: [ceo]
+            )?.avatarSymbol,
+            "star.fill",
+            "delegated Bot chrome uses the current definition despite handle casing"
+        )
+
+        ceo.avatarSymbol = "bolt.fill"
+        XCTAssertEqual(
+            SubagentActivityProjection.delegatedBot(
+                for: "bot.ceo.1234",
+                among: [ceo]
+            )?.avatarSymbol,
+            "bolt.fill",
+            "avatar edits are read live instead of copied into the receipt"
+        )
+        XCTAssertNil(
+            SubagentActivityProjection.delegatedBot(
+                for: "bot.missing.1234",
+                among: [ceo]
+            ),
+            "a missing Bot definition must select the generated subagent fallback"
+        )
+        XCTAssertNil(
+            SubagentActivityProjection.delegatedBot(
+                for: "nested.claude.1234",
+                among: [ceo]
+            ),
+            "ordinary subagents must keep their deterministic generated avatar"
+        )
+    }
+
     func test_botDelegationReceipt_projectsAsActiveSubagentOnHostThread() {
         let hostThread = AgentThreadID()
         let peerRun = AgentRunID()

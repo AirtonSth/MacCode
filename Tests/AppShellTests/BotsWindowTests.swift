@@ -6467,60 +6467,263 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
-    func test_setPhaseCASMismatchPublishesCanonicalSnapshotNotFailedCandidate() async throws {
-        // WHY: a failed authority CAS must not install the unpersisted phase
-        // into the ViewModel map. A later full-map persist would otherwise
-        // retry that candidate and clobber the canonical sibling.
+    func test_setPhaseRetriesOneTransientConflictFromCanonicalStateWithoutAlert() async throws {
+        // WHY: another writer or the mirror can win one persistence attempt.
+        // Retrying the phase intent from the freshly adopted canonical map
+        // heals that bounded race without exposing a false save alert.
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
         let peerRunner = ControlledBotHandoffRunner(provider: .claude)
-        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
         context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
         let vm = BotsViewModel(context: context, router: router)
-        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
         let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
         vm.openDesk(quinn)
         vm.setDeskProvider(.claude)
-        vm.openDesk(piper)
-        vm.setDeskProvider(.codex)
-        vm.createDeskThread()
-        let origin = try XCTUnwrap(vm.selectedConversation)
+        vm.setDeskModel("fake-model")
+        let originThread = AgentThread(
+            title: "Transient conflict origin",
+            provider: .codex,
+            model: "fake-model",
+            status: .completed
+        )
+        try context.threadRepo.upsert(originThread)
+
+        var persistCount = 0
+        context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = { data in
+            persistCount += 1
+            if persistCount == 2 {
+                throw NSError(domain: "setPhaseTransientConflict", code: 1)
+            }
+            UserDefaults.standard.set(data, forKey: "bots.peerTurns.v2")
+            guard UserDefaults.standard.synchronize(),
+                  UserDefaults.standard.data(forKey: "bots.peerTurns.v2") == data else {
+                throw NSError(domain: "setPhaseTransientConflict", code: 2)
+            }
+        }
+
+        let milestone = try XCTUnwrap(
+            context.botPeerHandoffAuthority.submitAgentAppMention(
+                peer: quinn,
+                text: "SETPHASE_TRANSIENT_RETRY",
+                peerText: "SETPHASE_TRANSIENT_RETRY",
+                originThread: originThread,
+                activityID: AgentMessageID(),
+                hostRunID: nil,
+                providerSnapshots: [],
+                resumeHostAfterPeer: false
+            )
+        )
+        let peerStarted = await waitUntil(timeout: 5) {
+            peerRunner.requests.contains { $0.prompt.contains("SETPHASE_TRANSIENT_RETRY") }
+        }
+        XCTAssertTrue(peerStarted)
+        let phaseAdvanced = await waitUntil(timeout: 5) {
+            persistCount >= 3
+                && vm.peerHandoffSnapshotsForTesting(
+                    originConversationID: nil,
+                    originThreadID: originThread.id
+                ).first?.phase == .peerRunning
+        }
+        XCTAssertTrue(phaseAdvanced)
+        XCTAssertEqual(
+            vm.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: originThread.id
+            ).first?.phase,
+            .peerRunning
+        )
+        XCTAssertNil(vm.errorMessage, vm.errorMessage ?? "")
+
+        context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
+        if let peerRunID = peerRunner.requests.first?.runId {
+            _ = peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
+        }
+        await milestone.value
+    }
+
+    func test_setPhasePersistentConflictPublishesCanonicalSnapshotAndSaveAlert() async throws {
+        // WHY: the bounded retry must not install an unpersisted phase or hide
+        // a storage failure that remains after retrying from canonical state.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: peerRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(quinn)
+        vm.setDeskProvider(.claude)
+        vm.setDeskModel("fake-model")
+        let originThread = AgentThread(
+            title: "Persistent conflict origin",
+            provider: .codex,
+            model: "fake-model",
+            status: .completed
+        )
+        try context.threadRepo.upsert(originThread)
 
         var persistCount = 0
         context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = { data in
             persistCount += 1
             if persistCount > 1 {
-                throw NSError(domain: "setPhaseCASMismatch", code: 1)
+                throw NSError(domain: "setPhasePersistentConflict", code: 1)
             }
             UserDefaults.standard.set(data, forKey: "bots.peerTurns.v2")
             guard UserDefaults.standard.synchronize(),
                   UserDefaults.standard.data(forKey: "bots.peerTurns.v2") == data else {
-                throw NSError(domain: "setPhaseCASMismatch", code: 2)
+                throw NSError(domain: "setPhasePersistentConflict", code: 2)
             }
         }
 
-        XCTAssertTrue(vm.send("@\(quinn.handle) SETPHASE_CAS_MUST_KEEP_CANONICAL"))
+        let milestone = try XCTUnwrap(
+            context.botPeerHandoffAuthority.submitAgentAppMention(
+                peer: quinn,
+                text: "SETPHASE_PERSISTENT_FAILURE",
+                peerText: "SETPHASE_PERSISTENT_FAILURE",
+                originThread: originThread,
+                activityID: AgentMessageID(),
+                hostRunID: nil,
+                providerSnapshots: [],
+                resumeHostAfterPeer: false
+            )
+        )
         let peerStarted = await waitUntil(timeout: 5) {
-            peerRunner.requests.contains { $0.prompt.contains("SETPHASE_CAS_MUST_KEEP_CANONICAL") }
+            peerRunner.requests.contains { $0.prompt.contains("SETPHASE_PERSISTENT_FAILURE") }
         }
         XCTAssertTrue(peerStarted)
-        let phaseHeld = await waitUntil(timeout: 5) { persistCount >= 2 }
-        XCTAssertTrue(phaseHeld, "execute must attempt the peerRunning persist after send")
+        let failurePublished = await waitUntil(timeout: 5) {
+            persistCount >= 3
+                && vm.errorMessage == "The bot handoff state could not be saved."
+        }
+        XCTAssertTrue(failurePublished, "setPhase must attempt once plus one bounded retry")
         XCTAssertEqual(
             vm.peerHandoffSnapshotsForTesting(
-                originConversationID: origin.id,
-                originThreadID: nil
+                originConversationID: nil,
+                originThreadID: originThread.id
             ).first?.phase,
             .peerPrepared,
-            "CAS failure must rehydrate the ViewModel from canonical storage, not the failed peerRunning candidate"
+            "persistent failure must retain canonical state, not the failed candidate"
         )
+        XCTAssertEqual(vm.errorMessage, "The bot handoff state could not be saved.")
 
+        context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
         if let peerRunID = peerRunner.requests.first?.runId {
             _ = peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
         }
-        context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
+        await milestone.value
+    }
+
+    func test_relaunchMissingPreparedPeerRunFinalizesExactAcceptedBotDelegationReceipt() throws {
+        // WHY: the receipt id map is process-local. After a crash, a restored
+        // peerPrepared row with no run is known to have failed before provider
+        // start, so its exact Bot telemetry row must stop claiming Working.
+        let context = try makeContext()
+        let originThread = AgentThread(
+            title: "Restored Bot host",
+            provider: .codex,
+            model: "fake-model",
+            status: .completed
+        )
+        let peerThread = AgentThread(
+            title: "Restored Bot peer",
+            provider: .claude,
+            model: "fake-model",
+            status: .completed
+        )
+        try context.threadRepo.upsert(originThread)
+        try context.threadRepo.upsert(peerThread)
+        let activityID = UUID()
+        let peerRunID = AgentRunID()
+        let hostRunID = AgentRunID()
+        let route = T005PeerHandoffRouteFixture(
+            provider: .claude,
+            providerInstanceID: "claude",
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            serviceTier: .auto,
+            runAsUser: AgentRunAsUser(
+                generatedUID: "restored-bot-fixture",
+                shortName: "fixture",
+                uid: 0,
+                gid: 0,
+                homePath: "/tmp/restored-bot-fixture"
+            ),
+            routingConfiguration: nil
+        )
+        let payload = try JSONEncoder().encode([
+            activityID: T005PeerHandoffRecordFixture(
+                version: 2,
+                activityID: activityID,
+                originBotID: nil,
+                originConversationID: nil,
+                originAgentThreadID: originThread.id,
+                peerBotID: BotID(),
+                peerConversationID: BotConversationID(),
+                peerThreadID: peerThread.id,
+                peerRunID: peerRunID,
+                inboundMessageID: activityID,
+                peerName: "Restored Quinn",
+                peerTitle: "CRM Controller",
+                peerHandle: "restored-quinn",
+                outboundText: "RESTORED_PRESTART_FAILURE",
+                createdAt: Date(),
+                peerRoute: route,
+                hostThreadID: originThread.id,
+                hostRunID: hostRunID,
+                hostRoute: route,
+                replyText: nil,
+                replyCreatedAt: nil,
+                phase: .peerPrepared
+            ),
+        ])
+        UserDefaults.standard.set(payload, forKey: "bots.peerTurns.v2")
+        XCTAssertTrue(UserDefaults.standard.synchronize())
+        try context.settingsRepo.set(
+            "bots.peerTurns.v2",
+            "base64:\(payload.base64EncodedString())"
+        )
+        let receipt = try context.orchestrationRuntime.recordBotDelegationTelemetry(
+            runId: peerRunID,
+            hostThreadId: originThread.id,
+            nodeId: "bot.restored-quinn.\(peerRunID.value.uuidString)",
+            provider: .claude,
+            providerInstanceId: "claude",
+            model: "fake-model",
+            reasoningEffort: .medium,
+            permissionMode: .supervised
+        )
+        XCTAssertEqual(receipt.lifecycleStatus, .accepted)
+        XCTAssertNil(try context.runRepo.get(id: peerRunID))
+
+        let reopened = BotsViewModel(context: context)
+        reopened.reconcilePeerHandoffsForTesting()
+        XCTAssertEqual(
+            reopened.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: originThread.id
+            ).first?.phase,
+            .needsAttention
+        )
+        let reconciledReceipt = try XCTUnwrap(
+            context.orchestrationRuntime.recentReceipts(limit: 64).first {
+                $0.id == receipt.id
+                    && $0.runId == peerRunID
+                    && $0.decisionReason == AgentOrchestrationRuntime.botDelegationDecisionReason
+            }
+        )
+        XCTAssertEqual(reconciledReceipt.lifecycleStatus, .finalized)
+        XCTAssertEqual(reconciledReceipt.finalRunStatus, .failed)
+        XCTAssertFalse(
+            try context.orchestrationRuntime.activityReceipts(
+                threadIds: [originThread.id],
+                limit: 16
+            ).contains {
+                $0.id == receipt.id && $0.lifecycleStatus == .accepted
+            },
+            "the exact restored Bot receipt must no longer project as active"
+        )
     }
 
     func test_routeMutationAfterDurablePrebindCannotRerouteMentionedPeer() async throws {

@@ -451,6 +451,60 @@ private struct BotPeerHandoffDelta {
     let errorMessage: String?
 }
 
+private enum BotPeerRunStartDeadlineError: Error {
+    case exceeded
+}
+
+/// One-shot race whose deadline can settle the handoff even when provider
+/// preparation ignores cooperative task cancellation.
+private final class BotPeerRunStartRace: @unchecked Sendable {
+    typealias Outcome = Result<AgentMessageSendResult, Error>
+
+    private let lock = NSLock()
+    private var outcome: Outcome?
+    private var continuation: CheckedContinuation<Outcome, Never>?
+    private var tasks: [Task<Void, Never>] = []
+
+    func install(_ continuation: CheckedContinuation<Outcome, Never>) {
+        lock.lock()
+        if let outcome {
+            lock.unlock()
+            continuation.resume(returning: outcome)
+        } else {
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    func add(_ task: Task<Void, Never>) {
+        lock.lock()
+        if outcome == nil {
+            tasks.append(task)
+            lock.unlock()
+        } else {
+            lock.unlock()
+            task.cancel()
+        }
+    }
+
+    func resolve(_ outcome: Outcome) {
+        lock.lock()
+        guard self.outcome == nil else {
+            lock.unlock()
+            return
+        }
+        self.outcome = outcome
+        let continuation = self.continuation
+        self.continuation = nil
+        let tasks = self.tasks
+        self.tasks.removeAll()
+        lock.unlock()
+
+        tasks.forEach { $0.cancel() }
+        continuation?.resume(returning: outcome)
+    }
+}
+
 @MainActor
 private protocol BotPeerHandoffAuthorityObserver: AnyObject {
     func botPeerHandoffAuthority(
@@ -472,6 +526,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     private static let defaultsKey = "bots.peerTurns.v2"
     private static let canonicalPrefix = "base64:"
     private static let emptyPayload = Data("[]".utf8)
+    private static let peerRunStartTimeout: TimeInterval = 60
     private static let knownRecordFields: Set<String> = [
         "version", "activityID", "originBotID", "originConversationID",
         "originAgentThreadID", "peerBotID", "peerConversationID", "peerThreadID",
@@ -543,6 +598,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     private var observers: [WeakObserver] = []
 
     var beforeBotRunDispatchForTesting: ((AgentRunID) -> Void)?
+    var peerRunStartTimeoutForTesting: TimeInterval?
     #if DEBUG
     var peerHandoffMirrorCommitGateForTesting: ((Data) throws -> Void)?
     #endif
@@ -666,7 +722,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 providerInstanceId: routing.providerInstanceID,
                 runAsUser: routing.runAsUser,
                 surfaceID: nil,
-                routingConfiguration: nil,
+                routingConfiguration: peerRoutingConfiguration(routing),
                 quiet: true
             )
             conversation.linkedAgentThreadID = thread.id
@@ -1341,17 +1397,10 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         }
         beforeBotRunDispatchForTesting?(plan.started.runID)
         do {
-            let routing = plan.started.routing
-            let result = try await router.sendAgentMessage(
-                thread: plan.started.thread.id,
-                text: receipt.compiledPayload,
-                provider: routing.provider,
-                model: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
-                permissionMode: routing.permissionMode,
-                reasoningEffort: routing.reasoningEffort,
-                providerInstanceId: routing.providerInstanceID,
-                attachments: plan.attachments,
-                requestedRunID: plan.started.runID
+            let result = try await sendPeerRunWithDeadline(
+                plan,
+                receipt: receipt,
+                router: router
             )
             guard result.runId == plan.started.runID else {
                 cancelExactRunWait(plan.started.runID)
@@ -1372,6 +1421,125 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             cancelExactRunWait(plan.started.runID)
             return false
         }
+    }
+
+    private func sendPeerRunWithDeadline(
+        _ plan: BotPeerRunPlan,
+        receipt: ContextAssemblyReceipt,
+        router: AppCommandRouter
+    ) async throws -> AgentMessageSendResult {
+        let threadID = plan.started.thread.id
+        let runID = plan.started.runID
+        let timeout = max(
+            0.001,
+            peerRunStartTimeoutForTesting ?? Self.peerRunStartTimeout
+        )
+        let race = BotPeerRunStartRace()
+        coordinator.reserveProviderStart(threadId: threadID, runId: runID)
+
+        let outcome: BotPeerRunStartRace.Outcome = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                race.install(continuation)
+
+                let sendTask = Task { @MainActor [coordinator] in
+                    defer {
+                        coordinator.discardProviderStartReservation(
+                            threadId: threadID,
+                            runId: runID
+                        )
+                    }
+                    do {
+                        let routing = plan.started.routing
+                        let result = try await router.sendAgentMessage(
+                            thread: threadID,
+                            text: receipt.compiledPayload,
+                            provider: routing.provider,
+                            model: routing.resolvedModel(
+                                defaultModel: BotsViewModel.defaultModel(for:)
+                            ),
+                            permissionMode: routing.permissionMode,
+                            reasoningEffort: routing.reasoningEffort,
+                            providerInstanceId: routing.providerInstanceID,
+                            attachments: plan.attachments,
+                            requestedRunID: runID,
+                            orchestrationRoutingSnapshot: peerOrchestrationRoutingSnapshot(plan),
+                            allowProviderCatalogListingDuringPreflight: false
+                        )
+                        race.resolve(.success(result))
+                    } catch {
+                        race.resolve(.failure(error))
+                    }
+                }
+                race.add(sendTask)
+
+                let timeoutTask = Task { [coordinator] in
+                    let nanoseconds = UInt64(
+                        min(Double(UInt64.max), timeout * 1_000_000_000)
+                    )
+                    do {
+                        try await Task.sleep(nanoseconds: nanoseconds)
+                    } catch {
+                        return
+                    }
+                    coordinator.stopRun(threadId: threadID)
+                    race.resolve(.failure(BotPeerRunStartDeadlineError.exceeded))
+                }
+                race.add(timeoutTask)
+            }
+        } onCancel: {
+            coordinator.stopRun(threadId: threadID)
+            race.resolve(.failure(CancellationError()))
+        }
+        return try outcome.get()
+    }
+
+    private func peerRoutingConfiguration(
+        _ routing: BotDeskRouting
+    ) -> AgentRoutingConfiguration? {
+        guard routing.routingMode == .auto else { return nil }
+        let model = routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:))
+        return AgentRoutingConfiguration(
+            mode: .auto,
+            manualSelection: AgentModelSelection(
+                provider: routing.provider,
+                modelId: model,
+                reasoningEffort: routing.reasoningEffort,
+                serviceTier: .auto
+            ),
+            manualProviderInstanceId: routing.providerInstanceID,
+            eligibleProviders: [routing.provider],
+            policyDigest: orchestrationRuntime?.policyDigest ?? "",
+            revision: 1
+        )
+    }
+
+    private func peerOrchestrationRoutingSnapshot(
+        _ plan: BotPeerRunPlan
+    ) -> AgentOrchestrationRoutingSnapshot? {
+        let configuration = plan.started.thread.effectiveRoutingConfiguration
+        guard configuration.mode == .auto else { return nil }
+        let snapshots: [AgentProviderSnapshot]
+        if plan.providerSnapshots.isEmpty {
+            let routing = plan.started.routing
+            let model = routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:))
+            snapshots = [AgentProviderSnapshotFactory.snapshot(
+                provider: routing.provider,
+                models: [AgentModelDescriptor(
+                    id: model,
+                    label: model,
+                    provider: routing.provider,
+                    supportsReasoning: true
+                )],
+                id: routing.providerInstanceID,
+                modelDiscoverySource: .builtInFallback
+            )]
+        } else {
+            snapshots = plan.providerSnapshots
+        }
+        return AgentOrchestrationRoutingSnapshot(
+            configuration: configuration,
+            providerSnapshots: snapshots
+        )
     }
 
     private func startAgentAppHost(
@@ -1536,11 +1704,18 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         _ phase: BotPeerHandoffPhase,
         projectAttention: Bool = true
     ) {
-        guard !isDeletionBlocked(activityID), var handoff = handoffs[activityID] else { return }
-        handoff.phase = phase
-        var candidate = handoffs
-        candidate[activityID] = handoff
-        guard replaceSnapshot(candidate) else {
+        var persistedHandoff: PersistedBotPeerHandoff?
+        for _ in 0..<2 {
+            guard !isDeletionBlocked(activityID), var handoff = handoffs[activityID] else { return }
+            handoff.phase = phase
+            var candidate = handoffs
+            candidate[activityID] = handoff
+            if replaceSnapshot(candidate) {
+                persistedHandoff = handoff
+                break
+            }
+        }
+        guard let handoff = persistedHandoff else {
             let stored = handoffs[activityID]
             publish(
                 BotPeerHandoffDelta(
@@ -1697,8 +1872,23 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             switch handoff.phase {
             case .peerPrepared, .peerRunning:
                 guard let peerThreadID = handoff.peerThreadID,
-                      let peerRunID = handoff.peerRunID,
-                      let run = try? runRepo.get(id: peerRunID),
+                      let peerRunID = handoff.peerRunID else {
+                    setPhase(activityID, .needsAttention)
+                    continue
+                }
+                let restoredRun: AgentRun?
+                do {
+                    restoredRun = try runRepo.get(id: peerRunID)
+                } catch {
+                    setPhase(activityID, .needsAttention)
+                    continue
+                }
+                guard let run = restoredRun else {
+                    finalizeRestoredMissingPeerRunTelemetry(runID: peerRunID)
+                    setPhase(activityID, .needsAttention)
+                    continue
+                }
+                guard
                       run.threadId == peerThreadID,
                       BotsDeskFollowThrough.isTerminal(run.status),
                       run.status == .completed,
@@ -1757,6 +1947,21 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             case .completed, .needsAttention:
                 break
             }
+        }
+    }
+
+    private func finalizeRestoredMissingPeerRunTelemetry(runID: AgentRunID) {
+        guard let orchestrationRuntime,
+              let receipts = try? orchestrationRuntime.recentReceipts(limit: 10_000) else {
+            return
+        }
+        for receipt in receipts where receipt.runId == runID
+            && receipt.decisionReason == AgentOrchestrationRuntime.botDelegationDecisionReason
+            && receipt.lifecycleStatus == .accepted {
+            try? orchestrationRuntime.finalizeBotDelegationReceipt(
+                id: receipt.id,
+                status: .failed
+            )
         }
     }
 

@@ -59,15 +59,23 @@ final class AgentChatPeerChromeTests: XCTestCase {
         )
     }
 
-    func test_waitingActivityUsesVisibleSharedSpinner() throws {
-        // WHY: a 14pt small spinner disappears against the dark transcript.
-        // Workspaces and Bots both mount this shared activity row.
+    func test_waitingActivityUsesSpinnerBeforeMatchingBotAvatar() throws {
+        // WHY: a 14pt small spinner disappears against the dark transcript,
+        // and the waiting Bot must remain visible immediately to its right.
         let source = try String(
             contentsOf: URL(fileURLWithPath: "Sources/Surfaces/AgentChatSharedChrome.swift"),
             encoding: .utf8
         )
         let row = try XCTUnwrap(source.range(of: "public struct AgentChatPeerActivityRow"))
         let slice = String(source[row.lowerBound...])
+        let stack = try XCTUnwrap(slice.range(of: "HStack(alignment: .top, spacing: DS.Space.sm)"))
+        let stackSlice = String(slice[stack.lowerBound...])
+        let details = try XCTUnwrap(stackSlice.range(of: "VStack(alignment: .leading"))
+        let leadingChrome = String(stackSlice[..<details.lowerBound])
+        let stateIcon = try XCTUnwrap(leadingChrome.range(of: "stateIcon"))
+        let botAvatar = try XCTUnwrap(leadingChrome.range(of: "BotsAvatarView("))
+        XCTAssertLessThan(stateIcon.lowerBound, botAvatar.lowerBound)
+        XCTAssertTrue(leadingChrome.contains("size: 22"))
         XCTAssertTrue(slice.contains(".controlSize(.regular)"))
         XCTAssertTrue(slice.contains(".frame(width: 22, height: 22)"))
         XCTAssertTrue(slice.contains("Circle().fill(DS.Palette.accent.opacity(0.16))"))

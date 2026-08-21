@@ -3633,7 +3633,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         providerInstanceId: String? = nil,
         attachments: [AgentAttachment] = [],
         requestedRunID: AgentRunID,
-        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
+        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil,
+        orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil,
+        allowProviderCatalogListingDuringPreflight: Bool = true
     ) async throws -> AgentMessageSendResult {
         try await sendAgentMessage(
             thread: thread,
@@ -3650,7 +3652,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             queueMessageId: nil,
             routingSnapshot: routingSnapshot,
             requestedRunID: requestedRunID,
-            orchestrationRoutingSnapshot: nil
+            orchestrationRoutingSnapshot: orchestrationRoutingSnapshot,
+            allowProviderCatalogListingDuringPreflight: allowProviderCatalogListingDuringPreflight
         )
     }
 
@@ -3724,7 +3727,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         providerInstanceId: String?,
         permissionMode: AgentPermissionMode,
         interactionMode: AgentInteractionMode,
-        attachments: [AgentAttachment]
+        attachments: [AgentAttachment],
+        allowProviderCatalogListing: Bool = true
     ) async throws {
         let desiredProvider = provider ?? thread.provider
         let desiredInstance = providerInstanceId
@@ -3735,6 +3739,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let snapshots: [AgentProviderSnapshot]
         if !cachedProviderSnapshots.isEmpty, providerSnapshotsAreFresh {
             snapshots = cachedProviderSnapshots
+        } else if !allowProviderCatalogListing {
+            return
         } else {
             preflightListedProviderSnapshotsForTesting = true
             snapshots = await listAgentProviderSnapshots()
@@ -3759,7 +3765,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, allowProviderCatalogListingDuringPreflight: Bool = true) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         let effectiveRouting = orchestrationRoutingSnapshot?.configuration
@@ -3776,7 +3782,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 providerInstanceId: providerInstanceId,
                 permissionMode: permissionMode ?? existing.permissionMode,
                 interactionMode: interactionMode ?? .default,
-                attachments: resolvedAttachments
+                attachments: resolvedAttachments,
+                allowProviderCatalogListing: allowProviderCatalogListingDuringPreflight
             )
         }
         sendAgentMessageAfterPreflightProbeForTesting?()

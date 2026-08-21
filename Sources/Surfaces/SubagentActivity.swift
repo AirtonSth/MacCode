@@ -508,6 +508,17 @@ public enum SubagentActivityProjection {
         return handle.isEmpty ? nil : handle
     }
 
+    /// Resolve a delegated peer from today's Bot directory, never from the
+    /// orchestration receipt, so avatar edits appear without rewriting history.
+    public static func delegatedBot(
+        for nodeId: String,
+        among bots: [BotDefinition]
+    ) -> BotDefinition? {
+        guard let rawHandle = botDelegationHandle(from: nodeId),
+              let handle = BotHandle.normalize(rawHandle) else { return nil }
+        return bots.first { BotHandle.normalize($0.handle) == handle }
+    }
+
     /// `Nested` / `Native` from the durable nodeId prefix; other workers → `Worker`.
     public static func kindLabel(from nodeId: String) -> String {
         let lower = nodeId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -797,6 +808,7 @@ public enum SubagentActivityStyle {
 /// Popover holds Active / Done sections with “Show N more”.
 public struct SubagentActivityBadge: View {
     let snapshot: SubagentActivitySnapshot
+    let bots: [BotDefinition]
     let now: Date
     /// When true (Auto/orchestrate), empty chrome still explains that delegated
     /// workers appear here — so orchestrate never looks like a missing feature.
@@ -808,11 +820,13 @@ public struct SubagentActivityBadge: View {
 
     public init(
         snapshot: SubagentActivitySnapshot,
+        bots: [BotDefinition] = [],
         now: Date = Date(),
         isPresented: Binding<Bool>,
         orchestrateActive: Bool = false
     ) {
         self.snapshot = snapshot
+        self.bots = bots
         self.now = now
         self.orchestrateActive = orchestrateActive
         self._isPresented = isPresented
@@ -832,7 +846,12 @@ public struct SubagentActivityBadge: View {
                 if !snapshot.compactAvatarItems.isEmpty {
                     HStack(spacing: 2) {
                         ForEach(snapshot.compactAvatarItems) { item in
-                            SubagentAvatarView(item: item, size: 12, showsMonogram: false)
+                            SubagentIdentityAvatarView(
+                                item: item,
+                                bots: bots,
+                                size: 12,
+                                showsMonogram: false
+                            )
                         }
                     }
                     .accessibilityHidden(true)
@@ -866,6 +885,7 @@ public struct SubagentActivityBadge: View {
         .popover(isPresented: $isPresented, arrowEdge: .bottom) {
             SubagentActivityPopoverPanel(
                 snapshot: snapshot,
+                bots: bots,
                 now: now,
                 orchestrateActive: orchestrateActive,
                 activeExpanded: $activeExpanded,
@@ -921,6 +941,7 @@ public struct SubagentActivityBadge: View {
 
 struct SubagentActivityPopoverPanel: View {
     let snapshot: SubagentActivitySnapshot
+    let bots: [BotDefinition]
     let now: Date
     let orchestrateActive: Bool
     @Binding var activeExpanded: Bool
@@ -960,7 +981,7 @@ struct SubagentActivityPopoverPanel: View {
                     sectionHeader("Active", count: snapshot.activeCount)
                     VStack(spacing: 0) {
                         ForEach(snapshot.visibleActive(expanded: activeExpanded)) { item in
-                            SubagentActivityRowView(item: item, now: now)
+                            SubagentActivityRowView(item: item, bots: bots, now: now)
                             Divider().background(DS.Palette.line)
                         }
                     }
@@ -977,7 +998,7 @@ struct SubagentActivityPopoverPanel: View {
                     sectionHeader("Done", count: snapshot.doneCount)
                     VStack(spacing: 0) {
                         ForEach(snapshot.visibleDone(expanded: doneExpanded)) { item in
-                            SubagentActivityRowView(item: item, now: now)
+                            SubagentActivityRowView(item: item, bots: bots, now: now)
                             Divider().background(DS.Palette.line)
                         }
                     }
@@ -994,7 +1015,7 @@ struct SubagentActivityPopoverPanel: View {
                     sectionHeader("Unknown", count: snapshot.unknownCount)
                     VStack(spacing: 0) {
                         ForEach(snapshot.visibleUnknown(expanded: unknownExpanded)) { item in
-                            SubagentActivityRowView(item: item, now: now)
+                            SubagentActivityRowView(item: item, bots: bots, now: now)
                             Divider().background(DS.Palette.line)
                         }
                     }
@@ -1049,11 +1070,12 @@ struct SubagentActivityPopoverPanel: View {
 
 struct SubagentActivityRowView: View {
     let item: SubagentActivityItem
+    let bots: [BotDefinition]
     let now: Date
 
     var body: some View {
         HStack(alignment: .center, spacing: DS.Space.sm) {
-            SubagentAvatarView(item: item, size: 28, showsMonogram: true)
+            SubagentIdentityAvatarView(item: item, bots: bots, size: 28, showsMonogram: true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.displayName)
                     .font(DS.Font.bodyDense.weight(.medium))
@@ -1107,8 +1129,31 @@ struct SubagentActivityRowView: View {
     private var rowAccessibilityLabel: String {
         let time = SubagentActivityProjection.trailingTimeLabel(for: item, now: now)
         let meta = item.providerModelLabel.map { ", \($0)" } ?? ""
-        let face = SubagentActivityStyle.avatarSpec(for: item).monogram
+        let face = SubagentActivityProjection.delegatedBot(for: item.nodeId, among: bots)
+            .map { $0.name.isEmpty ? "@\($0.handle)" : $0.name }
+            ?? SubagentActivityStyle.avatarSpec(for: item).monogram
         return "\(item.displayName), avatar \(face), \(item.statusLabel)\(meta), \(time)"
+    }
+}
+
+/// One identity resolver shared by compact and popover Subagents chrome.
+struct SubagentIdentityAvatarView: View {
+    let item: SubagentActivityItem
+    let bots: [BotDefinition]
+    var size: CGFloat = 18
+    var showsMonogram: Bool = true
+
+    var body: some View {
+        if let bot = SubagentActivityProjection.delegatedBot(for: item.nodeId, among: bots) {
+            BotsAvatarView(
+                name: bot.name,
+                handle: bot.handle,
+                symbol: bot.avatarSymbol,
+                size: size
+            )
+        } else {
+            SubagentAvatarView(item: item, size: size, showsMonogram: showsMonogram)
+        }
     }
 }
 
