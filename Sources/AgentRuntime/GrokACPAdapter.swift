@@ -85,6 +85,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         /// previous one (or the user started a follow-up).
         var promptGeneration: UInt64 = 0
         var turnWatchdog: DispatchWorkItem?
+        /// Force-kill armed for a specific `promptGeneration`. Cancelled when a
+        /// newer generation starts so N's timer cannot kill N+1.
+        var forceKillWorkItem: DispatchWorkItem?
         /// True while `fireTurnInactivityWatchdog` is synthesizing a terminal.
         /// Blocks emit→refresh→fire re-entry: finishTurn/emit used to re-arm the
         /// inactivity timer mid-synthesis and recurse until SIGBUS (stack guard).
@@ -145,9 +148,20 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     private static var sharedDiscoveryCache: [String: (result: GrokACPDiscoveryResult, fetchedAt: Date)] = [:]
     private var sessions: [AgentThreadID: Session] = [:]
     private var promptWriteAcceptanceCountForTestingStorage = 0
+    var tokenSaverCensusAllowedOverrideForTesting: Bool?
     var beforePromptWriteForTesting: (() -> Void)?
     var beforePhysicalPromptWriteForTesting: (() -> Void)?
     var afterPromptWriteForTesting: (() -> Void)?
+    /// Runs on the cancel-write queue before `session/cancel`. Tests block here
+    /// without stalling `interruptTurn`.
+    var beforeCancelWriteForTesting: (() -> Void)?
+    /// When set, the ACP cancel write is skipped and treated as a diagnostic
+    /// failure. Teardown stays armed and the terminal stays cancelled.
+    var cancelWriteErrorForTesting: Error?
+    private var cancelWriteAttemptCountForTestingStorage = 0
+    var cancelWriteAttemptCountForTesting: Int {
+        synchronized { cancelWriteAttemptCountForTestingStorage }
+    }
     var promptWriteAcceptanceCountForTesting: Int {
         synchronized { promptWriteAcceptanceCountForTestingStorage }
     }
@@ -166,6 +180,13 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         self.discoveryCwd = discoveryCwd
         self.discoveryEnvironment = discoveryEnvironment
         self.modelCacheTTL = max(0, modelCacheTTL)
+    }
+
+    static func tokenSaverCensusAllowed(
+        runAsUser: AgentRunAsUser?,
+        currentUID: uid_t = getuid()
+    ) -> Bool {
+        runAsUser?.uid == nil || runAsUser?.uid == currentUID
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -342,29 +363,111 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     public func interruptTurn(threadId: AgentThreadID) throws {
-        lock.lock()
-        guard let session = sessions[threadId] else {
-            lock.unlock()
-            throw AgentProviderAdapterError.sessionNotFound(threadId)
+        let captured: (session: Session, generation: UInt64)? = synchronized {
+            guard let session = sessions[threadId] else { return nil }
+            let shouldCancel = session.inFlight && !session.cancelRequested
+            guard shouldCancel else { return nil }
+            session.cancelRequested = true
+            let generation = session.promptGeneration
+            armForceKillLocked(session: session, generation: generation)
+            return (session, generation)
         }
-        let shouldCancel = session.inFlight && !session.cancelRequested
-        if shouldCancel { session.cancelRequested = true }
-        lock.unlock()
-        guard shouldCancel else { return }
-        do { try session.client.cancel(sessionId: session.providerThreadId) }
-        catch {
-            let failure = GrokACPFailureTaxonomy.normalize(error, context: .turn)
-            finishTransportFailure(session: session, error: failure, forced: false)
-            throw failure
+        guard let captured else {
+            if synchronized({ sessions[threadId] == nil }) {
+                throw AgentProviderAdapterError.sessionNotFound(threadId)
+            }
+            return
         }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + cancellationGracePeriod) { [weak self, weak session] in
+        enqueueCancelWrite(session: captured.session, generation: captured.generation)
+    }
+
+    private func armForceKillLocked(session: Session, generation: UInt64) {
+        session.forceKillWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session else { return }
-            self.lock.lock()
-            let force = session.inFlight && !session.turnTerminalEmitted
-            if force { session.forcedKillByUs = true }
-            self.lock.unlock()
-            if force { session.client.stop() }
+            self.forceKillIfCurrent(session: session, generation: generation)
         }
+        session.forceKillWorkItem = item
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + cancellationGracePeriod,
+            execute: item
+        )
+        grokAcpLog.info(
+            "grok.cancel.force.armed thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
+        )
+    }
+
+    private func enqueueCancelWrite(session: Session, generation: UInt64) {
+        grokAcpLog.info(
+            "grok.cancel.enqueue thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
+        )
+        DispatchQueue.global(qos: .utility).async { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.beforeCancelWriteForTesting?()
+            if let injected = self.cancelWriteErrorForTesting {
+                grokAcpLog.info(
+                    "grok.cancel.write.failed thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public) injected=1"
+                )
+                _ = injected
+                return
+            }
+            do {
+                let wrote = try session.client.cancel(
+                    sessionId: session.providerThreadId,
+                    admittedBy: { [weak self, weak session] in
+                        guard let self, let session else { return false }
+                        return self.synchronized {
+                            let current = self.sessions[session.threadId] === session
+                                && session.promptGeneration == generation
+                                && session.inFlight
+                                && !session.turnTerminalEmitted
+                                && session.cancelRequested
+                            if current {
+                                self.cancelWriteAttemptCountForTestingStorage += 1
+                            }
+                            return current
+                        }
+                    }
+                )
+                if !wrote {
+                    grokAcpLog.info(
+                        "grok.cancel.write.stale thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
+                    )
+                }
+            } catch {
+                grokAcpLog.info(
+                    "grok.cancel.write.failed thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
+                )
+            }
+        }
+    }
+
+    private func forceKillIfCurrent(session: Session, generation: UInt64) {
+        lock.lock()
+        let current = sessions[session.threadId] === session
+            && session.promptGeneration == generation
+            && session.inFlight
+            && !session.turnTerminalEmitted
+            && session.cancelRequested
+        if current {
+            session.forcedKillByUs = true
+            // Retain map identity for handleTermination's one terminal, but
+            // close reuse before dropping the lock. A natural N completion in
+            // the tiny interval before client.stop cannot admit N+1.
+            session.isLive = false
+            session.promptWritePermit.invalidate()
+        }
+        lock.unlock()
+        guard current else {
+            grokAcpLog.info(
+                "grok.cancel.force.stale thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
+            )
+            return
+        }
+        grokAcpLog.info(
+            "grok.cancel.force.kill thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
+        )
+        session.client.stop()
     }
 
     public func respondToRequest(
@@ -420,7 +523,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         for request in pending {
             request.continuation.resume(throwing: AgentProviderAdapterError.sessionNotFound(threadId))
         }
-        if session.inFlight { try? session.client.cancel(sessionId: session.providerThreadId) }
+        // Hard teardown must never queue behind the cooperative cancel write.
+        // The first Stop already enqueued session/cancel; a second Stop owns
+        // transport termination and goes straight to the process tree.
         session.client.stop()
     }
 
@@ -524,7 +629,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 notificationHandler: { method, params in
                     bufferedNotifications.append(method: method, params: params)
                 },
-                tokenSaverCensusAllowed: request.runAsUser?.uid == nil || request.runAsUser?.uid == getuid()
+                tokenSaverCensusAllowed: tokenSaverCensusAllowedOverrideForTesting
+                    ?? Self.tokenSaverCensusAllowed(runAsUser: request.runAsUser)
             )
         } catch {
             throw GrokACPFailureTaxonomy.normalize(
@@ -664,6 +770,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             session.forcedKillByUs = false
             session.turnTerminalEmitted = false
             session.turnWatchdogSynthesisInProgress = false
+            session.forceKillWorkItem?.cancel()
+            session.forceKillWorkItem = nil
             session.promptGeneration &+= 1
             session.onEvent = onEvent
             cancelTurnWatchdogLocked(session: session)
@@ -919,16 +1027,28 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         error: Error
     ) {
         lock.lock()
-        let active = session.inFlight && session.promptAccepted && !session.turnTerminalEmitted
+        let generation = session.promptGeneration
+        let current = sessions[session.threadId] === session
+        let active = current
+            && session.inFlight
+            && session.promptAccepted
+            && !session.turnTerminalEmitted
         let forced = session.forcedKillByUs
         let cancelled = session.cancelRequested
-        if sessions[session.threadId] === session {
+        if current {
             sessions.removeValue(forKey: session.threadId)
         }
         session.isLive = false
         session.promptWritePermit.invalidate()
+        session.forceKillWorkItem?.cancel()
+        session.forceKillWorkItem = nil
         lock.unlock()
-        guard active else { return }
+        guard active else {
+            grokAcpLog.info(
+                "grok.turn.termination.stale thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
+            )
+            return
+        }
         let terminal = GrokACPTerminalClassifier.status(
             promptResolved: false,
             cancelRequested: cancelled,
@@ -963,11 +1083,25 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
 
     private func finishTurn(session: Session, status: AgentRunStatus) {
         lock.lock()
+        guard sessions[session.threadId] === session || !session.isLive else {
+            lock.unlock()
+            return
+        }
         guard !session.turnTerminalEmitted else { lock.unlock(); return }
         session.turnTerminalEmitted = true
         session.turnWatchdogSynthesisInProgress = false
         session.inFlight = false
         session.status = status
+        let shouldStopOwnedTree = status == .cancelled && session.cancelRequested
+        if shouldStopOwnedTree {
+            if sessions[session.threadId] === session {
+                sessions.removeValue(forKey: session.threadId)
+            }
+            session.isLive = false
+            session.promptWritePermit.invalidate()
+        }
+        session.forceKillWorkItem?.cancel()
+        session.forceKillWorkItem = nil
         cancelTurnWatchdogLocked(session: session)
         let callback = session.onEvent
         let final = session.mapper.finalAssistantMessage
@@ -977,6 +1111,12 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         lock.unlock()
         for request in pending {
             request.continuation.resume(throwing: AgentProviderAdapterError.unsupported("Grok ACP turn ended before permission response"))
+        }
+        if shouldStopOwnedTree {
+            grokAcpLog.info(
+                "grok.cancel.ack.tree_stop thread=\(session.threadId.value.uuidString, privacy: .public)"
+            )
+            session.client.stop()
         }
         callback?(.status(status))
         callback?(.finished(status, finalMessage: final, providerThreadId: providerThreadId))

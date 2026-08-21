@@ -3825,9 +3825,13 @@ public final class AgentRunRepository: @unchecked Sendable {
 
     public func upsert(_ r: AgentRun) throws {
         let st = try db.prepare("""
-            INSERT INTO agent_runs(id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET status=excluded.status, finished_at=excluded.finished_at, error_message=excluded.error_message;
+            INSERT INTO agent_runs(id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message, terminal_reason)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status=excluded.status,
+                finished_at=excluded.finished_at,
+                error_message=excluded.error_message,
+                terminal_reason=excluded.terminal_reason;
         """)
         try st.bind(1, r.id.value.uuidString)
         try st.bind(2, r.threadId.value.uuidString)
@@ -3838,28 +3842,19 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(7, iso.string(from: r.startedAt))
         try st.bind(8, r.finishedAt.map { iso.string(from: $0) })
         try st.bind(9, r.errorMessage)
+        try st.bind(10, r.terminalReason)
         _ = try st.step()
     }
 
     public func get(id: AgentRunID) throws -> AgentRun? {
         let st = try db.prepare("""
-            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message
+            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message, terminal_reason
             FROM agent_runs
             WHERE id = ?;
         """)
         try st.bind(1, id.value.uuidString)
         guard try st.step() else { return nil }
-        return AgentRun(
-            id: AgentRunID(UUID(uuidString: st.columnText(0) ?? "") ?? id.value),
-            threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
-            provider: AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex,
-            providerInstanceId: st.columnText(3) ?? (AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex).rawValue,
-            model: st.columnText(4) ?? "",
-            status: AgentRunStatus(rawValue: st.columnText(5) ?? "") ?? .pending,
-            startedAt: parseDate(st.columnText(6)),
-            finishedAt: st.columnText(7).map(parseDate),
-            errorMessage: st.columnText(8)
-        )
+        return decodeRun(st, fallbackId: id.value)
     }
 
     /// Latest non-terminal run for a thread, including LaunchAgent-owned rows.
@@ -3869,7 +3864,7 @@ public final class AgentRunRepository: @unchecked Sendable {
     /// "Working for Xs" and Stop targeting without inventing a local session.
     public func latestActive(for threadId: AgentThreadID) throws -> AgentRun? {
         let st = try db.prepare("""
-            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message
+            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message, terminal_reason
             FROM agent_runs
             WHERE thread_id = ? AND status IN ('pending', 'running')
             ORDER BY started_at DESC
@@ -3877,40 +3872,20 @@ public final class AgentRunRepository: @unchecked Sendable {
         """)
         try st.bind(1, threadId.value.uuidString)
         guard try st.step() else { return nil }
-        return AgentRun(
-            id: AgentRunID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID()),
-            threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? threadId.value),
-            provider: AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex,
-            providerInstanceId: st.columnText(3) ?? (AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex).rawValue,
-            model: st.columnText(4) ?? "",
-            status: AgentRunStatus(rawValue: st.columnText(5) ?? "") ?? .pending,
-            startedAt: parseDate(st.columnText(6)),
-            finishedAt: st.columnText(7).map(parseDate),
-            errorMessage: st.columnText(8)
-        )
+        return decodeRun(st, fallbackThread: threadId.value)
     }
 
     /// All pending/running runs (for launch reconcile ledger stamping).
     public func listActive() throws -> [AgentRun] {
         let st = try db.prepare("""
-            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message
+            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message, terminal_reason
             FROM agent_runs
             WHERE status IN ('pending', 'running')
             ORDER BY started_at DESC;
             """)
         var rows: [AgentRun] = []
         while try st.step() {
-            rows.append(AgentRun(
-                id: AgentRunID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID()),
-                threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
-                provider: AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex,
-                providerInstanceId: st.columnText(3) ?? (AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex).rawValue,
-                model: st.columnText(4) ?? "",
-                status: AgentRunStatus(rawValue: st.columnText(5) ?? "") ?? .pending,
-                startedAt: parseDate(st.columnText(6)),
-                finishedAt: st.columnText(7).map(parseDate),
-                errorMessage: st.columnText(8)
-            ))
+            rows.append(decodeRun(st))
         }
         return rows
     }
@@ -3923,7 +3898,7 @@ public final class AgentRunRepository: @unchecked Sendable {
     public func listRecentFinished(limit: Int = 50) throws -> [AgentRun] {
         let capped = max(1, min(limit, 500))
         let st = try db.prepare("""
-            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message
+            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message, terminal_reason
             FROM agent_runs
             WHERE finished_at IS NOT NULL
               AND status NOT IN ('pending', 'running')
@@ -3933,17 +3908,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(1, Int64(capped))
         var rows: [AgentRun] = []
         while try st.step() {
-            rows.append(AgentRun(
-                id: AgentRunID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID()),
-                threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
-                provider: AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex,
-                providerInstanceId: st.columnText(3) ?? (AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex).rawValue,
-                model: st.columnText(4) ?? "",
-                status: AgentRunStatus(rawValue: st.columnText(5) ?? "") ?? .completed,
-                startedAt: parseDate(st.columnText(6)),
-                finishedAt: st.columnText(7).map(parseDate),
-                errorMessage: st.columnText(8)
-            ))
+            rows.append(decodeRun(st, defaultStatus: .completed))
         }
         return rows
     }
@@ -3957,7 +3922,8 @@ public final class AgentRunRepository: @unchecked Sendable {
             let st = try db.prepare("""
                 UPDATE agent_runs
                 SET status='interrupted', finished_at=?,
-                    error_message=COALESCE(error_message, ?)
+                    error_message=COALESCE(error_message, ?),
+                    terminal_reason=COALESCE(terminal_reason, 'relaunchReconcile')
                 WHERE status IN ('pending', 'running');
                 """)
             try st.bind(1, iso.string(from: Date()))
@@ -3971,7 +3937,8 @@ public final class AgentRunRepository: @unchecked Sendable {
         let st = try db.prepare("""
             UPDATE agent_runs
             SET status='interrupted', finished_at=?,
-                error_message=COALESCE(error_message, ?)
+                error_message=COALESCE(error_message, ?),
+                terminal_reason=COALESCE(terminal_reason, 'relaunchReconcile')
             WHERE status IN ('pending', 'running') AND thread_id NOT IN (\(placeholders));
             """)
         try st.bind(1, iso.string(from: Date()))
@@ -3984,11 +3951,38 @@ public final class AgentRunRepository: @unchecked Sendable {
     }
 
     public func markStopped(id: AgentRunID, status: AgentRunStatus = .cancelled, at date: Date = Date()) throws {
-        let st = try db.prepare("UPDATE agent_runs SET status=?, finished_at=? WHERE id=? AND status IN ('pending', 'running');")
+        let reason = status == .cancelled ? "userStop" : nil
+        let st = try db.prepare("""
+            UPDATE agent_runs
+            SET status=?, finished_at=?,
+                terminal_reason=COALESCE(?, terminal_reason)
+            WHERE id=? AND status IN ('pending', 'running');
+            """)
         try st.bind(1, status.rawValue)
         try st.bind(2, iso.string(from: date))
-        try st.bind(3, id.value.uuidString)
+        try st.bind(3, reason)
+        try st.bind(4, id.value.uuidString)
         _ = try st.step()
+    }
+
+    private func decodeRun(
+        _ st: SQLiteStatement,
+        fallbackId: UUID? = nil,
+        fallbackThread: UUID? = nil,
+        defaultStatus: AgentRunStatus = .pending
+    ) -> AgentRun {
+        AgentRun(
+            id: AgentRunID(UUID(uuidString: st.columnText(0) ?? "") ?? fallbackId ?? UUID()),
+            threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? fallbackThread ?? UUID()),
+            provider: AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex,
+            providerInstanceId: st.columnText(3) ?? (AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex).rawValue,
+            model: st.columnText(4) ?? "",
+            status: AgentRunStatus(rawValue: st.columnText(5) ?? "") ?? defaultStatus,
+            startedAt: parseDate(st.columnText(6)),
+            finishedAt: st.columnText(7).map(parseDate),
+            errorMessage: st.columnText(8),
+            terminalReason: st.columnText(9)
+        )
     }
 
     private func countRunning() throws -> Int {

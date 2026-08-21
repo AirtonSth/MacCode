@@ -5,33 +5,54 @@ import Surfaces
 /// Maps a linked Agent run onto Bot Desk / Attention so a teammate turn
 /// does not stay stuck on "Working…".
 enum BotsDeskFollowThrough {
-    static func conversationState(for status: AgentRunStatus) -> BotAttentionState {
+    static func conversationState(
+        for status: AgentRunStatus,
+        terminalReason: String? = nil
+    ) -> BotAttentionState {
         switch status {
         case .pending, .running:
             return .working
         case .completed:
             return .unreadActivity
-        case .failed, .cancelled, .interrupted:
+        case .failed, .interrupted:
+            return .needsAttention
+        case .cancelled:
+            if terminalReason == "userStop" { return .none }
             return .needsAttention
         }
     }
 
     /// A completed turn on the open Desk is already being read — do not badge it Unread.
-    static func conversationState(for status: AgentRunStatus, viewingDesk: Bool) -> BotAttentionState {
-        let state = conversationState(for: status)
+    static func conversationState(
+        for status: AgentRunStatus,
+        viewingDesk: Bool,
+        terminalReason: String? = nil
+    ) -> BotAttentionState {
+        let state = conversationState(for: status, terminalReason: terminalReason)
         if viewingDesk && state == .unreadActivity { return .none }
         return state
     }
 
-    static func attentionKind(for status: AgentRunStatus) -> BotAttentionItemKind? {
+    static func attentionKind(
+        for status: AgentRunStatus,
+        terminalReason: String? = nil
+    ) -> BotAttentionItemKind? {
         switch status {
         case .pending, .running, .completed:
             return nil
         case .failed, .interrupted:
             return .blocked
         case .cancelled:
-            return .question
+            if terminalReason == "userStop" { return nil }
+            return .blocked
         }
+    }
+
+    static func attentionTitle(for status: AgentRunStatus, terminalReason: String? = nil) -> String {
+        if status == .cancelled && terminalReason != "userStop" {
+            return "Run needs you"
+        }
+        return status == .cancelled ? "Run cancelled" : "Run needs you"
     }
 
     static let workingPlaceholder = "Working…"

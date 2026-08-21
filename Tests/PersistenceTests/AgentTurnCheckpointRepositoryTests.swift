@@ -34,6 +34,23 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         return (thread.id, run.id)
     }
 
+    private func seedThreadAndLegacyRun(db: SQLiteDB) throws -> (threadId: AgentThreadID, runId: AgentRunID) {
+        // WHY: migration fixtures stop at the shared v56 base. They must seed a
+        // row using only columns that actually existed then, not today's writer.
+        let thread = AgentThread(title: "t", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let runID = AgentRunID()
+        let insert = try db.prepare("""
+            INSERT INTO agent_runs(id, thread_id, provider, model, status, started_at)
+            VALUES (?, ?, 'codex', 'm', 'running', ?);
+            """)
+        try insert.bind(1, runID.value.uuidString)
+        try insert.bind(2, thread.id.value.uuidString)
+        try insert.bind(3, ISO8601DateFormatter().string(from: Date()))
+        _ = try insert.step()
+        return (thread.id, runID)
+    }
+
     private func makeCheckpoint(
         threadId: AgentThreadID,
         turnCount: Int,
@@ -618,7 +635,7 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
             db,
             Schema.steps.filter { $0.version <= Schema.sharedIntegrationBaseVersion }
         )
-        let (tid, rid) = try seedThreadAndRun(db: db)
+        let (tid, rid) = try seedThreadAndLegacyRun(db: db)
         let completed = Date(timeIntervalSince1970: 1_700_000_600)
         let insert = try db.prepare("""
             INSERT INTO agent_turn_checkpoints(
@@ -788,7 +805,7 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
             db,
             Schema.steps.filter { $0.version <= Schema.sharedIntegrationBaseVersion }
         )
-        let (tid, rid) = try seedThreadAndRun(db: db)
+        let (tid, rid) = try seedThreadAndLegacyRun(db: db)
         let insert = try db.prepare("""
             INSERT INTO agent_turn_checkpoints(
                 thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status,

@@ -66,6 +66,7 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
     private func request(
         threadId: AgentThreadID,
         runId: AgentRunID = AgentRunID(),
+        model: String = "claude-manual",
         environment: [String: String] = [:]
     ) -> AgentRunRequest {
         AgentRunRequest(
@@ -73,7 +74,7 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
             threadId: threadId,
             provider: .claude,
             providerInstanceId: "claude-manual",
-            model: "claude-manual",
+            model: model,
             cwd: NSTemporaryDirectory(),
             prompt: "route this run",
             userMessageContent: "route this run",
@@ -91,7 +92,8 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
-        let thread = AgentThread(title: "manual", provider: .claude, model: "claude-manual")
+        let supportedModel = "claude-sonnet-4-6"
+        let thread = AgentThread(title: "manual", provider: .claude, model: supportedModel)
         try threadRepo.upsert(thread)
         let runner = RecordingProviderRunner(provider: .claude)
         let supplier = SnapshotSupplierProbe(snapshots: [])
@@ -106,7 +108,7 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
             providerSnapshotSupplier: { try supplier.load() },
             providers: [.claude: runner]
         )
-        let original = request(threadId: thread.id)
+        let original = request(threadId: thread.id, model: supportedModel)
 
         _ = try await coordinator.startRun(original)
 

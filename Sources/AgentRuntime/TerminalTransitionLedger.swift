@@ -282,7 +282,25 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
     }
 
     public func records(forRunId runId: String) throws -> [TerminalTransitionRecord] {
-        try allRecords().filter { $0.runId == runId }
+        try allRecords().filter { $0.runId.compare(runId, options: .caseInsensitive) == .orderedSame }
+    }
+
+    /// Narrow causal lookup for the Persistence-owned legacy user-Stop repair.
+    public func records(
+        reason: TerminalTransitionReason,
+        runId: String? = nil,
+        threadId: String? = nil
+    ) throws -> [TerminalTransitionRecord] {
+        try allRecords().filter { record in
+            guard record.reason == reason else { return false }
+            if let runId, record.runId.compare(runId, options: .caseInsensitive) != .orderedSame {
+                return false
+            }
+            if let threadId, record.threadId.compare(threadId, options: .caseInsensitive) != .orderedSame {
+                return false
+            }
+            return true
+        }
     }
 
     private func appendLocked(_ record: TerminalTransitionRecord) throws {

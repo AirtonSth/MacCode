@@ -2103,6 +2103,9 @@ public struct AgentRun: Codable, Sendable, Equatable, Identifiable {
     public var startedAt: Date
     public var finishedAt: Date?
     public var errorMessage: String?
+    /// Durable `TerminalTransitionReason.rawValue`. Nil on pre-column rows
+    /// and while the run is still pending/running.
+    public var terminalReason: String?
 
     public init(
         id: AgentRunID = AgentRunID(),
@@ -2113,11 +2116,18 @@ public struct AgentRun: Codable, Sendable, Equatable, Identifiable {
         status: AgentRunStatus = .running,
         startedAt: Date = Date(),
         finishedAt: Date? = nil,
-        errorMessage: String? = nil
+        errorMessage: String? = nil,
+        terminalReason: String? = nil
     ) {
         self.id = id; self.threadId = threadId; self.provider = provider; self.providerInstanceId = providerInstanceId ?? provider.rawValue; self.model = model
         self.status = status; self.startedAt = startedAt; self.finishedAt = finishedAt
         self.errorMessage = errorMessage
+        self.terminalReason = terminalReason
+    }
+
+    /// User Stop/force Stop is idle; any other cancellation stays actionable.
+    public var isUserStopCancellation: Bool {
+        status == .cancelled && terminalReason == "userStop"
     }
 }
 

@@ -2547,6 +2547,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         _ = pendingStart?.invalidateAcceptance()
         if let runId, let handle {
+            // Claim userStop before interrupt/cancel callbacks can persist a
+            // provider-acknowledged cancellation over the user's Stop.
+            markStopRequested(threadId: threadId, runId: runId)
             var deliveredNativeInterrupt = false
             if let adapter = try? adapterForThread(threadId) {
                 lock.lock()
@@ -2580,12 +2583,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             } else {
                 handle.cancel()
             }
-            // Always route through markStopRequested: when a terminal is already
-            // claimed it re-arms the durability retry (and clears the local wire
-            // rendering gate so Stop cannot stick on "Stopping…"). When only a
-            // deferred provider terminal is waiting on in-flight rendering, cancel
-            // still claims the slot. Never skip markStopRequested for user Stop.
-            markStopRequested(threadId: threadId, runId: runId)
             return
         }
         // F19: nothing to stop unless the thread is actually running/pending. A
@@ -3922,7 +3919,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 assistantMessage: nil,
                 finishedAt: Date(),
                 providerTerminalAcknowledged: false,
-                errorMessage: nil
+                errorMessage: nil,
+                terminalReason: TerminalTransitionReason.userStop.rawValue
             )
             lock.unlock()
             handle(
@@ -6645,11 +6643,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             )
             let status = durable.status
             let initiator = durable.initiator
-            if status != pendingTerminal.status || durable.errorMessage != pendingTerminal.errorMessage {
+            let reason = TerminalTransitionReason.classify(
+                requestedStatus: requestedStatus,
+                initiator: initiator
+            )
+            if status != pendingTerminal.status
+                || durable.errorMessage != pendingTerminal.errorMessage
+                || pendingTerminal.terminalReason != reason.rawValue {
                 pendingTerminal.status = status
                 if let msg = durable.errorMessage {
                     pendingTerminal.errorMessage = msg
                 }
+                pendingTerminal.terminalReason = reason.rawValue
                 // Keep retry map consistent if durability flushes later.
                 lock.lock()
                 pendingTerminalEvents[runId] = pendingTerminal
@@ -6929,6 +6934,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         run.finishedAt = pending.finishedAt
         // Persist the resolved reason for abnormal ends. User cancel leaves this nil.
         run.errorMessage = pending.errorMessage
+        run.terminalReason = pending.terminalReason
+            ?? TerminalTransitionReason.classify(
+                requestedStatus: pending.status,
+                initiator: Self.terminalInitiator(
+                    status: pending.status,
+                    providerTerminalAcknowledged: pending.providerTerminalAcknowledged,
+                    errorMessage: pending.errorMessage
+                )
+            ).rawValue
 
         thread.status = pending.status
         thread.hasUnread = Self.hasUnread(for: pending.status)
@@ -8526,6 +8540,8 @@ private struct PendingTerminalEvent {
     var providerTerminalAcknowledged: Bool
     /// Durable `agent_runs.error_message` for this terminal (nil for cancel/success).
     var errorMessage: String?
+    /// Durable `agent_runs.terminal_reason` (`TerminalTransitionReason.rawValue`).
+    var terminalReason: String? = nil
     /// Raw provider final used only for incomplete-turn classification when the
     /// user-facing final was locally rendered from RCW1. Never persisted as the
     /// canonical assistant message.

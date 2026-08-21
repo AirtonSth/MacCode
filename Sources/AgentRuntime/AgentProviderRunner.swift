@@ -580,7 +580,11 @@ public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Send
             status: status,
             providerThreadId: providerThreadId ?? existing.providerThreadId
         )
-        handles.removeValue(forKey: threadId)
+        // This is only the coordinator's durable terminal projection; it is
+        // not proof that the provider process acknowledged cancellation. Keep
+        // the handle so stopAndAwaitTermination (including a second Stop click)
+        // can still cancel/tear down the exact provider work. A real provider
+        // `.finished` event removes it in record(event:threadId:).
     }
 }
 

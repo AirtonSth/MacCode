@@ -149,6 +149,28 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         return Int(st.columnInt64(0))
     }
 
+    /// Current AgentRunRepository writes `terminal_reason` (v77). Partial-schema
+    /// fixtures must insert the pre-column shape so upgrade tests still prove
+    /// the older row survives.
+    private func insertPreTerminalReasonRun(_ db: SQLiteDB, _ run: AgentRun) throws {
+        let st = try db.prepare("""
+            INSERT INTO agent_runs(
+                id, thread_id, provider, provider_instance_id, model, status,
+                started_at, finished_at, error_message
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """)
+        try st.bind(1, run.id.value.uuidString)
+        try st.bind(2, run.threadId.value.uuidString)
+        try st.bind(3, run.provider.rawValue)
+        try st.bind(4, run.providerInstanceId ?? run.provider.rawValue)
+        try st.bind(5, run.model)
+        try st.bind(6, run.status.rawValue)
+        try st.bind(7, ISO8601DateFormatter().string(from: run.startedAt))
+        try st.bind(8, run.finishedAt.map { ISO8601DateFormatter().string(from: $0) })
+        try st.bind(9, run.errorMessage)
+        _ = try st.step()
+    }
+
     /// Build a DB that looks like "the app was at version n" by applying only the
     /// first n steps, then migrate to head and return the DB.
     private func migrateFromVersion(n: Int) throws -> SQLiteDB {
@@ -461,9 +483,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             73,
             74,
             75,
-            76
+            76,
+            77
         ])
-        XCTAssertEqual(Schema.currentVersion, 76)
+        XCTAssertEqual(Schema.currentVersion, 77)
         XCTAssertFalse(
             Schema.steps.contains { (63...66).contains($0.version) },
             "schema versions 63-66 are retired and must never be reused"
@@ -486,11 +509,11 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             model: "gpt-test",
             status: .pending
         )
-        try AgentRunRepository(db: db).upsert(run)
+        try insertPreTerminalReasonRun(db, run)
 
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(Schema.currentVersion, 76)
+        XCTAssertEqual(Schema.currentVersion, 77)
 
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 0,
                        "v72 must not backfill historical winners")
@@ -571,10 +594,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.steps.filter { $0.version == 71 }.count, 1,
             "HEAD/origin production last published step is 71"
         )
-        XCTAssertEqual(Schema.currentVersion, 76)
+        XCTAssertEqual(Schema.currentVersion, 77)
         XCTAssertEqual(
-            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76],
-            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec"
+            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77],
+            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason"
         )
         let v72 = try XCTUnwrap(Schema.steps.first { $0.version == 72 })
         XCTAssertTrue(v72.sql.contains("CHECK(format IN ('human', 'rcw1', 'rcs1'))"))
@@ -587,7 +610,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         let thread = AgentThread(title: "v72-rcs1-contract", provider: .codex, model: "gpt-test")
         try AgentThreadRepository(db: db).upsert(thread)
         let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
-        try AgentRunRepository(db: db).upsert(run)
+        try insertPreTerminalReasonRun(db, run)
         try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 72 })
         XCTAssertEqual(try maxVersion(db), 72)
 
@@ -646,8 +669,8 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         try AgentThreadRepository(db: db).upsert(thread)
         let humanRun = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
         let rcw1Run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
-        try AgentRunRepository(db: db).upsert(humanRun)
-        try AgentRunRepository(db: db).upsert(rcw1Run)
+        try insertPreTerminalReasonRun(db, humanRun)
+        try insertPreTerminalReasonRun(db, rcw1Run)
         try db.execute("""
             INSERT INTO token_saver_run_winner_receipts(
                 run_id, thread_id, provider, resolved_model, selected_format, reason,
@@ -745,7 +768,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         let thread = AgentThread(title: "v74-context", provider: .codex, model: "gpt-test")
         try AgentThreadRepository(db: db).upsert(thread)
         let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
-        try AgentRunRepository(db: db).upsert(run)
+        try insertPreTerminalReasonRun(db, run)
         try db.execute("""
             INSERT INTO token_saver_run_winner_receipts(
                 run_id, thread_id, provider, resolved_model, selected_format, reason,
@@ -1451,5 +1474,42 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertEqual(versions.last, Schema.currentVersion,
                        "the last SchemaStep version must equal Schema.currentVersion — " +
                        "a mismatch means currentVersion does not reflect the actual schema")
+    }
+
+    /// WHY: Bot attention cannot tell userStop from providerCancelled after
+    /// restart without a durable reason. v77 must add a nullable column so an
+    /// older binary can ignore it on downgrade.
+    func test_v77AddsNullableAgentRunTerminalReasonWithoutRewritingRows() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 76 })
+        XCTAssertEqual(try maxVersion(db), 76)
+        let thread = AgentThread(title: "v77-reason", provider: .codex, model: "gpt-test")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let runId = UUID().uuidString
+        try db.execute("""
+            INSERT INTO agent_runs(id, thread_id, provider, model, status, started_at, finished_at)
+            VALUES('\(runId)', '\(thread.id.value.uuidString)', 'codex', 'gpt-test', 'cancelled',
+                   '2026-08-21T02:54:43Z', '2026-08-21T02:54:43Z');
+            """)
+
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), 77)
+        let info = try db.prepare("PRAGMA table_info(agent_runs);")
+        var names: [String] = []
+        var terminalNotNull = 1
+        while try info.step() {
+            let name = info.columnText(1) ?? ""
+            names.append(name)
+            if name == "terminal_reason" {
+                terminalNotNull = Int(info.columnInt64(3))
+            }
+        }
+        XCTAssertTrue(names.contains("terminal_reason"))
+        XCTAssertEqual(terminalNotNull, 0, "terminal_reason must stay nullable for downgrade")
+        let loaded = try XCTUnwrap(
+            AgentRunRepository(db: db).get(id: AgentRunID(UUID(uuidString: runId)!))
+        )
+        XCTAssertNil(loaded.terminalReason, "v77 must not invent a reason for pre-column rows")
+        XCTAssertEqual(loaded.status, .cancelled)
     }
 }

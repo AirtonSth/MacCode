@@ -743,6 +743,21 @@ public final class GrokACPClient: @unchecked Sendable {
         try notify(method: "session/cancel", params: ["sessionId": sessionId])
     }
 
+    /// Serializes generation admission with the physical cancel write. If a
+    /// newer prompt has already reached this write queue, `admittedBy` observes
+    /// its newer generation and the stale cancel never reaches ACP. If cancel
+    /// wins the queue, its line is written before that newer prompt line.
+    @discardableResult
+    func cancel(
+        sessionId: String,
+        admittedBy: @escaping @Sendable () -> Bool
+    ) throws -> Bool {
+        try write(
+            ["jsonrpc": "2.0", "method": "session/cancel", "params": ["sessionId": sessionId]],
+            admittedBy: admittedBy
+        )
+    }
+
     public func notify(method: String, params: Any? = nil) throws {
         var payload: JSONObject = ["jsonrpc": "2.0", "method": method]
         if let params { payload["params"] = params }
@@ -977,7 +992,11 @@ public final class GrokACPClient: @unchecked Sendable {
         for request in all.values { request.resume(.failure(error)) }
     }
 
-    private func write(_ object: JSONObject) throws {
+    @discardableResult
+    private func write(
+        _ object: JSONObject,
+        admittedBy: (@Sendable () -> Bool)? = nil
+    ) throws -> Bool {
         // Foundation defaults escape `/` as `\/` (e.g. `session\/prompt`). grok-build
         // documents that form as a historical ACP envelope hazard; emit canonical paths.
         let data = try JSONSerialization.data(
@@ -1005,11 +1024,13 @@ public final class GrokACPClient: @unchecked Sendable {
         } else {
             toWrite = line
         }
-        try writeQueue.sync {
+        return try writeQueue.sync {
+            guard admittedBy?() ?? true else { return false }
             try GuardedStdinWrite.write(
                 toWrite, to: stdinPipe.fileHandleForWriting, process: process,
                 notFound: { GrokACPError.processExited(reason: .exit, status: -1, stderrTail: "") }
             )
+            return true
         }
     }
 

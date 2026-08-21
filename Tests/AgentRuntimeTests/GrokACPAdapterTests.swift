@@ -159,7 +159,12 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
             gid: getgid(),
             homePath: "/tmp"
         )
-        let request = makeRequest(runAsUser: foreign)
+        let censusAllowed = GrokACPAdapter.tokenSaverCensusAllowed(runAsUser: foreign)
+        XCTAssertFalse(censusAllowed)
+        // Exercise the actual ACP census gate without invoking sudo or relying
+        // on a second local account existing on the CI machine.
+        adapter.tokenSaverCensusAllowedOverrideForTesting = censusAllowed
+        let request = makeRequest()
         let box = GrokACPEventBox()
         _ = try await adapter.startSession(request) { box.append($0) }
         let pending = try await box.waitForRequest(timeout: 3)
@@ -172,7 +177,7 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(census.snapshot().isEmpty)
     }
 
-    func test_cancelUsesACPNotificationAndDoesNotHardCloseFirst() async throws {
+    func test_cancelUsesACPNotificationAndReturnsProviderIdentity() async throws {
         let peer = try FakeGrokACPPeer(mode: .cancel)
         defer { peer.remove() }
         let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 1)
@@ -184,6 +189,44 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         let finished = try await box.waitFinished(timeout: 3)
         XCTAssertEqual(finished.status, .cancelled)
         XCTAssertEqual(finished.providerThreadId, "session-fixed")
+    }
+
+    func test_cancelAcknowledgementStillTerminatesOwnedProviderTreeAndBackgroundChild() async throws {
+        // WHY: Grok can acknowledge session/cancel while a shell tool that it
+        // auto-backgrounded remains alive. Stop owns that process tree; a
+        // logical cancelled terminal must not leave either root or child behind.
+        let peer = try FakeGrokACPPeer(mode: .cancelWithBackgroundChild)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 5)
+        let request = makeRequest()
+        let box = GrokACPEventBox()
+        let handle = try await adapter.startSession(request) { box.append($0) }
+
+        let childDeadline = Date().addingTimeInterval(2)
+        while peer.backgroundChildPID == nil, Date() < childDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let childPID = try XCTUnwrap(peer.backgroundChildPID)
+        let childIdentity = try XCTUnwrap(ProviderProcessStartIdentity.read(pid: childPID))
+        XCTAssertTrue(ProcessTerminator.isAlive(childPID))
+
+        handle.cancel()
+        let finished = try await box.waitFinished(timeout: 3)
+        XCTAssertEqual(finished.status, .cancelled)
+        XCTAssertEqual(box.finishedCount, 1)
+
+        let deathDeadline = Date().addingTimeInterval(3.5)
+        while (handle.process?.isRunning == true
+               || ProviderProcessStartIdentity.read(pid: childPID) == childIdentity),
+              Date() < deathDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertFalse(handle.process?.isRunning == true,
+                       "cancel acknowledgement must still terminate the owned Grok root")
+        XCTAssertNotEqual(ProviderProcessStartIdentity.read(pid: childPID), childIdentity,
+                          "cancel acknowledgement must not leave an auto-backgrounded shell child alive")
+        XCTAssertFalse(adapter.hasSession(threadId: request.threadId),
+                       "a stopped provider tree cannot remain reusable")
     }
 
     func test_crashBeforePromptResponseIsFailedButKeepsProviderIdentity() async throws {
@@ -1011,6 +1054,112 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
                        "after the prior turn ends, Approve/follow-up must reuse the session")
     }
 
+    func test_GrokACPStop_returnsWithin100msWhenCancelWriteIsBlocked() async throws {
+        let peer = try FakeGrokACPPeer(mode: .cancel)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 2)
+        let gate = DispatchSemaphore(value: 0)
+        adapter.beforeCancelWriteForTesting = { gate.wait() }
+        let box = GrokACPEventBox()
+        let handle = try await adapter.startSession(makeRequest()) { box.append($0) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let started = Date()
+        handle.cancel()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.1)
+        gate.signal()
+        let finished = try await box.waitFinished(timeout: 3)
+        XCTAssertEqual(finished.status, .cancelled)
+        XCTAssertEqual(box.finishedCount, 1)
+    }
+
+    func test_GrokACPSecondStop_doesNotQueueBehindBlockedCancelWrite() async throws {
+        // WHY: stopSession is the hard/second-click path used by both Agent App
+        // and Bots Desk. It must tear down the owned transport even while the
+        // cooperative session/cancel write is blocked elsewhere.
+        let peer = try FakeGrokACPPeer(mode: .ignoreCancel)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 2)
+        let gate = DispatchSemaphore(value: 0)
+        adapter.beforeCancelWriteForTesting = { gate.wait() }
+        let request = makeRequest()
+        let handle = try await adapter.startSession(request) { _ in }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        handle.cancel()
+
+        let started = Date()
+        try adapter.stopSession(threadId: request.threadId)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.1)
+        XCTAssertFalse(adapter.hasSession(threadId: request.threadId))
+        gate.signal()
+    }
+
+    func test_GrokACPStop_writeFailureStillCancelsAndKillsOwnedTreeByGracePlusOneSecond() async throws {
+        let peer = try FakeGrokACPPeer(mode: .ignoreCancel)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 0.05)
+        adapter.cancelWriteErrorForTesting = NSError(domain: "test", code: 1)
+        let box = GrokACPEventBox()
+        let handle = try await adapter.startSession(makeRequest()) { box.append($0) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let process = try XCTUnwrap(handle.process)
+        handle.cancel()
+        let finished = try await box.waitFinished(timeout: 3)
+        XCTAssertEqual(finished.status, .cancelled)
+        XCTAssertEqual(box.finishedCount, 1)
+        let deadline = Date().addingTimeInterval(1.05)
+        while process.isRunning, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertFalse(process.isRunning, "owned tree must die by grace + 1s after a failed cancel write")
+    }
+
+    func test_GrokACPStop_staleGenerationTimerDoesNotKillNextPrompt() async throws {
+        let peer = try FakeGrokACPPeer(mode: .cancel)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 0.4)
+        let first = GrokACPEventBox()
+        let request = makeRequest()
+        let handle = try await adapter.startSession(request) { first.append($0) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        handle.cancel()
+        let cancelled = try await first.waitFinished(timeout: 3)
+        XCTAssertEqual(cancelled.status, .cancelled)
+        let second = GrokACPEventBox()
+        _ = try await adapter.sendTurn(request) { second.append($0) }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertEqual(second.finishedCount, 0, "N's force timer must not terminate N+1")
+        XCTAssertTrue(adapter.hasSession(threadId: request.threadId))
+        XCTAssertEqual(peer.launchCount, 2,
+                       "a follow-up after Stop must use a fresh provider tree")
+        adapter.stopAll()
+    }
+
+    func test_GrokACPStop_staleQueuedCancelWriteCannotReachNextSession() async throws {
+        // WHY: the async notification can remain queued past N's force kill.
+        // It must revalidate session identity/generation before touching ACP.
+        let peer = try FakeGrokACPPeer(mode: .ignoreCancel)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 0.05)
+        let gate = DispatchSemaphore(value: 0)
+        adapter.beforeCancelWriteForTesting = { gate.wait() }
+        let request = makeRequest()
+        let first = GrokACPEventBox()
+        let handle = try await adapter.startSession(request) { first.append($0) }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        handle.cancel()
+        let firstFinished = try await first.waitFinished(timeout: 3)
+        XCTAssertEqual(firstFinished.status, .cancelled)
+
+        let second = GrokACPEventBox()
+        _ = try await adapter.startSession(request) { second.append($0) }
+        gate.signal()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(adapter.cancelWriteAttemptCountForTesting, 0)
+        XCTAssertEqual(second.finishedCount, 0)
+        XCTAssertTrue(adapter.hasSession(threadId: request.threadId))
+        adapter.stopAll()
+    }
+
     private func makeRequest(
         threadId: AgentThreadID? = nil,
         providerThreadId: String? = nil,
@@ -1134,7 +1283,7 @@ private final class GrokACPEventBox: @unchecked Sendable {
 
 private final class FakeGrokACPPeer {
     enum Mode: String {
-        case permission, cancel, ignoreCancel, crash, load, loadThenPrompt, discovery, plan
+        case permission, cancel, cancelWithBackgroundChild, ignoreCancel, crash, load, loadThenPrompt, discovery, plan
         case auth, rateLimit, network, invalidResume, invalidJSON, immediateResponse, promptWriteFailure
         /// Streams a complete assistant final then never resolves session/prompt —
         /// field shape of the 70m Grok Working zombie. The turn-inactivity
@@ -1155,12 +1304,17 @@ private final class FakeGrokACPPeer {
     let launchCountPath: String
     let promptCountPath: String
     let sessionIdPath: String
+    let backgroundChildPIDPath: String
 
     var launchCount: Int {
         ((try? String(contentsOfFile: launchCountPath, encoding: .utf8)) ?? "").count
     }
     var promptCount: Int {
         ((try? String(contentsOfFile: promptCountPath, encoding: .utf8)) ?? "").count
+    }
+    var backgroundChildPID: Int32? {
+        let raw = (try? String(contentsOfFile: backgroundChildPIDPath, encoding: .utf8)) ?? ""
+        return Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     init(mode: Mode) throws {
@@ -1170,6 +1324,7 @@ private final class FakeGrokACPPeer {
         launchCountPath = root.appendingPathComponent("launch-count").path
         promptCountPath = root.appendingPathComponent("prompt-count").path
         sessionIdPath = root.appendingPathComponent("session-id").path
+        backgroundChildPIDPath = root.appendingPathComponent("background-child-pid").path
         let body = #"""
         #!/bin/sh
         mode="MODE"
@@ -1219,6 +1374,12 @@ private final class FakeGrokACPPeer {
               id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
               if [ -f "SESSION_ID_PATH" ]; then session_id=$(cat "SESSION_ID_PATH"); fi
               if [ "$mode" = crash ]; then kill -ABRT $$; fi
+              if [ "$mode" = cancelWithBackgroundChild ]; then
+                sleep 300 &
+                printf '%s' "$!" > "BACKGROUND_CHILD_PID_PATH"
+                prompt_id="$id"
+                continue
+              fi
               if [ "$mode" = cancel ] || [ "$mode" = ignoreCancel ]; then prompt_id="$id"; continue; fi
               if [ "$mode" = auth ]; then
                 printf '{"jsonrpc":"2.0","id":%s,"error":{"code":401,"message":"Unauthorized access_token=fake-secret-value at /Users/example/.grok/config"}}\n' "$id"
@@ -1309,6 +1470,7 @@ private final class FakeGrokACPPeer {
             .replacingOccurrences(of: "PROMPT_COUNT_PATH", with: promptCountPath)
             .replacingOccurrences(of: "COUNT_PATH", with: launchCountPath)
             .replacingOccurrences(of: "SESSION_ID_PATH", with: sessionIdPath)
+            .replacingOccurrences(of: "BACKGROUND_CHILD_PID_PATH", with: backgroundChildPIDPath)
         try body.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
         path = script.path

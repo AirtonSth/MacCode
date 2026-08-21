@@ -821,6 +821,252 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    /// Causal proof from `TerminalTransitionLedger` for the one-way legacy
+    /// `Run cancelled` repair. Missing or mismatched proof preserves the row.
+    public struct LegacyUserStopLedgerProof: Equatable, Sendable {
+        public var runId: String
+        public var threadId: String
+        public var eventTime: Date
+        public var reason: String
+
+        public init(runId: String, threadId: String, eventTime: Date, reason: String) {
+            self.runId = runId
+            self.threadId = threadId
+            self.eventTime = eventTime
+            self.reason = reason
+        }
+    }
+
+    /// Exact pre-column signature manufactured for every cancelled Bot turn.
+    public enum LegacyUserStopAttentionSignature {
+        public static let kind = BotAttentionItemKind.question
+        public static let title = "Run cancelled"
+        public static let detail = "The supervised turn ended without a clean completion."
+        public static let terminalReason = "userStop"
+    }
+
+    #if DEBUG
+    /// Test seam: throw after acknowledging matching rows and before conversation
+    /// reset so a rolled-back transaction cannot split row vs conversation.
+    public var legacyRepairFaultAfterAcknowledgeForTesting = false
+    #endif
+
+    /// Forward-only repair of proven false legacy user-Stop attention artifacts.
+    ///
+    /// Reads causal candidates from the caller (TerminalTransitionLedger), then
+    /// revalidates every SQLite predicate inside one transaction: exact old
+    /// kind/title/detail, linked conversation, case-normalized run/thread,
+    /// ledger `reason=userStop` with matching event/finish/attention time,
+    /// cancelled provider session with the same `last_run_id`, no later run,
+    /// and no pending provider callback. Acknowledges duplicate matching rows
+    /// and resets the conversation only when no other actionable row remains.
+    /// Missing ledger or any mismatch preserves messages, runs, and rows.
+    /// Intentionally does not delete data and cannot un-acknowledge a row.
+    @discardableResult
+    public func repairLegacyUserStopAttention(
+        proofs: [LegacyUserStopLedgerProof],
+        now: Date = Date()
+    ) throws -> Int {
+        var seen = Set<String>()
+        let userStopProofs = proofs.filter { proof in
+            guard proof.reason == "userStop" else { return false }
+            let key = proof.runId.lowercased() + "\0" + proof.threadId.lowercased()
+            return seen.insert(key).inserted
+        }
+        guard !userStopProofs.isEmpty else { return 0 }
+        return try db.transaction {
+            var acknowledged = 0
+            var conversationsToReset: Set<String> = []
+            for proof in userStopProofs {
+                let matched = try matchingLegacyUserStopAttentionIDs(proof: proof, database: db)
+                guard !matched.itemIDs.isEmpty else { continue }
+                for itemID in matched.itemIDs {
+                    let statement = try db.prepare("""
+                        UPDATE bot_attention_items
+                        SET acknowledged_at = COALESCE(acknowledged_at, ?)
+                        WHERE id = ?;
+                        """)
+                    defer { statement.reset() }
+                    try statement.bind(1, string(now))
+                    try statement.bind(2, itemID)
+                    _ = try statement.step()
+                    acknowledged += 1
+                }
+                conversationsToReset.formUnion(matched.conversationIDs)
+            }
+            #if DEBUG
+            if legacyRepairFaultAfterAcknowledgeForTesting {
+                throw BotStoreError.invalidRow("injected legacy repair fault")
+            }
+            #endif
+            for conversationID in conversationsToReset {
+                if try conversationHasOtherActionableAttention(
+                    conversationID: conversationID,
+                    database: db
+                ) {
+                    continue
+                }
+                let statement = try db.prepare("""
+                    UPDATE bot_conversations
+                    SET attention_state = 'none', unread = 0, updated_at = ?
+                    WHERE id = ?;
+                    """)
+                defer { statement.reset() }
+                try statement.bind(1, string(now))
+                try statement.bind(2, conversationID)
+                _ = try statement.step()
+            }
+            return acknowledged
+        }
+    }
+
+    private struct LegacyUserStopMatch {
+        var itemIDs: [String]
+        var conversationIDs: Set<String>
+    }
+
+    private func matchingLegacyUserStopAttentionIDs(
+        proof: LegacyUserStopLedgerProof,
+        database: SQLiteDB
+    ) throws -> LegacyUserStopMatch {
+        let runKey = proof.runId.lowercased()
+        let threadKey = proof.threadId.lowercased()
+        let statement = try database.prepare("""
+            SELECT id, conversation_id, created_at
+            FROM bot_attention_items
+            WHERE acknowledged_at IS NULL
+              AND kind = ?
+              AND title = ?
+              AND detail = ?;
+            """)
+        defer { statement.reset() }
+        try statement.bind(1, LegacyUserStopAttentionSignature.kind.rawValue)
+        try statement.bind(2, LegacyUserStopAttentionSignature.title)
+        try statement.bind(3, LegacyUserStopAttentionSignature.detail)
+        var candidates: [(id: String, conversationID: String, createdAt: String)] = []
+        while try statement.step() {
+            guard let id = statement.columnText(0),
+                  let conversationID = statement.columnText(1),
+                  let createdAt = statement.columnText(2) else { continue }
+            candidates.append((id, conversationID, createdAt))
+        }
+
+        var matchedIDs: [String] = []
+        var matchedConversations: Set<String> = []
+        for candidate in candidates {
+            guard let created = date(candidate.createdAt),
+                  Self.legacyRepairTimesMatch(created, proof.eventTime) else { continue }
+            let conversation = try database.prepare("""
+                SELECT linked_agent_thread_id
+                FROM bot_conversations
+                WHERE id = ?
+                LIMIT 1;
+                """)
+            defer { conversation.reset() }
+            try conversation.bind(1, candidate.conversationID)
+            guard try conversation.step(),
+                  let linked = conversation.columnText(0),
+                  linked.lowercased() == threadKey else { continue }
+
+            let run = try database.prepare("""
+                SELECT id, thread_id, status, finished_at, started_at, terminal_reason
+                FROM agent_runs
+                WHERE id = ? COLLATE NOCASE
+                LIMIT 1;
+                """)
+            defer { run.reset() }
+            try run.bind(1, proof.runId)
+            guard try run.step(),
+                  (run.columnText(0) ?? "").lowercased() == runKey,
+                  (run.columnText(1) ?? "").lowercased() == threadKey,
+                  run.columnText(2) == AgentRunStatus.cancelled.rawValue,
+                  let finishedRaw = run.columnText(3),
+                  let finishedAt = iso.date(from: finishedRaw) ?? date(finishedRaw),
+                  Self.legacyRepairTimesMatch(finishedAt, proof.eventTime) else { continue }
+            let terminalReason = run.columnText(5)
+            guard terminalReason == nil
+                    || terminalReason == LegacyUserStopAttentionSignature.terminalReason else { continue }
+
+            let later = try database.prepare("""
+                SELECT 1
+                FROM agent_runs
+                WHERE thread_id = ? COLLATE NOCASE
+                  AND id != ? COLLATE NOCASE
+                  AND started_at >= ?
+                LIMIT 1;
+                """)
+            defer { later.reset() }
+            try later.bind(1, proof.threadId)
+            try later.bind(2, proof.runId)
+            try later.bind(3, finishedRaw)
+            if try later.step() { continue }
+
+            let session = try database.prepare("""
+                SELECT status, last_run_id
+                FROM provider_session_runtime
+                WHERE thread_id = ? COLLATE NOCASE
+                LIMIT 1;
+                """)
+            defer { session.reset() }
+            try session.bind(1, proof.threadId)
+            guard try session.step(),
+                  session.columnText(0) == AgentRunStatus.cancelled.rawValue,
+                  (session.columnText(1) ?? "").lowercased() == runKey else { continue }
+
+            let callback = try database.prepare("""
+                SELECT 1
+                FROM provider_pending_callbacks
+                WHERE thread_id = ? COLLATE NOCASE
+                  AND state = ?
+                LIMIT 1;
+                """)
+            defer { callback.reset() }
+            try callback.bind(1, proof.threadId)
+            try callback.bind(2, AssistantRequestState.pending.rawValue)
+            if try callback.step() { continue }
+
+            if terminalReason == nil {
+                // v76 and older runs acquire the nullable v77 column as NULL.
+                // Establish the cause only after every ledger/run/session/
+                // callback predicate above proves this exact legacy user Stop.
+                let backfill = try database.prepare("""
+                    UPDATE agent_runs
+                    SET terminal_reason = ?
+                    WHERE id = ? COLLATE NOCASE
+                      AND terminal_reason IS NULL;
+                    """)
+                defer { backfill.reset() }
+                try backfill.bind(1, LegacyUserStopAttentionSignature.terminalReason)
+                try backfill.bind(2, proof.runId)
+                _ = try backfill.step()
+            }
+
+            matchedIDs.append(candidate.id)
+            matchedConversations.insert(candidate.conversationID)
+        }
+        return LegacyUserStopMatch(itemIDs: matchedIDs, conversationIDs: matchedConversations)
+    }
+
+    private func conversationHasOtherActionableAttention(
+        conversationID: String,
+        database: SQLiteDB
+    ) throws -> Bool {
+        let statement = try database.prepare("""
+            SELECT 1
+            FROM bot_attention_items
+            WHERE conversation_id = ?
+              AND acknowledged_at IS NULL
+            LIMIT 1;
+            """)
+        defer { statement.reset() }
+        try statement.bind(1, conversationID)
+        return try statement.step()
+    }
+
+    private static func legacyRepairTimesMatch(_ lhs: Date, _ rhs: Date) -> Bool {
+        Int(lhs.timeIntervalSince1970) == Int(rhs.timeIntervalSince1970)
+    }
+
     public func listRoutines(botID: BotID) throws -> [BotRoutine] {
         try db.performSync { database in
             try loadRoutines(botID: botID, database: database)

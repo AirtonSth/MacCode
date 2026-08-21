@@ -178,6 +178,7 @@ final class AgentRunTerminalReasonTests: XCTestCase {
         XCTAssertEqual(row?.status, .cancelled)
         XCTAssertNil(row?.errorMessage,
                      "user Stop must not invent an error_message; cancelled is a legitimate silent end")
+        XCTAssertEqual(row?.terminalReason, "userStop")
     }
 
     // MARK: - empty completed is not silent success

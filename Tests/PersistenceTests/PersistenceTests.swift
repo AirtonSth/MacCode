@@ -87,10 +87,11 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(msgs[0].role, .user)
 
         let runs = AgentRunRepository(db: db)
-        let run = AgentRun(threadId: t.id, provider: .codex, providerInstanceId: "codex-personal", model: "gpt-5", status: .running)
+        let run = AgentRun(threadId: t.id, provider: .codex, providerInstanceId: "codex-personal", model: "gpt-5", status: .cancelled, finishedAt: Date(), terminalReason: "userStop")
         try runs.upsert(run)
         XCTAssertEqual(try runs.get(id: run.id)?.providerInstanceId, "codex-personal",
                        "provider instance id must persist on runs so recovery/debugging can identify the exact provider identity used")
+        XCTAssertEqual(try runs.get(id: run.id)?.terminalReason, "userStop")
     }
 
     func test_agentMessageRepositoryPagesOlderHistoryWithStableCursor() throws {
@@ -157,6 +158,7 @@ final class PersistenceTests: XCTestCase {
         try runs.upsert(r)
         let count = try runs.reconcileRunningOnLaunch()
         XCTAssertEqual(count, 1)
+        XCTAssertEqual(try runs.get(id: r.id)?.terminalReason, "relaunchReconcile")
     }
 
     func test_providerSessionRuntime_roundtripsRecoveryStateAcrossBootstrapRestart() throws {
@@ -819,8 +821,8 @@ final class PersistenceTests: XCTestCase {
 
         let replayed = try runs.listLatestStreamEvents(threadId: thread.id, limit: 500)
 
-        XCTAssertEqual(replayed.count, 500)
-        XCTAssertEqual(replayed.first, .turnStarted(turnId: "turn-150"),
+        XCTAssertEqual(replayed.count, AgentEventRetentionPolicy.production.streamEventCountPerThread)
+        XCTAssertEqual(replayed.first, .turnStarted(turnId: "turn-550"),
                        "long Agent App reload must drop the oldest persisted provider events, not the newest output")
         XCTAssertEqual(replayed.last, .turnStarted(turnId: "turn-649"),
                        "bounded replay must keep the newest provider event visible after restart")
