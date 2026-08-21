@@ -1730,7 +1730,7 @@ public final class JSONRPCDispatcher {
                     isExplicitV1: AgentCheckpointListContract.isExplicitV1(params: params)
                 )
             }
-            if req.method.hasPrefix("bot.") {
+            if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.peer.") {
                 let result = try await router.dispatchPairedBotRemote(method: req.method, params: params)
                 return .init(id: id, result: result)
             }

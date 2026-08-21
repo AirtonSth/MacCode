@@ -5763,4 +5763,22 @@ final class DispatcherTests: XCTestCase {
                            "case \(idx) must not invoke router.agentCheckpointDiff before validation")
         }
     }
+
+    @MainActor
+    func test_botPeerMethodsAreNotInterceptedByPairedBotRemote() async {
+        let d = JSONRPCDispatcher(router: FakeRouter())
+        for method in ["bot.peer.list", "bot.peer.ask", "bot.peer.self_config"] {
+            let resp = await d.dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: method,
+                params: [:]
+            ))
+            XCTAssertEqual(
+                resp.error?.code,
+                -32601,
+                "\(method) must remain Unix-catalog-only (method not found on local IPC), not paired Bot remote (-32004)"
+            )
+        }
+    }
 }

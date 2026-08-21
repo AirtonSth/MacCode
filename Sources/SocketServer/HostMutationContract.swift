@@ -149,7 +149,6 @@ public enum HostMutationContract {
     bot.soul.set
     bot.routing.set
     bot.attention.ack
-    bot.peer.ask
     bot.self_config
     bot.scheduler.tick
     """.split(separator: "\n").map(String.init))
@@ -312,7 +311,7 @@ public enum HostMutationContract {
     private static func syntaxRules(for method: String) -> [SyntaxRule] {
         if method.hasPrefix("bot.") {
             switch method {
-            case "bot.create", "bot.scheduler.tick":
+            case "bot.create", "bot.scheduler.tick", "bot.self_config":
                 return []
             case "bot.settings.set":
                 return [.string("key")]
