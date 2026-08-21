@@ -565,7 +565,7 @@ stable_macos_arm64_dmg:
         --arg name "RemoteCode $VERSION" \
         --arg description "RemoteCode macOS $VERSION
 
-$(rc2_release_guard_ownership_marker)" \
+      $(rc2_release_guard_ownership_marker)" \
         --arg dmg_name "$ASSET_NAME" \
         --arg dmg_url "$S3_DOWNLOAD_BASE_URL/$TAG/$ASSET_NAME" \
         --arg appcast_url "$S3_DOWNLOAD_BASE_URL/appcast.xml" \
