@@ -1703,7 +1703,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// Skip equal token-saver footer publishes (soft reselect / idle multipass).
-    nonisolated public static func shouldPublishTokenSaverFooter(
+    public nonisolated static func shouldPublishTokenSaverFooter(
         currentEnabled: Bool,
         nextEnabled: Bool,
         currentMeasured: Int,
@@ -6683,8 +6683,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         suppressPersistedFinalDuplicatedByTimeline()
         lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
         selectedThreadHasRecoverableContext = false  // UX-MAC_AGENT-CONTINUE: run started; hide Continue
-        let display = attached.isEmpty ? text
-            : text + "\n\n📎 " + attached.map(\.displayName).joined(separator: ", ")
+        let display = AgentChatTranscriptChrome.displayUserLine(text: text, attachments: attached)
         // The coordinator is the single writer of run messages — mirror
         // the user message in-memory only (no double-persist). Queue drain
         // passes the same UUID as runId, so the optimistic bubble is stable.
@@ -7169,9 +7168,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private static func retryPrompt(_ message: AgentMessage) -> String {
-        guard !message.attachments.isEmpty else { return message.content }
-        let suffix = "\n\n📎 " + message.attachments.map(\.displayName).joined(separator: ", ")
-        return message.content.hasSuffix(suffix) ? String(message.content.dropLast(suffix.count)) : message.content
+        AgentChatTranscriptChrome.promptByRemovingDisplayDecorations(
+            from: message.content,
+            attachments: message.attachments
+        )
     }
 
     @discardableResult
@@ -9934,12 +9934,12 @@ public struct AgentAppView: View {
         let offersRetry: Bool
     }
 
-    enum TokenSaverDisplayMode: String, CaseIterable, Identifiable {
+    public enum TokenSaverDisplayMode: String, CaseIterable, Identifiable {
         case translated
         case original
 
-        var id: String { rawValue }
-        var label: String { self == .translated ? "Human" : "RCW1" }
+        public var id: String { rawValue }
+        public var label: String { self == .translated ? "Human" : "RCW1" }
     }
 
     struct TokenSaverDisplaySelections: Equatable {
@@ -10105,15 +10105,15 @@ public struct AgentAppView: View {
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
     /// Pure seam for the low-chrome Token Saver disclosure.
-    static func showsTokenSaverOptimizedBadge(wasTokenSaverOptimized: Bool) -> Bool {
+    public static func showsTokenSaverOptimizedBadge(wasTokenSaverOptimized: Bool) -> Bool {
         wasTokenSaverOptimized
     }
 
-    static func tokenSaverBadgeLabel(hasOriginalText _: Bool) -> String {
+    public static func tokenSaverBadgeLabel(hasOriginalText _: Bool) -> String {
         "Token Saver optimized"
     }
 
-    static func tokenSaverCopyText(
+    public static func tokenSaverCopyText(
         translated: String,
         original: String,
         request: String?,
@@ -10127,7 +10127,7 @@ public struct AgentAppView: View {
 
     /// A request or plain fallback is never a raw assistant response. Accept a
     /// strict RCW1 response envelope only; malformed/preamble-only text fails safe.
-    static func hasInspectableAssistantRCW1Response(_ original: String) -> Bool {
+    public static func hasInspectableAssistantRCW1Response(_ original: String) -> Bool {
         let trimmed = original.trimmingCharacters(in: .whitespacesAndNewlines)
         let payload = RCWireProtocol.transportEnvelope(in: trimmed)?.payload ?? trimmed
         guard let frames = try? RCWireProtocol.parse(payload), !frames.isEmpty else {
@@ -10136,7 +10136,7 @@ public struct AgentAppView: View {
         return frames.allSatisfy { $0.direction == .response }
     }
 
-    static func hasInspectableUserRCW1Request(_ request: String?) -> Bool {
+    public static func hasInspectableUserRCW1Request(_ request: String?) -> Bool {
         guard let request else { return false }
         let trimmed = request.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let frames = try? RCWireProtocol.parse(trimmed), !frames.isEmpty else {
@@ -10148,7 +10148,7 @@ public struct AgentAppView: View {
     /// Composition gate shared by every picker call site. Assistant/progress
     /// rows require actual RCW1 A bytes; only the durable user row may disclose
     /// an outbound RCW1 Q before any provider response exists.
-    static func showsTokenSaverDisplayControl(
+    public static func showsTokenSaverDisplayControl(
         original: String,
         request: String?,
         allowsRequestOnlyRCW1: Bool
@@ -10157,25 +10157,28 @@ public struct AgentAppView: View {
             || (allowsRequestOnlyRCW1 && hasInspectableUserRCW1Request(request))
     }
 
-    static func showsTokenSaverOriginalContent(
+    public static func showsTokenSaverOriginalContent(
         original: String,
         mode: TokenSaverDisplayMode
     ) -> Bool {
         mode == .original && hasInspectableAssistantRCW1Response(original)
     }
 
-    static func tokenSaverUserMessageDisplayText(
+    public static func tokenSaverUserMessageDisplayText(
         human: String,
         wireRequest: String?,
         mode: TokenSaverDisplayMode
     ) -> String {
-        guard mode == .original, let wireRequest, RCWireProtocol.isWire(wireRequest) else {
-            return human
+        let body: String
+        if mode == .original, let wireRequest, RCWireProtocol.isWire(wireRequest) {
+            body = wireRequest
+        } else {
+            body = human
         }
-        return wireRequest
+        return AgentChatTranscriptChrome.preservingImageMarkers(in: body, source: human)
     }
 
-    static func tokenSaverMessageDisplayKey(_ messageId: String) -> String {
+    public static func tokenSaverMessageDisplayKey(_ messageId: String) -> String {
         "message|\(messageId.utf8.count)|\(messageId)"
     }
 
@@ -13412,7 +13415,7 @@ public struct AgentAppView: View {
     ///
     /// Invariant: result ≥ measuredDelivered when enabled (estimates never lower
     /// the thread figure).
-    nonisolated static func tokenSaverThreadFooterDisplayTokens(
+    public nonisolated static func tokenSaverThreadFooterDisplayTokens(
         measuredDelivered: Int,
         assistantChars: Int,
         tokenSaverEnabled: Bool,
@@ -13457,7 +13460,7 @@ public struct AgentAppView: View {
     ///   figure — never invent a chip from assistant text alone.
     /// - Product copy: full stack in plain language (tool output, shorter answers,
     ///   multi-turn cache). Optional Auto note for cheaper models.
-    nonisolated static func tokenSaverThreadFooterText(
+    public nonisolated static func tokenSaverThreadFooterText(
         displayTokens: Int,
         measuredTokens: Int,
         enabled: Bool,
@@ -13515,31 +13518,7 @@ public struct AgentAppView: View {
             enabled: vm.tokenSaverFooterEnabled,
             autoRoutingActive: autoRouting
         ) {
-            HStack(spacing: DS.Space.xs) {
-                Image(systemName: "leaf.fill")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(DS.Palette.success)
-                    .accessibilityHidden(true)
-                Text(text)
-                    .font(DS.Font.caption2.weight(.medium))
-                    .foregroundColor(DS.Palette.success)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, DS.Space.sm)
-            .padding(.vertical, 5)
-            .background(DS.Palette.success.opacity(0.12))
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel(text)
-            .accessibilityIdentifier("agent.tokenSaver.threadFooter")
-            .help(
-                autoRouting
-                    ? "Measured tool/command-output savings from the local Token Saver ledger (not full provider usage), plus Auto routing to cheaper models"
-                    : "Measured tool/command-output savings from the local Token Saver ledger only — not total provider or context tokens"
-            )
-            .transition(.opacity.combined(with: .move(edge: .top)))
+            AgentChatTokenSaverThreadFooter(text: text, autoRouting: autoRouting)
         }
     }
 
@@ -13916,11 +13895,9 @@ public struct AgentAppView: View {
                         content: AnyView(
                             VStack(alignment: .leading, spacing: DS.Space.xs) {
                                 if showBadge {
-                                    Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
-                                        .font(DS.Font.caption2)
-                                        .foregroundColor(DS.Palette.textTertiary)
-                                        .accessibilityLabel("Token Saver optimized this reply")
-                                        .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(msg.id.value.uuidString)")
+                                    AgentChatTokenSaverOptimizedBadge(
+                                        messageId: msg.id.value.uuidString
+                                    )
                                 }
                                 AgentChatPeerIdentityHeader(
                                     name: parsed.name,
@@ -13974,11 +13951,9 @@ public struct AgentAppView: View {
                             content: showBadge
                                 ? AnyView(
                                     VStack(alignment: .leading, spacing: DS.Space.xs) {
-                                        Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
-                                            .font(DS.Font.caption2)
-                                            .foregroundColor(DS.Palette.textTertiary)
-                                            .accessibilityLabel("Token Saver optimized this reply")
-                                            .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(msg.id.value.uuidString)")
+                                        AgentChatTokenSaverOptimizedBadge(
+                                            messageId: msg.id.value.uuidString
+                                        )
                                         assistantProse(msg.content)
                                     }
                                 )
@@ -14060,27 +14035,21 @@ public struct AgentAppView: View {
         )
         let displayMode = tokenSaverDisplayMode(for: itemKey, messageId: messageId)
         if showsControl {
-            HStack(spacing: DS.Space.sm) {
-                Label("Token Saver optimized", systemImage: "arrow.left.arrow.right")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(1)
-                Picker("Token Saver display", selection: tokenSaverDisplayModeBinding(for: itemKey, messageId: messageId)) {
-                    Text("Human").tag(TokenSaverDisplayMode.translated)
-                    Text("RCW1").tag(TokenSaverDisplayMode.original)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .controlSize(.small)
-                .frame(width: 150)
-                .accessibilityLabel("Token Saver display")
-                .accessibilityValue(displayMode == .translated ? "Human" : "RCW1")
-                .accessibilityHint("Switches only this transcript item between readable and original transport text.")
-                .accessibilityIdentifier("agent.tokenSaver.displayMode.\(selectionKey)")
-                .help("Show translated text or the exact Token Saver transport")
-            }
-            .frame(minHeight: 32)
-            .frame(maxWidth: .infinity, alignment: alignment)
+            AgentChatTokenSaverDisplayControl(
+                mode: Binding(
+                    get: {
+                        displayMode == .original
+                            ? AgentChatTokenSaverDisplayMode.rcw1
+                            : AgentChatTokenSaverDisplayMode.human
+                    },
+                    set: { mode in
+                        tokenSaverDisplayModeBinding(for: itemKey, messageId: messageId)
+                            .wrappedValue = mode == .rcw1 ? .original : .translated
+                    }
+                ),
+                identifier: selectionKey,
+                alignment: alignment
+            )
         }
     }
 
@@ -14091,48 +14060,26 @@ public struct AgentAppView: View {
         identifierSuffix: String,
         retryMessageId: AgentMessageID? = nil
     ) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            if let request, !request.isEmpty {
-                Text("What was sent")
-                    .font(DS.Font.caption2.weight(.semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                Text(request)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                Button("Copy what was sent") { copyToPasteboard(request) }
-                    .buttonStyle(.plain)
-                    .font(DS.Font.caption2)
-                    .accessibilityIdentifier("agent.tokenSaver.copyRequest.\(identifierSuffix)")
+        AgentChatTokenSaverOriginalContent(
+            original: original,
+            request: request,
+            identifierSuffix: identifierSuffix,
+            onCopy: { copyToPasteboard($0) },
+            retryLabel: retryMessageId.map { id in
+                vm.tokenSaverTranslationRetryMessageIds.contains(id)
+                    ? "Retrying translation…"
+                    : "Retry translation"
+            },
+            retryDisabled: retryMessageId.map {
+                vm.tokenSaverTranslationRetryMessageIds.contains($0)
+            } ?? false,
+            retryIdentifier: retryMessageId.map {
+                "agent.assistantMessage.retryTokenSaverTranslation.\($0.value.uuidString)"
+            },
+            onRetry: retryMessageId.map { id in
+                { vm.retryTokenSaverTranslation(for: id) }
             }
-            Text("Original provider response")
-                .font(DS.Font.caption2.weight(.semibold))
-                .foregroundColor(DS.Palette.textTertiary)
-            Text(original)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundColor(DS.Palette.textSecondary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-            Button("Copy original provider response") { copyToPasteboard(original) }
-                .buttonStyle(.plain)
-                .font(DS.Font.caption2)
-                .accessibilityIdentifier("agent.tokenSaver.copyOriginal.\(identifierSuffix)")
-            if let messageId = retryMessageId {
-                Button(vm.tokenSaverTranslationRetryMessageIds.contains(messageId) ? "Retrying translation…" : "Retry translation") {
-                    vm.retryTokenSaverTranslation(for: messageId)
-                }
-                .buttonStyle(.plain)
-                .font(DS.Font.caption2)
-                .disabled(vm.tokenSaverTranslationRetryMessageIds.contains(messageId))
-                .accessibilityLabel("Retry local translation")
-                .accessibilityIdentifier("agent.assistantMessage.retryTokenSaverTranslation.\(messageId.value.uuidString)")
-            }
-        }
-        .padding(DS.Space.md)
-        .background(DS.Palette.surface.opacity(0.45))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .frame(maxWidth: .infinity, alignment: .leading)
+        )
     }
 
     @ViewBuilder

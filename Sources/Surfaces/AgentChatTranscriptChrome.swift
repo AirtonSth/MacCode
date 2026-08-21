@@ -24,13 +24,104 @@ public enum AgentChatTranscriptChrome {
         "Ask \(providerDisplayName) for changes…"
     }
 
+    /// User-visible transcript line. Image attachments always render as
+    /// `[Image #1]`, `[Image #2]`, … — the same marker Agent App and Desk
+    /// must show, including after Token Saver Human/RCW1 toggles. Non-image
+    /// files keep the 📎 name suffix.
     public static func displayUserLine(text: String, attachments: [AgentAttachment]) -> String {
-        let names = attachments.map(\.displayName).filter { !$0.isEmpty }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if names.isEmpty { return trimmed }
-        let suffix = "📎 " + names.joined(separator: ", ")
-        if trimmed.isEmpty { return suffix }
-        return trimmed + "\n\n" + suffix
+        let decorations = attachmentDecorations(attachments)
+        if decorations.isEmpty { return trimmed }
+        if trimmed.isEmpty { return decorations.joined(separator: "\n\n") }
+        return ([trimmed] + decorations).joined(separator: "\n\n")
+    }
+
+    /// Strip a previously applied display suffix so retry/re-render can rebuild
+    /// it from current attachments without doubling `[Image #N]` or 📎 names.
+    public static func promptByRemovingDisplayDecorations(
+        from text: String,
+        attachments: [AgentAttachment]
+    ) -> String {
+        var result = text
+        let decorations = attachmentDecorations(attachments)
+        if !decorations.isEmpty {
+            let joined = decorations.joined(separator: "\n\n")
+            if result == joined {
+                return ""
+            }
+            let suffix = "\n\n" + joined
+            if result.hasSuffix(suffix) {
+                result = String(result.dropLast(suffix.count))
+            }
+        }
+        let legacyNames = attachments.map(\.displayName).filter { !$0.isEmpty }
+        if !legacyNames.isEmpty {
+            let legacy = "📎 " + legacyNames.joined(separator: ", ")
+            if result == legacy {
+                return ""
+            }
+            let legacySuffix = "\n\n" + legacy
+            if result.hasSuffix(legacySuffix) {
+                result = String(result.dropLast(legacySuffix.count))
+            }
+        }
+        return result
+    }
+
+    /// Keep `[Image #N]` visible when Token Saver RCW1 replaces the human body
+    /// with wire bytes that never carried the marker.
+    public static func preservingImageMarkers(in display: String, source: String) -> String {
+        let markers = imageMarkers(in: source)
+        guard !markers.isEmpty else { return display }
+        var result = display
+        for marker in markers where !result.contains(marker) {
+            result = result.isEmpty ? marker : result + "\n\n" + marker
+        }
+        return result
+    }
+
+    public static func isImageAttachment(_ attachment: AgentAttachment) -> Bool {
+        if attachment.kind == .image { return true }
+        return isImagePath(attachment.path) || isImagePath(attachment.displayName)
+    }
+
+    public static func imageMarker(index: Int) -> String {
+        "[Image #\(index)]"
+    }
+
+    static func attachmentDecorations(_ attachments: [AgentAttachment]) -> [String] {
+        var decorations: [String] = []
+        var imageIndex = 0
+        var fileNames: [String] = []
+        for attachment in attachments {
+            if isImageAttachment(attachment) {
+                imageIndex += 1
+                decorations.append(imageMarker(index: imageIndex))
+            } else if !attachment.displayName.isEmpty {
+                fileNames.append(attachment.displayName)
+            }
+        }
+        if !fileNames.isEmpty {
+            decorations.append("📎 " + fileNames.joined(separator: ", "))
+        }
+        return decorations
+    }
+
+    static func imageMarkers(in text: String) -> [String] {
+        guard text.contains("[Image #") else { return [] }
+        var markers: [String] = []
+        var search = text.startIndex
+        while search < text.endIndex,
+              let start = text[search...].range(of: "[Image #") {
+            let after = start.upperBound
+            guard let close = text[after...].firstIndex(of: "]") else { break }
+            let number = text[after..<close]
+            if !number.isEmpty, number.allSatisfy(\.isNumber) {
+                markers.append(String(text[start.lowerBound...close]))
+            }
+            search = text.index(after: close)
+        }
+        return markers
     }
 
     public static func admitsSend(text: String, attachmentCount: Int) -> Bool {

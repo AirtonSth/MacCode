@@ -5761,6 +5761,33 @@ final class AgentAppViewModelTests: XCTestCase {
                       "the transcript shows a friendly attachment summary, not raw paths")
     }
 
+    func test_send_withImageAttachment_showsLiteralImageMarker() async throws {
+        // WHY: Agent App and Bot Desk share displayUserLine. A one-image turn
+        // must persist `[Image #1]` in the user bubble, not 📎 photo.png.
+        let runner = CapturingProviderRunner(provider: .codex)
+        let (vm, _) = try makeVM(provider: runner)
+        vm.createThread(title: "t")
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-code-shot-\(UUID().uuidString).png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        vm.prompt = "What is in this picture?"
+        vm.addAttachments([file.path])
+        await vm.send()
+
+        XCTAssertEqual(runner.prompts.last, "What is in this picture?",
+                       "image markers are display-only; the provider prompt stays the user's words")
+        XCTAssertTrue(
+            vm.messages.contains { $0.role == .user && $0.content.contains("[Image #1]") },
+            "the transcript must show the literal [Image #1] marker"
+        )
+        XCTAssertFalse(
+            vm.messages.contains { $0.role == .user && $0.content.contains("📎") },
+            "an image-only turn must not fall back to the file paperclip suffix"
+        )
+    }
+
     func test_send_withMissingAttachmentErrorStillSendsOrdinaryTextWithoutAttachment() async throws {
         let runner = CapturingProviderRunner(provider: .codex)
         let (vm, _) = try makeVM(provider: runner)

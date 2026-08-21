@@ -115,6 +115,34 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         )
     }
 
+    func test_displayUserLine_emitsLiteralImageMarkers_becauseBotsAndAgentAppMustShareThem() {
+        // WHY: both transcripts must show the Grok-style `[Image #1]` marker
+        // for the first image, not a 📎 filename that the user cannot map.
+        let shot = AgentAttachment(path: "/tmp/shot.png", displayName: "shot.png", kind: .image)
+        let second = AgentAttachment(path: "/tmp/diagram.jpg", displayName: "diagram.jpg", kind: .image)
+        let brief = AgentAttachment(path: "/tmp/brief.pdf", displayName: "brief.pdf", kind: .file)
+        XCTAssertEqual(
+            AgentChatTranscriptChrome.displayUserLine(text: "Look at this", attachments: [shot]),
+            "Look at this\n\n[Image #1]"
+        )
+        XCTAssertEqual(
+            AgentChatTranscriptChrome.displayUserLine(text: "", attachments: [shot, second]),
+            "[Image #1]\n\n[Image #2]"
+        )
+        XCTAssertEqual(
+            AgentChatTranscriptChrome.displayUserLine(
+                text: "Review",
+                attachments: [shot, brief, second]
+            ),
+            "Review\n\n[Image #1]\n\n[Image #2]\n\n📎 brief.pdf"
+        )
+        let stripped = AgentChatTranscriptChrome.promptByRemovingDisplayDecorations(
+            from: "Look at this\n\n[Image #1]",
+            attachments: [shot]
+        )
+        XCTAssertEqual(stripped, "Look at this")
+    }
+
     func test_deskWorkingLabel_usesAgentAppThinkingPhase() {
         // WHY: a live bot turn must show the same working phrase Agent App
         // uses, not only a work-log pill.
@@ -245,5 +273,11 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         }
         XCTAssertFalse(source.contains("private var loadingStatus"))
         XCTAssertFalse(source.contains("private var workingStatus"))
+        XCTAssertTrue(
+            source.contains("AgentChatTokenSaverThreadFooter("),
+            "Agent App must mount the shared Token Saver footer, not a private twin"
+        )
+        XCTAssertTrue(source.contains("AgentChatTokenSaverDisplayControl("))
+        XCTAssertTrue(source.contains("AgentChatTranscriptChrome.displayUserLine("))
     }
 }

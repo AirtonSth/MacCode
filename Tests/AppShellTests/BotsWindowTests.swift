@@ -93,6 +93,135 @@ final class BotsWindowTests: XCTestCase {
         router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
     }
 
+    func test_deskSendWithImageShowsLiteralImageMarker_becauseBotsMustMatchAgentApp() async throws {
+        // WHY: a one-image Desk turn must paint `[Image #1]` through the same
+        // displayUserLine Agent App uses — not a 📎 filename.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        let file = (directory as NSString).appendingPathComponent("shot.png")
+        FileManager.default.createFile(atPath: file, contents: Data([0x89, 0x50, 0x4E, 0x47]))
+        vm.addAttachments([file])
+        vm.composerText = "What is in this picture?"
+        let exp = expectation(description: "sendAgentMessage resolved image")
+        var received: [AgentAttachment] = []
+        router.sendAgentMessageResolvedAttachmentsProbeForTesting = { attachments in
+            received = attachments
+            exp.fulfill()
+        }
+        XCTAssertTrue(vm.send())
+        XCTAssertEqual(
+            vm.deskMessages.first?.text,
+            "What is in this picture?\n\n[Image #1]"
+        )
+        let two = (directory as NSString).appendingPathComponent("diagram.jpg")
+        FileManager.default.createFile(atPath: two, contents: Data([0xFF, 0xD8, 0xFF]))
+        await fulfillment(of: [exp], timeout: 3)
+        XCTAssertEqual(received.count, 1)
+        XCTAssertEqual(received.first?.kind, .image)
+        router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
+
+        let human = AgentChatTranscriptChrome.displayUserLine(
+            text: "Compare",
+            attachments: [
+                AgentAttachment(path: file, displayName: "shot.png", kind: .image),
+                AgentAttachment(path: two, displayName: "diagram.jpg", kind: .image),
+            ]
+        )
+        XCTAssertTrue(human.contains("[Image #1]"))
+        XCTAssertTrue(human.contains("[Image #2]"))
+        let rcw1 = AgentChatTokenSaverDisplayMode.userMessageDisplayText(
+            human: human,
+            wireRequest: "RCW1\tQ\t1\nG\tCompare\n.\n",
+            mode: .rcw1
+        )
+        XCTAssertTrue(rcw1.contains("[Image #1]"))
+        XCTAssertTrue(rcw1.contains("[Image #2]"))
+    }
+
+    func test_deskSendFailOpenLeavesOriginalPrompt_whenTokenSaverIsOff() async throws {
+        // WHY: Token Saver off must not inject Distill into a Bot turn. The
+        // compiled payload is the original provider input.
+        let context = try makeContext()
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .grok, model: "grok-4.6")
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .grok,
+            providerInstanceID: "grok",
+            model: "grok-4.6",
+            routingMode: .manual
+        )
+        vm.composerText = "FAIL-OPEN-BOT-PROMPT"
+        XCTAssertTrue(vm.send())
+        let started = await waitUntil(timeout: 5) { !runner.requests.isEmpty }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertTrue(request.prompt.contains("FAIL-OPEN-BOT-PROMPT"))
+        XCTAssertNil(
+            request.environment["RC_TOKEN_SAVER_DISTILL_HINT"],
+            "Token Saver off must not admit Distill on a bot provider turn"
+        )
+        XCTAssertNil(request.environment["RC_TOKEN_SAVER_POST_TOOL_USE"])
+    }
+
+    func test_deskFooterCalculatorMatchesAgentApp_onIdenticalInputs() {
+        // WHY: Desk figures must be the Agent App calculator, not a second formula.
+        let observation = TokenSaverThreadFooterReload.Observation(
+            assistantChars: 80_000,
+            turnCount: 6,
+            cacheReadInputTokens: 12_000,
+            providerRawTokens: 9_000,
+            providerBilledTokenUnits: 9_500,
+            autoRoutingActive: false
+        )
+        let snapshot = TokenSaverThreadFooterReload.snapshot(
+            measuredDelivered: 4_000,
+            eligible: true,
+            graphifyActive: false,
+            observation: observation
+        )
+        XCTAssertEqual(
+            snapshot.displayTokens,
+            AgentAppView.tokenSaverThreadFooterDisplayTokens(
+                measuredDelivered: 4_000,
+                assistantChars: 80_000,
+                tokenSaverEnabled: true,
+                graphifyActive: false,
+                turnCount: 6,
+                cacheReadInputTokens: 12_000,
+                providerRawTokens: 9_000,
+                providerBilledTokenUnits: 9_500,
+                autoRoutingActive: false
+            )
+        )
+        let context = try? makeContext()
+        XCTAssertNotNil(context)
+        if let context {
+            let vm = BotsViewModel(context: context)
+            XCTAssertNil(vm.tokenSaverFooterTextForTesting())
+            XCTAssertFalse(vm.tokenSaverFooterEnabled)
+        }
+    }
+
     func test_hostCatalogBotSendUsesTheFullDeskBrainPipeline() async throws {
         // WHY: a host MCP send must not bypass the Bot's soul/skills/VM routing
         // by forwarding the user's raw text as a generic Agent App prompt.
@@ -11366,6 +11495,13 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("AgentChatUserBubble"))
         XCTAssertTrue(bots.contains("AgentChatAssistantReply"))
         XCTAssertTrue(bots.contains("AgentChatComposerBar"))
+        XCTAssertTrue(
+            bots.contains("AgentChatTokenSaverThreadFooter"),
+            "Desk must mount the shared Token Saver footer, not a lookalike capsule"
+        )
+        XCTAssertTrue(bots.contains("AgentChatTokenSaverDisplayControl"))
+        XCTAssertTrue(bots.contains("deskUserDisplayText"))
+        XCTAssertTrue(bots.contains("bindTokenSaverThreadFooter"))
         XCTAssertTrue(
             bots.contains("placeholder: \"Message \\(bot.name)…\""),
             "Desk composer must invite messaging the teammate, not Ask Claude for changes"

@@ -215,4 +215,69 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         XCTAssertEqual(AgentAppView.formatTokenCountForFooter(42), "42")
         XCTAssertEqual(AgentAppView.formatTokenCountForFooter(999), "999")
     }
+
+    func test_sharedReloadSnapshot_matchesAgentAppCalculator_becauseBotsMustNotForkMath() {
+        // WHY: Bot Desk mounts TokenSaverThreadFooterReload so identical
+        // ledger+observation inputs cannot produce a second number.
+        let observation = TokenSaverThreadFooterReload.Observation(
+            assistantChars: 200_000,
+            turnCount: 12,
+            cacheReadInputTokens: 80_000,
+            providerRawTokens: 40_000,
+            providerBilledTokenUnits: 41_000,
+            autoRoutingActive: true,
+            graphifySignalCount: 3
+        )
+        let snapshot = TokenSaverThreadFooterReload.snapshot(
+            measuredDelivered: 12_500,
+            eligible: true,
+            graphifyActive: true,
+            observation: observation
+        )
+        let display = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+            measuredDelivered: 12_500,
+            assistantChars: 200_000,
+            tokenSaverEnabled: true,
+            graphifyActive: true,
+            graphifySignalCount: 3,
+            turnCount: 12,
+            cacheReadInputTokens: 80_000,
+            providerRawTokens: 40_000,
+            providerBilledTokenUnits: 41_000,
+            autoRoutingActive: true
+        )
+        XCTAssertEqual(snapshot.displayTokens, display)
+        XCTAssertEqual(snapshot.measuredTokens, 12_500)
+        XCTAssertTrue(snapshot.enabled)
+        XCTAssertEqual(
+            AgentChatTokenSaverDisplayMode.footerText(
+                displayTokens: display,
+                measuredTokens: 12_500,
+                enabled: true,
+                autoRoutingActive: true
+            ),
+            AgentAppView.tokenSaverThreadFooterText(
+                displayTokens: display,
+                measuredTokens: 12_500,
+                enabled: true,
+                autoRoutingActive: true
+            )
+        )
+        let off = TokenSaverThreadFooterReload.snapshot(
+            measuredDelivered: 12_500,
+            eligible: false,
+            graphifyActive: true,
+            observation: observation
+        )
+        XCTAssertEqual(off.displayTokens, 12_500)
+        XCTAssertFalse(off.enabled)
+        XCTAssertNil(
+            AgentChatTokenSaverDisplayMode.footerText(
+                displayTokens: off.displayTokens,
+                measuredTokens: off.measuredTokens,
+                enabled: off.enabled,
+                autoRoutingActive: true
+            )
+        )
+    }
 }
