@@ -2839,6 +2839,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let foundation = Self.foundationObject(params)
         do {
             let result = try authority.dispatch(method: method, params: foundation)
+            botsViewModel?.reloadQueuedFollowUpsFromStore()
             return JSONValue.from(result)
         } catch let error as BotRemoteControlAuthority.Error {
             throw JSONRPCError(code: error.code, message: error.message)
@@ -2853,8 +2854,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let created = BotRemoteControlAuthority(
             db: ctx.db,
             store: ctx.botStore,
-            settings: SettingsStore(db: ctx.db)
+            settings: SettingsStore(db: ctx.db),
+            appSupportDirectory: ctx.appSupportDirectory
         )
+        created.onHasLiveRun = { [weak self] id in
+            self?.botsViewModel?.hasLiveRun(botID: id) ?? false
+        }
+        created.onStopRun = { [weak self] id, force in
+            self?.botsViewModel?.stopLiveRuns(for: id, force: force)
+        }
+        created.onStartGuest = { [weak self] id, _ in
+            self?.botsViewModel?.presentGuestDesktop(botID: id)
+        }
+        created.onStopGuest = { [weak self] id in
+            self?.botsViewModel?.stopDockerGuest(botID: id)
+        }
+        created.onRebuildGuest = { [weak self] id in
+            self?.botsViewModel?.rebuildDockerGuest(botID: id)
+        }
+        created.onDockerClear = { [weak self] id in
+            self?.botsViewModel?.computerGuestService?.teardown(botID: id)
+        }
         pairedBotRemote = created
         return created
     }

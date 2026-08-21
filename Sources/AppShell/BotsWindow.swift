@@ -36,6 +36,11 @@ public struct BotQueuedFollowUp: Equatable, Identifiable, Codable {
     }
 }
 
+private struct BotQueuedFollowUpStorePayload: Codable {
+    var attachments: [AgentAttachment]
+    var routing: BotDeskRouting?
+}
+
 public struct BotDeskRouting: Equatable, Codable {
     public var provider: AgentProvider
     public var providerInstanceID: String
@@ -4068,6 +4073,31 @@ public final class BotsViewModel: ObservableObject {
         syncQueuedFollowUps()
     }
 
+    public func hasLiveRun(botID: BotID) -> Bool {
+        let rows = (try? botStore.listConversations(botID: botID)) ?? []
+        return rows.contains { conversation in
+            guard let threadID = conversation.linkedAgentThreadID else { return false }
+            return context.coordinator.activeRunId(threadId: threadID) != nil
+        }
+    }
+
+    public func stopLiveRuns(for botID: BotID, force: Bool) {
+        let rows = (try? botStore.listConversations(botID: botID)) ?? []
+        for conversation in rows {
+            guard let threadID = conversation.linkedAgentThreadID,
+                  context.coordinator.activeRunId(threadId: threadID) != nil else { continue }
+            if force {
+                isStopping = true
+            }
+            stopDeskThread(conversation.id)
+        }
+    }
+
+    public func reloadQueuedFollowUpsFromStore() {
+        queuedFollowUpsByBot = decodeQueuedFollowUpsFromStore()
+        syncQueuedFollowUps()
+    }
+
     public func stopDeskRun() {
         guard let id = selectedConversation?.id else { return }
         stopDeskThread(id)
@@ -5493,19 +5523,35 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func persistQueuedFollowUps() {
-        let payload = Dictionary(uniqueKeysWithValues: queuedFollowUpsByBot.map {
-            ($0.key.value.uuidString.lowercased(), $0.value)
-        })
-        if payload.isEmpty {
-            UserDefaults.standard.removeObject(forKey: Self.queuedFollowUpsDefaultsKey)
-            return
+        let liveIDs = Set(queuedFollowUpsByBot.keys)
+        if let stored = try? botStore.listAllQueuedFollowUps() {
+            for botID in Set(stored.map(\.botID)) where !liveIDs.contains(botID) {
+                try? botStore.deleteQueuedFollowUps(botID: botID)
+            }
         }
-        if let data = try? JSONEncoder().encode(payload) {
-            UserDefaults.standard.set(data, forKey: Self.queuedFollowUpsDefaultsKey)
+        for (botID, items) in queuedFollowUpsByBot {
+            let records = items.enumerated().map { index, item in
+                BotQueuedFollowUpRecord(
+                    id: item.id.uuidString.lowercased(),
+                    botID: botID,
+                    conversationID: item.conversationID?.value.uuidString.lowercased(),
+                    text: item.text,
+                    payloadJSON: encodeQueuedFollowUpPayload(item),
+                    sortOrder: index,
+                    createdAt: Date()
+                )
+            }
+            try? botStore.replaceQueuedFollowUps(botID: botID, items: records)
         }
+        UserDefaults.standard.removeObject(forKey: Self.queuedFollowUpsDefaultsKey)
     }
 
     private func restoreQueuedFollowUpsIfNeeded() {
+        let fromStore = decodeQueuedFollowUpsFromStore()
+        if !fromStore.isEmpty {
+            queuedFollowUpsByBot = fromStore
+            return
+        }
         guard let data = UserDefaults.standard.data(forKey: Self.queuedFollowUpsDefaultsKey),
               let payload = try? JSONDecoder().decode([String: [BotQueuedFollowUp]].self, from: data)
         else { return }
@@ -5521,6 +5567,44 @@ public final class BotsViewModel: ObservableObject {
             }
         }
         queuedFollowUpsByBot = restored
+        if !restored.isEmpty {
+            persistQueuedFollowUps()
+        }
+    }
+
+    private func decodeQueuedFollowUpsFromStore() -> [BotID: [BotQueuedFollowUp]] {
+        guard let stored = try? botStore.listAllQueuedFollowUps() else { return [:] }
+        var restored: [BotID: [BotQueuedFollowUp]] = [:]
+        for record in stored {
+            let item = decodeQueuedFollowUp(record)
+            guard !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !item.attachments.isEmpty else { continue }
+            restored[record.botID, default: []].append(item)
+        }
+        return restored
+    }
+
+    private func encodeQueuedFollowUpPayload(_ item: BotQueuedFollowUp) -> String {
+        let payload = BotQueuedFollowUpStorePayload(
+            attachments: item.attachments,
+            routing: item.routing
+        )
+        guard let data = try? JSONEncoder().encode(payload),
+              let text = String(data: data, encoding: .utf8) else { return "{}" }
+        return text
+    }
+
+    private func decodeQueuedFollowUp(_ record: BotQueuedFollowUpRecord) -> BotQueuedFollowUp {
+        let payload = record.payloadJSON.data(using: .utf8).flatMap {
+            try? JSONDecoder().decode(BotQueuedFollowUpStorePayload.self, from: $0)
+        }
+        return BotQueuedFollowUp(
+            id: UUID(uuidString: record.id) ?? UUID(),
+            text: record.text,
+            attachments: payload?.attachments ?? [],
+            conversationID: record.conversationID.flatMap(UUID.init).map(BotConversationID.init),
+            routing: payload?.routing
+        )
     }
 
     private func pruneQueuedFollowUpsToFleet() {

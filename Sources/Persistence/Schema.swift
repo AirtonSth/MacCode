@@ -32,8 +32,9 @@ public enum Schema {
     /// context-assembly receipts (bots branch used 72 before production
     /// shipped Token Saver receipts at that number), v76 owns Bot
     /// routine schedule spec (frequency, provider, model, reasoning),
-    /// and v77 owns nullable agent_runs.terminal_reason (downgrade-safe).
-    public static let currentVersion: Int = 77
+    /// v77 owns nullable agent_runs.terminal_reason (downgrade-safe),
+    /// and v78 owns host-authoritative Bot queued follow-ups.
+    public static let currentVersion: Int = 78
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1696,6 +1697,19 @@ public enum Schema {
         """),
         SchemaStep(77, """
         ALTER TABLE agent_runs ADD COLUMN terminal_reason TEXT;
+        """),
+        SchemaStep(78, """
+        CREATE TABLE IF NOT EXISTS bot_queued_follow_ups (
+            id TEXT PRIMARY KEY,
+            bot_id TEXT NOT NULL,
+            conversation_id TEXT,
+            text TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            sort_order INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS bot_queued_follow_ups_bot_sort
+            ON bot_queued_follow_ups(bot_id, sort_order);
         """),
     ]
 

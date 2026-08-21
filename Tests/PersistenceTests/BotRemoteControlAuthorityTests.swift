@@ -7,13 +7,22 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
     private var store: BotStore!
     private var settings: SettingsStore!
     private var authority: BotRemoteControlAuthority!
+    private var supportDir: URL!
 
     override func setUpWithError() throws {
         db = try SQLiteDB(path: ":memory:")
         try Schema.migrate(db)
         store = BotStore(db: db)
         settings = SettingsStore(db: db)
-        authority = BotRemoteControlAuthority(db: db, store: store, settings: settings)
+        supportDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-bot-remote-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        authority = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
     }
 
     override func tearDown() {
@@ -21,6 +30,10 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         settings = nil
         store = nil
         db = nil
+        if let supportDir {
+            try? FileManager.default.removeItem(at: supportDir)
+        }
+        supportDir = nil
     }
 
     func test_settingsSet_failsWithoutRequestId_becauseSilentLocalSuccessIsForbidden() {
@@ -96,7 +109,12 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "text": "follow up",
         ])
         XCTAssertEqual((queued["readback"] as? [String: Any])?["enqueued"] as? Bool, true)
-        let relaunched = BotRemoteControlAuthority(db: db, store: store, settings: settings)
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
         let list = try relaunched.dispatch(method: "bot.queue.list", params: ["bot_id": botID])
         let items = try XCTUnwrap(list["items"] as? [[String: Any]])
         XCTAssertEqual(items.count, 1)
@@ -367,5 +385,159 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "name": "Piper",
         ])
         XCTAssertEqual((second["readback"] as? [String: Any])?["pre"] as? String, "EXISTING")
+    }
+
+    func test_queuedFollowUp_isVisibleInBotStoreAfterEnqueue() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "store-q",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "store-q-1",
+            "bot_id": botID,
+            "text": "first turn",
+        ])
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "store-q-2",
+            "bot_id": botID,
+            "text": "follow up",
+        ])
+        let uuid = try XCTUnwrap(UUID(uuidString: botID))
+        let stored = try store.listQueuedFollowUps(botID: BotID(uuid))
+        XCTAssertEqual(stored.map(\.text), ["follow up"])
+        XCTAssertFalse(stored.isEmpty, "queue must land in BotStore, not a sidecar map")
+    }
+
+    func test_filesMutate_writesBotHomeDiskAndSurvivesRelaunchList() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "disk",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "disk-w",
+            "bot_id": botID,
+            "path": "notes.txt",
+            "op": "write",
+            "contents": "from remote",
+        ])
+        let uuid = try XCTUnwrap(UUID(uuidString: botID))
+        let bot = try XCTUnwrap(store.get(id: BotID(uuid)))
+        let home = BotHome(appSupportDirectory: supportDir, bot: bot)
+        let url = try home.resolvedURL("notes.txt")
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "from remote")
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+        let listed = try relaunched.dispatch(method: "bot.files.list", params: ["bot_id": botID])
+        let entries = try XCTUnwrap(listed["entries"] as? [[String: Any]])
+        XCTAssertTrue(
+            entries.contains { ($0["path"] as? String) == "notes.txt" },
+            "files.list must read the Bot Home disk after relaunch, got \(entries.map { $0["path"] as? String })"
+        )
+    }
+
+    func test_browserAction_persistsBotBrowserStoreTarget() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "br-store",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.link.open", params: [
+            "client_request_id": "br-open",
+            "bot_id": botID,
+            "url": "http://127.0.0.1:3000",
+            "title": "Dev",
+        ])
+        let uuid = try XCTUnwrap(UUID(uuidString: botID))
+        let persisted = try XCTUnwrap(
+            BotBrowserStore(appSupportDirectory: supportDir).loadTarget(botID: BotID(uuid))
+        )
+        XCTAssertEqual(persisted.url, "http://127.0.0.1:3000")
+        XCTAssertEqual(persisted.title, "Dev")
+        let pending = try BotBrowserStore(appSupportDirectory: supportDir).loadPendingOpens()
+        XCTAssertEqual(pending.last?.url, "http://127.0.0.1:3000")
+    }
+
+    func test_dockerClear_wipesGuestHomeOnDisk() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "dock",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.files.location.set", params: [
+            "client_request_id": "dock-loc",
+            "bot_id": botID,
+            "root": "docker_home",
+        ])
+        _ = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "dock-w",
+            "bot_id": botID,
+            "path": "scratch.txt",
+            "op": "write",
+            "contents": "guest bytes",
+        ])
+        let uuid = try XCTUnwrap(UUID(uuidString: botID))
+        let guest = BotGuestHome.url(appSupport: supportDir, botID: BotID(uuid))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: guest.appendingPathComponent("scratch.txt").path))
+        _ = try authority.dispatch(method: "bot.docker.clear", params: [
+            "client_request_id": "dock-c",
+            "bot_id": botID,
+            "confirm": "clear",
+        ])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: guest.path))
+    }
+
+    func test_guestStart_createsGuestHomeAndKeepsVncViewer() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "g-home",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let started = try authority.dispatch(method: "bot.guest.start", params: [
+            "client_request_id": "g-start",
+            "bot_id": botID,
+            "recipe": "pointer",
+        ])
+        let uuid = try XCTUnwrap(UUID(uuidString: botID))
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: BotGuestHome.url(appSupport: supportDir, botID: BotID(uuid)).path
+            )
+        )
+        XCTAssertEqual((started["readback"] as? [String: Any])?["viewer"] as? String, "/vnc.html")
+    }
+
+    func test_forceStop_drainsStoreQueue() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "drain",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "drain-1",
+            "bot_id": botID,
+            "text": "go",
+        ])
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "drain-2",
+            "bot_id": botID,
+            "text": "queued",
+        ])
+        let uuid = try XCTUnwrap(UUID(uuidString: botID))
+        XCTAssertEqual(try store.listQueuedFollowUps(botID: BotID(uuid)).count, 1)
+        let stopped = try authority.dispatch(method: "bot.force_stop", params: [
+            "client_request_id": "drain-stop",
+            "bot_id": botID,
+        ])
+        let readback = stopped["readback"] as? [String: Any]
+        XCTAssertEqual(readback?["terminal"] as? Bool, true)
+        XCTAssertEqual((readback?["drained"] as? [String: Any])?["text"] as? String, "queued")
+        XCTAssertEqual(try store.listQueuedFollowUps(botID: BotID(uuid)).count, 0)
     }
 }

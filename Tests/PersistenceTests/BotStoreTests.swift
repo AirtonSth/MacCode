@@ -27,7 +27,7 @@ final class BotStoreTests: XCTestCase {
             "bots", "bot_revisions", "bot_handles", "bot_handle_tombstones",
             "bot_conversations", "bot_memory_items", "bot_memory_item_revisions",
             "bot_attention_items", "bot_routine_definitions", "bot_routine_activations",
-            "bot_skill_bindings", "bot_context_receipts",
+            "bot_skill_bindings", "bot_context_receipts", "bot_queued_follow_ups",
         ] {
             let exists = try db.prepare(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?;"
@@ -557,5 +557,27 @@ final class BotStoreTests: XCTestCase {
         let second = try store.create(name: "New Agent", title: "", description: "", provider: .claude)
         XCTAssertEqual(first.handle, "new-agent")
         XCTAssertEqual(second.handle, "new-agent-2")
+    }
+
+    func test_queuedFollowUps_roundTripAndDeleteWithBot() throws {
+        let bot = try store.create(name: "Piper", title: "", description: "", provider: .claude)
+        let first = try store.enqueueQueuedFollowUp(
+            BotQueuedFollowUpRecord(botID: bot.id, text: "one", payloadJSON: "{\"n\":1}")
+        )
+        _ = try store.enqueueQueuedFollowUp(
+            BotQueuedFollowUpRecord(botID: bot.id, text: "two")
+        )
+        XCTAssertEqual(try store.listQueuedFollowUps(botID: bot.id).map(\.text), ["one", "two"])
+        XCTAssertEqual(first.sortOrder, 0)
+        let drained = try store.dequeueQueuedFollowUp(botID: bot.id)
+        XCTAssertEqual(drained?.text, "one")
+        XCTAssertEqual(try store.listQueuedFollowUps(botID: bot.id).map(\.text), ["two"])
+        try store.replaceQueuedFollowUps(
+            botID: bot.id,
+            items: [BotQueuedFollowUpRecord(botID: bot.id, text: "kept")]
+        )
+        XCTAssertEqual(try store.listQueuedFollowUps(botID: bot.id).map(\.text), ["kept"])
+        try store.delete(id: bot.id)
+        XCTAssertTrue(try store.listQueuedFollowUps(botID: bot.id).isEmpty)
     }
 }
