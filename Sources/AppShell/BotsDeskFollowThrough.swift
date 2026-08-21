@@ -131,8 +131,7 @@ enum BotsDeskFollowThrough {
         let logs = hideWorkLog ? [] : workLog
         let visibleTurns = turns.filter { turn in
             let composition = AgentChatLiveTurnChrome.compose(turn)
-            return !composition.reasoning.isEmpty
-                || !composition.work.isEmpty
+            return !composition.activity.isEmpty
                 || AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn)
                 || turn.items.contains {
                     $0.type == .assistantMessage

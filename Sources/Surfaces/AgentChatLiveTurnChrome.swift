@@ -74,33 +74,37 @@ public enum AgentChatLiveTurnChrome {
         }
     }
 
-    public static func splitTurn(_ turn: AssistantTurnSnapshot) -> (work: [AssistantItem], outside: [AssistantItem]) {
-        AgentTurnChatComposition.splitItems(
-            turn.items,
-            turnFinished: turn.finished,
-            isFinalItem: { $0.type == .assistantMessage }
-        )
+    public static func splitTurn(_ turn: AssistantTurnSnapshot) -> (activity: [AssistantItem], outside: [AssistantItem]) {
+        guard turn.finished else { return (turn.items, []) }
+
+        let final = turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !final.isEmpty {
+            return (
+                turn.items.filter {
+                    !($0.type == .assistantMessage && assistantTextsMatch($0.body, final))
+                },
+                []
+            )
+        }
+
+        guard let finalIndex = turn.items.lastIndex(where: {
+            $0.type == .assistantMessage
+                && !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else {
+            return (turn.items, [])
+        }
+        var activity = turn.items
+        let finalItem = activity.remove(at: finalIndex)
+        return (activity, [finalItem])
     }
 
-    /// Desk / Agent App live composition: Thinking…/Thought stays a visible
-    /// row. Work so far owns the non-final tools. Final markdown sits outside.
+    /// Desk / Agent App composition keeps every non-final item in provider
+    /// append order. Only the final answer may sit outside the activity stream.
     public static func compose(_ turn: AssistantTurnSnapshot) -> (
-        reasoning: [AssistantItem],
-        work: [AssistantItem],
+        activity: [AssistantItem],
         outside: [AssistantItem]
     ) {
         let split = splitTurn(turn)
-        var reasoning: [AssistantItem] = []
-        var work: [AssistantItem] = []
-        reasoning.reserveCapacity(split.work.count)
-        work.reserveCapacity(split.work.count)
-        for item in split.work {
-            if item.type == .reasoning {
-                reasoning.append(item)
-            } else {
-                work.append(item)
-            }
-        }
         var outside = deduplicatedAssistantItems(split.outside)
         if turn.finished,
            let final = turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -109,7 +113,7 @@ public enum AgentChatLiveTurnChrome {
                 $0.type == .assistantMessage && assistantTextsMatch($0.body, final)
             }
         }
-        return (reasoning, work, outside)
+        return (split.activity, outside)
     }
 
     /// Claude often emits a streaming assistantMessage and then a snapshot
@@ -138,7 +142,7 @@ public enum AgentChatLiveTurnChrome {
     }
 
     public static func workItems(in turn: AssistantTurnSnapshot) -> [AssistantItem] {
-        compose(turn).work
+        compose(turn).activity
     }
 
     public static func assistantBodies(in turn: AssistantTurnSnapshot) -> [String] {
@@ -185,7 +189,7 @@ public enum AgentChatLiveTurnChrome {
     public static func paintsLiveTurnChrome(_ timeline: AssistantTimelineState) -> Bool {
         timeline.turns.contains {
             let composition = compose($0)
-            return !composition.reasoning.isEmpty || !composition.work.isEmpty
+            return !composition.activity.isEmpty
         }
     }
 
@@ -689,6 +693,7 @@ public struct AgentChatLiveItemRow: View {
         switch item.type {
         case .reasoning:
             AgentChatReasoningRow(item: item, expandedIDs: $expandedReasoning)
+                .accessibilityIdentifier("bots.desk.thought.\(item.id)")
         case .assistantMessage:
             if !item.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 AgentChatAssistantReply(text: item.body)
@@ -715,15 +720,13 @@ public struct AgentChatLiveTurnView: View {
     public let turn: AssistantTurnSnapshot
     public let live: Bool
     public let hideAssistantOutput: Bool
-    /// False paints the work blocks directly (no "Work so far" disclosure).
-    /// Used by live turn-segment continuations after an interleaved bot
-    /// message so the chat keeps appending instead of stacking headers.
+    /// False omits the "Work so far" heading for a continuation segment.
+    /// Used after an interleaved bot message so the chat keeps appending
+    /// instead of stacking headers.
     public var showsWorkHeader: Bool
     public var renderFinal: ((String) -> AnyView)?
     public var afterWork: AnyView?
 
-    @State private var userExpanded: Set<String> = []
-    @State private var userCollapsedLive: Set<String> = []
     @State private var expandedReasoning: Set<String> = []
     @State private var expandedTools: Set<String> = []
     @State private var expandedToolGroups: Set<String> = []
@@ -746,52 +749,41 @@ public struct AgentChatLiveTurnView: View {
 
     public var body: some View {
         let composition = AgentChatLiveTurnChrome.compose(turn)
-        let blocks = AgentChatLiveTurnChrome.workBlocks(from: composition.work)
-        let expanded = AgentCompletedWorkExpandPolicy.isExpanded(
-            isLive: live,
-            isLatestLiveTurn: live,
-            userExplicitlyExpanded: userExpanded.contains(turn.turnId),
-            userCollapsedWhileLive: userCollapsedLive.contains(turn.turnId)
-        )
+        let blocks = AgentChatLiveTurnChrome.workBlocks(from: composition.activity)
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            if !composition.reasoning.isEmpty {
-                VStack(alignment: .leading, spacing: DS.Space.md) {
-                    ForEach(composition.reasoning) { item in
-                        AgentChatReasoningRow(item: item, expandedIDs: $expandedReasoning)
-                    }
-                }
-                .accessibilityIdentifier("bots.desk.thought")
-            }
-            if !composition.work.isEmpty {
-                if showsWorkHeader {
-                    AgentChatWorkSoFarDisclosure(
-                        turn: turn,
-                        live: live,
-                        blocks: AgentCompletedWorkPresentation.shouldBuildBlocks(
-                            expandCompletedWork: expanded,
-                            workItemCount: blocks.count
-                        ) ? blocks : [],
-                        workBlockCount: blocks.count,
-                        isExpanded: expanded,
-                        onToggle: toggleWork,
-                        expandedReasoning: $expandedReasoning,
-                        expandedTools: $expandedTools,
-                        expandedToolGroups: $expandedToolGroups
-                    )
-                } else {
-                    VStack(alignment: .leading, spacing: DS.Space.lg) {
-                        ForEach(blocks) { block in
-                            AgentChatWorkBlockView(
-                                block: block,
-                                expandedReasoning: $expandedReasoning,
-                                expandedTools: $expandedTools,
-                                expandedToolGroups: $expandedToolGroups
-                            )
+            if !composition.activity.isEmpty {
+                VStack(alignment: .leading, spacing: DS.Space.lg) {
+                    if showsWorkHeader {
+                        HStack(spacing: DS.Space.sm) {
+                            if live {
+                                Image(systemName: "circle.dotted")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(DS.Palette.textTertiary)
+                            }
+                            Text(AgentChatLiveTurnChrome.completedWorkLabel(
+                                turn,
+                                live: live,
+                                workBlockCount: blocks.count
+                            ))
+                            .font(DS.Font.body.weight(.medium))
+                            .foregroundColor(DS.Palette.textTertiary)
+                            Spacer(minLength: 0)
                         }
+                        .accessibilityIdentifier(
+                            live ? "agent.liveWork.\(turn.turnId)" : "agent.completedWork.\(turn.turnId)"
+                        )
                     }
-                    .padding(.leading, DS.Space.md)
-                    .accessibilityIdentifier("agent.work.continuation.\(turn.turnId)")
+                    ForEach(blocks) { block in
+                        AgentChatWorkBlockView(
+                            block: block,
+                            expandedReasoning: $expandedReasoning,
+                            expandedTools: $expandedTools,
+                            expandedToolGroups: $expandedToolGroups
+                        )
+                    }
                 }
+                .padding(.leading, showsWorkHeader ? 0 : DS.Space.md)
+                .accessibilityIdentifier("agent.work.timeline.\(turn.turnId)")
             }
             if let afterWork {
                 afterWork
@@ -816,32 +808,6 @@ public struct AgentChatLiveTurnView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("bots.desk.liveTurn.\(turn.turnId)")
-        .onChange(of: turn.finished) { _, finished in
-            if finished {
-                let cleared = AgentCompletedWorkExpandPolicy.clearedExpansionState()
-                userExpanded = cleared.expanded
-                userCollapsedLive = cleared.collapsedLive
-            }
-        }
-    }
-
-    private func toggleWork() {
-        let currently = AgentCompletedWorkExpandPolicy.isExpanded(
-            isLive: live,
-            isLatestLiveTurn: live,
-            userExplicitlyExpanded: userExpanded.contains(turn.turnId),
-            userCollapsedWhileLive: userCollapsedLive.contains(turn.turnId)
-        )
-        let next = AgentCompletedWorkExpandPolicy.toggle(
-            turnId: turn.turnId,
-            currentlyExpanded: currently,
-            isLive: live,
-            isLatestLiveTurn: live,
-            userExpanded: userExpanded,
-            userCollapsedLive: userCollapsedLive
-        )
-        userExpanded = next.expanded
-        userCollapsedLive = next.collapsedLive
     }
 }
 

@@ -1070,8 +1070,7 @@ final class BotsWindowTests: XCTestCase {
         )
         let live = try XCTUnwrap(vm.deskLiveTimeline.turns.first)
         let composition = AgentChatLiveTurnChrome.compose(live)
-        XCTAssertEqual(composition.reasoning.map(\.type), [.reasoning])
-        XCTAssertEqual(composition.work.map(\.type), [.tool])
+        XCTAssertEqual(composition.activity.map(\.type), [.reasoning, .tool])
         XCTAssertTrue(composition.outside.isEmpty)
     }
 

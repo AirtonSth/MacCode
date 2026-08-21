@@ -40,11 +40,9 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         )
     }
 
-    func test_workSoFarOwnsToolsAndReasoning_becauseLiveCompositionIsUserThenWorkThenFinal() {
-        // WHY: live composition is user → Thinking…/Thought → Work so far
-        // (non-final tools) → final markdown. Tools must not leak outside the
-        // disclosure the way a Supervised-run work-log card would, and thought
-        // must not hide inside a collapsed Work so far row.
+    func test_liveCompositionKeepsReasoningAndToolsInOneOrderedActivity() {
+        // WHY: reasoning and tools share one provider timeline. Splitting them
+        // into type buckets lets later thoughts jump above earlier tool work.
         let turn = AssistantTurnSnapshot(
             turnId: "t1",
             items: [
@@ -54,12 +52,36 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
             finished: false
         )
         let composition = AgentChatLiveTurnChrome.compose(turn)
-        XCTAssertEqual(composition.reasoning.map(\.id), ["r1"])
-        XCTAssertEqual(composition.work.map(\.id), ["tool1"])
-        XCTAssertTrue(composition.outside.isEmpty, "live turns keep tools inside Work so far")
-        XCTAssertEqual(AgentChatLiveTurnChrome.completedWorkLabel(turn, live: true, workBlockCount: 1),
-                       "Work so far")
+        XCTAssertEqual(composition.activity.map(\.id), ["r1", "tool1"])
+        XCTAssertTrue(composition.outside.isEmpty, "live turns keep all activity in append order")
+        XCTAssertEqual(AgentChatLiveTurnChrome.completedWorkLabel(turn, live: true, workBlockCount: 2),
+                       "Work so far · 2 steps in this turn")
         XCTAssertFalse(AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn))
+    }
+
+    func test_liveCompositionPreservesAppendOrder_becauseLateThoughtMustStayAfterPriorWork() {
+        // WHY: Grok interleaves reasoning, tools, and progress text. Rendering
+        // type-specific buckets moves every later Thought above work that was
+        // already visible instead of appending it at the bottom of the turn.
+        let turn = AssistantTurnSnapshot(
+            turnId: "t-interleaved",
+            items: [
+                AssistantItem(id: "r1", turnId: "t-interleaved", type: .reasoning, state: .completed, body: "first", startedAtMs: 1, finishedAtMs: 2),
+                AssistantItem(id: "tool1", turnId: "t-interleaved", type: .tool, state: .completed, summary: "Bash", startedAtMs: 3, finishedAtMs: 4),
+                AssistantItem(id: "progress1", turnId: "t-interleaved", type: .assistantMessage, state: .completed, body: "Still working", startedAtMs: 5, finishedAtMs: 6),
+                AssistantItem(id: "r2", turnId: "t-interleaved", type: .reasoning, state: .streaming, body: "next", startedAtMs: 7),
+            ],
+            finished: false
+        )
+
+        let composition = AgentChatLiveTurnChrome.compose(turn)
+        let renderedIDs = (composition.activity + composition.outside).map(\.id)
+
+        XCTAssertEqual(
+            renderedIDs,
+            turn.items.map(\.id),
+            "live activity must render in append order instead of hoisting every Thought"
+        )
     }
 
     func test_finalStaysOutsideWork_becauseTheAnswerIsTheChat() {
@@ -75,12 +97,34 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
             finished: true
         )
         let composition = AgentChatLiveTurnChrome.compose(turn)
-        XCTAssertEqual(composition.reasoning.map(\.type), [.reasoning])
-        XCTAssertEqual(composition.work.map(\.type), [.tool])
+        XCTAssertEqual(composition.activity.map(\.type), [.reasoning, .tool])
         XCTAssertTrue(composition.outside.isEmpty, "final text lives on the turn, not as a duplicate item")
         XCTAssertTrue(AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn))
-        XCTAssertEqual(AgentChatLiveTurnChrome.completedWorkLabel(turn, live: false, workBlockCount: 1),
+        XCTAssertEqual(AgentChatLiveTurnChrome.completedWorkLabel(turn, live: false, workBlockCount: 2),
                        "Worked for 2s")
+    }
+
+    func test_finishedCompositionKeepsProgressInOrderAndRemovesOnlyFinalDuplicate() {
+        // WHY: Grok can emit progress prose between thought phases. Finishing
+        // the turn must not reclassify every assistantMessage as a final reply.
+        let final = "All checks passed."
+        let turn = AssistantTurnSnapshot(
+            turnId: "t-finished-interleaved",
+            items: [
+                AssistantItem(id: "r1", turnId: "t-finished-interleaved", type: .reasoning, state: .completed, body: "first", startedAtMs: 1, finishedAtMs: 2),
+                AssistantItem(id: "progress", turnId: "t-finished-interleaved", type: .assistantMessage, state: .completed, body: "Running one more check", startedAtMs: 3, finishedAtMs: 4),
+                AssistantItem(id: "r2", turnId: "t-finished-interleaved", type: .reasoning, state: .completed, body: "second", startedAtMs: 5, finishedAtMs: 6),
+                AssistantItem(id: "final-copy", turnId: "t-finished-interleaved", type: .assistantMessage, state: .completed, body: final, startedAtMs: 7, finishedAtMs: 8),
+            ],
+            finalAssistantMessage: final,
+            finished: true
+        )
+
+        let composition = AgentChatLiveTurnChrome.compose(turn)
+
+        XCTAssertEqual(composition.activity.map(\.id), ["r1", "progress", "r2"])
+        XCTAssertTrue(composition.outside.isEmpty, "the authoritative turn final paints exactly once")
+        XCTAssertTrue(AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn))
     }
 
     func test_hasStreamingToolsDrivesWorkingPhase_becauseAThinkingPillIsNotEnough() {
@@ -122,7 +166,7 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         let reasoning = try XCTUnwrap(turn.items.first { $0.type == .reasoning })
         XCTAssertEqual(AgentChatLiveTurnChrome.reasoningTitle(isStreaming: reasoning.state == .streaming), "Thought")
         XCTAssertEqual(AgentChatLiveTurnChrome.reasoningText(reasoning), "Checking the suite")
-        XCTAssertTrue(AgentChatLiveTurnChrome.compose(turn).reasoning.contains { $0.type == .reasoning })
+        XCTAssertTrue(AgentChatLiveTurnChrome.compose(turn).activity.contains { $0.type == .reasoning })
         XCTAssertTrue(AgentChatLiveTurnChrome.workItems(in: turn).contains { $0.type == .tool })
         XCTAssertEqual(turn.finalAssistantMessage, "Three failing tests remain.")
         XCTAssertTrue(AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn))
@@ -350,7 +394,7 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
             finished: true
         )
         let composition = AgentChatLiveTurnChrome.compose(turn)
-        XCTAssertEqual(composition.work.map(\.id), ["cmd-1"])
+        XCTAssertEqual(composition.activity.map(\.id), ["cmd-1"])
         XCTAssertTrue(composition.outside.isEmpty)
         XCTAssertTrue(AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn))
         XCTAssertTrue(AgentChatLiveTurnChrome.messageDuplicatesTurn(answer, turns: [turn]))
