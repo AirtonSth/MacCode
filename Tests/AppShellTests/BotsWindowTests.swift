@@ -807,9 +807,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(slice.contains("BotsChrome.threadRailWidth)"))
     }
 
-    func test_hiddenDeskThreadRailOmitsHeaderPlus_becauseNewThreadLivesOnTheRail() throws {
-        // WHY: Agent App keeps a collapsed +. dest dest dest dest header
-        // already has identity + Studio. Hide must only restore the rail.
+    func test_deskHeaderKeepsThreadToggleAndNewThread_becauseHideMustNotRemoveThem() throws {
+        // WHY: hiding the rail used to remove the only header toggle, and
+        // new thread lived only on the rail. Both must stay in the Desk
+        // header; + sits after Open in New Window.
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         guard let start = source.range(of: "private func deskHeader") else {
             return XCTFail("desk header must exist")
@@ -817,9 +818,18 @@ final class BotsWindowTests: XCTestCase {
         let rest = source[start.upperBound...]
         let end = rest.range(of: "\n    private func deskChat")?.lowerBound ?? rest.endIndex
         let header = String(source[start.lowerBound..<end])
-        XCTAssertTrue(header.contains("bots.desk.thread.show"))
-        XCTAssertFalse(header.contains("bots.desk.thread.new.collapsed"))
-        XCTAssertFalse(header.contains("AgentChatThreadRailCopy.newHelp"))
+        XCTAssertFalse(header.contains("if !vm.isDeskThreadRailVisible"))
+        XCTAssertTrue(header.contains("isDeskThreadRailVisible.toggle()"))
+        XCTAssertTrue(header.contains("bots.desk.thread.toggle"))
+        XCTAssertTrue(header.contains("bots.desk.openInNewWindow"))
+        XCTAssertTrue(header.contains("bots.desk.thread.new.header"))
+        XCTAssertTrue(header.contains("AgentChatThreadRailCopy.newHelp"))
+        let window = try XCTUnwrap(header.range(of: "bots.desk.openInNewWindow"))
+        let plus = try XCTUnwrap(header.range(of: "bots.desk.thread.new.header"))
+        XCTAssertTrue(
+            window.lowerBound < plus.lowerBound,
+            "new thread must sit to the right of Open in New Window"
+        )
     }
 
     func test_deskAlwaysDropsTitlebarInsetsInMainShell_becauseTheHeaderMustHugTheTrafficLightRow() throws {
@@ -8592,6 +8602,123 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.attentionState(for: bot), .unreadActivity)
         vm.openDesk(bot)
         XCTAssertEqual(vm.attentionState(for: bot), .none)
+    }
+
+    func test_viewingDeskHidesNeedsYouFromSiblingFailedRun_becauseTheOpenThreadDoesNotNeedYou() throws {
+        // WHY: Ceo kept Needs you after a later thread completed. A leftover
+        // Grok ACP crash on another conversation is not a live ask.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Ceo", title: "Chief of all bots", provider: .grok)
+        let failed = BotConversation(
+            botID: bot.id,
+            title: "Melhore o oliver",
+            attentionState: .needsAttention,
+            updatedAt: Date().addingTimeInterval(-10_800)
+        )
+        let current = BotConversation(
+            botID: bot.id,
+            title: "Melhore o oliver",
+            attentionState: .none,
+            updatedAt: Date()
+        )
+        try context.botStore.upsertConversation(failed)
+        try context.botStore.upsertConversation(current)
+        try context.botStore.upsertAttention(
+            BotAttentionItem(
+                botID: bot.id,
+                conversationID: failed.id,
+                kind: .blocked,
+                title: "Run needs you",
+                detail: "Grok ACP process exited (exit 143)"
+            )
+        )
+        vm.reload()
+        vm.openDesk(bot)
+        vm.selectDeskThread(current.id)
+        XCTAssertEqual(vm.selectedConversation?.id, current.id)
+        XCTAssertEqual(
+            vm.attentionState(for: bot),
+            .none,
+            "the open completed thread must not inherit Needs you from a sibling failed run"
+        )
+        XCTAssertEqual(
+            vm.conversations.first(where: { $0.id == failed.id })?.attentionState,
+            .needsAttention,
+            "the failed thread remains marked so the rail can still surface it"
+        )
+    }
+
+    func test_viewingDeskKeepsNeedsYouWhenTheOpenThreadFailed() throws {
+        // WHY: hiding sibling leftovers must not hide a failed run the user
+        // is actually looking at.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Ceo", title: "Chief of all bots", provider: .grok)
+        let failed = BotConversation(
+            botID: bot.id,
+            title: "Melhore o oliver",
+            attentionState: .needsAttention
+        )
+        let current = BotConversation(
+            botID: bot.id,
+            title: "Melhore o oliver later",
+            attentionState: .none,
+            updatedAt: Date().addingTimeInterval(60)
+        )
+        try context.botStore.upsertConversation(failed)
+        try context.botStore.upsertConversation(current)
+        try context.botStore.upsertAttention(
+            BotAttentionItem(
+                botID: bot.id,
+                conversationID: failed.id,
+                kind: .blocked,
+                title: "Run needs you",
+                detail: "Grok ACP process exited (exit 143)"
+            )
+        )
+        vm.reload()
+        vm.openDesk(bot)
+        vm.selectDeskThread(failed.id)
+        XCTAssertEqual(vm.attentionState(for: bot), .needsAttention)
+    }
+
+    func test_viewingDeskKeepsNeedsYouForOpenApproval_becauseTheBotStillNeedsYou() throws {
+        // WHY: a live approval is an actual ask. Viewing a later completed
+        // thread must not swallow that inbox row.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Ceo", title: "Chief of all bots", provider: .grok)
+        let failed = BotConversation(
+            botID: bot.id,
+            title: "Melhore o oliver",
+            attentionState: .needsAttention,
+            updatedAt: Date().addingTimeInterval(-10_800)
+        )
+        let current = BotConversation(
+            botID: bot.id,
+            title: "Melhore o oliver",
+            attentionState: .none,
+            updatedAt: Date()
+        )
+        try context.botStore.upsertConversation(failed)
+        try context.botStore.upsertConversation(current)
+        try context.botStore.upsertAttention(
+            BotAttentionItem(
+                botID: bot.id,
+                conversationID: failed.id,
+                kind: .blocked,
+                title: "Run needs you",
+                detail: "Grok ACP process exited (exit 143)"
+            )
+        )
+        try context.botStore.upsertAttention(
+            BotAttentionItem(botID: bot.id, kind: .approval, title: "Approve vendor brief")
+        )
+        vm.reload()
+        vm.openDesk(bot)
+        vm.selectDeskThread(current.id)
+        XCTAssertEqual(vm.attentionState(for: bot), .needsAttention)
     }
 
     func test_reopeningDeskDoesNotRefetchRosterRevisions_becauseDestMustNotRereadEveryChip() throws {

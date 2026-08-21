@@ -2486,7 +2486,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public var deskSidePaneWidth: CGFloat = BotsChrome.desktopPaneWidth {
         didSet { persistDeskSidePaneWidth() }
     }
-    /// Dest thread rail is collapsible. Same hide/show as Agent App.
+    /// Dest thread rail is collapsible. Desk header always keeps the toggle.
     @Published public var isDeskThreadRailVisible: Bool = true {
         didSet { persistDeskThreadRail() }
     }
@@ -3080,7 +3080,29 @@ public final class BotsViewModel: ObservableObject {
     public func attentionState(for bot: BotDefinition) -> BotAttentionState {
         let state = attentionStateByBot[bot.id] ?? .none
         if isViewing(bot.id), state == .unreadActivity { return .none }
+        if isViewing(bot.id), state == .needsAttention, !viewingConversationNeedsYou(bot) {
+            return .none
+        }
         return state
+    }
+
+    /// A leftover failed/interrupted run on another thread is not a live ask.
+    /// Keep Needs you while this conversation is the failed one, or while a
+    /// question/approval is still open for this teammate.
+    private func viewingConversationNeedsYou(_ bot: BotDefinition) -> Bool {
+        if let selected = selectedConversation, selected.botID == bot.id,
+           selected.attentionState == .needsAttention {
+            return true
+        }
+        return attentionItems.contains { item in
+            guard item.acknowledgedAt == nil, item.botID == bot.id else { return false }
+            switch item.kind {
+            case .question, .approval:
+                return true
+            case .handoff, .unread, .blocked, .unknownEffect:
+                return false
+            }
+        }
     }
 
     public func isViewing(_ botID: BotID) -> Bool {
@@ -8872,14 +8894,17 @@ public struct BotsRootView: View {
     /// Desk is chat, so this stays a 44pt chrome strip.
     private func deskHeader(_ bot: BotDefinition) -> some View {
         HStack(spacing: DS.Space.md) {
-            if !vm.isDeskThreadRailVisible {
-                DSIconButton("sidebar.left", help: AgentChatThreadRailCopy.showHelp) {
-                    withAnimation(DS.Motion.standard) {
-                        vm.isDeskThreadRailVisible = true
-                    }
+            DSIconButton(
+                "sidebar.left",
+                help: vm.isDeskThreadRailVisible
+                    ? AgentChatThreadRailCopy.hideHelp
+                    : AgentChatThreadRailCopy.showHelp
+            ) {
+                withAnimation(DS.Motion.standard) {
+                    vm.isDeskThreadRailVisible.toggle()
                 }
-                .accessibilityIdentifier("bots.desk.thread.show")
             }
+            .accessibilityIdentifier("bots.desk.thread.toggle")
             Button {
                 vm.openStudio(bot)
             } label: {
@@ -8933,6 +8958,10 @@ public struct BotsRootView: View {
                     }
                     .accessibilityIdentifier("bots.desk.openInNewWindow")
                 }
+                DSIconButton("plus", help: AgentChatThreadRailCopy.newHelp) {
+                    vm.createDeskThread()
+                }
+                .accessibilityIdentifier("bots.desk.thread.new.header")
                 DSIconButton(
                     "sidebar.right",
                     help: vm.isDeskSidePaneVisible ? "Hide inspector" : "Show inspector"
