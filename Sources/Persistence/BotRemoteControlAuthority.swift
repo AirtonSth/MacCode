@@ -47,6 +47,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onStopGuest: ((BotID) -> Void)?
     public var onRebuildGuest: ((BotID) -> Void)?
     public var onDockerClear: ((BotID) -> Void)?
+    public var onSend: ((BotID, String) throws -> Void)?
 
     private var receipts: [String: [String: Any]] = [:]
     private var unpublished: Set<String> = []
@@ -520,6 +521,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
                 "id": stored.id,
             ])
+        }
+        if let onSend {
+            try onSend(bot.id, text)
         }
         liveRuns[botID] = [
             "bot_id": botID,

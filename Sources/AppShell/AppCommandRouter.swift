@@ -2875,6 +2875,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         created.onDockerClear = { [weak self] id in
             self?.botsViewModel?.computerGuestService?.teardown(botID: id)
         }
+        created.onSend = { [weak self] id, text in
+            guard let vm = self?.botsViewModel else { return }
+            _ = try vm.enqueueHostMessage(
+                botID: id,
+                text: text,
+                conversationID: nil,
+                routing: BotDeskRouting()
+            )
+        }
         pairedBotRemote = created
         return created
     }
