@@ -287,6 +287,23 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertTrue(user.text.contains("verbose English bot instruction"))
         XCTAssertEqual(user.agentMessageID?.value, request.runId.value)
+
+        let cold = BotsViewModel(context: context, router: router)
+        cold.openDesk(bot)
+        cold.selectDeskThread(conversationID)
+        let restored = try XCTUnwrap(cold.deskMessages.first { $0.role == .user })
+        XCTAssertEqual(restored.agentMessageID?.value, request.runId.value)
+        XCTAssertFalse(
+            RCWireProtocol.isWire(restored.text),
+            "cold restore must keep Human bytes, not the provider-bound wire"
+        )
+        XCTAssertFalse(
+            restored.text.contains("You are Piper"),
+            "cold restore must not surface the compiled brain envelope"
+        )
+        let coldWire = try XCTUnwrap(restored.tokenSaverWireRequest)
+        XCTAssertTrue(RCWireProtocol.isWire(coldWire))
+        XCTAssertEqual(coldWire, wireRequest)
     }
 
     func test_deskFooterCalculatorMatchesAgentApp_onIdenticalInputs() {

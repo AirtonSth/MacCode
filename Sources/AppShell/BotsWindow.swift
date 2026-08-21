@@ -6876,35 +6876,37 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    /// Coordinator stores the compiled provider envelope as the user row.
-    /// Desk Human/RCW1 needs the teammate line plus the adopted user-turn wire.
+    /// Create the Human user row (and RCW1 translation) before provider start
+    /// or queue. Coordinator skips append when this id already exists, so a
+    /// later throw or queue drain cannot leave compiled envelope as the
+    /// surviving transcript.
     private func persistDeskTokenSaverUserTranslation(
+        threadID: AgentThreadID,
         runID: AgentRunID,
         humanText: String,
         attachments: [AgentAttachment],
         wireRequest: String
     ) {
-        guard RCWireProtocol.isWire(wireRequest) else { return }
         let messageID = AgentMessageID(runID.value)
         let human = AgentChatTranscriptChrome.displayUserLine(
             text: humanText,
             attachments: attachments
         )
         do {
+            if try context.messageRepo.get(id: messageID) == nil {
+                try context.messageRepo.append(AgentMessage(
+                    id: messageID,
+                    threadId: threadID,
+                    role: .user,
+                    content: human,
+                    attachments: attachments
+                ))
+            }
+            guard RCWireProtocol.isWire(wireRequest) else { return }
             try context.messageRepo.upsertRCW1RequestTranslation(
                 messageId: messageID,
                 wireRequestText: wireRequest
             )
-            guard let stored = try context.messageRepo.get(id: messageID),
-                  stored.role == .user else { return }
-            try context.messageRepo.append(AgentMessage(
-                id: stored.id,
-                threadId: stored.threadId,
-                role: .user,
-                content: human,
-                createdAt: stored.createdAt,
-                attachments: stored.attachments.isEmpty ? attachments : stored.attachments
-            ))
         } catch {
             NSLog("RemoteCode Desk Token Saver RCW1 persist failed: \(error)")
         }
@@ -7526,6 +7528,13 @@ public final class BotsViewModel: ObservableObject {
             if !providers.isEmpty {
                 router.rememberProviderSnapshotsForSend(providers)
             }
+            persistDeskTokenSaverUserTranslation(
+                threadID: prepared.thread.id,
+                runID: prepared.runID,
+                humanText: userText,
+                attachments: attachments,
+                wireRequest: compressedUser
+            )
             beforeBotRunDispatchForTesting?(prepared.runID)
             let result = try await router.sendAgentMessage(
                 thread: prepared.thread.id,
@@ -7544,12 +7553,6 @@ public final class BotsViewModel: ObservableObject {
                 providerInstanceId: routing.providerInstanceID,
                 attachments: attachments,
                 requestedRunID: prepared.runID
-            )
-            persistDeskTokenSaverUserTranslation(
-                runID: prepared.runID,
-                humanText: userText,
-                attachments: attachments,
-                wireRequest: compressedUser
             )
             // Dest persist cannot unstart a live provider turn.
             _ = try? persistWorkingConversation(prepared.conversation)
