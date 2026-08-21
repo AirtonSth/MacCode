@@ -4081,15 +4081,42 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    public func stopLiveRuns(for botID: BotID, force: Bool) {
+    public func stopLiveRuns(for botID: BotID, force: Bool, onSettled: ((Bool) -> Void)? = nil) {
         let rows = (try? botStore.listConversations(botID: botID)) ?? []
-        for conversation in rows {
+        let threadIDs: [AgentThreadID] = rows.compactMap { conversation in
             guard let threadID = conversation.linkedAgentThreadID,
-                  context.coordinator.activeRunId(threadId: threadID) != nil else { continue }
-            if force {
-                isStopping = true
+                  context.coordinator.activeRunId(threadId: threadID) != nil else { return nil }
+            return threadID
+        }
+        guard !threadIDs.isEmpty else {
+            DispatchQueue.main.async { onSettled?(true) }
+            return
+        }
+        if force {
+            isStopping = true
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.context.coordinator.stopAndAwaitTermination(threadIds: threadIDs)
+                    self.isStopping = false
+                    onSettled?(!self.hasLiveRun(botID: botID))
+                } catch {
+                    self.isStopping = false
+                    self.errorMessage = "Force stop: \(error.localizedDescription)"
+                    onSettled?(false)
+                }
             }
-            stopDeskThread(conversation.id)
+            return
+        }
+        for threadID in threadIDs {
+            do {
+                try resolvedRouter()?.stopAgentRun(thread: threadID)
+            } catch {
+                errorMessage = String(describing: error)
+            }
+        }
+        DispatchQueue.main.async { [weak self] in
+            onSettled?(self?.hasLiveRun(botID: botID) == false)
         }
     }
 
@@ -7637,13 +7664,17 @@ public final class BotsViewModel: ObservableObject {
         objectWillChange.send()
     }
 
-    func presentGuestDesktop(botID: BotID) {
-        guard guestLaunchState(for: botID) != .starting else { return }
+    func presentGuestDesktop(botID: BotID, onSettled: ((Bool) -> Void)? = nil) {
+        guard guestLaunchState(for: botID) != .starting else {
+            DispatchQueue.main.async { onSettled?(false) }
+            return
+        }
         guard dockerGuestReadyOverrideForTesting == nil,
               let service = computerGuestService else {
             guestLaunchStateByBot[botID.value] = .failed(
                 BotComputerDockerError.cliMissing.description
             )
+            DispatchQueue.main.async { onSettled?(false) }
             return
         }
         guestLaunchStateByBot[botID.value] = .starting
@@ -7653,6 +7684,7 @@ public final class BotsViewModel: ObservableObject {
                 let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
                 await MainActor.run {
                     self.rememberGuestScreen(url: url, botID: botID, running: true)
+                    onSettled?(true)
                 }
             } catch {
                 await MainActor.run {
@@ -7663,13 +7695,17 @@ public final class BotsViewModel: ObservableObject {
                             ?? BotComputerDockerError.provisioningFailed.description
                     )
                     self.objectWillChange.send()
+                    onSettled?(false)
                 }
             }
         }
     }
 
-    func stopDockerGuest(botID: BotID) {
-        guard let service = computerGuestService else { return }
+    func stopDockerGuest(botID: BotID, onSettled: ((Bool) -> Void)? = nil) {
+        guard let service = computerGuestService else {
+            DispatchQueue.main.async { onSettled?(false) }
+            return
+        }
         Task.detached { [service] in
             do {
                 try service.stop(botID: botID)
@@ -7677,19 +7713,25 @@ public final class BotsViewModel: ObservableObject {
                     self.guestRunningByBot[botID.value] = false
                     self.guestLaunchStateByBot[botID.value] = .idle
                     self.objectWillChange.send()
+                    onSettled?(true)
                 }
             } catch {
                 await MainActor.run {
                     self.errorMessage = "Could not stop the Linux desktop."
+                    onSettled?(false)
                 }
             }
         }
     }
 
-    func rebuildDockerGuest(botID: BotID) {
-        guard !isGuestRebuilding(botID) else { return }
+    func rebuildDockerGuest(botID: BotID, onSettled: ((Bool) -> Void)? = nil) {
+        guard !isGuestRebuilding(botID) else {
+            DispatchQueue.main.async { onSettled?(false) }
+            return
+        }
         guard let service = computerGuestService else {
             errorMessage = "Docker desktop is not ready."
+            DispatchQueue.main.async { onSettled?(false) }
             return
         }
         let wasRunning = isGuestRunning(botID)
@@ -7701,6 +7743,7 @@ public final class BotsViewModel: ObservableObject {
                 await MainActor.run {
                     self.guestRebuildingByBot[botID.value] = false
                     self.rememberGuestScreen(url: url, botID: botID, running: true)
+                    onSettled?(true)
                 }
             } catch {
                 await MainActor.run {
@@ -7708,6 +7751,7 @@ public final class BotsViewModel: ObservableObject {
                     self.errorMessage = wasRunning
                         ? "Could not rebuild the Linux desktop. The current desktop is still running."
                         : "Could not rebuild the Linux desktop."
+                    onSettled?(false)
                 }
             }
         }

@@ -612,7 +612,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "text": "queued",
         ])
         var stopped = false
-        authority.onStopRun = { _, force in
+        authority.onStopRun = { _, force, _ in
             stopped = force
         }
         let uuid = try XCTUnwrap(UUID(uuidString: botID))
@@ -652,5 +652,137 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(readback?["terminal"] as? Bool, true)
         XCTAssertEqual((readback?["drained"] as? [String: Any])?["text"] as? String, "queued")
         XCTAssertEqual(try store.listQueuedFollowUps(botID: BotID(uuid)).count, 0)
+    }
+
+    func test_guestInput_requiresLiveHookAndCompletesWhenHookReturns() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "gin",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        XCTAssertThrowsError(
+            try authority.dispatch(method: "bot.guest.input", params: [
+                "client_request_id": "gin-miss",
+                "bot_id": botID,
+                "text": "hello",
+            ])
+        )
+        var received = ""
+        var hookedRequest = ""
+        authority.onGuestInput = { _, params, requestID in
+            received = params["text"] as? String ?? ""
+            hookedRequest = requestID
+        }
+        let sent = try authority.dispatch(method: "bot.guest.input", params: [
+            "client_request_id": "gin-ok",
+            "bot_id": botID,
+            "text": "hello",
+        ])
+        XCTAssertEqual(received, "hello")
+        XCTAssertEqual(hookedRequest, "gin-ok")
+        XCTAssertEqual(sent["status"] as? String, "accepted")
+        XCTAssertEqual((sent["readback"] as? [String: Any])?["status"] as? String, "running")
+        authority.settle(
+            requestID: "gin-ok",
+            status: .completed,
+            readback: [
+                "bot_id": botID,
+                "status": "running",
+                "viewer": "/vnc.html",
+                "embed_html_is_not_runtime": true,
+            ]
+        )
+        let status = try authority.dispatch(method: "bot.receipt.status", params: [
+            "client_request_id": "gin-ok",
+        ])
+        XCTAssertEqual(status["status"] as? String, "completed")
+    }
+
+    func test_guestStart_acceptedThenSettleBecomesCompleted() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "g-set",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        var requestID = ""
+        authority.onStartGuest = { _, _, id in requestID = id }
+        let started = try authority.dispatch(method: "bot.guest.start", params: [
+            "client_request_id": "g-set-1",
+            "bot_id": botID,
+            "recipe": "pointer",
+        ])
+        XCTAssertEqual(started["status"] as? String, "accepted")
+        XCTAssertEqual(requestID, "g-set-1")
+        authority.settle(
+            requestID: requestID,
+            status: .completed,
+            readback: [
+                "bot_id": botID,
+                "status": "running",
+                "viewer": "/vnc.html",
+                "embed_html_is_not_runtime": true,
+            ]
+        )
+        let status = try authority.dispatch(method: "bot.receipt.status", params: [
+            "client_request_id": "g-set-1",
+        ])
+        XCTAssertEqual(status["status"] as? String, "completed")
+        let guest = try authority.dispatch(method: "bot.guest.state", params: ["bot_id": botID])
+        XCTAssertEqual(guest["status"] as? String, "running")
+    }
+
+    func test_browserOpen_keepsPendingWhenNotifyFails() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "br-fail",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        authority.notifyBrowserPendingOpen = { _ in
+            throw BotRemoteControlAuthority.Error(code: -32087, message: "Bot browser persist failed.")
+        }
+        XCTAssertThrowsError(
+            try authority.dispatch(method: "bot.link.open", params: [
+                "client_request_id": "br-fail-1",
+                "bot_id": botID,
+                "url": "http://127.0.0.1:5000",
+            ])
+        )
+        XCTAssertEqual(
+            try BotBrowserStore(appSupportDirectory: supportDir).loadPendingOpens().map(\.url),
+            ["http://127.0.0.1:5000"]
+        )
+        let failed = try authority.dispatch(method: "bot.receipt.status", params: [
+            "client_request_id": "br-fail-1",
+        ])
+        XCTAssertEqual(failed["status"] as? String, "failed")
+    }
+
+    func test_forceStop_acceptedSettlesToCompleted() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "stop-set",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "stop-set-run",
+            "bot_id": botID,
+            "text": "go",
+        ])
+        var requestID = ""
+        authority.onStopRun = { _, _, id in requestID = id }
+        let stopped = try authority.dispatch(method: "bot.force_stop", params: [
+            "client_request_id": "stop-set-1",
+            "bot_id": botID,
+        ])
+        XCTAssertEqual(stopped["status"] as? String, "accepted")
+        authority.settle(requestID: requestID, status: .completed, readback: [
+            "accepted": true,
+            "force": true,
+            "terminal": true,
+        ])
+        let status = try authority.dispatch(method: "bot.receipt.status", params: [
+            "client_request_id": "stop-set-1",
+        ])
+        XCTAssertEqual(status["status"] as? String, "completed")
     }
 }

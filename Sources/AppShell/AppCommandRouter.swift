@@ -2860,17 +2860,100 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         created.onHasLiveRun = { [weak self] id in
             self?.botsViewModel?.hasLiveRun(botID: id) ?? false
         }
-        created.onStopRun = { [weak self] id, force in
-            self?.botsViewModel?.stopLiveRuns(for: id, force: force)
+        created.onStopRun = { [weak self] id, force, requestID in
+            self?.botsViewModel?.stopLiveRuns(for: id, force: force) { ok in
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: ok,
+                    readback: [
+                        "accepted": true,
+                        "force": force,
+                        "terminal": ok,
+                    ]
+                )
+            }
         }
-        created.onStartGuest = { [weak self] id, _ in
-            self?.botsViewModel?.presentGuestDesktop(botID: id)
+        created.onStartGuest = { [weak self] id, _, requestID in
+            self?.botsViewModel?.presentGuestDesktop(botID: id) { ok in
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: ok,
+                    readback: [
+                        "bot_id": id.value.uuidString.lowercased(),
+                        "status": ok ? "running" : "failed",
+                        "viewer": "/vnc.html",
+                        "embed_html_is_not_runtime": true,
+                    ]
+                )
+            }
         }
-        created.onStopGuest = { [weak self] id in
-            self?.botsViewModel?.stopDockerGuest(botID: id)
+        created.onStopGuest = { [weak self] id, requestID in
+            self?.botsViewModel?.stopDockerGuest(botID: id) { ok in
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: ok,
+                    readback: [
+                        "bot_id": id.value.uuidString.lowercased(),
+                        "status": ok ? "stopped" : "failed",
+                        "viewer": "/vnc.html",
+                        "embed_html_is_not_runtime": true,
+                    ]
+                )
+            }
         }
-        created.onRebuildGuest = { [weak self] id in
-            self?.botsViewModel?.rebuildDockerGuest(botID: id)
+        created.onRebuildGuest = { [weak self] id, requestID in
+            self?.botsViewModel?.rebuildDockerGuest(botID: id) { ok in
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: ok,
+                    readback: [
+                        "bot_id": id.value.uuidString.lowercased(),
+                        "status": ok ? "running" : "failed",
+                        "viewer": "/vnc.html",
+                        "embed_html_is_not_runtime": true,
+                    ]
+                )
+            }
+        }
+        created.onGuestInput = { [weak self] id, params, requestID in
+            guard let service = self?.botsViewModel?.computerGuestService else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32091,
+                    message: "Bot guest input is unavailable."
+                )
+            }
+            let steps = try Self.guestInputSteps(params)
+            Task.detached { [weak self] in
+                do {
+                    try service.act(botID: id, steps: steps)
+                    await MainActor.run {
+                        self?.settlePairedBot(
+                            requestID: requestID,
+                            ok: true,
+                            readback: [
+                                "bot_id": id.value.uuidString.lowercased(),
+                                "status": "running",
+                                "viewer": "/vnc.html",
+                                "embed_html_is_not_runtime": true,
+                            ]
+                        )
+                    }
+                } catch {
+                    await MainActor.run {
+                        self?.settlePairedBot(
+                            requestID: requestID,
+                            ok: false,
+                            readback: [
+                                "bot_id": id.value.uuidString.lowercased(),
+                                "status": "failed",
+                                "error": String(describing: error),
+                                "viewer": "/vnc.html",
+                                "embed_html_is_not_runtime": true,
+                            ]
+                        )
+                    }
+                }
+            }
         }
         created.onDockerClear = { [weak self] id in
             guard let service = self?.botsViewModel?.computerGuestService else {
@@ -2901,10 +2984,49 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         created.notifyBrowserPendingOpen = { [weak self] name in
             DistributedNotificationCenter.default().post(name: name, object: nil)
-            try? self?.reconcileBotBrowserOpens()
+            _ = try self?.reconcileBotBrowserOpens()
         }
         pairedBotRemote = created
         return created
+    }
+
+    /// Settle after `dispatch` returns. `mutate` overwrites in-flight settle,
+    /// and `NSLock` is not recursive.
+    private func settlePairedBot(requestID: String, ok: Bool, readback: [String: Any]) {
+        DispatchQueue.main.async { [weak self] in
+            self?.pairedBotRemote?.settle(
+                requestID: requestID,
+                status: ok ? .completed : .failed,
+                readback: readback
+            )
+        }
+    }
+
+    private static func guestInputSteps(_ params: [String: Any]) throws -> [BotComputerActStep] {
+        if let raw = params["steps"] as? [[String: Any]] {
+            let steps = raw.map { dict in
+                BotComputerActStep(
+                    action: dict["action"] as? String ?? "",
+                    x: dict["x"] as? Int ?? (dict["x"] as? NSNumber)?.intValue,
+                    y: dict["y"] as? Int ?? (dict["y"] as? NSNumber)?.intValue,
+                    text: dict["text"] as? String,
+                    key: dict["key"] as? String
+                )
+            }
+            try BotComputerGuestObserve.assertActStepCount(steps.count)
+            return steps
+        }
+        if let text = params["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return [BotComputerActStep(action: "type", text: text)]
+        }
+        if let key = params["key"] as? String, !key.isEmpty {
+            return [BotComputerActStep(action: "key", key: key)]
+        }
+        if let x = params["x"] as? Int ?? (params["x"] as? NSNumber)?.intValue,
+           let y = params["y"] as? Int ?? (params["y"] as? NSNumber)?.intValue {
+            return [BotComputerActStep(action: "click", x: x, y: y)]
+        }
+        throw BotRemoteControlAuthority.Error.invalidParams
     }
 
     private static func foundationObject(_ params: [String: JSONValue]) -> [String: Any] {
@@ -6620,7 +6742,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let bot = try ctx.botStore.get(id: botID)
         let workspace = bot?.workspaceID ?? ctx.state.workspaces.keys.sorted { $0.value.uuidString < $1.value.uuidString }.first
         guard let workspace, ctx.state.workspaces[workspace] != nil else {
-            return target
+            throw LayoutError.workspaceNotFound
         }
         if let existing = botBrowserSurface(botID: botID, workspace: workspace),
            let browser = SurfaceRegistry.shared.surface(existing.id) as? BrowserSurface {

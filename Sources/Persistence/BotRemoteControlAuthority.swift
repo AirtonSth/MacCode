@@ -46,14 +46,15 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private let browserStore: BotBrowserStore
 
     public var onHasLiveRun: ((BotID) -> Bool)?
-    public var onStopRun: ((BotID, Bool) -> Void)?
-    public var onStartGuest: ((BotID, String) -> Void)?
-    public var onStopGuest: ((BotID) -> Void)?
-    public var onRebuildGuest: ((BotID) -> Void)?
+    public var onStopRun: ((BotID, Bool, String) -> Void)?
+    public var onStartGuest: ((BotID, String, String) -> Void)?
+    public var onStopGuest: ((BotID, String) -> Void)?
+    public var onRebuildGuest: ((BotID, String) -> Void)?
+    public var onGuestInput: ((BotID, [String: Any], String) throws -> Void)?
     public var onDockerClear: ((BotID) throws -> Void)?
     public var onSend: ((BotID, String) throws -> Void)?
     public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
-    public var notifyBrowserPendingOpen: ((Notification.Name) -> Void)?
+    public var notifyBrowserPendingOpen: ((Notification.Name) throws -> Void)?
 
     private var receipts: [String: [String: Any]] = [:]
     private var unpublished: Set<String> = []
@@ -78,6 +79,24 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         self.browserStore = BotBrowserStore(appSupportDirectory: appSupportDirectory)
         loadSidecar()
         migrateSidecarQueueIfNeeded()
+    }
+
+    /// Upgrade an `accepted` receipt after `dispatch` returns. In-hook settle is
+    /// overwritten by `mutate`, and `NSLock` is not recursive.
+    public func settle(requestID: String, status: Status, readback: [String: Any]? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var existing = receipts[requestID],
+              (existing["status"] as? String) == Status.accepted.rawValue else { return }
+        existing["status"] = status.rawValue
+        if let readback {
+            existing["readback"] = readback
+            if let botID = existing["bot_id"] as? String, readback["viewer"] != nil {
+                guest[botID] = readback
+            }
+        }
+        receipts[requestID] = existing
+        persistSidecar()
     }
 
     public func dispatch(method: String, params: [String: Any], now: Date = Date()) throws -> [String: Any] {
@@ -561,7 +580,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let hadLive = onHasLiveRun?(bot.id) ?? (liveRuns[botID] != nil)
         let run = liveRuns[botID]
         let liveStop = onStopRun != nil
-        onStopRun?(bot.id, force)
+        onStopRun?(bot.id, force, requestID)
         liveRuns[botID] = nil
         var drained: [String: Any]?
         if !liveStop, let next = try store.dequeueQueuedFollowUp(botID: bot.id) {
@@ -786,8 +805,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 botID: bot.id,
                 url: url,
                 title: title.isEmpty ? nil : title,
-                notify: notifyBrowserPendingOpen ?? { name in
-                    DistributedNotificationCenter.default().post(name: name, object: nil)
+                notify: { name in
+                    if let notifyBrowserPendingOpen {
+                        try notifyBrowserPendingOpen(name)
+                    } else {
+                        DistributedNotificationCenter.default().post(name: name, object: nil)
+                    }
                 }
             )
         } catch {
@@ -821,20 +844,26 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let receiptStatus: Status
         switch name {
         case "guest.start":
-            onStartGuest?(bot.id, recipe)
+            onStartGuest?(bot.id, recipe, requestID)
             status = "starting"
             receiptStatus = .accepted
         case "guest.rebuild":
-            onRebuildGuest?(bot.id)
+            onRebuildGuest?(bot.id, requestID)
             status = "starting"
             receiptStatus = .accepted
         case "guest.stop":
-            onStopGuest?(bot.id)
+            onStopGuest?(bot.id, requestID)
             status = "stopping"
             receiptStatus = .accepted
-        default:
-            status = "input"
+        case "guest.input":
+            guard let onGuestInput else {
+                throw Error(code: -32091, message: "Bot guest input is unavailable.")
+            }
+            try onGuestInput(bot.id, params, requestID)
+            status = "running"
             receiptStatus = .accepted
+        default:
+            throw Error.invalidParams
         }
         let state: [String: Any] = [
             "bot_id": botID,
