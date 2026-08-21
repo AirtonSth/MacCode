@@ -62,7 +62,10 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                 prompt.contains("non-GUI") || prompt.contains("GUI"),
                 "\(provider) must exempt GUI from | distill"
             )
-            XCTAssertTrue(prompt.contains("NEVER pipe"), "\(provider) exact-output still forbidden")
+            XCTAssertTrue(
+                prompt.contains("NEVER auto-distill raw exact-output"),
+                "\(provider) exact-output still forbidden"
+            )
             XCTAssertTrue(prompt.contains(AgentSkillInstaller.rcWireAgentInstructionsTemplate),
                           "every Token Saver session must trust RCW1 before a later encoded follow-up arrives")
             assertWireResponseProfitabilityContract(prompt, context: "\(provider) primary")

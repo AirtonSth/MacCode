@@ -1027,11 +1027,10 @@ public struct LocalDistillRuntime: DistillRuntime {
         let parsed = splitLegacyCommandPayload(request.input)
         let source = strippingANSIControlSequences(parsed.output)
         guard JSONCrusher.looksLikeJSON(source),
-              let routed = contentRouter.route(source, options: routerOptions(for: request)),
-              routed.contentType == .json else {
+              let minified = JSONCrusher.minify(source) else {
             return nil
         }
-        return boundedCommandOutput(routed.output, maxOutputCharacters: request.maxOutputCharacters)
+        return boundedCommandOutput(minified, maxOutputCharacters: request.maxOutputCharacters)
     }
 
     private static let ansiCSIRegex = try! NSRegularExpression(
