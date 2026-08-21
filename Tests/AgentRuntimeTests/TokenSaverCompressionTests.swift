@@ -1831,13 +1831,13 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertEqual(translation.rewrittenText, rendered)
     }
 
-    func test_finalAssistantHandleMarkerIsStrippedBeforePersistenceAndTurnCompletedDisplay() async throws {
+    func test_finalAssistantMarkersAreStrippedBeforePersistenceAndTurnCompletedDisplay() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-ts-final-handle-strip-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
-        let final = "Build passed. Full raw output available.\n[[rc:deadbeef]]"
+        let final = "Build passed. Full raw output available.\n[[rc:deadbeef]]\n\(DistillAppliedReceipt.makeMarker())"
         let runner = ScriptedFinalRunner(provider: .codex, finalMessage: final)
         let thread = AgentThread(title: "final handle", provider: .codex, model: "fake-model")
         try threadRepo.upsert(thread)
@@ -1858,8 +1858,9 @@ final class TokenSaverCompressionTests: XCTestCase {
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 
         XCTAssertEqual(assistant.content, "Build passed. Full raw output available.",
-                       "final assistant persistence must strip retrieve handles so transcript text stays human-facing")
+                       "final assistant persistence must strip recovery and applied markers so transcript text stays human-facing")
         XCTAssertFalse(assistant.content.contains("[[rc:"))
+        XCTAssertFalse(assistant.content.contains("[[rcd:"))
         let turnCompleted = observer.recordedEvents.compactMap(\.turnCompletedFinalMessageForTest).last
         XCTAssertEqual(turnCompleted, assistant.content,
                        "turnCompleted display payload must match the sanitized persisted assistant text")

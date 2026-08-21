@@ -340,7 +340,7 @@ public enum CommandWrapPolicy {
     /// A command's whole output is being replaced, so a degenerate "compression" must never
     /// reach the agent. The distill model can answer as a question and return a tiny token
     /// (e.g. "NONE"/"PASS"); the deterministic router can't, but the model lane can. Reject any
-    /// compressed result whose content (excluding the `[[rc:<handle>]]` recovery marker) is
+    /// compressed result whose content (excluding trailing recovery and applied markers) is
     /// implausibly small for output that cleared the compress threshold — the caller then emits
     /// the raw bytes instead. An absolute floor (not a ratio) so a legitimately huge win on
     /// highly-repetitive output is still accepted.
@@ -356,14 +356,15 @@ public enum CommandWrapPolicy {
         pattern: #"\n?\[\[rc:[^\]]*\]\]\s*$"#
     )
 
-    /// Byte length of the compressed content with a trailing `[[rc:<handle>]]` marker line and
-    /// surrounding whitespace removed, so the faithfulness floor measures real content — not the
-    /// ~70-byte recovery handle that would otherwise let a "NONE" token slip past the floor.
+    /// Byte length of the compressed content with trailing applied-receipt and
+    /// `[[rc:<handle>]]` recovery lines removed, so the faithfulness floor measures real
+    /// content — not protocol metadata that would let a "NONE" token slip past the floor.
     public static func compressedContentByteCount(_ emitted: String) -> Int {
-        let ns = emitted as NSString
+        let withoutReceipt = DistillAppliedReceipt.strip(emitted)
+        let ns = withoutReceipt as NSString
         let full = NSRange(location: 0, length: ns.length)
         let withoutHandle = trailingRecoveryHandleRegex.stringByReplacingMatches(
-            in: emitted,
+            in: withoutReceipt,
             options: [],
             range: full,
             withTemplate: ""

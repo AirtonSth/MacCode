@@ -9,7 +9,8 @@ import CoreModel
 /// This never loses data: in compress mode, on ANY failure (no state, transport error,
 /// non-200, empty output) it writes the buffered raw stdin verbatim to stdout and exits 0.
 /// On success it emits the compressed output, plus a `[[rc:<handle>]]` marker when the
-/// sidecar stored the original (so the agent can recover it via `distill retrieve`).
+/// sidecar stored the original (so the agent can recover it via `distill retrieve`), and
+/// a trailing applied receipt only when the complete emitted UTF-8 payload is a net shrink.
 ///
 /// Transport is injected so the logic is unit-testable without a network; the executable
 /// wires a real URLSession transport.
@@ -391,14 +392,14 @@ public struct ManagedDistillCLI: Sendable {
         let nestedResult = await nested.runResult()
         guard nestedResult.exitCode == 0 else { return emptyOK }
 
-        // Compress always appends a trailing newline on success; fail-open echoes stdin
-        // (which may also end in \n). Strip trailing newlines on BOTH sides before
-        // deciding whether a real shrink happened — otherwise fail-open looks shorter.
+        // A nested successful compression carries its own trailing receipt. Preserve it
+        // in updatedToolOutput; fail-open returns the exact raw bytes with no receipt.
+        let nestedInput = Data(rawOutput.utf8)
         let compressed = Self.stripTrailingNewlines(String(decoding: nestedResult.stdout, as: UTF8.self))
-        let rawNormalized = Self.stripTrailingNewlines(rawOutput)
         guard !compressed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              compressed != rawNormalized,
-              compressed.utf8.count < rawNormalized.utf8.count else {
+              nestedResult.stdout != nestedInput,
+              DistillAppliedReceipt.containsMarker(compressed),
+              compressed.utf8.count < rawOutput.utf8.count else {
             return emptyOK
         }
 
@@ -530,6 +531,17 @@ public struct ManagedDistillCLI: Sendable {
 
     // MARK: - compress (fail-open)
 
+    /// Appends the host receipt at the final emission boundary. Recovery markers are
+    /// already part of `transformed`, so the byte comparison includes every protocol
+    /// line the provider will see. Returning nil means exact fail-open to `original`.
+    private static func receiptedCompression(original: Data, transformed: String) -> Data? {
+        guard Data(transformed.utf8) != original else { return nil }
+        let separator = transformed.hasSuffix("\n") ? "" : "\n"
+        let emitted = Data((transformed + separator + DistillAppliedReceipt.makeMarker() + "\n").utf8)
+        guard emitted.count < original.count else { return nil }
+        return emitted
+    }
+
     private func compress(prompt: String) async -> RunResult {
         // Fail-open: hand back exactly what was piped in. exit 0 so the agent never
         // sees an error in place of its tool output.
@@ -547,6 +559,12 @@ public struct ManagedDistillCLI: Sendable {
         if tokenSaverHintOn,
            let pre = TokenSaverWaveLosslessPrepass.apply(input: input, toolHint: prompt) {
             guard distillAdmission() else { return failOpen() }
+            guard let compressed = Self.receiptedCompression(
+                original: stdin,
+                transformed: pre.output
+            ) else {
+                return failOpen()
+            }
             FileHandle.standardError.write(Data(
                 "rc-wave-prepass wave=\(pre.waveID) trigger=\(pre.trigger) saved_bytes=\(pre.savedBytes) frac=\(String(format: "%.3f", pre.savedFraction))\n".utf8
             ))
@@ -554,7 +572,6 @@ public struct ManagedDistillCLI: Sendable {
             // via the same /v1/distill recordSavings path the normal compress path
             // uses — never a gate. Exactly one POST; we do not fall through to
             // normal compress (no double-count).
-            let compressed = Data((pre.output + "\n").utf8)
             let recordOriginal = input
             let recordPrompt = prompt
             let recordPre = pre
@@ -610,7 +627,10 @@ public struct ManagedDistillCLI: Sendable {
         if let handle = response.originalHandle, !handle.isEmpty {
             out += "\n[[rc:\(handle)]]"
         }
-        return RunResult(stdout: Data((out + "\n").utf8), exitCode: 0)
+        guard let emitted = Self.receiptedCompression(original: stdin, transformed: out) else {
+            return failOpen()
+        }
+        return RunResult(stdout: emitted, exitCode: 0)
     }
 
     /// Fire one `/v1/distill` POST with `recordSavings: true` and client-supplied
@@ -741,7 +761,13 @@ public struct ManagedDistillCLI: Sendable {
             }
             emitted.append(out)
         }
-        return (Data((emitted.joined(separator: "\n\n") + "\n").utf8), 0)
+        guard let output = Self.receiptedCompression(
+            original: stdin,
+            transformed: emitted.joined(separator: "\n\n")
+        ) else {
+            return failOpen()
+        }
+        return (output, 0)
     }
 
     static func utf8Chunks(_ input: String, maxBytes: Int) -> [String] {

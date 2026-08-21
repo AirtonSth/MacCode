@@ -317,6 +317,33 @@ final class CommandWrapPolicyTests: XCTestCase {
         XCTAssertTrue(CommandWrapPolicy.isFaithfulCompression(rawByteCount: 10, compressedContentByteCount: 10))
     }
 
+    func test_faithfulnessContentCount_excludesRecoveryAndAppliedReceiptLines() {
+        // WHY: protocol markers can exceed the 24-byte floor by themselves. Only
+        // substantive compressed content may make a wrapped replacement faithful.
+        let receipt = DistillAppliedReceipt.makeMarker()
+        let recovery = "[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"
+        let content = "NONE"
+        let lossyEmitted = "\(content)\n\(recovery)\n\(receipt)\n"
+        let losslessEmitted = "\(content)\n\(receipt)\n"
+
+        XCTAssertEqual(CommandWrapPolicy.compressedContentByteCount(lossyEmitted), content.utf8.count)
+        XCTAssertEqual(CommandWrapPolicy.compressedContentByteCount(losslessEmitted), content.utf8.count)
+        XCTAssertFalse(
+            CommandWrapPolicy.isFaithfulCompression(
+                rawByteCount: 7_000,
+                compressedContentByteCount: CommandWrapPolicy.compressedContentByteCount(lossyEmitted)
+            ),
+            "recovery and applied receipt bytes must not rescue a degenerate body"
+        )
+
+        let markerInBody = "quoted \(receipt) text\nreal content"
+        XCTAssertEqual(
+            CommandWrapPolicy.compressedContentByteCount(markerInBody),
+            markerInBody.utf8.count,
+            "a non-trailing marker is user content, not a receipt"
+        )
+    }
+
     func test_wrappedCommandCatalog_includesEndorsedForcedWrapCategories() {
         // One representative per newly-endorsed category (package managers, build tools,
         // test runners, linters, containers/IaC, HTTP/cloud, python) must be forced-wrapped.

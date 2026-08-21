@@ -2,7 +2,7 @@ import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import * as claudeSDK from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { execFile, execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -66,6 +66,10 @@ const TOKEN_SAVER_MIN_LINES = 10;
 const TOKEN_SAVER_STORE_MIN_BYTES = 2048;
 // Nested large Read/Grep + sidecar RTT; 1s caused silent fail-open / zero model-mode.
 const TOKEN_SAVER_HOOK_TIMEOUT_MS = 45000;
+
+function tokenSaverAppliedReceipt() {
+  return `[[rcd:v1.${randomBytes(16).toString('base64url')}]]`;
+}
 // Edit echoes + Skill bodies stay full (verbatim edits / complete skills).
 // Read/Grep are compressed with reversible [[rc:handle]] so large exploration
 // reaches the ledger (previously excluded → near-zero PTU savings on advisors).
@@ -412,6 +416,9 @@ async function postTokenSaverDistill(state, body) {
     if (!response.ok) return null;
     const decoded = await response.json();
     if (typeof decoded.output !== 'string') return null;
+    const input = body && typeof body.input === 'string' ? body.input : '';
+    const routeStage = decoded.routeStage ?? decoded.route_stage;
+    if (!input || routeStage === 'verbatim' || decoded.output === input) return null;
     // Preserve store-before-loss recoverability: the agent must see [[rc:handle]]
     // when the sidecar stored the original (AGENTS.md).
     let output = decoded.output;
@@ -419,16 +426,13 @@ async function postTokenSaverDistill(state, body) {
       || (typeof decoded.original_handle === 'string' && decoded.original_handle.trim())
       || '';
     if (handle && !output.includes(`[[rc:${handle}]]`)) {
-      // Append only when the marker-inclusive payload is still a net shrink.
-      // Otherwise return null so the hook fails open without replacing tool output
-      // (and without leaving the agent on a lossy body it never chose).
-      const withMarker = `${output}\n[[rc:${handle}]]`;
-      if (withMarker.length >= (body && body.input ? String(body.input).length : withMarker.length + 1)) {
-        return null;
-      }
-      output = withMarker;
+      output = `${output}\n[[rc:${handle}]]`;
     }
-    return output;
+    // A distinct applied receipt drives the persisted Distilled badge. Command
+    // syntax is not proof: an explicit pipe can fail open and return raw bytes.
+    const withReceipt = `${output}\n${tokenSaverAppliedReceipt()}`;
+    if (Buffer.byteLength(withReceipt, 'utf8') >= Buffer.byteLength(input, 'utf8')) return null;
+    return withReceipt;
   } catch (_) {
     return null;
   } finally {
@@ -464,7 +468,7 @@ async function tokenSaverPostToolUse(input) {
     cacheState: 'tool_output_hooked',
     reversibleStoreMinBytes: TOKEN_SAVER_STORE_MIN_BYTES,
   });
-  if (!output || output.length >= rawOutput.length) return {};
+  if (!output || Buffer.byteLength(output, 'utf8') >= Buffer.byteLength(rawOutput, 'utf8')) return {};
   const replaced = replaceToolOutputText(input.tool_response, output);
   // SDK: updatedToolOutput works for built-in tools; updatedMCPToolOutput is
   // MCP-only. Set both so eligible non-Bash output is replaced in either lane.

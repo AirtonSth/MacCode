@@ -5656,12 +5656,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     private func sanitizeFinalAssistantText(_ text: String) -> String {
         // Shared provider-agnostic choke point for final assistant text: strip
-        // leaked model control tokens (e.g. Grok `<|eos|>`), then unresolved CCR
-        // handles, then raw tool-invocation markup (leaving the uncalled-tool
-        // incomplete-turn signal). Covers claude / codex / grok.
+        // leaked model control tokens (e.g. Grok `<|eos|>`), applied Distill
+        // receipts, unresolved CCR handles, then raw tool-invocation markup
+        // (leaving the uncalled-tool incomplete-turn signal). Covers claude /
+        // codex / grok.
         AssistantToolMarkupSanitizer.sanitize(
             RetrieveHandleSanitizer.strip(
-                ProviderControlTokenSanitizer.strip(text)
+                DistillAppliedReceipt.strip(
+                    ProviderControlTokenSanitizer.strip(text)
+                )
             )
         )
     }

@@ -11,6 +11,9 @@ public enum RetrieveHandleSanitizer {
     private static let handleRegex = try! NSRegularExpression(
         pattern: #"\[\[rc:(?:[0-9a-fA-F]+|"# + compactScopedCapability + #"|"# + legacyScopedCapability + #")\]\]"#
     )
+    private static let scopedHandleRegex = try! NSRegularExpression(
+        pattern: #"\[\[rc:(?:"# + compactScopedCapability + #"|"# + legacyScopedCapability + #")\]\]"#
+    )
     private static let trailingSpacesBeforeNewlineRegex = try! NSRegularExpression(
         pattern: #"[ \t]+\n"#
     )
@@ -32,6 +35,11 @@ public enum RetrieveHandleSanitizer {
     public static func containsHandle(_ text: String) -> Bool {
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return handleRegex.firstMatch(in: text, options: [], range: range) != nil
+    }
+
+    public static func containsScopedHandle(_ text: String) -> Bool {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return scopedHandleRegex.firstMatch(in: text, options: [], range: range) != nil
     }
 
     private static func tidyWhitespace(_ text: String) -> String {

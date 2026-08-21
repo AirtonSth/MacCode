@@ -2062,6 +2062,89 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(json["webMCPUpdated"] as? String, "DISTILLED_NON_BASH")
     }
 
+    func test_agentSDKBridgePostToolUse_appliesReceiptOnlyForNetShrink() throws {
+        let node = try XCTUnwrap(
+            ProcessLocator.resolve("node"),
+            "node is required for the bridge receipt contract test"
+        )
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+
+        // WHY: command syntax cannot prove that Distill actually replaced bytes.
+        // Exercise the bridge's direct sidecar lane so only a real, marker-inclusive
+        // UTF-8 shrink emits the receipt that drives the persisted UI badge.
+        let harness = #"""
+        import { readFileSync } from 'fs';
+        import { Buffer } from 'buffer';
+        const src = readFileSync(process.argv[2], 'utf8');
+        const start = src.indexOf('function tokenSaverAppliedReceipt');
+        const end = src.indexOf('async function tokenSaverPostToolUse');
+        if (start < 0 || end < 0) throw new Error('bridge receipt slice not found');
+        let decoded = {};
+        const factory = new Function(
+          'current',
+          'fetch',
+          'randomUUID',
+          'randomBytes',
+          'TOKEN_SAVER_HOOK_TIMEOUT_MS',
+          src.slice(start, end) + '\nreturn postTokenSaverDistill;'
+        );
+        const post = factory(
+          { env: { REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
+          async () => ({ ok: true, json: async () => decoded }),
+          () => '123e4567-e89b-12d3-a456-426614174000',
+          () => Buffer.alloc(16, 0xaa),
+          100
+        );
+        const state = { baseURL: 'http://127.0.0.1', authToken: 'tok' };
+        const largeInput = 'é'.repeat(120);
+
+        decoded = { output: 'COMPRESSED', routeStage: 'deterministic' };
+        const lossless = await post(state, { id: 'one', input: largeInput });
+        decoded = {
+          output: 'LOSSY',
+          originalHandle: 'rcv1.ABCDEFGHIJKLMNOPQRSTUV',
+          routeStage: 'model'
+        };
+        const lossy = await post(state, { id: 'two', input: largeInput });
+        decoded = { output: largeInput, routeStage: 'deterministic' };
+        const unchanged = await post(state, { id: 'three', input: largeInput });
+        decoded = { output: 'short', routeStage: 'verbatim' };
+        const verbatim = await post(state, { id: 'four', input: largeInput });
+        decoded = { output: 'x', routeStage: 'deterministic' };
+        const noNetShrink = await post(state, { id: 'five', input: 'tiny' });
+
+        console.log(JSON.stringify({ lossless, lossy, unchanged, verbatim, noNetShrink }));
+        """#
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-sdk-distill-receipt-\(UUID().uuidString).mjs")
+        try harness.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [tmp.path, bridge.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
+        let data = try XCTUnwrap(out.data(using: .utf8))
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let receipt = #"\[\[rcd:v1\.[A-Za-z0-9_-]{22}\]\]$"#
+        XCTAssertNotNil((json["lossless"] as? String)?.range(of: receipt, options: .regularExpression))
+        XCTAssertTrue((json["lossy"] as? String)?.contains("[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]") == true)
+        XCTAssertNotNil((json["lossy"] as? String)?.range(of: receipt, options: .regularExpression))
+        XCTAssertTrue(json["unchanged"] is NSNull)
+        XCTAssertTrue(json["verbatim"] is NSNull)
+        XCTAssertTrue(json["noNetShrink"] is NSNull)
+    }
+
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {
         guard let node = ProcessLocator.resolve("node") else {
             throw XCTSkip("node not available")

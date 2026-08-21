@@ -9089,7 +9089,6 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         pattern: #"(?::\s*|\s+)call-[0-9a-f-]{8,}\s*$"#,
         options: [.caseInsensitive]
     )
-    private static let distillPipePresentRegex = try! NSRegularExpression(pattern: #"\|\s*distill\b"#)
     private static let distillPipeWithStderrRegex = try! NSRegularExpression(
         pattern: #"\s*2>&1\s*\|\s*distill\b[\s\S]*$"#
     )
@@ -9253,16 +9252,12 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return showsLiveToolElapsed(for: item)
     }
 
-    /// Token Saver ran for this tool (display chip only). Explicit pipes are visible
-    /// in the command; transparent PATH interception is proven by its scoped recovery
-    /// receipt in the delivered output.
+    /// Token Saver ran for this tool (display chip only). A valid applied receipt is
+    /// authoritative; strict recovery handles remain a fallback for persisted legacy output.
     static func toolCommandWasDistilled(for item: AssistantItem) -> Bool {
-        if let raw = rawShellCommand(for: item) ?? toolCommandPreview(for: item),
-           firstMatchRange(distillPipePresentRegex, in: raw) != nil {
-            return true
-        }
         guard let detail = detailText(for: item) else { return false }
-        return RetrieveHandleSanitizer.containsHandle(detail)
+        return DistillAppliedReceipt.containsMarker(detail)
+            || RetrieveHandleSanitizer.containsScopedHandle(detail)
     }
 
     /// Compact elapsed label (`12s`, `1m 53s`) from start→end timestamps.
@@ -9550,7 +9545,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     /// count — an exact grapheme delta would need the O(n) walk this avoids — so
     /// the marker reports a size, not a character count.
     static func cappedDetail(_ text: String, limit: Int = 6_000, for item: AssistantItem? = nil) -> String {
-        let clean = stripANSI(text)
+        let clean = DistillAppliedReceipt.strip(stripANSI(text))
         if let item, isSkillToolItem(item) {
             return clean
         }
