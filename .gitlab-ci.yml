@@ -2,6 +2,7 @@ stages:
   - lint
   - test
   - package
+  - attest
   - release
 
 workflow:
@@ -89,6 +90,7 @@ lint_scripts:
         echo "PkgInfo must be printf'd (8 bytes), not heredoc'd (9 bytes)" >&2
         exit 1
       fi
+    - scripts/test-stable-release-guards.sh
 
 claude_agent_sdk_advisory:
   extends: .macos_medium
@@ -250,21 +252,57 @@ package_bundle_check:
     - RC2_CONFIG=debug bash scripts/package-app.sh
     - bash scripts/check-app-bundle.sh dist/RemoteCode.app
     - plutil -lint dist/RemoteCode.app/Contents/Info.plist
-    # Launch smoke (non-gating: runner GUI-session availability is not
-    # guaranteed): catches launch-abort regressions the structural checks
-    # cannot see. Loud in the log; run gating locally before a release tag.
-    - bash scripts/orchestrate-launch-smoke.sh dist/RemoteCode.app || echo "[smoke] WARNING - launch smoke failed; investigate before tagging a release"
+    # A package that cannot launch is not releasable. The smoke helper owns its
+    # GUI-session diagnosis and fails loudly when the runner cannot prove launch.
+    - bash scripts/orchestrate-launch-smoke.sh dist/RemoteCode.app
+
+release_validation_receipt:
+  extends: .macos_medium
+  stage: attest
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1" && $CI_COMMIT_BRANCH == "production"'
+  script:
+    - test "$RUN_ALL_MACOS_CI" = "1"
+    - test "$CI_COMMIT_BRANCH" = "production"
+    - |
+      jq -n -S \
+        --arg sha "$CI_COMMIT_SHA" \
+        --arg ref "$CI_COMMIT_REF_NAME" \
+        --arg pipeline_id "$CI_PIPELINE_ID" \
+        --arg job_id "$CI_JOB_ID" \
+        '{
+          schema_version: 1,
+          commit_sha: $sha,
+          ref: $ref,
+          pipeline_id: ($pipeline_id | tonumber),
+          validation_job_id: ($job_id | tonumber),
+          run_all_macos_ci: "1",
+          prior_stages_status: "success",
+          required_jobs: [
+            {id: "lint_scripts", status: "PASS"},
+            {id: "pr_unit_tests", status: "PASS"},
+            {id: "package_bundle_check", status: "PASS"}
+          ]
+        }' > release-validation-receipt.json
+      jq -e '.prior_stages_status == "success"' release-validation-receipt.json >/dev/null
+  artifacts:
+    when: on_success
+    expire_in: 1 week
+    paths:
+      - release-validation-receipt.json
 
 stable_macos_arm64_dmg:
   extends: .macos_large
   stage: release
   timeout: 120m
+  resource_group: stable-macos-release
   id_tokens:
     GITLAB_OIDC_TOKEN:
       aud: sts.amazonaws.com
   rules:
-    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
-    - if: '$RELEASE_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+    # A bare tag never publishes. The controller explicitly starts this job on
+    # the tag with an exact-SHA validation pipeline and acceptance manifest.
+    - if: '$RELEASE_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $RC2_VALIDATED_PIPELINE_ID =~ /^[0-9]+$/ && $RC2_VALIDATED_JOB_ID =~ /^[0-9]+$/ && $RC2_ACCEPTANCE_MANIFEST_SHA256 =~ /^[0-9a-f]{64}$/ && $RC2_ACCEPTANCE_MANIFEST_BASE64'
   script:
     - |
       set -euo pipefail
@@ -293,6 +331,8 @@ stable_macos_arm64_dmg:
       command -v aws >/dev/null || brew install awscli
       command -v jq >/dev/null || brew install jq
 
+      scripts/release-preflight.sh
+
       if [ -z "$CODESIGN_P12_BASE64" ] || [ -z "$CODESIGN_P12_PASSWORD" ]; then
         echo "Missing Developer ID certificate variables"
         exit 1
@@ -318,12 +358,43 @@ stable_macos_arm64_dmg:
       KEYCHAIN="$TEMP_DIR/remotecode-signing.keychain-db"
       CERTIFICATE="$TEMP_DIR/developer-id.p12"
       ORIGINAL_USER_KEYCHAINS="$TEMP_DIR/original-user-keychains.txt"
+      # shellcheck source=scripts/release-publication-guard.sh
+      source scripts/release-publication-guard.sh
+      RELEASE_API="$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
+      export RC2_RELEASE_BACKUP_DIR="$TEMP_DIR/mutable-publication-backup"
+      export RC2_RELEASE_S3_BUCKET="$S3_BUCKET"
+      export RC2_RELEASE_LATEST_KEY="$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME"
+      export RC2_RELEASE_APPCAST_KEY="$S3_DOWNLOAD_PREFIX/appcast.xml"
+      export RC2_RELEASE_CLOUDFRONT_DISTRIBUTION_ID="$CLOUDFRONT_DISTRIBUTION_ID"
+      export RC2_RELEASE_API="$RELEASE_API"
+      export RC2_RELEASE_TAG="$TAG"
+      export RC2_RELEASE_JOB_TOKEN="$CI_JOB_TOKEN"
+      export RC2_RELEASE_OWNERSHIP_TOKEN="${CI_PIPELINE_ID}-${CI_JOB_ID}-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+      EXISTING_RELEASE_RESPONSE="$TEMP_DIR/existing-release.json"
+      EXISTING_RELEASE_CODE="$(curl --silent --show-error \
+        --output "$EXISTING_RELEASE_RESPONSE" \
+        --write-out "%{http_code}" \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        "$RELEASE_API/$TAG")"
+      if [ "$EXISTING_RELEASE_CODE" != "404" ]; then
+        echo "Expected no existing GitLab release for $TAG; HTTP $EXISTING_RELEASE_CODE" >&2
+        cat "$EXISTING_RELEASE_RESPONSE" >&2 || true
+        exit 1
+      fi
+
       security list-keychains -d user \
         | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' \
         > "$ORIGINAL_USER_KEYCHAINS"
       MOUNT=""
-      cleanup_release_keychain() {
+      cleanup_release() {
+        local exit_code="$1"
+        trap - EXIT
         set +e
+        if ! rc2_release_guard_rollback; then
+          echo "release guard: rollback did not complete" >&2
+          exit_code=1
+        fi
         if [ -n "$MOUNT" ] && [ -d "$MOUNT" ]; then
           hdiutil detach "$MOUNT" >/dev/null 2>&1 || true
           rmdir "$MOUNT" >/dev/null 2>&1 || true
@@ -339,8 +410,9 @@ stable_macos_arm64_dmg:
         fi
         security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
         rm -rf "$TEMP_DIR"
+        exit "$exit_code"
       }
-      trap cleanup_release_keychain EXIT
+      trap 'cleanup_release "$?"' EXIT
 
       printf '%s' "$CODESIGN_P12_BASE64" | base64 --decode > "$CERTIFICATE"
       security create-keychain -p "$TEMP_DIR" "$KEYCHAIN"
@@ -420,6 +492,7 @@ stable_macos_arm64_dmg:
       hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "dist/$ASSET_NAME"
       codesign --verify --deep --strict --verbose=4 "$MOUNT/RemoteCode.app"
       spctl --assess --type execute --verbose=4 "$MOUNT/RemoteCode.app"
+      bash scripts/orchestrate-launch-smoke.sh "$MOUNT/RemoteCode.app"
       hdiutil detach "$MOUNT"
       rmdir "$MOUNT"
       MOUNT=""
@@ -439,6 +512,10 @@ stable_macos_arm64_dmg:
       aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/$TAG/$ASSET_NAME" \
         --content-type "application/x-apple-diskimage" \
         --cache-control "public, max-age=31536000, immutable"
+
+      rc2_release_guard_capture
+      rc2_release_guard_begin_mutation
+
       aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME" \
         --content-type "application/x-apple-diskimage" \
         --cache-control "no-cache, max-age=0"
@@ -486,7 +563,9 @@ stable_macos_arm64_dmg:
         --arg tag "$TAG" \
         --arg ref "$TAG" \
         --arg name "RemoteCode $VERSION" \
-        --arg description "RemoteCode macOS $VERSION" \
+        --arg description "RemoteCode macOS $VERSION
+
+$(rc2_release_guard_ownership_marker)" \
         --arg dmg_name "$ASSET_NAME" \
         --arg dmg_url "$S3_DOWNLOAD_BASE_URL/$TAG/$ASSET_NAME" \
         --arg appcast_url "$S3_DOWNLOAD_BASE_URL/appcast.xml" \
@@ -502,23 +581,46 @@ stable_macos_arm64_dmg:
             ]
           }
         }')"
-      RELEASE_API="$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
-      RELEASE_CODE="$(curl --silent --show-error --output /tmp/gitlab-release-response.json --write-out "%{http_code}" \
-        --request POST \
-        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
-        --header "Content-Type: application/json" \
-        --data "$RELEASE_PAYLOAD" \
-        "$RELEASE_API")"
-      if [ "$RELEASE_CODE" = "409" ]; then
-        RELEASE_CODE="$(curl --silent --show-error --output /tmp/gitlab-release-response.json --write-out "%{http_code}" \
-          --request PUT \
+      RELEASE_RESPONSE="$TEMP_DIR/gitlab-release-response.json"
+      RELEASE_CODE=""
+      RELEASE_REQUEST_SUCCEEDED=0
+      if RELEASE_CODE="$(curl --silent --show-error --output "$RELEASE_RESPONSE" --write-out "%{http_code}" \
+          --request POST \
           --header "JOB-TOKEN: $CI_JOB_TOKEN" \
           --header "Content-Type: application/json" \
           --data "$RELEASE_PAYLOAD" \
-          "$RELEASE_API/$TAG")"
+          "$RELEASE_API")"
+      then
+        RELEASE_REQUEST_SUCCEEDED=1
       fi
-      if [ "$RELEASE_CODE" != "200" ] && [ "$RELEASE_CODE" != "201" ]; then
-        echo "GitLab release API failed with HTTP $RELEASE_CODE"
-        cat /tmp/gitlab-release-response.json
+      RELEASE_OWNED=0
+      if [ "$RELEASE_REQUEST_SUCCEEDED" = "1" ] && [ "$RELEASE_CODE" = "201" ]; then
+        RELEASE_OWNED=1
+      elif rc2_release_guard_retry rc2_release_guard_confirm_release_ownership; then
+        echo "GitLab release creation was reconciled after an ambiguous response"
+        RELEASE_OWNED=1
+      fi
+      if [ "$RELEASE_OWNED" != "1" ]; then
+        echo "GitLab release API failed without proof of ownership (HTTP ${RELEASE_CODE:-transport-error})" >&2
+        cat "$RELEASE_RESPONSE" >&2 || true
         exit 1
       fi
+      rc2_release_guard_note_release_created
+
+      RELEASE_READBACK="$TEMP_DIR/gitlab-release-readback.json"
+      curl --fail --silent --show-error \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        "$RELEASE_API/$TAG" > "$RELEASE_READBACK"
+      jq -e \
+        --arg tag "$TAG" \
+        --arg sha "$CI_COMMIT_SHA" \
+        --arg dmg_url "$S3_DOWNLOAD_BASE_URL/$TAG/$ASSET_NAME" \
+        --arg appcast_url "$S3_DOWNLOAD_BASE_URL/appcast.xml" \
+        '
+          .tag_name == $tag
+          and .commit.id == $sha
+          and any(.assets.links[]; .url == $dmg_url)
+          and any(.assets.links[]; .url == $appcast_url)
+        ' "$RELEASE_READBACK" >/dev/null
+
+      rc2_release_guard_commit
