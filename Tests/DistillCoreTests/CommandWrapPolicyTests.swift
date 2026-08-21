@@ -311,6 +311,43 @@ final class CommandWrapPolicyTests: XCTestCase {
         )
     }
 
+    func test_structuredCommandOutput_preservesValidJSONWhenMinifiedPayloadExceedsBudget() throws {
+        // WHY: truncating a losslessly minified payload to the character budget produces
+        // invalid JSON, so providers lose every field instead of receiving a faithful fallback.
+        let rows: [[String: Any]] = (1...96).map { index in
+            [
+                "id": index,
+                "state": "CHANGES_REQUESTED",
+                "body": "finding \(index): " + String(repeating: "evidence ", count: 8),
+            ]
+        }
+        let prettyData = try JSONSerialization.data(withJSONObject: rows, options: [.prettyPrinted, .sortedKeys])
+        let pretty = try XCTUnwrap(String(data: prettyData, encoding: .utf8))
+        let compactData = try JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys])
+        let compact = try XCTUnwrap(String(data: compactData, encoding: .utf8))
+        XCTAssertGreaterThan(compactData.count, 4_000, "the fixture must cross the structured-output budget")
+        for input in [pretty, compact] {
+            let request = DistillRequest(
+                mode: .commandOutput,
+                input: input,
+                question: try XCTUnwrap(CommandWrapPolicy.extractionQuery(forCommand: "gh")),
+                maxOutputCharacters: 4_000,
+                reversibleStoreMinBytes: 256
+            )
+
+            let output = try XCTUnwrap(LocalDistillRuntime.structuredCommandOutput(for: request))
+            let decoded = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(output.utf8)) as? [[String: Any]]
+            )
+
+            XCTAssertEqual(output, input, "an over-budget structured result must fail open verbatim")
+            XCTAssertGreaterThan(output.count, request.maxOutputCharacters)
+            XCTAssertEqual(decoded.count, rows.count)
+            XCTAssertEqual(decoded.last?["id"] as? Int, rows.count)
+            XCTAssertEqual(decoded.last?["state"] as? String, "CHANGES_REQUESTED")
+        }
+    }
+
     func test_faithfulnessGuard_rejectsTinyGarbageTokens() {
         XCTAssertFalse(CommandWrapPolicy.isFaithfulCompression(rawByteCount: 7_000, compressedContentByteCount: 4))
         XCTAssertTrue(CommandWrapPolicy.isFaithfulCompression(rawByteCount: 7_000, compressedContentByteCount: 200))

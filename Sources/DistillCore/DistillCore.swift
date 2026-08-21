@@ -1021,16 +1021,18 @@ public struct LocalDistillRuntime: DistillRuntime {
     /// wrapped in ANSI CSI sequences. Classifying those bytes as prose sends them through the
     /// model, where a rejected answer fails open to the full multi-KB payload. Remove display-
     /// only control sequences, then losslessly minify the JSON before any intent/model path.
-    /// The service still stores the byte-exact colored original before serving this reduction.
+    /// If even the minified form exceeds the budget, preserve valid JSON instead of truncating
+    /// its structure. The service still stores the byte-exact colored original before serving it.
     static func structuredCommandOutput(for request: DistillRequest) -> String? {
         guard request.mode == .commandOutput else { return nil }
         let parsed = splitLegacyCommandPayload(request.input)
         let source = strippingANSIControlSequences(parsed.output)
-        guard JSONCrusher.looksLikeJSON(source),
-              let minified = JSONCrusher.minify(source) else {
-            return nil
+        guard JSONCrusher.looksLikeJSON(source) else { return nil }
+        guard let minified = JSONCrusher.minify(source) else { return source }
+        guard minified.count <= request.maxOutputCharacters else {
+            return source
         }
-        return boundedCommandOutput(minified, maxOutputCharacters: request.maxOutputCharacters)
+        return minified
     }
 
     private static let ansiCSIRegex = try! NSRegularExpression(
