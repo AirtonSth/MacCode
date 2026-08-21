@@ -415,8 +415,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                     "attachments": Self.attachmentPayload(request.attachments),
                     "session_id": session.providerThreadId ?? request.threadId.value.uuidString,
                     "mcp_servers": Self.botPeerMCPServers(environment: request.environment),
-                    "allowed_tools": BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
-                        + DistillMCPAdmit.claudeAutomaticallyAllowedTools
+                    "allowed_tools": ClaudeRunner.automaticallyAllowedTools(environment: request.environment)
                 ]
                 if let turnContext = request.environment[BotPeerDelegation.turnContextEnvironmentKey]?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1710,8 +1709,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
         payload["system_prompt"] = Self.claudeSystemPrompt(environment: request.environment)
         payload["mcp_servers"] = Self.botPeerMCPServers(environment: request.environment)
-        payload["allowed_tools"] = BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
-            + DistillMCPAdmit.claudeAutomaticallyAllowedTools
+        payload["allowed_tools"] = ClaudeRunner.automaticallyAllowedTools(environment: request.environment)
         return payload
     }
 
@@ -1719,8 +1717,9 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// does not reliably inherit the managed server written to settings.json.
     /// The definition is rebuilt per turn so the MCP receives that turn's exact
     /// thread/run/socket authority without deriving anything from user prose.
-    /// Carries the Distill librarian server too — SDK-engine parity with the
-    /// CLI route's `--mcp-config` (see ClaudeRunner.botPeerMCPConfigJSON).
+    /// Carries the Distill librarian server too while Token Saver is enabled —
+    /// SDK-engine parity with the CLI route's `--mcp-config` (see
+    /// ClaudeRunner.botPeerMCPConfigJSON).
     static func botPeerMCPServers(
         environment: [String: String],
         command: String? = nil
@@ -1728,16 +1727,19 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let resolved = command
             ?? AgentSkillInstaller.resolveServiceBinary()?.path
             ?? BotSelfConfigMCPAdmit.fallbackCommand
-        return [
+        var servers: [String: Any] = [
             BotSelfConfigMCPAdmit.serverName: BotSelfConfigMCPAdmit.claudeSDKServer(
                 command: resolved,
                 environment: environment
-            ),
-            DistillMCPAdmit.serverName: DistillMCPAdmit.claudeServer(
+            )
+        ]
+        if DistillMCPAdmit.isEnabled(environment: environment) {
+            servers[DistillMCPAdmit.serverName] = DistillMCPAdmit.claudeServer(
                 command: resolved,
                 environment: environment
-            ),
-        ]
+            )
+        }
+        return servers
     }
 
     /// System prompt for the SDK session, set on every run (additive — the SDK's

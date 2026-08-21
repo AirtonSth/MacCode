@@ -98,23 +98,24 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             let allowed = Set(args[args.index(after: allowedIndex)].split(separator: ",").map(String.init))
             XCTAssertEqual(
                 allowed,
-                Set(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
-                    + DistillMCPAdmit.claudeAutomaticallyAllowedTools),
-                "supervised mode must allow exactly the managed delegation/settings and librarian tools without another user confirmation"
+                Set(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools),
+                "without Token Saver, supervised mode must allow only the exact managed delegation/settings tools"
             )
         }
     }
 
-    func test_liveClaudeRoutesAdmitDistillLibrarianMCP() throws {
-        // WHY: the distill skill instructs every provider to prefer the librarian
+    func test_liveClaudeRoutesAdmitDistillLibrarianMCPOnlyWithTokenSaver() throws {
+        // WHY: the distill skill instructs every provider to use the librarian
         // MCP tools (rc_stats/rc_search/rc_ask/rc_retrieve/rc_compress — the
         // 01-catalogo.html surface), but Claude never saw the server: it was
         // installed into ~/.claude/settings.json, which Claude Code does not read
         // for mcpServers (proven live: the entry never spawned and `claude mcp
         // list` omits it). Codex reads it from config.toml and Grok admits it per
-        // ACP session; both Claude routes must admit it per spawn the same way
-        // the bot peer server already is.
+        // ACP session — all gated on Token Saver, the paid feature that also
+        // injects the usage policy. Both Claude routes must admit it per spawn
+        // under the same gate: hint on → server + rc_* allowlist; off → neither.
         let environment = [
+            DistillMCPAdmit.tokenSaverHintEnvironmentKey: "1",
             "RC_TOKEN_SAVER_THREAD_ID": "11111111-2222-3333-4444-555555555555",
             "REMOTE_CODE_AGENT_PROVIDER": "claude",
             "UNRELATED_SECRET": "must-not-be-forwarded",
@@ -134,7 +135,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             let servers = try XCTUnwrap(root["mcpServers"] as? [String: Any])
             let librarian = try XCTUnwrap(
                 servers[DistillMCPAdmit.serverName] as? [String: Any],
-                "every Claude CLI turn must carry the librarian MCP server"
+                "every Token Saver Claude turn must carry the librarian MCP server"
             )
             XCTAssertEqual(librarian["args"] as? [String], ["mcp"])
             let forwarded = try XCTUnwrap(librarian["env"] as? [String: String])
@@ -143,12 +144,44 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                          "only recovery-scope keys may be forwarded to the librarian server")
             XCTAssertNotNil(servers[BotSelfConfigMCPAdmit.serverName],
                             "the librarian must supplement, never replace, the bot peer server")
+            let allowedIndex = try XCTUnwrap(args.firstIndex(of: "--allowedTools"))
+            let allowed = Set(args[args.index(after: allowedIndex)].split(separator: ",").map(String.init))
+            XCTAssertEqual(
+                allowed,
+                Set(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
+                    + DistillMCPAdmit.claudeAutomaticallyAllowedTools),
+                "Token Saver on must auto-allow the librarian tools so supervised runs use them without a prompt"
+            )
         }
 
-        // SDK bridge engine parity: the same server must ride the bridge payload.
+        // SDK bridge engine parity: same server, same gate.
         let sdkServers = ClaudeAgentSDKBridgeAdapter.botPeerMCPServers(environment: environment)
         XCTAssertNotNil(sdkServers[DistillMCPAdmit.serverName] as? [String: Any],
                         "the opt-in SDK engine must admit the librarian server too, or the engines drift")
+
+        // Token Saver off → no librarian server and no rc_* allowlist anywhere.
+        let offRequest = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .claude,
+            model: "claude-opus-4-7",
+            cwd: "/tmp",
+            prompt: "hello"
+        )
+        for args in [ClaudeRunner.buildArgs(offRequest), ClaudeRunner.buildStreamingArgs(offRequest)] {
+            let index = try XCTUnwrap(args.firstIndex(of: "--mcp-config"))
+            let data = Data(args[args.index(after: index)].utf8)
+            let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let servers = try XCTUnwrap(root["mcpServers"] as? [String: Any])
+            XCTAssertNil(servers[DistillMCPAdmit.serverName],
+                         "Token Saver off must not expose the librarian server to Claude")
+            let allowedIndex = try XCTUnwrap(args.firstIndex(of: "--allowedTools"))
+            XCTAssertFalse(args[args.index(after: allowedIndex)].contains("remotecode-distill"),
+                           "Token Saver off must not pre-authorize librarian tools")
+        }
+        XCTAssertNil(
+            ClaudeAgentSDKBridgeAdapter.botPeerMCPServers(environment: [:])[DistillMCPAdmit.serverName],
+            "SDK engine must apply the same Token Saver gate"
+        )
 
         // The allowlisted tool names must match the tools the server actually
         // serves (ManagedRetrieveMCP), or supervised mode silently prompts.

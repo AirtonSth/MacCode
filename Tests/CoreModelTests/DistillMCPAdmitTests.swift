@@ -2,6 +2,13 @@ import XCTest
 @testable import CoreModel
 
 final class DistillMCPAdmitTests: XCTestCase {
+    func test_isEnabledRequiresTheTokenSaverHint() {
+        XCTAssertTrue(DistillMCPAdmit.isEnabled(environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]))
+        XCTAssertFalse(DistillMCPAdmit.isEnabled(environment: [:]),
+                       "the librarian is paid-feature surface: no Token Saver, no server, on every provider")
+        XCTAssertFalse(DistillMCPAdmit.isEnabled(environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "0"]))
+    }
+
     func test_claudeServerCarriesCommandArgsAndOnlyRecoveryEnvKeys() {
         let server = DistillMCPAdmit.claudeServer(
             command: "/tmp/RemoteCodeDistillService",

@@ -234,8 +234,8 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
             XCTAssertEqual(forwarded[BotPeerDelegation.runEnvironmentKey], run)
             XCTAssertEqual(forwarded[BotPeerDelegation.socketEnvironmentKey], "/tmp/remote-code.sock")
             XCTAssertEqual(command["allowed_tools"] as? [String],
-                           BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
-                               + DistillMCPAdmit.claudeAutomaticallyAllowedTools)
+                           BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools,
+                           "without the Token Saver hint, only bot peer tools are pre-authorized")
         }
     }
 

@@ -267,7 +267,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     public static func buildArgs(_ request: AgentRunRequest) -> [String] {
         var args: [String] = ["--print", "--output-format", "stream-json", "--verbose"]
         args.append(contentsOf: ["--mcp-config", botPeerMCPConfigJSON(environment: request.environment)])
-        args.append(contentsOf: ["--allowedTools", (BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools + DistillMCPAdmit.claudeAutomaticallyAllowedTools).joined(separator: ",")])
+        args.append(contentsOf: ["--allowedTools", automaticallyAllowedTools(environment: request.environment).joined(separator: ",")])
         args.append(contentsOf: ["--model", request.model])
         let prompt = request.providerPrompt
         let effort = normalizedReasoningEffort(request.reasoningEffort, model: request.model)
@@ -308,7 +308,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             "--setting-sources", "user,project,local"
         ]
         args.append(contentsOf: ["--mcp-config", botPeerMCPConfigJSON(environment: request.environment)])
-        args.append(contentsOf: ["--allowedTools", (BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools + DistillMCPAdmit.claudeAutomaticallyAllowedTools).joined(separator: ",")])
+        args.append(contentsOf: ["--allowedTools", automaticallyAllowedTools(environment: request.environment).joined(separator: ",")])
         args.append(contentsOf: ["--model", request.model])
         let effort = normalizedReasoningEffort(request.reasoningEffort, model: request.model)
         args.append(contentsOf: effortArgs(effort, model: request.model))
@@ -348,13 +348,26 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     /// Claude Code does not discover `mcpServers` from settings.json. Admit the
-    /// managed peer server AND the Distill librarian server (rc_stats/rc_search/
-    /// rc_ask/rc_retrieve/rc_compress — the 01-catalogo.html surface) through the
-    /// documented per-process `--mcp-config` input so every CLI turn gets the
-    /// exact run context authored by the host. Codex reads the librarian from
-    /// config.toml and Grok admits it per ACP session; without this entry Claude
-    /// was the only provider that never saw the catalog tools.
-    /// User/project MCP sources remain enabled because this is not strict mode.
+    /// managed peer server AND — while Token Saver is enabled — the Distill
+    /// librarian server (rc_stats/rc_search/rc_ask/rc_retrieve/rc_compress —
+    /// the 01-catalogo.html surface) through the documented per-process
+    /// `--mcp-config` input so every CLI turn gets the exact run context
+    /// authored by the host. Codex reads the librarian from config.toml and
+    /// Grok admits it per ACP session, both under the same Token Saver gate;
+    /// without this entry Claude was the only provider that never saw the
+    /// catalog tools. User/project MCP sources remain enabled because this is
+    /// not strict mode.
+    /// Provider tool names auto-approved for supervised Claude runs: the bot
+    /// peer tools always, plus the librarian tools while Token Saver is on
+    /// (matching the servers actually admitted for the run).
+    static func automaticallyAllowedTools(environment: [String: String]) -> [String] {
+        var tools = BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
+        if DistillMCPAdmit.isEnabled(environment: environment) {
+            tools += DistillMCPAdmit.claudeAutomaticallyAllowedTools
+        }
+        return tools
+    }
+
     static func botPeerMCPConfigJSON(
         environment: [String: String],
         command: String? = nil
@@ -362,18 +375,19 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         let resolved = command
             ?? AgentSkillInstaller.resolveServiceBinary()?.path
             ?? BotSelfConfigMCPAdmit.fallbackCommand
-        let object: [String: Any] = [
-            "mcpServers": [
-                BotSelfConfigMCPAdmit.serverName: BotSelfConfigMCPAdmit.claudeSDKServer(
-                    command: resolved,
-                    environment: environment
-                ),
-                DistillMCPAdmit.serverName: DistillMCPAdmit.claudeServer(
-                    command: resolved,
-                    environment: environment
-                ),
-            ]
+        var servers: [String: Any] = [
+            BotSelfConfigMCPAdmit.serverName: BotSelfConfigMCPAdmit.claudeSDKServer(
+                command: resolved,
+                environment: environment
+            )
         ]
+        if DistillMCPAdmit.isEnabled(environment: environment) {
+            servers[DistillMCPAdmit.serverName] = DistillMCPAdmit.claudeServer(
+                command: resolved,
+                environment: environment
+            )
+        }
+        let object: [String: Any] = ["mcpServers": servers]
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else {
             return #"{"mcpServers":{}}"#

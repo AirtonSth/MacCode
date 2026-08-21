@@ -1380,6 +1380,30 @@ final class GrokACPProtocolTests: XCTestCase {
         )
     }
 
+    /// WHY: the Distill librarian MCP (rc_* / 01-catalogo.html) is Token Saver
+    /// surface. It must ride Grok sessions only while the run carries the Token
+    /// Saver hint — the same gate Claude (--mcp-config) and Codex (config.toml
+    /// lifecycle) apply — instead of unconditionally on every session.
+    func test_sessionMCPServersAdmitDistillLibrarianOnlyWithTokenSaver() {
+        func names(_ environment: [String: String]) -> [String] {
+            GrokACPClient.sessionMCPServers(
+                existing: [],
+                command: "/tmp/RemoteCodeDistillService",
+                environment: environment
+            ).compactMap { ($0 as? [String: Any])?["name"] as? String }
+        }
+
+        let on = names([DistillMCPAdmit.tokenSaverHintEnvironmentKey: "1"])
+        XCTAssertTrue(on.contains(DistillMCPAdmit.serverName),
+                      "Token Saver on must admit the librarian MCP into the Grok session")
+
+        let off = names([:])
+        XCTAssertFalse(off.contains(DistillMCPAdmit.serverName),
+                       "Token Saver off must not expose the librarian MCP to Grok")
+        XCTAssertTrue(off.contains(BotSelfConfigMCPAdmit.serverName),
+                      "the gate is librarian-only: bot servers stay admitted either way")
+    }
+
     /// WHY: workspace-less bot threads fall through to currentDirectoryPath,
     /// which can be empty. Live grok session/new then returns
     /// Invalid params / Path is not absolute.

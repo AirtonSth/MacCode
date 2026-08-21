@@ -627,11 +627,16 @@ public final class GrokACPClient: @unchecked Sendable {
             command: resolved,
             environment: environment
         )
-        let withDistill = DistillMCPAdmit.admitGrokACP(
-            existing: withWeb,
-            command: resolved,
-            environment: environment
-        )
+        // The librarian MCP is Token Saver surface: admitted only while the
+        // run carries the Token Saver hint, matching Claude (--mcp-config /
+        // SDK mcp_servers) and Codex (config.toml install lifecycle).
+        let withDistill = DistillMCPAdmit.isEnabled(environment: environment)
+            ? DistillMCPAdmit.admitGrokACP(
+                existing: withWeb,
+                command: resolved,
+                environment: environment
+            )
+            : withWeb
         return BotComputerMCPAdmit.admitGrokACP(
             existing: withDistill,
             command: resolved,

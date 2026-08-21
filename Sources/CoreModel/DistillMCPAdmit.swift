@@ -4,6 +4,17 @@ import Foundation
 public enum DistillMCPAdmit: Sendable {
     public static let serverName = "remotecode-distill"
     public static let cliArgument = "mcp"
+
+    /// Token Saver activation signal: set to "1" on every admitted run's
+    /// environment by the execution receipt when the distill capability is on.
+    public static let tokenSaverHintEnvironmentKey = "RC_TOKEN_SAVER_DISTILL_HINT"
+
+    /// The librarian is paid-feature surface: it must be admitted for a run —
+    /// on EVERY provider — only while Token Saver is enabled, exactly like the
+    /// `| distill` policy prompt that instructs the model to use it.
+    public static func isEnabled(environment: [String: String]) -> Bool {
+        environment[tokenSaverHintEnvironmentKey] == "1"
+    }
     public static let recoveryEnvKeys = [
         "RC_TOKEN_SAVER_WORKSPACE_ID",
         "RC_TOKEN_SAVER_PROJECT_ID",
