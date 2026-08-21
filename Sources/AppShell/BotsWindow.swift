@@ -3287,8 +3287,17 @@ public final class BotsViewModel: ObservableObject {
         reloadTokenSaverThreadSavings()
     }
 
+    private func resetTokenSaverFooterSnapshot() {
+        tokenSaverFooterReloadTask?.cancel()
+        tokenSaverFooterEnabled = false
+        tokenSaverThreadMeasuredTokens = 0
+        tokenSaverThreadSavedTokens = 0
+    }
+
     func reloadTokenSaverThreadSavings() {
         tokenSaverFooterReloadTask?.cancel()
+        let ownerBotID = selectedBotID
+        let ownerConversationID = selectedConversation?.id
         let threadId = selectedConversation?.linkedAgentThreadID
         let assistantChars = deskMessages
             .filter { $0.role == .assistant }
@@ -3327,6 +3336,11 @@ public final class BotsViewModel: ObservableObject {
             )
             await MainActor.run { [weak self] in
                 guard let self, !Task.isCancelled else { return }
+                guard self.selectedBotID == ownerBotID,
+                      self.selectedConversation?.id == ownerConversationID,
+                      self.selectedConversation?.linkedAgentThreadID == threadId else {
+                    return
+                }
                 let current = TokenSaverThreadFooterReload.Snapshot(
                     enabled: self.tokenSaverFooterEnabled,
                     measuredTokens: self.tokenSaverThreadMeasuredTokens,
@@ -3403,6 +3417,10 @@ public final class BotsViewModel: ObservableObject {
         tokenSaverFooterEnabled = snapshot.enabled
         tokenSaverThreadMeasuredTokens = snapshot.measuredTokens
         tokenSaverThreadSavedTokens = snapshot.displayTokens
+    }
+
+    func awaitTokenSaverFooterReloadForTesting() async {
+        await tokenSaverFooterReloadTask?.value
     }
 
     func replaceDeskMessagesForTesting(_ messages: [BotDeskMessage]) {
@@ -3711,9 +3729,7 @@ public final class BotsViewModel: ObservableObject {
         messagesByBot[bot.id] = []
         messagesConversationIDByBot[bot.id] = nil
         deskMessages = []
-        tokenSaverFooterEnabled = false
-        tokenSaverThreadMeasuredTokens = 0
-        tokenSaverThreadSavedTokens = 0
+        resetTokenSaverFooterSnapshot()
         tokenSaverOriginalDisplayMessageIds = []
         deskThreadSearchQuery = ""
         attentionItems.removeAll {
@@ -3728,6 +3744,7 @@ public final class BotsViewModel: ObservableObject {
     public func selectDeskThread(_ id: BotConversationID) {
         guard let conversation = conversations.first(where: { $0.id == id }) else { return }
         captureDeskRouting()
+        resetTokenSaverFooterSnapshot()
         selectedConversation = conversation
         selectedConversationByBot[conversation.botID] = conversation.id
         applyDeskRouting(for: conversation)
@@ -5340,6 +5357,7 @@ public final class BotsViewModel: ObservableObject {
 
     private func reloadSelectedBot(id: BotID) {
         leaveDeskLiveWatch()
+        resetTokenSaverFooterSnapshot()
         let threadID = destConversation(for: id)?.linkedAgentThreadID
         deskLiveTimeline = threadID.flatMap { liveTimelineByThread[$0] } ?? AssistantTimelineState()
         deskStreamEventCount = threadID.flatMap { liveStreamCountByThread[$0] } ?? 0
@@ -5354,6 +5372,7 @@ public final class BotsViewModel: ObservableObject {
         restoreDeskWorkLog(botID: id)
         restoreDeskLiveTurn(botID: id)
         reloadStudioSupport(id: id)
+        reloadTokenSaverThreadSavings()
         if let bot = bots.first(where: { $0.id == id }) {
             settleTerminalWorkingConversation(bot: bot)
         }
@@ -6773,7 +6792,9 @@ public final class BotsViewModel: ObservableObject {
         messagesConversationIDByBot[botID] = conversation?.id
         if selectedBotID == botID {
             deskMessages = visible
-            reloadTokenSaverThreadSavings()
+            if selectedConversation?.botID == botID {
+                reloadTokenSaverThreadSavings()
+            }
         }
         if let last = visible.last, !last.text.isEmpty {
             lastPreviewByBot[botID] = last.text

@@ -316,6 +316,121 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNil(vm.tokenSaverFooterTextForTesting())
     }
 
+    func test_switchingWarmCachedBotsResetsTokenSaverFooter() throws {
+        // WHY: a subscribed user must not keep bot A's savings chip after a
+        // warm-cache switch to bot B that skips restoreDeskMessages.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let alpha = try vm.create(name: "Alpha", title: "A")
+        let beta = try vm.create(name: "Beta", title: "B")
+        let threadA = AgentThread(title: "alpha-thread", provider: .codex, model: "test")
+        let threadB = AgentThread(title: "beta-thread", provider: .codex, model: "test")
+        try context.threadRepo.upsert(threadA)
+        try context.threadRepo.upsert(threadB)
+        try context.messageRepo.append(AgentMessage(threadId: threadA.id, role: .user, content: "hello alpha"))
+        try context.messageRepo.append(AgentMessage(threadId: threadB.id, role: .user, content: "hello beta"))
+        try context.botStore.upsertConversation(BotConversation(
+            botID: alpha.id,
+            title: "Alpha chat",
+            linkedAgentThreadID: threadA.id
+        ))
+        try context.botStore.upsertConversation(BotConversation(
+            botID: beta.id,
+            title: "Beta chat",
+            linkedAgentThreadID: threadB.id
+        ))
+        vm.openDesk(alpha)
+        XCTAssertFalse(vm.deskMessages.isEmpty, "alpha cache must be warm")
+        vm.applyTokenSaverFooterSnapshotForTesting(
+            TokenSaverThreadFooterReload.Snapshot(
+                enabled: true,
+                measuredTokens: 8_000,
+                displayTokens: 8_000
+            )
+        )
+        XCTAssertNotNil(vm.tokenSaverFooterTextForTesting())
+        vm.openDesk(beta)
+        XCTAssertFalse(vm.tokenSaverFooterEnabled)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
+        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, 0)
+        XCTAssertNil(vm.tokenSaverFooterTextForTesting())
+        vm.applyTokenSaverFooterSnapshotForTesting(
+            TokenSaverThreadFooterReload.Snapshot(
+                enabled: true,
+                measuredTokens: 3_000,
+                displayTokens: 3_000
+            )
+        )
+        vm.openDesk(alpha)
+        XCTAssertFalse(vm.tokenSaverFooterEnabled)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
+        XCTAssertNil(vm.tokenSaverFooterTextForTesting())
+    }
+
+    func test_switchingBotsPublishesOnlyTheSelectedThreadLedger() async throws {
+        // WHY: after the immediate reset, the async reload must publish the
+        // selected thread's measured savings, never the previous bot's.
+        let context = try makeContext()
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "token",
+            refreshToken: "refresh",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        ))
+        let vm = BotsViewModel(context: context)
+        let alpha = try vm.create(name: "Alpha", title: "A")
+        let beta = try vm.create(name: "Beta", title: "B")
+        let threadA = AgentThread(title: "alpha-thread", provider: .codex, model: "test")
+        let threadB = AgentThread(title: "beta-thread", provider: .codex, model: "test")
+        try context.threadRepo.upsert(threadA)
+        try context.threadRepo.upsert(threadB)
+        try context.messageRepo.append(AgentMessage(threadId: threadA.id, role: .user, content: "hello alpha"))
+        try context.messageRepo.append(AgentMessage(threadId: threadB.id, role: .user, content: "hello beta"))
+        try context.botStore.upsertConversation(BotConversation(
+            botID: alpha.id,
+            title: "Alpha chat",
+            linkedAgentThreadID: threadA.id
+        ))
+        try context.botStore.upsertConversation(BotConversation(
+            botID: beta.id,
+            title: "Beta chat",
+            linkedAgentThreadID: threadB.id
+        ))
+        try context.tokenSaverSavingsRepo.record(
+            provider: "codex",
+            mode: "command-output",
+            inputTokens: 9_000,
+            outputTokens: 1_000,
+            delivered: true,
+            threadID: threadA.id.value.uuidString
+        )
+        try context.tokenSaverSavingsRepo.record(
+            provider: "codex",
+            mode: "command-output",
+            inputTokens: 4_000,
+            outputTokens: 1_000,
+            delivered: true,
+            threadID: threadB.id.value.uuidString
+        )
+        vm.openDesk(alpha)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 8_000)
+        vm.openDesk(beta)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0, "switch must hide the previous bot immediately")
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 3_000)
+        vm.openDesk(alpha)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 8_000)
+    }
+
     func test_hostCatalogBotSendUsesTheFullDeskBrainPipeline() async throws {
         // WHY: a host MCP send must not bypass the Bot's soul/skills/VM routing
         // by forwarding the user's raw text as a generic Agent App prompt.
