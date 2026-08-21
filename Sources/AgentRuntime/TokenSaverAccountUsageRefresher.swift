@@ -4,11 +4,20 @@ import CoreModel
 import RemoteCodeCSystem
 
 public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
+    public static let defaultGrokCreditsAPIURL = URL(
+        string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+    )!
+
     public let codexBinary: String
     public let claudeBinary: String
     public let grokBinary: String
     /// Override for tests; default is `~/.grok/logs/unified.jsonl`.
     public let grokBillingLogURL: URL?
+    /// When set, Grok usage prefers the live CLI credits API using this auth file.
+    /// Tests leave it nil so they never hit the network.
+    public let grokAuthFileURL: URL?
+    /// Override for tests; default is `defaultGrokCreditsAPIURL`.
+    public let grokCreditsAPIURL: URL?
     public let cwd: String
     public let environment: [String: String]
 
@@ -17,6 +26,8 @@ public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
         claudeBinary: String = "claude",
         grokBinary: String = "grok",
         grokBillingLogURL: URL? = nil,
+        grokAuthFileURL: URL? = nil,
+        grokCreditsAPIURL: URL? = nil,
         cwd: String = NSHomeDirectory(),
         environment: [String: String] = [:]
     ) {
@@ -24,6 +35,8 @@ public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
         self.claudeBinary = claudeBinary
         self.grokBinary = grokBinary
         self.grokBillingLogURL = grokBillingLogURL
+        self.grokAuthFileURL = grokAuthFileURL
+        self.grokCreditsAPIURL = grokCreditsAPIURL
         self.cwd = cwd
         self.environment = environment
     }
@@ -31,6 +44,16 @@ public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
 
 public protocol TokenSaverAccountUsageRefreshing: Sendable {
     func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage]
+    func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage?
+}
+
+extension TokenSaverAccountUsageRefreshing {
+    public func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        let url = request.grokBillingLogURL
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".grok/logs/unified.jsonl")
+        return AssistantAccountUsageParser.grokFromBillingLogFile(at: url)
+    }
 }
 
 public enum AssistantAccountUsageParser {
@@ -224,27 +247,59 @@ public enum AssistantAccountUsageParser {
         let ctx = obj["ctx"] as? [String: Any] ?? obj["context"] as? [String: Any] ?? obj
         let config = ctx["config"] as? [String: Any] ?? obj["config"] as? [String: Any]
         guard let config else { return nil }
-        // Prefer billing log lines; also accept bare credit-config objects that
-        // carry creditUsagePercent (unit tests / future cache files).
+        // Prefer billing log lines; also accept the live CLI credits-API payload
+        // (`GET …/v1/billing?format=credits`) which is a bare `{config:{…}}`.
         let looksLikeBilling = msg.contains("billing") || msg.contains("credits")
             || config["creditUsagePercent"] != nil || config["credit_usage_percent"] != nil
+            || config["productUsage"] != nil || config["product_usage"] != nil
+            || config["monthlyLimit"] != nil || config["monthly_limit"] != nil
+            || config["used"] != nil
         guard looksLikeBilling else { return nil }
-        let percent = double(config["creditUsagePercent"])
-            ?? double(config["credit_usage_percent"])
-            ?? double(config["usedPercent"])
-            ?? double(config["used_percent"])
-        guard let percent else { return nil }
-        let periodEnd = config["billingPeriodEnd"] as? String
-            ?? config["billing_period_end"] as? String
-            ?? (config["currentPeriod"] as? [String: Any])?["end"] as? String
-            ?? (config["current_period"] as? [String: Any])?["end"] as? String
-        let resetsAtMs = parseISO8601Milliseconds(periodEnd)
+        guard let percent = grokWeeklyUsedPercent(from: config) else { return nil }
+        let resetsAtMs = parseISO8601Milliseconds(grokPeriodEnd(from: config))
         return AssistantAccountUsage(
             provider: .grok,
             weeklyUsedPercent: percent,
             weeklyWindowDurationMinutes: 10_080,
             weeklyResetsAtMs: resetsAtMs
         )
+    }
+
+    /// Access token from `~/.grok/auth.json`. The file is a map of
+    /// `issuer::principal` objects whose `key` field is the live CLI bearer.
+    /// Never logs the token.
+    public static func grokAccessToken(fromAuthFile url: URL, now: Date = Date()) -> String? {
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return grokAccessToken(fromAuthObject: obj, now: now)
+    }
+
+    public static func grokAccessToken(fromAuthObject obj: [String: Any], now: Date = Date()) -> String? {
+        var candidates: [(token: String, expires: Date?)] = []
+        func consider(_ record: [String: Any]) {
+            let token = string(record["key"])
+                ?? string(record["access_token"])
+                ?? string(record["accessToken"])
+            guard let token, !token.isEmpty else { return }
+            let expires = parseISO8601Date(string(record["expires_at"]) ?? string(record["expiresAt"]))
+            candidates.append((token, expires))
+        }
+        consider(obj)
+        for value in obj.values {
+            if let record = value as? [String: Any] {
+                consider(record)
+            }
+        }
+        let live = candidates.filter { candidate in
+            guard let expires = candidate.expires else { return true }
+            return expires > now
+        }
+        let pool = live.isEmpty ? candidates : live
+        return pool.max { lhs, rhs in
+            (lhs.expires ?? .distantPast) < (rhs.expires ?? .distantPast)
+        }?.token
     }
 
     /// Scans a Grok unified log file (newest first within the last `maxBytes`) for
@@ -288,12 +343,62 @@ public enum AssistantAccountUsageParser {
         return nil
     }
 
-    private static func parseISO8601Milliseconds(_ value: String?) -> Int64? {
+    private static func grokWeeklyUsedPercent(from config: [String: Any]) -> Double? {
+        if let product = grokBuildProductPercent(from: config) {
+            return product
+        }
+        if let credits = double(config["creditUsagePercent"])
+            ?? double(config["credit_usage_percent"])
+            ?? double(config["usedPercent"])
+            ?? double(config["used_percent"]) {
+            return credits
+        }
+        let used = moneyVal(config["used"])
+        let limit = moneyVal(config["monthlyLimit"]) ?? moneyVal(config["monthly_limit"])
+        if let used, let limit, limit > 0 {
+            return min(100, max(0, (used / limit) * 100))
+        }
+        return nil
+    }
+
+    /// Grok's Usage UI labels the weekly bar "Grok Build". Prefer that product
+    /// row when the live credits payload includes `productUsage`.
+    private static func grokBuildProductPercent(from config: [String: Any]) -> Double? {
+        let rows = config["productUsage"] as? [[String: Any]]
+            ?? config["product_usage"] as? [[String: Any]]
+            ?? []
+        for row in rows {
+            let name = (string(row["product"]) ?? string(row["name"]) ?? "")
+                .lowercased()
+                .replacingOccurrences(of: "[^a-z0-9]", with: "", options: .regularExpression)
+            guard name == "grokbuild" || name == "grokcli" else { continue }
+            return double(row["usagePercent"]) ?? double(row["usage_percent"])
+        }
+        return nil
+    }
+
+    private static func grokPeriodEnd(from config: [String: Any]) -> String? {
+        let period = config["currentPeriod"] as? [String: Any]
+            ?? config["current_period"] as? [String: Any]
+        let type = (string(period?["type"]) ?? "").uppercased()
+        if type.contains("WEEKLY"), let end = string(period?["end"]) {
+            return end
+        }
+        return string(config["billingPeriodEnd"])
+            ?? string(config["billing_period_end"])
+            ?? string(period?["end"])
+    }
+
+    private static func parseISO8601Date(_ value: String?) -> Date? {
         guard let value, !value.isEmpty else { return nil }
         iso8601Lock.lock()
         let date = iso8601Fractional.date(from: value) ?? iso8601WholeSecond.date(from: value)
         iso8601Lock.unlock()
-        return date.map { Int64($0.timeIntervalSince1970 * 1000) }
+        return date
+    }
+
+    private static func parseISO8601Milliseconds(_ value: String?) -> Int64? {
+        parseISO8601Date(value).map { Int64($0.timeIntervalSince1970 * 1000) }
     }
 
     public static func claudeUsageScreen(_ text: String) -> AssistantAccountUsage? {
@@ -424,6 +529,21 @@ public enum AssistantAccountUsageParser {
         if let value = value as? String { return Double(value) }
         return nil
     }
+
+    private static func string(_ value: Any?) -> String? {
+        if let value = value as? String {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return nil
+    }
+
+    private static func moneyVal(_ value: Any?) -> Double? {
+        if let object = value as? [String: Any] {
+            return double(object["val"]) ?? double(object["value"])
+        }
+        return double(value)
+    }
 }
 
 public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing, @unchecked Sendable {
@@ -433,9 +553,14 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private let timeoutSeconds: TimeInterval
+    private let grokCreditsFetcher: (@Sendable (URL, String) async -> [String: Any]?)?
 
-    public init(timeoutSeconds: TimeInterval = 18.0) {
+    public init(
+        timeoutSeconds: TimeInterval = 18.0,
+        grokCreditsFetcher: (@Sendable (URL, String) async -> [String: Any]?)? = nil
+    ) {
         self.timeoutSeconds = timeoutSeconds
+        self.grokCreditsFetcher = grokCreditsFetcher
     }
 
     public func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
@@ -445,6 +570,10 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         return await [codex, claude, grok]
             .compactMap { $0 }
             .sorted { $0.provider.rawValue < $1.provider.rawValue }
+    }
+
+    public func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        await fetchGrokUsage(request)
     }
 
     private func withProviderTimeout(
@@ -522,15 +651,52 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         return nil
     }
 
-    /// Grok weekly credit usage is written by the shell to
-    /// `~/.grok/logs/unified.jsonl` (`billing: fetched credits config`).
-    /// Headless `/usage` does not return a machine-readable account probe, so
-    /// we read the freshest local billing snapshot (same source the TUI uses).
+    /// Grok weekly credits: live CLI billing API first (same host the Grok
+    /// Usage UI uses), then `~/.grok/logs/unified.jsonl`. A failed probe returns
+    /// nil so the last known percent is kept instead of painting 0%.
     private func fetchGrokUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        if let live = await fetchGrokCreditsAPI(request) {
+            return live
+        }
         let url = request.grokBillingLogURL
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".grok/logs/unified.jsonl")
         return AssistantAccountUsageParser.grokFromBillingLogFile(at: url)
+    }
+
+    private func fetchGrokCreditsAPI(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        guard let authFile = request.grokAuthFileURL,
+              let token = AssistantAccountUsageParser.grokAccessToken(fromAuthFile: authFile) else {
+            return nil
+        }
+        let endpoint = request.grokCreditsAPIURL
+            ?? TokenSaverAccountUsageRefreshRequest.defaultGrokCreditsAPIURL
+        guard let payload = await fetchGrokCreditsJSON(endpoint: endpoint, token: token) else {
+            return nil
+        }
+        return AssistantAccountUsageParser.grokBillingJSON(payload)
+    }
+
+    private func fetchGrokCreditsJSON(endpoint: URL, token: String) async -> [String: Any]? {
+        if let grokCreditsFetcher {
+            return await grokCreditsFetcher(endpoint, token)
+        }
+        var request = URLRequest(url: endpoint, timeoutInterval: min(10, max(2, timeoutSeconds)))
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("xai-grok-cli", forHTTPHeaderField: "X-XAI-Token-Auth")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            return object
+        } catch {
+            return nil
+        }
     }
 
     private func runClaudeUsageScreen(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {

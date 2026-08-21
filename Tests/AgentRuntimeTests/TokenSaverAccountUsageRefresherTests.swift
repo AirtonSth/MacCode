@@ -166,6 +166,129 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
                        "default scan window must still find creditUsagePercent past the old 512KB limit")
     }
 
+    func test_grokBillingJSON_prefersGrokBuildProductPercentOverSharedCredits() {
+        // WHY: Grok's Usage UI labels the weekly bar "Grok Build". Painting the
+        // shared-pool percent (or 0% after a log miss) while SuperGrok shows 31%
+        // is the complaint this probe exists to close.
+        let payload: [String: Any] = [
+            "config": [
+                "creditUsagePercent": 10.0,
+                "productUsage": [
+                    ["product": "GrokChat"],
+                    ["product": "Grok Build", "usagePercent": 31.0],
+                    ["product": "Api", "usagePercent": 44.0]
+                ],
+                "currentPeriod": [
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "end": "2099-08-26T16:16:03Z"
+                ]
+            ]
+        ]
+        let usage = AssistantAccountUsageParser.grokBillingJSON(payload)
+        XCTAssertEqual(usage?.weeklyUsedPercent, 31)
+        XCTAssertNotNil(usage?.weeklyResetsAtMs)
+    }
+
+    func test_grokBillingJSON_usesLiveCreditsAPIShapeWithoutLogMessage() {
+        let payload: [String: Any] = [
+            "config": [
+                "creditUsagePercent": 36.0,
+                "currentPeriod": [
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "end": "2099-08-26T16:16:03Z"
+                ]
+            ]
+        ]
+        let usage = AssistantAccountUsageParser.grokBillingJSON(payload)
+        XCTAssertEqual(usage?.provider, .grok)
+        XCTAssertEqual(usage?.weeklyUsedPercent, 36)
+    }
+
+    func test_grokAccessToken_prefersUnexpiredKeyFromIssuerMap() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-grok-auth-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let auth = dir.appendingPathComponent("auth.json")
+        let body: [String: Any] = [
+            "https://auth.x.ai::old": [
+                "key": "expired-token",
+                "expires_at": "2020-01-01T00:00:00Z"
+            ],
+            "https://auth.x.ai::live": [
+                "key": "live-token",
+                "expires_at": "2099-01-01T00:00:00Z"
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: body).write(to: auth)
+        XCTAssertEqual(
+            AssistantAccountUsageParser.grokAccessToken(fromAuthFile: auth),
+            "live-token",
+            "must use the unexpired CLI bearer, never the expired sibling account"
+        )
+    }
+
+    func test_fetchGrokUsage_prefersLiveCreditsAPIOverStaleLog() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-grok-live-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let auth = dir.appendingPathComponent("auth.json")
+        try JSONSerialization.data(withJSONObject: [
+            "https://auth.x.ai::live": ["key": "test-token", "expires_at": "2099-01-01T00:00:00Z"]
+        ]).write(to: auth)
+        let log = dir.appendingPathComponent("unified.jsonl")
+        try #"{"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":10.0,"billingPeriodEnd":"2099-07-22T20:46:41.975270+00:00"}}}"#
+            .write(to: log, atomically: true, encoding: .utf8)
+
+        let refresher = TokenSaverAccountUsageRefresher(
+            timeoutSeconds: 3,
+            grokCreditsFetcher: { _, token in
+                guard token == "test-token" else { return nil }
+                return [
+                    "config": [
+                        "creditUsagePercent": 31.0,
+                        "currentPeriod": [
+                            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                            "end": "2099-08-26T16:16:03Z"
+                        ]
+                    ]
+                ]
+            }
+        )
+        let usage = await refresher.grokAccountUsage(TokenSaverAccountUsageRefreshRequest(
+            grokBillingLogURL: log,
+            grokAuthFileURL: auth
+        ))
+        XCTAssertEqual(usage?.weeklyUsedPercent, 31,
+                       "live credits API must beat a stale billing-log percent so Grok is not stuck at the last CLI snapshot")
+    }
+
+    func test_fetchGrokUsage_keepsLogWhenLiveCreditsAPIFails() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-grok-fallback-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let auth = dir.appendingPathComponent("auth.json")
+        try JSONSerialization.data(withJSONObject: [
+            "https://auth.x.ai::live": ["key": "test-token", "expires_at": "2099-01-01T00:00:00Z"]
+        ]).write(to: auth)
+        let log = dir.appendingPathComponent("unified.jsonl")
+        try #"{"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":42.0,"billingPeriodEnd":"2099-07-22T20:46:41.975270+00:00"}}}"#
+            .write(to: log, atomically: true, encoding: .utf8)
+
+        let refresher = TokenSaverAccountUsageRefresher(
+            timeoutSeconds: 3,
+            grokCreditsFetcher: { _, _ in nil }
+        )
+        let usage = await refresher.grokAccountUsage(TokenSaverAccountUsageRefreshRequest(
+            grokBillingLogURL: log,
+            grokAuthFileURL: auth
+        ))
+        XCTAssertEqual(usage?.weeklyUsedPercent, 42,
+                       "API miss must fall back to the billing log rather than recording 0%")
+    }
+
     func test_claudeUsageScreenParsesInteractiveUsageDialog() {
         let output = """
         Settings  Status Config Usage Stats

@@ -2822,6 +2822,7 @@ public final class AppContext {
             codexBinary: codexBinary?.isEmpty == false ? codexBinary! : "codex",
             claudeBinary: claudeBinary?.isEmpty == false ? claudeBinary! : "claude",
             grokBinary: grokBinary?.isEmpty == false ? grokBinary! : "grok",
+            grokAuthFileURL: Self.defaultGrokAuthFileURL,
             cwd: state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
             environment: [:]
         )
@@ -2879,18 +2880,18 @@ public final class AppContext {
         }
     }
 
-    /// Grok-only account-usage refresh from the local billing log.
+    /// Grok-only account-usage refresh from the live CLI credits API, with the
+    /// local billing log as fallback.
     ///
     /// WHY: Claude/Codex push live `.accountUsage` during a turn. Grok ACP does
     /// not, so the purple weekly ring stayed stale until launch / periodic /
-    /// details-open. Call this after a Grok run finishes (or from
-    /// tests) to re-read `~/.grok/logs/unified.jsonl` without spawning the slow
-    /// Claude/Codex CLI probes. Independent of `tokenSaverAccountUsageRefreshTask`
+    /// details-open. Independent of `tokenSaverAccountUsageRefreshTask`
     /// so a busy full refresh cannot skip Grok.
     ///
     /// - Parameters:
     ///   - reason: telemetry label (`run_finished`, tests, …)
-    ///   - billingLogURL: override for tests; default is the user billing log
+    ///   - billingLogURL: override for tests; default is the user billing log.
+    ///     When set, the live credits API is skipped so tests stay offline.
     public func refreshGrokTokenSaverAccountUsage(
         reason: String,
         billingLogURL: URL? = nil
@@ -2899,14 +2900,20 @@ public final class AppContext {
             publishTokenSaverAccountUsageRefresh(state: "skipped", reason: reason, detail: "signed_out")
             return
         }
-        let url = billingLogURL
+        let logURL = billingLogURL
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".grok/logs/unified.jsonl")
-        publishTokenSaverAccountUsageRefresh(state: "started", reason: reason, detail: "grok_billing_log")
+        let request = TokenSaverAccountUsageRefreshRequest(
+            grokBillingLogURL: logURL,
+            grokAuthFileURL: billingLogURL == nil ? Self.defaultGrokAuthFileURL : nil,
+            cwd: state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
+            environment: [:]
+        )
+        let detail = billingLogURL == nil ? "grok_credits_api" : "grok_billing_log"
+        publishTokenSaverAccountUsageRefresh(state: "started", reason: reason, detail: detail)
+        let refresher = tokenSaverAccountUsageRefresher
         Task { [weak self] in
-            let usage = await Task.detached {
-                AssistantAccountUsageParser.grokFromBillingLogFile(at: url)
-            }.value
+            let usage = await refresher.grokAccountUsage(request)
             await MainActor.run {
                 guard let self else { return }
                 if let usage {
@@ -2931,6 +2938,11 @@ public final class AppContext {
                 }
             }
         }
+    }
+
+    static var defaultGrokAuthFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".grok/auth.json")
     }
 
     static func refreshAccountUsageWithTimeout(
