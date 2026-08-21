@@ -394,7 +394,7 @@ function tokenSaverRecoveryHeaders(env) {
   return headers;
 }
 
-async function postTokenSaverDistill(state, body) {
+async function postTokenSaverRequest(state, body, extraHeaders = {}) {
   if (typeof fetch !== 'function') return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TOKEN_SAVER_HOOK_TIMEOUT_MS);
@@ -404,6 +404,7 @@ async function postTokenSaverDistill(state, body) {
       authorization: `Bearer ${state.authToken}`,
       'content-type': 'application/json',
       ...tokenSaverRecoveryHeaders(current.env),
+      ...extraHeaders,
       'X-RemoteCode-Invocation-ID': invocationID,
       'X-RemoteCode-Operation-ID': `ptuhook1.${invocationID}`,
     };
@@ -415,7 +416,20 @@ async function postTokenSaverDistill(state, body) {
     });
     if (!response.ok) return null;
     const decoded = await response.json();
-    if (typeof decoded.output !== 'string') return null;
+    return decoded;
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function postTokenSaverDistill(state, body) {
+  const decoded = await postTokenSaverRequest(state, body, {
+    'X-RemoteCode-Delivery-Deferred': '1',
+  });
+  if (!decoded || typeof decoded.output !== 'string') return null;
+  try {
     const input = body && typeof body.input === 'string' ? body.input : '';
     const routeStage = decoded.routeStage ?? decoded.route_stage;
     if (!input || routeStage === 'verbatim' || decoded.output === input) return null;
@@ -432,12 +446,39 @@ async function postTokenSaverDistill(state, body) {
     // syntax is not proof: an explicit pipe can fail open and return raw bytes.
     const withReceipt = `${output}\n${tokenSaverAppliedReceipt()}`;
     if (Buffer.byteLength(withReceipt, 'utf8') >= Buffer.byteLength(input, 'utf8')) return null;
-    return withReceipt;
+    const capability = handle;
+    const idempotencyKey = (typeof decoded.recoveryIdempotencyKey === 'string'
+      && decoded.recoveryIdempotencyKey.trim())
+      || (typeof decoded.recovery_idempotency_key === 'string'
+        && decoded.recovery_idempotency_key.trim())
+      || '';
+    const recoveryConfirmations = capability && idempotencyKey
+      ? [{ capability, idempotencyKey }]
+      : [];
+    return { output: withReceipt, routeStage, recoveryConfirmations };
   } catch (_) {
     return null;
-  } finally {
-    clearTimeout(timer);
   }
+}
+
+async function bestEffortRecordTokenSaverSavings(
+  state,
+  candidate,
+  delivered,
+  routeStage,
+  recoveryConfirmations
+) {
+  if (!delivered || delivered === candidate.input) return;
+  await postTokenSaverRequest(state, {
+    ...candidate,
+    id: randomUUID(),
+    recordSavings: true,
+    precomputedOutput: delivered,
+    precomputedRouteStage: routeStage,
+    precomputedRecoveryConfirmations: recoveryConfirmations?.length
+      ? recoveryConfirmations
+      : undefined,
+  });
 }
 
 async function tokenSaverPostToolUse(input) {
@@ -448,7 +489,7 @@ async function tokenSaverPostToolUse(input) {
   if (!decision.shouldCompress) return {};
   const state = loadTokenSaverState();
   if (!state) return {};
-  const output = await postTokenSaverDistill(state, {
+  const candidate = {
     // The sidecar's DistillRequest requires a UUID `id`; without it the POST is
     // rejected 400 and this hook fails open silently — recording zero Token Saver
     // savings for Claude. Always send one so tool-output distillation is counted.
@@ -458,21 +499,21 @@ async function tokenSaverPostToolUse(input) {
     input: rawOutput,
     question: tokenSaverContractQuestion(input.tool_name, input.tool_input, decision.profile),
     provider: current.env.REMOTE_CODE_AGENT_PROVIDER || 'claude',
-    // Savings are measured on the sidecar for the compressed body (before the
-    // client appends [[rc:handle]]). We only apply the replacement when the
-    // marker-inclusive output is still shorter than raw, so the common path is
-    // honest; rare edge cases where the marker tips length are fail-open.
-    recordSavings: true,
+    // Candidate compression is never delivery proof. A separate precomputed-output
+    // request records only the exact receipt/handle-inclusive replacement below.
+    recordSavings: false,
     runMode: 'optimize',
     maxOutputCharacters: Math.max(512, Math.min(rawOutput.length, 48000)),
     cacheState: 'tool_output_hooked',
     reversibleStoreMinBytes: TOKEN_SAVER_STORE_MIN_BYTES,
-  });
+  };
+  const compressed = await postTokenSaverDistill(state, candidate);
+  const output = compressed && compressed.output;
   if (!output || Buffer.byteLength(output, 'utf8') >= Buffer.byteLength(rawOutput, 'utf8')) return {};
   const replaced = replaceToolOutputText(input.tool_response, output);
   // SDK: updatedToolOutput works for built-in tools; updatedMCPToolOutput is
   // MCP-only. Set both so eligible non-Bash output is replaced in either lane.
-  return {
+  const hookOutput = {
     continue: true,
     hookSpecificOutput: {
       hookEventName: 'PostToolUse',
@@ -480,6 +521,16 @@ async function tokenSaverPostToolUse(input) {
       updatedMCPToolOutput: replaced,
     },
   };
+  // The bridge is long-lived, so the best-effort ledger write can run after the
+  // replacement has cleared every gate without delaying Claude's hook response.
+  void bestEffortRecordTokenSaverSavings(
+    state,
+    candidate,
+    output,
+    compressed.routeStage,
+    compressed.recoveryConfirmations
+  );
+  return hookOutput;
 }
 
 function tokenSaverHooks() {

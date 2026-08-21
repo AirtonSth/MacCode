@@ -1985,6 +1985,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           'current',
           'loadTokenSaverState',
           'postTokenSaverDistill',
+          'bestEffortRecordTokenSaverSavings',
           'randomUUID',
           'tokenSaverContractQuestion',
           src.slice(helperStart, helperEnd) + '\\n' + src.slice(hookStart, hookEnd)
@@ -1995,7 +1996,11 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         const hook = factory(
           { env: { RC_TOKEN_SAVER_POST_TOOL_USE: '1', REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
           () => { stateLoads += 1; return { base_url: 'http://127.0.0.1', auth_token: 'tok' }; },
-          async () => { sidecarCalls += 1; return 'DISTILLED_NON_BASH'; },
+          async () => {
+            sidecarCalls += 1;
+            return { output: 'DISTILLED_NON_BASH', routeStage: 'deterministic', recoveryConfirmations: [] };
+          },
+          async () => {},
           () => '123e4567-e89b-12d3-a456-426614174000',
           () => 'contract'
         );
@@ -2117,7 +2122,13 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         decoded = { output: 'x', routeStage: 'deterministic' };
         const noNetShrink = await post(state, { id: 'five', input: 'tiny' });
 
-        console.log(JSON.stringify({ lossless, lossy, unchanged, verbatim, noNetShrink }));
+        console.log(JSON.stringify({
+          lossless: lossless?.output,
+          lossy: lossy?.output,
+          unchanged,
+          verbatim,
+          noNetShrink
+        }));
         """#
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc-sdk-distill-receipt-\(UUID().uuidString).mjs")
@@ -2143,6 +2154,155 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(json["unchanged"] is NSNull)
         XCTAssertTrue(json["verbatim"] is NSNull)
         XCTAssertTrue(json["noNetShrink"] is NSNull)
+    }
+
+    func test_agentSDKBridgePostToolUse_recordsOnlyExactAcceptedReplacement() throws {
+        let node = try XCTUnwrap(
+            ProcessLocator.resolve("node"),
+            "node is required for the bridge delivered-savings contract test"
+        )
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+
+        // WHY: the compression POST precedes the receipt-inclusive client gate.
+        // It must be accounting-disabled; only an accepted updatedToolOutput may
+        // enqueue one precomputed-output POST with those exact provider-visible bytes.
+        let harness = #"""
+        import { readFileSync } from 'fs';
+        import { randomBytes, randomUUID } from 'crypto';
+        const src = readFileSync(process.argv[2], 'utf8');
+        const start = src.indexOf('function tokenSaverAppliedReceipt');
+        const end = src.indexOf('function tokenSaverHooks');
+        if (start < 0 || end < 0) throw new Error('bridge delivered-savings slice not found');
+
+        let scenario = 'accepted';
+        let requests = [];
+        let deferredHeaders = [];
+        const fakeFetch = async (_url, options) => {
+          const body = JSON.parse(options.body);
+          requests.push(body);
+          deferredHeaders.push(options.headers['X-RemoteCode-Delivery-Deferred'] || null);
+          if (body.recordSavings === true) {
+            return { ok: true, json: async () => ({
+              output: body.precomputedOutput,
+              routeStage: body.precomputedRouteStage
+            }) };
+          }
+          if (scenario === 'accepted') {
+            return { ok: true, json: async () => ({
+              output: 'BUILD FAILED: 3 errors',
+              originalHandle: 'rcv1.ABCDEFGHIJKLMNOPQRSTUV',
+              recoveryIdempotencyKey: 'recovery-key',
+              routeStage: 'llm_mlx'
+            }) };
+          }
+          return { ok: true, json: async () => ({
+            output: 'x'.repeat(Buffer.byteLength(body.input, 'utf8') - 1),
+            routeStage: 'deterministic'
+          }) };
+        };
+        const factory = new Function(
+          'current',
+          'fetch',
+          'randomUUID',
+          'randomBytes',
+          'fs',
+          'TOKEN_SAVER_HOOK_TIMEOUT_MS',
+          'TOKEN_SAVER_MIN_BYTES',
+          'TOKEN_SAVER_MIN_LINES',
+          'TOKEN_SAVER_STORE_MIN_BYTES',
+          src.slice(start, end) + '\nreturn tokenSaverPostToolUse;'
+        );
+        const hook = factory(
+          { env: {
+            RC_TOKEN_SAVER_POST_TOOL_USE: '1',
+            REMOTE_CODE_AGENT_PROVIDER: 'claude',
+            REMOTE_CODE_DISTILL_STATE_PATH: '/tmp/state.json'
+          } },
+          fakeFetch,
+          randomUUID,
+          randomBytes,
+          { readFileSync: () => JSON.stringify({ base_url: 'http://127.0.0.1', auth_token: 'tok' }) },
+          100,
+          1024,
+          10,
+          2048
+        );
+        const raw = Array.from({ length: 80 }, (_, i) => `diagnostic line ${i}`).join('\n');
+        const envelope = () => ({
+          hook_event_name: 'PostToolUse',
+          tool_name: 'WebFetch',
+          tool_input: { url: 'https://example.invalid/noisy' },
+          tool_response: raw,
+        });
+
+        const accepted = await hook(envelope());
+        await Promise.resolve();
+        const acceptedRequests = requests.splice(0);
+        const acceptedDeferredHeaders = deferredHeaders.splice(0);
+        scenario = 'rejected';
+        const rejected = await hook(envelope());
+        await Promise.resolve();
+        const rejectedRequests = requests.splice(0);
+        const rejectedDeferredHeaders = deferredHeaders.splice(0);
+        console.log(JSON.stringify({
+          accepted,
+          acceptedRequests,
+          acceptedDeferredHeaders,
+          rejected,
+          rejectedRequests,
+          rejectedDeferredHeaders
+        }));
+        """#
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-sdk-delivered-savings-\(UUID().uuidString).mjs")
+        try harness.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [tmp.path, bridge.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
+        let data = try XCTUnwrap(out.data(using: .utf8))
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        let accepted = try XCTUnwrap(json["accepted"] as? [String: Any])
+        let acceptedHook = try XCTUnwrap(accepted["hookSpecificOutput"] as? [String: Any])
+        let updated = try XCTUnwrap(acceptedHook["updatedToolOutput"] as? String)
+        XCTAssertTrue(updated.contains("[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"))
+        XCTAssertNotNil(updated.range(of: #"\[\[rcd:v1\.[A-Za-z0-9_-]{22}\]\]$"#, options: .regularExpression))
+        let acceptedRequests = try XCTUnwrap(json["acceptedRequests"] as? [[String: Any]])
+        XCTAssertEqual(acceptedRequests.count, 2)
+        XCTAssertEqual(acceptedRequests[0]["recordSavings"] as? Bool, false)
+        XCTAssertNil(acceptedRequests[0]["precomputedOutput"])
+        XCTAssertEqual(acceptedRequests[1]["recordSavings"] as? Bool, true)
+        XCTAssertEqual(acceptedRequests[1]["precomputedOutput"] as? String, updated)
+        XCTAssertEqual(acceptedRequests[1]["precomputedRouteStage"] as? String, "llm_mlx")
+        let confirmations = try XCTUnwrap(
+            acceptedRequests[1]["precomputedRecoveryConfirmations"] as? [[String: Any]]
+        )
+        XCTAssertEqual(confirmations.count, 1)
+        XCTAssertEqual(confirmations[0]["capability"] as? String, "rcv1.ABCDEFGHIJKLMNOPQRSTUV")
+        XCTAssertEqual(confirmations[0]["idempotencyKey"] as? String, "recovery-key")
+        let acceptedDeferredHeaders = try XCTUnwrap(json["acceptedDeferredHeaders"] as? [Any])
+        XCTAssertEqual(acceptedDeferredHeaders.first as? String, "1")
+        XCTAssertTrue(acceptedDeferredHeaders.last is NSNull)
+
+        XCTAssertEqual((json["rejected"] as? [String: Any])?.count, 0)
+        let rejectedRequests = try XCTUnwrap(json["rejectedRequests"] as? [[String: Any]])
+        XCTAssertEqual(rejectedRequests.count, 1)
+        XCTAssertEqual(rejectedRequests[0]["recordSavings"] as? Bool, false)
+        XCTAssertFalse(rejectedRequests.contains { $0["recordSavings"] as? Bool == true })
+        XCTAssertEqual(json["rejectedDeferredHeaders"] as? [String], ["1"])
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {

@@ -1197,7 +1197,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private func tryScopedLossyCommandOutput(
         request: DistillRequest,
         scopedContext: TokenSaverRecoveryRequestContext?,
-        scopedRecoveryStore: TokenSaverScopedRecoveryStoring?
+        scopedRecoveryStore: TokenSaverScopedRecoveryStoring?,
+        deferDeliveryConfirmation: Bool
     ) async -> DistillResponse? {
         guard request.mode == .commandOutput,
               request.effectiveRunMode == .optimize,
@@ -1241,13 +1242,15 @@ public final class DistillHTTPServer: @unchecked Sendable {
             ), routed.output != input else {
                 return nil
             }
-            guard try scopedRecoveryStore.markDelivered(
-                capability: preparation.capability,
-                idempotencyKey: preparation.idempotencyKey,
-                context: scopedContext,
-                outcome: .sentUnknown
-            ) else {
-                return nil
+            if !deferDeliveryConfirmation {
+                guard try scopedRecoveryStore.markDelivered(
+                    capability: preparation.capability,
+                    idempotencyKey: preparation.idempotencyKey,
+                    context: scopedContext,
+                    outcome: .sentUnknown
+                ) else {
+                    return nil
+                }
             }
             let inputTokens = TokenEstimator.estimate(input)
             let outputTokens = TokenEstimator.estimate(routed.output)
@@ -1421,6 +1424,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         }
         do {
             let distillRequest = try decoder.decode(DistillRequest.self, from: request.body)
+            let deferDeliveryConfirmation = request.headers["x-remotecode-delivery-deferred"] == "1"
             // Prefer scoped recovery header; empty for bare CLI pipes.
             let savingsThreadID = (request.headers["x-remotecode-thread-id"] ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1439,6 +1443,44 @@ public final class DistillHTTPServer: @unchecked Sendable {
             // delta via onSuccess and skip the model/scheduler entirely — mirror the
             // terminal-recovery early-return below (build response, onSuccess, 200).
             if let response = distillRequest.responseUsingPrecomputedOutput() {
+                if let confirmations = distillRequest.precomputedRecoveryConfirmations,
+                   !confirmations.isEmpty {
+                    guard let scopedRecoveryStore,
+                          let context = recoveryContext(headers: request.headers, requiresOperationID: false),
+                          confirmations.allSatisfy({ confirmation in
+                              !confirmation.capability.isEmpty
+                                  && !confirmation.idempotencyKey.isEmpty
+                                  && response.output.contains("[[rc:\(confirmation.capability)]]")
+                          }) else {
+                        send(
+                            status: 409,
+                            body: ErrorBody(
+                                error: "recovery_delivery_confirmation_failed",
+                                message: "scoped recovery confirmation is invalid"
+                            ),
+                            connection: connection
+                        )
+                        return
+                    }
+                    for confirmation in confirmations {
+                        guard (try? scopedRecoveryStore.markDelivered(
+                            capability: confirmation.capability,
+                            idempotencyKey: confirmation.idempotencyKey,
+                            context: context,
+                            outcome: .sentUnknown
+                        )) == true else {
+                            send(
+                                status: 409,
+                                body: ErrorBody(
+                                    error: "recovery_delivery_confirmation_failed",
+                                    message: "scoped recovery confirmation was not recorded"
+                                ),
+                                connection: connection
+                            )
+                            return
+                        }
+                    }
+                }
                 if distillRequest.mode == .commandOutput, response.output != distillRequest.input {
                     await metrics.recordToolOutputCompressed()
                 }
@@ -1496,7 +1538,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
             if let early = await tryScopedLossyCommandOutput(
                 request: distillRequest,
                 scopedContext: scopedContext,
-                scopedRecoveryStore: scopedRecoveryStore
+                scopedRecoveryStore: scopedRecoveryStore,
+                deferDeliveryConfirmation: deferDeliveryConfirmation
             ) {
                 if distillRequest.mode == .commandOutput {
                     await metrics.recordToolOutputCompressed()
@@ -1551,14 +1594,18 @@ public final class DistillHTTPServer: @unchecked Sendable {
                               try scopedRecoveryStore.retrieveOriginal(
                                 capability: preparation.capability,
                                 context: scopedContext
-                              ) == originalBytes,
-                              try scopedRecoveryStore.markDelivered(
+                              ) == originalBytes else {
+                            throw DistillError.invalidOutput
+                        }
+                        if !deferDeliveryConfirmation {
+                            guard try scopedRecoveryStore.markDelivered(
                                 capability: preparation.capability,
                                 idempotencyKey: preparation.idempotencyKey,
                                 context: scopedContext,
                                 outcome: .sentUnknown
-                              ) else {
-                            throw DistillError.invalidOutput
+                            ) else {
+                                throw DistillError.invalidOutput
+                            }
                         }
                         response = compressed.withOriginalHandle(
                             preparation.capability,

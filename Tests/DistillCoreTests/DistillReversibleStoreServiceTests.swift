@@ -63,11 +63,20 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
 
         func markDelivered(capability: String, idempotencyKey: String, context: TokenSaverRecoveryRequestContext, outcome: TokenSaverScopedDeliveryOutcome) throws -> Bool {
             lock.lock(); defer { lock.unlock() }
-            guard var record = records[context.invocationID], record.capability == capability,
-                  idempotencyKey == context.invocationID, outcome == .sentUnknown else { return false }
+            guard let originalInvocationID = records.first(where: { _, record in
+                record.capability == capability
+                    && idempotencyKey == record.context.invocationID
+                    && context.workspaceID == record.context.workspaceID
+                    && context.projectID == record.context.projectID
+                    && context.threadID == record.context.threadID
+                    && context.provider == record.context.provider
+                    && context.attemptID == record.context.attemptID
+            })?.key,
+                  var record = records[originalInvocationID],
+                  outcome == .sentUnknown else { return false }
             record.state = .delivered
             record.outcome = outcome
-            records[context.invocationID] = record
+            records[originalInvocationID] = record
             return true
         }
 
@@ -81,6 +90,12 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         var preparationCount: Int {
             lock.lock(); defer { lock.unlock() }
             return records.count
+        }
+
+        func invocationState(_ invocationID: String) -> TokenSaverScopedInvocationState? {
+            lock.lock(); defer { lock.unlock() }
+            guard let record = records[invocationID] else { return nil }
+            return .init(state: record.state, transportOutcome: record.outcome)
         }
     }
     /// In-memory CCR store for the HTTP boundary test (no Persistence dependency).
@@ -410,6 +425,114 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         let incomplete = await incompleteCLI.run()
         XCTAssertEqual(incomplete.exitCode, 0)
         XCTAssertEqual(incomplete.stdout, incompleteInput)
+    }
+
+    func test_deferredClientDeliveryStaysPreparedUntilReceiptInclusiveConfirmation() async throws {
+        // WHY: the CLI may reject a sidecar candidate after adding the recovery
+        // marker and applied receipt. The candidate response must leave recovery
+        // prepared/not-sent; only the exact accepted payload may mark it delivered.
+        let store = InMemoryScopedStore()
+        let configuration = try DistillServiceConfiguration(
+            authToken: "deferred-delivery-token",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 2),
+            scopedRecoveryStore: store
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let invocationID = "deferred-invocation"
+        let headers = [
+            "X-RemoteCode-Workspace-ID": "workspace",
+            "X-RemoteCode-Project-ID": "project",
+            "X-RemoteCode-Thread-ID": "thread",
+            "X-RemoteCode-Provider": "codex",
+            "X-RemoteCode-Attempt-ID": "attempt",
+            "X-RemoteCode-Invocation-ID": invocationID,
+            "X-RemoteCode-Operation-ID": invocationID,
+            "X-RemoteCode-Delivery-Deferred": "1",
+        ]
+        let original = String(repeating: "byte exact provider input line\n", count: 80)
+        let candidate = DistillRequest(
+            mode: .commandOutput,
+            input: original,
+            provider: "codex",
+            recordSavings: false,
+            runMode: .optimize
+        )
+        let candidateHTTP = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "deferred-delivery-token",
+            body: try JSONEncoder().encode(candidate),
+            headers: headers
+        )
+        XCTAssertEqual(candidateHTTP.status, 200)
+        let candidateResponse = try JSONDecoder().decode(DistillResponse.self, from: candidateHTTP.data)
+        let capability = try XCTUnwrap(candidateResponse.originalHandle)
+        let idempotencyKey = try XCTUnwrap(candidateResponse.recoveryIdempotencyKey)
+        XCTAssertEqual(store.invocationState(invocationID)?.state, .prepared)
+        XCTAssertEqual(store.invocationState(invocationID)?.transportOutcome, .notSent)
+
+        var delivered = candidateResponse.output
+        if !delivered.contains("[[rc:\(capability)]]") {
+            delivered += "\n[[rc:\(capability)]]"
+        }
+        delivered += "\n\(DistillAppliedReceipt.makeMarker())\n"
+        XCTAssertLessThan(delivered.utf8.count, original.utf8.count)
+        let confirmation = DistillRequest(
+            mode: .commandOutput,
+            input: original,
+            provider: "codex",
+            recordSavings: true,
+            runMode: .optimize,
+            precomputedOutput: delivered,
+            precomputedRouteStage: candidateResponse.routeStage,
+            precomputedRecoveryConfirmations: [
+                .init(capability: capability, idempotencyKey: idempotencyKey),
+            ]
+        )
+        var confirmationHeaders = headers
+        confirmationHeaders.removeValue(forKey: "X-RemoteCode-Delivery-Deferred")
+        confirmationHeaders["X-RemoteCode-Invocation-ID"] = "\(invocationID).delivered"
+        confirmationHeaders["X-RemoteCode-Operation-ID"] = "delivered-ledger"
+        let invalidConfirmation = DistillRequest(
+            mode: .commandOutput,
+            input: original,
+            provider: "codex",
+            recordSavings: true,
+            runMode: .optimize,
+            precomputedOutput: "X\n\(DistillAppliedReceipt.makeMarker())\n",
+            precomputedRouteStage: candidateResponse.routeStage,
+            precomputedRecoveryConfirmations: [
+                .init(capability: capability, idempotencyKey: idempotencyKey),
+            ]
+        )
+        let invalidHTTP = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "deferred-delivery-token",
+            body: try JSONEncoder().encode(invalidConfirmation),
+            headers: confirmationHeaders
+        )
+        XCTAssertEqual(invalidHTTP.status, 409)
+        XCTAssertEqual(store.invocationState(invocationID)?.state, .prepared)
+
+        let confirmationHTTP = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "deferred-delivery-token",
+            body: try JSONEncoder().encode(confirmation),
+            headers: confirmationHeaders
+        )
+        XCTAssertEqual(confirmationHTTP.status, 200)
+        let echoed = try JSONDecoder().decode(DistillResponse.self, from: confirmationHTTP.data)
+        XCTAssertEqual(echoed.output, delivered)
+        XCTAssertEqual(store.invocationState(invocationID)?.state, .delivered)
+        XCTAssertEqual(store.invocationState(invocationID)?.transportOutcome, .sentUnknown)
     }
 
     func test_scopedUnchangedCandidateLeavesNoRecoveryRecord() async throws {

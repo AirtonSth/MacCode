@@ -487,7 +487,8 @@ final class DistillServiceTests: XCTestCase {
             recordSavings: true,
             cacheState: "wave_prepass_A",
             maxOutputCharacters: 4000,
-            precomputedOutput: delivered
+            precomputedOutput: delivered,
+            precomputedRouteStage: .llmMLX
         )
         let body = try JSONEncoder().encode(request)
         let distill = try await response(
@@ -500,7 +501,7 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(distill.status, 200)
         let decoded = try JSONDecoder().decode(DistillResponse.self, from: distill.data)
         XCTAssertEqual(decoded.output, delivered, "response must echo client precomputed output")
-        XCTAssertEqual(decoded.routeStage, .deterministic)
+        XCTAssertEqual(decoded.routeStage, .llmMLX)
         XCTAssertEqual(decoded.inputTokens, TokenEstimator.estimate(original))
         XCTAssertEqual(decoded.outputTokens, TokenEstimator.estimate(delivered))
 
@@ -509,6 +510,8 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(records.count, 1, "exactly one ledger row (no double-count)")
         XCTAssertEqual(record.provider, "claude")
         XCTAssertEqual(record.cacheState, "wave_prepass_A")
+        XCTAssertEqual(record.routeStage, .llmMLX)
+        XCTAssertEqual(record.mode, "command-output (model)")
         XCTAssertEqual(
             record.savedTokens,
             max(TokenEstimator.estimate(original) - TokenEstimator.estimate(delivered), 0)

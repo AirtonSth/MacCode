@@ -136,7 +136,7 @@ public struct ManagedDistillCLI: Sendable {
     }
 
     /// Result of a CLI invocation. `deferredSideEffect` is optional best-effort
-    /// work (Wave A ledger write) that must not delay delivery of `stdout` when
+    /// work (delivered-savings ledger write) that must not delay delivery of `stdout` when
     /// the executable can flush stdout first (see `runResult` + service main).
     public struct RunResult: Sendable {
         public let stdout: Data
@@ -155,7 +155,7 @@ public struct ManagedDistillCLI: Sendable {
     }
 
     /// Full result including optional post-stdout side effects. Preferred by the
-    /// executable so Wave A ledger POSTs do not delay the pipe consumer.
+    /// executable so delivered-savings ledger POSTs do not delay the pipe consumer.
     public func runResult() async -> RunResult {
         if arguments.first == "retrieve" {
             let (out, code) = await retrieve(handle: arguments.dropFirst().first ?? "")
@@ -223,7 +223,8 @@ public struct ManagedDistillCLI: Sendable {
 
     /// Claude PostToolUse hook handler. Reads Claude's hook JSON on stdin
     /// (`tool_name` / `tool_input` / `tool_response` / `hook_event_name`), compresses
-    /// the tool output via the existing `/v1/distill` path with `recordSavings: true`,
+    /// the tool output via the existing `/v1/distill` path, then records savings only
+    /// after the complete replacement clears every client gate,
     /// and emits `hookSpecificOutput.updatedToolOutput` on success.
     ///
     /// ANY failure (malformed input, sidecar down, non-shrink, admission off) yields
@@ -374,7 +375,7 @@ public struct ManagedDistillCLI: Sendable {
         // sidecar model stage (and ledger as command-output (model)), not only a
         // tiny deterministic head. Floor stays 512.
         let maxChars = max(512, min(rawOutput.count, 48_000))
-        // Nested CLI reuses the same compress + recordSavings path (including Wave A).
+        // Nested CLI reuses the same compress + deferred delivered-savings path.
         let nested = ManagedDistillCLI(
             arguments: [question],
             stdin: Data(rawOutput.utf8),
@@ -395,7 +396,7 @@ public struct ManagedDistillCLI: Sendable {
         // A nested successful compression carries its own trailing receipt. Preserve it
         // in updatedToolOutput; fail-open returns the exact raw bytes with no receipt.
         let nestedInput = Data(rawOutput.utf8)
-        let compressed = Self.stripTrailingNewlines(String(decoding: nestedResult.stdout, as: UTF8.self))
+        let compressed = String(decoding: nestedResult.stdout, as: UTF8.self)
         guard !compressed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               nestedResult.stdout != nestedInput,
               DistillAppliedReceipt.containsMarker(compressed),
@@ -568,30 +569,31 @@ public struct ManagedDistillCLI: Sendable {
             FileHandle.standardError.write(Data(
                 "rc-wave-prepass wave=\(pre.waveID) trigger=\(pre.trigger) saved_bytes=\(pre.savedBytes) frac=\(String(format: "%.3f", pre.savedFraction))\n".utf8
             ))
-            // Compressed bytes are ready now. Ledger write is a deferred side-effect
-            // via the same /v1/distill recordSavings path the normal compress path
-            // uses — never a gate. Exactly one POST; we do not fall through to
-            // normal compress (no double-count).
+            // Compressed bytes are ready now. Record only the exact receipt-inclusive
+            // bytes that passed the final client gate; never the smaller prepass body.
             let recordOriginal = input
             let recordPrompt = prompt
             let recordPre = pre
+            let delivered = String(decoding: compressed, as: UTF8.self)
             let recordSelf = self
             return RunResult(
                 stdout: compressed,
                 exitCode: 0,
                 deferredSideEffect: {
-                    await recordSelf.bestEffortRecordPrepassSavings(
+                    await recordSelf.bestEffortRecordDeliveredSavings(
                         original: recordOriginal,
                         prompt: recordPrompt,
-                        pre: recordPre
+                        delivered: delivered,
+                        cacheState: "wave_prepass_\(recordPre.waveID)",
+                        routeStage: .deterministic,
+                        invocationSuffix: "wave-prepass"
                     )
                 }
             )
         }
 
         if ManagedDistillCLI.exceedsStdinCap(byteCount: stdin.count, cap: ManagedDistillCLI.stdinCapBytes) {
-            let (out, code) = await compressChunks(input: input, prompt: prompt)
-            return RunResult(stdout: out, exitCode: code)
+            return await compressChunks(input: input, prompt: prompt)
         }
         guard let state, let url = URL(string: state.baseURL + "/v1/distill") else { return failOpen() }
 
@@ -601,7 +603,7 @@ public struct ManagedDistillCLI: Sendable {
             input: input,
             question: prompt.isEmpty ? nil : prompt,
             provider: provider,
-            recordSavings: true,
+            recordSavings: false,
             maxOutputCharacters: maxOutputCharacters,
             reversibleStoreMinBytes: reversibleStoreMinBytes
         )
@@ -612,6 +614,7 @@ public struct ManagedDistillCLI: Sendable {
         urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         applyRecoveryScope(to: &urlRequest)
+        urlRequest.setValue("1", forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred")
         urlRequest.setValue(invocationID, forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
         urlRequest.setValue(Self.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
         urlRequest.httpBody = body
@@ -630,24 +633,45 @@ public struct ManagedDistillCLI: Sendable {
         guard let emitted = Self.receiptedCompression(original: stdin, transformed: out) else {
             return failOpen()
         }
-        return RunResult(stdout: emitted, exitCode: 0)
+        let delivered = String(decoding: emitted, as: UTF8.self)
+        let recoveryConfirmations = Self.recoveryConfirmations(response)
+        let recordSelf = self
+        return RunResult(
+            stdout: emitted,
+            exitCode: 0,
+            deferredSideEffect: {
+                await recordSelf.bestEffortRecordDeliveredSavings(
+                    original: input,
+                    prompt: prompt,
+                    delivered: delivered,
+                    cacheState: nil,
+                    routeStage: response.routeStage,
+                    recoveryConfirmations: recoveryConfirmations,
+                    invocationSuffix: "delivered"
+                )
+            }
+        )
     }
 
     /// Fire one `/v1/distill` POST with `recordSavings: true` and client-supplied
-    /// `precomputedOutput` so the sidecar records the honest original→`pre.output`
+    /// `precomputedOutput` so the sidecar records the honest original→provider-visible
     /// delta via `DistillSavingsCalculator.record` without re-running compression.
     ///
-    /// Response body is discarded — the caller already holds `pre.output`. One bounded
+    /// Response body is discarded — the caller already holds `delivered`. One bounded
     /// retry covers a transient hiccup (e.g. the resident sidecar mid-restart); a final
     /// failure is logged to stderr (wave id + byte count only, never prompt/output
     /// content) so a dropped ledger write is observable instead of vanishing silently.
     /// Still never gates compressed delivery either way.
-    private func bestEffortRecordPrepassSavings(
+    private func bestEffortRecordDeliveredSavings(
         original: String,
         prompt: String,
-        pre: TokenSaverWaveLosslessPrepass.Result
+        delivered: String,
+        cacheState: String?,
+        routeStage: TokenSaverRouteStage?,
+        recoveryConfirmations: [DistillRecoveryDeliveryConfirmation] = [],
+        invocationSuffix: String
     ) async {
-        guard pre.savedBytes > 0 else { return }
+        guard delivered != original else { return }
         guard distillAdmission() else { return }
         guard let state, let url = URL(string: state.baseURL + "/v1/distill") else { return }
 
@@ -658,10 +682,12 @@ public struct ManagedDistillCLI: Sendable {
             question: prompt.isEmpty ? nil : prompt,
             provider: provider,
             recordSavings: true,
-            cacheState: "wave_prepass_\(pre.waveID)",
+            cacheState: cacheState,
             maxOutputCharacters: maxOutputCharacters,
             reversibleStoreMinBytes: reversibleStoreMinBytes,
-            precomputedOutput: pre.output
+            precomputedOutput: delivered,
+            precomputedRouteStage: routeStage,
+            precomputedRecoveryConfirmations: recoveryConfirmations.isEmpty ? nil : recoveryConfirmations
         )
         guard let body = Self.canonicalBody(request) else { return }
 
@@ -670,9 +696,9 @@ public struct ManagedDistillCLI: Sendable {
         urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         applyRecoveryScope(to: &urlRequest)
-        // Distinct invocation suffix so a later full-compress of the same bytes (if any)
-        // cannot collide on idempotency with this savings-only prepass record.
-        urlRequest.setValue("\(invocationID).wave-prepass", forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
+        // Distinct invocation suffix prevents the candidate compression and its
+        // delivered-savings record from colliding on idempotency.
+        urlRequest.setValue("\(invocationID).\(invocationSuffix)", forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
         urlRequest.setValue(
             Self.recoveryOperationID(kind: "distill", canonicalPayload: body),
             forHTTPHeaderField: "X-RemoteCode-Operation-ID"
@@ -691,7 +717,7 @@ public struct ManagedDistillCLI: Sendable {
             }
         }
         FileHandle.standardError.write(Data(
-            "rc-wave-prepass ledger-post-failed wave=\(pre.waveID) saved_bytes=\(pre.savedBytes)\n".utf8
+            "rc-distill ledger-post-failed delivered_bytes=\(delivered.utf8.count)\n".utf8
         ))
     }
 
@@ -718,14 +744,18 @@ public struct ManagedDistillCLI: Sendable {
         return DistillSavingsCalculator.record(for: request, response: response)
     }
 
-    private func compressChunks(input: String, prompt: String) async -> (Data, Int32) {
-        func failOpen() -> (Data, Int32) { (stdin, 0) }
+    private func compressChunks(input: String, prompt: String) async -> RunResult {
+        func failOpen() -> RunResult { RunResult(stdout: stdin, exitCode: 0) }
         guard let state, let url = URL(string: state.baseURL + "/v1/distill") else { return failOpen() }
         let chunks = Self.utf8Chunks(input, maxBytes: Self.stdinCapBytes)
         guard chunks.count > 1 else { return failOpen() }
 
         var emitted: [String] = []
+        var routeStages: [TokenSaverRouteStage] = []
+        var recoveryConfirmations: [DistillRecoveryDeliveryConfirmation] = []
         emitted.reserveCapacity(chunks.count)
+        routeStages.reserveCapacity(chunks.count)
+        recoveryConfirmations.reserveCapacity(chunks.count)
         for (offset, chunk) in chunks.enumerated() {
             let question = Self.chunkQuestion(prompt: prompt, index: offset + 1, count: chunks.count)
             let request = DistillRequest(
@@ -734,7 +764,7 @@ public struct ManagedDistillCLI: Sendable {
                 input: chunk,
                 question: question,
                 provider: provider,
-                recordSavings: true,
+                recordSavings: false,
                 maxOutputCharacters: maxOutputCharacters,
                 reversibleStoreMinBytes: reversibleStoreMinBytes
             )
@@ -744,6 +774,7 @@ public struct ManagedDistillCLI: Sendable {
             urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
             applyRecoveryScope(to: &urlRequest)
+            urlRequest.setValue("1", forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred")
             urlRequest.setValue("\(invocationID).chunk-\(offset + 1)", forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
             urlRequest.setValue(Self.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
             urlRequest.httpBody = body
@@ -760,6 +791,10 @@ public struct ManagedDistillCLI: Sendable {
                 out += "\n[[rc:\(handle)]]"
             }
             emitted.append(out)
+            if let routeStage = response.routeStage {
+                routeStages.append(routeStage)
+            }
+            recoveryConfirmations.append(contentsOf: Self.recoveryConfirmations(response))
         }
         guard let output = Self.receiptedCompression(
             original: stdin,
@@ -767,7 +802,42 @@ public struct ManagedDistillCLI: Sendable {
         ) else {
             return failOpen()
         }
-        return (output, 0)
+        let delivered = String(decoding: output, as: UTF8.self)
+        let aggregateRouteStage = Self.aggregateRouteStage(routeStages)
+        let deliveredRecoveryConfirmations = recoveryConfirmations
+        let recordSelf = self
+        return RunResult(
+            stdout: output,
+            exitCode: 0,
+            deferredSideEffect: {
+                await recordSelf.bestEffortRecordDeliveredSavings(
+                    original: input,
+                    prompt: prompt,
+                    delivered: delivered,
+                    cacheState: nil,
+                    routeStage: aggregateRouteStage,
+                    recoveryConfirmations: deliveredRecoveryConfirmations,
+                    invocationSuffix: "chunked-delivered"
+                )
+            }
+        )
+    }
+
+    private static func aggregateRouteStage(_ stages: [TokenSaverRouteStage]) -> TokenSaverRouteStage? {
+        if stages.contains(.llmMLX) { return .llmMLX }
+        if stages.contains(.encoderBERT) { return .encoderBERT }
+        if stages.contains(.deterministic) { return .deterministic }
+        return nil
+    }
+
+    private static func recoveryConfirmations(
+        _ response: DistillResponse
+    ) -> [DistillRecoveryDeliveryConfirmation] {
+        guard let capability = response.originalHandle, !capability.isEmpty,
+              let idempotencyKey = response.recoveryIdempotencyKey, !idempotencyKey.isEmpty else {
+            return []
+        }
+        return [.init(capability: capability, idempotencyKey: idempotencyKey)]
     }
 
     static func utf8Chunks(_ input: String, maxBytes: Int) -> [String] {
