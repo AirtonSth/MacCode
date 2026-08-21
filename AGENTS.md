@@ -6,6 +6,16 @@
 - Do not add browser behavior that only works on one side without updating the other side in the same change.
 - User workflow state must survive closing and reopening RemoteCode. Persist the user's active workspace, panes, selected tabs, browser URLs/titles, surface metadata, agent thread state, and other explicit user choices unless the user intentionally closes/deletes them.
 
+## Isolated sandbox (mandatory)
+
+The user's running RemoteCode (`io.remotecode.desktop`) is off-limits. A git worktree isolates files; it does not isolate bundle id, Application Support, SQLite, port `18217`, or `/tmp/RemoteCode.sock`.
+
+- Create/enter a linked worktree, then edit, build, and test only there: `cd "$(scripts/isolated-sandbox.sh ensure)"`
+- Prove with `scripts/isolated-sandbox.sh test` (optional `--filter …`). Launch a second GUI only via `scripts/isolated-sandbox.sh run`.
+- Never `pkill -x RemoteCode`. Never `osascript` quit `io.remotecode.desktop`. Never `script/build_and_run.sh` or `scripts/run-app.sh` (they package the stable bundle id and quit the host).
+- Do not install or overwrite `~/.local/bin/distill` from the sandbox. Leave Token Saver off on the debug instance.
+- Identity, ports, and App Support live in `scripts/isolated-sandbox.sh`. Ritual: `.grok/skills/isolated-sandbox/SKILL.md`.
+
 ## Shared components
 
 - Reusing components is welcome and encouraged when it is done well. If two surfaces already show the same control (composer chips, popovers, bubbles, live-turn chrome, queued header), extract one component and mount it from both. Do not copy a second SwiftUI implementation just because the caller lives in another file.

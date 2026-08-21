@@ -3461,13 +3461,35 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public var filteredDeskConversations: [BotConversation] {
-        conversations.filter {
+        let matching = conversations.filter {
             AgentChatThreadRailCopy.matches(title: $0.title, query: deskThreadSearchQuery)
+        }
+        let live = liveDeskThreadIDs()
+        return AgentChatThreadRailCopy.orderingActiveFirst(matching) {
+            isDeskConversationRunning($0, liveThreadIDs: live)
         }
     }
 
     public var deskThreadActiveCount: Int {
-        conversations.filter { $0.attentionState == .working }.count
+        let live = liveDeskThreadIDs()
+        return conversations.filter { isDeskConversationRunning($0, liveThreadIDs: live) }.count
+    }
+
+    public func isDeskConversationRunning(_ conversation: BotConversation) -> Bool {
+        isDeskConversationRunning(conversation, liveThreadIDs: liveDeskThreadIDs())
+    }
+
+    private func liveDeskThreadIDs() -> Set<AgentThreadID> {
+        Set(activeThreadIDsOverrideForTesting ?? context.coordinator.activeThreadIdsSnapshot())
+    }
+
+    private func isDeskConversationRunning(
+        _ conversation: BotConversation,
+        liveThreadIDs: Set<AgentThreadID>
+    ) -> Bool {
+        if conversation.attentionState == .working { return true }
+        guard let threadID = conversation.linkedAgentThreadID else { return false }
+        return liveThreadIDs.contains(threadID)
     }
 
     public func clearAllDeskThreads() {
@@ -4047,8 +4069,14 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func stopDeskRun() {
-        guard let threadID = selectedConversation?.linkedAgentThreadID else { return }
-        if isStopping {
+        guard let id = selectedConversation?.id else { return }
+        stopDeskThread(id)
+    }
+
+    public func stopDeskThread(_ conversationID: BotConversationID) {
+        guard let threadID = deskLinkedThreadID(for: conversationID) else { return }
+        let affectsComposer = selectedConversation?.id == conversationID
+        if isStopping, affectsComposer {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 do {
@@ -4067,13 +4095,24 @@ public final class BotsViewModel: ObservableObject {
             }
             return
         }
-        isStopping = true
+        if affectsComposer {
+            isStopping = true
+        }
         do {
             try resolvedRouter()?.stopAgentRun(thread: threadID)
         } catch {
             errorMessage = String(describing: error)
-            isStopping = false
+            if affectsComposer {
+                isStopping = false
+            }
         }
+    }
+
+    private func deskLinkedThreadID(for conversationID: BotConversationID) -> AgentThreadID? {
+        if let selected = selectedConversation, selected.id == conversationID {
+            return selected.linkedAgentThreadID
+        }
+        return conversations.first(where: { $0.id == conversationID })?.linkedAgentThreadID
     }
 
     @discardableResult
@@ -9622,7 +9661,8 @@ public struct BotsRootView: View {
     /// rails must not fork the chrome.
     private func deskThreadRow(_ conversation: BotConversation) -> some View {
         let unread = conversation.unread || conversation.attentionState == .unreadActivity
-        let running = conversation.attentionState == .working
+        let running = vm.isDeskConversationRunning(conversation)
+        let rowID = conversation.id.value.uuidString
         let status: AgentChatThreadStatusMark = {
             if running { return .running }
             if conversation.pinned {
@@ -9647,8 +9687,11 @@ public struct BotsRootView: View {
             unread: unread,
             selected: vm.selectedConversation?.id == conversation.id,
             status: status,
-            identifier: "bots.desk.thread.row.\(conversation.id.value.uuidString)",
+            identifier: "bots.desk.thread.row.\(rowID)",
+            runningIdentifier: "bots.desk.thread.row.running.\(rowID)",
+            stopIdentifier: "bots.desk.thread.row.stop.\(rowID)",
             onSelect: { vm.selectDeskThread(conversation.id) },
+            onStop: running ? { vm.stopDeskThread(conversation.id) } : nil,
             leading: { AgentThreadProviderMonogram(provider: routing.provider) },
             trailing: { EmptyView() }
         )

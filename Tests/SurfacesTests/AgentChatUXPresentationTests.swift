@@ -775,5 +775,40 @@ final class AgentChatUXPresentationTests: XCTestCase {
             chrome.contains("DS.Space.xs - (DSIconButton.hitTargetSize"),
             "Clear All is text; packing 44pt hit boxes against it mashed the cluster"
         )
+        XCTAssertTrue(chrome.contains("AgentChatThreadRowStopChrome"))
+        XCTAssertTrue(chrome.contains(AgentChatThreadRowStopChrome.symbolName))
+    }
+
+    func test_threadRailOrdersActiveFirst_becauseANewIdleRowMustNotBuryALiveRun() {
+        // WHY: dest and Agent App share this sort. Creating or selecting an
+        // idle thread used to insert at index 0 and hide the working spinner.
+        struct Row { let title: String; let running: Bool }
+        let rows = [
+            Row(title: "idle-new", running: false),
+            Row(title: "live", running: true),
+            Row(title: "idle-old", running: false),
+            Row(title: "live-2", running: true),
+        ]
+        XCTAssertEqual(
+            AgentChatThreadRailCopy.orderingActiveFirst(rows, isActive: { $0.running }).map(\.title),
+            ["live", "live-2", "idle-new", "idle-old"]
+        )
+    }
+
+    func test_threadRowStopChromeOnlyWhenRunningWithHandler() {
+        // WHY: the shared row owns the stop.circle; idle rows must not
+        // paint it, and a running row without a handler is not stoppable.
+        XCTAssertTrue(
+            AgentChatThreadRowStopChrome.isVisible(status: .running, hasStopHandler: true)
+        )
+        XCTAssertFalse(
+            AgentChatThreadRowStopChrome.isVisible(status: .running, hasStopHandler: false)
+        )
+        XCTAssertFalse(
+            AgentChatThreadRowStopChrome.isVisible(status: .hidden, hasStopHandler: true)
+        )
+        XCTAssertFalse(
+            AgentChatThreadRowStopChrome.isVisible(status: .unread, hasStopHandler: true)
+        )
     }
 }

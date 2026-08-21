@@ -10,6 +10,20 @@ public enum AgentChatThreadStatusMark: Equatable {
     case symbol(name: String, color: Color, size: CGFloat)
 }
 
+/// One stop affordance for Agent App and dest thread rows.
+public enum AgentChatThreadRowStopChrome {
+    public static let symbolName = "stop.circle"
+    public static let accessibilityLabel = "Stop thread"
+    public static let help = "Stop this thread"
+
+    public static func isVisible(
+        status: AgentChatThreadStatusMark,
+        hasStopHandler: Bool
+    ) -> Bool {
+        status == .running && hasStopHandler
+    }
+}
+
 public struct AgentChatThreadRow<Leading: View, Trailing: View>: View {
     public let title: String
     public let subtitle: String
@@ -20,6 +34,8 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View {
     public let onSelect: () -> Void
     public var unreadIdentifier: String?
     public var runningIdentifier: String?
+    public var stopIdentifier: String?
+    public var onStop: (() -> Void)?
     public var leading: Leading
     public var trailing: Trailing
 
@@ -32,7 +48,9 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View {
         identifier: String,
         unreadIdentifier: String? = nil,
         runningIdentifier: String? = nil,
+        stopIdentifier: String? = nil,
         onSelect: @escaping () -> Void,
+        onStop: (() -> Void)? = nil,
         @ViewBuilder leading: () -> Leading,
         @ViewBuilder trailing: () -> Trailing
     ) {
@@ -44,7 +62,9 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View {
         self.identifier = identifier
         self.unreadIdentifier = unreadIdentifier
         self.runningIdentifier = runningIdentifier
+        self.stopIdentifier = stopIdentifier
         self.onSelect = onSelect
+        self.onStop = onStop
         self.leading = leading()
         self.trailing = trailing()
     }
@@ -81,7 +101,25 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .overlay(alignment: .trailing) { stopControl }
         .accessibilityIdentifier(identifier)
+    }
+
+    @ViewBuilder
+    private var stopControl: some View {
+        if AgentChatThreadRowStopChrome.isVisible(status: status, hasStopHandler: onStop != nil),
+           let onStop {
+            Button(action: onStop) {
+                Image(systemName: AgentChatThreadRowStopChrome.symbolName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(DS.Palette.danger.opacity(0.75))
+            }
+            .buttonStyle(.plain)
+            .padding(.trailing, DS.Space.md)
+            .accessibilityLabel(AgentChatThreadRowStopChrome.accessibilityLabel)
+            .accessibilityIdentifier(stopIdentifier ?? "\(identifier).stop")
+            .help(AgentChatThreadRowStopChrome.help)
+        }
     }
 
     @ViewBuilder
@@ -140,7 +178,9 @@ public extension AgentChatThreadRow where Leading == EmptyView, Trailing == Empt
         identifier: String,
         unreadIdentifier: String? = nil,
         runningIdentifier: String? = nil,
-        onSelect: @escaping () -> Void
+        stopIdentifier: String? = nil,
+        onSelect: @escaping () -> Void,
+        onStop: (() -> Void)? = nil
     ) {
         self.init(
             title: title,
@@ -151,7 +191,9 @@ public extension AgentChatThreadRow where Leading == EmptyView, Trailing == Empt
             identifier: identifier,
             unreadIdentifier: unreadIdentifier,
             runningIdentifier: runningIdentifier,
+            stopIdentifier: stopIdentifier,
             onSelect: onSelect,
+            onStop: onStop,
             leading: { EmptyView() },
             trailing: { EmptyView() }
         )

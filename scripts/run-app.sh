@@ -47,6 +47,8 @@ for pid in $running_pids; do
 done
 # Use the debug build while preserving the existing bundle-id override contract.
 # An explicit caller override still wins.
+# Agents: this default still packages io.remotecode.desktop and can quit the
+# user's host app. Use scripts/isolated-sandbox.sh for an isolated debug GUI.
 RC2_REPLACE_RUNNING_APP=1 \
 RC2_CONFIG=debug \
 ./scripts/package-app.sh

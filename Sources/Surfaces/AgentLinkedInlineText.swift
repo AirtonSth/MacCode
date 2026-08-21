@@ -230,6 +230,18 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
         return tv
     }
 
+    /// SwiftUI proposes a concrete width; we return the wrapped height.
+    /// Measuring here (instead of `layout()` → `invalidateIntrinsicContentSize()`)
+    /// is what stops LazyVStack AttributeGraph from growing without bound.
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        nsView: IntrinsicHeightTextView,
+        context: Context
+    ) -> CGSize {
+        let width = proposal.width ?? nsView.bounds.width
+        return nsView.sizeThatFitsWidth(width)
+    }
+
     func updateNSView(_ tv: IntrinsicHeightTextView, context: Context) {
         // Always refresh routing even when presentation is unchanged.
         context.coordinator.openURL = openURL
@@ -358,29 +370,54 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
 
 /// NSTextView that reports vertical intrinsic size for SwiftUI layout.
 final class IntrinsicHeightTextView: NSTextView {
+    private(set) var intrinsicInvalidationCountForTesting = 0
+
+    override func invalidateIntrinsicContentSize() {
+        intrinsicInvalidationCountForTesting += 1
+        super.invalidateIntrinsicContentSize()
+    }
+
     override var intrinsicContentSize: NSSize {
-        guard let layoutManager, let textContainer else {
-            return NSSize(width: NSView.noIntrinsicMetric, height: 0)
+        let fitted = sizeThatFitsWidth(bounds.width > 0 ? bounds.width : 10_000)
+        return NSSize(width: NSView.noIntrinsicMetric, height: fitted.height)
+    }
+
+    func sizeThatFitsWidth(_ width: CGFloat) -> CGSize {
+        let fallback = font?.boundingRectForFont.height ?? 14
+        guard width.isFinite, width > 0 else {
+            return CGSize(width: 0, height: fallback)
         }
+        guard let layoutManager, let textContainer else {
+            return CGSize(width: width, height: fallback)
+        }
+        applyContainerWidth(width)
         layoutManager.ensureLayout(for: textContainer)
         let used = layoutManager.usedRect(for: textContainer)
-        let height = max(ceil(used.height + textContainerInset.height * 2), font?.boundingRectForFont.height ?? 14)
-        return NSSize(width: NSView.noIntrinsicMetric, height: height)
+        let height = max(ceil(used.height + textContainerInset.height * 2), fallback)
+        return CGSize(width: width, height: height)
     }
 
     override func layout() {
         super.layout()
+        // Track the laid-out width only. Do not invalidate here: SwiftUI
+        // LazyVStack placement calls sizeThatFits, then layout, and an
+        // invalidate retriggers placement (live sample: 100% main thread,
+        // 16 GB AttributeGraph RSS on ChatFlowRow + AgentLinkedInlineText).
         let width = bounds.width
-        guard width > 0, let textContainer else { return }
-        let target = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
-        if abs(textContainer.containerSize.width - width) > 0.5 {
-            textContainer.containerSize = target
-            invalidateIntrinsicContentSize()
-        }
+        guard width > 0 else { return }
+        applyContainerWidth(width)
     }
 
     override func didChangeText() {
         super.didChangeText()
         invalidateIntrinsicContentSize()
+    }
+
+    private func applyContainerWidth(_ width: CGFloat) {
+        guard let textContainer else { return }
+        let target = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+        if abs(textContainer.containerSize.width - width) > 0.5 {
+            textContainer.containerSize = target
+        }
     }
 }

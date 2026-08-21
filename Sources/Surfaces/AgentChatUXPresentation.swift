@@ -1398,6 +1398,24 @@ public enum AgentChatThreadRailCopy {
         return title.localizedCaseInsensitiveContains(q)
             || extra.localizedCaseInsensitiveContains(q)
     }
+
+    /// Running rows stay above idle/unread matches, preserving relative
+    /// order inside each group. Agent App and dest mount the same sort so
+    /// a new idle thread cannot bury a live run.
+    public static func orderingActiveFirst<T>(_ items: [T], isActive: (T) -> Bool) -> [T] {
+        var active: [T] = []
+        var rest: [T] = []
+        active.reserveCapacity(items.count)
+        rest.reserveCapacity(items.count)
+        for item in items {
+            if isActive(item) {
+                active.append(item)
+            } else {
+                rest.append(item)
+            }
+        }
+        return active + rest
+    }
 }
 
 // MARK: - Empty starters (shared copy)

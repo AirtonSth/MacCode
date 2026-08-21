@@ -12126,7 +12126,9 @@ public struct AgentAppView: View {
                 identifier: "agent.thread.row.\(t.id.value.uuidString)",
                 unreadIdentifier: "agent.thread.row.unread.\(t.id.value.uuidString)",
                 runningIdentifier: "agent.thread.row.running.\(t.id.value.uuidString)",
+                stopIdentifier: "agent.thread.row.stop.\(t.id.value.uuidString)",
                 onSelect: { selectThreadRow(t) },
+                onStop: running ? { vm.stopThread(t.id) } : nil,
                 leading: {
                     AgentThreadProviderMonogram(provider: t.provider)
                 },
@@ -12144,22 +12146,6 @@ public struct AgentAppView: View {
                 }
             )
             .help(t.title)
-            .overlay(alignment: .trailing) {
-                if running {
-                    Button {
-                        vm.stopThread(t.id)
-                    } label: {
-                        Image(systemName: "stop.circle")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(DS.Palette.danger.opacity(0.75))
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.trailing, DS.Space.md)
-                    .accessibilityLabel("Stop thread")
-                    .accessibilityIdentifier("agent.thread.row.stop.\(t.id.value.uuidString)")
-                    .help("Stop this thread")
-                }
-            }
             .onDrag {
                 draggingThreadId = t.id
                 return NSItemProvider(object: t.id.value.uuidString as NSString)

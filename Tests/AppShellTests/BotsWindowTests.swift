@@ -941,6 +941,12 @@ final class BotsWindowTests: XCTestCase {
         let agent = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
         XCTAssertTrue(agent.contains("AgentThreadProviderMonogram(provider: t.provider)"),
                       "Agent App must mount the shared monogram, not an inline copy")
+        XCTAssertTrue(agent.contains("onStop: running ? { vm.stopThread(t.id) } : nil"),
+                      "Agent App must mount the shared stop, not a private overlay")
+        XCTAssertFalse(
+            agent.contains("accessibilityIdentifier(\"agent.thread.row.stop."),
+            "the stop identifier must live on the shared row, not an Agent-App-only overlay"
+        )
 
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -948,6 +954,64 @@ final class BotsWindowTests: XCTestCase {
         let routing = vm.deskThreadRailRouting(for: conversation)
         XCTAssertEqual(routing.provider, vm.deskRunProvider,
                        "a never-run conversation must show the routing the desk would use today")
+        XCTAssertTrue(slice.contains("onStop:"))
+        XCTAssertTrue(slice.contains("stopDeskThread"))
+        XCTAssertTrue(slice.contains("isDeskConversationRunning"))
+        XCTAssertTrue(slice.contains("runningIdentifier"))
+        XCTAssertTrue(slice.contains("stopIdentifier"))
+        let chrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatSharedChrome.swift"), encoding: .utf8)
+        XCTAssertTrue(chrome.contains("AgentChatThreadRowStopChrome"))
+        XCTAssertTrue(chrome.contains("stop.circle"))
+    }
+
+    func test_deskThreadRailOrdersWorkingFirst_becauseActiveMustStayOnTop() throws {
+        // WHY: + / a newer idle dest thread used to insert at index 0 and
+        // bury the live spinner. Dest must use the shared active-first sort
+        // so Working rows stay at the top like Agent App.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        let idle = BotConversation(
+            botID: piper.id,
+            title: "Review idle",
+            updatedAt: Date()
+        )
+        let working = BotConversation(
+            botID: piper.id,
+            title: "Review live",
+            attentionState: .working,
+            updatedAt: Date().addingTimeInterval(-120)
+        )
+        try context.botStore.upsertConversation(idle)
+        try context.botStore.upsertConversation(working)
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.filteredDeskConversations.map(\.title), ["Review live", "Review idle"])
+        XCTAssertEqual(vm.deskThreadActiveCount, 1)
+        XCTAssertTrue(vm.isDeskConversationRunning(working))
+        XCTAssertFalse(vm.isDeskConversationRunning(idle))
+    }
+
+    func test_deskThreadRailTreatsCoordinatorLiveThreadAsRunning() throws {
+        // WHY: attentionState can lag. A dest row linked to a live
+        // coordinator thread must still sort and paint as active.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        let thread = AgentThread(title: "live", provider: .grok, model: "grok-4")
+        let idle = BotConversation(botID: piper.id, title: "Idle", updatedAt: Date())
+        let live = BotConversation(
+            botID: piper.id,
+            title: "Coordinator live",
+            linkedAgentThreadID: thread.id,
+            updatedAt: Date().addingTimeInterval(-60)
+        )
+        try context.botStore.upsertConversation(idle)
+        try context.botStore.upsertConversation(live)
+        vm.activeThreadIDsOverrideForTesting = [thread.id]
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.filteredDeskConversations.map(\.title), ["Coordinator live", "Idle"])
+        XCTAssertEqual(vm.deskThreadActiveCount, 1)
+        XCTAssertTrue(vm.isDeskConversationRunning(live))
     }
 
     func test_deskHeaderOpenInNewWindowSitsAfterStudioCog() throws {

@@ -271,4 +271,35 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         XCTAssertTrue(plan.maximumNumberOfLinesDirty)
         XCTAssertTrue(plan.lineFragmentPaddingDirty)
     }
+
+    /// WHY: live RemoteCode sample (pid 30891) spent the main thread in
+    /// LazyVStackLayout + AgentLinkedInlineTextRepresentable while RSS grew
+    /// to 16 GB. `layout()` must not invalidate; SwiftUI already asks
+    /// `sizeThatFits` for the proposed width.
+    func test_layout_doesNotInvalidateIntrinsicSizeOnceWidthHasSettled() {
+        let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        tv.string = String(repeating: "word ", count: 80)
+        tv.frame = NSRect(x: 0, y: 0, width: 240, height: 40)
+        tv.layoutSubtreeIfNeeded()
+        let afterFirstPass = tv.intrinsicInvalidationCountForTesting
+        for _ in 0..<20 {
+            tv.frame.size.width = 240
+            tv.layout()
+        }
+        tv.frame.size.width = 241
+        tv.layout()
+        tv.frame.size.width = 239
+        tv.layout()
+        XCTAssertEqual(
+            tv.intrinsicInvalidationCountForTesting,
+            afterFirstPass,
+            "layout() must never invalidate intrinsic size; that retriggers LazyVStack placement"
+        )
+        let fitted = tv.sizeThatFitsWidth(240)
+        XCTAssertGreaterThan(
+            fitted.height,
+            0,
+            "sizeThatFits must still report a concrete wrapped height for the proposed width"
+        )
+    }
 }

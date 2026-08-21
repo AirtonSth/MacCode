@@ -3,6 +3,8 @@
 .references/
 dist/
 .rc-autoloops/
+.sandbox-worktrees/
+.sandbox-state/
 DerivedData/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
