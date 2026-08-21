@@ -15,10 +15,14 @@ final class RetrieveMCPInstallTests: XCTestCase {
         try Data("binary".utf8).write(to: binary)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
 
-        // Pre-existing user content in both files.
+        // Pre-existing user content in both files. The Claude file carries a
+        // legacy managed entry from older app versions: Claude Code never reads
+        // mcpServers from settings.json (the entry never spawned; `claude mcp
+        // list` omits it), so install must stop writing it — Claude is admitted
+        // per spawn via --mcp-config instead — while uninstall still purges it.
         let claudeSettings = home.appendingPathComponent(".claude/settings.json")
         try FileManager.default.createDirectory(at: claudeSettings.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data(#"{"theme":"dark","mcpServers":{"other":{"command":"x"}}}"#.utf8).write(to: claudeSettings)
+        try Data(#"{"theme":"dark","mcpServers":{"other":{"command":"x"},"remotecode-distill-retrieve":{"command":"/legacy/RemoteCodeDistillService","args":["mcp"]}}}"#.utf8).write(to: claudeSettings)
         let codexConfig = home.appendingPathComponent(".codex/config.toml")
         try FileManager.default.createDirectory(at: codexConfig.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("model = \"gpt\"\n".utf8).write(to: codexConfig)
@@ -27,13 +31,13 @@ final class RetrieveMCPInstallTests: XCTestCase {
         try installer.installRetrieveMCP(serviceBinaryURL: binary)
         try installer.installRetrieveMCP(serviceBinaryURL: binary) // idempotent
 
-        let settings = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: claudeSettings)) as? [String: Any])
+        let settingsData = try Data(contentsOf: claudeSettings)
+        let settings = try XCTUnwrap(try JSONSerialization.jsonObject(with: settingsData) as? [String: Any])
         XCTAssertEqual(settings["theme"] as? String, "dark", "user keys preserved")
         let servers = try XCTUnwrap(settings["mcpServers"] as? [String: Any])
-        XCTAssertNotNil(servers["other"], "user's other MCP server preserved")
-        let ours = try XCTUnwrap(servers["remotecode-distill-retrieve"] as? [String: Any])
-        XCTAssertEqual(ours["command"] as? String, binary.path)
-        XCTAssertEqual(ours["args"] as? [String], ["mcp"])
+        let legacy = try XCTUnwrap(servers["remotecode-distill-retrieve"] as? [String: Any])
+        XCTAssertEqual(legacy["command"] as? String, "/legacy/RemoteCodeDistillService",
+                       "install must no longer write Claude settings.json — a dead location that made the librarian look installed while Claude never saw it")
 
         let toml = try String(contentsOf: codexConfig, encoding: .utf8)
         XCTAssertTrue(toml.contains("model = \"gpt\""), "user TOML preserved")
@@ -42,7 +46,8 @@ final class RetrieveMCPInstallTests: XCTestCase {
 
         try installer.uninstallRetrieveMCP()
         let settings2 = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: claudeSettings)) as? [String: Any])
-        XCTAssertNil((settings2["mcpServers"] as? [String: Any])?["remotecode-distill-retrieve"], "our server removed")
+        XCTAssertNil((settings2["mcpServers"] as? [String: Any])?["remotecode-distill-retrieve"],
+                     "uninstall must purge the legacy Claude settings.json entry")
         XCTAssertNotNil((settings2["mcpServers"] as? [String: Any])?["other"], "user MCP preserved on uninstall")
         let toml2 = try String(contentsOf: codexConfig, encoding: .utf8)
         XCTAssertFalse(toml2.contains("[mcp_servers.remotecode-distill-retrieve]"))

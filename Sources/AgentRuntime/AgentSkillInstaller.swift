@@ -1716,14 +1716,18 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         codexInstructionsURL.deletingLastPathComponent().appendingPathComponent("config.toml")
     }
 
-    /// Install the RETRIEVE-ONLY MCP server (rc_retrieve) into Claude settings.json and
-    /// Codex config.toml. Idempotent; preserves any user-authored entries. The server is the
-    /// native RemoteCodeDistillService binary in `mcp` mode (no Python — N1).
+    /// Install the librarian MCP server (`RemoteCodeDistillService mcp`) into Codex
+    /// config.toml. Idempotent; preserves any user-authored entries. Codex is the only
+    /// provider that reads it from a config file: Claude does NOT read `mcpServers`
+    /// from settings.json (an installed entry never spawned and `claude mcp list`
+    /// omits it), so both Claude engines admit the server per spawn instead
+    /// (ClaudeRunner.botPeerMCPConfigJSON / ClaudeAgentSDKBridgeAdapter.botPeerMCPServers),
+    /// and Grok admits it per ACP session (GrokACPClient.sessionMCPServers).
+    /// `uninstallRetrieveMCP` still purges the legacy Claude settings.json entry.
     public func installRetrieveMCP(serviceBinaryURL: URL? = nil) throws {
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
         }
-        try installClaudeRetrieveMCP(binary: binary)
         try installCodexRetrieveMCP(binary: binary)
     }
 
@@ -1962,21 +1966,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             let stripped = Self.removingMarkerBlock(text, begin: Self.mcpBeginMarker, end: Self.mcpEndMarker)
             try? Data(stripped.utf8).write(to: codex, options: .atomic)
         }
-    }
-
-    private func installClaudeRetrieveMCP(binary: URL) throws {
-        let url = claudeSettingsURL()
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url),
-           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            root = obj
-        }
-        var servers = root["mcpServers"] as? [String: Any] ?? [:]
-        servers[Self.retrieveMCPName] = ["command": binary.path, "args": ["mcp"]]
-        root["mcpServers"] = servers
-        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-        try out.write(to: url, options: .atomic)
     }
 
     private func installCodexRetrieveMCP(binary: URL) throws {

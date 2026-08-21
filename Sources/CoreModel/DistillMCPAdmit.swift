@@ -12,22 +12,58 @@ public enum DistillMCPAdmit: Sendable {
         "RC_TOKEN_SAVER_ATTEMPT_ID",
     ]
 
+    /// Librarian tool names served by the `mcp` subcommand. Must mirror
+    /// `ManagedRetrieveMCP.*ToolName` (DistillCore, which CoreModel cannot
+    /// import); a parity test pins the two lists together.
+    public static let toolNames = ["rc_stats", "rc_search", "rc_ask", "rc_retrieve", "rc_compress"]
+
+    /// Claude's supervised mode must not turn a local librarian lookup into a
+    /// user confirmation: these tools only read/compress content the host
+    /// already holds (handles, ledger stats, catalog ops) — same trust class
+    /// as the already auto-allowed bot self-config tools.
+    public static let claudeAutomaticallyAllowedTools =
+        toolNames.map { "mcp__\(serverName)__\($0)" }
+
+    /// Per-spawn server definition for Claude (`--mcp-config` on the CLI route,
+    /// `mcp_servers` on the SDK bridge). Claude does not reliably read
+    /// `mcpServers` from settings.json (proven: an installed entry never
+    /// spawns and `claude mcp list` omits it), so — like the bot peer MCP —
+    /// the librarian must be admitted explicitly on every run.
+    public static func claudeServer(
+        command: String,
+        environment: [String: String] = [:]
+    ) -> [String: Any] {
+        var config: [String: Any] = [
+            "command": command,
+            "args": [cliArgument],
+        ]
+        let extra = recoveryEnvironment(environment)
+        if !extra.isEmpty {
+            config["env"] = extra
+        }
+        return config
+    }
+
     public static func grokACPServer(
         command: String,
         environment: [String: String] = [:]
     ) -> [String: Any] {
+        GrokACPMcpServer.stdio(
+            name: serverName,
+            command: command,
+            args: [cliArgument],
+            extraEnv: recoveryEnvironment(environment)
+        )
+    }
+
+    private static func recoveryEnvironment(_ environment: [String: String]) -> [String: String] {
         var extra: [String: String] = [:]
         for key in recoveryEnvKeys {
             if let value = environment[key], !value.isEmpty {
                 extra[key] = value
             }
         }
-        return GrokACPMcpServer.stdio(
-            name: serverName,
-            command: command,
-            args: [cliArgument],
-            extraEnv: extra
-        )
+        return extra
     }
 
     public static func admitGrokACP(

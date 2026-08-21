@@ -416,6 +416,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                     "session_id": session.providerThreadId ?? request.threadId.value.uuidString,
                     "mcp_servers": Self.botPeerMCPServers(environment: request.environment),
                     "allowed_tools": BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
+                        + DistillMCPAdmit.claudeAutomaticallyAllowedTools
                 ]
                 if let turnContext = request.environment[BotPeerDelegation.turnContextEnvironmentKey]?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1710,6 +1711,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         payload["system_prompt"] = Self.claudeSystemPrompt(environment: request.environment)
         payload["mcp_servers"] = Self.botPeerMCPServers(environment: request.environment)
         payload["allowed_tools"] = BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
+            + DistillMCPAdmit.claudeAutomaticallyAllowedTools
         return payload
     }
 
@@ -1717,6 +1719,8 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// does not reliably inherit the managed server written to settings.json.
     /// The definition is rebuilt per turn so the MCP receives that turn's exact
     /// thread/run/socket authority without deriving anything from user prose.
+    /// Carries the Distill librarian server too — SDK-engine parity with the
+    /// CLI route's `--mcp-config` (see ClaudeRunner.botPeerMCPConfigJSON).
     static func botPeerMCPServers(
         environment: [String: String],
         command: String? = nil
@@ -1728,7 +1732,11 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             BotSelfConfigMCPAdmit.serverName: BotSelfConfigMCPAdmit.claudeSDKServer(
                 command: resolved,
                 environment: environment
-            )
+            ),
+            DistillMCPAdmit.serverName: DistillMCPAdmit.claudeServer(
+                command: resolved,
+                environment: environment
+            ),
         ]
     }
 

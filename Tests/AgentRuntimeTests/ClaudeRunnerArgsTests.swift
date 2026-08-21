@@ -1,6 +1,7 @@
 import XCTest
 @testable import AgentRuntime
 import CoreModel
+import DistillCore
 import Persistence
 
 /// Regression: `claude --print --output-format stream-json` is rejected by
@@ -95,9 +96,73 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                            "RemoteCode's server must supplement, not replace, user/project MCP servers")
             let allowedIndex = try XCTUnwrap(args.firstIndex(of: "--allowedTools"))
             let allowed = Set(args[args.index(after: allowedIndex)].split(separator: ",").map(String.init))
-            XCTAssertEqual(allowed, Set(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools),
-                           "supervised mode must allow only the exact managed delegation/settings tools without another user confirmation")
+            XCTAssertEqual(
+                allowed,
+                Set(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
+                    + DistillMCPAdmit.claudeAutomaticallyAllowedTools),
+                "supervised mode must allow exactly the managed delegation/settings and librarian tools without another user confirmation"
+            )
         }
+    }
+
+    func test_liveClaudeRoutesAdmitDistillLibrarianMCP() throws {
+        // WHY: the distill skill instructs every provider to prefer the librarian
+        // MCP tools (rc_stats/rc_search/rc_ask/rc_retrieve/rc_compress — the
+        // 01-catalogo.html surface), but Claude never saw the server: it was
+        // installed into ~/.claude/settings.json, which Claude Code does not read
+        // for mcpServers (proven live: the entry never spawned and `claude mcp
+        // list` omits it). Codex reads it from config.toml and Grok admits it per
+        // ACP session; both Claude routes must admit it per spawn the same way
+        // the bot peer server already is.
+        let environment = [
+            "RC_TOKEN_SAVER_THREAD_ID": "11111111-2222-3333-4444-555555555555",
+            "REMOTE_CODE_AGENT_PROVIDER": "claude",
+            "UNRELATED_SECRET": "must-not-be-forwarded",
+        ]
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .claude,
+            model: "claude-opus-4-7",
+            cwd: "/tmp",
+            prompt: "hello",
+            environment: environment
+        )
+        for args in [ClaudeRunner.buildArgs(request), ClaudeRunner.buildStreamingArgs(request)] {
+            let index = try XCTUnwrap(args.firstIndex(of: "--mcp-config"))
+            let data = Data(args[args.index(after: index)].utf8)
+            let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let servers = try XCTUnwrap(root["mcpServers"] as? [String: Any])
+            let librarian = try XCTUnwrap(
+                servers[DistillMCPAdmit.serverName] as? [String: Any],
+                "every Claude CLI turn must carry the librarian MCP server"
+            )
+            XCTAssertEqual(librarian["args"] as? [String], ["mcp"])
+            let forwarded = try XCTUnwrap(librarian["env"] as? [String: String])
+            XCTAssertEqual(forwarded["RC_TOKEN_SAVER_THREAD_ID"], "11111111-2222-3333-4444-555555555555")
+            XCTAssertNil(forwarded["UNRELATED_SECRET"],
+                         "only recovery-scope keys may be forwarded to the librarian server")
+            XCTAssertNotNil(servers[BotSelfConfigMCPAdmit.serverName],
+                            "the librarian must supplement, never replace, the bot peer server")
+        }
+
+        // SDK bridge engine parity: the same server must ride the bridge payload.
+        let sdkServers = ClaudeAgentSDKBridgeAdapter.botPeerMCPServers(environment: environment)
+        XCTAssertNotNil(sdkServers[DistillMCPAdmit.serverName] as? [String: Any],
+                        "the opt-in SDK engine must admit the librarian server too, or the engines drift")
+
+        // The allowlisted tool names must match the tools the server actually
+        // serves (ManagedRetrieveMCP), or supervised mode silently prompts.
+        XCTAssertEqual(
+            Set(DistillMCPAdmit.toolNames),
+            Set([
+                ManagedRetrieveMCP.statsToolName,
+                ManagedRetrieveMCP.searchToolName,
+                ManagedRetrieveMCP.askToolName,
+                ManagedRetrieveMCP.toolName,
+                ManagedRetrieveMCP.compressToolName,
+            ]),
+            "CoreModel cannot import DistillCore, so the duplicated tool-name list must be pinned to the real server surface"
+        )
     }
 
     func test_uncaughtSignalIsFailureUnlessCancellationWasRequested() {
