@@ -274,7 +274,7 @@ public struct BotBrowserStore: Sendable {
 
     private func readJSON<T: Decodable>(_ type: T.Type, from url: URL) throws -> T? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        let data = try Data(contentsOf: url)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         Self.codecLock.lock()
         defer { Self.codecLock.unlock() }
         return try Self.sharedDecoder.decode(type, from: data)
