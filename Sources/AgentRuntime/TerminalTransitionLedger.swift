@@ -253,7 +253,7 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
     /// damaged ledger still fails loudly like the prior String-based path.
     private func computeRowCountFromDiskLocked() throws -> Int {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return 0 }
-        let data = try Data(contentsOf: fileURL)
+        let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
         guard String(data: data, encoding: .utf8) != nil else {
             throw NSError(
                 domain: "RemoteCode.TerminalTransitionLedger",
