@@ -262,6 +262,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         // subscribed-account auto-approve path cannot fire. This env must
         // approve without presenting the Mac panel or blocking the main thread.
         setenv("RC2_E2E_AUTO_APPROVE_PAIRING", "1", 1)
+        defer { unsetenv("RC2_E2E_AUTO_APPROVE_PAIRING") }
 
         let dir = NSTemporaryDirectory() + "RC2E2EPairing-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)

@@ -182,13 +182,18 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     }
 
     /// Isolated E2E host pairing: `RC2_E2E_AUTO_APPROVE_PAIRING=1` skips the
-    /// Mac Approve panel. `ProcessInfo.environment` is snapshotted; `getenv`
+    /// Mac Approve panel. Compiled out of Release so an env var cannot bypass
+    /// pairing in production. `ProcessInfo.environment` is snapshotted; `getenv`
     /// sees XCTest `setenv` after that snapshot.
     static var isE2EPairingAutoApproveEnabled: Bool {
+        #if DEBUG
         if ProcessInfo.processInfo.environment["RC2_E2E_AUTO_APPROVE_PAIRING"] == "1" {
             return true
         }
         return getenv("RC2_E2E_AUTO_APPROVE_PAIRING").map { String(cString: $0) } == "1"
+        #else
+        return false
+        #endif
     }
 
     private func canAutoApprovePairing(privateAccountAccessToken: String?) -> Bool {
