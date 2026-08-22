@@ -7310,8 +7310,17 @@ public final class BotsViewModel: ObservableObject {
         let work = DeskSendWork()
         work.threadID = prepared.thread.id
         work.runID = prepared.runID
+        context.coordinator.reserveProviderStart(threadId: prepared.thread.id, runId: prepared.runID)
         work.task = Task { [weak self] in
             guard let self else { return }
+            defer {
+                if let threadID = work.threadID, let runID = work.runID {
+                    self.context.coordinator.discardProviderStartReservation(
+                        threadId: threadID,
+                        runId: runID
+                    )
+                }
+            }
             await Task.yield()
             guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
                 self.forgetDeskSend(work, botID: bot.id)

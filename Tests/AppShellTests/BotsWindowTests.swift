@@ -4267,8 +4267,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(vm.lastSendStartedProviderRun)
         await fulfillment(of: [settled], timeout: 5)
         XCTAssertEqual(settledOK, true)
+        router.sendAgentMessageAfterPreflightProbeForTesting = nil
+        _ = try vm.enqueueHostMessage(botID: bot.id, text: "after-settled", conversationID: nil, routing: routing)
         let startedAfter = await waitUntil(timeout: 3) { !runner.requests.isEmpty || vm.lastSendStartedProviderRun }
-        XCTAssertTrue(startedAfter, "a send admitted during stop may start only after that stop settles")
+        XCTAssertTrue(startedAfter, "a send after stop has settled is new work and may start")
         router.sendAgentMessageAfterPreflightProbeForTesting = nil
     }
 
