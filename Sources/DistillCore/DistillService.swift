@@ -249,6 +249,14 @@ public enum DistillServiceError: Error, Sendable, Equatable, CustomStringConvert
 public enum DistillServiceLaunch {
     public static let httpServiceProgramName = "RemoteCodeDistillService"
 
+    /// Ordered sidecar argv dispatch used by `RemoteCodeDistillServiceMain`.
+    /// HTTP-flag identity of this Mach-O wins before the global interceptor.
+    public enum ArgvMode: Equatable, Sendable {
+        case httpService
+        case wrap(command: String, arguments: [String])
+        case passthrough
+    }
+
     public static func shouldStartHTTPService(programName: String, arguments: [String]) -> Bool {
         let name = (programName as NSString).lastPathComponent
         guard name == httpServiceProgramName else { return false }
@@ -256,6 +264,22 @@ public enum DistillServiceLaunch {
             return false
         }
         return true
+    }
+
+    /// Same start state `main` uses: program basename + remaining args.
+    /// Wrap-first classifies `RemoteCodeDistillService --help` as wrap and
+    /// exits 127 (`command not found`). HTTP identity must be first.
+    public static func argvMode(programName: String, arguments: [String]) -> ArgvMode {
+        if shouldStartHTTPService(programName: programName, arguments: arguments) {
+            return .httpService
+        }
+        if CommandWrapPolicy.isWrapped(programName) {
+            return .wrap(command: programName, arguments: arguments)
+        }
+        if arguments.first == "wrap", arguments.count >= 2 {
+            return .wrap(command: arguments[1], arguments: Array(arguments.dropFirst(2)))
+        }
+        return .passthrough
     }
 }
 

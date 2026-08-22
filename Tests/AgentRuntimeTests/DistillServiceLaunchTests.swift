@@ -41,6 +41,86 @@ final class DistillServiceLaunchTests: XCTestCase {
         )
     }
 
+    func test_argvMode_sidecarHTTPFlagsTakePrecedenceOverWrap() {
+        // WHY: wrap-first treats RemoteCodeDistillService as a wrappable
+        // basename and prints `RemoteCodeDistillService: command not found`
+        // (exit 127) for the host spawn. HTTP identity must win. This is the
+        // shipped argvMode main calls — not shouldStartHTTPService alone.
+        XCTAssertTrue(
+            CommandWrapPolicy.isWrapped("RemoteCodeDistillService"),
+            "interceptor still admits the sidecar basename; argv order is the gate"
+        )
+        XCTAssertEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "RemoteCodeDistillService",
+                arguments: ["--auth-token", "t", "--app-support-dir", "/tmp"]
+            ),
+            .httpService
+        )
+        XCTAssertEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "RemoteCodeDistillService",
+                arguments: ["--help"]
+            ),
+            .httpService
+        )
+        XCTAssertNotEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "RemoteCodeDistillService",
+                arguments: ["--help"]
+            ),
+            .wrap(command: "RemoteCodeDistillService", arguments: ["--help"])
+        )
+        XCTAssertNotEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "RemoteCodeDistillService",
+                arguments: ["--auth-token", "t"]
+            ),
+            .passthrough
+        )
+    }
+
+    func test_argvMode_arbitraryCommandStillWrapsAndShebangIsNotHTTP() {
+        // WHY: fixing sidecar HTTP identity must not shrink PATH wrap for
+        // arbitrary tools, and leftover node/env shebang wrappers must not
+        // become an HTTP sidecar launch.
+        XCTAssertEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "workspace-report",
+                arguments: ["--summary"]
+            ),
+            .wrap(command: "workspace-report", arguments: ["--summary"])
+        )
+        XCTAssertEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "rg",
+                arguments: ["pattern"]
+            ),
+            .wrap(command: "rg", arguments: ["pattern"])
+        )
+        XCTAssertEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "node",
+                arguments: ["/opt/homebrew/bin/codex", "app-server"]
+            ),
+            .passthrough
+        )
+        XCTAssertEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "env",
+                arguments: ["node", "/opt/homebrew/bin/codex", "app-server"]
+            ),
+            .passthrough
+        )
+        XCTAssertNotEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "node",
+                arguments: ["/opt/homebrew/bin/codex", "app-server"]
+            ),
+            .httpService
+        )
+    }
+
     func test_shouldStartHTTPService_rejectsShebangInterpreterWrappers() {
         // WHY: `#!/usr/bin/env node /opt/homebrew/bin/codex app-server` must
         // not become an HTTP sidecar launch.

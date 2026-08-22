@@ -256,29 +256,23 @@ struct RemoteCodeDistillServiceMain {
             let code = ProviderProxyRunner.run(command: rawArgs[2], arguments: Array(rawArgs.dropFirst(3)))
             Darwin.exit(code)
         }
-        // RTK-style transparent command wrappers: invoked via a symlink whose basename is a
-        // wrapped command (e.g. ~/.remote-code/bin/rg), or explicitly as `… wrap <cmd> <args>`.
-        if CommandWrapPolicy.isWrapped(programName) {
-            await runWrap(command: programName, arguments: Array(rawArgs.dropFirst()))
-            return
-        }
-        if rawArgs.dropFirst().first == "wrap", rawArgs.count >= 3 {
-            await runWrap(command: rawArgs[2], arguments: Array(rawArgs.dropFirst(3)))
-            return
-        }
-
+        // Wrap vs HTTP vs leftover passthrough. HTTP-flag sidecar identity must
+        // win before the global interceptor admits this Mach-O's basename.
+        // Unknown symlink basenames (node/env leftovers) passthrough-exec the
+        // real binary; parse() treats `/opt/homebrew/bin/codex` as a flag name.
         let programArguments = Array(rawArgs.dropFirst())
-        // Unknown symlink basenames (node/env leftovers) must exec the real
-        // binary. parse() treats `/opt/homebrew/bin/codex` as a flag name.
-        guard DistillServiceLaunch.shouldStartHTTPService(
-            programName: programName,
-            arguments: programArguments
-        ) else {
+        switch DistillServiceLaunch.argvMode(programName: programName, arguments: programArguments) {
+        case .wrap(let command, let arguments):
+            await runWrap(command: command, arguments: arguments)
+            return
+        case .passthrough:
             let code = CommandWrapRunner.runPassthroughInheritingStreams(
                 command: programName,
                 args: programArguments
             )
             Darwin.exit(code)
+        case .httpService:
+            break
         }
 
         do {
