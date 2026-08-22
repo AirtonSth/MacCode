@@ -202,7 +202,7 @@ final class PetAtlas {
     private static let manifestDecoder = JSONDecoder()
 
     init(manifestURL: URL) throws {
-        let data = try Data(contentsOf: manifestURL)
+        let data = try Data(contentsOf: manifestURL, options: .mappedIfSafe)
         self.manifest = try Self.manifestDecoder.decode(PetAtlasManifest.self, from: data).validated()
 
         let directory = manifestURL.deletingLastPathComponent()
@@ -222,7 +222,7 @@ final class PetAtlas {
         guard FileManager.default.fileExists(atPath: idleMicroManifestURL.path) else {
             throw PetAtlasError.missingResource(idleMicroManifestURL.lastPathComponent)
         }
-        let idleMicroData = try Data(contentsOf: idleMicroManifestURL)
+        let idleMicroData = try Data(contentsOf: idleMicroManifestURL, options: .mappedIfSafe)
         self.idleMicroManifest = try Self.manifestDecoder.decode(
             PetIdleMicroManifest.self,
             from: idleMicroData
