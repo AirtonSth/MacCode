@@ -374,7 +374,8 @@ struct RemoteCodeDistillServiceMain {
                         engine: record.routeStage?.rawValue ?? "unknown",
                         attributability: record.attributability,
                         delivered: record.delivered,
-                        threadID: record.threadID
+                        threadID: record.threadID,
+                        idempotencyKey: record.idempotencyKey
                     )
                 } catch {
                     FileHandle.standardError.write(Data("RemoteCodeDistillService savings record failed: \(error)\n".utf8))

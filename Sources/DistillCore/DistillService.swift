@@ -1412,7 +1412,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
             routeStage: compressed.routeStage,
             attributability: Self.savingsAttributability(for: request.mode),
             delivered: false,
-            threadID: threadID
+            threadID: threadID,
+            idempotencyKey: request.id.uuidString.lowercased()
         )
         if let onSavingsRecord {
             await onSavingsRecord(record)

@@ -179,6 +179,17 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
     )
 }
 
+public enum TokenSaverSavingsRepositoryError: Error, Equatable, CustomStringConvertible {
+    case idempotencyConflict(String)
+
+    public var description: String {
+        switch self {
+        case .idempotencyConflict(let key):
+            return "Token Saver savings idempotency conflict for \(key)"
+        }
+    }
+}
+
 /// Persists Token Saver savings events to the local SQLite database, keeps event
 /// rows for at least one week for reports/charts, and updates a permanent
 /// accumulator so total saved tokens keep adding up for the user.
@@ -239,6 +250,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         delivered: Bool = false,
         governance: String = "{}",
         threadID: String = "",
+        idempotencyKey: String = "",
         at date: Date = Date()
     ) throws -> Int {
         let saved = max(inputTokens - outputTokens, 0)
@@ -255,6 +267,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             delivered: delivered,
             governance: governance,
             threadID: threadID,
+            idempotencyKey: idempotencyKey,
             at: date
         )
     }
@@ -276,6 +289,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         delivered: Bool = false,
         governance: String = "{}",
         threadID: String = "",
+        idempotencyKey: String = "",
         at date: Date = Date()
     ) throws -> Int {
         let saved = max(savedTokens, 0)
@@ -290,88 +304,127 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         let trimmedEngine = engine.trimmingCharacters(in: .whitespacesAndNewlines)
         let eng = trimmedEngine.isEmpty ? "unknown" : trimmedEngine
         let thread = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
-        try db.performSync { database in
-            let insert = try database.prepare("""
-                INSERT INTO token_saver_savings
-                    (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms,
-                     cache_state, content_type, engine, attributability, delivered, governance_json, thread_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """)
-            defer { insert.reset() }
-            try insert.bind(1, provider)
-            try insert.bind(2, mode)
-            try insert.bind(3, max(0, inputTokens))
-            try insert.bind(4, max(0, outputTokens))
-            try insert.bind(5, saved)
-            try insert.bind(6, iso)
-            try insert.bind(7, ms)
-            try insert.bind(8, cacheState)
-            try insert.bind(9, content)
-            try insert.bind(10, eng)
-            try insert.bind(11, attr)
-            try insert.bind(12, deliveredFlag)
-            try insert.bind(13, gov)
-            try insert.bind(14, thread)
-            _ = try insert.step()
-
-            let total = try database.prepare("""
-                INSERT INTO token_saver_savings_totals
-                    (provider, mode, input_tokens, output_tokens, saved_tokens, runs, updated_at,
-                     attributability, delivered, governance_json)
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-                ON CONFLICT(provider, mode) DO UPDATE SET
-                    input_tokens = token_saver_savings_totals.input_tokens + excluded.input_tokens,
-                    output_tokens = token_saver_savings_totals.output_tokens + excluded.output_tokens,
-                    saved_tokens = token_saver_savings_totals.saved_tokens + excluded.saved_tokens,
-                    runs = token_saver_savings_totals.runs + excluded.runs,
-                    updated_at = excluded.updated_at,
-                    delivered = MAX(token_saver_savings_totals.delivered, excluded.delivered),
-                    attributability = CASE
-                        WHEN excluded.attributability != 'unknown' THEN excluded.attributability
-                        ELSE token_saver_savings_totals.attributability
-                    END,
-                    governance_json = CASE
-                        WHEN excluded.governance_json != '{}' THEN excluded.governance_json
-                        ELSE token_saver_savings_totals.governance_json
-                    END;
-            """)
-            defer { total.reset() }
-            try total.bind(1, provider)
-            try total.bind(2, mode)
-            try total.bind(3, max(0, inputTokens))
-            try total.bind(4, max(0, outputTokens))
-            try total.bind(5, saved)
-            try total.bind(6, iso)
-            try total.bind(7, attr)
-            try total.bind(8, deliveredFlag)
-            try total.bind(9, gov)
-            _ = try total.step()
-
-            // Permanent per-thread accumulator (only delivered rows count toward
-            // the user-facing "saved in this thread" claim).
-            if !thread.isEmpty, delivered {
-                let threadTotal = try database.prepare("""
-                    INSERT INTO token_saver_thread_totals
-                        (thread_id, saved_tokens, runs, updated_at)
-                    VALUES (?, ?, 1, ?)
-                    ON CONFLICT(thread_id) DO UPDATE SET
-                        saved_tokens = token_saver_thread_totals.saved_tokens + excluded.saved_tokens,
-                        runs = token_saver_thread_totals.runs + excluded.runs,
-                        updated_at = excluded.updated_at;
+        let key = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let inserted = try db.performSync { database in
+            try database.transaction {
+                let insert = try database.prepare("""
+                    INSERT OR IGNORE INTO token_saver_savings
+                        (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms,
+                         cache_state, content_type, engine, attributability, delivered, governance_json, thread_id,
+                         idempotency_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """)
-                defer { threadTotal.reset() }
-                try threadTotal.bind(1, thread)
-                try threadTotal.bind(2, saved)
-                try threadTotal.bind(3, iso)
-                _ = try threadTotal.step()
-            }
+                defer { insert.reset() }
+                try insert.bind(1, provider)
+                try insert.bind(2, mode)
+                try insert.bind(3, max(0, inputTokens))
+                try insert.bind(4, max(0, outputTokens))
+                try insert.bind(5, saved)
+                try insert.bind(6, iso)
+                try insert.bind(7, ms)
+                try insert.bind(8, cacheState)
+                try insert.bind(9, content)
+                try insert.bind(10, eng)
+                try insert.bind(11, attr)
+                try insert.bind(12, deliveredFlag)
+                try insert.bind(13, gov)
+                try insert.bind(14, thread)
+                try insert.bind(15, key)
+                _ = try insert.step()
 
-            let prune = try database.prepare("DELETE FROM token_saver_savings WHERE created_at_ms < ?;")
-            defer { prune.reset() }
-            try prune.bind(1, cutoff)
-            _ = try prune.step()
+                let changes = try database.prepare("SELECT changes();")
+                defer { changes.reset() }
+                let didInsert = try changes.step() && changes.columnInt64(0) == 1
+                guard didInsert else {
+                    let existing = try database.prepare("""
+                        SELECT provider, mode, input_tokens, output_tokens, saved_tokens,
+                               cache_state, content_type, engine, attributability, delivered,
+                               governance_json, thread_id
+                        FROM token_saver_savings
+                        WHERE idempotency_key = ?
+                        LIMIT 1;
+                    """)
+                    defer { existing.reset() }
+                    try existing.bind(1, key)
+                    guard !key.isEmpty,
+                          try existing.step(),
+                          existing.columnText(0) == provider,
+                          existing.columnText(1) == mode,
+                          existing.columnInt64(2) == Int64(max(0, inputTokens)),
+                          existing.columnInt64(3) == Int64(max(0, outputTokens)),
+                          existing.columnInt64(4) == Int64(saved),
+                          existing.columnText(5) == cacheState,
+                          existing.columnText(6) == content,
+                          existing.columnText(7) == eng,
+                          existing.columnText(8) == attr,
+                          existing.columnInt64(9) == Int64(deliveredFlag),
+                          existing.columnText(10) == gov,
+                          existing.columnText(11) == thread else {
+                        throw TokenSaverSavingsRepositoryError.idempotencyConflict(key)
+                    }
+                    return false
+                }
+
+                let total = try database.prepare("""
+                    INSERT INTO token_saver_savings_totals
+                        (provider, mode, input_tokens, output_tokens, saved_tokens, runs, updated_at,
+                         attributability, delivered, governance_json)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    ON CONFLICT(provider, mode) DO UPDATE SET
+                        input_tokens = token_saver_savings_totals.input_tokens + excluded.input_tokens,
+                        output_tokens = token_saver_savings_totals.output_tokens + excluded.output_tokens,
+                        saved_tokens = token_saver_savings_totals.saved_tokens + excluded.saved_tokens,
+                        runs = token_saver_savings_totals.runs + excluded.runs,
+                        updated_at = excluded.updated_at,
+                        delivered = MAX(token_saver_savings_totals.delivered, excluded.delivered),
+                        attributability = CASE
+                            WHEN excluded.attributability != 'unknown' THEN excluded.attributability
+                            ELSE token_saver_savings_totals.attributability
+                        END,
+                        governance_json = CASE
+                            WHEN excluded.governance_json != '{}' THEN excluded.governance_json
+                            ELSE token_saver_savings_totals.governance_json
+                        END;
+                """)
+                defer { total.reset() }
+                try total.bind(1, provider)
+                try total.bind(2, mode)
+                try total.bind(3, max(0, inputTokens))
+                try total.bind(4, max(0, outputTokens))
+                try total.bind(5, saved)
+                try total.bind(6, iso)
+                try total.bind(7, attr)
+                try total.bind(8, deliveredFlag)
+                try total.bind(9, gov)
+                _ = try total.step()
+
+                // Permanent per-thread accumulator (only delivered rows count toward
+                // the user-facing "saved in this thread" claim).
+                if !thread.isEmpty, delivered {
+                    let threadTotal = try database.prepare("""
+                        INSERT INTO token_saver_thread_totals
+                            (thread_id, saved_tokens, runs, updated_at)
+                        VALUES (?, ?, 1, ?)
+                        ON CONFLICT(thread_id) DO UPDATE SET
+                            saved_tokens = token_saver_thread_totals.saved_tokens + excluded.saved_tokens,
+                            runs = token_saver_thread_totals.runs + excluded.runs,
+                            updated_at = excluded.updated_at;
+                    """)
+                    defer { threadTotal.reset() }
+                    try threadTotal.bind(1, thread)
+                    try threadTotal.bind(2, saved)
+                    try threadTotal.bind(3, iso)
+                    _ = try threadTotal.step()
+                }
+
+                let prune = try database.prepare("DELETE FROM token_saver_savings WHERE created_at_ms < ?;")
+                defer { prune.reset() }
+                try prune.bind(1, cutoff)
+                _ = try prune.step()
+                return true
+            }
         }
-        return saved
+        return inserted ? saved : 0
     }
 
     /// Cumulative delivered tokens saved for one agent thread (permanent total).

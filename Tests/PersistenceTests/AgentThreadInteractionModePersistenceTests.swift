@@ -25,7 +25,7 @@ final class AgentThreadInteractionModePersistenceTests: XCTestCase {
 
     func test_preMigrationThreadDefaultsToDefaultMode() throws {
         let db = try SQLiteDB(path: ":memory:")
-        try Schema.migrateSteps(db, Array(Schema.steps.dropLast()))
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 33 })
         try db.execute("""
             INSERT INTO agent_threads(id, title, provider, model, status, created_at, updated_at)
             VALUES('legacy-thread', 'legacy', 'codex', 'gpt-5', 'completed',

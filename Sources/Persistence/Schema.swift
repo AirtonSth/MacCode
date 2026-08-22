@@ -32,8 +32,9 @@ public enum Schema {
     /// context-assembly receipts (bots branch used 72 before production
     /// shipped Token Saver receipts at that number), v76 owns Bot
     /// routine schedule spec (frequency, provider, model, reasoning),
-    /// and v77 owns nullable agent_runs.terminal_reason (downgrade-safe).
-    public static let currentVersion: Int = 77
+    /// v77 owns nullable agent_runs.terminal_reason (downgrade-safe),
+    /// and v78 deduplicates Token Saver savings by logical request.
+    public static let currentVersion: Int = 78
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1696,6 +1697,12 @@ public enum Schema {
         """),
         SchemaStep(77, """
         ALTER TABLE agent_runs ADD COLUMN terminal_reason TEXT;
+        """),
+        SchemaStep(78, """
+        ALTER TABLE token_saver_savings ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT '';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_token_saver_savings_idempotency
+            ON token_saver_savings(idempotency_key)
+            WHERE idempotency_key != '';
         """),
     ]
 

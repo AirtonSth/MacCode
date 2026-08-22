@@ -508,6 +508,9 @@ public struct DistillSavingsRecord: Sendable, Equatable {
     /// Agent thread that produced this saving (from `X-RemoteCode-Thread-ID` /
     /// `RC_TOKEN_SAVER_THREAD_ID`). Empty when unscoped (bare CLI).
     public let threadID: String
+    /// Stable identity of the logical distill request. Transport retries reuse
+    /// this key so a lost HTTP response cannot credit the same delivery twice.
+    public let idempotencyKey: String
 
     public init(
         provider: String,
@@ -519,7 +522,8 @@ public struct DistillSavingsRecord: Sendable, Equatable {
         routeStage: TokenSaverRouteStage? = nil,
         attributability: String = "unknown",
         delivered: Bool = true,
-        threadID: String = ""
+        threadID: String = "",
+        idempotencyKey: String = ""
     ) {
         self.provider = provider
         self.mode = mode
@@ -531,6 +535,7 @@ public struct DistillSavingsRecord: Sendable, Equatable {
         self.attributability = attributability
         self.delivered = delivered
         self.threadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.idempotencyKey = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -567,7 +572,8 @@ public enum DistillSavingsCalculator {
                 routeStage: response.routeStage,
                 attributability: "not_prompt_bound",
                 delivered: delivered,
-                threadID: thread
+                threadID: thread,
+                idempotencyKey: request.id.uuidString.lowercased()
             )
         case .wireRenderEnglish:
             // Rendering changes only local display text. It does not establish a
@@ -595,7 +601,8 @@ public enum DistillSavingsCalculator {
                 routeStage: response.routeStage,
                 attributability: attributability,
                 delivered: delivered,
-                threadID: thread
+                threadID: thread,
+                idempotencyKey: request.id.uuidString.lowercased()
             )
         }
     }

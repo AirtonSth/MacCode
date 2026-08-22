@@ -484,9 +484,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             74,
             75,
             76,
-            77
+            77,
+            78
         ])
-        XCTAssertEqual(Schema.currentVersion, 77)
+        XCTAssertEqual(Schema.currentVersion, 78)
         XCTAssertFalse(
             Schema.steps.contains { (63...66).contains($0.version) },
             "schema versions 63-66 are retired and must never be reused"
@@ -513,7 +514,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
 
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(Schema.currentVersion, 77)
+        XCTAssertEqual(Schema.currentVersion, 78)
 
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 0,
                        "v72 must not backfill historical winners")
@@ -594,10 +595,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.steps.filter { $0.version == 71 }.count, 1,
             "HEAD/origin production last published step is 71"
         )
-        XCTAssertEqual(Schema.currentVersion, 77)
+        XCTAssertEqual(Schema.currentVersion, 78)
         XCTAssertEqual(
-            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77],
-            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason"
+            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78],
+            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries"
         )
         let v72 = try XCTUnwrap(Schema.steps.first { $0.version == 72 })
         XCTAssertTrue(v72.sql.contains("CHECK(format IN ('human', 'rcw1', 'rcs1'))"))
@@ -1492,7 +1493,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
                    '2026-08-21T02:54:43Z', '2026-08-21T02:54:43Z');
             """)
 
-        try Schema.migrateSteps(db, Schema.steps)
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 77 })
         XCTAssertEqual(try maxVersion(db), 77)
         let info = try db.prepare("PRAGMA table_info(agent_runs);")
         var names: [String] = []
@@ -1511,5 +1512,43 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         )
         XCTAssertNil(loaded.terminalReason, "v77 must not invent a reason for pre-column rows")
         XCTAssertEqual(loaded.status, .cancelled)
+    }
+
+    /// WHY: the managed CLI retries one logical ledger POST when its first HTTP
+    /// response is lost. v78 must preserve historical rows while giving new
+    /// non-empty request identities a uniqueness fence.
+    func test_v78AddsPartialUniqueSavingsIdempotencyWithoutCollidingHistoricalRows() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 77 })
+        XCTAssertEqual(try maxVersion(db), 77)
+        try db.execute("""
+            INSERT INTO token_saver_savings
+                (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms)
+            VALUES
+                ('claude', 'command-output', 10, 5, 5, '2026-08-21T00:00:00Z', 1),
+                ('codex', 'command-output', 20, 5, 15, '2026-08-21T00:00:00Z', 2);
+            """)
+
+        try Schema.migrateSteps(db, Schema.steps)
+
+        XCTAssertEqual(try maxVersion(db), 78)
+        XCTAssertEqual(try rowCount(db, table: "token_saver_savings"), 2,
+                       "v78 must retain every historical row with the empty default key")
+        try db.execute("""
+            INSERT INTO token_saver_savings
+                (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms,
+                 idempotency_key)
+            VALUES
+                ('grok', 'command-output', 30, 10, 20, '2026-08-21T00:00:00Z', 3,
+                 'request-1');
+            """)
+        XCTAssertThrowsError(try db.execute("""
+            INSERT INTO token_saver_savings
+                (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms,
+                 idempotency_key)
+            VALUES
+                ('grok', 'command-output', 30, 10, 20, '2026-08-21T00:00:00Z', 4,
+                 'request-1');
+            """), "a non-empty logical request identity must be unique")
     }
 }

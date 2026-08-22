@@ -1,6 +1,7 @@
 import CryptoKit
 import XCTest
 import CoreModel
+import Persistence
 @testable import DistillCore
 
 private let managedDistillCLITestRootRunID = "managed-distill-cli-tests"
@@ -899,6 +900,88 @@ final class ManagedDistillCLITests: XCTestCase {
         )
         let transportCalls = await calls.count()
         XCTAssertEqual(transportCalls, 2, "retry must recover the saving after one transient failure, then stop")
+    }
+
+    func test_waveAHit_lostFirstHTTP200DoesNotDoubleSavingsLedger() async throws {
+        // WHY: the server can commit savings and send 200 while the client loses
+        // that response. Its bounded retry reuses the exact DistillRequest UUID,
+        // so persistence must credit the delivered bytes exactly once.
+        TokenSaverWaveLiveRollout.activate(.waveA)
+        setenv("RC_TOKEN_SAVER_DISTILL_HINT", "1", 1)
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let repo = TokenSaverSavingsRepository(db: db)
+        let token = "lost-200-token"
+        let configuration = try DistillServiceConfiguration(
+            authToken: token,
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
+            onSuccess: { request, response, threadID in
+                guard let record = DistillSavingsCalculator.record(
+                    for: request,
+                    response: response,
+                    threadID: threadID
+                ) else { return }
+                do {
+                    _ = try repo.record(
+                        provider: record.provider,
+                        mode: record.mode,
+                        inputTokens: record.inputTokens,
+                        outputTokens: record.outputTokens,
+                        savedTokens: record.savedTokens,
+                        cacheState: record.cacheState,
+                        engine: record.routeStage?.rawValue ?? "unknown",
+                        attributability: record.attributability,
+                        delivered: record.delivered,
+                        threadID: record.threadID,
+                        idempotencyKey: record.idempotencyKey
+                    )
+                } catch {
+                    XCTFail("savings persistence failed: \(error)")
+                }
+            }
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let line = "same log line that repeats many times for compression"
+        let input = String(repeating: line + "\n", count: 20) + "exit code: 0\n"
+        let calls = CallCounter()
+        let liveState = ManagedDistillCLI.State(
+            baseURL: ready.baseURL,
+            authToken: token,
+            receiptKey: managedDistillCLITestReceiptKey
+        )
+        let cli = ManagedDistillCLI(
+            arguments: [],
+            stdin: Data(input.utf8),
+            state: liveState,
+            provider: "claude"
+        ) { request in
+            let attempt = await calls.increment()
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if attempt == 1 { return nil } // server committed; client lost 200
+                return (data, status)
+            } catch {
+                return nil
+            }
+        }
+
+        let (output, exitCode) = await cli.run()
+
+        XCTAssertEqual(exitCode, 0)
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(String(decoding: output, as: UTF8.self)))
+        let transportCalls = await calls.count()
+        XCTAssertEqual(transportCalls, 2, "the hidden first 200 must trigger exactly one retry")
+        let summary = try repo.summary()
+        XCTAssertEqual(summary.totalRuns, 1, "both HTTP requests represent one delivered saving")
+        XCTAssertGreaterThan(summary.totalSavedTokens, 0)
     }
 
     func test_waveAHit_smallerBodyButReceiptEliminatesGain_failsOpenWithoutLedger() async throws {
