@@ -1017,7 +1017,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         do {
             let index = try decoder.decode(
                 CancellationDenyIndex.self,
-                from: Data(contentsOf: url)
+                from: Data(contentsOf: url, options: .mappedIfSafe)
             )
             guard index.schemaVersion == CancellationDenyIndex.empty.schemaVersion else {
                 throw AttachmentUploadV2Error.storageFailure(
