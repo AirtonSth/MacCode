@@ -367,9 +367,21 @@ public final class BotComputerGuestService: @unchecked Sendable {
         return value
     }
 
+    // PERF: nibble table avoids String(format:) per byte; same lowercase hex.
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+    private static func hexString<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(digest.underestimatedCount * 2)
+        for b in digest {
+            out.append(hexAlphabet[Int(b >> 4)])
+            out.append(hexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
+    }
+
     private func refreshLegacyStartScriptIfNeeded(at target: URL, from source: URL) throws {
         let existing = try Data(contentsOf: target, options: .mappedIfSafe)
-        let digest = SHA256.hash(data: existing).map { String(format: "%02x", $0) }.joined()
+        let digest = Self.hexString(SHA256.hash(data: existing))
         guard digest == Self.legacyUnauthenticatedStartScriptSHA256,
               FileManager.default.fileExists(atPath: source.path)
         else { return }
@@ -377,7 +389,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     public static func pngMagic(_ data: Data) -> String {
-        data.prefix(4).map { String(format: "%02x", $0) }.joined()
+        Self.hexString(data.prefix(4))
     }
 
     public func observe(botID: BotID) throws -> (png: Data, hash: String, magic: String) {
