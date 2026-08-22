@@ -663,7 +663,7 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
         var digests = Set<String>()
         for referenceID in referenceIDs {
             let url = metadataRoot.appendingPathComponent("\(referenceID).json")
-            guard let data = try? Data(contentsOf: url),
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let digest = validDigest(object["digest"] as? String) else { continue }
             digests.insert(digest)
@@ -684,7 +684,7 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
                 try? fileManager.removeItem(at: url)
                 continue
             }
-            guard let data = try? Data(contentsOf: url),
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   validDigest(object["digest"] as? String) == digest else { continue }
             try? fileManager.removeItem(at: url)

@@ -7786,7 +7786,7 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
     }
 
     private func decodeAnchor(at url: URL) throws -> TerminalHistoryFailureAnchor {
-        let data = try Data(contentsOf: url)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         guard let anchor = try? decoder.decode(
             TerminalHistoryFailureAnchor.self,
             from: data
@@ -7810,7 +7810,7 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
     }
 
     private func decodePendingDelete(at url: URL) throws -> TerminalHistoryPendingDelete {
-        let data = try Data(contentsOf: url)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         guard let pending = try? decoder.decode(
             TerminalHistoryPendingDelete.self,
             from: data
