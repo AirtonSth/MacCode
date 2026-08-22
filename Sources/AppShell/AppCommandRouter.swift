@@ -310,7 +310,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Fires after inbound attachments pass `validatedForRetry` on the managed store.
     var sendAgentMessageResolvedAttachmentsProbeForTesting: (([AgentAttachment]) -> Void)?
     /// Fires after send preflight resolves, whether from cache or a catalog list.
-    var sendAgentMessageAfterPreflightProbeForTesting: (() -> Void)?
+    var sendAgentMessageAfterPreflightProbeForTesting: (() async -> Void)?
     var listAgentProviderSnapshotsCallCountForTesting = 0
     var preflightListedProviderSnapshotsForTesting = false
     private var cachedProviderSnapshots: [AgentProviderSnapshot] = []
@@ -4283,7 +4283,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 allowProviderCatalogListing: allowProviderCatalogListingDuringPreflight
             )
         }
-        sendAgentMessageAfterPreflightProbeForTesting?()
+        if let probe = sendAgentMessageAfterPreflightProbeForTesting {
+            await probe()
+        }
         if Task.isCancelled {
             throw CancellationError()
         }

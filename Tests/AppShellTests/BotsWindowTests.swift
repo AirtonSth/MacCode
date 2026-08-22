@@ -4136,6 +4136,48 @@ final class BotsWindowTests: XCTestCase {
         router.sendAgentMessageAfterPreflightProbeForTesting = nil
     }
 
+    func test_stopJoinsOverlappingPreflightSends() async throws {
+        // WHY: a second same-bot send must not overwrite the first task slot.
+        // Stop has to cancel and join both preflight waits, or the older send
+        // can start the provider after the stop receipt.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        let gate = OverlappingSendPreflightGate()
+        router.sendAgentMessageAfterPreflightProbeForTesting = { await gate.park() }
+        let routing = BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        _ = try vm.enqueueHostMessage(botID: bot.id, text: "first", conversationID: nil, routing: routing)
+        _ = try vm.enqueueHostMessage(botID: bot.id, text: "second", conversationID: nil, routing: routing)
+        await gate.waitUntilEntered(2)
+        let settled = expectation(description: "stop joined both overlapping sends")
+        var settledOK: Bool?
+        vm.stopLiveRuns(for: bot.id, force: true) { ok in
+            settledOK = ok
+            settled.fulfill()
+        }
+        await fulfillment(of: [settled], timeout: 5)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(runner.requests.isEmpty, "neither overlapping send may start after stop")
+        XCTAssertFalse(vm.lastSendStartedProviderRun)
+        XCTAssertEqual(settledOK, true)
+        router.sendAgentMessageAfterPreflightProbeForTesting = nil
+    }
+
     func test_openHomeFileRevealsOwnedSkillInStudioFiles() throws {
         // WHY: Skills Open used to write homeDraft only. Studio Files now
         // hosts FilesSurfaceRoot, so that path left the preview on
@@ -12024,6 +12066,58 @@ final class BotsWindowTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent(relative)
+    }
+}
+
+/// Parks overlapping sendAgentMessage preflights until Task cancellation resumes them.
+private final class OverlappingSendPreflightGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entered = 0
+    private var needed = 0
+    private var parking: [CheckedContinuation<Void, Never>] = []
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancelled = false
+
+    func park() async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                entered += 1
+                let ready = needed > 0 && entered >= needed
+                let waiters = ready ? entryWaiters : []
+                if ready { entryWaiters.removeAll() }
+                if cancelled {
+                    lock.unlock()
+                    waiters.forEach { $0.resume() }
+                    cont.resume()
+                    return
+                }
+                parking.append(cont)
+                lock.unlock()
+                waiters.forEach { $0.resume() }
+            }
+        } onCancel: {
+            lock.lock()
+            let parked = parking
+            parking.removeAll()
+            cancelled = true
+            lock.unlock()
+            parked.forEach { $0.resume() }
+        }
+    }
+
+    func waitUntilEntered(_ count: Int) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            needed = count
+            if entered >= count {
+                lock.unlock()
+                cont.resume()
+                return
+            }
+            entryWaiters.append(cont)
+            lock.unlock()
+        }
     }
 }
 

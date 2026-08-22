@@ -2439,6 +2439,11 @@ public struct BotDeskThreadRailRouting: Equatable {
     }
 }
 
+/// Identity token so overlapping sends compare-and-remove instead of overwriting one slot.
+private final class DeskSendWork {
+    var task: Task<Void, Never>!
+}
+
 @MainActor
 public final class BotsViewModel: ObservableObject {
     public static let assistantPlaceholder = BotsDeskFollowThrough.noRouterPlaceholder
@@ -2541,7 +2546,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var deskTimelineRejoinToken = 0
     /// Owner of the in-flight send so roster switch does not paint Loading on the wrong desk.
     private var deskSendInFlightBotID: BotID?
-    private var deskSendTasks: [BotID: Task<Void, Never>] = [:]
+    private var deskSendTasks: [BotID: [DeskSendWork]] = [:]
     private var deskStopEpoch: [BotID: Int] = [:]
     /// Test seam: how many times Desk actually decoded stream events.
     public private(set) var deskLiveReplayFetchCountForTesting = 0
@@ -4085,8 +4090,8 @@ public final class BotsViewModel: ObservableObject {
 
     public func stopLiveRuns(for botID: BotID, force: Bool, onSettled: ((Bool) -> Void)? = nil) {
         deskStopEpoch[botID, default: 0] += 1
-        let sendTask = deskSendTasks.removeValue(forKey: botID)
-        sendTask?.cancel()
+        let sendWorks = takeDeskSendWorks(for: botID)
+        sendWorks.forEach { $0.task.cancel() }
         let threadIDs: [AgentThreadID]
         do {
             threadIDs = try liveThreadIDs(for: botID)
@@ -4102,8 +4107,8 @@ public final class BotsViewModel: ObservableObject {
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
-            if let sendTask {
-                await sendTask.value
+            for work in sendWorks {
+                await work.task.value
             }
             let remaining: [AgentThreadID]
             do {
@@ -7262,10 +7267,12 @@ public final class BotsViewModel: ObservableObject {
         )
         beginDeskSendInFlight(for: bot.id)
         let epoch = deskStopEpoch[bot.id] ?? 0
-        let sendTask = Task { [weak self] in
+        let work = DeskSendWork()
+        work.task = Task { [weak self] in
             guard let self else { return }
             await Task.yield()
             guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
+                self.forgetDeskSend(work, botID: bot.id)
                 self.clearDeskSendInFlight(for: bot.id)
                 return
             }
@@ -7281,8 +7288,8 @@ public final class BotsViewModel: ObservableObject {
                 router: router,
                 expectedEpoch: epoch
             )
+            self.forgetDeskSend(work, botID: bot.id)
             self.clearDeskSendInFlight(for: bot.id)
-            self.deskSendTasks[bot.id] = nil
             if let started {
                 self.lastSendStartedProviderRun = true
                 self.lastLinkedRunIDByBot[bot.id] = started.runID
@@ -7294,7 +7301,7 @@ public final class BotsViewModel: ObservableObject {
                 self.recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
             }
         }
-        deskSendTasks[bot.id] = sendTask
+        rememberDeskSend(work, botID: bot.id)
         return prepared
     }
 
@@ -7667,8 +7674,27 @@ public final class BotsViewModel: ObservableObject {
 
     private func clearDeskSendInFlight(for botID: BotID) {
         guard deskSendInFlightBotID == nil || deskSendInFlightBotID == botID else { return }
+        if !(deskSendTasks[botID] ?? []).isEmpty { return }
         deskSendInFlight = false
         deskSendInFlightBotID = nil
+    }
+
+    private func rememberDeskSend(_ work: DeskSendWork, botID: BotID) {
+        deskSendTasks[botID, default: []].append(work)
+    }
+
+    private func forgetDeskSend(_ work: DeskSendWork, botID: BotID) {
+        guard var works = deskSendTasks[botID] else { return }
+        works.removeAll { $0 === work }
+        if works.isEmpty {
+            deskSendTasks[botID] = nil
+        } else {
+            deskSendTasks[botID] = works
+        }
+    }
+
+    private func takeDeskSendWorks(for botID: BotID) -> [DeskSendWork] {
+        deskSendTasks.removeValue(forKey: botID) ?? []
     }
 
     public var dockerDesktopSelectable: Bool {
