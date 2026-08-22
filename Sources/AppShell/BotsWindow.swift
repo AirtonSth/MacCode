@@ -2442,6 +2442,8 @@ public struct BotDeskThreadRailRouting: Equatable {
 /// Identity token so overlapping sends compare-and-remove instead of overwriting one slot.
 private final class DeskSendWork {
     var task: Task<Void, Never>!
+    var threadID: AgentThreadID?
+    var runID: AgentRunID?
 }
 
 /// One in-flight stop join per bot so concurrent stops share the same await.
@@ -4099,9 +4101,9 @@ public final class BotsViewModel: ObservableObject {
 
     public func stopLiveRuns(for botID: BotID, force: Bool, onSettled: ((Bool) -> Void)? = nil) {
         if let existing = deskStopJoins[botID] {
-            Task { @MainActor [weak self] in
-                _ = await existing.task.value
-                self?.stopLiveRuns(for: botID, force: force, onSettled: onSettled)
+            Task { @MainActor in
+                let ok = await existing.task.value
+                onSettled?(ok)
             }
             return
         }
@@ -4113,7 +4115,12 @@ public final class BotsViewModel: ObservableObject {
             isStopping = true
         }
         let sendWorks = takeDeskSendWorks(for: botID)
-        sendWorks.forEach { $0.task.cancel() }
+        sendWorks.forEach { work in
+            work.task.cancel()
+            if let threadID = work.threadID {
+                context.coordinator.cancelPreparation(threadId: threadID)
+            }
+        }
         join.task = Task { @MainActor [weak self] in
             guard let self else { return false }
             var discoveryError: Error?
@@ -7301,6 +7308,8 @@ public final class BotsViewModel: ObservableObject {
         beginDeskSendInFlight(for: bot.id)
         let epoch = deskStopEpoch[bot.id] ?? 0
         let work = DeskSendWork()
+        work.threadID = prepared.thread.id
+        work.runID = prepared.runID
         work.task = Task { [weak self] in
             guard let self else { return }
             await Task.yield()

@@ -4318,6 +4318,11 @@ final class BotsWindowTests: XCTestCase {
         await fulfillment(of: [first, second], timeout: 5)
         XCTAssertEqual(firstOK, true)
         XCTAssertEqual(secondOK, true)
+        XCTAssertEqual(
+            vm.deskStopJoinStartCountForTesting,
+            1,
+            "duplicate stop must attach to the same join result, not start a second generation"
+        )
         XCTAssertTrue(runner.requests.isEmpty)
         router.sendAgentMessageAfterPreflightProbeForTesting = nil
     }
