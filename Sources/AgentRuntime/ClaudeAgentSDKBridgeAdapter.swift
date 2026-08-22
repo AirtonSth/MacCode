@@ -944,11 +944,19 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let specs: [String]             // exact-pinned install argv: sdk + native + peers
     }
 
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     static func cachedBridgeFileName(source: String) -> String {
         let digest = SHA256.hash(data: Data(source.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
-        return "ClaudeAgentSDKBridge-\(digest).mjs"
+        // PERF: nibble table avoids 32 String(format:) calls; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(Self.hexAlphabet[Int(b >> 4)])
+            out.append(Self.hexAlphabet[Int(b & 0x0F)])
+        }
+        let hex = String(bytes: out, encoding: .utf8) ?? ""
+        return "ClaudeAgentSDKBridge-\(hex).mjs"
     }
 
     private func resolvedBridgeScriptPath(onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws -> String {
