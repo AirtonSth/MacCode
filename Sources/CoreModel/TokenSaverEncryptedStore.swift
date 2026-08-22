@@ -265,7 +265,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
 
         if FileManager.default.fileExists(atPath: metaURL.path) {
             // Fail closed: unreadable/corrupt meta must not regenerate a live store.
-            let data = try Data(contentsOf: metaURL)
+            let data = try Data(contentsOf: metaURL, options: .mappedIfSafe)
             do {
                 self.meta = try decoder.decode(Meta.self, from: data)
             } catch {
@@ -303,7 +303,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
                 raw = stored
             } else if FileManager.default.fileExists(atPath: dekURL.path) {
                 // One-way N-1 migration from the unencapsulated branch prototype.
-                let legacy = try Data(contentsOf: dekURL)
+                let legacy = try Data(contentsOf: dekURL, options: .mappedIfSafe)
                 raw = try keyProvider.storeIfAbsent(legacy, reference: reference)
                 try FileManager.default.removeItem(at: dekURL)
             } else {
@@ -349,7 +349,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         var pending: [String] = []
         for f in files where f.pathExtension == "tsrec" {
             let id = f.deletingPathExtension().lastPathComponent
-            let data = try Data(contentsOf: f)
+            let data = try Data(contentsOf: f, options: .mappedIfSafe)
             let record = try decoder.decode(DiskRecord.self, from: data)
             if record.formatVersion == Self.previousSchemaVersion {
                 pending.append(id)
@@ -360,7 +360,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
 
         for id in pending {
             let url = rootURL.appendingPathComponent(id + ".tsrec")
-            let data = try Data(contentsOf: url)
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
             let record = try decoder.decode(DiskRecord.self, from: data)
             let box = try AES.GCM.SealedBox(combined: record.ciphertext)
             let plain = try AES.GCM.open(box, using: key)
