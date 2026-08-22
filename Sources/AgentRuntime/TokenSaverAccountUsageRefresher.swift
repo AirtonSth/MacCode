@@ -290,7 +290,7 @@ public enum AssistantAccountUsageParser {
     /// `issuer::principal` objects whose `key` field is the live CLI bearer.
     /// Never logs the token.
     public static func grokAccessToken(fromAuthFile url: URL, now: Date = Date()) -> String? {
-        guard let data = try? Data(contentsOf: url),
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
@@ -346,7 +346,7 @@ public enum AssistantAccountUsageParser {
     }
 
     public static func claudeAccessToken(fromAuthFile url: URL) -> String? {
-        guard let data = try? Data(contentsOf: url),
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
@@ -414,7 +414,7 @@ public enum AssistantAccountUsageParser {
     }
 
     public static func codexAccessToken(fromAuthFile url: URL) -> (token: String, accountID: String?)? {
-        guard let data = try? Data(contentsOf: url),
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
