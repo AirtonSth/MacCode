@@ -1145,8 +1145,11 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         let url = ownerBindingURL(uploadId: uploadId)
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         do {
-            let value = try String(contentsOf: url, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            guard let raw = String(data: data, encoding: .utf8) else {
+                throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [NSFilePathErrorKey: url.path])
+            }
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
             guard value.count == 64, value.allSatisfy(\.isHexDigit) else {
                 throw AttachmentUploadV2Error.storageFailure(

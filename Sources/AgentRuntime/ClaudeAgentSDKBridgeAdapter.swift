@@ -337,7 +337,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     private static func bridgeSupportsNativeSessionMutation(at path: String) -> Bool {
         guard pinnedNPMVersion(in: sdkPackageSpec()) == "0.3.157",
-              let source = try? String(contentsOfFile: path, encoding: .utf8) else {
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe), let source = String(data: data, encoding: .utf8) else {
             return false
         }
         return source.contains("const BRIDGE_PROTOCOL_VERSION = 3")
@@ -973,7 +973,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     private func runtimeProvisionPlan(sourcePath: String) throws -> RuntimeProvisionPlan? {
         let url = URL(fileURLWithPath: sourcePath)
         guard FileManager.default.isReadableFile(atPath: url.path) else { return nil }
-        let source = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let source = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
         guard source.contains("@anthropic-ai/claude-agent-sdk") else { return nil }
         let localPackage = url.deletingLastPathComponent()
             .appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json")
@@ -990,7 +990,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         // cannot overwrite a newer PostToolUse implementation during launch.
         let cachedBridge = cache.appendingPathComponent(Self.cachedBridgeFileName(source: source))
         if !FileManager.default.isReadableFile(atPath: cachedBridge.path)
-            || ((try? String(contentsOf: cachedBridge, encoding: .utf8)) != source) {
+            || (((try? Data(contentsOf: cachedBridge, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) != source) {
             try source.write(to: cachedBridge, atomically: true, encoding: .utf8)
         }
         let sdkSpec = Self.sdkPackageSpec()
