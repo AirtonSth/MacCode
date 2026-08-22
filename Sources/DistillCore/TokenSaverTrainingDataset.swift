@@ -92,7 +92,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
                 "model": modelID,
                 "source": source,
                 "input_sha256": sha,
-                "created_at": ISO8601DateFormatter().string(from: Date()),
+                "created_at": Self.isoNow(),
             ],
         ]
         appendJSONL(record, to: sftURL(for: request.mode), split: "sft")
@@ -116,7 +116,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
                 "source": source,
                 "reason": reason,
                 "input_sha256": sha256(request.input),
-                "created_at": ISO8601DateFormatter().string(from: Date()),
+                "created_at": Self.isoNow(),
             ],
         ]
         appendJSONL(record, to: root.appendingPathComponent("rejected", isDirectory: true).appendingPathComponent("\(day).jsonl"), split: "rejected")
@@ -149,7 +149,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
                 "model": modelID,
                 "source": source,
                 "input_sha256": sha,
-                "created_at": ISO8601DateFormatter().string(from: Date()),
+                "created_at": Self.isoNow(),
             ],
         ]
         appendJSONL(
@@ -178,7 +178,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
                 "source": source,
                 "reason": reason,
                 "input_sha256": sha256(system + "\n" + user),
-                "created_at": ISO8601DateFormatter().string(from: Date()),
+                "created_at": Self.isoNow(),
             ],
         ]
         appendJSONL(
@@ -242,7 +242,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
             obj = parsed
         }
         obj["schema_version"] = Self.schemaVersion
-        obj["last_write"] = ISO8601DateFormatter().string(from: Date())
+        obj["last_write"] = Self.isoNow()
         var counts = obj["counts"] as? [String: Int] ?? [:]
         counts[split, default: 0] += 1
         obj["counts"] = counts
@@ -271,14 +271,14 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         redact(LibrarianThinkStrip.stripLenient(text))
     }
 
+    // PERF: NSRegularExpression recompilation is expensive. Share precompiled regexes.
+    private static let liveRegex = try! NSRegularExpression(pattern: #"sk_live_[A-Za-z0-9]+"#)
+    private static let keyedRegex = try! NSRegularExpression(pattern: #"(?i)(api[_-]?key|password|secret|token|bearer)\s*[:=]\s*\S+"#)
+
     private func redact(_ text: String) -> String {
         var s = text
-        if let live = try? NSRegularExpression(pattern: #"sk_live_[A-Za-z0-9]+"#) {
-            s = live.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "<redacted>")
-        }
-        if let keyed = try? NSRegularExpression(pattern: #"(?i)(api[_-]?key|password|secret|token|bearer)\s*[:=]\s*\S+"#) {
-            s = keyed.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "$1=<redacted>")
-        }
+        s = Self.liveRegex.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "<redacted>")
+        s = Self.keyedRegex.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "$1=<redacted>")
         return s
     }
 
@@ -291,6 +291,20 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()
+
+    private static let isoLock = NSLock()
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    private static func isoNow() -> String {
+        isoLock.lock()
+        let s = isoFormatter.string(from: Date())
+        isoLock.unlock()
+        return s
+    }
 
     private static func dayStamp(_ date: Date) -> String {
         dayStampLock.lock()
