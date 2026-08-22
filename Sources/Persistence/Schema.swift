@@ -33,8 +33,9 @@ public enum Schema {
     /// shipped Token Saver receipts at that number), v76 owns Bot
     /// routine schedule spec (frequency, provider, model, reasoning),
     /// v77 owns nullable agent_runs.terminal_reason (downgrade-safe),
-    /// and v78 deduplicates Token Saver savings by logical request.
-    public static let currentVersion: Int = 78
+    /// v78 deduplicates Token Saver savings by logical request, and v79 keeps
+    /// authenticated item metadata outside the rolling replay window.
+    public static let currentVersion: Int = 79
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1703,6 +1704,38 @@ public enum Schema {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_token_saver_savings_idempotency
             ON token_saver_savings(idempotency_key)
             WHERE idempotency_key != '';
+        """),
+        SchemaStep(79, """
+        CREATE TABLE IF NOT EXISTS agent_item_host_attestations (
+            run_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            stream_event_id INTEGER NOT NULL,
+            event_kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(run_id, seq),
+            FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+        );
+        INSERT OR IGNORE INTO agent_item_host_attestations(
+            run_id, seq, stream_event_id, event_kind, payload_json, created_at
+        )
+        SELECT run_id, seq, id, event_kind, payload_json, created_at
+        FROM agent_stream_events
+        WHERE event_kind LIKE 'itemHostMetadata(% distill=true)';
+        CREATE VIEW IF NOT EXISTS agent_replay_stream_events AS
+        SELECT e.id AS id, e.payload_json, r.started_at, e.seq,
+               e.id AS ordering_id, e.run_id, r.thread_id
+        FROM agent_stream_events e
+        JOIN agent_runs r ON r.id = e.run_id
+        WHERE NOT EXISTS (
+            SELECT 1 FROM agent_item_host_attestations h
+            WHERE h.run_id = e.run_id AND h.seq = e.seq
+        )
+        UNION ALL
+        SELECT -h.rowid AS id, h.payload_json, r.started_at, h.seq,
+               h.stream_event_id AS ordering_id, h.run_id, r.thread_id
+        FROM agent_item_host_attestations h
+        JOIN agent_runs r ON r.id = h.run_id;
         """),
     ]
 

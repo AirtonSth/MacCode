@@ -697,6 +697,82 @@ final class PersistenceTests: XCTestCase {
         }
     }
 
+    func test_persistStreamBatch_durableHostIdentityFencesPrunedSequenceRetries() throws {
+        // WHY: retention may remove the rolling row while its host proof stays.
+        // A retry must accept the exact committed bytes but reject any different
+        // event that attempts to reuse that durable raw occurrence.
+        let tmp = NSTemporaryDirectory() + "RC2DurableHostIdentity-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "durable identity", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m")
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+        let proof = AssistantItemHostAttestation(
+            itemType: .tool,
+            body: AssistantContentFingerprint(
+                byteCount: 4,
+                sha256: Data(repeating: 1, count: 32)
+            ),
+            output: nil
+        )
+        let event = AssistantEvent.itemHostMetadata(
+            turnId: "turn",
+            itemId: "item",
+            distillApplied: true,
+            attestation: proof
+        )
+        let exact = AgentRunRepository.StreamWriteIntent(
+            seq: 1,
+            kind: event.debugDescription,
+            payloadJSON: String(decoding: try JSONEncoder().encode(event), as: UTF8.self),
+            providerEvent: nil
+        )
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: [exact],
+            shouldPruneStreamEvents: false
+        )
+        let deleteRolling = try db.prepare(
+            "DELETE FROM agent_stream_events WHERE run_id = ? AND seq = 1;"
+        )
+        try deleteRolling.bind(1, run.id.value.uuidString)
+        _ = try deleteRolling.step()
+
+        let fresh = AgentRunRepository(db: db)
+        try fresh.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: [exact],
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(try fresh.countStreamEvents(threadId: thread.id), 0,
+                       "an exact retry must use durable identity without resurrecting a pruned row")
+        XCTAssertEqual(
+            try fresh.listLatestStreamEvents(threadId: thread.id, strictDecoding: true),
+            [event]
+        )
+
+        let conflicting = AssistantEvent.turnStarted(turnId: "different")
+        XCTAssertThrowsError(try fresh.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: [AgentRunRepository.StreamWriteIntent(
+                seq: 1,
+                kind: conflicting.debugDescription,
+                payloadJSON: String(decoding: try JSONEncoder().encode(conflicting), as: UTF8.self),
+                providerEvent: nil
+            )],
+            shouldPruneStreamEvents: false
+        )) { error in
+            XCTAssertTrue(String(describing: error).contains("Conflicting durable stream event identity"))
+        }
+        XCTAssertEqual(try fresh.countStreamEvents(threadId: thread.id), 0,
+                       "the conflicting retry transaction must not insert a replacement")
+    }
+
     func test_persistStreamBatch_skipsProviderIdentitySelectOnFirstWrite() throws {
         // WHY: persistStreamBatch used to SELECT the full provider-log row
         // (payload_json included) before every INSERT even when the

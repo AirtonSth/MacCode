@@ -2580,7 +2580,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }) else { return providerSnapshot }
         let persistedOccurrences = replayItemOccurrences(persisted)
         let snapshotOccurrences = replayItemOccurrences(providerSnapshot)
-        var merged = providerSnapshot
+        var insertions: [(afterEventIndex: Int, occurrenceSequence: Int, event: AssistantEvent)] = []
+        var insertedOccurrenceSequences = Set<Int>()
         let fallback = renderableItemCount(persisted) > 0 ? persisted : providerSnapshot
 
         for (turnOrdinal, persistedTurn) in persistedOccurrences.turns.enumerated() {
@@ -2602,11 +2603,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                       replayOccurrenceMatches(
                           persistedItem,
                           occurrenceMatches[itemOrdinal]
-                      ),
-                      snapshotOccurrences.isTerminalPaintOccurrence(
-                          turnOrdinal: turnOrdinal,
-                          itemID: occurrenceMatches[itemOrdinal].id,
-                          occurrence: occurrenceMatches[itemOrdinal]
                       ) else {
                     // A richer snapshot is not worth losing or moving durable host
                     // truth. Keep the exact persisted replay when occurrences no
@@ -2614,11 +2610,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     return fallback
                 }
                 let snapshotItem = occurrenceMatches[itemOrdinal]
-                merged.append(.itemHostMetadata(
-                    turnId: snapshotOccurrenceTurn.id,
-                    itemId: snapshotItem.id,
-                    distillApplied: true,
-                    attestation: persistedItem.attestation
+                guard insertedOccurrenceSequences.insert(snapshotItem.sequence).inserted else {
+                    return fallback
+                }
+                insertions.append((
+                    snapshotItem.lastEventIndex,
+                    snapshotItem.sequence,
+                    .itemHostMetadata(
+                        turnId: snapshotOccurrenceTurn.id,
+                        itemId: snapshotItem.id,
+                        distillApplied: true,
+                        attestation: persistedItem.attestation
+                    )
                 ))
             }
         }
@@ -2628,27 +2631,39 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                   attestation.isWellFormed else {
                 return fallback
             }
-            let candidates = snapshotOccurrences.turns.enumerated().flatMap { turnOrdinal, turn in
+            let candidates = snapshotOccurrences.turns.flatMap { turn in
                 turn.items.filter { item in
                     item.id == orphan.itemID
                         && item.type == attestation.itemType
                         && item.matches(attestation)
-                        && snapshotOccurrences.isTerminalPaintOccurrence(
-                            turnOrdinal: turnOrdinal,
-                            itemID: item.id,
-                            occurrence: item
-                        )
                 }.map { (turn, $0) }
             }
             guard candidates.count == 1, let candidate = candidates.first else {
                 return fallback
             }
-            merged.append(.itemHostMetadata(
-                turnId: candidate.0.id,
-                itemId: candidate.1.id,
-                distillApplied: true,
-                attestation: attestation
+            guard insertedOccurrenceSequences.insert(candidate.1.sequence).inserted else {
+                return fallback
+            }
+            insertions.append((
+                candidate.1.lastEventIndex,
+                candidate.1.sequence,
+                .itemHostMetadata(
+                    turnId: candidate.0.id,
+                    itemId: candidate.1.id,
+                    distillApplied: true,
+                    attestation: attestation
+                )
             ))
+        }
+        let insertionsByIndex = Dictionary(grouping: insertions, by: \.afterEventIndex)
+        var merged: [AssistantEvent] = []
+        merged.reserveCapacity(providerSnapshot.count + insertions.count)
+        for (eventIndex, event) in providerSnapshot.enumerated() {
+            merged.append(event)
+            for insertion in (insertionsByIndex[eventIndex] ?? [])
+                .sorted(by: { $0.occurrenceSequence < $1.occurrenceSequence }) {
+                merged.append(insertion.event)
+            }
         }
         return merged
     }
@@ -2666,6 +2681,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private struct ReplayItemOccurrence: Sendable {
         let sequence: Int
+        var lastEventIndex: Int
         let id: String
         let type: AssistantItemType
         var body: ReplayContentFingerprintBuilder
@@ -2725,31 +2741,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private struct ReplayOccurrenceState: Sendable {
         var turns: [ReplayTurnOccurrence] = []
         var orphanAttestations: [ReplayOrphanAttestation] = []
-
-        func isTerminalPaintOccurrence(
-            turnOrdinal: Int,
-            itemID: String,
-            occurrence: ReplayItemOccurrence
-        ) -> Bool {
-            guard turns.indices.contains(turnOrdinal),
-                  let occurrenceIndex = turns[turnOrdinal].items.firstIndex(where: {
-                      $0.sequence == occurrence.sequence
-                  }) else {
-                return false
-            }
-            let turnID = turns[turnOrdinal].id
-            for laterTurnOrdinal in turnOrdinal..<turns.count
-            where turns[laterTurnOrdinal].id == turnID {
-                let startIndex = laterTurnOrdinal == turnOrdinal
-                    ? occurrenceIndex + 1
-                    : 0
-                guard startIndex < turns[laterTurnOrdinal].items.count else { continue }
-                if turns[laterTurnOrdinal].items[startIndex...].contains(where: { $0.id == itemID }) {
-                    return false
-                }
-            }
-            return true
-        }
     }
 
     /// Replays content while assigning a fresh internal identity to every raw
@@ -2770,7 +2761,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return index
         }
 
-        for event in events {
+        for (eventIndex, event) in events.enumerated() {
             switch event {
             case .turnStarted(let turnID):
                 _ = appendTurn(turnID)
@@ -2779,6 +2770,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 let turnIndex = latestTurnIndexByID[item.turnId] ?? appendTurn(item.turnId)
                 var occurrence = ReplayItemOccurrence(
                     sequence: nextItemSequence,
+                    lastEventIndex: eventIndex,
                     id: item.id,
                     type: item.type,
                     body: ReplayContentFingerprintBuilder(item.body),
@@ -2802,6 +2794,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
             case .itemDelta(let itemID, let bodyAppend, let outputAppend, _):
                 if let location = latestItemLocationByID[itemID] {
+                    state.turns[location.turn].items[location.item].lastEventIndex = eventIndex
                     if let bodyAppend {
                         state.turns[location.turn].items[location.item].body.append(bodyAppend)
                     }
@@ -2812,6 +2805,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         }
                         state.turns[location.turn].items[location.item].output?.append(outputAppend)
                     }
+                }
+
+            case .itemState(let itemID, _),
+                 .itemProgress(let itemID, _),
+                 .itemCompleted(let itemID, _):
+                if let location = latestItemLocationByID[itemID] {
+                    state.turns[location.turn].items[location.item].lastEventIndex = eventIndex
                 }
 
             case .itemHostMetadata(let turnID, let itemID, let distillApplied, let attestation):

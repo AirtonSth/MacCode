@@ -3993,29 +3993,46 @@ public final class AgentRunRepository: @unchecked Sendable {
 
     public func appendStreamEvent(runId: AgentRunID, seq: Int, kind: String, payloadJSON: String) throws {
         let bounded = try boundedStreamRow(kind: kind, payloadJSON: payloadJSON)
-        let st = try db.prepare("INSERT INTO agent_stream_events(run_id, seq, event_kind, payload_json, created_at) VALUES(?, ?, ?, ?, ?);")
-        try st.bind(1, runId.value.uuidString)
-        try st.bind(2, Int64(seq))
-        try st.bind(3, bounded.kind)
-        try st.bind(4, bounded.payloadJSON)
-        try st.bind(5, iso.string(from: Date()))
-        _ = try st.step()
-        rememberCommittedStreamSeq(runId: runId, seq: seq)
-        // Single-path writers (tests + rare direct callers) must also reclaim so
-        // a large admit never relies on the batch prune cadence alone.
-        if let run = try get(id: runId) {
-            try db.performSync { database in
-                let pruned = try pruneStreamEvents(
+        let createdAt = iso.string(from: Date())
+        try db.performSync { database in
+            try database.transaction {
+                let st = try database.prepare("INSERT INTO agent_stream_events(run_id, seq, event_kind, payload_json, created_at) VALUES(?, ?, ?, ?, ?);")
+                try st.bind(1, runId.value.uuidString)
+                try st.bind(2, Int64(seq))
+                try st.bind(3, bounded.kind)
+                try st.bind(4, bounded.payloadJSON)
+                try st.bind(5, createdAt)
+                _ = try st.step()
+                try persistDurableHostMetadataIfNeeded(
                     db: database,
-                    threadId: run.threadId,
-                    keepLatest: AgentEventRetentionPolicy.production.streamEventCountPerThread,
-                    maxPayloadBytes: AgentEventRetentionPolicy.production.streamEventBytesPerThread
+                    runId: runId,
+                    seq: seq,
+                    kind: bounded.kind,
+                    payloadJSON: bounded.payloadJSON,
+                    createdAt: createdAt
                 )
-                if pruned {
-                    try markAgentHistoryPartial(db: database, threadId: run.threadId)
+
+                let owner = try database.prepare(
+                    "SELECT thread_id FROM agent_runs WHERE id = ? LIMIT 1;"
+                )
+                try owner.bind(1, runId.value.uuidString)
+                if try owner.step(),
+                   let rawThreadID = owner.columnText(0),
+                   let threadUUID = UUID(uuidString: rawThreadID) {
+                    let threadId = AgentThreadID(threadUUID)
+                    let pruned = try pruneStreamEvents(
+                        db: database,
+                        threadId: threadId,
+                        keepLatest: AgentEventRetentionPolicy.production.streamEventCountPerThread,
+                        maxPayloadBytes: AgentEventRetentionPolicy.production.streamEventBytesPerThread
+                    )
+                    if pruned {
+                        try markAgentHistoryPartial(db: database, threadId: threadId)
+                    }
                 }
             }
         }
+        rememberCommittedStreamSeq(runId: runId, seq: seq)
     }
 
     /// Highest durable sequence already committed for `runId`, or `0` when none.
@@ -4027,10 +4044,84 @@ public final class AgentRunRepository: @unchecked Sendable {
 
     private func maxStreamEventSeq(db: SQLiteDB, runId: AgentRunID) throws -> Int {
         let st = try db.prepare(
-            "SELECT COALESCE(MAX(seq), 0) FROM agent_stream_events WHERE run_id = ?;"
+            """
+            SELECT COALESCE(MAX(seq), 0)
+            FROM (
+                SELECT seq FROM agent_stream_events WHERE run_id = ?
+                UNION ALL
+                SELECT seq FROM agent_item_host_attestations WHERE run_id = ?
+            );
+            """
         )
         try st.bind(1, runId.value.uuidString)
+        try st.bind(2, runId.value.uuidString)
         return (try st.step()) ? Int(st.columnInt64(0)) : 0
+    }
+
+    /// Authenticated item metadata is host-owned workflow state, not disposable
+    /// provider output. Keep its exact stream occurrence after the rolling event
+    /// row ages out so reopen can reattach the proof to the same raw occurrence.
+    private func persistDurableHostMetadataIfNeeded(
+        db: SQLiteDB,
+        runId: AgentRunID,
+        seq: Int,
+        kind: String,
+        payloadJSON: String,
+        createdAt: String
+    ) throws {
+        guard let data = payloadJSON.data(using: .utf8),
+              let event = try? JSONDecoder().decode(AssistantEvent.self, from: data),
+              case .itemHostMetadata(_, _, let applied, let attestation) = event,
+              applied == true,
+              let attestation,
+              attestation.isWellFormed else {
+            return
+        }
+
+        let existing = try db.prepare("""
+            SELECT event_kind, payload_json
+            FROM agent_item_host_attestations
+            WHERE run_id = ? AND seq = ?
+            LIMIT 1;
+            """)
+        try existing.bind(1, runId.value.uuidString)
+        try existing.bind(2, Int64(seq))
+        if try existing.step() {
+            guard existing.columnText(0) == kind,
+                  existing.columnText(1) == payloadJSON else {
+                throw SQLiteError.execute(
+                    "Conflicting host attestation identity for run \(runId.value.uuidString) seq \(seq)."
+                )
+            }
+            return
+        }
+
+        let streamRow = try db.prepare("""
+            SELECT id
+            FROM agent_stream_events
+            WHERE run_id = ? AND seq = ?
+            ORDER BY id ASC
+            LIMIT 1;
+            """)
+        try streamRow.bind(1, runId.value.uuidString)
+        try streamRow.bind(2, Int64(seq))
+        guard try streamRow.step() else {
+            throw SQLiteError.execute(
+                "Host attestation stream row missing for run \(runId.value.uuidString) seq \(seq)."
+            )
+        }
+        let insert = try db.prepare("""
+            INSERT INTO agent_item_host_attestations(
+                run_id, seq, stream_event_id, event_kind, payload_json, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?);
+            """)
+        try insert.bind(1, runId.value.uuidString)
+        try insert.bind(2, Int64(seq))
+        try insert.bind(3, streamRow.columnInt64(0))
+        try insert.bind(4, kind)
+        try insert.bind(5, payloadJSON)
+        try insert.bind(6, createdAt)
+        _ = try insert.step()
     }
 
     private func rememberedCommittedStreamSeq(runId: AgentRunID) -> Int? {
@@ -4501,6 +4592,37 @@ public final class AgentRunRepository: @unchecked Sendable {
                 bounded: bounded,
                 createdAt: createdAt
             )
+            try persistDurableHostMetadataIfNeeded(
+                db: db,
+                runId: runId,
+                seq: item.seq,
+                kind: bounded.kind,
+                payloadJSON: bounded.payloadJSON,
+                createdAt: createdAt ?? iso.string(from: Date())
+            )
+            return
+        }
+
+        // Rolling retention may have removed the stream row while preserving
+        // its host-owned identity. Treat that ledger row as the committed
+        // sequence fence; never let a different retry reuse the occurrence.
+        let durable = try db.prepare("""
+            SELECT event_kind, payload_json
+            FROM agent_item_host_attestations
+            WHERE run_id = ? AND seq = ?
+            LIMIT 1;
+            """)
+        try durable.bind(1, runId.value.uuidString)
+        try durable.bind(2, Int64(item.seq))
+        if try durable.step() {
+            let existingKind = durable.columnText(0)
+            guard existingKind == bounded.kind,
+                  durable.columnText(1) == bounded.payloadJSON else {
+                throw SQLiteError.execute(
+                    "Conflicting durable stream event identity for run \(runId.value.uuidString) seq \(item.seq) " +
+                    "(existing kind: \(existingKind ?? "nil"), retry kind: \(item.kind))."
+                )
+            }
             return
         }
 
@@ -4511,6 +4633,14 @@ public final class AgentRunRepository: @unchecked Sendable {
         try insert.bind(4, bounded.payloadJSON)
         try insert.bind(5, createdAt ?? iso.string(from: Date()))
         _ = try insert.step()
+        try persistDurableHostMetadataIfNeeded(
+            db: db,
+            runId: runId,
+            seq: item.seq,
+            kind: bounded.kind,
+            payloadJSON: bounded.payloadJSON,
+            createdAt: createdAt ?? iso.string(from: Date())
+        )
         rememberCommittedStreamSeq(runId: runId, seq: item.seq)
     }
 
@@ -4535,6 +4665,27 @@ public final class AgentRunRepository: @unchecked Sendable {
                 let existingKindDescription = existingKind ?? "nil"
                 throw SQLiteError.execute(
                     "Conflicting stream event identity for run \(runId.value.uuidString) seq \(item.seq) " +
+                    "(existing kind: \(existingKindDescription), retry kind: \(item.kind))."
+                )
+            }
+            return
+        }
+
+        let durable = try db.prepare("""
+            SELECT event_kind, payload_json
+            FROM agent_item_host_attestations
+            WHERE run_id = ? AND seq = ?
+            LIMIT 1;
+            """)
+        try durable.bind(1, runId.value.uuidString)
+        try durable.bind(2, Int64(item.seq))
+        if try durable.step() {
+            let existingKind = durable.columnText(0)
+            let existingKindDescription = existingKind ?? "nil"
+            guard existingKind == bounded.kind,
+                  durable.columnText(1) == bounded.payloadJSON else {
+                throw SQLiteError.execute(
+                    "Conflicting durable stream event identity for run \(runId.value.uuidString) seq \(item.seq) " +
                     "(existing kind: \(existingKindDescription), retry kind: \(item.kind))."
                 )
             }
@@ -5038,38 +5189,36 @@ public final class AgentRunRepository: @unchecked Sendable {
         if maxPayloadBytes != nil {
             sql = """
             WITH ranked AS (
-                SELECT e.payload_json, r.started_at, e.seq, e.id,
+                SELECT payload_json, started_at, seq, ordering_id, id,
                        ROW_NUMBER() OVER (
-                           ORDER BY r.started_at DESC, e.seq DESC, e.id DESC
+                           ORDER BY started_at DESC, seq DESC, ordering_id DESC
                        ) AS row_number,
-                       SUM(LENGTH(CAST(e.payload_json AS BLOB))) OVER (
-                           ORDER BY r.started_at DESC, e.seq DESC, e.id DESC
+                       SUM(LENGTH(CAST(payload_json AS BLOB))) OVER (
+                           ORDER BY started_at DESC, seq DESC, ordering_id DESC
                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                        ) AS running_bytes
-                FROM agent_stream_events e
-                JOIN agent_runs r ON r.id = e.run_id
-                WHERE r.thread_id = ?
+                FROM agent_replay_stream_events
+                WHERE thread_id = ?
             )
             SELECT payload_json, id
             FROM (
-                SELECT payload_json, started_at, seq, id
+                SELECT payload_json, started_at, seq, ordering_id, id
                 FROM ranked
                 WHERE row_number <= ? AND (row_number = 1 OR running_bytes <= ?)
             )
-            ORDER BY started_at ASC, seq ASC, id ASC;
+            ORDER BY started_at ASC, seq ASC, ordering_id ASC;
             """
         } else {
             sql = """
             SELECT payload_json, id
             FROM (
-                SELECT e.payload_json, r.started_at, e.seq, e.id
-                FROM agent_stream_events e
-                JOIN agent_runs r ON r.id = e.run_id
-                WHERE r.thread_id = ?
-                ORDER BY r.started_at DESC, e.seq DESC, e.id DESC
+                SELECT payload_json, started_at, seq, ordering_id, id
+                FROM agent_replay_stream_events
+                WHERE thread_id = ?
+                ORDER BY started_at DESC, seq DESC, ordering_id DESC
                 LIMIT ?
             )
-            ORDER BY started_at ASC, seq ASC, id ASC;
+            ORDER BY started_at ASC, seq ASC, ordering_id ASC;
             """
         }
         let st = try db.prepare(sql)
@@ -5186,18 +5335,15 @@ public final class AgentRunRepository: @unchecked Sendable {
         let st = try db.prepare("""
             SELECT id, seq, presentation_bytes, trailer_suffix
             FROM (
-                SELECT e.id AS id,
-                       e.seq AS seq,
-                       r.started_at AS started_at,
-                       LENGTH(CAST(e.payload_json AS BLOB)) AS presentation_bytes,
-                       substr(e.payload_json, -240) AS trailer_suffix
-                FROM agent_stream_events e
-                JOIN agent_runs r ON r.id = e.run_id
-                WHERE r.thread_id = ?
-                ORDER BY r.started_at DESC, e.seq DESC, e.id DESC
+                SELECT id, seq, started_at, ordering_id,
+                       LENGTH(CAST(payload_json AS BLOB)) AS presentation_bytes,
+                       substr(payload_json, -240) AS trailer_suffix
+                FROM agent_replay_stream_events
+                WHERE thread_id = ?
+                ORDER BY started_at DESC, seq DESC, ordering_id DESC
                 LIMIT ?
             )
-            ORDER BY started_at ASC, seq ASC, id ASC;
+            ORDER BY started_at ASC, seq ASC, ordering_id ASC;
         """)
         try st.bind(1, threadId.value.uuidString)
         try st.bind(2, Int64(safeLimit))
@@ -5218,7 +5364,8 @@ public final class AgentRunRepository: @unchecked Sendable {
         return rows
     }
 
-    /// Fetch + decode only the given row ids (chronological). Does not scan peers.
+    /// Fetch + decode only the given virtual row ids (chronological). Positive
+    /// ids address rolling stream rows; negative ids address durable host proof.
     public func listStreamEventsByIds(
         _ ids: [Int64],
         strictDecoding: Bool = true,
@@ -5227,11 +5374,10 @@ public final class AgentRunRepository: @unchecked Sendable {
         guard !ids.isEmpty else { return [] }
         let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
         let st = try db.prepare("""
-            SELECT e.id, e.payload_json
-            FROM agent_stream_events e
-            JOIN agent_runs r ON r.id = e.run_id
-            WHERE e.id IN (\(placeholders))
-            ORDER BY r.started_at ASC, e.seq ASC, e.id ASC;
+            SELECT id, payload_json
+            FROM agent_replay_stream_events
+            WHERE id IN (\(placeholders))
+            ORDER BY started_at ASC, seq ASC, ordering_id ASC;
         """)
         for (offset, id) in ids.enumerated() {
             try st.bind(Int32(offset + 1), id)

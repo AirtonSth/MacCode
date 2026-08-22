@@ -5176,6 +5176,7 @@ final class AgentAppViewModelTests: XCTestCase {
             turnId: "persisted", itemId: "tool", distillApplied: true,
             attestation: attestation
         ))
+        fullPersisted.append(.turnCompleted(turnId: "persisted", finalMessage: nil))
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrate(db)
         let thread = AgentThread(title: "pruned receipt", provider: .codex, model: "m")
@@ -5259,6 +5260,184 @@ final class AgentAppViewModelTests: XCTestCase {
 
         XCTAssertEqual(timeline.turns[0].items[0].body, "trusted")
         XCTAssertEqual(timeline.turns[0].items[0].distillApplied, true)
+    }
+
+    func test_chooseReplayPinsFirstAttestedRepeatedTurnOccurrence() {
+        // WHY: the paint reducer collapses repeated turn IDs. Host proof for the
+        // first raw turn must land before the second occurrence can replace it.
+        let attestation = distillAttestation(body: "first trusted", output: nil)
+        let persisted: [AssistantEvent] = [
+            .turnStarted(turnId: "same"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "same", type: .tool,
+                body: "first trusted", startedAtMs: 1
+            )),
+            .itemHostMetadata(
+                turnId: "same", itemId: "tool", distillApplied: true,
+                attestation: attestation
+            ),
+            .turnStarted(turnId: "same"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "same", type: .tool,
+                body: "later untrusted", startedAtMs: 2
+            ))
+        ]
+        let snapshot: [AssistantEvent] = [
+            .turnStarted(turnId: "same"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "same", type: .tool,
+                body: "first trusted", startedAtMs: 10
+            )),
+            .turnStarted(turnId: "same"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "same", type: .tool,
+                body: "later untrusted", startedAtMs: 11
+            )),
+            .itemStarted(item: AssistantItem(
+                id: "extra", turnId: "same", type: .tool,
+                body: "richer snapshot", startedAtMs: 12
+            ))
+        ]
+
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: snapshot)
+        let timeline = AgentAppViewModel.timelineByReplaying(chosen)
+
+        XCTAssertEqual(timeline.turns[0].items[0].body, "first trusted",
+                       "first-occurrence proof must freeze its bytes before the repeated turn")
+        XCTAssertEqual(timeline.turns[0].items[0].distillApplied, true)
+        XCTAssertEqual(timeline.turns[0].items[1].body, "richer snapshot")
+    }
+
+    func test_chooseReplayPinsFirstAttestedDuplicateItemOccurrenceWithinTurn() {
+        // WHY: duplicate provider item IDs are merged for paint. The metadata
+        // insertion point, not a newest-by-ID lookup, must select the raw item.
+        let attestation = distillAttestation(body: "first trusted", output: nil)
+        let persisted: [AssistantEvent] = [
+            .turnStarted(turnId: "turn"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "turn", type: .tool,
+                body: "first trusted", startedAtMs: 1
+            )),
+            .itemHostMetadata(
+                turnId: "turn", itemId: "tool", distillApplied: true,
+                attestation: attestation
+            ),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "turn", type: .tool,
+                body: "later untrusted", startedAtMs: 2
+            ))
+        ]
+        let snapshot: [AssistantEvent] = [
+            .turnStarted(turnId: "turn"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "turn", type: .tool,
+                body: "first trusted", startedAtMs: 10
+            )),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "turn", type: .tool,
+                body: "later untrusted", startedAtMs: 11
+            )),
+            .itemStarted(item: AssistantItem(
+                id: "extra", turnId: "turn", type: .tool,
+                body: "richer snapshot", startedAtMs: 12
+            ))
+        ]
+
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: snapshot)
+        let timeline = AgentAppViewModel.timelineByReplaying(chosen)
+
+        XCTAssertEqual(timeline.turns[0].items[0].body, "first trusted",
+                       "first duplicate proof must freeze that occurrence before replacement")
+        XCTAssertEqual(timeline.turns[0].items[0].distillApplied, true)
+        XCTAssertEqual(timeline.turns[0].items[1].body, "richer snapshot")
+    }
+
+    func test_chooseReplayUsesDurableAttestationAfterLaterRowsPruneMetadata() throws {
+        // WHY: a completed tool can be followed by hundreds of later events.
+        // Its host proof must survive outside the 100-row rolling window and be
+        // available through both macOS replay and bounded iOS thread reads.
+        let output = "durably distilled output"
+        let attestation = distillAttestation(body: "", output: output)
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let thread = AgentThread(title: "durable receipt", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m", status: .completed)
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+        let events: [AssistantEvent] = [
+            .turnStarted(turnId: "persisted"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "persisted", type: .tool,
+                state: .completed, body: "", output: output,
+                startedAtMs: 1, finishedAtMs: 2
+            )),
+            .itemHostMetadata(
+                turnId: "persisted", itemId: "tool", distillApplied: true,
+                attestation: attestation
+            )
+        ] + (0..<101).map { .turnStarted(turnId: "later-\($0)") }
+        let encoder = JSONEncoder()
+        for (offset, event) in events.enumerated() {
+            try runs.appendStreamEvent(
+                runId: run.id,
+                seq: offset + 1,
+                kind: event.debugDescription,
+                payloadJSON: String(decoding: try encoder.encode(event), as: UTF8.self)
+            )
+        }
+
+        let rollingMetadata = try db.prepare("""
+            SELECT COUNT(*) FROM agent_stream_events
+            WHERE run_id = ? AND event_kind LIKE 'itemHostMetadata(%';
+            """)
+        try rollingMetadata.bind(1, run.id.value.uuidString)
+        XCTAssertTrue(try rollingMetadata.step())
+        XCTAssertEqual(rollingMetadata.columnInt64(0), 0,
+                       "the regression requires the original metadata row to age out")
+        let durableCount = try db.prepare("""
+            SELECT COUNT(*) FROM agent_item_host_attestations WHERE run_id = ?;
+            """)
+        try durableCount.bind(1, run.id.value.uuidString)
+        XCTAssertTrue(try durableCount.step())
+        XCTAssertEqual(durableCount.columnInt64(0), 1)
+
+        let retained = try runs.listLatestStreamEvents(
+            threadId: thread.id,
+            limit: 500,
+            strictDecoding: true
+        )
+        XCTAssertTrue(retained.contains {
+            if case .itemHostMetadata(_, "tool", true, let proof) = $0 {
+                return proof == attestation
+            }
+            return false
+        }, "macOS replay must union durable host proof back into chronology")
+        let mobile = try runs.listLatestStreamEventsForThreadReadV1(
+            threadId: thread.id,
+            eventLimit: 200,
+            maxPayloadBytes: 1 * 1_024 * 1_024,
+            strictDecoding: true
+        )
+        XCTAssertTrue(mobile.events.contains {
+            if case .itemHostMetadata(_, "tool", true, let proof) = $0 {
+                return proof == attestation
+            }
+            return false
+        }, "bounded mirror replay must use the same durable proof source")
+
+        let snapshot: [AssistantEvent] = [
+            .turnStarted(turnId: "snapshot"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "snapshot", type: .tool,
+                state: .completed, body: "", output: output,
+                startedAtMs: 10, finishedAtMs: 11
+            ))
+        ]
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: retained, snapshot: snapshot)
+        let timeline = AgentAppViewModel.timelineByReplaying(chosen)
+        XCTAssertEqual(timeline.turns[0].items[0].distillApplied, true,
+                       "reopen must recover the badge after later rows prune metadata")
     }
 
     func test_chooseReplayRejectsProviderOwnedHostMetadata() {
