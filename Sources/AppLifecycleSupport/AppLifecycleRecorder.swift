@@ -193,7 +193,7 @@ public final class AppLifecycleRecorder {
     /// removes it) so the caller can log it; returns nil on a clean prior run.
     @discardableResult
     public func consumeStaleRunMarker() -> String? {
-        guard let data = try? Data(contentsOf: markerURL),
+        guard let data = try? Data(contentsOf: markerURL, options: .mappedIfSafe),
               let contents = String(data: data, encoding: .utf8) else { return nil }
         try? FileManager.default.removeItem(at: markerURL)
         return contents
