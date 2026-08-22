@@ -2838,12 +2838,35 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let authority = try pairedBotAuthority()
         let foundation = Self.foundationObject(params)
         do {
-            let result = try authority.dispatch(method: method, params: foundation)
+            var result = try authority.dispatch(method: method, params: foundation)
             botsViewModel?.reloadQueuedFollowUpsFromStore()
+            if method == "bot.get" || method == "bot.send" {
+                result = enrichPairedBotAssistant(params: foundation, result: result)
+            }
             return JSONValue.from(result)
         } catch let error as BotRemoteControlAuthority.Error {
             throw JSONRPCError(code: error.code, message: error.message)
         }
+    }
+
+    private func enrichPairedBotAssistant(params: [String: Any], result: [String: Any]) -> [String: Any] {
+        let rawID = (params["bot_id"] as? String)
+            ?? (result["bot_id"] as? String)
+            ?? (result["id"] as? String)
+        guard let rawID, let uuid = UUID(uuidString: rawID),
+              let reply = botsViewModel?.lastAssistantText(for: BotID(uuid)),
+              !reply.isEmpty else {
+            return result
+        }
+        var next = result
+        next["last_reply"] = reply
+        if var readback = next["readback"] as? [String: Any] {
+            if readback["reply"] == nil {
+                readback["reply"] = reply
+                next["readback"] = readback
+            }
+        }
+        return next
     }
 
     private func pairedBotAuthority() throws -> BotRemoteControlAuthority {

@@ -6268,7 +6268,7 @@ public final class BotsViewModel: ObservableObject {
         return merged.sorted { $0.createdAt < $1.createdAt }
     }
 
-    private func lastAssistantText(for botID: BotID) -> String? {
+    func lastAssistantText(for botID: BotID) -> String? {
         let rows = botID == selectedBotID ? deskMessages : (messagesByBot[botID] ?? [])
         if let text = rows.last(where: {
             $0.role == .assistant
