@@ -315,7 +315,20 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             hash ^= UInt64(byte)
             hash &*= 1_099_511_628_211
         }
-        return String(format: "grok-acp-v1-%016llx", hash)
+        // PERF: nibble table avoids String(format:) per discovery; same lowercase 16-hex.
+        let hex = GrokACPAdapter.hex16(hash)
+        return "grok-acp-v1-\(hex)"
+    }
+
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+    private static func hex16(_ value: UInt64) -> String {
+        var out: [UInt8] = Array(repeating: 0, count: 16)
+        var v = value
+        for i in (0..<16).reversed() {
+            out[i] = hexAlphabet[Int(v & 0xf)]
+            v >>= 4
+        }
+        return String(bytes: out, encoding: .utf8) ?? String(format: "%016llx", value)
     }
 
     private static func cachedDiscovery(for key: String) -> (result: GrokACPDiscoveryResult, fetchedAt: Date)? {

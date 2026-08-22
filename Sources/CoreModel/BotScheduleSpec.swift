@@ -102,7 +102,10 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     }
 
     public func displayNote() -> String {
-        let time = String(format: "%02d:%02d", localTimeHour, localTimeMinute)
+        // PERF: manual two-digit decimal avoids String(format:) ICU per schedule display.
+        let hh = localTimeHour < 10 ? "0\(localTimeHour)" : "\(localTimeHour)"
+        let mm = localTimeMinute < 10 ? "0\(localTimeMinute)" : "\(localTimeMinute)"
+        let time = "\(hh):\(mm)"
         switch frequency {
         case .once:
             return "Once"
