@@ -1984,6 +1984,21 @@ public final class AppContext {
                 )
             }
             do {
+                let searchDirectories = ProcessLocator.expandedPath(
+                    environmentPath: baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"],
+                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path
+                )
+                .split(separator: ":")
+                .map(String.init)
+                _ = try installer.installCommandWrappers(
+                    searchDirectoriesOverride: searchDirectories
+                )
+            } catch {
+                NSLog(
+                    "RemoteCode: command wrapper refresh before agent turn failed: \(error.localizedDescription)"
+                )
+            }
+            do {
                 try installer.installMacOSHarness()
             } catch {
                 NSLog(
@@ -2154,6 +2169,21 @@ public final class AppContext {
         }
         let managedBin = installer.managedCLIBinURL.path
         let basePath = environment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
+        if tokenSaverRuntimeAdmitted {
+            let searchDirectories = ProcessLocator.expandedPath(
+                environmentPath: basePath,
+                homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path
+            )
+            .split(separator: ":")
+            .map(String.init)
+            do {
+                _ = try installer.installCommandWrappers(
+                    searchDirectoriesOverride: searchDirectories
+                )
+            } catch {
+                NSLog("RemoteCode: command wrapper refresh before subagent env failed: \(error.localizedDescription)")
+            }
+        }
         environment["PATH"] = AppCommandRouter.providerPathWithManagedWrappers(
             currentPath: basePath,
             managedBin: managedBin
@@ -2575,7 +2605,16 @@ public final class AppContext {
                 _ = try installer.ensureDistillCLI(serviceBinaryURL: sharedBinary)
             }
             capture("command wrappers") {
-                _ = try installer.installCommandWrappers(serviceBinaryURL: sharedBinary)
+                let searchDirectories = ProcessLocator.expandedPath(
+                    environmentPath: ProcessInfo.processInfo.environment["PATH"],
+                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path
+                )
+                .split(separator: ":")
+                .map(String.init)
+                _ = try installer.installCommandWrappers(
+                    serviceBinaryURL: sharedBinary,
+                    searchDirectoriesOverride: searchDirectories
+                )
             }
             // Re-ensure after wrappers: recovers from catalog refresh races and
             // from hosts where only wrappers survived a prior partial install.

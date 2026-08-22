@@ -7,18 +7,23 @@ import Foundation
 /// executable; everything here is pure so the decisions are unit-tested without spawning a
 /// process or touching the filesystem.
 ///
-/// Wrappers cover high-volume / noisy commands (find, ls, git log/status, builds, CI).
-/// Exact-output tools (sed, rg, grep, cat, head, tail, awk, …) are intentionally NOT
-/// wrapped: agents need full line lists and file slices; distill would drop payload lines.
+/// The global interceptor covers high-volume / noisy commands (find, ls, git log/status, builds,
+/// CI) and arbitrary non-interpreter command basenames. Exact-output tools (sed, rg, grep, cat,
+/// head, tail, awk, …) also enter that interceptor; `passthroughReason` keeps their stdout raw
+/// because agents need full line lists and file slices.
 public enum CommandWrapPolicy {
-    /// Compressible wrap targets only (canonical list in `CoreModel.WrappedCommandCatalog`).
+    /// Canonical compressible targets in `CoreModel.WrappedCommandCatalog`.
     public static var wrappedCommands: Set<String> { WrappedCommandCatalog.commandSet }
 
     /// Basenames that must never be auto-compressed (wrap install or `| distill`).
     public static var exactOutputCommands: Set<String> { WrappedCommandCatalog.exactOutputCommandSet }
 
     public static func isWrapped(_ command: String) -> Bool {
-        wrappedCommands.contains(commandBasename(command))
+        let name = commandBasename(command)
+        // Exact-output commands enter the shared decision point and are kept raw
+        // by passthroughReason. This preserves bytes without bypassing the
+        // interceptor's fail-open and telemetry path.
+        return !name.isEmpty && !WrappedCommandCatalog.isShebangInterpreter(name)
     }
 
     public static func isExactOutputCommand(_ command: String) -> Bool {

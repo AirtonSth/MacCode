@@ -16,6 +16,22 @@ The user's running RemoteCode (`io.remotecode.desktop`) is off-limits. A git wor
 - Do not install or overwrite `~/.local/bin/distill` from the sandbox. Leave Token Saver off on the debug instance.
 - Identity, ports, and App Support live in `scripts/isolated-sandbox.sh`. Ritual: `.grok/skills/isolated-sandbox/SKILL.md`.
 
+## macOS UI automation lease (mandatory)
+
+- macOS event posting is host-global even when a harness targets an app PID. Run every
+  macos-harness or Computer Use session through `scripts/macos-ui-lease.sh -- ...`; its shared
+  `/tmp/remotecode-macos-ui-lease.lock` is single-flight across all worktrees.
+- This is a cooperative repository guard, not an OS-enforced sandbox: a raw external
+  Computer Use client can bypass it. Therefore the default acceptance path uses read-only
+  macos-harness only; do not run input-capable Computer Use in parallel with a user's session.
+  If another agent cannot honor the lease, stop the UI E2E rather than competing for HID.
+- The lease is read-only by default and rejects input-producing snippets. Use `--allow-input`
+  only for one bounded, reversible E2E that must click, type, press keys, scroll, drag, or run
+  AppleScript. Prefer `see`/`state` and targeted AX actions.
+- Target the exact debug bundle ID `io.remotecode.desktop.debug`, then exit the session. Never
+  target stable RemoteCode or leave SkyComputerUseService, `node_repl`, or Computer Use MCP
+  daemons running; never use a persistent harness `repl`.
+
 ## Shared components
 
 - Reusing components is welcome and encouraged when it is done well. If two surfaces already show the same control (composer chips, popovers, bubbles, live-turn chrome, queued header), extract one component and mount it from both. Do not copy a second SwiftUI implementation just because the caller lives in another file.
