@@ -8568,7 +8568,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(revision.soul.contains(BotStandingInstructions.openBrowserTool), "tools layer owns browser")
         let preview = try XCTUnwrap(vm.previewBrain(userText: "Remember this"))
         XCTAssertTrue(preview.compiledPayload.contains(BotStandingInstructions.admittedToolsText))
-        XCTAssertTrue(preview.compiledPayload.contains(BotStandingInstructions.getBrowserTool))
+        XCTAssertTrue(
+            preview.compiledPayload.contains(BotStandingInstructions.computerUseObservationTool),
+            "logical Desktop starter instructions must expose native observation before mutation"
+        )
         vm.beginEdit(bot)
         XCTAssertEqual(vm.studioDraft.soul, revision.soul)
         vm.studioDraft.title = "Reviews PRs"
@@ -8737,7 +8740,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.send("Open https://example.com in the default macOS browser."))
         XCTAssertEqual(
             BotStandingInstructions.admittedToolsText(for: .logicalExecutionSpace)
-                .contains(BotStandingInstructions.macosHarnessTool),
+                .contains(BotStandingInstructions.computerUseObservationTool),
             true
         )
 
@@ -8749,7 +8752,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.send("Open https://example.com in this teammate's own browser."))
         XCTAssertFalse(
             BotStandingInstructions.admittedToolsText(for: .botOwnedBrowser)
-                .contains(BotStandingInstructions.generatedMacOSHarnessLine)
+                .contains(BotStandingInstructions.generatedNativeHostComputerLine)
         )
 
         guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1" else {

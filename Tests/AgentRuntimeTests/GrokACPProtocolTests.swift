@@ -1325,9 +1325,9 @@ final class GrokACPProtocolTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(clientSource.contains("sessionMCPServers"), "Grok session/new and session/load must still send MCP servers")
-        XCTAssertFalse(
+        XCTAssertTrue(
             clientSource.contains("ComputerUseMCPAdmit.admitGrokACP"),
-            "Grok sessions must not admit remotecode-computer-use; bots use macos-harness"
+            "Grok logical Desktop sessions must admit the native host MCP conditionally"
         )
         XCTAssertTrue(clientSource.contains("noReplay"), "loadSession must accept noReplay")
         XCTAssertTrue(

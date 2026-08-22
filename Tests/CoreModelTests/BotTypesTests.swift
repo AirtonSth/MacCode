@@ -229,8 +229,8 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(browserTools.contains(BotStandingInstructions.getBrowserTool))
         XCTAssertTrue(browserTools.contains(BotStandingInstructions.waitLoginTool))
         XCTAssertTrue(browserTools.contains("teammate's"))
-        XCTAssertTrue(tools.contains(BotStandingInstructions.macosHarnessTool))
-        XCTAssertTrue(tools.contains(BotStandingInstructions.generatedMacOSHarnessLine))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.computerUseObservationTool))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.generatedNativeHostComputerLine))
         XCTAssertFalse(tools.contains("desktop"), "leftover desktop is not a live write")
         XCTAssertTrue(starter.contains(BotStandingInstructions.generatedSignature))
         XCTAssertTrue(BotStandingInstructions.looksGenerated(""))
@@ -291,22 +291,22 @@ final class BotTypesTests: XCTestCase {
         )
         XCTAssertFalse(tools.contains("handle,"), "handle is create-only")
         XCTAssertFalse(tools.contains("or handle"), "handle is create-only")
-        XCTAssertFalse(tools.contains("permission"), "leftover permission is not a live write")
+        XCTAssertFalse(tools.contains("permission_mode"), "retired permission_mode setting is not a live write")
         XCTAssertFalse(tools.contains("desktop"), "leftover desktop is not a live write")
     }
 
-    func test_admittedToolsNameMacOSHarness() {
-        // WHY: bots must drive the Mac through macos-harness on every
-        // provider. Naming remotecode-computer-use would send them back
-        // to the retired MCP.
+    func test_admittedToolsNameNativeHostComputerUse() {
+        // WHY: logical Desktop bots must observe the native host before
+        // mutating it, while the starter soul must not claim these tools.
         let tools = BotStandingInstructions.admittedToolsText
-        XCTAssertTrue(tools.contains(BotStandingInstructions.macosHarnessTool))
-        XCTAssertTrue(tools.contains("mac.see"))
-        XCTAssertTrue(tools.contains("Do not call remotecode-computer-use"))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.generatedNativeHostComputerLine))
+        XCTAssertTrue(tools.contains("first call screenshot or list_windows"))
+        XCTAssertTrue(tools.contains("expected_state_token"))
+        XCTAssertTrue(tools.contains("must never activate an app"))
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")
-                .contains(BotStandingInstructions.macosHarnessTool),
-            "tools layer owns macos-harness"
+                .contains(BotStandingInstructions.generatedNativeHostComputerLine),
+            "tools layer owns native host computer-use"
         )
     }
 

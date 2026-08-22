@@ -16,7 +16,7 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
 
         let host = BotDesktopAdmission.forPublished(.logicalExecutionSpace)
         XCTAssertTrue(host.allowsHostDefaultBrowser)
-        XCTAssertTrue(host.allowsMacOSHarness)
+        XCTAssertTrue(host.allowsNativeHostComputerUse)
         XCTAssertFalse(host.allowsGuestComputer)
         XCTAssertFalse(
             host.allowsBotOwnedBrowser,
@@ -25,12 +25,12 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
 
         let owned = BotDesktopAdmission.forPublished(.botOwnedBrowser)
         XCTAssertTrue(owned.allowsBotOwnedBrowser)
-        XCTAssertFalse(owned.allowsMacOSHarness)
+        XCTAssertFalse(owned.allowsNativeHostComputerUse)
         XCTAssertFalse(owned.allowsHostDefaultBrowser)
 
         let docker = BotDesktopAdmission.forPublished(.dockerDesktop)
         XCTAssertTrue(docker.allowsGuestComputer)
-        XCTAssertFalse(docker.allowsMacOSHarness)
+        XCTAssertFalse(docker.allowsNativeHostComputerUse)
         XCTAssertTrue(
             docker.allowsBotOwnedBrowser,
             "a docker bot's own browser is Playwright inside its guest"
@@ -53,7 +53,8 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
         )
 
         let leftover = BotDesktopAdmission.forPublished(.dedicatedLocalVM)
-        XCTAssertEqual(leftover.kind, .logicalExecutionSpace)
+        XCTAssertEqual(leftover.kind, .dedicatedLocalVM)
+        XCTAssertFalse(leftover.allowsNativeHostComputerUse)
         XCTAssertFalse(
             BotDesktopKind.dedicatedLocalVM.isSelectable(
                 flags: BotControlPlaneFlags(botsControlPlaneEnabled: true),
@@ -65,7 +66,7 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
 
     func test_compileFollowsAdmission_becauseSendMustSeeTheSameTools() {
         let host = BotStandingInstructions.admittedToolsText(for: .logicalExecutionSpace)
-        XCTAssertTrue(host.contains(BotStandingInstructions.macosHarnessTool))
+        XCTAssertTrue(host.contains(BotStandingInstructions.computerUseObservationTool))
         XCTAssertTrue(host.contains("Google Chrome"), "this-Mac bots must be told to browse in the owner's Chrome")
         XCTAssertFalse(
             host.contains(BotStandingInstructions.openBrowserTool),
@@ -74,7 +75,7 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
         XCTAssertFalse(host.contains(BotStandingInstructions.computerObserveTool))
 
         let owned = BotStandingInstructions.admittedToolsText(for: .botOwnedBrowser)
-        XCTAssertFalse(owned.contains(BotStandingInstructions.generatedMacOSHarnessLine))
+        XCTAssertFalse(owned.contains(BotStandingInstructions.generatedNativeHostComputerLine))
         XCTAssertTrue(owned.contains(BotStandingInstructions.openBrowserTool))
         XCTAssertTrue(owned.contains("Playwright"), "the bot's own browser must be named as Playwright, not a RemoteCode tab")
 
@@ -82,7 +83,7 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
         XCTAssertTrue(docker.contains(BotStandingInstructions.computerObserveTool))
         XCTAssertTrue(docker.contains(BotStandingInstructions.computerExecTool))
         XCTAssertTrue(docker.contains(BotStandingInstructions.computerRebuildTool))
-        XCTAssertFalse(docker.contains(BotStandingInstructions.generatedMacOSHarnessLine))
+        XCTAssertFalse(docker.contains(BotStandingInstructions.generatedNativeHostComputerLine))
         XCTAssertTrue(
             docker.contains(BotStandingInstructions.openBrowserTool),
             "docker bots browse via bot_browser_* backed by Playwright inside the guest"
@@ -98,7 +99,7 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
         // WHY: bot_browser_* must run Playwright locally for a bot-owned
         // browser and Playwright inside the guest for Docker. Owner's-Chrome
         // desktops (and leftover VM kinds) must refuse with copy that points
-        // at macos-harness — never at a RemoteCode in-app browser tab.
+        // at native host browser bridge — never at a RemoteCode in-app browser tab.
         XCTAssertEqual(BotBrowserRoute.forPublished(.botOwnedBrowser), .playwrightLocal)
         XCTAssertEqual(BotBrowserRoute.forPublished(.dockerDesktop), .playwrightGuest)
         for kind: BotDesktopKind in [.logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac] {

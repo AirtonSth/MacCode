@@ -642,7 +642,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
     }
 
     @MainActor
-    func test_providerEnvironmentStampsCallerBotIdOnLinkedDeskThread() throws {
+    func test_providerEnvironmentStampsCallerBotIdAndLogicalHostAdmission() throws {
         // WHY: self-config MCP must inherit the calling bot, not a baked home-MCP id.
         let appSupport = NSTemporaryDirectory() + "RC2BotSelfConfigEnv-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
@@ -659,6 +659,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             env[BotSelfConfigCatalog.callerEnvironmentKey],
             bot.id.value.uuidString.lowercased()
         )
+        XCTAssertEqual(env[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey], "1")
 
         let other = try admittedThread(in: ctx, provider: .grok)
         let unbound = router.providerEnvironment(provider: .grok, instanceId: nil, threadId: other.id)
@@ -666,9 +667,9 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
     }
 
     @MainActor
-    func test_providerEnvironmentStubsHarnessOnDockerDesktop() throws {
-        // WHY: dockerDesktop child PATH must win with a failing macos-harness
-        // and must not keep DOCKER_HOST. this-Mac runs must not get those stubs.
+    func test_providerEnvironmentStubsDockerAndExcludesHostMCP() throws {
+        // WHY: dockerDesktop child PATH must retain failing host stubs and must
+        // not keep DOCKER_HOST or the native physical-host MCP admission.
         let appSupport = NSTemporaryDirectory() + "RC2DockerPath-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
@@ -691,6 +692,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         )
         XCTAssertNil(dockerEnv["DOCKER_HOST"])
         XCTAssertNil(dockerEnv["DOCKER_CONTEXT"])
+        XCTAssertNil(dockerEnv[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey])
         let stub = URL(fileURLWithPath: appSupport, isDirectory: true)
             .appendingPathComponent("bot-desktop-stubs", isDirectory: true)
             .appendingPathComponent("dockerDesktop", isDirectory: true)
@@ -722,6 +724,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             instanceId: nil,
             threadId: hostThread.id
         )
+        XCTAssertEqual(hostEnv[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey], "1")
         let hostPath = hostEnv["PATH"] ?? ""
         XCTAssertFalse(
             hostPath.split(separator: ":").map(String.init).contains(stub.path),

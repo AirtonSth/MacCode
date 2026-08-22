@@ -162,17 +162,17 @@ public struct BotDesktopAdmission: Equatable, Sendable {
     public let allowsHostDefaultBrowser: Bool
     public let allowsBotOwnedBrowser: Bool
     public let allowsGuestComputer: Bool
-    public let allowsMacOSHarness: Bool
+    public let allowsNativeHostComputerUse: Bool
 
     public static func forPublished(_ kind: BotDesktopKind) -> BotDesktopAdmission {
-        switch kind.advertisedOrLogical {
+        switch kind {
         case .botOwnedBrowser:
             return BotDesktopAdmission(
                 kind: .botOwnedBrowser,
                 allowsHostDefaultBrowser: false,
                 allowsBotOwnedBrowser: true,
                 allowsGuestComputer: false,
-                allowsMacOSHarness: false
+                allowsNativeHostComputerUse: false
             )
         case .dockerDesktop:
             // A docker bot's own browser is Playwright inside its guest.
@@ -181,16 +181,26 @@ public struct BotDesktopAdmission: Equatable, Sendable {
                 allowsHostDefaultBrowser: false,
                 allowsBotOwnedBrowser: true,
                 allowsGuestComputer: true,
-                allowsMacOSHarness: false
+                allowsNativeHostComputerUse: false
             )
-        case .logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac:
-            // Browses with the owner's Google Chrome via macos-harness only.
+        case .logicalExecutionSpace:
+            // Logical Desktop uses RemoteCode's native, target-scoped host MCP.
             return BotDesktopAdmission(
                 kind: .logicalExecutionSpace,
                 allowsHostDefaultBrowser: true,
                 allowsBotOwnedBrowser: false,
                 allowsGuestComputer: false,
-                allowsMacOSHarness: true
+                allowsNativeHostComputerUse: true
+            )
+        case .dedicatedLocalVM, .managedRemoteMac:
+            // Persisted leftovers are not implemented runtimes. Never redirect
+            // them to the physical host by way of advertisedOrLogical.
+            return BotDesktopAdmission(
+                kind: kind,
+                allowsHostDefaultBrowser: false,
+                allowsBotOwnedBrowser: false,
+                allowsGuestComputer: false,
+                allowsNativeHostComputerUse: false
             )
         }
     }
@@ -340,16 +350,16 @@ public enum BotStandingInstructions {
     public static let generatedPeerLine =
         "When another @Bot's input is needed, interpret the full request first, then call \(askPeerTool) with a new focused prompt containing only that Bot's part. Use \(listPeersTool) when you need the exact handle."
 
-    public static let macosHarnessTool = "macos-harness"
-    public static let generatedMacOSHarnessLine =
-        "When asked to see the screen, click, type, or press keys on this Mac, run \(macosHarnessTool) with a Python program using mac.see, mac.key, mac.type, mac.click, mac.ax, and mac.script. If \(macosHarnessTool) is missing, install it with uv tool install --python 3.12 --upgrade macos-harness from https://github.com/browser-use/macos-harness then retry. Do not call remotecode-computer-use. Open websites in the owner's Google Chrome on this Mac, never in a RemoteCode in-app browser tab."
+    public static let generatedNativeHostComputerLine =
+        "When asked to see or use this Mac, first call screenshot or list_windows, then use get_ui_tree or doctor to observe the exact PID and window. Every observation returns a state token and capabilities. Before any click, type, key, scroll, or semantic action, target that exact PID/window and pass its latest expected_state_token; if it is stale, minimized, off-screen, permission-limited, focus-only, or human activity is present, stop and observe again. Native host actions are background and must never activate an app or change Chrome's active tab. Open websites through the native host Google Chrome bridge, never a RemoteCode in-app tab."
 
     public static let computerObserveTool = "bot_computer_observe"
     public static let computerActTool = "bot_computer_act"
     public static let computerExecTool = "bot_computer_exec"
     public static let computerRebuildTool = "bot_computer_rebuild"
+    public static let computerUseObservationTool = "screenshot"
     public static let generatedGuestComputerLine =
-        "When asked to see or use the Linux desktop, call \(computerObserveTool) then \(computerActTool). To install packages or run a command in the guest, call \(computerExecTool). To change the guest image, edit /home/remotecode/Dockerfile then call \(computerRebuildTool). That screen is the Docker guest on 127.0.0.1. For websites, prefer \(openBrowserTool) then \(snapshotBrowserTool) and \(actBrowserTool) — that browser is Playwright running inside this bot's Docker guest. If those browser tools fail, open the Chrome-engine browser on the guest desktop and drive it with \(computerObserveTool) and \(computerActTool). Do not run \(macosHarnessTool). Do not call remotecode-computer-use. Do not use this Mac's default browser. Do not run host docker."
+        "When asked to see or use the Linux desktop, call \(computerObserveTool) then \(computerActTool). To install packages or run a command in the guest, call \(computerExecTool). To change the guest image, edit /home/remotecode/Dockerfile then call \(computerRebuildTool). That screen is the Docker guest on 127.0.0.1. For websites, prefer \(openBrowserTool) then \(snapshotBrowserTool) and \(actBrowserTool) — that browser is Playwright running inside this bot's Docker guest. If those browser tools fail, open the Chrome-engine browser on the guest desktop and drive it with \(computerObserveTool) and \(computerActTool). Do not use host computer-use, the host default browser, or host docker."
 
     /// Compiler layer. Starter soul must not own these names.
     public static let admittedToolsText = admittedToolsText(for: .logicalExecutionSpace)
@@ -372,8 +382,8 @@ public enum BotStandingInstructions {
             generatedAskLine,
             generatedPeerLine,
         ])
-        if admission.allowsMacOSHarness {
-            lines.append(generatedMacOSHarnessLine)
+        if admission.allowsNativeHostComputerUse {
+            lines.append(generatedNativeHostComputerLine)
         }
         return lines.joined(separator: "\n")
     }
