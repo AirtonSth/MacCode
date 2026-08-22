@@ -4178,6 +4178,150 @@ final class BotsWindowTests: XCTestCase {
         router.sendAgentMessageAfterPreflightProbeForTesting = nil
     }
 
+    func test_stopAwaitsCancelledSendsWhenLiveThreadDiscoveryFails() async throws {
+        // WHY: a listConversations/durable lookup error must not settle stop
+        // before the already-cancelled send task has left preflight.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        let gate = OverlappingSendPreflightGate()
+        router.sendAgentMessageAfterPreflightProbeForTesting = { await gate.park() }
+        let routing = BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        _ = try vm.enqueueHostMessage(botID: bot.id, text: "go", conversationID: nil, routing: routing)
+        await gate.waitUntilEntered(1)
+        vm.liveThreadDiscoveryErrorForTesting = NSError(
+            domain: "BotStopDiscovery",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "conversation list failed"]
+        )
+        let settled = expectation(description: "stop failed after joining cancelled send")
+        var settledOK: Bool?
+        vm.stopLiveRuns(for: bot.id, force: true) { ok in
+            settledOK = ok
+            settled.fulfill()
+        }
+        await fulfillment(of: [settled], timeout: 5)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(settledOK, false)
+        XCTAssertTrue(runner.requests.isEmpty)
+        XCTAssertFalse(vm.lastSendStartedProviderRun)
+        vm.liveThreadDiscoveryErrorForTesting = nil
+        router.sendAgentMessageAfterPreflightProbeForTesting = nil
+    }
+
+    func test_sendAfterStopWaitsUntilStopSettles() async throws {
+        // WHY: a send admitted after stop takes its snapshot must not start
+        // the provider until that stop has settled.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        let gate = OverlappingSendPreflightGate()
+        var preflightCount = 0
+        router.sendAgentMessageAfterPreflightProbeForTesting = {
+            preflightCount += 1
+            if preflightCount == 1 {
+                await gate.park()
+            }
+        }
+        let routing = BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        _ = try vm.enqueueHostMessage(botID: bot.id, text: "first", conversationID: nil, routing: routing)
+        await gate.waitUntilEntered(1)
+        let settled = expectation(description: "stop settled")
+        var settledOK: Bool?
+        vm.stopLiveRuns(for: bot.id, force: true) { ok in
+            settledOK = ok
+            settled.fulfill()
+        }
+        _ = try vm.enqueueHostMessage(botID: bot.id, text: "after-stop", conversationID: nil, routing: routing)
+        XCTAssertTrue(runner.requests.isEmpty, "send-after-stop must not start while stop is joining")
+        XCTAssertFalse(vm.lastSendStartedProviderRun)
+        await fulfillment(of: [settled], timeout: 5)
+        XCTAssertEqual(settledOK, true)
+        let startedAfter = await waitUntil(timeout: 3) { !runner.requests.isEmpty || vm.lastSendStartedProviderRun }
+        XCTAssertTrue(startedAfter, "a send admitted during stop may start only after that stop settles")
+        router.sendAgentMessageAfterPreflightProbeForTesting = nil
+    }
+
+    func test_concurrentStopsJoinTheSameInFlightSend() async throws {
+        // WHY: a second stop must not take an empty list and complete while
+        // the first stop is still awaiting the cancelled send.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        let gate = OverlappingSendPreflightGate()
+        router.sendAgentMessageAfterPreflightProbeForTesting = { await gate.park() }
+        let routing = BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        _ = try vm.enqueueHostMessage(botID: bot.id, text: "go", conversationID: nil, routing: routing)
+        await gate.waitUntilEntered(1)
+        let first = expectation(description: "first stop settled")
+        let second = expectation(description: "second stop settled")
+        var firstOK: Bool?
+        var secondOK: Bool?
+        vm.stopLiveRuns(for: bot.id, force: true) { ok in
+            firstOK = ok
+            first.fulfill()
+        }
+        vm.stopLiveRuns(for: bot.id, force: false) { ok in
+            secondOK = ok
+            second.fulfill()
+        }
+        XCTAssertEqual(
+            vm.deskStopJoinStartCountForTesting,
+            1,
+            "concurrent stop must share the in-flight join, not start a second empty-list stop"
+        )
+        await fulfillment(of: [first, second], timeout: 5)
+        XCTAssertEqual(firstOK, true)
+        XCTAssertEqual(secondOK, true)
+        XCTAssertTrue(runner.requests.isEmpty)
+        router.sendAgentMessageAfterPreflightProbeForTesting = nil
+    }
+
     func test_openHomeFileRevealsOwnedSkillInStudioFiles() throws {
         // WHY: Skills Open used to write homeDraft only. Studio Files now
         // hosts FilesSurfaceRoot, so that path left the preview on

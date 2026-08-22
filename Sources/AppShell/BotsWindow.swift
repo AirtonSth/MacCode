@@ -2444,6 +2444,11 @@ private final class DeskSendWork {
     var task: Task<Void, Never>!
 }
 
+/// One in-flight stop join per bot so concurrent stops share the same await.
+private final class DeskStopJoin {
+    var task: Task<Bool, Never>!
+}
+
 @MainActor
 public final class BotsViewModel: ObservableObject {
     public static let assistantPlaceholder = BotsDeskFollowThrough.noRouterPlaceholder
@@ -2548,6 +2553,10 @@ public final class BotsViewModel: ObservableObject {
     private var deskSendInFlightBotID: BotID?
     private var deskSendTasks: [BotID: [DeskSendWork]] = [:]
     private var deskStopEpoch: [BotID: Int] = [:]
+    private var deskStopJoins: [BotID: DeskStopJoin] = [:]
+    /// Test seam: force `liveThreadIDs` to throw so stop must still await cancelled sends.
+    public var liveThreadDiscoveryErrorForTesting: Error?
+    public private(set) var deskStopJoinStartCountForTesting = 0
     /// Test seam: how many times Desk actually decoded stream events.
     public private(set) var deskLiveReplayFetchCountForTesting = 0
     /// Test seam: dest at the moment send first acknowledged the click.
@@ -4089,54 +4098,78 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func stopLiveRuns(for botID: BotID, force: Bool, onSettled: ((Bool) -> Void)? = nil) {
-        deskStopEpoch[botID, default: 0] += 1
-        let sendWorks = takeDeskSendWorks(for: botID)
-        sendWorks.forEach { $0.task.cancel() }
-        let threadIDs: [AgentThreadID]
-        do {
-            threadIDs = try liveThreadIDs(for: botID)
-        } catch {
-            DispatchQueue.main.async { onSettled?(false) }
+        if let existing = deskStopJoins[botID] {
+            Task { @MainActor [weak self] in
+                _ = await existing.task.value
+                self?.stopLiveRuns(for: botID, force: force, onSettled: onSettled)
+            }
             return
         }
-        for threadID in threadIDs {
-            context.coordinator.cancelPreparation(threadId: threadID)
-        }
+        let join = DeskStopJoin()
+        deskStopJoinStartCountForTesting += 1
+        deskStopJoins[botID] = join
+        deskStopEpoch[botID, default: 0] += 1
         if force {
             isStopping = true
         }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        let sendWorks = takeDeskSendWorks(for: botID)
+        sendWorks.forEach { $0.task.cancel() }
+        join.task = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            var discoveryError: Error?
+            var threadIDs: [AgentThreadID] = []
+            do {
+                threadIDs = try self.liveThreadIDs(for: botID)
+            } catch {
+                discoveryError = error
+            }
+            if discoveryError == nil {
+                for threadID in threadIDs {
+                    self.context.coordinator.cancelPreparation(threadId: threadID)
+                }
+            }
             for work in sendWorks {
                 await work.task.value
             }
+            defer {
+                if self.deskStopJoins[botID] === join {
+                    self.deskStopJoins[botID] = nil
+                }
+                self.isStopping = false
+            }
+            if discoveryError != nil {
+                return false
+            }
             let remaining: [AgentThreadID]
             do {
-                remaining = try self.liveThreadIDs(for: botID)
+                remaining = try self.liveThreadIDs(for: botID, includeInFlightSends: false)
             } catch {
-                self.isStopping = false
-                onSettled?(false)
-                return
+                return false
             }
             do {
                 if !remaining.isEmpty {
                     try await self.context.coordinator.stopAndAwaitTermination(threadIds: remaining)
                 }
-                self.isStopping = false
-                onSettled?(!self.hasLiveRun(botID: botID) && self.deskSendInFlightBotID != botID)
+                return try self.liveThreadIDs(for: botID, includeInFlightSends: false).isEmpty
             } catch {
-                self.isStopping = false
                 self.errorMessage = force
                     ? "Force stop: \(error.localizedDescription)"
                     : String(describing: error)
-                onSettled?(false)
+                return false
             }
+        }
+        Task { @MainActor [weak self] in
+            let ok = await join.task.value
+            onSettled?(ok)
         }
     }
 
-    private func liveThreadIDs(for botID: BotID) throws -> [AgentThreadID] {
+    private func liveThreadIDs(for botID: BotID, includeInFlightSends: Bool = true) throws -> [AgentThreadID] {
+        if let error = liveThreadDiscoveryErrorForTesting {
+            throw error
+        }
         var ids: [AgentThreadID] = []
-        let inFlight = deskSendInFlightBotID == botID
+        let inFlight = includeInFlightSends && deskSendInFlightBotID == botID
         for conversation in try botStore.listConversations(botID: botID) {
             guard let threadID = conversation.linkedAgentThreadID else { continue }
             if inFlight {
@@ -7271,6 +7304,24 @@ public final class BotsViewModel: ObservableObject {
         work.task = Task { [weak self] in
             guard let self else { return }
             await Task.yield()
+            guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
+                self.forgetDeskSend(work, botID: bot.id)
+                self.clearDeskSendInFlight(for: bot.id)
+                return
+            }
+            while let join = self.deskStopJoins[bot.id] {
+                if Task.isCancelled || (self.deskStopEpoch[bot.id] ?? 0) != epoch {
+                    self.forgetDeskSend(work, botID: bot.id)
+                    self.clearDeskSendInFlight(for: bot.id)
+                    return
+                }
+                if (self.deskSendTasks[bot.id] ?? []).contains(where: { $0 === work }) {
+                    await Task.yield()
+                    continue
+                }
+                _ = await join.task.value
+                break
+            }
             guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
                 self.forgetDeskSend(work, botID: bot.id)
                 self.clearDeskSendInFlight(for: bot.id)
