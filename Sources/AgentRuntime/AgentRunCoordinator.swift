@@ -994,6 +994,50 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
+    /// Run-bound receipt authority captured before a provider can emit events.
+    /// The state file is re-read only at a terminal verification boundary so an
+    /// Off toggle (which removes the file) cannot mint new trusted metadata.
+    private struct DistillReceiptRunScope: Sendable {
+        let stateFileURL: URL
+        let verifierScope: DistillAppliedReceiptStreamVerifier.Scope
+
+        init?(environment: [String: String], runId: AgentRunID) {
+            guard environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1",
+                  let root = environment["RC_TOKEN_SAVER_ROOT_RUN_ID"],
+                  UUID(uuidString: root) == runId.value,
+                  let path = environment["REMOTE_CODE_DISTILL_STATE_PATH"],
+                  !path.isEmpty else {
+                return nil
+            }
+            let url = URL(fileURLWithPath: path)
+            guard url.lastPathComponent == "DistillCLIState.json",
+                  Self.isOwnerOnlyStateFile(url),
+                  let key = TokenSaverSidecarLeaseProbe.readLease(at: url)?.receiptKey else {
+                return nil
+            }
+            self.stateFileURL = url
+            self.verifierScope = .init(rootRunID: root, key: key)
+        }
+
+        var isCurrentlyActive: Bool {
+            guard Self.isOwnerOnlyStateFile(stateFileURL),
+                  let currentKey = TokenSaverSidecarLeaseProbe.readLease(at: stateFileURL)?.receiptKey else {
+                return false
+            }
+            return currentKey == verifierScope.key
+        }
+
+        private static func isOwnerOnlyStateFile(_ url: URL) -> Bool {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue,
+                  permissions & 0o077 == 0,
+                  let owner = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value else {
+                return false
+            }
+            return owner == getuid()
+        }
+    }
+
     private let runRepo: AgentRunRepository
     private let messageRepo: AgentMessageRepository
     private let threadRepo: AgentThreadRepository
@@ -1057,6 +1101,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// therefore retain the exact scope of the process that owns their idle session.
     /// A changed attempt/admission scope forces a process refresh before the next turn.
     private var providerTurnScopes: [AgentThreadID: ProviderTurnScope] = [:]
+    /// Unlike the resident-process scope above, receipt authority belongs to one
+    /// exact UI callback run and is removed at that run's terminal cleanup.
+    private var distillReceiptRunScopes: [AgentRunID: DistillReceiptRunScope] = [:]
+    private var distillReceiptVerifiers: [AgentRunID: DistillAppliedReceiptStreamVerifier] = [:]
+    private var distillReceiptItemTurnIDs: [AgentRunID: [String: String]] = [:]
+    private var authenticatedFinalReceiptTexts: [AgentRunID: (sourceDigest: Data, stripped: String)] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
     private var latestTokenUsage: [AgentRunID: AssistantTokenUsage] = [:]
     private var reconciledTokenUsage: [AgentRunID: ReconciledTokenUsageAccumulator] = [:]
@@ -2116,6 +2166,24 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         agentRunLog.info("run.started thread=\(effectiveRequest.threadId.value.uuidString, privacy: .public) run=\(effectiveRequest.runId.value.uuidString, privacy: .public) provider=\(effectiveRequest.provider.rawValue, privacy: .public) model=\(effectiveRequest.model, privacy: .public)")
 
+        // Some adapters synchronously emit their first item before sendTurn
+        // returns. Capture receipt authority before crossing that boundary.
+        let distillReceiptScope = DistillReceiptRunScope(
+            environment: effectiveRequest.environment,
+            runId: runId
+        )
+        lock.withLock {
+            if let distillReceiptScope {
+                distillReceiptRunScopes[runId] = distillReceiptScope
+                distillReceiptVerifiers[runId] = DistillAppliedReceiptStreamVerifier()
+            } else {
+                distillReceiptRunScopes.removeValue(forKey: runId)
+                distillReceiptVerifiers.removeValue(forKey: runId)
+            }
+            distillReceiptItemTurnIDs.removeValue(forKey: runId)
+            authenticatedFinalReceiptTexts.removeValue(forKey: runId)
+        }
+
         let coordinator = self
         let handle: AgentRunHandle
         do {
@@ -2140,6 +2208,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 event: .providerFinished(generation: gen, reason: .providerFailure)
             )
             lock.unlock()
+            lock.withLock {
+                distillReceiptRunScopes.removeValue(forKey: runId)
+                distillReceiptVerifiers.removeValue(forKey: runId)
+                distillReceiptItemTurnIDs.removeValue(forKey: runId)
+                authenticatedFinalReceiptTexts.removeValue(forKey: runId)
+            }
             markStartFailure(
                 error,
                 request: effectiveRequest,
@@ -3293,6 +3367,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             || activeProviderTextItemTypes[runId] != nil
             || bufferedProviderTextItems[runId] != nil
             || providerTextTranslationsInFlight[runId] != nil
+            || distillReceiptRunScopes[runId] != nil
+            || distillReceiptVerifiers[runId] != nil
+            || distillReceiptItemTurnIDs[runId] != nil
+            || authenticatedFinalReceiptTexts[runId] != nil
             || deferredProviderTerminalEvents[runId] != nil
             || finishingRuns.contains(runId)
             || pendingTerminalEvents[runId] != nil
@@ -3397,6 +3475,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         activeProviderTextItemTypes.removeValue(forKey: runId)
         bufferedProviderTextItems.removeValue(forKey: runId)
         providerTextTranslationsInFlight.removeValue(forKey: runId)
+        distillReceiptRunScopes.removeValue(forKey: runId)
+        distillReceiptVerifiers.removeValue(forKey: runId)
+        distillReceiptItemTurnIDs.removeValue(forKey: runId)
+        authenticatedFinalReceiptTexts.removeValue(forKey: runId)
         deferredProviderTerminalEvents.removeValue(forKey: runId)
         deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
         finishingRuns.remove(runId)
@@ -5294,8 +5376,33 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             extraArgs: activeTurnId.map { ["remotecode.recovery.activeTurnId=\($0)"] } ?? [],
             runAsUser: thread.runAsUser
         )
-        try await adapter.recoverSession(request) { [weak self] event in
-            self?.handle(event: event, runId: recoveryEventRunId, threadId: threadId)
+        let distillReceiptScope = DistillReceiptRunScope(
+            environment: request.environment,
+            runId: recoveryEventRunId
+        )
+        lock.withLock {
+            if let distillReceiptScope {
+                distillReceiptRunScopes[recoveryEventRunId] = distillReceiptScope
+                distillReceiptVerifiers[recoveryEventRunId] = DistillAppliedReceiptStreamVerifier()
+            } else {
+                distillReceiptRunScopes.removeValue(forKey: recoveryEventRunId)
+                distillReceiptVerifiers.removeValue(forKey: recoveryEventRunId)
+            }
+            distillReceiptItemTurnIDs.removeValue(forKey: recoveryEventRunId)
+            authenticatedFinalReceiptTexts.removeValue(forKey: recoveryEventRunId)
+        }
+        do {
+            try await adapter.recoverSession(request) { [weak self] event in
+                self?.handle(event: event, runId: recoveryEventRunId, threadId: threadId)
+            }
+        } catch {
+            lock.withLock {
+                distillReceiptRunScopes.removeValue(forKey: recoveryEventRunId)
+                distillReceiptVerifiers.removeValue(forKey: recoveryEventRunId)
+                distillReceiptItemTurnIDs.removeValue(forKey: recoveryEventRunId)
+                authenticatedFinalReceiptTexts.removeValue(forKey: recoveryEventRunId)
+            }
+            throw error
         }
         lock.lock()
         providerTurnScopes[threadId] = ProviderTurnScope(environment: request.environment)
@@ -5573,7 +5680,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         threadId: AgentThreadID,
         runId: AgentRunID
     ) -> PersistAssistantOutcome {
-        let text = AssistantTimelineState.cappedText(sanitizeFinalAssistantText(text))
+        let text = AssistantTimelineState.cappedText(
+            sanitizeFinalAssistantText(text, runId: runId)
+        )
         guard !text.isEmpty else {
             return PersistAssistantOutcome(message: nil, deferredIssue: nil, pendingMessageAppendNotification: nil)
         }
@@ -5654,23 +5763,61 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
     }
 
-    private func sanitizeFinalAssistantText(_ text: String) -> String {
+    private func sanitizeFinalAssistantText(
+        _ text: String,
+        runId: AgentRunID? = nil
+    ) -> String {
         // Shared provider-agnostic choke point for final assistant text: strip
-        // leaked model control tokens (e.g. Grok `<|eos|>`), applied Distill
-        // receipts, unresolved CCR handles, then raw tool-invocation markup
-        // (leaving the uncalled-tool incomplete-turn signal). Covers claude /
-        // codex / grok.
-        AssistantToolMarkupSanitizer.sanitize(
+        // leaked model control tokens (e.g. Grok `<|eos|>`), authenticated
+        // Distill receipts, unresolved CCR handles, then raw tool-invocation
+        // markup (leaving the uncalled-tool incomplete-turn signal). Covers
+        // claude / codex / grok. Unauthenticated receipt-shaped prose remains
+        // visible instead of manufacturing a Token Saver claim.
+        let receiptChecked = runId.map {
+            stripAuthenticatedFinalReceipt(text, runId: $0)
+        } ?? text
+        return AssistantToolMarkupSanitizer.sanitize(
             RetrieveHandleSanitizer.strip(
-                DistillAppliedReceipt.strip(
-                    ProviderControlTokenSanitizer.strip(text)
-                )
+                ProviderControlTokenSanitizer.strip(receiptChecked)
             )
         )
     }
 
-    private func sanitizeFinalAssistantText(_ text: String?) -> String? {
-        text.map(sanitizeFinalAssistantText)
+    private func sanitizeFinalAssistantText(
+        _ text: String?,
+        runId: AgentRunID? = nil
+    ) -> String? {
+        text.map { sanitizeFinalAssistantText($0, runId: runId) }
+    }
+
+    private func stripAuthenticatedFinalReceipt(
+        _ text: String,
+        runId: AgentRunID
+    ) -> String {
+        let sourceDigest = Data(SHA256.hash(data: Data(text.utf8)))
+        if let cached = lock.withLock({ authenticatedFinalReceiptTexts[runId] }),
+           cached.sourceDigest == sourceDigest {
+            return cached.stripped
+        }
+        guard let receiptScope = lock.withLock({ distillReceiptRunScopes[runId] }),
+              receiptScope.isCurrentlyActive else {
+            return text
+        }
+        let authenticated = lock.withLock { () -> Bool in
+            guard var verifier = distillReceiptVerifiers[runId] else { return false }
+            let result = verifier.authenticateStandalone(
+                text,
+                scope: receiptScope.verifierScope
+            )
+            distillReceiptVerifiers[runId] = verifier
+            return result
+        }
+        guard authenticated else { return text }
+        let stripped = DistillAppliedReceipt.strip(text)
+        lock.withLock {
+            authenticatedFinalReceiptTexts[runId] = (sourceDigest, stripped)
+        }
+        return stripped
     }
 
     /// Stable identity for a final message synthesized from a provider terminal
@@ -5682,9 +5829,128 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return AgentMessageID(UUID(uuid: bytes))
     }
 
+    private struct PreparedAssistantEvent {
+        let event: AssistantEvent
+        let hostMetadataTrusted: Bool
+    }
+
+    /// Converts provider-owned events into a host-owned receipt metadata event
+    /// only after the exact terminal bytes authenticate for this run. The caller
+    /// persists these returned events in order before any observer sees them.
+    private func prepareDistillReceiptEvents(
+        _ event: AssistantEvent,
+        runId: AgentRunID
+    ) -> [PreparedAssistantEvent] {
+        switch event {
+        case .itemStarted(let item):
+            let providerItem = item.withoutHostMetadata()
+            let hasScope = lock.withLock { distillReceiptRunScopes[runId] != nil }
+            if hasScope {
+                lock.withLock {
+                    var verifier = distillReceiptVerifiers[runId]
+                        ?? DistillAppliedReceiptStreamVerifier()
+                    verifier.startItem(id: item.id, body: item.body, output: item.output)
+                    distillReceiptVerifiers[runId] = verifier
+                    distillReceiptItemTurnIDs[runId, default: [:]][item.id] = item.turnId
+                }
+            }
+            var prepared = [PreparedAssistantEvent(
+                event: .itemStarted(item: providerItem),
+                hostMetadataTrusted: false
+            )]
+            if item.state != .streaming,
+               let turnId = completeDistillReceipt(itemID: item.id, runId: runId) {
+                prepared.append(PreparedAssistantEvent(
+                    event: .itemHostMetadata(
+                        turnId: turnId,
+                        itemId: item.id,
+                        distillApplied: true
+                    ),
+                    hostMetadataTrusted: true
+                ))
+            }
+            return prepared
+
+        case .itemDelta(let itemId, let bodyAppend, let outputAppend, let summary):
+            lock.withLock {
+                guard var verifier = distillReceiptVerifiers[runId] else { return }
+                verifier.append(itemID: itemId, body: bodyAppend, output: outputAppend)
+                distillReceiptVerifiers[runId] = verifier
+            }
+            return [PreparedAssistantEvent(
+                event: .itemDelta(
+                    itemId: itemId,
+                    bodyAppend: bodyAppend,
+                    outputAppend: outputAppend,
+                    summary: summary
+                ),
+                hostMetadataTrusted: false
+            )]
+
+        case .itemCompleted(let itemId, let finalState):
+            var prepared: [PreparedAssistantEvent] = []
+            if let turnId = completeDistillReceipt(itemID: itemId, runId: runId) {
+                prepared.append(PreparedAssistantEvent(
+                    event: .itemHostMetadata(
+                        turnId: turnId,
+                        itemId: itemId,
+                        distillApplied: true
+                    ),
+                    hostMetadataTrusted: true
+                ))
+            }
+            prepared.append(PreparedAssistantEvent(
+                event: .itemCompleted(itemId: itemId, finalState: finalState),
+                hostMetadataTrusted: false
+            ))
+            return prepared
+
+        case .itemHostMetadata:
+            // Providers and parsers share AssistantEvent but never this authority.
+            return []
+
+        case .turnCompleted:
+            lock.withLock {
+                if var verifier = distillReceiptVerifiers[runId] {
+                    verifier.endTurn()
+                    distillReceiptVerifiers[runId] = verifier
+                }
+                distillReceiptItemTurnIDs.removeValue(forKey: runId)
+            }
+            return [PreparedAssistantEvent(event: event, hostMetadataTrusted: false)]
+
+        default:
+            return [PreparedAssistantEvent(event: event, hostMetadataTrusted: false)]
+        }
+    }
+
+    private func completeDistillReceipt(
+        itemID: String,
+        runId: AgentRunID
+    ) -> String? {
+        guard let receiptScope = lock.withLock({ distillReceiptRunScopes[runId] }),
+              receiptScope.isCurrentlyActive else {
+            lock.withLock {
+                distillReceiptItemTurnIDs[runId]?.removeValue(forKey: itemID)
+            }
+            return nil
+        }
+        return lock.withLock {
+            guard var verifier = distillReceiptVerifiers[runId] else { return nil }
+            let applied = verifier.complete(
+                itemID: itemID,
+                scope: receiptScope.verifierScope
+            )
+            distillReceiptVerifiers[runId] = verifier
+            let turnId = distillReceiptItemTurnIDs[runId]?.removeValue(forKey: itemID)
+            return applied ? turnId : nil
+        }
+    }
+
     private func sanitizeFinalAssistantEvent(
         _ ev: AssistantEvent,
-        runId: AgentRunID
+        runId: AgentRunID,
+        hostMetadataTrusted: Bool
     ) -> AssistantEvent? {
         let suppress = lock.withLock { replyOnlyPrimaryRuns.contains(runId) }
         if suppress {
@@ -5697,7 +5963,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             case .itemDelta(let itemId, _, _, _),
                  .itemState(let itemId, _),
                  .itemProgress(let itemId, _),
-                 .itemCompleted(let itemId, _):
+                 .itemCompleted(let itemId, _),
+                 .itemHostMetadata(_, let itemId, _):
                 if lock.withLock({ replyOnlyAssistantItemIDs[runId]?.contains(itemId) == true }) {
                     return nil
                 }
@@ -5709,7 +5976,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         switch ev {
         case .turnCompleted(let turnId, let finalMessage):
-            return .turnCompleted(turnId: turnId, finalMessage: finalMessage.map(finalResponseDisplayText))
+            return .turnCompleted(
+                turnId: turnId,
+                finalMessage: finalMessage.map { finalResponseDisplayText($0, runId: runId) }
+            )
+        case .itemHostMetadata:
+            return hostMetadataTrusted ? ev : nil
+        case .itemStarted(let item):
+            guard item.distillApplied != nil else { return ev }
+            return .itemStarted(item: item.withoutHostMetadata())
         case .itemDelta(let itemId, let bodyAppend, let outputAppend, let summary):
             // Defense in depth for live stream: drop leaked control tokens from
             // body deltas without trimming (preserves inter-chunk whitespace).
@@ -5954,7 +6229,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         threadId: AgentThreadID,
         allowFinalResponseTranslation: Bool = true,
         providerTerminalAcknowledged: Bool = true,
-        continuationSourceFinalMessage: String? = nil
+        continuationSourceFinalMessage: String? = nil,
+        distillReceiptPrepared: Bool = false,
+        hostDistillMetadataTrusted: Bool = false
     ) {
         guard let lease = admitRunCallback(runId: runId, threadId: threadId) else { return }
         #if DEBUG
@@ -5964,7 +6241,27 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         defer { endAdmittedCallbackMutation(runId: runId) }
         switch event {
         case .event(let rawEvent):
-            guard let ev = sanitizeFinalAssistantEvent(rawEvent, runId: runId) else { return }
+            if !distillReceiptPrepared,
+               lock.withLock({ distillReceiptRunScopes[runId] != nil }) {
+                for prepared in prepareDistillReceiptEvents(rawEvent, runId: runId) {
+                    handle(
+                        event: .event(prepared.event),
+                        runId: runId,
+                        threadId: threadId,
+                        allowFinalResponseTranslation: allowFinalResponseTranslation,
+                        providerTerminalAcknowledged: providerTerminalAcknowledged,
+                        continuationSourceFinalMessage: continuationSourceFinalMessage,
+                        distillReceiptPrepared: true,
+                        hostDistillMetadataTrusted: prepared.hostMetadataTrusted
+                    )
+                }
+                return
+            }
+            guard let ev = sanitizeFinalAssistantEvent(
+                rawEvent,
+                runId: runId,
+                hostMetadataTrusted: hostDistillMetadataTrusted
+            ) else { return }
             persistProviderNativeSubagentLifecycle(
                 from: ev,
                 parentRunId: runId,
@@ -6452,7 +6749,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     runId: runId,
                     threadId: threadId,
                     preferredStatus: reportedStatus,
-                    finalMessage: sanitizeFinalAssistantText(rawFinalMessage),
+                    finalMessage: sanitizeFinalAssistantText(rawFinalMessage, runId: runId),
                     providerThreadId: providerThreadId
                 )
                 return
@@ -6468,7 +6765,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             lock.unlock()
 
-            let finalMessage = rawFinalMessage.map(finalResponseDisplayText)
+            let finalMessage = rawFinalMessage.map {
+                finalResponseDisplayText($0, runId: runId)
+            }
             if allowFinalResponseTranslation,
                reportedStatus == .completed,
                let rawProviderText = rawFinalMessage,
@@ -6771,6 +7070,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeAssistantMessageIds.removeValue(forKey: runId)
             activeProviderTextItemTypes.removeValue(forKey: runId)
             bufferedProviderTextItems.removeValue(forKey: runId)
+            distillReceiptRunScopes.removeValue(forKey: runId)
+            distillReceiptVerifiers.removeValue(forKey: runId)
+            distillReceiptItemTurnIDs.removeValue(forKey: runId)
+            authenticatedFinalReceiptTexts.removeValue(forKey: runId)
             latestRunErrorMessages.removeValue(forKey: runId)
             finishingRuns.remove(runId)
             pendingTerminalEvents.removeValue(forKey: runId)
@@ -7378,13 +7681,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         finalResponseWireAdmissionCheck(projection.wire, projection.human)
     }
 
-    private func finalResponseDisplayText(_ text: String) -> String {
+    private func finalResponseDisplayText(
+        _ text: String,
+        runId: AgentRunID
+    ) -> String {
         guard finalResponseTranslator != nil,
               let projection = wireResponseProjection(text),
               !admitsWireResponse(projection) else {
-            return sanitizeFinalAssistantText(text)
+            return sanitizeFinalAssistantText(text, runId: runId)
         }
-        return sanitizeFinalAssistantText(projection.human)
+        return sanitizeFinalAssistantText(projection.human, runId: runId)
     }
 
     private func shouldTranslateFinalResponse(_ text: String) -> Bool {
@@ -7824,7 +8130,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 first.resume(returning: deterministicFallback)
             }
         }
-        let trimmed = sanitizeFinalAssistantText(translated).trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = sanitizeFinalAssistantText(
+            translated,
+            runId: runId
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty || RCWireProtocol.transportEnvelope(in: trimmed) != nil {
             return deterministicFallback
         }

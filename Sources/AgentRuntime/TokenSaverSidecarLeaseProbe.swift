@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CoreModel
 
 /// Pure probe for the Distill sidecar lease written to `DistillCLIState.json`.
 ///
@@ -12,11 +13,13 @@ public enum TokenSaverSidecarLeaseProbe {
         public let baseURL: String
         public let authToken: String
         public let pid: Int32
+        public let receiptKey: Data?
 
-        public init(baseURL: String, authToken: String, pid: Int32) {
+        public init(baseURL: String, authToken: String, pid: Int32, receiptKey: Data? = nil) {
             self.baseURL = baseURL
             self.authToken = authToken
             self.pid = pid
+            self.receiptKey = receiptKey
         }
     }
 
@@ -24,11 +27,13 @@ public enum TokenSaverSidecarLeaseProbe {
         let baseURL: String
         let authToken: String
         let pid: Int32
+        let receiptKey: String?
 
         enum CodingKeys: String, CodingKey {
             case baseURL = "base_url"
             case authToken = "auth_token"
             case pid
+            case receiptKey = "receipt_key"
         }
     }
 
@@ -53,7 +58,12 @@ public enum TokenSaverSidecarLeaseProbe {
               decoded.pid > 1 else {
             return nil
         }
-        return Lease(baseURL: base, authToken: token, pid: decoded.pid)
+        return Lease(
+            baseURL: base,
+            authToken: token,
+            pid: decoded.pid,
+            receiptKey: DistillAppliedReceipt.decodeReceiptKey(decoded.receiptKey)
+        )
     }
 
     public static func readLease(at url: URL) -> Lease? {

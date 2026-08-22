@@ -35,13 +35,26 @@ public struct AssistantItem: Codable, Sendable, Equatable, Identifiable {
     /// Private action target. Normal transcript rendering must show only a safe display name.
     public var resourcePath: String?
     public var progress: Double?
+    /// Host-attested Token Saver result. Provider/parser-owned item payloads are
+    /// never trusted to set this; `AssistantTimelineState` only admits `true`
+    /// through `AssistantEvent.itemHostMetadata`.
+    public internal(set) var distillApplied: Bool?
     public var startedAtMs: Int64
     public var finishedAtMs: Int64?
 
     public init(id: String, turnId: String, type: AssistantItemType, state: AssistantItemState = .streaming, summary: String? = nil, body: String = "", output: String? = nil, resourcePath: String? = nil, progress: Double? = nil, startedAtMs: Int64, finishedAtMs: Int64? = nil) {
         self.id = id; self.turnId = turnId; self.type = type; self.state = state
         self.summary = summary; self.body = body; self.output = output; self.resourcePath = resourcePath; self.progress = progress
+        self.distillApplied = nil
         self.startedAtMs = startedAtMs; self.finishedAtMs = finishedAtMs
+    }
+
+    /// Returns provider-owned item content with host-only attestation removed.
+    /// Callers may clear trust at a parser boundary but cannot manufacture it.
+    public func withoutHostMetadata() -> AssistantItem {
+        var copy = self
+        copy.distillApplied = nil
+        return copy
     }
 }
 
@@ -773,6 +786,9 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
     case itemState(itemId: String, state: AssistantItemState)
     case itemProgress(itemId: String, progress: Double?)
     case itemCompleted(itemId: String, finalState: AssistantItemState)
+    /// Host-only metadata channel. Keeping trust out of parser-owned
+    /// `itemStarted`/`itemDelta` payloads prevents provider text from minting UI truth.
+    case itemHostMetadata(turnId: String, itemId: String, distillApplied: Bool?)
     case turnCompleted(turnId: String, finalMessage: String?)
     case proposedPlan(AssistantProposedPlan)
     case activePlanUpdated(AssistantActivePlan)
@@ -797,6 +813,7 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
         case .itemState(let i, let s): return "itemState(\(i) -> \(s.rawValue))"
         case .itemProgress(let i, let p): return "itemProgress(\(i) -> \(p ?? -1))"
         case .itemCompleted(let i, let s): return "itemCompleted(\(i) -> \(s.rawValue))"
+        case .itemHostMetadata(let t, let i, let applied): return "itemHostMetadata(\(t)/\(i) distill=\(applied == true))"
         case .turnCompleted(let t, _): return "turnCompleted(\(t))"
         case .proposedPlan(let p): return "proposedPlan(\(p.id))"
         case .activePlanUpdated(let p): return "activePlanUpdated(\(p.steps.count))"
@@ -842,6 +859,8 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
             return envelope + id.utf8.count
         case .itemCompleted(let id, _):
             return envelope + id.utf8.count
+        case .itemHostMetadata(let turnId, let itemId, _):
+            return envelope + turnId.utf8.count + itemId.utf8.count + 8
         case .turnCompleted(let t, let final):
             return envelope + t.utf8.count + s(final)
         case .proposedPlan(let plan):
@@ -992,6 +1011,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         var body: String = ""
         var output: String = ""
         var summary: String?
+        var distillApplied: Bool?
     }
 
     public init() {
@@ -1365,11 +1385,18 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         case .itemStarted(let item):
             ensureTurn(item.turnId)
             if let idx = turns.firstIndex(where: { $0.turnId == item.turnId }) {
-                let pending = pendingItemDeltas.removeValue(forKey: item.id)
-                if pending != nil { pendingItemDeltaOrder.removeAll { $0 == item.id } }
+                let deltaKey = Self.pendingItemDeltaKey(itemId: item.id)
+                let pending = pendingItemDeltas.removeValue(forKey: deltaKey)
+                if pending != nil { pendingItemDeltaOrder.removeAll { $0 == deltaKey } }
+                let metadataKey = Self.pendingHostMetadataKey(turnId: item.turnId, itemId: item.id)
+                let pendingMetadata = pendingItemDeltas.removeValue(forKey: metadataKey)
+                if pendingMetadata != nil { pendingItemDeltaOrder.removeAll { $0 == metadataKey } }
                 if let itemIndex = turns[idx].items.firstIndex(where: { $0.id == item.id }) {
                     let existing = turns[idx].items[itemIndex]
                     var merged = item
+                    // Provider/parser item payloads never mint trust. Preserve only
+                    // an already host-attested value from the local timeline.
+                    merged.distillApplied = existing.distillApplied == true ? true : nil
                     if merged.body.isEmpty { merged.body = existing.body }
                     if merged.output == nil { merged.output = existing.output }
                     if merged.progress == nil { merged.progress = existing.progress }
@@ -1377,10 +1404,13 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                     if merged.finishedAtMs == nil { merged.finishedAtMs = existing.finishedAtMs }
                     if merged.state == .streaming, existing.state != .streaming { merged.state = existing.state }
                     applyPendingDelta(pending, to: &merged)
+                    applyPendingDelta(pendingMetadata, to: &merged)
                     turns[idx].items[itemIndex] = merged
                 } else {
                     var started = item
+                    started.distillApplied = nil
                     applyPendingDelta(pending, to: &started)
+                    applyPendingDelta(pendingMetadata, to: &started)
                     turns[idx].items.append(started)
                     trimTurnItems(at: idx)
                 }
@@ -1401,8 +1431,9 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 if let s = summary { item.summary = s }
             }
             if !applied {
-                var pending = pendingItemDeltas[iid] ?? PendingItemDelta()
-                if pendingItemDeltas[iid] == nil { pendingItemDeltaOrder.append(iid) }
+                let key = Self.pendingItemDeltaKey(itemId: iid)
+                var pending = pendingItemDeltas[key] ?? PendingItemDelta()
+                if pendingItemDeltas[key] == nil { pendingItemDeltaOrder.append(key) }
                 if let b = bodyAppend {
                     Self.appendCapped(&pending.body, append: b, limit: Self.liveTextLimit)
                 }
@@ -1410,7 +1441,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                     Self.appendCapped(&pending.output, append: o, limit: Self.liveOutputLimit)
                 }
                 if let s = summary { pending.summary = s }
-                pendingItemDeltas[iid] = pending
+                pendingItemDeltas[key] = pending
                 trimPendingItemDeltas()
             }
         case .itemState(let iid, let state):
@@ -1432,6 +1463,21 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
             if let item = item(withId: iid) {
                 recordActivity(for: item, state: state)
+            }
+        case .itemHostMetadata(let turnId, let itemId, let distillApplied):
+            // OR semantics are deliberate: absent/false metadata is never an
+            // instruction to erase a durable host attestation.
+            guard distillApplied == true else { break }
+            let applied = mutateItem(turnId: turnId, itemId: itemId) {
+                $0.distillApplied = true
+            }
+            if !applied {
+                let key = Self.pendingHostMetadataKey(turnId: turnId, itemId: itemId)
+                var pending = pendingItemDeltas[key] ?? PendingItemDelta()
+                if pendingItemDeltas[key] == nil { pendingItemDeltaOrder.append(key) }
+                pending.distillApplied = true
+                pendingItemDeltas[key] = pending
+                trimPendingItemDeltas()
             }
         case .turnCompleted(let tid, let final):
             if let idx = turns.firstIndex(where: { $0.turnId == tid }) {
@@ -1665,6 +1711,29 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         pendingUserInputs = Array(pendingUserInputs.suffix(Self.pendingRequestLimit))
     }
 
+    private static func pendingHostMetadataKey(turnId: String, itemId: String) -> String {
+        "host|\(turnId.utf8.count)|\(turnId)|\(itemId.utf8.count)|\(itemId)"
+    }
+
+    private static func pendingItemDeltaKey(itemId: String) -> String {
+        "provider|\(itemId.utf8.count)|\(itemId)"
+    }
+
+    @discardableResult
+    private mutating func mutateItem(
+        turnId: String,
+        itemId: String,
+        _ mut: (inout AssistantItem) -> Void
+    ) -> Bool {
+        guard let turnIndex = turns.lastIndex(where: { $0.turnId == turnId }) else { return false }
+        for itemIndex in turns[turnIndex].items.indices.reversed()
+        where turns[turnIndex].items[itemIndex].id == itemId {
+            mut(&turns[turnIndex].items[itemIndex])
+            return true
+        }
+        return false
+    }
+
     @discardableResult
     private mutating func mutateItem(_ iid: String, _ mut: (inout AssistantItem) -> Void) -> Bool {
         // Streaming itemDeltas target the most-recently-started item, which is the
@@ -1701,6 +1770,9 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         }
         if let summary = pending.summary {
             item.summary = summary
+        }
+        if pending.distillApplied == true {
+            item.distillApplied = true
         }
     }
 

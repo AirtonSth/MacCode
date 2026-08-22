@@ -77,9 +77,11 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         let stateJSON: [String: Any] = [
             "base_url": ready.baseURL,
             "auth_token": "tok",
+            "receipt_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
             "pid": ready.pid,
         ]
         try JSONSerialization.data(withJSONObject: stateJSON).write(to: stateURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
 
         let baseEnvironment = [
             "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
@@ -88,6 +90,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             "RC_TOKEN_SAVER_PROJECT_ID": "project-subprocess",
             "RC_TOKEN_SAVER_THREAD_ID": "thread-subprocess",
             "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-subprocess",
+            "RC_TOKEN_SAVER_ROOT_RUN_ID": "managed-distill-subprocess-root",
             "RC_WRAP_FIXTURE_PATH": fixtureURL.path,
             "PATH": "\(managedBin.path):\(realBin.path):/usr/bin:/bin",
         ]
@@ -163,6 +166,26 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
                 try Data(contentsOf: redirectURL),
                 original: fixture,
                 context: "\(provider) ordinary wrapper redirect"
+            )
+        }
+
+        // A pre-v2 state file still decodes and keeps the CLI usable, but cannot
+        // authorize a lossy replacement. Every provider must receive exact raw bytes.
+        try JSONSerialization.data(withJSONObject: [
+            "base_url": ready.baseURL,
+            "auth_token": "tok",
+            "pid": ready.pid,
+        ]).write(to: stateURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
+        for provider in ["claude", "codex", "grok"] {
+            var environment = baseEnvironment
+            environment["REMOTE_CODE_AGENT_PROVIDER"] = provider
+            let legacy = try runProcessData(distill, [prompt], env: environment, stdin: fixture)
+            XCTAssertEqual(legacy.code, 0, "\(provider) legacy state")
+            assertByteExactWithoutAppliedReceipt(
+                legacy.out,
+                original: fixture,
+                context: "\(provider) legacy state without receipt authority"
             )
         }
 
@@ -279,8 +302,10 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: [
             "base_url": ready.baseURL,
             "auth_token": "tok",
+            "receipt_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
             "pid": ready.pid,
         ]).write(to: stateURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
 
         let workspaceCaptureID = "-wrapper-byte-exact-\(UUID().uuidString)"
         let sessionID = UUID().uuidString
@@ -307,6 +332,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             "RC_TOKEN_SAVER_PROJECT_ID": "project-wrapper",
             "RC_TOKEN_SAVER_THREAD_ID": "thread-wrapper",
             "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-wrapper",
+            "RC_TOKEN_SAVER_ROOT_RUN_ID": "managed-wrapper-subprocess-root",
         ]
 
         for hasTerminalLF in [false, true] {
@@ -361,7 +387,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
     }
 
     private static let strictAppliedReceiptLineRegex = try! NSRegularExpression(
-        pattern: #"(?m)^\[\[rcd:v1\.[A-Za-z0-9_-]{22}\]\]\r?$"#
+        pattern: #"(?m)^\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]\r?$"#
     )
 
     private func assertSingleAppliedReceiptAndNetShrink(

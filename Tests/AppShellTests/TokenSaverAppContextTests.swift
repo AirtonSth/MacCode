@@ -9,6 +9,24 @@ import SocketServer
 
 @MainActor
 final class TokenSaverAppContextTests: XCTestCase {
+    private struct UntaggedDistillProcessSpawner: DistillProcessSpawning {
+        func spawn(executableURL: URL, arguments: [String]) throws -> DistillSpawnResult {
+            let process = Process()
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.executableURL = executableURL
+            process.arguments = arguments
+            process.standardOutput = stdout
+            process.standardError = stderr
+            try process.run()
+            return DistillSpawnResult(
+                process: process,
+                stdoutHandle: stdout.fileHandleForReading,
+                stderrHandle: stderr.fileHandleForReading
+            )
+        }
+    }
+
     private final class TestScopedRecoveryStore: TokenSaverScopedRecoveryStoring, @unchecked Sendable {
         private let store: TokenSaverScopedRecoveryStore
 
@@ -176,6 +194,43 @@ final class TokenSaverAppContextTests: XCTestCase {
                 subscribed: subscribed
             )
         ))
+    }
+
+    func test_itemHostMetadataPublishesDistillAppliedAsAdditiveWireEvent() throws {
+        // WHY: iOS reduces the EventBus stream independently from macOS. The
+        // host-attested bit must cross that boundary without replaying provider
+        // text or changing the terminal item lifecycle event.
+        let appSupport = NSTemporaryDirectory() + "RC2DistillMetadataWire-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let threadID = AgentThreadID()
+        let runID = AgentRunID()
+        let cursor = EventBus.shared.currentSeq
+
+        context.coordinator.onAssistantEvent?(
+            .itemHostMetadata(
+                turnId: "turn-wire",
+                itemId: "item-wire",
+                distillApplied: true
+            ),
+            threadID,
+            runID
+        )
+
+        let event = try XCTUnwrap(
+            EventBus.shared.recentEvents(since: cursor, maxBytes: nil).events.last { event in
+                event.kind == "agent.item.delta"
+                    && event.payload.objectValue?["item_id"] == .string("item-wire")
+            }
+        )
+        let payload = try XCTUnwrap(event.payload.objectValue)
+        XCTAssertEqual(event.kind, "agent.item.delta")
+        XCTAssertEqual(payload["thread_id"], .string(threadID.value.uuidString))
+        XCTAssertEqual(payload["turn_id"], .string("turn-wire"))
+        XCTAssertEqual(payload["item_id"], .string("item-wire"))
+        XCTAssertEqual(payload["distill_applied"], .bool(true),
+                       "host truth must use the snake_case cross-platform wire field")
+        XCTAssertNil(payload["body_append"],
+                     "metadata-only events must not duplicate provider output")
     }
 
     @discardableResult
@@ -393,11 +448,13 @@ final class TokenSaverAppContextTests: XCTestCase {
         {
           "base_url": "\(ready.baseURL)",
           "auth_token": "cli-token",
+          "receipt_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
           "pid": \(ready.pid),
           "runtime": "\(ready.runtime)",
           "model_id": "\(ready.modelID)"
         }
         """.utf8).write(to: stateURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
 
         let process = Process()
         let stdin = Pipe()
@@ -412,6 +469,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         for (key, value) in [
             "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
             "REMOTE_CODE_AGENT_PROVIDER": "codex",
+            "RC_TOKEN_SAVER_ROOT_RUN_ID": "managed-cli-local-service-test",
             "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace",
             "RC_TOKEN_SAVER_PROJECT_ID": "project",
             "RC_TOKEN_SAVER_THREAD_ID": "thread",
@@ -422,7 +480,8 @@ final class TokenSaverAppContextTests: XCTestCase {
         process.environment = cliEnvironment
 
         try process.run()
-        stdin.fileHandleForWriting.write(Data("unit tests passed\nno failures\n".utf8))
+        let noisyPassingOutput = String(repeating: "unit tests passed with no failures\n", count: 40)
+        stdin.fileHandleForWriting.write(Data(noisyPassingOutput.utf8))
         stdin.fileHandleForWriting.closeFile()
         process.waitUntilExit()
 
@@ -432,6 +491,8 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(output.split(whereSeparator: \.isNewline).first.map(String.init), "PASS",
                        "the managed distill command must preserve the requested answer before its recovery marker")
         XCTAssertTrue(output.contains("[[rc:rcv1."), "lossy CLI output must carry its exact-scope recovery capability")
+        XCTAssertNotNil(DistillAppliedReceipt.parseTrailingV2Marker(in: Data(output.utf8)),
+                        "the real CLI must load receipt_key + root and emit authenticated v2")
         XCTAssertFalse(output.contains("PROMPT:"))
         XCTAssertFalse(output.contains("INPUT:"))
         XCTAssertFalse(error.contains("dev/distill/src/cli.ts"),
@@ -2844,7 +2905,11 @@ final class TokenSaverAppContextTests: XCTestCase {
 
         let controller = TokenSaverDistillServiceController(
             appSupportDirectory: appSupport,
-            executableURLResolver: { executable }
+            executableURLResolver: { executable },
+            processSpawner: UntaggedDistillProcessSpawner(),
+            terminateForeignServers: { _ in
+                ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+            }
         )
         let session = PrivateAccountSession(
             accessToken: "access-token",
@@ -2868,8 +2933,10 @@ final class TokenSaverAppContextTests: XCTestCase {
             if case .running = controller.status { return true }
             return false
         }
-        XCTAssertTrue(ready,
-                      "paid subscribed launches with Token Saver enabled and a verified model must spawn the managed sidecar")
+        XCTAssertTrue(
+            ready,
+            "paid subscribed launches with Token Saver enabled and a verified model must spawn the managed sidecar; status=\(controller.status)"
+        )
         guard case .running(let event) = controller.status else {
             return XCTFail("expected running Token Saver sidecar status")
         }
@@ -2881,14 +2948,109 @@ final class TokenSaverAppContextTests: XCTestCase {
         let stateURL = appSupport
             .appendingPathComponent("Distill", isDirectory: true)
             .appendingPathComponent("DistillCLIState.json")
-        let state = try String(contentsOf: stateURL)
+        let stateData = try Data(contentsOf: stateURL)
+        let state = try XCTUnwrap(String(data: stateData, encoding: .utf8))
+        let stateObject = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: stateData) as? [String: Any]
+        )
         XCTAssertTrue(state.contains("\"base_url\":\"http:\\/\\/127.0.0.1:18181\"") ||
                       state.contains("\"base_url\":\"http://127.0.0.1:18181\""))
         XCTAssertTrue(state.contains(token),
                       "the managed distill CLI needs the live sidecar bearer token, not an external TypeScript CLI")
+        let receiptKey = try XCTUnwrap(stateObject["receipt_key"] as? String)
+        XCTAssertEqual(Data(base64Encoded: receiptKey)?.count, 32,
+                       "authenticated receipts need a separate 256-bit lifecycle key")
+        XCTAssertNotEqual(receiptKey, token,
+                          "receipt authentication must not reuse the rotating HTTP bearer")
+        let mode = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: stateURL.path)[.posixPermissions] as? NSNumber
+        ).intValue & 0o777
+        XCTAssertEqual(mode, 0o600, "the receipt key state must remain owner-only")
 
         controller.stop()
         XCTAssertFalse(FileManager.default.fileExists(atPath: stateURL.path))
+    }
+
+    func test_tokenSaverDistillServiceControllerKeepsReceiptKeyAcrossSidecarRestart() async throws {
+        // WHY: provider output from an in-flight root run may arrive after the
+        // sidecar crashes. Rotating this key with the HTTP bearer would make its
+        // authenticated receipt unverifiable even though Token Saver stayed On.
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2TokenSaverReceiptRestart-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        let executable = appSupport.appendingPathComponent("FakeRemoteCodeDistillService")
+        let script = """
+        #!/bin/sh
+        counter="$0.count"
+        count=0
+        if [ -f "$counter" ]; then count=$(cat "$counter"); fi
+        count=$((count + 1))
+        printf '%s' "$count" > "$counter"
+        printf '%s\\n' '{"event":"ready","base_url":"http://127.0.0.1:18184","host":"127.0.0.1","port":18184,"pid":12348,"protocol":1,"runtime":"mlx","model_id":"\(DistillApprovedModel.id)","max_concurrent_requests":8,"max_queue_depth":64}'
+        if [ "$count" -eq 1 ]; then sleep 0.4; exit 1; fi
+        sleep 20
+        """
+        try Data(script.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: appSupport,
+            executableURLResolver: { executable },
+            processSpawner: UntaggedDistillProcessSpawner(),
+            terminateForeignServers: { _ in
+                ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+            }
+        )
+        let session = PrivateAccountSession(
+            accessToken: "access-token",
+            refreshToken: "refresh-token",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        )
+        let stateURL = appSupport
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+        let counterURL = URL(fileURLWithPath: executable.path + ".count")
+
+        controller.startIfEligible(
+            session: session,
+            settings: AppSettings(tokenSaverEnabled: true),
+            modelValidation: .installed
+        )
+        let firstReady = await waitUntil {
+            if case .running = controller.status { return true }
+            return false
+        }
+        XCTAssertTrue(firstReady)
+        let firstStateData = try Data(contentsOf: stateURL)
+        let firstState = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: firstStateData) as? [String: Any]
+        )
+        let firstKey = try XCTUnwrap(firstState["receipt_key"] as? String)
+        let firstBearer = try XCTUnwrap(firstState["auth_token"] as? String)
+
+        let restarted = await waitUntil(timeout: 4) {
+            let count = try? String(contentsOf: counterURL, encoding: .utf8)
+            guard count == "2" else { return false }
+            if case .running = controller.status { return true }
+            return false
+        }
+        XCTAssertTrue(restarted, "an unexpected sidecar exit must reach a new ready state")
+        let secondStateData = try Data(contentsOf: stateURL)
+        let secondState = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: secondStateData) as? [String: Any]
+        )
+        XCTAssertEqual(secondState["receipt_key"] as? String, firstKey,
+                       "the receipt key belongs to the Token Saver On lifecycle, not one sidecar process")
+        XCTAssertNotEqual(secondState["auth_token"] as? String, firstBearer,
+                          "the HTTP bearer still rotates independently when the sidecar restarts")
+
+        controller.stop()
     }
 
     func test_tokenSaverDistillServiceControllerReadsReadyBeforeSidecarClosesStdout() async throws {
@@ -2906,7 +3068,11 @@ final class TokenSaverAppContextTests: XCTestCase {
 
         let controller = TokenSaverDistillServiceController(
             appSupportDirectory: appSupport,
-            executableURLResolver: { executable }
+            executableURLResolver: { executable },
+            processSpawner: UntaggedDistillProcessSpawner(),
+            terminateForeignServers: { _ in
+                ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+            }
         )
         let session = PrivateAccountSession(
             accessToken: "access-token",
@@ -3011,7 +3177,11 @@ final class TokenSaverAppContextTests: XCTestCase {
 
         let controller = TokenSaverDistillServiceController(
             appSupportDirectory: appSupport,
-            executableURLResolver: { executable }
+            executableURLResolver: { executable },
+            processSpawner: UntaggedDistillProcessSpawner(),
+            terminateForeignServers: { _ in
+                ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+            }
         )
         let session = PrivateAccountSession(
             accessToken: "access-token",

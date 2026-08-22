@@ -14,13 +14,17 @@ final class DistillMCPAdmitTests: XCTestCase {
             command: "/tmp/RemoteCodeDistillService",
             environment: [
                 "RC_TOKEN_SAVER_THREAD_ID": "t-1",
+                "RC_TOKEN_SAVER_ROOT_RUN_ID": "root-1",
                 "UNRELATED_SECRET": "nope",
             ]
         )
         XCTAssertEqual(server["command"] as? String, "/tmp/RemoteCodeDistillService")
         XCTAssertEqual(server["args"] as? [String], ["mcp"])
         let env = server["env"] as? [String: String]
-        XCTAssertEqual(env, ["RC_TOKEN_SAVER_THREAD_ID": "t-1"],
+        XCTAssertEqual(env, [
+            "RC_TOKEN_SAVER_THREAD_ID": "t-1",
+            "RC_TOKEN_SAVER_ROOT_RUN_ID": "root-1",
+        ],
                        "only recovery-scope keys may be forwarded; unrelated environment must stay out")
 
         let bare = DistillMCPAdmit.claudeServer(command: "/tmp/RemoteCodeDistillService")

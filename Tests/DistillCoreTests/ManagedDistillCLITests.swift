@@ -1,6 +1,39 @@
+import CryptoKit
 import XCTest
 import CoreModel
 @testable import DistillCore
+
+private let managedDistillCLITestRootRunID = "managed-distill-cli-tests"
+private let managedDistillCLITestReceiptKey = Data(repeating: 0x42, count: 32)
+
+private extension ManagedDistillCLI {
+    init(
+        arguments: [String],
+        stdin: Data,
+        state: State?,
+        provider: String? = nil,
+        recoveryContext: TokenSaverRecoveryRequestContext? = nil,
+        invocationID: String = UUID().uuidString.lowercased(),
+        maxOutputCharacters: Int = 4_000,
+        reversibleStoreMinBytes: Int? = nil,
+        distillAdmission: @escaping DistillAdmission = { true },
+        transport: @escaping Transport
+    ) {
+        self.init(
+            arguments: arguments,
+            stdin: stdin,
+            state: state,
+            rootRunID: managedDistillCLITestRootRunID,
+            provider: provider,
+            recoveryContext: recoveryContext,
+            invocationID: invocationID,
+            maxOutputCharacters: maxOutputCharacters,
+            reversibleStoreMinBytes: reversibleStoreMinBytes,
+            distillAdmission: distillAdmission,
+            transport: transport
+        )
+    }
+}
 
 final class ManagedDistillCLITests: XCTestCase {
     override func tearDown() {
@@ -107,7 +140,11 @@ final class ManagedDistillCLITests: XCTestCase {
         func all() -> [[String: String]] { values }
     }
 
-    private let state = ManagedDistillCLI.State(baseURL: "http://127.0.0.1:9", authToken: "t")
+    private let state = ManagedDistillCLI.State(
+        baseURL: "http://127.0.0.1:9",
+        authToken: "t",
+        receiptKey: managedDistillCLITestReceiptKey
+    )
 
     func test_compress_success_recordsOnlyTheExactReceiptInclusiveDeliveredOutput() async throws {
         let raw = Data(String(repeating: "verbose build output that passed\n", count: 20).utf8)
@@ -181,6 +218,67 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertFalse(emitted.contains("\n\n[[rcd:"), "an existing output LF must serve as the receipt separator")
         XCTAssertFalse(DistillAppliedReceipt.strip(emitted).contains("[[rc:"), "lossless output needs no recovery handle")
         XCTAssertLessThan(out.count, raw.count, "the comparison must use UTF-8 bytes, including the receipt")
+    }
+
+    func test_compressWithReceiptKeyAndRootEmitsVerifiableV2BoundToExactPrefix() async throws {
+        // WHY: a marker is trustworthy only when it authenticates the exact bytes
+        // the provider sees under this root run and the current On-lifecycle key.
+        let raw = Data(String(repeating: "verbose output line\n", count: 40).utf8)
+        let encoded = try JSONEncoder().encode(DistillResponse(
+            requestID: UUID(),
+            output: "COMPRESSED\n",
+            inputCharacters: raw.count,
+            routeStage: .deterministic
+        ))
+        let key = Data(0..<32)
+        let rootRunID = "123e4567-e89b-12d3-a456-426614174000"
+        let cli = ManagedDistillCLI(
+            arguments: [],
+            stdin: raw,
+            state: .init(baseURL: "http://127.0.0.1:9", authToken: "t", receiptKey: key),
+            rootRunID: rootRunID
+        ) { _ in (encoded, 200) }
+
+        let (out, code) = await cli.run()
+        let parsed = try XCTUnwrap(DistillAppliedReceipt.parseTrailingV2Marker(in: out))
+        let prefix = out.prefix(parsed.markerByteRange.lowerBound)
+
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(prefix, Data("COMPRESSED\n".utf8))
+        XCTAssertTrue(DistillAppliedReceipt.verify(
+            parsed,
+            rootRunID: rootRunID,
+            payloadByteCount: prefix.count,
+            payloadSHA256: Data(SHA256.hash(data: prefix)),
+            key: key
+        ))
+    }
+
+    func test_compressWithoutReceiptKeyOrRootFailsOpenVerbatim() async throws {
+        // WHY: lossy output without receipt authority cannot be authenticated by
+        // the host, so legacy state must preserve the exact input instead.
+        let raw = Data(String(repeating: "verbose output line\n", count: 40).utf8)
+        let encoded = try JSONEncoder().encode(DistillResponse(
+            requestID: UUID(), output: "short", inputCharacters: raw.count,
+            routeStage: .deterministic
+        ))
+        let key = Data(repeating: 0x55, count: 32)
+        let withoutKey = ManagedDistillCLI(
+            arguments: [], stdin: raw,
+            state: .init(baseURL: "http://127.0.0.1:9", authToken: "t"),
+            rootRunID: "root"
+        ) { _ in (encoded, 200) }
+        let withoutRoot = ManagedDistillCLI(
+            arguments: [], stdin: raw,
+            state: .init(baseURL: "http://127.0.0.1:9", authToken: "t", receiptKey: key),
+            rootRunID: nil
+        ) { _ in (encoded, 200) }
+
+        for result in [await withoutKey.run(), await withoutRoot.run()] {
+            XCTAssertEqual(result.1, 0)
+            XCTAssertNil(DistillAppliedReceipt.parseTrailingV2Marker(in: result.0))
+            XCTAssertEqual(result.0, raw, "missing receipt authority must fail open to verbatim stdin")
+        }
     }
 
     func test_compressDerivesStableDistinctOperationIDsPerCanonicalRequest() async throws {

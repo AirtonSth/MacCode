@@ -690,11 +690,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
                 return "\(kind):\(sid)"
             }
         case "agent.item.delta":
-            if let item = payload?["item_id"] as? String {
-                return "\(kind):\(item)"
-            }
-            if let thread = payload?["thread_id"] as? String {
-                return "\(kind):\(thread)"
+            if let thread = payload?["thread_id"] as? String,
+               let item = payload?["item_id"] as? String {
+                return "\(kind):\(thread):\(item)"
             }
         default:
             break

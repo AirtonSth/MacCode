@@ -41,7 +41,7 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
         let stateURL = URL(fileURLWithPath: statePath).standardizedFileURL
         guard stateURL.lastPathComponent == "DistillCLIState.json",
               stateURL.deletingLastPathComponent().lastPathComponent == "Distill",
-              Self.isOwnedRegularFile(stateURL),
+              Self.isOwnedRegularFile(stateURL, requiresOwnerOnlyPermissions: true),
               let lease = Self.readLease(stateURL),
               lease.baseURL == state.baseURL,
               lease.authToken == state.authToken,
@@ -92,7 +92,7 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
 
     func isAdmitted() -> Bool {
         let now = Date()
-        guard Self.isOwnedRegularFile(stateURL),
+        guard Self.isOwnedRegularFile(stateURL, requiresOwnerOnlyPermissions: true),
               let lease = Self.readLease(stateURL),
               lease.authToken == expectedAuthToken,
               lease.pid == expectedPID,
@@ -159,13 +159,21 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
         return true
     }
 
-    private static func isOwnedRegularFile(_ url: URL) -> Bool {
+    private static func isOwnedRegularFile(
+        _ url: URL,
+        requiresOwnerOnlyPermissions: Bool = false
+    ) -> Bool {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               attributes[.type] as? FileAttributeType == .typeRegular,
               let owner = attributes[.ownerAccountID] as? NSNumber else {
             return false
         }
-        return owner.uint32Value == getuid()
+        guard owner.uint32Value == getuid() else { return false }
+        if requiresOwnerOnlyPermissions {
+            guard let permissions = attributes[.posixPermissions] as? NSNumber else { return false }
+            return permissions.uint16Value & 0o077 == 0
+        }
+        return true
     }
 
     private static func processIsAlive(_ pid: Int32) -> Bool {
@@ -465,6 +473,7 @@ struct RemoteCodeDistillServiceMain {
             arguments: arguments,
             stdin: stdin,
             state: loadedState?.state,
+            rootRunID: env["RC_TOKEN_SAVER_ROOT_RUN_ID"],
             provider: provider,
             recoveryContext: recoveryContext,
             maxOutputCharacters: maxChars,
@@ -623,6 +632,7 @@ struct RemoteCodeDistillServiceMain {
                 arguments: query.map { [$0] } ?? [],
                 stdin: captured,
                 state: loadedState?.state,
+                rootRunID: env["RC_TOKEN_SAVER_ROOT_RUN_ID"],
                 provider: provider,
                 recoveryContext: recoveryContext,
                 maxOutputCharacters: maxChars,
@@ -712,6 +722,9 @@ struct RemoteCodeDistillServiceMain {
                 request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 applyRecoveryHeaders(to: &request, environment: environment)
+                if distillRequest.precomputedOutput == nil {
+                    request.setValue("1", forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred")
+                }
                 mcpCodecLock.lock()
                 request.httpBody = try? mcpSortedEncoder.encode(distillRequest)
                 mcpCodecLock.unlock()
@@ -755,11 +768,19 @@ struct RemoteCodeDistillServiceMain {
                 }
                 return (obj["envelope"] as? String) ?? (obj["text"] as? String)
             },
-            scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment)
+            scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment),
+            rootRunID: environment["RC_TOKEN_SAVER_ROOT_RUN_ID"],
+            receiptKey: state?.receiptKey,
+            distillAdmission: { admission?.isAdmitted() == true }
         )
         while let line = readLine(strippingNewline: true) {
-            if let response = await server.handle(line) {
+            let result = await server.handleForDelivery(line)
+            if let response = result.response {
                 FileHandle.standardOutput.write(Data((response + "\n").utf8))
+                try? FileHandle.standardOutput.synchronize()
+                if let deferred = result.deferredSideEffect {
+                    await deferred()
+                }
             }
         }
     }
@@ -885,7 +906,11 @@ struct RemoteCodeDistillServiceMain {
                 continue
             }
             return LoadedCLIState(
-                state: ManagedDistillCLI.State(baseURL: baseURL, authToken: token),
+                state: ManagedDistillCLI.State(
+                    baseURL: baseURL,
+                    authToken: token,
+                    receiptKey: DistillAppliedReceipt.decodeReceiptKey(obj["receipt_key"] as? String)
+                ),
                 path: path
             )
         }

@@ -2,7 +2,7 @@ import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import * as claudeSDK from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { execFile, execFileSync } from 'node:child_process';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -67,8 +67,32 @@ const TOKEN_SAVER_STORE_MIN_BYTES = 2048;
 // Nested large Read/Grep + sidecar RTT; 1s caused silent fail-open / zero model-mode.
 const TOKEN_SAVER_HOOK_TIMEOUT_MS = 45000;
 
-function tokenSaverAppliedReceipt() {
-  return `[[rcd:v1.${randomBytes(16).toString('base64url')}]]`;
+function tokenSaverAppliedReceipt(prefix, state) {
+  const rootRunID = typeof current.env.RC_TOKEN_SAVER_ROOT_RUN_ID === 'string'
+    ? current.env.RC_TOKEN_SAVER_ROOT_RUN_ID.trim()
+    : '';
+  const key = Buffer.isBuffer(state?.receiptKey) ? state.receiptKey : null;
+  if (!rootRunID || !key || key.length !== 32) {
+    return null;
+  }
+  const payload = Buffer.from(prefix, 'utf8');
+  const nonce = randomBytes(16);
+  const fields = [
+    Buffer.from('io.remotecode.distill-applied-receipt', 'utf8'),
+    Buffer.from('v2', 'utf8'),
+    Buffer.from(rootRunID, 'utf8'),
+    Buffer.from(String(payload.length), 'utf8'),
+    createHash('sha256').update(payload).digest(),
+    nonce,
+  ];
+  const canonical = [];
+  for (const field of fields) {
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64BE(BigInt(field.length));
+    canonical.push(length, field);
+  }
+  const mac = createHmac('sha256', key).update(Buffer.concat(canonical)).digest();
+  return `[[rcd:v2.${nonce.toString('base64url')}.${mac.toString('base64url')}]]`;
 }
 // Edit echoes + Skill bodies stay full (verbatim edits / complete skills).
 // Read/Grep are compressed with reversible [[rc:handle]] so large exploration
@@ -364,9 +388,27 @@ function loadTokenSaverState() {
   const candidates = override ? [override] : [];
   for (const candidate of candidates) {
     try {
+      const stat = fs.statSync(candidate);
+      const currentUID = typeof process.getuid === 'function' ? process.getuid() : null;
+      if (typeof stat?.isFile !== 'function'
+          || !stat.isFile()
+          || currentUID === null
+          || stat.uid !== currentUID
+          || !Number.isInteger(stat.mode)
+          || (stat.mode & 0o077) !== 0) {
+        continue;
+      }
       const parsed = JSON.parse(fs.readFileSync(candidate, 'utf8'));
       if (parsed.base_url && parsed.auth_token) {
-        return { baseURL: String(parsed.base_url), authToken: String(parsed.auth_token) };
+        const receiptKeyText = typeof parsed.receipt_key === 'string' ? parsed.receipt_key : '';
+        const receiptKey = /^[A-Za-z0-9+/]{43}=$/.test(receiptKeyText)
+          ? Buffer.from(receiptKeyText, 'base64')
+          : null;
+        return {
+          baseURL: String(parsed.base_url),
+          authToken: String(parsed.auth_token),
+          receiptKey: receiptKey?.length === 32 ? receiptKey : null,
+        };
       }
     } catch (_) {
       // fail open
@@ -444,7 +486,10 @@ async function postTokenSaverDistill(state, body) {
     }
     // A distinct applied receipt drives the persisted Distilled badge. Command
     // syntax is not proof: an explicit pipe can fail open and return raw bytes.
-    const withReceipt = `${output}\n${tokenSaverAppliedReceipt()}`;
+    const receiptPrefix = `${output}\n`;
+    const receipt = tokenSaverAppliedReceipt(receiptPrefix, state);
+    if (!receipt) return null;
+    const withReceipt = `${receiptPrefix}${receipt}`;
     if (Buffer.byteLength(withReceipt, 'utf8') >= Buffer.byteLength(input, 'utf8')) return null;
     const capability = handle;
     const idempotencyKey = (typeof decoded.recoveryIdempotencyKey === 'string'
@@ -523,13 +568,15 @@ async function tokenSaverPostToolUse(input) {
   };
   // The bridge is long-lived, so the best-effort ledger write can run after the
   // replacement has cleared every gate without delaying Claude's hook response.
-  void bestEffortRecordTokenSaverSavings(
-    state,
-    candidate,
-    output,
-    compressed.routeStage,
-    compressed.recoveryConfirmations
-  );
+  setImmediate(() => {
+    void bestEffortRecordTokenSaverSavings(
+      state,
+      candidate,
+      output,
+      compressed.routeStage,
+      compressed.recoveryConfirmations
+    );
+  });
   return hookOutput;
 }
 

@@ -1190,6 +1190,14 @@ public final class AppContext {
                     runId: runId,
                     finalize: false
                 )
+            case .itemHostMetadata(let turnId, let itemId, let distillApplied):
+                var p: [String: JSONValue] = [
+                    "thread_id": .string(t),
+                    "turn_id": .string(turnId),
+                    "item_id": .string(itemId),
+                ]
+                if let distillApplied { p["distill_applied"] = .bool(distillApplied) }
+                EventBus.shared.publish(kind: "agent.item.delta", payload: .object(p))
             case .itemState(let itemId, let state):
                 if state != .streaming {
                     EventBus.shared.publish(kind: "agent.item.completed",

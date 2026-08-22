@@ -106,7 +106,7 @@ final class WebSocketEventBatcherAdmissionTests: XCTestCase {
     func test_keyedReplacement_doesNotConsumeExtraCountSlot() {
         let lock = NSLock()
         var overflowCount = 0
-        // cellularSafe coalesces agent.item.delta by item_id (concat merge).
+        // cellularSafe coalesces agent.item.delta by thread_id + item_id.
         let batcher = WebSocketEventBatcher(
             enabled: true,
             filter: .cellularSafe(),
@@ -164,6 +164,7 @@ final class WebSocketEventBatcherAdmissionTests: XCTestCase {
             "sequence": sequence,
             "kind": "agent.item.delta",
             "payload": [
+                "thread_id": "thread-count-delta",
                 "item_id": itemId,
                 "text": text,
             ],
@@ -173,6 +174,7 @@ final class WebSocketEventBatcherAdmissionTests: XCTestCase {
             seq: sequence,
             kind: "agent.item.delta",
             payload: .object([
+                "thread_id": .string("thread-count-delta"),
                 "item_id": .string(itemId),
                 "text": .string(text),
             ]),

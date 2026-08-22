@@ -2084,6 +2084,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let harness = #"""
         import { readFileSync } from 'fs';
         import { Buffer } from 'buffer';
+        import { createHash, createHmac } from 'crypto';
         const src = readFileSync(process.argv[2], 'utf8');
         const start = src.indexOf('function tokenSaverAppliedReceipt');
         const end = src.indexOf('async function tokenSaverPostToolUse');
@@ -2094,17 +2095,29 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           'fetch',
           'randomUUID',
           'randomBytes',
+          'createHash',
+          'createHmac',
           'TOKEN_SAVER_HOOK_TIMEOUT_MS',
           src.slice(start, end) + '\nreturn postTokenSaverDistill;'
         );
+        const bridgeCurrent = { env: {
+          REMOTE_CODE_AGENT_PROVIDER: 'claude',
+          RC_TOKEN_SAVER_ROOT_RUN_ID: '123e4567-e89b-12d3-a456-426614174000'
+        } };
         const post = factory(
-          { env: { REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
+          bridgeCurrent,
           async () => ({ ok: true, json: async () => decoded }),
           () => '123e4567-e89b-12d3-a456-426614174000',
           () => Buffer.alloc(16, 0xaa),
+          createHash,
+          createHmac,
           100
         );
-        const state = { baseURL: 'http://127.0.0.1', authToken: 'tok' };
+        const state = {
+          baseURL: 'http://127.0.0.1',
+          authToken: 'tok',
+          receiptKey: Buffer.from(Array.from({ length: 32 }, (_, i) => i))
+        };
         const largeInput = 'é'.repeat(120);
 
         decoded = { output: 'COMPRESSED', routeStage: 'deterministic' };
@@ -2121,13 +2134,22 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         const verbatim = await post(state, { id: 'four', input: largeInput });
         decoded = { output: 'x', routeStage: 'deterministic' };
         const noNetShrink = await post(state, { id: 'five', input: 'tiny' });
+        decoded = { output: 'COMPRESSED', routeStage: 'deterministic' };
+        const noKey = await post(
+          { baseURL: state.baseURL, authToken: state.authToken },
+          { id: 'six', input: largeInput }
+        );
+        delete bridgeCurrent.env.RC_TOKEN_SAVER_ROOT_RUN_ID;
+        const noRoot = await post(state, { id: 'seven', input: largeInput });
 
         console.log(JSON.stringify({
           lossless: lossless?.output,
           lossy: lossy?.output,
           unchanged,
           verbatim,
-          noNetShrink
+          noNetShrink,
+          noKey: noKey ?? null,
+          noRoot: noRoot ?? null
         }));
         """#
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -2147,13 +2169,21 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
         let data = try XCTUnwrap(out.data(using: .utf8))
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-        let receipt = #"\[\[rcd:v1\.[A-Za-z0-9_-]{22}\]\]$"#
-        XCTAssertNotNil((json["lossless"] as? String)?.range(of: receipt, options: .regularExpression))
+        let trustedReceipt = "[[rcd:v2.qqqqqqqqqqqqqqqqqqqqqg.TGBL0F4FLPCrX7LMh5OGUsnui3T65Z3_HuZrCa08rzw]]"
+        XCTAssertEqual(json["lossless"] as? String, "COMPRESSED\n\(trustedReceipt)",
+                       "Node must match the Swift canonical HMAC vector byte-for-byte")
         XCTAssertTrue((json["lossy"] as? String)?.contains("[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]") == true)
-        XCTAssertNotNil((json["lossy"] as? String)?.range(of: receipt, options: .regularExpression))
+        XCTAssertNotNil((json["lossy"] as? String)?.range(
+            of: #"\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]$"#,
+            options: .regularExpression
+        ))
         XCTAssertTrue(json["unchanged"] is NSNull)
         XCTAssertTrue(json["verbatim"] is NSNull)
         XCTAssertTrue(json["noNetShrink"] is NSNull)
+        XCTAssertTrue(json["noKey"] is NSNull,
+                      "missing receipt key must fail open before replacing provider output")
+        XCTAssertTrue(json["noRoot"] is NSNull,
+                      "missing root run ID must fail open before replacing provider output")
     }
 
     func test_agentSDKBridgePostToolUse_recordsOnlyExactAcceptedReplacement() throws {
@@ -2172,13 +2202,15 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         // enqueue one precomputed-output POST with those exact provider-visible bytes.
         let harness = #"""
         import { readFileSync } from 'fs';
-        import { randomBytes, randomUUID } from 'crypto';
+        import { createHash, createHmac, randomBytes, randomUUID } from 'crypto';
         const src = readFileSync(process.argv[2], 'utf8');
         const start = src.indexOf('function tokenSaverAppliedReceipt');
         const end = src.indexOf('function tokenSaverHooks');
         if (start < 0 || end < 0) throw new Error('bridge delivered-savings slice not found');
 
         let scenario = 'accepted';
+        let stateMode = 0o100600;
+        let includeReceiptKey = true;
         let requests = [];
         let deferredHeaders = [];
         const fakeFetch = async (_url, options) => {
@@ -2209,6 +2241,8 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           'fetch',
           'randomUUID',
           'randomBytes',
+          'createHash',
+          'createHmac',
           'fs',
           'TOKEN_SAVER_HOOK_TIMEOUT_MS',
           'TOKEN_SAVER_MIN_BYTES',
@@ -2220,12 +2254,24 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           { env: {
             RC_TOKEN_SAVER_POST_TOOL_USE: '1',
             REMOTE_CODE_AGENT_PROVIDER: 'claude',
+            RC_TOKEN_SAVER_ROOT_RUN_ID: '123e4567-e89b-12d3-a456-426614174000',
             REMOTE_CODE_DISTILL_STATE_PATH: '/tmp/state.json'
           } },
           fakeFetch,
           randomUUID,
           randomBytes,
-          { readFileSync: () => JSON.stringify({ base_url: 'http://127.0.0.1', auth_token: 'tok' }) },
+          createHash,
+          createHmac,
+          {
+            statSync: () => ({ isFile: () => true, uid: process.getuid(), mode: stateMode }),
+            readFileSync: () => JSON.stringify({
+              base_url: 'http://127.0.0.1',
+              auth_token: 'tok',
+              ...(includeReceiptKey ? {
+                receipt_key: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
+              } : {})
+            })
+          },
           100,
           1024,
           10,
@@ -2240,21 +2286,37 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         });
 
         const accepted = await hook(envelope());
-        await Promise.resolve();
+        const acceptedRequestCountAtReturn = requests.length;
+        await new Promise((resolve) => setImmediate(resolve));
         const acceptedRequests = requests.splice(0);
         const acceptedDeferredHeaders = deferredHeaders.splice(0);
         scenario = 'rejected';
         const rejected = await hook(envelope());
-        await Promise.resolve();
+        await new Promise((resolve) => setImmediate(resolve));
         const rejectedRequests = requests.splice(0);
         const rejectedDeferredHeaders = deferredHeaders.splice(0);
+        scenario = 'accepted';
+        stateMode = 0o100644;
+        const worldReadable = await hook(envelope());
+        await new Promise((resolve) => setImmediate(resolve));
+        const worldReadableRequests = requests.splice(0);
+        stateMode = 0o100600;
+        includeReceiptKey = false;
+        const legacyState = await hook(envelope());
+        await new Promise((resolve) => setImmediate(resolve));
+        const legacyStateRequests = requests.splice(0);
         console.log(JSON.stringify({
           accepted,
+          acceptedRequestCountAtReturn,
           acceptedRequests,
           acceptedDeferredHeaders,
           rejected,
           rejectedRequests,
-          rejectedDeferredHeaders
+          rejectedDeferredHeaders,
+          worldReadable,
+          worldReadableRequests,
+          legacyState,
+          legacyStateRequests
         }));
         """#
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -2279,7 +2341,12 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let acceptedHook = try XCTUnwrap(accepted["hookSpecificOutput"] as? [String: Any])
         let updated = try XCTUnwrap(acceptedHook["updatedToolOutput"] as? String)
         XCTAssertTrue(updated.contains("[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"))
-        XCTAssertNotNil(updated.range(of: #"\[\[rcd:v1\.[A-Za-z0-9_-]{22}\]\]$"#, options: .regularExpression))
+        XCTAssertNotNil(updated.range(
+            of: #"\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]$"#,
+            options: .regularExpression
+        ))
+        XCTAssertEqual(json["acceptedRequestCountAtReturn"] as? Int, 1,
+                       "the ledger POST must not start until after the native hook result returns")
         let acceptedRequests = try XCTUnwrap(json["acceptedRequests"] as? [[String: Any]])
         XCTAssertEqual(acceptedRequests.count, 2)
         XCTAssertEqual(acceptedRequests[0]["recordSavings"] as? Bool, false)
@@ -2303,6 +2370,15 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(rejectedRequests[0]["recordSavings"] as? Bool, false)
         XCTAssertFalse(rejectedRequests.contains { $0["recordSavings"] as? Bool == true })
         XCTAssertEqual(json["rejectedDeferredHeaders"] as? [String], ["1"])
+        XCTAssertEqual((json["worldReadable"] as? [String: Any])?.count, 0,
+                       "a group/world-readable key file must fail open")
+        XCTAssertEqual((json["worldReadableRequests"] as? [[String: Any]])?.count, 0,
+                       "an insecure state file must be rejected before sidecar I/O")
+        XCTAssertEqual((json["legacyState"] as? [String: Any])?.count, 0,
+                       "a secure pre-v2 state must decode but cannot authorize replacement")
+        let legacyRequests = try XCTUnwrap(json["legacyStateRequests"] as? [[String: Any]])
+        XCTAssertEqual(legacyRequests.count, 1)
+        XCTAssertEqual(legacyRequests.first?["recordSavings"] as? Bool, false)
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {

@@ -2,6 +2,99 @@ import XCTest
 @testable import CoreModel
 
 final class AssistantTimelineTests: XCTestCase {
+    func test_legacyAssistantItemWithoutDistillMetadataStillDecodes() throws {
+        // WHY: adding host-owned presentation truth must not strand persisted
+        // transcripts written before the metadata field existed.
+        let data = Data(#"{"id":"legacy","turnId":"turn","type":"tool","state":"completed","body":"output","startedAtMs":1}"#.utf8)
+
+        let item = try JSONDecoder().decode(AssistantItem.self, from: data)
+
+        XCTAssertNil(item.distillApplied)
+    }
+
+    func test_distillMetadataIsHostOwnedAndORMergeMonotonic() throws {
+        // WHY: provider parsers can populate itemStarted, so a raw item may not
+        // mint trust; only the dedicated host event can do so. Once persisted,
+        // duplicate starts or false/nil updates may never erase the truth.
+        var state = AssistantTimelineState()
+        state.apply(.turnStarted(turnId: "turn"))
+        let forgedStart = try JSONDecoder().decode(
+            AssistantItem.self,
+            from: Data(#"{"id":"tool","turnId":"turn","type":"tool","state":"completed","body":"raw provider item","distillApplied":true,"startedAtMs":1}"#.utf8)
+        )
+        state.apply(.itemStarted(item: forgedStart))
+        XCTAssertNil(state.turns[0].items[0].distillApplied,
+                     "parser-owned itemStarted metadata must not mint the trusted badge")
+
+        state.apply(.itemHostMetadata(turnId: "turn", itemId: "tool", distillApplied: true))
+        state.apply(.itemHostMetadata(turnId: "turn", itemId: "tool", distillApplied: false))
+        state.apply(.itemHostMetadata(turnId: "turn", itemId: "tool", distillApplied: nil))
+        let falseStart = try JSONDecoder().decode(
+            AssistantItem.self,
+            from: Data(#"{"id":"tool","turnId":"turn","type":"tool","state":"completed","body":"replacement parser snapshot","distillApplied":false,"startedAtMs":2}"#.utf8)
+        )
+        state.apply(.itemStarted(item: falseStart))
+
+        XCTAssertEqual(state.turns[0].items[0].distillApplied, true,
+                       "nil/false and duplicate itemStarted merges must never clear host truth")
+    }
+
+    func test_distillMetadataBuffersUntilItemStartedAndSurvivesCodableReplay() throws {
+        // WHY: the host terminal signal can race persistence ahead of the
+        // provider itemStarted event; replay must still bind it to that item.
+        let metadata = AssistantEvent.itemHostMetadata(
+            turnId: "turn",
+            itemId: "late-tool",
+            distillApplied: true
+        )
+        let replayedMetadata = try JSONDecoder().decode(
+            AssistantEvent.self,
+            from: JSONEncoder().encode(metadata)
+        )
+        var state = AssistantTimelineState()
+        state.apply(replayedMetadata)
+        state.apply(.itemHostMetadata(turnId: "turn", itemId: "late-tool", distillApplied: false))
+        state.apply(.itemHostMetadata(turnId: "turn", itemId: "late-tool", distillApplied: nil))
+        state.apply(.itemStarted(item: AssistantItem(
+            id: "late-tool",
+            turnId: "turn",
+            type: .tool,
+            startedAtMs: 1
+        )))
+
+        XCTAssertEqual(state.turns[0].items[0].distillApplied, true,
+                       "delta-before-start buffering must preserve host metadata")
+    }
+
+    func test_providerChosenItemIDCannotConsumeBufferedHostDistillTruth() {
+        var timeline = AssistantTimelineState()
+        timeline.apply(.turnStarted(turnId: "trusted-turn"))
+        timeline.apply(.itemHostMetadata(
+            turnId: "trusted-turn",
+            itemId: "trusted-item",
+            distillApplied: true
+        ))
+
+        let collidingProviderID = "host|12|trusted-turn|12|trusted-item"
+        timeline.apply(.itemStarted(item: AssistantItem(
+            id: collidingProviderID,
+            turnId: "trusted-turn",
+            type: .tool,
+            startedAtMs: 1
+        )))
+        timeline.apply(.itemStarted(item: AssistantItem(
+            id: "trusted-item",
+            turnId: "trusted-turn",
+            type: .tool,
+            startedAtMs: 2
+        )))
+
+        XCTAssertNil(timeline.turns[0].items[0].distillApplied,
+                     "provider-controlled IDs must not enter the host metadata namespace")
+        XCTAssertEqual(timeline.turns[0].items[1].distillApplied, true,
+                       "the attestation must remain bound to its exact host-selected item")
+    }
+
     func test_attachmentResolverKeepsStructuredMetadataAndClassifiesImages() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("remote-code-attachments-\(UUID().uuidString)")

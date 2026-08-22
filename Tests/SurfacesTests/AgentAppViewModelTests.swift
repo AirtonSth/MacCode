@@ -4966,6 +4966,42 @@ final class AgentAppViewModelTests: XCTestCase {
                        "when persisted history is thinner, the provider snapshot fills it in")
     }
 
+    func test_chooseReplayCarriesHostDistillTruthByTurnAndItemOccurrence() {
+        // WHY: provider item IDs may repeat across turns and adapter snapshots
+        // can use different turn IDs. When the richer snapshot replaces local
+        // replay, matching globally by itemId badges the wrong occurrence.
+        let persisted: [AssistantEvent] = [
+            .turnStarted(turnId: "persisted-first"),
+            .itemStarted(item: AssistantItem(id: "shared", turnId: "persisted-first", type: .tool, startedAtMs: 1)),
+            .turnStarted(turnId: "persisted-second"),
+            .itemStarted(item: AssistantItem(id: "shared", turnId: "persisted-second", type: .tool, startedAtMs: 2)),
+            .itemHostMetadata(turnId: "persisted-second", itemId: "shared", distillApplied: true)
+        ]
+        let snapshot: [AssistantEvent] = [
+            .turnStarted(turnId: "snapshot-first"),
+            .itemStarted(item: AssistantItem(id: "extra-first", turnId: "snapshot-first", type: .tool, startedAtMs: 0)),
+            .itemStarted(item: AssistantItem(id: "shared", turnId: "snapshot-first", type: .tool, startedAtMs: 1)),
+            .turnStarted(turnId: "snapshot-second"),
+            .itemStarted(item: AssistantItem(id: "extra-second", turnId: "snapshot-second", type: .tool, startedAtMs: 1)),
+            .itemStarted(item: AssistantItem(id: "shared", turnId: "snapshot-second", type: .tool, startedAtMs: 2)),
+            .turnStarted(turnId: "snapshot-extra"),
+            .itemStarted(item: AssistantItem(id: "extra", turnId: "snapshot-extra", type: .tool, startedAtMs: 3))
+        ]
+
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: snapshot)
+        let timeline = AgentAppViewModel.timelineByReplaying(chosen)
+
+        XCTAssertNil(timeline.turns[0].items[0].distillApplied,
+                     "an extra snapshot item before the match must remain unbadged")
+        XCTAssertNil(timeline.turns[0].items[1].distillApplied,
+                     "the same itemId in the first turn occurrence must remain unbadged")
+        XCTAssertNil(timeline.turns[1].items[0].distillApplied,
+                     "an inserted item must not inherit truth by absolute item index")
+        XCTAssertEqual(timeline.turns[1].items[1].distillApplied, true,
+                       "host truth must follow the matching id/type occurrence inside the paired turn")
+        XCTAssertNil(timeline.turns[2].items[0].distillApplied)
+    }
+
     func test_chooseReplayFallsBackToPersistedWhenNoSnapshot() {
         let persisted = startedItems(5)
         XCTAssertEqual(AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: nil).count, 5)

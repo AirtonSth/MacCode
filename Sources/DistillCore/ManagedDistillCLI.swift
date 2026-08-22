@@ -74,15 +74,18 @@ public struct ManagedDistillCLI: Sendable {
     public struct State: Sendable, Equatable {
         public let baseURL: String
         public let authToken: String
-        public init(baseURL: String, authToken: String) {
+        public let receiptKey: Data?
+        public init(baseURL: String, authToken: String, receiptKey: Data? = nil) {
             self.baseURL = baseURL
             self.authToken = authToken
+            self.receiptKey = receiptKey
         }
     }
 
     public let arguments: [String]
     public let stdin: Data
     public let state: State?
+    public let rootRunID: String?
     public let provider: String?
     public let recoveryContext: TokenSaverRecoveryRequestContext?
     /// Unique logical invocation identity. Reusing one CLI value for a transport
@@ -99,6 +102,7 @@ public struct ManagedDistillCLI: Sendable {
         arguments: [String],
         stdin: Data,
         state: State?,
+        rootRunID: String? = nil,
         provider: String? = nil,
         recoveryContext: TokenSaverRecoveryRequestContext? = nil,
         invocationID: String = UUID().uuidString.lowercased(),
@@ -110,6 +114,8 @@ public struct ManagedDistillCLI: Sendable {
         self.arguments = arguments
         self.stdin = stdin
         self.state = state
+        let trimmedRootRunID = rootRunID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.rootRunID = trimmedRootRunID?.isEmpty == false ? trimmedRootRunID : nil
         // Prefer explicit provider, then recovery-scope provider, so savings land
         // on claude/codex/grok instead of "unknown" when only headers are set.
         let recoveryProvider = recoveryContext?.provider
@@ -380,6 +386,7 @@ public struct ManagedDistillCLI: Sendable {
             arguments: [question],
             stdin: Data(rawOutput.utf8),
             state: state,
+            rootRunID: rootRunID,
             provider: provider ?? "claude",
             recoveryContext: recoveryContext,
             invocationID: invocationID,
@@ -535,10 +542,24 @@ public struct ManagedDistillCLI: Sendable {
     /// Appends the host receipt at the final emission boundary. Recovery markers are
     /// already part of `transformed`, so the byte comparison includes every protocol
     /// line the provider will see. Returning nil means exact fail-open to `original`.
-    private static func receiptedCompression(original: Data, transformed: String) -> Data? {
+    private static func receiptedCompression(
+        original: Data,
+        transformed: String,
+        rootRunID: String?,
+        receiptKey: Data?
+    ) -> Data? {
         guard Data(transformed.utf8) != original else { return nil }
         let separator = transformed.hasSuffix("\n") ? "" : "\n"
-        let emitted = Data((transformed + separator + DistillAppliedReceipt.makeMarker() + "\n").utf8)
+        let prefix = Data((transformed + separator).utf8)
+        guard let rootRunID, let receiptKey,
+              let marker = DistillAppliedReceipt.makeV2Marker(
+                  rootRunID: rootRunID,
+                  payload: prefix,
+                  key: receiptKey
+              ) else {
+            return nil
+        }
+        let emitted = prefix + Data((marker + "\n").utf8)
         guard emitted.count < original.count else { return nil }
         return emitted
     }
@@ -562,7 +583,9 @@ public struct ManagedDistillCLI: Sendable {
             guard distillAdmission() else { return failOpen() }
             guard let compressed = Self.receiptedCompression(
                 original: stdin,
-                transformed: pre.output
+                transformed: pre.output,
+                rootRunID: rootRunID,
+                receiptKey: state?.receiptKey
             ) else {
                 return failOpen()
             }
@@ -630,7 +653,12 @@ public struct ManagedDistillCLI: Sendable {
         if let handle = response.originalHandle, !handle.isEmpty {
             out += "\n[[rc:\(handle)]]"
         }
-        guard let emitted = Self.receiptedCompression(original: stdin, transformed: out) else {
+        guard let emitted = Self.receiptedCompression(
+            original: stdin,
+            transformed: out,
+            rootRunID: rootRunID,
+            receiptKey: state.receiptKey
+        ) else {
             return failOpen()
         }
         let delivered = String(decoding: emitted, as: UTF8.self)
@@ -798,7 +826,9 @@ public struct ManagedDistillCLI: Sendable {
         }
         guard let output = Self.receiptedCompression(
             original: stdin,
-            transformed: emitted.joined(separator: "\n\n")
+            transformed: emitted.joined(separator: "\n\n"),
+            rootRunID: rootRunID,
+            receiptKey: state.receiptKey
         ) else {
             return failOpen()
         }

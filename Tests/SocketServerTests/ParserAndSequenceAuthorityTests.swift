@@ -442,9 +442,9 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         let s2 = try eventJSON(seq: 3, kind: "surface.output.summary",
                                payload: ["surface_id": "s1", "v": 2])
         let d1 = try eventJSON(seq: 4, kind: "agent.item.delta",
-                               payload: ["item_id": "i1", "text": "Hel"])
+                               payload: ["thread_id": "t", "item_id": "i1", "text": "Hel"])
         let d2 = try eventJSON(seq: 5, kind: "agent.item.delta",
-                               payload: ["item_id": "i1", "text": "lo"])
+                               payload: ["thread_id": "t", "item_id": "i1", "text": "lo"])
 
         let coalesced = WebSocketOutboundQueue.coalesceApplicationFrames(
             [s1, critical, s2, d1, d2]
@@ -469,6 +469,71 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         let text = payload?["text"] as? String
         XCTAssertEqual(text, "Hello",
                        "delta coalesce must concatenate append fields, not last-write-wins")
+    }
+
+    func test_coalesceApplicationFrames_agentDeltaUsesThreadItemTupleAndMonotonicReceipt() throws {
+        // WHY: provider item IDs can repeat across threads, while a trusted
+        // distill_applied bit must survive later nil/false append frames.
+        let trustedA = try eventJSON(
+            seq: 1,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-a",
+                "item_id": "shared",
+                "text": "A",
+                "distill_applied": true,
+            ]
+        )
+        let threadB = try eventJSON(
+            seq: 2,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-b",
+                "item_id": "shared",
+                "text": "X",
+                "distill_applied": false,
+            ]
+        )
+        let laterA = try eventJSON(
+            seq: 3,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-a",
+                "item_id": "shared",
+                "text": "B",
+                "distill_applied": false,
+            ]
+        )
+        let legacyWithoutThread = try eventJSON(
+            seq: 4,
+            kind: "agent.item.delta",
+            payload: ["item_id": "shared", "text": "legacy"]
+        )
+
+        let frames = WebSocketOutboundQueue.coalesceApplicationFrames([
+            trustedA,
+            threadB,
+            laterA,
+            legacyWithoutThread,
+        ])
+
+        XCTAssertEqual(frames.count, 3,
+                       "only deltas sharing both thread_id and item_id may coalesce")
+        let payloads = try frames.map { frame -> [String: Any] in
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: frame) as? [String: Any]
+            )
+            return try XCTUnwrap(object["payload"] as? [String: Any])
+        }
+        XCTAssertEqual(payloads[0]["thread_id"] as? String, "thread-a")
+        XCTAssertEqual(payloads[0]["text"] as? String, "AB")
+        XCTAssertEqual(payloads[0]["distill_applied"] as? Bool, true,
+                       "false from a later delta must not erase trusted true")
+        XCTAssertEqual(payloads[1]["thread_id"] as? String, "thread-b")
+        XCTAssertEqual(payloads[1]["text"] as? String, "X")
+        XCTAssertNil(payloads[2]["thread_id"],
+                     "legacy frames without thread identity stay independently deliverable")
+        XCTAssertEqual(payloads[2]["text"] as? String, "legacy")
     }
 
     func test_degradePreservesControlFramesWhileSheddingBulk() throws {

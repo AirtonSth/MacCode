@@ -445,6 +445,7 @@ public enum TokenSaverDistillStatusFormatter {
 private struct TokenSaverDistillCLIState: Codable {
     let baseURL: String
     let authToken: String
+    let receiptKey: String
     let pid: Int32
     let runtime: String
     let modelID: String
@@ -452,6 +453,7 @@ private struct TokenSaverDistillCLIState: Codable {
     enum CodingKeys: String, CodingKey {
         case baseURL = "base_url"
         case authToken = "auth_token"
+        case receiptKey = "receipt_key"
         case pid
         case runtime
         case modelID = "model_id"
@@ -552,6 +554,7 @@ public final class TokenSaverDistillServiceController {
         }
     }
     public private(set) var bearerToken: String?
+    private var receiptKey: Data?
 
     private let appSupportDirectory: URL
     private let executableURLResolver: ExecutableURLResolver
@@ -751,6 +754,7 @@ public final class TokenSaverDistillServiceController {
         process = nil
         processOwnershipTag = nil
         bearerToken = nil
+        receiptKey = nil
         // Reset from EVERY state (.starting/.failed/.running) so a stuck status
         // never survives a stop()/eligibility change.
         let decision = TokenSaverDistillSupervisor.decide(
@@ -862,6 +866,9 @@ public final class TokenSaverDistillServiceController {
         // A start request wants the sidecar running; the off-main sweep below can
         // overlap with stop()/termination, so its completion re-checks this latch.
         shouldRun = true
+        if receiptKey == nil {
+            receiptKey = DistillAppliedReceipt.generateReceiptKey()
+        }
         if let process, process.isRunning {
             return
         }
@@ -1064,10 +1071,15 @@ public final class TokenSaverDistillServiceController {
     }
 
     private func writeCLIState(ready: DistillServiceReadyEvent) {
-        guard let bearerToken else { return }
+        guard let bearerToken,
+              let receiptKey,
+              let encodedReceiptKey = DistillAppliedReceipt.encodeReceiptKey(receiptKey) else {
+            return
+        }
         let state = TokenSaverDistillCLIState(
             baseURL: ready.baseURL,
             authToken: bearerToken,
+            receiptKey: encodedReceiptKey,
             pid: ready.pid,
             runtime: ready.runtime,
             modelID: ready.modelID

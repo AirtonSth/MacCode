@@ -21,6 +21,7 @@ public enum DistillMCPAdmit: Sendable {
         "RC_TOKEN_SAVER_THREAD_ID",
         "REMOTE_CODE_AGENT_PROVIDER",
         "RC_TOKEN_SAVER_ATTEMPT_ID",
+        "RC_TOKEN_SAVER_ROOT_RUN_ID",
     ]
 
     /// Librarian tool names served by the `mcp` subcommand. Must mirror

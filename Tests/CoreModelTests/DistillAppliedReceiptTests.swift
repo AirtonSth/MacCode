@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import CoreModel
@@ -65,5 +66,89 @@ final class DistillAppliedReceiptTests: XCTestCase {
             XCTAssertFalse(DistillAppliedReceipt.containsMarker(text), text)
             XCTAssertEqual(DistillAppliedReceipt.strip(text), text, text)
         }
+    }
+
+    func test_v2DeterministicVectorBindsExactPrefixRootNonceAndKey() throws {
+        // WHY: Swift and the Claude Node bridge must sign identical bytes or a
+        // valid provider receipt will be rejected by the host as untrusted.
+        let prefix = Data("COMPRESSED\n".utf8)
+        let key = Data(0..<32)
+        let nonce = Data(repeating: 0xaa, count: 16)
+        let rootRunID = "123e4567-e89b-12d3-a456-426614174000"
+        let digest = Data(SHA256.hash(data: prefix))
+        let expected = "[[rcd:v2.qqqqqqqqqqqqqqqqqqqqqg.TGBL0F4FLPCrX7LMh5OGUsnui3T65Z3_HuZrCa08rzw]]"
+
+        let marker = try XCTUnwrap(DistillAppliedReceipt.makeV2Marker(
+            rootRunID: rootRunID,
+            payloadByteCount: prefix.count,
+            payloadSHA256: digest,
+            key: key,
+            nonce: nonce
+        ))
+
+        XCTAssertEqual(marker, expected)
+        let framed = prefix + Data((marker + "\n").utf8)
+        let parsed = try XCTUnwrap(DistillAppliedReceipt.parseTrailingV2Marker(in: framed))
+        XCTAssertEqual(parsed.nonce, nonce)
+        XCTAssertEqual(parsed.markerByteRange, prefix.count..<(prefix.count + marker.utf8.count))
+        XCTAssertEqual(parsed.markerByteCount, marker.utf8.count)
+        XCTAssertEqual(parsed.terminalSuffixByteCount, 1)
+        XCTAssertEqual(DistillAppliedReceipt.maximumV2MarkerByteCount, marker.utf8.count)
+        XCTAssertTrue(DistillAppliedReceipt.verify(
+            parsed,
+            rootRunID: rootRunID,
+            payloadByteCount: prefix.count,
+            payloadSHA256: digest,
+            key: key
+        ))
+    }
+
+    func test_v2ParserIsByteSafeWhenTailStartsInsideUTF8AndRejectsNonTerminalMarker() throws {
+        // WHY: the coordinator retains only a bounded byte tail. Its first byte
+        // may be a UTF-8 continuation byte, so receipt parsing cannot decode the
+        // entire tail as a String before finding the ASCII terminal marker.
+        let prefix = Data([0x80, 0x81, 0x0a])
+        let key = Data(repeating: 0x11, count: 32)
+        let nonce = Data(repeating: 0x22, count: 16)
+        let digest = Data(SHA256.hash(data: prefix))
+        let marker = try XCTUnwrap(DistillAppliedReceipt.makeV2Marker(
+            rootRunID: "root",
+            payloadByteCount: prefix.count,
+            payloadSHA256: digest,
+            key: key,
+            nonce: nonce
+        ))
+        let tail = prefix + Data((marker + "\r\n").utf8)
+
+        let parsed = try XCTUnwrap(DistillAppliedReceipt.parseTrailingV2Marker(in: tail))
+        XCTAssertEqual(parsed.markerByteRange.lowerBound, prefix.count)
+        XCTAssertEqual(parsed.terminalSuffixByteCount, 2)
+        XCTAssertNil(DistillAppliedReceipt.parseTrailingV2Marker(in: tail + Data("after".utf8)))
+    }
+
+    func test_v2VerificationRejectsEveryBoundFieldAndMalformedLengths() throws {
+        // WHY: a random syntax token is forgeable. Trust requires the MAC to bind
+        // the exact bytes, run identity, nonce, and the current On-lifecycle key.
+        let prefix = Data("result\n".utf8)
+        let digest = Data(SHA256.hash(data: prefix))
+        let key = Data(repeating: 0x33, count: 32)
+        let nonce = Data(repeating: 0x44, count: 16)
+        let marker = try XCTUnwrap(DistillAppliedReceipt.makeV2Marker(
+            rootRunID: "root-a",
+            payloadByteCount: prefix.count,
+            payloadSHA256: digest,
+            key: key,
+            nonce: nonce
+        ))
+        let parsed = try XCTUnwrap(DistillAppliedReceipt.parseTrailingV2Marker(
+            in: prefix + Data(marker.utf8)
+        ))
+
+        XCTAssertFalse(DistillAppliedReceipt.verify(parsed, rootRunID: "root-b", payloadByteCount: prefix.count, payloadSHA256: digest, key: key))
+        XCTAssertFalse(DistillAppliedReceipt.verify(parsed, rootRunID: "root-a", payloadByteCount: prefix.count + 1, payloadSHA256: digest, key: key))
+        XCTAssertFalse(DistillAppliedReceipt.verify(parsed, rootRunID: "root-a", payloadByteCount: prefix.count, payloadSHA256: Data(repeating: 0, count: 32), key: key))
+        XCTAssertFalse(DistillAppliedReceipt.verify(parsed, rootRunID: "root-a", payloadByteCount: prefix.count, payloadSHA256: digest, key: Data(repeating: 0x34, count: 32)))
+        XCTAssertNil(DistillAppliedReceipt.makeV2Marker(rootRunID: "root-a", payloadByteCount: prefix.count, payloadSHA256: Data(), key: key, nonce: nonce))
+        XCTAssertNil(DistillAppliedReceipt.makeV2Marker(rootRunID: "root-a", payloadByteCount: prefix.count, payloadSHA256: digest, key: key, nonce: Data()))
     }
 }

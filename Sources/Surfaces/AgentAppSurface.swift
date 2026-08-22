@@ -2557,7 +2557,54 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// history) still fall back to the snapshot.
     nonisolated static func chooseReplayEvents(persisted: [AssistantEvent], snapshot: [AssistantEvent]?) -> [AssistantEvent] {
         guard let snapshot else { return persisted }
-        return renderableItemCount(persisted) > renderableItemCount(snapshot) ? persisted : snapshot
+        guard renderableItemCount(persisted) <= renderableItemCount(snapshot) else { return persisted }
+        return snapshotPreservingPersistedHostMetadata(snapshot, persisted: persisted)
+    }
+
+    /// Provider snapshots can be richer than local replay, but cannot recreate
+    /// host-owned attestations. Carry those by structural occurrence so reused
+    /// provider item IDs never badge a different turn.
+    nonisolated private static func snapshotPreservingPersistedHostMetadata(
+        _ snapshot: [AssistantEvent],
+        persisted: [AssistantEvent]
+    ) -> [AssistantEvent] {
+        guard persisted.contains(where: { event in
+            if case .itemHostMetadata(_, _, let applied) = event { return applied == true }
+            return false
+        }) else { return snapshot }
+        let persistedTimeline = timelineByReplaying(persisted)
+        let snapshotTimeline = timelineByReplaying(snapshot)
+        var merged = snapshot
+        let turnCount = min(persistedTimeline.turns.count, snapshotTimeline.turns.count)
+        for turnIndex in 0..<turnCount {
+            let persistedTurn = persistedTimeline.turns[turnIndex]
+            let snapshotTurn = snapshotTimeline.turns[turnIndex]
+            var persistedOrdinals: [String: Int] = [:]
+            var snapshotItemsByIdentity: [String: [AssistantItem]] = [:]
+            for item in snapshotTurn.items {
+                snapshotItemsByIdentity[replayItemIdentity(item), default: []].append(item)
+            }
+            for persistedItem in persistedTurn.items {
+                let identity = replayItemIdentity(persistedItem)
+                let ordinal = persistedOrdinals[identity, default: 0]
+                persistedOrdinals[identity] = ordinal + 1
+                guard persistedItem.distillApplied == true,
+                      let matches = snapshotItemsByIdentity[identity],
+                      matches.indices.contains(ordinal),
+                      matches[ordinal].distillApplied != true else { continue }
+                let snapshotItem = matches[ordinal]
+                merged.append(.itemHostMetadata(
+                    turnId: snapshotTurn.turnId,
+                    itemId: snapshotItem.id,
+                    distillApplied: true
+                ))
+            }
+        }
+        return merged
+    }
+
+    nonisolated private static func replayItemIdentity(_ item: AssistantItem) -> String {
+        "\(item.id.utf8.count)|\(item.id)|\(item.type.rawValue)"
     }
 
     nonisolated static func renderableItemCount(_ events: [AssistantEvent]) -> Int {
@@ -9252,12 +9299,10 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return showsLiveToolElapsed(for: item)
     }
 
-    /// Token Saver ran for this tool (display chip only). A valid applied receipt is
-    /// authoritative; strict recovery handles remain a fallback for persisted legacy output.
+    /// Token Saver ran for this tool (display chip only). The host verifier owns
+    /// this truth; provider-visible receipt/handle text is never authoritative.
     static func toolCommandWasDistilled(for item: AssistantItem) -> Bool {
-        guard let detail = detailText(for: item) else { return false }
-        return DistillAppliedReceipt.containsMarker(detail)
-            || RetrieveHandleSanitizer.containsScopedHandle(detail)
+        item.distillApplied == true
     }
 
     /// Compact elapsed label (`12s`, `1m 53s`) from start→end timestamps.
@@ -9545,7 +9590,10 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     /// count — an exact grapheme delta would need the O(n) walk this avoids — so
     /// the marker reports a size, not a character count.
     static func cappedDetail(_ text: String, limit: Int = 6_000, for item: AssistantItem? = nil) -> String {
-        let clean = DistillAppliedReceipt.strip(stripANSI(text))
+        let ansiStripped = stripANSI(text)
+        let clean = item?.distillApplied == true
+            ? DistillAppliedReceipt.strip(ansiStripped)
+            : ansiStripped
         if let item, isSkillToolItem(item) {
             return clean
         }

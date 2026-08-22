@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 /// MCP server core (P3-T5): a native tool surface so Claude/Codex can fetch the byte-exact
 /// original behind a `[[rc:HANDLE]]` marker without shelling out. It exposes read-only
@@ -13,6 +14,18 @@ public struct ManagedRetrieveMCP: Sendable {
     public typealias StatsFn = @Sendable () async -> DistillStatsSnapshot?
     public typealias CompressFn = @Sendable (_ request: DistillRequest) async -> DistillResponse?
     public typealias AskFn = @Sendable (_ op: String, _ input: String, _ question: String, _ handle: String?) async -> String?
+    public typealias DistillAdmission = @Sendable () -> Bool
+    public typealias DeferredSideEffect = @Sendable () async -> Void
+
+    public struct HandleResult: Sendable {
+        public let response: String?
+        public let deferredSideEffect: DeferredSideEffect?
+
+        public init(response: String?, deferredSideEffect: DeferredSideEffect? = nil) {
+            self.response = response
+            self.deferredSideEffect = deferredSideEffect
+        }
+    }
 
     public static let toolName = "rc_retrieve"
     public static let searchToolName = "rc_search"
@@ -25,6 +38,9 @@ public struct ManagedRetrieveMCP: Sendable {
     private let compress: CompressFn?
     private let ask: AskFn?
     private let scopedRecoveryAvailable: Bool
+    private let rootRunID: String?
+    private let receiptKey: Data?
+    private let distillAdmission: DistillAdmission
 
     public init(
         retrieve: @escaping RetrieveFn,
@@ -32,7 +48,10 @@ public struct ManagedRetrieveMCP: Sendable {
         stats: @escaping StatsFn = { nil },
         compress: CompressFn? = nil,
         ask: AskFn? = nil,
-        scopedRecoveryAvailable: Bool = false
+        scopedRecoveryAvailable: Bool = false,
+        rootRunID: String? = nil,
+        receiptKey: Data? = nil,
+        distillAdmission: @escaping DistillAdmission = { false }
     ) {
         self.retrieve = retrieve
         self.search = search
@@ -40,6 +59,27 @@ public struct ManagedRetrieveMCP: Sendable {
         self.compress = compress
         self.ask = ask
         self.scopedRecoveryAvailable = scopedRecoveryAvailable
+        let trimmedRootRunID = rootRunID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.rootRunID = trimmedRootRunID?.isEmpty == false ? trimmedRootRunID : nil
+        self.receiptKey = receiptKey.flatMap {
+            DistillAppliedReceipt.encodeReceiptKey($0) == nil ? nil : $0
+        }
+        self.distillAdmission = distillAdmission
+    }
+
+    /// Production transport seam: callers write `response` first, then await the
+    /// deferred ledger side effect. Non-compress tools have no deferred work.
+    public func handleForDelivery(_ line: String) async -> HandleResult {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = trimmed.data(using: .utf8),
+              let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = msg["id"],
+              msg["method"] as? String == "tools/call",
+              let params = msg["params"] as? [String: Any],
+              params["name"] as? String == Self.compressToolName else {
+            return HandleResult(response: await handle(line))
+        }
+        return await compressResult(id: id, args: params["arguments"] as? [String: Any])
     }
 
     /// Handle one JSON-RPC request line. Returns the response line, or nil for notifications
@@ -114,7 +154,7 @@ public struct ManagedRetrieveMCP: Sendable {
                         "required": ["handle"],
                     ],
                 ])
-                if compress != nil {
+                if trustedCompressionAvailable {
                     tools.append([
                         "name": Self.compressToolName,
                         "description": "Compress input only after scoped durable recovery succeeds.",
@@ -136,7 +176,8 @@ public struct ManagedRetrieveMCP: Sendable {
             guard name == Self.statsToolName
                     || name == Self.searchToolName
                     || name == Self.askToolName
-                    || (scopedRecoveryAvailable && (name == Self.toolName || name == Self.compressToolName)) else {
+                    || name == Self.compressToolName
+                    || (scopedRecoveryAvailable && name == Self.toolName) else {
                 return errorReply(
                     id: id,
                     code: -32602,
@@ -205,47 +246,7 @@ public struct ManagedRetrieveMCP: Sendable {
                 ])
             }
             if name == Self.compressToolName {
-                guard let input = args?["input"] as? String else {
-                    return errorReply(id: id, code: -32602, message: "missing input")
-                }
-                let estimatedInputTokens = args?["estimatedInputTokens"] as? Int ?? TokenEstimator.estimate(input)
-                let toolRoundTripTokens = args?["toolRoundTripTokens"] as? Int ?? 200
-                guard estimatedInputTokens > toolRoundTripTokens else {
-                    return reply(id: id, result: [
-                        "content": [["type": "text", "text": "skipped: estimated savings do not exceed MCP round-trip cost"]],
-                        "isError": false,
-                    ])
-                }
-                guard let compress else {
-                    return reply(id: id, result: [
-                        "content": [["type": "text", "text": "compression unavailable"]],
-                        "isError": true,
-                    ])
-                }
-                let request = DistillRequest(
-                    mode: .commandOutput,
-                    priority: .agent,
-                    input: input,
-                    question: args?["question"] as? String,
-                    provider: args?["provider"] as? String,
-                    recordSavings: true,
-                    maxOutputCharacters: args?["maxOutputCharacters"] as? Int ?? 4_000,
-                    reversibleStoreMinBytes: args?["reversibleStoreMinBytes"] as? Int ?? 256
-                )
-                guard let response = await compress(request) else {
-                    return reply(id: id, result: [
-                        "content": [["type": "text", "text": "compression unavailable"]],
-                        "isError": true,
-                    ])
-                }
-                var text = response.output
-                if let handle = response.originalHandle, !handle.isEmpty {
-                    text += "\n[[rc:\(handle)]]"
-                }
-                return reply(id: id, result: [
-                    "content": [["type": "text", "text": text]],
-                    "isError": false,
-                ])
+                return await compressResult(id: id, args: args).response
             }
             guard name == Self.toolName, let handleArg = args?["handle"] as? String else {
                 return errorReply(id: id, code: -32602, message: "unknown tool or missing handle")
@@ -258,6 +259,103 @@ public struct ManagedRetrieveMCP: Sendable {
         default:
             return errorReply(id: id, code: -32601, message: "method not found: \(method)")
         }
+    }
+
+    private var trustedCompressionAvailable: Bool {
+        scopedRecoveryAvailable
+            && compress != nil
+            && rootRunID != nil
+            && receiptKey != nil
+            && distillAdmission()
+    }
+
+    private func compressResult(id: Any?, args: [String: Any]?) async -> HandleResult {
+        guard let input = args?["input"] as? String else {
+            return HandleResult(response: errorReply(id: id, code: -32602, message: "missing input"))
+        }
+        func failOpen() -> HandleResult {
+            HandleResult(response: reply(id: id, result: [
+                "content": [["type": "text", "text": input]],
+                "isError": false,
+            ]))
+        }
+
+        let estimatedInputTokens = args?["estimatedInputTokens"] as? Int ?? TokenEstimator.estimate(input)
+        let toolRoundTripTokens = args?["toolRoundTripTokens"] as? Int ?? 200
+        guard estimatedInputTokens > toolRoundTripTokens,
+              trustedCompressionAvailable,
+              let compress,
+              let rootRunID,
+              let receiptKey else {
+            return failOpen()
+        }
+
+        let maxOutputCharacters = args?["maxOutputCharacters"] as? Int ?? 4_000
+        let reversibleStoreMinBytes = args?["reversibleStoreMinBytes"] as? Int ?? 256
+        let request = DistillRequest(
+            mode: .commandOutput,
+            priority: .agent,
+            input: input,
+            question: args?["question"] as? String,
+            provider: args?["provider"] as? String,
+            recordSavings: false,
+            maxOutputCharacters: maxOutputCharacters,
+            reversibleStoreMinBytes: reversibleStoreMinBytes
+        )
+        guard let response = await compress(request),
+              trustedCompressionAvailable,
+              response.routeStage != .verbatim,
+              !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let handle = response.originalHandle, !handle.isEmpty,
+              let recoveryIdempotencyKey = response.recoveryIdempotencyKey,
+              !recoveryIdempotencyKey.isEmpty else {
+            return failOpen()
+        }
+
+        let outputSeparator = response.output.hasSuffix("\n") ? "" : "\n"
+        let signedPayload = Data((response.output + outputSeparator + "[[rc:\(handle)]]\n").utf8)
+        guard let marker = DistillAppliedReceipt.makeV2Marker(
+            rootRunID: rootRunID,
+            payload: signedPayload,
+            key: receiptKey
+        ) else {
+            return failOpen()
+        }
+        let deliveredData = signedPayload + Data((marker + "\n").utf8)
+        guard deliveredData.count < Data(input.utf8).count,
+              let delivered = String(data: deliveredData, encoding: .utf8) else {
+            return failOpen()
+        }
+        guard let responseLine = reply(id: id, result: [
+            "content": [["type": "text", "text": delivered]],
+            "isError": false,
+        ]) else {
+            return failOpen()
+        }
+
+        let ledgerRequest = DistillRequest(
+            mode: .commandOutput,
+            priority: .agent,
+            input: input,
+            question: args?["question"] as? String,
+            provider: args?["provider"] as? String,
+            recordSavings: true,
+            maxOutputCharacters: maxOutputCharacters,
+            reversibleStoreMinBytes: reversibleStoreMinBytes,
+            precomputedOutput: delivered,
+            precomputedRouteStage: response.routeStage,
+            precomputedRecoveryConfirmations: [
+                .init(capability: handle, idempotencyKey: recoveryIdempotencyKey),
+            ]
+        )
+        let admission = distillAdmission
+        return HandleResult(
+            response: responseLine,
+            deferredSideEffect: {
+                guard admission() else { return }
+                _ = await compress(ledgerRequest)
+            }
+        )
     }
 
     private func reply(id: Any?, result: [String: Any]) -> String? {

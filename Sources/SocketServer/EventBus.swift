@@ -864,11 +864,12 @@ public enum EventStreamFilter: Sendable, Equatable {
            let surfaceID = payload["surface_id"]?.stringValue {
             return "\(event.kind):\(surfaceID)"
         }
-        // C-16: same item_id merges by *concat* of append fields (not LWW) so
-        // agent text stays byte-identical to the unaggregated stream.
+        // C-16: same thread_id + item_id merges by *concat* of append fields
+        // (not LWW) so agent text stays byte-identical without crossing threads.
         if event.kind == "agent.item.delta",
+           let threadID = payload["thread_id"]?.stringValue,
            let itemID = payload["item_id"]?.stringValue {
-            return "\(event.kind):\(itemID)"
+            return "\(event.kind):\(threadID):\(itemID)"
         }
         return nil
     }

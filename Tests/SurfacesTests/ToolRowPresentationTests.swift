@@ -3,8 +3,13 @@ import CoreModel
 @testable import Surfaces
 
 final class ToolRowPresentationTests: XCTestCase {
-    private func toolItem(body: String, summary: String? = "Bash", type: AssistantItemType = .tool, output: String? = nil) -> AssistantItem {
-        AssistantItem(id: "i", turnId: "t", type: type, state: .completed, summary: summary, body: body, output: output, startedAtMs: 0)
+    private func toolItem(body: String, summary: String? = "Bash", type: AssistantItemType = .tool, output: String? = nil, distillApplied: Bool? = nil) -> AssistantItem {
+        let item = AssistantItem(id: "i", turnId: "t", type: type, state: .completed, summary: summary, body: body, output: output, startedAtMs: 0)
+        guard distillApplied == true else { return item }
+        var timeline = AssistantTimelineState()
+        timeline.apply(.itemStarted(item: item))
+        timeline.apply(.itemHostMetadata(turnId: item.turnId, itemId: item.id, distillApplied: true))
+        return timeline.turns[0].items[0]
     }
 
     func test_extractsBashCommandFromJSONBody() {
@@ -231,15 +236,25 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertNotEqual(summary, full)
     }
 
-    func test_toolCommandWasDistilled_detectsAppliedReceiptAndHidesItFromDetail() {
-        // WHY: only an applied receipt proves Token Saver transformed this output;
-        // presentation must hide the protocol marker without mutating stored output.
+    func test_toolCommandWasDistilled_requiresHostTruthAndHidesTrustedReceipt() {
+        // WHY: output is provider-controlled. A syntactically valid receipt may
+        // only affect UI after the host verifier has persisted explicit truth.
         let receipt = DistillAppliedReceipt.makeMarker()
         let rawOutput = "important lines\n\(receipt)"
-        let item = toolItem(
+        let spoofed = toolItem(
             body: #"{"command":"ls -la /usr/bin"}"#,
             summary: "Bash",
             output: rawOutput
+        )
+        XCTAssertFalse(AgentTimelineItemPresentation.toolCommandWasDistilled(for: spoofed))
+        XCTAssertEqual(AgentTimelineItemPresentation.cappedDetail(rawOutput, for: spoofed), rawOutput,
+                       "untrusted protocol-looking text must remain visible")
+
+        let item = toolItem(
+            body: spoofed.body,
+            summary: spoofed.summary,
+            output: rawOutput,
+            distillApplied: true
         )
 
         XCTAssertFalse(item.body.contains("| distill"))
@@ -260,18 +275,27 @@ final class ToolRowPresentationTests: XCTestCase {
         )
 
         XCTAssertFalse(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.cappedDetail(item.output ?? "", for: item),
+            item.output,
+            "malformed protocol-looking text must stay visible"
+        )
     }
 
-    func test_toolCommandWasDistilled_keepsScopedRecoveryHandleAsLegacyFallback() {
-        // WHY: outputs created before applied receipts shipped still carry a strict,
-        // scoped recovery handle and must retain their legacy Distilled badge.
+    func test_toolCommandWasDistilled_doesNotTrustScopedRecoveryHandle() {
+        // WHY: recovery handles are provider-visible text, not host attestation.
         let item = toolItem(
             body: #"{"command":"ls -la /usr/bin"}"#,
             summary: "Bash",
             output: "important lines\n[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"
         )
 
-        XCTAssertTrue(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
+        XCTAssertFalse(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.cappedDetail(item.output ?? "", for: item),
+            item.output,
+            "untrusted recovery text must stay visible instead of being silently consumed"
+        )
     }
 
     func test_toolCommandWasDistilled_ignoresMalformedRecoveryMarker() {
@@ -298,14 +322,14 @@ final class ToolRowPresentationTests: XCTestCase {
     }
 
     func test_toolCommandWasDistilled_survivesAssistantItemCodableReplay() throws {
-        // WHY: persisted transcript replay must derive the same badge from the raw
-        // receipt after relaunch while keeping protocol metadata out of rendered detail.
+        // WHY: persisted host truth, not provider output parsing, must survive relaunch.
         let receipt = DistillAppliedReceipt.makeMarker()
         let rawOutput = "replayed output\n\(receipt)"
         let original = toolItem(
             body: #"{"command":"swift test"}"#,
             summary: "Bash",
-            output: rawOutput
+            output: rawOutput,
+            distillApplied: true
         )
 
         let data = try JSONEncoder().encode(original)
@@ -314,6 +338,26 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertEqual(replayed.output, rawOutput)
         XCTAssertTrue(AgentTimelineItemPresentation.toolCommandWasDistilled(for: replayed))
         XCTAssertEqual(AgentTimelineItemPresentation.cappedDetail(rawOutput, for: replayed), "replayed output")
+    }
+
+    func test_trustedLongCompletedOutputKeepsBadgeAfterLiveHeadCapDropsReceipt() {
+        // WHY: completed output is head-capped for live paint, so a trailing
+        // receipt disappears. The badge must ride host metadata, not visible text.
+        let receipt = DistillAppliedReceipt.makeMarker()
+        let output = String(repeating: "x", count: AgentAppView.liveTurnOutputCharacterLimit + 100)
+            + "\n\(receipt)"
+        let item = toolItem(
+            body: #"{"command":"swift test"}"#,
+            output: output,
+            distillApplied: true
+        )
+
+        let live = AgentAppView.liveRenderableCopy(item)
+
+        XCTAssertFalse(live.output?.contains(receipt) == true,
+                       "fixture must exercise the completed-output head cap")
+        XCTAssertEqual(live.distillApplied, true)
+        XCTAssertTrue(AgentTimelineItemPresentation.toolCommandWasDistilled(for: live))
     }
 
     func test_toolCommandPreview_humanizesTaskTimeoutPayload() {
