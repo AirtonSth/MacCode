@@ -9161,24 +9161,30 @@ public struct BotsRootView: View {
     // MARK: Empty desk
 
     private var emptyDesk: some View {
-        VStack(spacing: DS.Space.xl) {
-            DSEmptyState(
-                icon: "bubble.left.and.bubble.right",
-                title: vm.isControlPlaneActive ? "Select a teammate" : "Turn on Bot control plane in Settings",
-                subtitle: vm.isControlPlaneActive
-                    ? "Chat opens here. Studio is the other destination."
-                    : "Bots stay off until the control plane is enabled."
-            )
+        DSEmptyState(
+            icon: "bubble.left.and.bubble.right",
+            title: vm.isControlPlaneActive ? "Select a teammate" : "Turn on Bot control plane in Settings",
+            subtitle: vm.isControlPlaneActive
+                ? "Chat opens here. Studio is the other destination."
+                : "Bots stay off until the control plane is enabled."
+        ) {
             if vm.isControlPlaneActive {
                 Button(action: vm.beginCreate) {
-                    Text(BotsChrome.Label.newBot)
-                        .frame(minHeight: BotsChrome.hitTarget)
+                    HStack(spacing: DS.Space.sm) {
+                        Image(systemName: "person.badge.plus")
+                            .font(.system(size: 12, weight: .semibold))
+                            .accessibilityHidden(true)
+                        Text(BotsChrome.Label.newBot)
+                    }
                 }
-                .buttonStyle(BotsPrimaryButtonStyle())
+                .buttonStyle(DSPrimaryButtonStyle())
+                .frame(minHeight: BotsChrome.hitTarget)
+                .contentShape(Rectangle())
+                .help("Create a named teammate")
                 .accessibilityIdentifier("bots.desk.empty.new")
+                .padding(.top, DS.Space.xs)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityIdentifier("bots.desk.empty")
     }
 

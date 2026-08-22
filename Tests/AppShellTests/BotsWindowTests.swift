@@ -12449,6 +12449,39 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_emptyDeskGroupsNewBotWithCopy_becauseAFooterPrimaryLooksOrphaned() throws {
+        // WHY: DSEmptyState used to fill the pane, so New Bot sat on the
+        // window bottom as a stock filled pill. The CTA belongs under the
+        // empty-state copy, in DS chrome, with the same plus-person mark
+        // as the sidebar row.
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        guard let start = bots.range(of: "private var emptyDesk: some View") else {
+            return XCTFail("emptyDesk must exist")
+        }
+        let rest = bots[start.lowerBound...]
+        guard let end = rest.range(of: "\n    @ViewBuilder\n    private func attentionBadge") else {
+            return XCTFail("emptyDesk must end before attentionBadge")
+        }
+        let body = String(rest[..<end.lowerBound])
+        XCTAssertTrue(body.contains("DSEmptyState("))
+        XCTAssertTrue(
+            body.contains("accessibilityIdentifier(\"bots.desk.empty.new\")"),
+            "empty desk must keep the New Bot control"
+        )
+        XCTAssertTrue(
+            body.contains("person.badge.plus"),
+            "empty-desk New Bot must share the sidebar plus-person glyph"
+        )
+        XCTAssertTrue(
+            body.contains("DSPrimaryButtonStyle()"),
+            "empty-desk New Bot must use compact DS primary chrome, not a stock filled footer pill"
+        )
+        XCTAssertFalse(
+            body.contains("BotsPrimaryButtonStyle()"),
+            "BotsPrimaryButtonStyle is the 44pt studio save fill; it reads as a leftover footer here"
+        )
+    }
+
     func test_modeSwitcherShowsWorkspaces_becauseUsersSeeWorkspaceModeNotInternalAgenticName() {
         // WHY: the left mode is the workspace list. Shipping "Agentic" as the
         // visible tab name was product jargon; the control must say Workspaces.

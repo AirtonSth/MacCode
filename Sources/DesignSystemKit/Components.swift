@@ -268,17 +268,27 @@ extension DSSectionHeaderG {
 
 // MARK: - Empty state
 
-public struct DSEmptyState: View {
+public struct DSEmptyState<Action: View>: View {
     let icon: String
     let title: String
     let subtitle: String
     let background: Color
-    public init(icon: String, title: String, subtitle: String, background: Color = DS.Palette.bg) {
+    let action: Action
+
+    public init(
+        icon: String,
+        title: String,
+        subtitle: String,
+        background: Color = DS.Palette.bg,
+        @ViewBuilder action: () -> Action
+    ) {
         self.icon = icon
         self.title = title
         self.subtitle = subtitle
         self.background = background
+        self.action = action()
     }
+
     public var body: some View {
         VStack(spacing: DS.Space.lg) {
             Image(systemName: icon)
@@ -291,9 +301,18 @@ public struct DSEmptyState: View {
                 .foregroundColor(DS.Palette.textTertiary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 360)
+            action
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(background)
+    }
+}
+
+extension DSEmptyState where Action == EmptyView {
+    public init(icon: String, title: String, subtitle: String, background: Color = DS.Palette.bg) {
+        self.init(icon: icon, title: title, subtitle: subtitle, background: background) {
+            EmptyView()
+        }
     }
 }
 

@@ -390,5 +390,9 @@ final class DSEmptyStateTests: XCTestCase {
             body.contains(".accessibilityHidden(true)"),
             "DSEmptyState icon must be hidden so VoiceOver speaks title, not the SF Symbol"
         )
+        XCTAssertTrue(
+            body.contains("@ViewBuilder action:"),
+            "empty-state CTAs must sit in the same cluster as the copy, not as a sibling pushed to the window edge"
+        )
     }
 }
