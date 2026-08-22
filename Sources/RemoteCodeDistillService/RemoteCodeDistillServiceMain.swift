@@ -492,9 +492,11 @@ struct RemoteCodeDistillServiceMain {
         // Flush stdout before any deferred Wave A ledger POST so the pipe
         // consumer never waits on the sidecar RTT for already-compressed bytes.
         let result = await cli.runResult()
-        FileHandle.standardOutput.write(result.stdout)
-        try? FileHandle.standardOutput.synchronize()
-        if let deferred = result.deferredSideEffect {
+        let deliveredDeferred = GuardedStdoutWrite.deliveredValue(
+            result.deferredSideEffect,
+            afterWriting: result.stdout
+        )
+        if let deferred = deliveredDeferred {
             await deferred()
         }
         Darwin.exit(result.exitCode)
@@ -776,9 +778,11 @@ struct RemoteCodeDistillServiceMain {
         while let line = readLine(strippingNewline: true) {
             let result = await server.handleForDelivery(line)
             if let response = result.response {
-                FileHandle.standardOutput.write(Data((response + "\n").utf8))
-                try? FileHandle.standardOutput.synchronize()
-                if let deferred = result.deferredSideEffect {
+                let deliveredDeferred = GuardedStdoutWrite.deliveredValue(
+                    result.deferredSideEffect,
+                    afterWriting: Data((response + "\n").utf8)
+                )
+                if let deferred = deliveredDeferred {
                     await deferred()
                 }
             }
