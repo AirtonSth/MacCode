@@ -355,10 +355,11 @@ public final class BotComputerGuestService: @unchecked Sendable {
         Self.viewerTokenLock.lock()
         defer { Self.viewerTokenLock.unlock() }
         let tokenURL = BotComputerGuestSpec.viewerTokenURL(appSupport: appSupport, botID: botID)
-        if let value = try? String(contentsOf: tokenURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           value.range(of: #"^[a-zA-Z0-9-]{32,128}$"#, options: .regularExpression) != nil {
-            return value
+        if let data = try? Data(contentsOf: tokenURL, options: .mappedIfSafe), let raw = String(data: data, encoding: .utf8) {
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.range(of: #"^[a-zA-Z0-9-]{32,128}$"#, options: .regularExpression) != nil {
+                return value
+            }
         }
         let value = UUID().uuidString.lowercased()
         try Data((value + "\n").utf8).write(to: tokenURL, options: .atomic)
