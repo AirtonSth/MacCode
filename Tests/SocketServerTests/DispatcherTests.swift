@@ -89,7 +89,12 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         throw JSONRPCError.notSupported("host Bot skill view")
     }
 
+    var pairedBotRemoteResult: JSONValue?
+    var lastPairedBotRemote: (method: String, params: [String: JSONValue])?
+
     func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
+        lastPairedBotRemote = (method, params)
+        if let pairedBotRemoteResult { return pairedBotRemoteResult }
         throw JSONRPCError.notSupported("paired Bot remote control")
     }
     func selectWorkspace(_ id: WorkspaceID) throws { window.selectedWorkspaceID = id }
@@ -1329,6 +1334,38 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(result["partial_reason"], .string("history_retention_cap"),
                        "authoritative history must preserve the host's permanent partial-output truth")
         XCTAssertEqual(result["pending_bytes"], .number(4096))
+    }
+
+    @MainActor
+    func test_httpBotCreateKeepsClientRequestIdOnPairedRemote() async {
+        let router = FakeRouter()
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "receipt_id": .string("r1"),
+            "bot_id": .string("bot-1"),
+            "request_id": .string("e2e"),
+        ])
+        let d = JSONRPCDispatcher(router: router)
+        let resp = await d.dispatchHTTP(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "bot.create",
+                params: [
+                    "client_request_id": .string("e2e"),
+                    "name": .string("Piper"),
+                ]
+            ),
+            mutationContext: MutationRequestContext(
+                ownerFingerprint: "owner",
+                hostId: "host",
+                bootEpoch: 1
+            )
+        )
+        XCTAssertNil(resp.error, "paired Bot create must not fall through to methodNotFound")
+        XCTAssertEqual(router.lastPairedBotRemote?.method, "bot.create")
+        XCTAssertEqual(router.lastPairedBotRemote?.params["client_request_id"], .string("e2e"))
+        XCTAssertEqual(resp.result?.objectValue?["receipt_id"], .string("r1"))
     }
 
     @MainActor

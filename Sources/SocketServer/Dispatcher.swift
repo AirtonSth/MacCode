@@ -1261,6 +1261,12 @@ public final class JSONRPCDispatcher {
            !Self.managedProviderSocketAuthenticated {
             return .init(id: req.id, error: .methodNotFound)
         }
+        // Paired Bot remote-control keeps its own receipts. Do not strip
+        // client_request_id through the host-mutation ledger or create
+        // lands in commandOutcomeUnknown / methodNotFound.
+        if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.peer.") {
+            return await dispatchCore(req)
+        }
         guard let mutationContext else { return await dispatchCore(req) }
         if req.method == "command.receipt.status" {
             return commandReceiptStatus(req, context: mutationContext)
