@@ -133,6 +133,16 @@ public struct BotHome: Sendable {
         try writeAtomic(lines.joined(separator: "\n") + "\n", to: memoryURL)
     }
 
+    // PERF: DateFormatter ICU init is expensive. Share one for bootstrap yyyy-MM-dd
+    // behind a lock; DateFormatter is not thread-safe and calendar varies per call.
+    private static let bootstrapDateLock = NSLock()
+    private static let bootstrapDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
     public func readBootstrapMemory(
         now: Date = Date(),
         calendar: Calendar = .current
@@ -143,14 +153,13 @@ public struct BotHome: Sendable {
                 files.append(file)
             }
         }
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        let today = formatter.string(from: now)
+        Self.bootstrapDateLock.lock()
+        Self.bootstrapDateFormatter.calendar = calendar
+        Self.bootstrapDateFormatter.timeZone = calendar.timeZone
+        let today = Self.bootstrapDateFormatter.string(from: now)
         let yesterdayDate = calendar.date(byAdding: .day, value: -1, to: now) ?? now
-        let yesterday = formatter.string(from: yesterdayDate)
+        let yesterday = Self.bootstrapDateFormatter.string(from: yesterdayDate)
+        Self.bootstrapDateLock.unlock()
         for day in [today, yesterday] {
             files.append(contentsOf: try dailyNotes(dayPrefix: day))
         }

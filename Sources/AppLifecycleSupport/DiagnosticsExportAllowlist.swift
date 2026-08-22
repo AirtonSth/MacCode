@@ -174,6 +174,14 @@ public enum DiagnosticsExportAllowlist {
         return digest.prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
+    // PERF: ISO8601DateFormatter init is expensive. Share one for export.
+    private static let exportISOFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    private static let exportISOFormatterLock = NSLock()
+
     public static func buildExportDocument(
         fields: [DiagnosticsExportField],
         unavailableSections: [DiagnosticsExportSection],
@@ -188,9 +196,12 @@ public enum DiagnosticsExportAllowlist {
             bucket[field.key] = field.value
             sections[field.section.rawValue] = bucket
         }
+        exportISOFormatterLock.lock()
+        let exportedAt = exportISOFormatter.string(from: now)
+        exportISOFormatterLock.unlock()
         let object: [String: Any] = [
             "schema_version": "1.0.0",
-            "exported_at": ISO8601DateFormatter().string(from: now),
+            "exported_at": exportedAt,
             "correlation_prefix": correlationID(sessionSalt: sessionSalt, eventSeed: "export"),
             "sections": sections,
             "unavailable_sections": unavailableSections.map(\.rawValue).sorted(),
