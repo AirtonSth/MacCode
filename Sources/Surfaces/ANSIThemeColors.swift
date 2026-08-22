@@ -62,13 +62,22 @@ public enum ANSIPaletteMapper {
 
     /// Encode a single NSColor as a lowercase `#rrggbb` hex string from its
     /// sRGB channels. Pure; no AppKit runloop needed.
+    // PERF: nibble table instead of per-color `String(format:)` (ICU) so palette
+    // resolution (16 colors per theme) avoids formatter allocation.
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
     static func hex(_ color: NSColor) -> String {
         let c = color.usingColorSpace(.sRGB) ?? color
-        let r = Int((c.redComponent * 255.0).rounded())
-        let g = Int((c.greenComponent * 255.0).rounded())
-        let b = Int((c.blueComponent * 255.0).rounded())
-        func clamp(_ v: Int) -> Int { max(0, min(255, v)) }
-        return String(format: "#%02x%02x%02x", clamp(r), clamp(g), clamp(b))
+        let r = UInt8(max(0, min(255, Int((c.redComponent * 255.0).rounded()))))
+        let g = UInt8(max(0, min(255, Int((c.greenComponent * 255.0).rounded()))))
+        let b = UInt8(max(0, min(255, Int((c.blueComponent * 255.0).rounded()))))
+        var out: [UInt8] = [35, 0, 0, 0, 0, 0, 0] // '#' + 6 nibbles
+        out[1] = hexAlphabet[Int(r >> 4)]
+        out[2] = hexAlphabet[Int(r & 0x0f)]
+        out[3] = hexAlphabet[Int(g >> 4)]
+        out[4] = hexAlphabet[Int(g & 0x0f)]
+        out[5] = hexAlphabet[Int(b >> 4)]
+        out[6] = hexAlphabet[Int(b & 0x0f)]
+        return String(bytes: out, encoding: .utf8) ?? String(format: "#%02x%02x%02x", Int(r), Int(g), Int(b))
     }
 
     /// The default 16-entry palette (basic 0-7 then bright 8-15) as `#rrggbb`.
