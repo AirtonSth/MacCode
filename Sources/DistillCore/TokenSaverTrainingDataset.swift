@@ -282,11 +282,20 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         return s
     }
 
-    private static func dayStamp(_ date: Date) -> String {
+    // PERF: DateFormatter ICU init is expensive. Share one for yyyy-MM-dd behind lock.
+    private static let dayStampLock = NSLock()
+    private static let dayStampFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone(secondsFromGMT: 0)
         f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: date)
+        return f
+    }()
+
+    private static func dayStamp(_ date: Date) -> String {
+        dayStampLock.lock()
+        let s = dayStampFormatter.string(from: date)
+        dayStampLock.unlock()
+        return s
     }
 }

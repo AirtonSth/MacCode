@@ -68,10 +68,19 @@ public struct LibrarianEnvelope: Sendable, Equatable, Codable {
         case modelID = "model_id"
     }
 
+    // PERF: JSONEncoder init is expensive. Share one for envelope JSON behind lock.
+    private static let jsonEncoderLock = NSLock()
+    private static let jsonEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.sortedKeys]
+        return e
+    }()
+
     public func jsonString() -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        guard let data = try? encoder.encode(self), let text = String(data: data, encoding: .utf8) else {
+        Self.jsonEncoderLock.lock()
+        let data = try? Self.jsonEncoder.encode(self)
+        Self.jsonEncoderLock.unlock()
+        guard let data, let text = String(data: data, encoding: .utf8) else {
             return #"{"status":"unavailable","confidence":0,"op":"\#(op)","answer":{},"evidence":[],"why_uncertain":"encode_failed","fallback":{"recommended":"retrieve"}}"#
         }
         return text
