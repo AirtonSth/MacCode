@@ -615,6 +615,21 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         }
     }
 
+    // PERF: share JSON codec
+    private static let sharedEncoder = JSONEncoder()
+    private static let sharedDecoder = JSONDecoder()
+    private static let codecLock = NSLock()
+    private static func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
+        Self.codecLock.lock()
+        defer { Self.codecLock.unlock() }
+        return try Self.sharedEncoder.encode(value)
+    }
+    private static func decodeJSON<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        Self.codecLock.lock()
+        defer { Self.codecLock.unlock() }
+        return try Self.sharedDecoder.decode(type, from: data)
+    }
+
     private static let defaultsKey = "bots.peerTurns.v2"
     private static let canonicalPrefix = "base64:"
     private static let emptyPayload = Data("[]".utf8)
@@ -1175,7 +1190,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
               let expectedValue = canonicalSettingsValue,
               let expectedData = canonicalPayloadData,
               candidate.allSatisfy({ $0.value.version == 2 && $0.value.activityID == $0.key }),
-              let data = try? JSONEncoder().encode(candidate) else { return false }
+              let data = try? Self.encodeJSON(candidate) else { return false }
         let nextValue = Self.canonicalValue(for: data)
         do {
             let committed = try settingsRepo.compareAndSetTransactionally(
@@ -1294,7 +1309,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     }
 
     private static func decodePayload(_ data: Data) -> StoredPayload {
-        guard let decoded = try? JSONDecoder().decode(
+        guard let decoded = try? Self.decodeJSON(
             [UUID: PersistedBotPeerHandoff].self,
             from: data
         ) else {
@@ -2448,6 +2463,21 @@ public struct BotDeskThreadRailRouting: Equatable {
 
 @MainActor
 public final class BotsViewModel: ObservableObject {
+    // PERF: share JSON codec to avoid per-call allocation (many UserDefaults encode/decode per UI update).
+    private static let sharedEncoder = JSONEncoder()
+    private static let sharedDecoder = JSONDecoder()
+    private static let codecLock = NSLock()
+    private static func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
+        Self.codecLock.lock()
+        defer { Self.codecLock.unlock() }
+        return try Self.sharedEncoder.encode(value)
+    }
+    private static func decodeJSON<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        Self.codecLock.lock()
+        defer { Self.codecLock.unlock() }
+        return try Self.sharedDecoder.decode(type, from: data)
+    }
+
     public static let assistantPlaceholder = BotsDeskFollowThrough.noRouterPlaceholder
 
     @Published public private(set) var bots: [BotDefinition] = []
@@ -5644,14 +5674,14 @@ public final class BotsViewModel: ObservableObject {
             UserDefaults.standard.removeObject(forKey: Self.studioDraftDefaultsKey)
             return
         }
-        if let data = try? JSONEncoder().encode(payload) {
+        if let data = try? Self.encodeJSON(payload) {
             UserDefaults.standard.set(data, forKey: Self.studioDraftDefaultsKey)
         }
     }
 
     private func restoreStudioDraftIfNeeded() {
         guard let data = UserDefaults.standard.data(forKey: Self.studioDraftDefaultsKey) else { return }
-        if let payload = try? JSONDecoder().decode([String: BotStudioDraft].self, from: data) {
+        if let payload = try? Self.decodeJSON([String: BotStudioDraft].self, from: data) {
             var restored: [BotID: BotStudioDraft] = [:]
             for (raw, draft) in payload {
                 guard let uuid = UUID(uuidString: raw) else { continue }
@@ -5660,7 +5690,7 @@ public final class BotsViewModel: ObservableObject {
             studioDraftsByBot = restored
             return
         }
-        if let draft = try? JSONDecoder().decode(BotStudioDraft.self, from: data),
+        if let draft = try? Self.decodeJSON(BotStudioDraft.self, from: data),
            let botID = draft.botID {
             studioDraftsByBot = [botID: draft]
         }
@@ -5725,14 +5755,14 @@ public final class BotsViewModel: ObservableObject {
             UserDefaults.standard.removeObject(forKey: Self.queuedFollowUpsDefaultsKey)
             return
         }
-        if let data = try? JSONEncoder().encode(payload) {
+        if let data = try? Self.encodeJSON(payload) {
             UserDefaults.standard.set(data, forKey: Self.queuedFollowUpsDefaultsKey)
         }
     }
 
     private func restoreQueuedFollowUpsIfNeeded() {
         guard let data = UserDefaults.standard.data(forKey: Self.queuedFollowUpsDefaultsKey),
-              let payload = try? JSONDecoder().decode([String: [BotQueuedFollowUp]].self, from: data)
+              let payload = try? Self.decodeJSON([String: [BotQueuedFollowUp]].self, from: data)
         else { return }
         var restored: [BotID: [BotQueuedFollowUp]] = [:]
         for (raw, items) in payload {
@@ -6064,7 +6094,7 @@ public final class BotsViewModel: ObservableObject {
             UserDefaults.standard.removeObject(forKey: Self.deskRoutingDefaultsKey)
             return
         }
-        if let data = try? JSONEncoder().encode(payload) {
+        if let data = try? Self.encodeJSON(payload) {
             UserDefaults.standard.set(data, forKey: Self.deskRoutingDefaultsKey)
         }
     }
@@ -6074,7 +6104,7 @@ public final class BotsViewModel: ObservableObject {
         // provider. Never migrate that state into a thread.
         UserDefaults.standard.removeObject(forKey: Self.legacyBotRoutingDefaultsKey)
         guard let data = UserDefaults.standard.data(forKey: Self.deskRoutingDefaultsKey),
-              let payload = try? JSONDecoder().decode([String: BotDeskRouting].self, from: data)
+              let payload = try? Self.decodeJSON([String: BotDeskRouting].self, from: data)
         else { return }
         var restored: [BotConversationID: BotDeskRouting] = [:]
         for (raw, routing) in payload {
@@ -6385,14 +6415,14 @@ public final class BotsViewModel: ObservableObject {
         })
         if payload.isEmpty {
             UserDefaults.standard.removeObject(forKey: Self.studioFilesLocationsDefaultsKey)
-        } else if let data = try? JSONEncoder().encode(payload) {
+        } else if let data = try? Self.encodeJSON(payload) {
             UserDefaults.standard.set(data, forKey: Self.studioFilesLocationsDefaultsKey)
         }
     }
 
     private func restoreStudioFilesLocationsIfNeeded() {
         guard let data = UserDefaults.standard.data(forKey: Self.studioFilesLocationsDefaultsKey),
-              let payload = try? JSONDecoder().decode([String: BotStudioFilesLocation].self, from: data)
+              let payload = try? Self.decodeJSON([String: BotStudioFilesLocation].self, from: data)
         else { return }
         studioFilesLocationsByBot = Dictionary(uniqueKeysWithValues: payload.compactMap { raw, location in
             guard let uuid = UUID(uuidString: raw) else { return nil }
@@ -6408,14 +6438,14 @@ public final class BotsViewModel: ObservableObject {
             UserDefaults.standard.removeObject(forKey: Self.composerDraftsDefaultsKey)
             return
         }
-        if let data = try? JSONEncoder().encode(payload) {
+        if let data = try? Self.encodeJSON(payload) {
             UserDefaults.standard.set(data, forKey: Self.composerDraftsDefaultsKey)
         }
     }
 
     private func restoreComposerDraftsIfNeeded() {
         guard let data = UserDefaults.standard.data(forKey: Self.composerDraftsDefaultsKey),
-              let payload = try? JSONDecoder().decode([String: BotComposerDraft].self, from: data)
+              let payload = try? Self.decodeJSON([String: BotComposerDraft].self, from: data)
         else { return }
         var restored: [BotID: BotComposerDraft] = [:]
         for (raw, draft) in payload {
@@ -6477,14 +6507,14 @@ public final class BotsViewModel: ObservableObject {
             UserDefaults.standard.removeObject(forKey: Self.inspectorDraftsDefaultsKey)
             return
         }
-        if let data = try? JSONEncoder().encode(payload) {
+        if let data = try? Self.encodeJSON(payload) {
             UserDefaults.standard.set(data, forKey: Self.inspectorDraftsDefaultsKey)
         }
     }
 
     private func restoreInspectorDraftsIfNeeded() {
         guard let data = UserDefaults.standard.data(forKey: Self.inspectorDraftsDefaultsKey),
-              let payload = try? JSONDecoder().decode([String: BotInspectorDraft].self, from: data)
+              let payload = try? Self.decodeJSON([String: BotInspectorDraft].self, from: data)
         else { return }
         var restored: [BotID: BotInspectorDraft] = [:]
         for (raw, draft) in payload {
