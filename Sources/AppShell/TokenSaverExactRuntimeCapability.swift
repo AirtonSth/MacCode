@@ -90,8 +90,17 @@ struct TokenSaverProvisionalRCW1Recovery: Sendable {
 }
 
 enum TokenSaverExactRuntimeSupport {
+    // PERF: nibble table avoids 32 String(format:) calls per hash; same lowercase hex as before.
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
     static func sha256Hex(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hash(data: Data(text.utf8))
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(hexAlphabet[Int(b >> 4)])
+            out.append(hexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     /// Disabled RCS1 is ineligible through known failed gates, including
