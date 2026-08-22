@@ -66,6 +66,63 @@ final class AssistantTimelineTests: XCTestCase {
                        "delta-before-start buffering must preserve host metadata")
     }
 
+    func test_distillMetadataFreezesAuthenticatedBytesButAllowsItemIDReuseInAnotherTurn() {
+        // WHY: the badge attests exact terminal bytes. Provider replay or a late
+        // delta must not change those bytes, while item ids remain reusable in a
+        // later turn where the identity is different.
+        var state = AssistantTimelineState()
+        state.apply(.itemStarted(item: AssistantItem(
+            id: "shared-tool",
+            turnId: "trusted-turn",
+            type: .tool,
+            state: .completed,
+            body: "trusted body",
+            output: "trusted output",
+            startedAtMs: 1
+        )))
+        state.apply(.itemHostMetadata(
+            turnId: "trusted-turn",
+            itemId: "shared-tool",
+            distillApplied: true
+        ))
+        state.apply(.itemStarted(item: AssistantItem(
+            id: "shared-tool",
+            turnId: "trusted-turn",
+            type: .tool,
+            state: .completed,
+            body: "unsigned replacement",
+            output: "unsigned replacement",
+            startedAtMs: 2
+        )))
+        state.apply(.itemDelta(
+            itemId: "shared-tool",
+            bodyAppend: " late body",
+            outputAppend: " late output",
+            summary: "late summary"
+        ))
+
+        XCTAssertEqual(state.turns[0].items[0].body, "trusted body")
+        XCTAssertEqual(state.turns[0].items[0].output, "trusted output")
+        XCTAssertNil(state.turns[0].items[0].summary)
+        XCTAssertEqual(state.turns[0].items[0].distillApplied, true)
+
+        state.apply(.itemStarted(item: AssistantItem(
+            id: "shared-tool",
+            turnId: "new-turn",
+            type: .tool,
+            body: "new body",
+            startedAtMs: 3
+        )))
+        state.apply(.itemDelta(
+            itemId: "shared-tool",
+            bodyAppend: " accepted",
+            outputAppend: nil,
+            summary: nil
+        ))
+        XCTAssertEqual(state.turns[1].items[0].body, "new body accepted")
+        XCTAssertNil(state.turns[1].items[0].distillApplied)
+    }
+
     func test_providerChosenItemIDCannotConsumeBufferedHostDistillTruth() {
         var timeline = AssistantTimelineState()
         timeline.apply(.turnStarted(turnId: "trusted-turn"))

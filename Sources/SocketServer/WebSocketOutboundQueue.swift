@@ -692,7 +692,11 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         case "agent.item.delta":
             if let thread = payload?["thread_id"] as? String,
                let item = payload?["item_id"] as? String {
-                return "\(kind):\(thread):\(item)"
+                return AgentItemDeltaCoalescingIdentity.key(
+                    threadID: thread,
+                    itemID: item,
+                    turnID: payload?["turn_id"] as? String
+                )
             }
         default:
             break

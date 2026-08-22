@@ -76,6 +76,19 @@ final class DistillAppliedReceiptStreamVerifierTests: XCTestCase {
         XCTAssertFalse(verifier.authenticateStandalone(valid, scope: scope))
     }
 
+    func test_standaloneSanitizationValidationAllowsExactReplayWithoutMintingAuthority() throws {
+        // WHY: providers repeat an authenticated assistant item in turnCompleted.
+        // The replay may be stripped for display, but must not restore badge
+        // authority after the nonce was already consumed.
+        let valid = try receipted("final", nonce: 5)
+        var verifier = DistillAppliedReceiptStreamVerifier()
+
+        XCTAssertTrue(verifier.authenticateStandalone(valid, scope: scope))
+        XCTAssertTrue(verifier.validatesStandaloneForSanitization(valid, scope: scope))
+        XCTAssertFalse(verifier.authenticateStandalone(valid, scope: scope),
+                       "display validation must not mint fresh receipt authority")
+    }
+
     func test_nonceCapacityFailsClosedWithoutReenablingReplay() throws {
         // WHY: a pathological long run must stay memory-bounded without evicting
         // old nonces, because eviction would make a captured receipt reusable.

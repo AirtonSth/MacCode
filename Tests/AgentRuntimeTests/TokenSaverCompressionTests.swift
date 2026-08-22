@@ -1837,7 +1837,26 @@ final class TokenSaverCompressionTests: XCTestCase {
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
-        let final = "Build passed. Full raw output available.\n[[rc:deadbeef]]\n\(DistillAppliedReceipt.makeMarker())"
+        let runID = AgentRunID()
+        let receiptKey = Data((0..<32).map(UInt8.init))
+        let receiptPrefix = Data("Build passed. Full raw output available.\n[[rc:deadbeef]]\n".utf8)
+        let receipt = try XCTUnwrap(DistillAppliedReceipt.makeV2Marker(
+            rootRunID: runID.value.uuidString,
+            payload: receiptPrefix,
+            key: receiptKey,
+            nonce: Data(repeating: 0x42, count: 16)
+        ))
+        let final = String(decoding: receiptPrefix, as: UTF8.self) + receipt
+        let stateURL = URL(fileURLWithPath: tmp, isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+        let state = try JSONSerialization.data(withJSONObject: [
+            "base_url": "http://127.0.0.1:1",
+            "auth_token": "test-token",
+            "receipt_key": try XCTUnwrap(DistillAppliedReceipt.encodeReceiptKey(receiptKey)),
+            "pid": ProcessInfo.processInfo.processIdentifier,
+        ], options: [.sortedKeys])
+        try state.write(to: stateURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
         let runner = ScriptedFinalRunner(provider: .codex, finalMessage: final)
         let thread = AgentThread(title: "final handle", provider: .codex, model: "fake-model")
         try threadRepo.upsert(thread)
@@ -1849,11 +1868,17 @@ final class TokenSaverCompressionTests: XCTestCase {
         coordinator.addObserver(observer)
 
         _ = try await coordinator.startRun(AgentRunRequest(
+            runId: runID,
             threadId: thread.id,
             provider: .codex,
             model: "fake-model",
             cwd: tmp,
-            prompt: "Summarize the build output."
+            prompt: "Summarize the build output.",
+            environment: [
+                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                "RC_TOKEN_SAVER_ROOT_RUN_ID": runID.value.uuidString,
+                "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
+            ]
         ))
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 

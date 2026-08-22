@@ -16,6 +16,8 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         private var records: [String: Record] = [:]
         private var operationIDs: [String] = []
         private var lastCapability = ""
+        private var failNextDeliveryBatch = false
+        private var deliveryBatchCalls = 0
         private(set) var preparedLane: String?
         /// Test seam: force prepareOriginal to throw so command-output unscoped fallback runs.
         var failPrepare = false
@@ -80,6 +82,43 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
             return true
         }
 
+        func markDeliveredBatch(
+            confirmations: [DistillRecoveryDeliveryConfirmation],
+            context: TokenSaverRecoveryRequestContext,
+            outcome: TokenSaverScopedDeliveryOutcome
+        ) throws -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            deliveryBatchCalls += 1
+            guard outcome == .sentUnknown else { return false }
+            var invocationIDs: [String] = []
+            for confirmation in confirmations {
+                guard let invocationID = records.first(where: { _, record in
+                    record.capability == confirmation.capability
+                        && confirmation.idempotencyKey == record.context.invocationID
+                        && context.workspaceID == record.context.workspaceID
+                        && context.projectID == record.context.projectID
+                        && context.threadID == record.context.threadID
+                        && context.provider == record.context.provider
+                        && context.attemptID == record.context.attemptID
+                        && record.state == .prepared
+                        && record.outcome == .notSent
+                })?.key else { return false }
+                invocationIDs.append(invocationID)
+            }
+            guard Set(invocationIDs).count == invocationIDs.count else { return false }
+            if failNextDeliveryBatch {
+                failNextDeliveryBatch = false
+                return false
+            }
+            for invocationID in invocationIDs {
+                guard var record = records[invocationID] else { return false }
+                record.state = .delivered
+                record.outcome = outcome
+                records[invocationID] = record
+            }
+            return true
+        }
+
         func ack(capability: String, idempotencyKey: String, context: TokenSaverRecoveryRequestContext) throws -> Bool { true }
 
         var preparedOperationIDs: [String] {
@@ -96,6 +135,16 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
             lock.lock(); defer { lock.unlock() }
             guard let record = records[invocationID] else { return nil }
             return .init(state: record.state, transportOutcome: record.outcome)
+        }
+
+        func injectOneDeliveryBatchFailure() {
+            lock.lock(); defer { lock.unlock() }
+            failNextDeliveryBatch = true
+        }
+
+        var deliveryBatchCallCount: Int {
+            lock.lock(); defer { lock.unlock() }
+            return deliveryBatchCalls
         }
     }
     /// In-memory CCR store for the HTTP boundary test (no Persistence dependency).
@@ -533,6 +582,73 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         XCTAssertEqual(echoed.output, delivered)
         XCTAssertEqual(store.invocationState(invocationID)?.state, .delivered)
         XCTAssertEqual(store.invocationState(invocationID)?.transportOutcome, .sentUnknown)
+    }
+
+    func test_chunkedDeliveryConfirmationIsAtomicAndRetryable() async throws {
+        // WHY: stdout is already delivered before this ledger request. A failure
+        // on member two must not terminalize member one and poison the retry.
+        let store = InMemoryScopedStore()
+        let contextOne = TokenSaverRecoveryRequestContext(
+            workspaceID: "workspace", projectID: "project", threadID: "thread",
+            provider: "codex", attemptID: "attempt", operationID: "first-op",
+            invocationID: "first-invocation"
+        )
+        let contextTwo = TokenSaverRecoveryRequestContext(
+            workspaceID: "workspace", projectID: "project", threadID: "thread",
+            provider: "codex", attemptID: "attempt", operationID: "second-op",
+            invocationID: "second-invocation"
+        )
+        let first = try store.prepareOriginal(
+            Data("first exact original".utf8), context: contextOne, lane: "command_output"
+        )
+        let second = try store.prepareOriginal(
+            Data("second exact original".utf8), context: contextTwo, lane: "command_output"
+        )
+        let server = DistillHTTPServer(
+            configuration: try .init(authToken: "batch-token", appSupportDirectory: NSTemporaryDirectory()),
+            scheduler: DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: store
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        let delivered = "compressed\n[[rc:\(first.capability)]]\n[[rc:\(second.capability)]]"
+        let confirmation = DistillRequest(
+            mode: .commandOutput,
+            input: String(repeating: "large original line\n", count: 100),
+            provider: "codex",
+            recordSavings: true,
+            precomputedOutput: delivered,
+            precomputedRouteStage: .deterministic,
+            precomputedRecoveryConfirmations: [
+                .init(capability: first.capability, idempotencyKey: first.idempotencyKey),
+                .init(capability: second.capability, idempotencyKey: second.idempotencyKey),
+            ]
+        )
+        let headers = recoveryHeaders(invocationID: "ledger-invocation", operationID: "ledger-op")
+
+        store.injectOneDeliveryBatchFailure()
+        let failed = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "batch-token",
+            body: try JSONEncoder().encode(confirmation),
+            headers: headers
+        )
+        XCTAssertEqual(failed.status, 409)
+        XCTAssertEqual(store.invocationState(contextOne.invocationID)?.state, .prepared)
+        XCTAssertEqual(store.invocationState(contextTwo.invocationID)?.state, .prepared)
+
+        let retried = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "batch-token",
+            body: try JSONEncoder().encode(confirmation),
+            headers: headers
+        )
+        XCTAssertEqual(retried.status, 200)
+        XCTAssertEqual(store.invocationState(contextOne.invocationID)?.state, .delivered)
+        XCTAssertEqual(store.invocationState(contextTwo.invocationID)?.state, .delivered)
+        XCTAssertEqual(store.deliveryBatchCallCount, 2)
     }
 
     func test_scopedUnchangedCandidateLeavesNoRecoveryRecord() async throws {

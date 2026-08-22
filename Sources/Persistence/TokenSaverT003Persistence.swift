@@ -101,6 +101,9 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
     /// Test seam only: when true, `finalizeSemanticRecoverySet` fails after the first
     /// member mutates and before the second, forcing a full SQLite rollback.
     public static var testInjectFailureBetweenSemanticFinalizationMembers: Bool = false
+    /// Test seam only: force an atomic delivery batch to abort after its first
+    /// member update so rollback and a clean retry can be proven.
+    public static var testInjectFailureBetweenDeliveryMembers: Bool = false
 
     public init(db: SQLiteDB) {
         self.db = db
@@ -389,6 +392,97 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
             outcome: outcome,
             now: now
         )
+    }
+
+    /// Atomically transitions every recovery object represented in one delivered
+    /// provider payload. No prefix of a chunked result may become terminal while
+    /// a later member remains prepared.
+    public func markDeliveredBatch(
+        _ members: [TokenSaverSemanticRecoveryMember],
+        scope: TokenSaverPersistentScope,
+        outcome: TokenSaverRecoveryTransportOutcome,
+        now: Date = Date()
+    ) throws -> Bool {
+        guard scope.isComplete,
+              !members.isEmpty,
+              outcome == .sentUnknown || outcome == .acked else {
+            return false
+        }
+        let normalized = members.map { member in
+            TokenSaverSemanticRecoveryMember(
+                capability: member.capability,
+                idempotencyKey: member.idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        guard normalized.allSatisfy({
+            $0.capability.hasPrefix("rcv1.") && !$0.idempotencyKey.isEmpty
+        }) else {
+            return false
+        }
+        let identities = normalized.map {
+            "\($0.capability.utf8.count)|\($0.capability)|\($0.idempotencyKey.utf8.count)|\($0.idempotencyKey)"
+        }
+        guard Set(identities).count == identities.count else { return false }
+        let nowMS = Self.milliseconds(now)
+
+        enum BatchAbort: Error {
+            case deny
+            case updateMismatch
+            case injectedFailure
+        }
+
+        do {
+            return try db.performSync { database in
+                try database.transaction {
+                    var authorized: [(objectID: String, idempotencyKey: String)] = []
+                    authorized.reserveCapacity(normalized.count)
+                    for member in normalized {
+                        guard let objectID = try self.authorizedObjectID(
+                            database: database,
+                            capability: member.capability,
+                            scope: scope,
+                            nowMS: nowMS
+                        ),
+                        try self.outboxMatches(
+                            database: database,
+                            objectID: objectID,
+                            idempotencyKey: member.idempotencyKey,
+                            state: .prepared,
+                            transportOutcome: .notSent
+                        ) else {
+                            throw BatchAbort.deny
+                        }
+                        authorized.append((objectID, member.idempotencyKey))
+                    }
+                    guard Set(authorized.map { $0.objectID }).count == authorized.count else {
+                        throw BatchAbort.deny
+                    }
+
+                    for (index, member) in authorized.enumerated() {
+                        guard try self.applyOutboxAndObjectTransition(
+                            database: database,
+                            objectID: member.objectID,
+                            idempotencyKey: member.idempotencyKey,
+                            expectedState: .prepared,
+                            expectedOutcome: .notSent,
+                            nextState: .delivered,
+                            nextOutcome: outcome,
+                            nowMS: nowMS
+                        ) else {
+                            throw BatchAbort.updateMismatch
+                        }
+                        if index == 0,
+                           authorized.count > 1,
+                           Self.testInjectFailureBetweenDeliveryMembers {
+                            throw BatchAbort.injectedFailure
+                        }
+                    }
+                    return true
+                }
+            }
+        } catch BatchAbort.deny, BatchAbort.updateMismatch, BatchAbort.injectedFailure {
+            return false
+        }
     }
 
     public func ack(

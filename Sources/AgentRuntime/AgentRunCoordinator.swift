@@ -1105,7 +1105,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// exact UI callback run and is removed at that run's terminal cleanup.
     private var distillReceiptRunScopes: [AgentRunID: DistillReceiptRunScope] = [:]
     private var distillReceiptVerifiers: [AgentRunID: DistillAppliedReceiptStreamVerifier] = [:]
+    private struct DistillReceiptItemIdentity: Hashable {
+        let turnId: String
+        let itemId: String
+    }
+    /// The latest turn owning each provider item id remains known through run
+    /// cleanup so late deltas cannot mutate bytes after host attestation. A new
+    /// itemStarted in another turn intentionally moves the id to that turn.
     private var distillReceiptItemTurnIDs: [AgentRunID: [String: String]] = [:]
+    private var authenticatedDistillReceiptItems: [AgentRunID: Set<DistillReceiptItemIdentity>] = [:]
     private var authenticatedFinalReceiptTexts: [AgentRunID: (sourceDigest: Data, stripped: String)] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
     private var latestTokenUsage: [AgentRunID: AssistantTokenUsage] = [:]
@@ -2181,6 +2189,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 distillReceiptVerifiers.removeValue(forKey: runId)
             }
             distillReceiptItemTurnIDs.removeValue(forKey: runId)
+            authenticatedDistillReceiptItems.removeValue(forKey: runId)
             authenticatedFinalReceiptTexts.removeValue(forKey: runId)
         }
 
@@ -2212,6 +2221,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 distillReceiptRunScopes.removeValue(forKey: runId)
                 distillReceiptVerifiers.removeValue(forKey: runId)
                 distillReceiptItemTurnIDs.removeValue(forKey: runId)
+                authenticatedDistillReceiptItems.removeValue(forKey: runId)
                 authenticatedFinalReceiptTexts.removeValue(forKey: runId)
             }
             markStartFailure(
@@ -3370,6 +3380,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             || distillReceiptRunScopes[runId] != nil
             || distillReceiptVerifiers[runId] != nil
             || distillReceiptItemTurnIDs[runId] != nil
+            || authenticatedDistillReceiptItems[runId] != nil
             || authenticatedFinalReceiptTexts[runId] != nil
             || deferredProviderTerminalEvents[runId] != nil
             || finishingRuns.contains(runId)
@@ -3478,6 +3489,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         distillReceiptRunScopes.removeValue(forKey: runId)
         distillReceiptVerifiers.removeValue(forKey: runId)
         distillReceiptItemTurnIDs.removeValue(forKey: runId)
+        authenticatedDistillReceiptItems.removeValue(forKey: runId)
         authenticatedFinalReceiptTexts.removeValue(forKey: runId)
         deferredProviderTerminalEvents.removeValue(forKey: runId)
         deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
@@ -5389,6 +5401,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 distillReceiptVerifiers.removeValue(forKey: recoveryEventRunId)
             }
             distillReceiptItemTurnIDs.removeValue(forKey: recoveryEventRunId)
+            authenticatedDistillReceiptItems.removeValue(forKey: recoveryEventRunId)
             authenticatedFinalReceiptTexts.removeValue(forKey: recoveryEventRunId)
         }
         do {
@@ -5400,6 +5413,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 distillReceiptRunScopes.removeValue(forKey: recoveryEventRunId)
                 distillReceiptVerifiers.removeValue(forKey: recoveryEventRunId)
                 distillReceiptItemTurnIDs.removeValue(forKey: recoveryEventRunId)
+                authenticatedDistillReceiptItems.removeValue(forKey: recoveryEventRunId)
                 authenticatedFinalReceiptTexts.removeValue(forKey: recoveryEventRunId)
             }
             throw error
@@ -5804,13 +5818,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return text
         }
         let authenticated = lock.withLock { () -> Bool in
-            guard var verifier = distillReceiptVerifiers[runId] else { return false }
-            let result = verifier.authenticateStandalone(
+            guard let verifier = distillReceiptVerifiers[runId] else { return false }
+            return verifier.validatesStandaloneForSanitization(
                 text,
                 scope: receiptScope.verifierScope
             )
-            distillReceiptVerifiers[runId] = verifier
-            return result
         }
         guard authenticated else { return text }
         let stripped = DistillAppliedReceipt.strip(text)
@@ -5844,16 +5856,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         switch event {
         case .itemStarted(let item):
             let providerItem = item.withoutHostMetadata()
-            let hasScope = lock.withLock { distillReceiptRunScopes[runId] != nil }
-            if hasScope {
-                lock.withLock {
-                    var verifier = distillReceiptVerifiers[runId]
-                        ?? DistillAppliedReceiptStreamVerifier()
-                    verifier.startItem(id: item.id, body: item.body, output: item.output)
-                    distillReceiptVerifiers[runId] = verifier
-                    distillReceiptItemTurnIDs[runId, default: [:]][item.id] = item.turnId
+            let shouldAccept = lock.withLock { () -> Bool in
+                guard distillReceiptRunScopes[runId] != nil else { return true }
+                let identity = DistillReceiptItemIdentity(turnId: item.turnId, itemId: item.id)
+                guard authenticatedDistillReceiptItems[runId]?.contains(identity) != true else {
+                    return false
                 }
+                var verifier = distillReceiptVerifiers[runId]
+                    ?? DistillAppliedReceiptStreamVerifier()
+                verifier.startItem(id: item.id, body: item.body, output: item.output)
+                distillReceiptVerifiers[runId] = verifier
+                distillReceiptItemTurnIDs[runId, default: [:]][item.id] = item.turnId
+                return true
             }
+            guard shouldAccept else { return [] }
             var prepared = [PreparedAssistantEvent(
                 event: .itemStarted(item: providerItem),
                 hostMetadataTrusted: false
@@ -5872,11 +5888,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return prepared
 
         case .itemDelta(let itemId, let bodyAppend, let outputAppend, let summary):
-            lock.withLock {
-                guard var verifier = distillReceiptVerifiers[runId] else { return }
+            let shouldAccept = lock.withLock { () -> Bool in
+                if let turnId = distillReceiptItemTurnIDs[runId]?[itemId],
+                   authenticatedDistillReceiptItems[runId]?.contains(
+                       DistillReceiptItemIdentity(turnId: turnId, itemId: itemId)
+                   ) == true {
+                    return false
+                }
+                guard var verifier = distillReceiptVerifiers[runId] else { return true }
                 verifier.append(itemID: itemId, body: bodyAppend, output: outputAppend)
                 distillReceiptVerifiers[runId] = verifier
+                return true
             }
+            guard shouldAccept else { return [] }
             return [PreparedAssistantEvent(
                 event: .itemDelta(
                     itemId: itemId,
@@ -5915,7 +5939,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     verifier.endTurn()
                     distillReceiptVerifiers[runId] = verifier
                 }
-                distillReceiptItemTurnIDs.removeValue(forKey: runId)
             }
             return [PreparedAssistantEvent(event: event, hostMetadataTrusted: false)]
 
@@ -5930,9 +5953,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     ) -> String? {
         guard let receiptScope = lock.withLock({ distillReceiptRunScopes[runId] }),
               receiptScope.isCurrentlyActive else {
-            lock.withLock {
-                distillReceiptItemTurnIDs[runId]?.removeValue(forKey: itemID)
-            }
             return nil
         }
         return lock.withLock {
@@ -5942,8 +5962,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 scope: receiptScope.verifierScope
             )
             distillReceiptVerifiers[runId] = verifier
-            let turnId = distillReceiptItemTurnIDs[runId]?.removeValue(forKey: itemID)
-            return applied ? turnId : nil
+            guard applied, let turnId = distillReceiptItemTurnIDs[runId]?[itemID] else {
+                return nil
+            }
+            let identity = DistillReceiptItemIdentity(turnId: turnId, itemId: itemID)
+            return authenticatedDistillReceiptItems[runId, default: []].insert(identity).inserted
+                ? turnId
+                : nil
         }
     }
 
@@ -7073,6 +7098,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             distillReceiptRunScopes.removeValue(forKey: runId)
             distillReceiptVerifiers.removeValue(forKey: runId)
             distillReceiptItemTurnIDs.removeValue(forKey: runId)
+            authenticatedDistillReceiptItems.removeValue(forKey: runId)
             authenticatedFinalReceiptTexts.removeValue(forKey: runId)
             latestRunErrorMessages.removeValue(forKey: runId)
             finishingRuns.remove(runId)

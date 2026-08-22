@@ -133,6 +133,16 @@ package struct DistillAppliedReceiptStreamVerifier: Sendable {
         return consume(nonce)
     }
 
+    /// Verifies terminal display bytes without minting receipt authority. A
+    /// provider commonly repeats its completed assistant item as turnCompleted;
+    /// the first copy consumes the nonce for the badge, while the byte-identical
+    /// terminal copy still needs its authenticated marker removed from the UI.
+    package func validatesStandaloneForSanitization(_ text: String, scope: Scope) -> Bool {
+        var channel = Channel()
+        channel.append(text)
+        return channel.verifiedNonce(scope: scope) != nil
+    }
+
     package mutating func endTurn() {
         items.removeAll(keepingCapacity: true)
         itemOrder.removeAll(keepingCapacity: true)

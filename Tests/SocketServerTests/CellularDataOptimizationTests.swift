@@ -383,7 +383,7 @@ final class CellularDataOptimizationTests: XCTestCase {
         )
         XCTAssertEqual(
             EventStreamFilter.cellularSafe().coalescingKey(for: event),
-            "agent.item.delta:thread-3:item-9"
+            "agent.item.delta:8:thread-3:6:item-9:no-turn"
         )
         XCTAssertTrue(EventStreamFilter.cellularSafe().coalescingMergesByConcatenation(for: event))
         XCTAssertNil(EventStreamFilter.full.coalescingKey(for: event),
@@ -402,6 +402,23 @@ final class CellularDataOptimizationTests: XCTestCase {
             EventStreamFilter.cellularSafe().coalescingKey(for: missingThread),
             "a legacy delta without thread_id must stay uncoalesced instead of borrowing item identity"
         )
+
+        let hostMetadata = EventBus.Event(
+            seq: 3,
+            kind: "agent.item.delta",
+            payload: .object([
+                "thread_id": .string("thread-3"),
+                "turn_id": .string("turn-1"),
+                "item_id": .string("item-9"),
+                "distill_applied": .bool(true),
+            ]),
+            ts: 0
+        )
+        XCTAssertNotEqual(
+            EventStreamFilter.cellularSafe().coalescingKey(for: event),
+            EventStreamFilter.cellularSafe().coalescingKey(for: hostMetadata),
+            "host attestation must not coalesce with an item id reused outside its exact turn"
+        )
     }
 
     func test_C16_agentItemDeltaMerge_requiresSameThreadAndOrsDistillApplied() throws {
@@ -412,6 +429,7 @@ final class CellularDataOptimizationTests: XCTestCase {
             threadId: String?,
             body: String,
             distillApplied: Bool?,
+            turnId: String? = nil,
             summary: String? = nil,
             progress: Double? = nil
         ) throws -> Data {
@@ -420,6 +438,7 @@ final class CellularDataOptimizationTests: XCTestCase {
                 "body_append": body,
             ]
             if let threadId { payload["thread_id"] = threadId }
+            if let turnId { payload["turn_id"] = turnId }
             if let distillApplied { payload["distill_applied"] = distillApplied }
             if let summary { payload["summary"] = summary }
             if let progress { payload["progress"] = progress }
@@ -436,10 +455,17 @@ final class CellularDataOptimizationTests: XCTestCase {
             threadId: "thread-a",
             body: "A",
             distillApplied: true,
+            turnId: "turn-a",
             summary: "working",
             progress: 0.25
         )
-        let laterFalse = try frame(seq: 2, threadId: "thread-a", body: "B", distillApplied: false)
+        let laterFalse = try frame(
+            seq: 2,
+            threadId: "thread-a",
+            body: "B",
+            distillApplied: false,
+            turnId: "turn-a"
+        )
         let merged = try XCTUnwrap(
             WebSocketEventBatcher.mergeAgentItemDeltaFrames(trusted, laterFalse)
         )
@@ -459,6 +485,7 @@ final class CellularDataOptimizationTests: XCTestCase {
             threadId: "thread-a",
             body: "C",
             distillApplied: nil,
+            turnId: "turn-a",
             summary: "done",
             progress: 1
         )
@@ -474,7 +501,13 @@ final class CellularDataOptimizationTests: XCTestCase {
                        "the latest explicit progress value remains last-write-wins")
         XCTAssertEqual(completedPayload["distill_applied"] as? Bool, true)
 
-        let otherThread = try frame(seq: 4, threadId: "thread-b", body: "X", distillApplied: nil)
+        let otherThread = try frame(
+            seq: 4,
+            threadId: "thread-b",
+            body: "X",
+            distillApplied: nil,
+            turnId: "turn-a"
+        )
         XCTAssertNil(
             WebSocketEventBatcher.mergeAgentItemDeltaFrames(completed, otherThread),
             "matching item_id values from different threads must never merge"
@@ -484,6 +517,17 @@ final class CellularDataOptimizationTests: XCTestCase {
         XCTAssertNil(
             WebSocketEventBatcher.mergeAgentItemDeltaFrames(trusted, missingThread),
             "a missing thread_id must fail safe and remain independently deliverable"
+        )
+
+        let missingTurn = try frame(
+            seq: 6,
+            threadId: "thread-a",
+            body: "later turn",
+            distillApplied: nil
+        )
+        XCTAssertNil(
+            WebSocketEventBatcher.mergeAgentItemDeltaFrames(trusted, missingTurn),
+            "turn-scoped host truth must remain a separate frame from ordinary deltas"
         )
     }
 

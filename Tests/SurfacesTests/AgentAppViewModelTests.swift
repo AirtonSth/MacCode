@@ -4966,10 +4966,10 @@ final class AgentAppViewModelTests: XCTestCase {
                        "when persisted history is thinner, the provider snapshot fills it in")
     }
 
-    func test_chooseReplayCarriesHostDistillTruthByTurnAndItemOccurrence() {
+    func test_chooseReplayCarriesHostDistillTruthByUniqueProviderItemIdentity() {
         // WHY: provider item IDs may repeat across turns and adapter snapshots
-        // can use different turn IDs. When the richer snapshot replaces local
-        // replay, matching globally by itemId badges the wrong occurrence.
+        // can use different turn IDs. A stable item timestamp distinguishes the
+        // provider occurrence without trusting turn ordinal alone.
         let persisted: [AssistantEvent] = [
             .turnStarted(turnId: "persisted-first"),
             .itemStarted(item: AssistantItem(id: "shared", turnId: "persisted-first", type: .tool, startedAtMs: 1)),
@@ -5000,6 +5000,45 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(timeline.turns[1].items[1].distillApplied, true,
                        "host truth must follow the matching id/type occurrence inside the paired turn")
         XCTAssertNil(timeline.turns[2].items[0].distillApplied)
+    }
+
+    func test_chooseReplayRetainsPersistedHostTruthWhenSnapshotMappingIsAmbiguous() {
+        // WHY: a richer provider snapshot may insert or reorder turns. If two
+        // snapshot items claim the same provider identity, no target is safe.
+        let persisted: [AssistantEvent] = [
+            .turnStarted(turnId: "persisted"),
+            .itemStarted(item: AssistantItem(id: "shared", turnId: "persisted", type: .tool, startedAtMs: 7)),
+            .itemHostMetadata(turnId: "persisted", itemId: "shared", distillApplied: true)
+        ]
+        let snapshot: [AssistantEvent] = [
+            .turnStarted(turnId: "inserted-leading"),
+            .itemStarted(item: AssistantItem(id: "shared", turnId: "inserted-leading", type: .tool, startedAtMs: 7)),
+            .turnStarted(turnId: "reordered-match"),
+            .itemStarted(item: AssistantItem(id: "shared", turnId: "reordered-match", type: .tool, startedAtMs: 7))
+        ]
+
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: snapshot)
+        let timeline = AgentAppViewModel.timelineByReplaying(chosen)
+
+        XCTAssertEqual(chosen, persisted,
+                       "ambiguous provider replay must retain the authoritative persisted source")
+        XCTAssertEqual(timeline.turns[0].items[0].distillApplied, true)
+    }
+
+    func test_chooseReplayRejectsProviderOwnedHostMetadata() {
+        // WHY: snapshot/parser events are provider-owned and may not mint the
+        // host-only badge even when local persisted history is empty.
+        let snapshot: [AssistantEvent] = [
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "snapshot", type: .tool, startedAtMs: 1
+            )),
+            .itemHostMetadata(turnId: "snapshot", itemId: "tool", distillApplied: true)
+        ]
+
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: [], snapshot: snapshot)
+        let timeline = AgentAppViewModel.timelineByReplaying(chosen)
+
+        XCTAssertNil(timeline.turns[0].items[0].distillApplied)
     }
 
     func test_chooseReplayFallsBackToPersistedWhenNoSnapshot() {

@@ -456,10 +456,13 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         let rightThread = rightPayload["thread_id"] as? String
         let leftItem = leftPayload["item_id"] as? String
         let rightItem = rightPayload["item_id"] as? String
+        let leftTurn = leftPayload["turn_id"] as? String
+        let rightTurn = rightPayload["turn_id"] as? String
         guard let leftThread,
               leftThread == rightThread,
               let leftItem,
-              leftItem == rightItem else { return nil }
+              leftItem == rightItem,
+              leftTurn == rightTurn else { return nil }
 
         for field in ["body_append", "output_append", "text"] {
             let a = leftPayload[field] as? String ?? ""

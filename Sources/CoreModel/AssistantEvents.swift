@@ -1393,19 +1393,25 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 if pendingMetadata != nil { pendingItemDeltaOrder.removeAll { $0 == metadataKey } }
                 if let itemIndex = turns[idx].items.firstIndex(where: { $0.id == item.id }) {
                     let existing = turns[idx].items[itemIndex]
-                    var merged = item
-                    // Provider/parser item payloads never mint trust. Preserve only
-                    // an already host-attested value from the local timeline.
-                    merged.distillApplied = existing.distillApplied == true ? true : nil
-                    if merged.body.isEmpty { merged.body = existing.body }
-                    if merged.output == nil { merged.output = existing.output }
-                    if merged.progress == nil { merged.progress = existing.progress }
-                    if merged.summary == nil { merged.summary = existing.summary }
-                    if merged.finishedAtMs == nil { merged.finishedAtMs = existing.finishedAtMs }
-                    if merged.state == .streaming, existing.state != .streaming { merged.state = existing.state }
-                    applyPendingDelta(pending, to: &merged)
-                    applyPendingDelta(pendingMetadata, to: &merged)
-                    turns[idx].items[itemIndex] = merged
+                    if existing.distillApplied == true {
+                        // Host attestation binds to the exact terminal bytes. A
+                        // duplicate provider snapshot must not replace them.
+                        turns[idx].items[itemIndex] = existing
+                    } else {
+                        var merged = item
+                        // Provider/parser item payloads never mint trust. Preserve only
+                        // an already host-attested value from the local timeline.
+                        merged.distillApplied = nil
+                        if merged.body.isEmpty { merged.body = existing.body }
+                        if merged.output == nil { merged.output = existing.output }
+                        if merged.progress == nil { merged.progress = existing.progress }
+                        if merged.summary == nil { merged.summary = existing.summary }
+                        if merged.finishedAtMs == nil { merged.finishedAtMs = existing.finishedAtMs }
+                        if merged.state == .streaming, existing.state != .streaming { merged.state = existing.state }
+                        applyPendingDelta(pending, to: &merged)
+                        applyPendingDelta(pendingMetadata, to: &merged)
+                        turns[idx].items[itemIndex] = merged
+                    }
                 } else {
                     var started = item
                     started.distillApplied = nil
@@ -1420,6 +1426,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
         case .itemDelta(let iid, let bodyAppend, let outputAppend, let summary):
             let applied = mutateItem(iid) { item in
+                guard item.distillApplied != true else { return }
                 if let b = bodyAppend {
                     Self.appendCapped(&item.body, append: b, limit: Self.liveTextLimit)
                 }

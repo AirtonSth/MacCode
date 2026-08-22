@@ -93,11 +93,28 @@ public protocol TokenSaverScopedRecoveryStoring: Sendable {
     func prepareOriginal(_ data: Data, context: TokenSaverRecoveryRequestContext, lane: String) throws -> TokenSaverScopedPreparation
     func retrieveOriginal(capability: String, context: TokenSaverRecoveryRequestContext) throws -> Data?
     func markDelivered(capability: String, idempotencyKey: String, context: TokenSaverRecoveryRequestContext, outcome: TokenSaverScopedDeliveryOutcome) throws -> Bool
+    func markDeliveredBatch(confirmations: [DistillRecoveryDeliveryConfirmation], context: TokenSaverRecoveryRequestContext, outcome: TokenSaverScopedDeliveryOutcome) throws -> Bool
     func ack(capability: String, idempotencyKey: String, context: TokenSaverRecoveryRequestContext) throws -> Bool
 }
 
 public extension TokenSaverScopedRecoveryStoring {
     func lookupInvocation(context: TokenSaverRecoveryRequestContext) throws -> TokenSaverScopedInvocationState? { nil }
+
+    /// Stores without an atomic batch primitive may safely confirm one member.
+    /// Multi-member delivery fails closed before any mutation.
+    func markDeliveredBatch(
+        confirmations: [DistillRecoveryDeliveryConfirmation],
+        context: TokenSaverRecoveryRequestContext,
+        outcome: TokenSaverScopedDeliveryOutcome
+    ) throws -> Bool {
+        guard confirmations.count == 1, let confirmation = confirmations.first else { return false }
+        return try markDelivered(
+            capability: confirmation.capability,
+            idempotencyKey: confirmation.idempotencyKey,
+            context: context,
+            outcome: outcome
+        )
+    }
 }
 
 public struct DistillStatsProviderSavings: Codable, Sendable, Equatable {
@@ -1462,23 +1479,20 @@ public final class DistillHTTPServer: @unchecked Sendable {
                         )
                         return
                     }
-                    for confirmation in confirmations {
-                        guard (try? scopedRecoveryStore.markDelivered(
-                            capability: confirmation.capability,
-                            idempotencyKey: confirmation.idempotencyKey,
+                    guard (try? scopedRecoveryStore.markDeliveredBatch(
+                            confirmations: confirmations,
                             context: context,
                             outcome: .sentUnknown
                         )) == true else {
-                            send(
-                                status: 409,
-                                body: ErrorBody(
-                                    error: "recovery_delivery_confirmation_failed",
-                                    message: "scoped recovery confirmation was not recorded"
-                                ),
-                                connection: connection
-                            )
-                            return
-                        }
+                        send(
+                            status: 409,
+                            body: ErrorBody(
+                                error: "recovery_delivery_confirmation_failed",
+                                message: "scoped recovery confirmation was not recorded"
+                            ),
+                            connection: connection
+                        )
+                        return
                     }
                 }
                 if distillRequest.mode == .commandOutput, response.output != distillRequest.input {

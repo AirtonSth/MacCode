@@ -765,6 +765,14 @@ public final class EventBus: @unchecked Sendable {
     }
 }
 
+enum AgentItemDeltaCoalescingIdentity {
+    static func key(threadID: String, itemID: String, turnID: String?) -> String {
+        let base = "agent.item.delta:\(threadID.utf8.count):\(threadID):\(itemID.utf8.count):\(itemID)"
+        guard let turnID else { return base + ":no-turn" }
+        return base + ":turn:\(turnID.utf8.count):\(turnID)"
+    }
+}
+
 public enum EventStreamFilter: Sendable, Equatable {
     case full
     /// Cellular volume filter. Optional interest thread ids drop high-volume
@@ -869,7 +877,11 @@ public enum EventStreamFilter: Sendable, Equatable {
         if event.kind == "agent.item.delta",
            let threadID = payload["thread_id"]?.stringValue,
            let itemID = payload["item_id"]?.stringValue {
-            return "\(event.kind):\(threadID):\(itemID)"
+            return AgentItemDeltaCoalescingIdentity.key(
+                threadID: threadID,
+                itemID: itemID,
+                turnID: payload["turn_id"]?.stringValue
+            )
         }
         return nil
     }

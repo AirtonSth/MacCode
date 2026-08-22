@@ -120,6 +120,47 @@ final class TokenSaverDistillReceiptCoordinatorTests: XCTestCase {
         XCTAssertEqual(timeline.turns.first?.items.first?.distillApplied, true)
     }
 
+    func test_authenticatedTerminalItemRejectsLateProviderMutationForEveryProvider() async throws {
+        // WHY: once the host attests exact bytes, duplicate snapshots and late
+        // deltas from any provider must not retain the badge on different text.
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let fixture = try ReceiptCoordinatorFixture.make(
+                provider: provider,
+                scenario: .authenticatedThenLateMutation
+            )
+            defer { fixture.cleanUp() }
+
+            _ = try await fixture.coordinator.startRun(.init(
+                threadId: fixture.thread.id,
+                provider: provider,
+                model: "receipt-test",
+                cwd: fixture.root.path,
+                prompt: "exercise terminal mutation rejection"
+            ))
+
+            let events = fixture.observer.recordedEvents
+            XCTAssertEqual(events.filter {
+                if case .itemStarted(let item) = $0, item.id == "tool-item" { return true }
+                return false
+            }.count, 1, "\(provider.rawValue) must drop the duplicate terminal snapshot")
+            XCTAssertEqual(events.filter {
+                if case .itemDelta(let itemId, _, _, _) = $0, itemId == "tool-item" { return true }
+                return false
+            }.count, 1, "\(provider.rawValue) must drop the late unsigned delta")
+
+            fixture.runner.finish()
+            var timeline = AssistantTimelineState()
+            for event in fixture.coordinator.latestStreamEvents(threadId: fixture.thread.id) {
+                timeline.apply(event)
+            }
+            let item = try XCTUnwrap(timeline.turns.first?.items.first)
+            XCTAssertEqual(item.body, "distill build output")
+            XCTAssertFalse(item.output?.contains("unsigned replacement") == true)
+            XCTAssertFalse(item.output?.contains("late unsigned output") == true)
+            XCTAssertEqual(item.distillApplied, true)
+        }
+    }
+
     func test_offTransitionAndWorldReadableStateFailOpenWithoutBadge() async throws {
         // WHY: receipt authority ends immediately when Token Saver turns Off,
         // and a state secret exposed to group/other users is never trusted.
@@ -231,6 +272,7 @@ private struct ReceiptCoordinatorFixture {
 private final class ReceiptCoordinatorRunner: AgentProviderRunner, @unchecked Sendable {
     enum Scenario: CustomStringConvertible {
         case authenticated
+        case authenticatedThenLateMutation
         case completedStartAuthenticated
         case wrongRootWithForgedMetadata
         case removeStateBeforeCompletion
@@ -239,6 +281,7 @@ private final class ReceiptCoordinatorRunner: AgentProviderRunner, @unchecked Se
         var description: String {
             switch self {
             case .authenticated: "authenticated"
+            case .authenticatedThenLateMutation: "authenticated-late-mutation"
             case .completedStartAuthenticated: "completed-start"
             case .wrongRootWithForgedMetadata: "wrong-root"
             case .removeStateBeforeCompletion: "off-transition"
@@ -272,7 +315,7 @@ private final class ReceiptCoordinatorRunner: AgentProviderRunner, @unchecked Se
         switch scenario {
         case .wrongRootWithForgedMetadata:
             signedRoot = UUID().uuidString
-        case .authenticated, .completedStartAuthenticated,
+        case .authenticated, .authenticatedThenLateMutation, .completedStartAuthenticated,
              .removeStateBeforeCompletion, .worldReadableState:
             signedRoot = root
         }
@@ -325,6 +368,24 @@ private final class ReceiptCoordinatorRunner: AgentProviderRunner, @unchecked Se
             try? FileManager.default.removeItem(atPath: path)
         }
         onEvent(.event(.itemCompleted(itemId: "tool-item", finalState: .completed)))
+        if scenario == .authenticatedThenLateMutation {
+            onEvent(.event(.itemStarted(item: AssistantItem(
+                id: "tool-item",
+                turnId: "receipt-turn",
+                type: .commandExecution,
+                state: .completed,
+                body: "unsigned replacement",
+                output: "unsigned replacement",
+                startedAtMs: 3,
+                finishedAtMs: 4
+            ))))
+            onEvent(.event(.itemDelta(
+                itemId: "tool-item",
+                bodyAppend: " late unsigned body",
+                outputAppend: " late unsigned output",
+                summary: "late unsigned summary"
+            )))
+        }
         return AgentRunHandle(runId: request.runId, process: nil) {}
     }
 

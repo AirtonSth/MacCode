@@ -536,6 +536,60 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         XCTAssertEqual(payloads[2]["text"] as? String, "legacy")
     }
 
+    func test_coalesceApplicationFrames_keepsTurnScopedDistillTruthSeparateFromReusedItemID() throws {
+        // WHY: a provider may reuse an item id in another turn. The host-only
+        // attestation must remain its own turn-scoped reducer frame instead of
+        // being OR-carried onto ordinary or later-turn content.
+        let trusted = try eventJSON(
+            seq: 1,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-a",
+                "turn_id": "turn-a",
+                "item_id": "shared",
+                "distill_applied": true,
+            ]
+        )
+        let ordinary = try eventJSON(
+            seq: 2,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-a",
+                "item_id": "shared",
+                "text": "new turn content",
+            ]
+        )
+        let otherTurn = try eventJSON(
+            seq: 3,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-a",
+                "turn_id": "turn-b",
+                "item_id": "shared",
+                "distill_applied": false,
+            ]
+        )
+
+        let frames = WebSocketOutboundQueue.coalesceApplicationFrames([
+            trusted,
+            ordinary,
+            otherTurn,
+        ])
+
+        XCTAssertEqual(frames.count, 3)
+        let payloads = try frames.map { frame -> [String: Any] in
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: frame) as? [String: Any]
+            )
+            return try XCTUnwrap(object["payload"] as? [String: Any])
+        }
+        XCTAssertEqual(payloads[0]["turn_id"] as? String, "turn-a")
+        XCTAssertEqual(payloads[0]["distill_applied"] as? Bool, true)
+        XCTAssertNil(payloads[1]["distill_applied"])
+        XCTAssertEqual(payloads[1]["text"] as? String, "new turn content")
+        XCTAssertEqual(payloads[2]["turn_id"] as? String, "turn-b")
+    }
+
     func test_degradePreservesControlFramesWhileSheddingBulk() throws {
         // WHY: Coalescing/shedding must never drop pong/close control frames.
         // Losing a pong under pressure kills a healthy session and weakens the

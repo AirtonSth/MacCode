@@ -1019,6 +1019,24 @@ private struct SidecarScopedRecoveryStore: TokenSaverScopedRecoveryStoring {
         )
     }
 
+    func markDeliveredBatch(
+        confirmations: [DistillRecoveryDeliveryConfirmation],
+        context: TokenSaverRecoveryRequestContext,
+        outcome: TokenSaverScopedDeliveryOutcome
+    ) throws -> Bool {
+        let mapped = TokenSaverRecoveryTransportOutcome(rawValue: outcome.rawValue) ?? .failed
+        return try store.markDeliveredBatch(
+            confirmations.map {
+                TokenSaverSemanticRecoveryMember(
+                    capability: $0.capability,
+                    idempotencyKey: $0.idempotencyKey
+                )
+            },
+            scope: scope(context),
+            outcome: mapped
+        )
+    }
+
     func ack(capability: String, idempotencyKey: String, context: TokenSaverRecoveryRequestContext) throws -> Bool {
         try store.ack(capability: capability, scope: scope(context), idempotencyKey: idempotencyKey)
     }

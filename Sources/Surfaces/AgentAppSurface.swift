@@ -2562,49 +2562,62 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// Provider snapshots can be richer than local replay, but cannot recreate
-    /// host-owned attestations. Carry those by structural occurrence so reused
-    /// provider item IDs never badge a different turn.
+    /// host-owned attestations. Carry those only when one snapshot item uniquely
+    /// matches the persisted provider identity; ambiguous/reordered replay fails
+    /// closed instead of badging a different turn.
     nonisolated private static func snapshotPreservingPersistedHostMetadata(
         _ snapshot: [AssistantEvent],
         persisted: [AssistantEvent]
     ) -> [AssistantEvent] {
+        let providerSnapshot = snapshot.filter { event in
+            if case .itemHostMetadata = event { return false }
+            return true
+        }
         guard persisted.contains(where: { event in
             if case .itemHostMetadata(_, _, let applied) = event { return applied == true }
             return false
-        }) else { return snapshot }
+        }) else { return providerSnapshot }
         let persistedTimeline = timelineByReplaying(persisted)
-        let snapshotTimeline = timelineByReplaying(snapshot)
-        var merged = snapshot
-        let turnCount = min(persistedTimeline.turns.count, snapshotTimeline.turns.count)
-        for turnIndex in 0..<turnCount {
-            let persistedTurn = persistedTimeline.turns[turnIndex]
-            let snapshotTurn = snapshotTimeline.turns[turnIndex]
-            var persistedOrdinals: [String: Int] = [:]
-            var snapshotItemsByIdentity: [String: [AssistantItem]] = [:]
+        let snapshotTimeline = timelineByReplaying(providerSnapshot)
+        var merged = providerSnapshot
+        var snapshotItemsByIdentity: [String: [(turnId: String, item: AssistantItem)]] = [:]
+        for snapshotTurn in snapshotTimeline.turns {
             for item in snapshotTurn.items {
-                snapshotItemsByIdentity[replayItemIdentity(item), default: []].append(item)
-            }
-            for persistedItem in persistedTurn.items {
-                let identity = replayItemIdentity(persistedItem)
-                let ordinal = persistedOrdinals[identity, default: 0]
-                persistedOrdinals[identity] = ordinal + 1
-                guard persistedItem.distillApplied == true,
-                      let matches = snapshotItemsByIdentity[identity],
-                      matches.indices.contains(ordinal),
-                      matches[ordinal].distillApplied != true else { continue }
-                let snapshotItem = matches[ordinal]
-                merged.append(.itemHostMetadata(
+                snapshotItemsByIdentity[replayItemIdentity(item), default: []].append((
                     turnId: snapshotTurn.turnId,
-                    itemId: snapshotItem.id,
-                    distillApplied: true
+                    item: item
                 ))
             }
+        }
+        let persistedTrustedItems = persistedTimeline.turns
+            .flatMap(\.items)
+            .filter { $0.distillApplied == true }
+        let persistedIdentityCounts = Dictionary(
+            grouping: persistedTrustedItems,
+            by: replayItemIdentity
+        ).mapValues(\.count)
+        for persistedItem in persistedTrustedItems {
+            let identity = replayItemIdentity(persistedItem)
+            guard persistedIdentityCounts[identity] == 1,
+                  let matches = snapshotItemsByIdentity[identity],
+                  matches.count == 1,
+                  let match = matches.first else {
+                // A richer snapshot is not worth losing or moving durable host
+                // truth. Keep the exact persisted replay when correlation is not
+                // a one-to-one mapping.
+                return persisted
+            }
+            merged.append(.itemHostMetadata(
+                turnId: match.turnId,
+                itemId: match.item.id,
+                distillApplied: true
+            ))
         }
         return merged
     }
 
     nonisolated private static func replayItemIdentity(_ item: AssistantItem) -> String {
-        "\(item.id.utf8.count)|\(item.id)|\(item.type.rawValue)"
+        "\(item.id.utf8.count)|\(item.id)|\(item.type.rawValue)|\(item.startedAtMs)"
     }
 
     nonisolated static func renderableItemCount(_ events: [AssistantEvent]) -> Int {
