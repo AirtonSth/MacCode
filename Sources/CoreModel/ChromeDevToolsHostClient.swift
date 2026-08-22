@@ -37,9 +37,15 @@ public enum ChromeDevToolsHostClientError: Error, Equatable, LocalizedError, Cus
 /// fall back to an active tab or an application-focus change.
 public enum BrowserBackgroundUnsupported: Error, Equatable, LocalizedError, CustomStringConvertible {
     case unsupported
+    case protocolError(String)
 
     public var description: String {
-        "Chrome cannot provide a safe background browser target."
+        switch self {
+        case .unsupported:
+            return "Chrome cannot provide a safe background browser target."
+        case .protocolError(let message):
+            return "Chrome rejected the safe background browser target: \(message)"
+        }
     }
 
     public var errorDescription: String? { description }
@@ -114,10 +120,12 @@ public struct ChromeDevToolsTarget: Equatable, Sendable {
 public struct ChromeDevToolsPageState: Equatable, Sendable {
     public let url: String
     public let title: String
+    public let isReady: Bool
 
-    public init(url: String, title: String) {
+    public init(url: String, title: String, isReady: Bool = false) {
         self.url = url
         self.title = title
+        self.isReady = isReady
     }
 }
 
@@ -223,20 +231,23 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
             parameters: ["url": trimmed],
             target: target
         )
-        return ChromeDevToolsPageState(url: trimmed, title: title ?? "")
+        return ChromeDevToolsPageState(url: trimmed, title: title ?? "", isReady: false)
     }
 
     /// Reads page state through Runtime.evaluate; no tab activation is needed.
     public func state(botID: BotID) throws -> ChromeDevToolsPageState {
         let target = try target(for: botID)
         let value = try evaluate(
-            "(() => ({ url: String(location.href), title: String(document.title) }))()",
+            "(() => ({ url: String(location.href), title: String(document.title), ready: document.readyState === 'complete' }))()",
             target: target
         )
         guard let url = value["url"] as? String, let title = value["title"] as? String else {
             throw ChromeDevToolsHostClientError.protocolError("page state result is malformed")
         }
-        return ChromeDevToolsPageState(url: url, title: title)
+        // Readiness is a safety boundary for callers that settle navigation.
+        // An incomplete injected/protocol result must never look ready.
+        let isReady = value["ready"] as? Bool ?? false
+        return ChromeDevToolsPageState(url: url, title: title, isReady: isReady)
     }
 
     /// Takes a DOM snapshot and scopes every returned ref to this target and
@@ -362,21 +373,22 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
                     "url": "about:blank",
                     "browserContextId": browserContextID,
                     "background": true,
-                    "hidden": true,
-                    "newWindow": false,
-                    "focus": false
+                    "hidden": true
                 ],
                 webSocketURL: endpoint.browserWebSocketURL
             )
         } catch let error as BrowserBackgroundUnsupported {
             throw error
         } catch let error as ChromeDevToolsHostClientError {
-            if case .protocolError = error {
-                throw BrowserBackgroundUnsupported.unsupported
+            if case .protocolError(let message) = error {
+                throw BrowserBackgroundUnsupported.protocolError(message)
             }
             throw error
         } catch {
             throw BrowserBackgroundUnsupported.unsupported
+        }
+        if let protocolError = Self.backgroundProtocolError(in: creation) {
+            throw protocolError
         }
         guard let result = creation["result"] as? [String: Any],
               let targetID = result["targetId"] as? String,
@@ -430,12 +442,15 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
         } catch let error as BrowserBackgroundUnsupported {
             throw error
         } catch let error as ChromeDevToolsHostClientError {
-            if case .protocolError = error {
-                throw BrowserBackgroundUnsupported.unsupported
+            if case .protocolError(let message) = error {
+                throw BrowserBackgroundUnsupported.protocolError(message)
             }
             throw error
         } catch {
             throw BrowserBackgroundUnsupported.unsupported
+        }
+        if let protocolError = Self.backgroundProtocolError(in: creation) {
+            throw protocolError
         }
         guard let result = creation["result"] as? [String: Any],
               let contextID = result["browserContextId"] as? String,
@@ -449,6 +464,16 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
         }
         browserContexts[botID] = contextID
         return contextID
+    }
+
+    private static func backgroundProtocolError(in response: [String: Any]) -> BrowserBackgroundUnsupported? {
+        guard let error = response["error"] as? [String: Any] else { return nil }
+        let code = error["code"] as? Int
+        let message = error["message"] as? String ?? "unknown CDP error"
+        if let code {
+            return .protocolError("code=\(code), message=\(message)")
+        }
+        return .protocolError("message=\(message)")
     }
 
     private func send(

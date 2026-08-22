@@ -142,6 +142,26 @@ public final class ManagedChromeHostBrowserBridge: BotBrowserBridging, @unchecke
         }
     }
 
+    /// Stops every app-owned Chrome process and waits for its process seam to
+    /// report exit. This is intentionally scoped to this bridge's private
+    /// sessions; it cannot affect the user's Chrome profile or focus.
+    @discardableResult
+    func shutdown(timeout: TimeInterval = 5) -> Bool {
+        let processes: [any ManagedChromeHostProcess] = queue.sync {
+            let processes = sessions.values.map { $0.process }
+            sessions.removeAll()
+            processes.forEach { $0.terminate() }
+            return processes
+        }
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        for process in processes {
+            while process.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        return processes.allSatisfy { !$0.isRunning }
+    }
+
     /// One stable app-owned profile per app-support root, shared by all Bots.
     public static func profileDirectory(appSupport: URL) -> URL {
         appSupport
@@ -365,10 +385,10 @@ public final class ManagedChromeHostBrowserBridge: BotBrowserBridging, @unchecke
         let attempts = max(0, Int(ceil(navigationTimeout / max(interval, 0.001))))
         var page = try client.state(botID: botID)
         let expected = expectedURL?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let expected, !expected.isEmpty else { return page }
         let prior = priorURL?.trimmingCharacters(in: .whitespacesAndNewlines)
         func settled(_ candidate: ChromeDevToolsPageState) -> Bool {
-            guard !candidate.url.isEmpty else { return false }
+            guard candidate.isReady, !candidate.url.isEmpty else { return false }
+            guard let expected, !expected.isEmpty else { return true }
             if candidate.url == expected { return true }
             let baseline = (prior?.isEmpty == false ? prior! : "about:blank")
             return candidate.url != baseline

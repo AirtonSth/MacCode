@@ -1,4 +1,5 @@
 import XCTest
+import ScreenCaptureKit
 @testable import CoreModel
 
 final class ComputerUseNativeHostBackendTests: XCTestCase {
@@ -34,6 +35,150 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertFalse(result.isError)
         XCTAssertEqual(result.content.last?.type, "image")
         XCTAssertEqual(probe.captureCalls, 1)
+    }
+
+    func testQuartzFallbackCaptureIsReturnedAsSingleExactImageRead() async throws {
+        let probe = Probe()
+        probe.captureFallback = true
+        let backend = makeBackend(probe: probe)
+
+        let result = await backend.invoke(
+            name: "screenshot",
+            arguments: ["target_pid": 17, "target_window_id": 29]
+        )
+
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(result.content.last?.type, "image")
+        XCTAssertEqual(probe.captureCalls, 1, "a fallback capture must not be retried for token generation")
+        let metadata = try XCTUnwrap(result.content.first?.text)
+        XCTAssertTrue(metadata.contains("\"target_pid\":17"))
+        XCTAssertTrue(metadata.contains("\"target_window_id\":29"))
+        XCTAssertFalse(metadata.contains(probe.captureData), "observation metadata must not expose captured pixels")
+    }
+
+    func testQuartzFallbackValidationFailsClosedForDriftMissingSymbolAndFailedImage() {
+        let target = ComputerUseNativeHostTarget(pid: 17, windowID: 29)
+        let before = ComputerUseNativeHostBackend.NativePlatform.QuartzWindowSnapshot(
+            pid: target.pid,
+            windowID: target.windowID,
+            isOnScreen: true,
+            bounds: .init(x: 10, y: 20, width: 640, height: 480)
+        )
+        let drifted = ComputerUseNativeHostBackend.NativePlatform.QuartzWindowSnapshot(
+            pid: target.pid,
+            windowID: target.windowID,
+            isOnScreen: true,
+            bounds: .init(x: 11, y: 20, width: 640, height: 480)
+        )
+
+        XCTAssertEqual(
+            ComputerUseNativeHostBackend.NativePlatform.quartzFallbackValidationFailure(
+                target: target,
+                before: before,
+                symbolAvailable: true,
+                imageSize: .init(width: 640, height: 480),
+                after: drifted
+            ),
+            "window_identity_or_bounds_drifted_after"
+        )
+        XCTAssertEqual(
+            ComputerUseNativeHostBackend.NativePlatform.quartzFallbackValidationFailure(
+                target: target,
+                before: before,
+                symbolAvailable: false,
+                imageSize: nil,
+                after: nil
+            ),
+            "quartz_fallback_symbol_unavailable"
+        )
+        XCTAssertEqual(
+            ComputerUseNativeHostBackend.NativePlatform.quartzFallbackValidationFailure(
+                target: target,
+                before: before,
+                symbolAvailable: true,
+                imageSize: nil,
+                after: nil
+            ),
+            "quartz_fallback_image_unavailable"
+        )
+    }
+
+    func testQuartzFallbackOnlyHandlesScreenCaptureInternalError() {
+        XCTAssertTrue(
+            ComputerUseNativeHostBackend.NativePlatform.allowsQuartzFallback(
+                domain: SCStreamErrorDomain,
+                code: -3811
+            )
+        )
+        XCTAssertFalse(
+            ComputerUseNativeHostBackend.NativePlatform.allowsQuartzFallback(
+                domain: SCStreamErrorDomain,
+                code: -3801
+            )
+        )
+        XCTAssertFalse(
+            ComputerUseNativeHostBackend.NativePlatform.allowsQuartzFallback(
+                domain: "other.domain",
+                code: -3811
+            )
+        )
+    }
+
+    func testAXWindowArrayRejectsWrongCoreFoundationElementTypes() {
+        let malformedWindows = NSArray(object: "not-an-AXUIElement") as CFArray
+        XCTAssertNil(
+            ComputerUseNativeHostBackend.NativePlatform.axElements(from: malformedWindows),
+            "AX window resolution must fail closed when the AXWindows CFArray contains a wrong type"
+        )
+    }
+
+    func testAXTitleFallbackRequiresUniqueQuartzTargetTitle() {
+        let target = ComputerUseNativeHostTarget(pid: 17, windowID: 29)
+        func window(_ id: UInt32, title: String) -> ComputerUseNativeWindow {
+            ComputerUseNativeWindow(
+                target: .init(pid: 17, windowID: id),
+                title: title,
+                bundleIdentifier: "com.example.fixture",
+                isOnScreen: true,
+                isMinimized: false,
+                bounds: CGRect(x: 20, y: 30, width: 640, height: 480)
+            )
+        }
+
+        XCTAssertFalse(
+            ComputerUseNativeHostBackend.NativePlatform.quartzTitleUniquelyIdentifiesTarget(
+                "Fixture",
+                target: target,
+                windows: [window(29, title: "Fixture"), window(30, title: "Fixture")]
+            ),
+            "a title-only AX match must fail closed when Quartz has another same-PID window with that title"
+        )
+        XCTAssertTrue(
+            ComputerUseNativeHostBackend.NativePlatform.quartzTitleUniquelyIdentifiesTarget(
+                "Fixture",
+                target: target,
+                windows: [window(29, title: "Fixture"), window(30, title: "Other")]
+            )
+        )
+    }
+
+    func testCaptureFailureReturnsDiagnosticWithoutPixels() async throws {
+        let probe = Probe()
+        probe.captureFailure = "screenshot_manager_test_failure"
+        let backend = makeBackend(probe: probe)
+
+        let result = await backend.invoke(
+            name: "screenshot",
+            arguments: ["target_pid": 17, "target_window_id": 29]
+        )
+
+        XCTAssertTrue(result.isError)
+        let text = try XCTUnwrap(result.content.first?.text)
+        XCTAssertTrue(text.contains("capture_unavailable"))
+        XCTAssertTrue(text.contains("capture_failure: screenshot_manager_test_failure"))
+        XCTAssertEqual(result.content.count, 1, "capture failures must not emit an image content part")
+        XCTAssertEqual(probe.captureCalls, 1, "a failed capture must not be retried for token generation")
+        XCTAssertFalse(text.contains(probe.captureData), "diagnostics must not expose captured pixels")
     }
 
     func test_staleStateTokenExecutesNoMutation() async throws {
@@ -296,6 +441,21 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertEqual(probe.uiTreeCalls, 1, "get_ui_tree must hash and return the same single AX traversal")
     }
 
+    func testSemanticCapabilityRequiresExactTargetAXResolution() async throws {
+        let probe = Probe()
+        probe.axTargetAvailable = false
+        let backend = makeBackend(probe: probe)
+
+        let result = await backend.invoke(
+            name: "doctor",
+            arguments: ["target_pid": 17, "target_window_id": 29]
+        )
+
+        let text = try XCTUnwrap(result.content.first?.text)
+        XCTAssertTrue(probe.accessibilityPermission, "the regression requires global Accessibility permission")
+        XCTAssertFalse(text.contains("semantic_ax"), "global permission must not advertise AX when this target cannot resolve")
+    }
+
     func testSemanticAXActionCanMutateBackgroundTarget() async throws {
         let probe = Probe()
         let backend = makeBackend(probe: probe)
@@ -342,10 +502,20 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
             userActivity: { _ in probe.nextActivity() },
             activityMonitorAvailable: { probe.activityMonitorAvailable },
             accessibilityPermission: { probe.accessibilityPermission },
+            axTargetAvailable: { _ in probe.axTargetAvailable },
             screenCapturePermission: { probe.screenCapturePermission },
             capture: { _ in
                 probe.captureCalls += 1
-                return probe.isMinimized ? nil : .init(data: probe.captureData, mimeType: "image/png")
+                if probe.isMinimized {
+                    return .unavailable("minimized")
+                }
+                if let failure = probe.captureFailure {
+                    return .unavailable(failure)
+                }
+                if probe.captureFallback {
+                    return .quartzFallback(.init(data: probe.captureData, mimeType: "image/png"))
+                }
+                return .success(.init(data: probe.captureData, mimeType: "image/png"))
             },
             uiTree: { _ in
                 probe.uiTreeCalls += 1
@@ -380,6 +550,7 @@ private final class Probe: @unchecked Sendable {
     private var activityIndex = 0
     var activityMonitorAvailable = true
     var accessibilityPermission = true
+    var axTargetAvailable = true
     var screenCapturePermission = true
     var isMinimized = false
     var semanticMutations = 0
@@ -392,6 +563,8 @@ private final class Probe: @unchecked Sendable {
     var uiTree: String? = "{\"role\":\"AXWindow\",\"title\":\"RemoteCode\"}"
     var uiTreeCalls = 0
     var captureData = "cGl4ZWxz"
+    var captureFailure: String?
+    var captureFallback = false
 
     var window: ComputerUseNativeWindow {
         lock.lock(); defer { lock.unlock() }

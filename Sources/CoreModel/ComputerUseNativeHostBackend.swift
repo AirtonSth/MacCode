@@ -55,6 +55,12 @@ public struct ComputerUseNativeCapture: Sendable, Equatable {
     }
 }
 
+public enum ComputerUseNativeCaptureResult: Sendable, Equatable {
+    case success(ComputerUseNativeCapture)
+    case quartzFallback(ComputerUseNativeCapture)
+    case unavailable(String)
+}
+
 public enum ComputerUseNativeUserActivity: String, Sendable, Equatable {
     case none
     case human
@@ -192,8 +198,9 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         public var userActivity: @Sendable (ComputerUseNativeHostTarget) -> ComputerUseNativeUserActivity
         public var activityMonitorAvailable: @Sendable () -> Bool
         public var accessibilityPermission: @Sendable () -> Bool
+        public var axTargetAvailable: @Sendable (ComputerUseNativeHostTarget) -> Bool
         public var screenCapturePermission: @Sendable () -> Bool
-        public var capture: @Sendable (ComputerUseNativeHostTarget) async -> ComputerUseNativeCapture?
+        public var capture: @Sendable (ComputerUseNativeHostTarget) async -> ComputerUseNativeCaptureResult
         public var uiTree: @Sendable (ComputerUseNativeHostTarget) -> String?
         public var semanticAction: @Sendable (ComputerUseNativeHostTarget, String, String) -> Bool
         public var leftClick: @Sendable (ComputerUseNativeHostTarget, [Double]) -> Bool
@@ -214,10 +221,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             accessibilityPermission: @escaping @Sendable () -> Bool = {
                 NativePlatform.accessibilityPermission()
             },
+            axTargetAvailable: @escaping @Sendable (ComputerUseNativeHostTarget) -> Bool = {
+                NativePlatform.axTargetAvailable(target: $0)
+            },
             screenCapturePermission: @escaping @Sendable () -> Bool = {
                 NativePlatform.screenCapturePermission()
             },
-            capture: @escaping @Sendable (ComputerUseNativeHostTarget) async -> ComputerUseNativeCapture? = {
+            capture: @escaping @Sendable (ComputerUseNativeHostTarget) async -> ComputerUseNativeCaptureResult = {
                 await NativePlatform.capture(target: $0)
             },
             uiTree: @escaping @Sendable (ComputerUseNativeHostTarget) -> String? = {
@@ -241,6 +251,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             self.userActivity = userActivity
             self.activityMonitorAvailable = activityMonitorAvailable
             self.accessibilityPermission = accessibilityPermission
+            self.axTargetAvailable = axTargetAvailable
             self.screenCapturePermission = screenCapturePermission
             self.capture = capture
             self.uiTree = uiTree
@@ -298,17 +309,31 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         switch name {
         case "screenshot", "zoom":
             let capture: ComputerUseNativeCapture?
+            let captureFailure: String?
             if hooks.screenCapturePermission(), window.isOnScreen, !window.isMinimized {
-                capture = await hooks.capture(target)
+                switch await hooks.capture(target) {
+                case .success(let image), .quartzFallback(let image):
+                    capture = image
+                    captureFailure = nil
+                case .unavailable(let reason):
+                    capture = nil
+                    captureFailure = reason
+                }
             } else {
                 capture = nil
+                captureFailure = nil
             }
             let observation = await makeObservation(
                 window: window,
                 kind: .pixel,
-                content: capture?.data
+                content: capture?.data ?? "<pixels-unavailable>"
             )
-            return captureResult(observation: observation, image: capture, arguments: arguments)
+            return captureResult(
+                observation: observation,
+                image: capture,
+                failureReason: captureFailure,
+                arguments: arguments
+            )
         case "doctor":
             let observation = await makeObservation(window: window, kind: .semantic)
             return ComputerUseToolResult(text: encodeObservation(observation))
@@ -356,9 +381,10 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         let accessibility = hooks.accessibilityPermission()
         let screenCapture = hooks.screenCapturePermission()
         let renderable = screenCapture && window.isOnScreen && !window.isMinimized
+        let semanticAXAvailable = accessibility && hooks.axTargetAvailable(window.target)
         var capabilities = ["observe", "targeted"]
         if renderable { capabilities.append("window_capture") }
-        if accessibility { capabilities.append("semantic_ax") }
+        if semanticAXAvailable { capabilities.append("semantic_ax") }
         let activity = hooks.userActivity(window.target)
         let observedContent: String
         switch kind {
@@ -367,8 +393,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         case .pixel:
             if let content {
                 observedContent = content
-            } else if renderable, let capture = await hooks.capture(window.target) {
-                observedContent = capture.data
+            } else if renderable {
+                switch await hooks.capture(window.target) {
+                case .success(let capture), .quartzFallback(let capture):
+                    observedContent = capture.data
+                case .unavailable:
+                    observedContent = "<pixels-unavailable>"
+                }
             } else {
                 observedContent = "<pixels-unavailable>"
             }
@@ -398,6 +429,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     private func captureResult(
         observation: ComputerUseNativeHostObservation,
         image: ComputerUseNativeCapture?,
+        failureReason: String?,
         arguments: [String: Any]
     ) -> ComputerUseToolResult {
         guard observation.screenCapturePermission,
@@ -406,7 +438,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return failure(.pixel_target_not_renderable, encodeObservation(observation))
         }
         guard let image else {
-            return failure(.capture_unavailable, encodeObservation(observation))
+            let diagnostic = failureReason.map { "\n capture_failure: \($0)" } ?? ""
+            return failure(.capture_unavailable, encodeObservation(observation) + diagnostic)
         }
         _ = arguments
         return ComputerUseToolResult(content: [
@@ -463,7 +496,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             }
             return ComputerUseToolResult(text: "native left click applied\n\(encodeObservation(freshObservation))")
         case "click_element":
-            guard freshObservation.accessibilityPermission else {
+            guard freshObservation.accessibilityPermission,
+                  freshObservation.capabilities.contains("semantic_ax") else {
                 return failure(.permission_required, encodeObservation(freshObservation))
             }
             let role = arguments["role"] as? String ?? ""
@@ -478,7 +512,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return failure(.activation_forbidden, encodeObservation(freshObservation))
         case "type":
             let text = arguments["text"] as? String ?? ""
-            guard !text.isEmpty, hooks.typeText(target, text) else {
+            guard freshObservation.capabilities.contains("semantic_ax"),
+                  !text.isEmpty, hooks.typeText(target, text) else {
                 return failure(.focus_required, encodeObservation(freshObservation))
             }
             return ComputerUseToolResult(text: "native background typing applied\n\(encodeObservation(freshObservation))")
@@ -608,6 +643,64 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     }
 
     public enum NativePlatform {
+        private enum CaptureImageFailure: Error, CustomStringConvertible {
+            case screenshotManager(domain: String, code: Int, description: String)
+            case quartzFallback(String)
+
+            var allowsQuartzFallback: Bool {
+                switch self {
+                case .screenshotManager(let domain, let code, _):
+                    return NativePlatform.allowsQuartzFallback(domain: domain, code: code)
+                case .quartzFallback:
+                    return false
+                }
+            }
+
+            var description: String {
+                switch self {
+                case .screenshotManager(_, _, let value):
+                    return value
+                case .quartzFallback(let value):
+                    return value
+                }
+            }
+        }
+
+        static func allowsQuartzFallback(domain: String, code: Int) -> Bool {
+            domain == SCStreamErrorDomain && code == -3811
+        }
+
+        struct QuartzWindowSnapshot: Equatable {
+            let pid: Int32
+            let windowID: UInt32
+            let isOnScreen: Bool
+            let bounds: CGRect
+
+            init(pid: Int32, windowID: UInt32, isOnScreen: Bool, bounds: CGRect) {
+                self.pid = pid
+                self.windowID = windowID
+                self.isOnScreen = isOnScreen
+                self.bounds = bounds
+            }
+        }
+
+        private typealias QuartzWindowImageFunction = @convention(c) (
+            CGRect,
+            CGWindowListOption,
+            CGWindowID,
+            CGWindowImageOption
+        ) -> CGImage?
+
+        private static let quartzWindowImageFunction: QuartzWindowImageFunction? = {
+            guard let symbol = dlsym(
+                UnsafeMutableRawPointer(bitPattern: -2),
+                "CGWindowListCreateImage"
+            ) else {
+                return nil
+            }
+            return unsafeBitCast(symbol, to: QuartzWindowImageFunction.self)
+        }()
+
         public static func listWindows(bundleID: String?) -> [ComputerUseNativeWindow] {
             let infos = CGWindowListCopyWindowInfo(
                 [.optionAll, .excludeDesktopElements],
@@ -638,6 +731,20 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
 
         public static func accessibilityPermission() -> Bool {
             AXIsProcessTrusted()
+        }
+
+        public static func axTargetAvailable(target: ComputerUseNativeHostTarget) -> Bool {
+            AXIsProcessTrusted() && exactAXWindow(target: target) != nil
+        }
+
+        static func quartzTitleUniquelyIdentifiesTarget(
+            _ title: String?,
+            target: ComputerUseNativeHostTarget,
+            windows: [ComputerUseNativeWindow]
+        ) -> Bool {
+            guard let title, !title.isEmpty else { return false }
+            let matches = windows.filter { $0.target.pid == target.pid && $0.title == title }
+            return matches.count == 1 && matches[0].target == target
         }
 
         public static func screenCapturePermission() -> Bool {
@@ -809,25 +916,173 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             activityTap.start()
         }
 
-        public static func capture(target: ComputerUseNativeHostTarget) async -> ComputerUseNativeCapture? {
-            guard let content = await shareableContent(),
-                  let window = content.windows.first(where: { $0.windowID == CGWindowID(target.windowID) }),
-                  window.isOnScreen else {
-                return nil
+        public static func capture(target: ComputerUseNativeHostTarget) async -> ComputerUseNativeCaptureResult {
+            guard let content = await shareableContent() else {
+                return .unavailable("shareable_content_unavailable")
+            }
+            guard let window = content.windows.first(where: {
+                $0.windowID == CGWindowID(target.windowID)
+                    && $0.owningApplication?.processID == target.pid
+            }) else {
+                return .unavailable("target_window_unavailable")
+            }
+            guard window.isOnScreen else {
+                return .unavailable("target_window_off_screen")
             }
             let filter = SCContentFilter(desktopIndependentWindow: window)
             let configuration = SCStreamConfiguration()
-            configuration.width = max(Int(filter.contentRect.width * CGFloat(filter.pointPixelScale)), 1)
-            configuration.height = max(Int(filter.contentRect.height * CGFloat(filter.pointPixelScale)), 1)
+            let width = Int(filter.contentRect.width * CGFloat(filter.pointPixelScale))
+            let height = Int(filter.contentRect.height * CGFloat(filter.pointPixelScale))
+            guard width > 0, height > 0 else {
+                return .unavailable("target_window_empty_content_rect")
+            }
+            configuration.width = width
+            configuration.height = height
             configuration.showsCursor = false
-            guard let image = await captureImage(filter: filter, configuration: configuration) else {
+            let imageResult: Result<CGImage, CaptureImageFailure>
+            let usedQuartzFallback: Bool
+            switch await captureImage(filter: filter, configuration: configuration) {
+            case .success(let image):
+                imageResult = .success(image)
+                usedQuartzFallback = false
+            case .failure(let reason) where reason.allowsQuartzFallback:
+                imageResult = quartzWindowImage(target: target, after: reason)
+                usedQuartzFallback = true
+            case .failure(let reason):
+                return .unavailable(reason.description)
+            }
+            switch imageResult {
+            case .success(let image):
+                let bitmap = NSBitmapImageRep(cgImage: image)
+                guard let data = bitmap.representation(using: NSBitmapImageRep.FileType.png, properties: [:]) else {
+                    return .unavailable("png_encoding_failed")
+                }
+                let capture = ComputerUseNativeCapture(data: data.base64EncodedString(), mimeType: "image/png")
+                return usedQuartzFallback ? .quartzFallback(capture) : .success(capture)
+            case .failure(let reason):
+                return .unavailable(reason.description)
+            }
+        }
+
+        private static func quartzWindowImage(
+            target: ComputerUseNativeHostTarget,
+            after screenCaptureFailure: CaptureImageFailure
+        ) -> Result<CGImage, CaptureImageFailure> {
+            guard let before = quartzWindowSnapshot(target: target) else {
+                return .failure(.quartzFallback("window_identity_or_bounds_invalid_before_\(screenCaptureFailure.description)"))
+            }
+            guard let imageFunction = quartzWindowImageFunction else {
+                let reason = quartzFallbackValidationFailure(
+                    target: target,
+                    before: before,
+                    symbolAvailable: false,
+                    imageSize: nil,
+                    after: nil
+                ) ?? "quartz_fallback_symbol_unavailable"
+                return .failure(.quartzFallback("\(reason)_after_\(screenCaptureFailure.description)"))
+            }
+            guard let image = imageFunction(
+                .null,
+                [.optionIncludingWindow],
+                CGWindowID(target.windowID),
+                [.boundsIgnoreFraming, .bestResolution]
+            ) else {
+                let reason = quartzFallbackValidationFailure(
+                    target: target,
+                    before: before,
+                    symbolAvailable: true,
+                    imageSize: nil,
+                    after: nil
+                ) ?? "quartz_fallback_image_unavailable"
+                return .failure(.quartzFallback("\(reason)_after_\(screenCaptureFailure.description)"))
+            }
+            let after = quartzWindowSnapshot(target: target)
+            if let reason = quartzFallbackValidationFailure(
+                target: target,
+                before: before,
+                symbolAvailable: true,
+                imageSize: .init(width: image.width, height: image.height),
+                after: after
+            ) {
+                return .failure(.quartzFallback("\(reason)_after_\(screenCaptureFailure.description)"))
+            }
+            return .success(image)
+        }
+
+        static func quartzFallbackValidationFailure(
+            target: ComputerUseNativeHostTarget,
+            before: QuartzWindowSnapshot?,
+            symbolAvailable: Bool,
+            imageSize: CGSize?,
+            after: QuartzWindowSnapshot?
+        ) -> String? {
+            guard let before,
+                  before.pid == target.pid,
+                  before.windowID == target.windowID,
+                  before.isOnScreen,
+                  before.bounds.width > 0,
+                  before.bounds.height > 0,
+                  before.bounds.origin.x.isFinite,
+                  before.bounds.origin.y.isFinite,
+                  before.bounds.width.isFinite,
+                  before.bounds.height.isFinite else {
+                return "window_identity_or_bounds_invalid_before"
+            }
+            guard symbolAvailable else {
+                return "quartz_fallback_symbol_unavailable"
+            }
+            guard let imageSize,
+                  imageSize.width > 0,
+                  imageSize.height > 0 else {
+                return "quartz_fallback_image_unavailable"
+            }
+            guard let after,
+                  after == before,
+                  after.pid == target.pid,
+                  after.windowID == target.windowID,
+                  after.isOnScreen,
+                  after.bounds.width > 0,
+                  after.bounds.height > 0,
+                  after.bounds.origin.x.isFinite,
+                  after.bounds.origin.y.isFinite,
+                  after.bounds.width.isFinite,
+                  after.bounds.height.isFinite else {
+                return "window_identity_or_bounds_drifted_after"
+            }
+            return nil
+        }
+
+        private static func quartzWindowSnapshot(
+            target: ComputerUseNativeHostTarget
+        ) -> QuartzWindowSnapshot? {
+            let windowID = CGWindowID(target.windowID)
+            let infos = (CGWindowListCopyWindowInfo(
+                [.optionIncludingWindow],
+                windowID
+            ) as? [[String: Any]]) ?? []
+            guard infos.count == 1,
+                  let info = infos.first,
+                  let number = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  number == target.windowID,
+                  pid == target.pid,
+                  (info[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue == true,
+                  let dictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: dictionary),
+                  bounds.width > 0,
+                  bounds.height > 0,
+                  bounds.origin.x.isFinite,
+                  bounds.origin.y.isFinite,
+                  bounds.width.isFinite,
+                  bounds.height.isFinite else {
                 return nil
             }
-            let bitmap = NSBitmapImageRep(cgImage: image)
-            guard let data = bitmap.representation(using: .png, properties: [:]) else {
-                return nil
-            }
-            return ComputerUseNativeCapture(data: data.base64EncodedString(), mimeType: "image/png")
+            return QuartzWindowSnapshot(
+                pid: pid,
+                windowID: number,
+                isOnScreen: true,
+                bounds: bounds
+            )
         }
 
         private static func shareableContent() async -> SCShareableContent? {
@@ -844,14 +1099,22 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         private static func captureImage(
             filter: SCContentFilter,
             configuration: SCStreamConfiguration
-        ) async -> CGImage? {
-            await withCheckedContinuation { continuation in
-                SCScreenshotManager.captureImage(
+        ) async -> Result<CGImage, CaptureImageFailure> {
+            do {
+                return .success(try await SCScreenshotManager.captureImage(
                     contentFilter: filter,
                     configuration: configuration
-                ) { image, _ in
-                    continuation.resume(returning: image)
-                }
+                ))
+            } catch {
+                let nsError = error as NSError
+                let reason = String(describing: error)
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .prefix(256)
+                return .failure(.screenshotManager(
+                    domain: nsError.domain,
+                    code: nsError.code,
+                    description: String(reason)
+                ))
             }
         }
 
@@ -967,7 +1230,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return false
         }
 
-        private static func attribute(_ attribute: CFString, from element: AXUIElement) -> Any? {
+        private static func attribute(_ attribute: CFString, from element: AXUIElement) -> CFTypeRef? {
             var value: CFTypeRef?
             guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else { return nil }
             return value
@@ -975,43 +1238,82 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
 
         private static func elementAttribute(_ key: CFString, from element: AXUIElement) -> AXUIElement? {
             guard let value = attribute(key, from: element) else { return nil }
-            return unsafeBitCast(value, to: AXUIElement.self)
+            return axElement(from: value)
         }
 
         private static func valueAttribute(_ key: CFString, from element: AXUIElement) -> AXValue? {
             guard let value = attribute(key, from: element) else { return nil }
-            return unsafeBitCast(value, to: AXValue.self)
+            guard CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+            let pointer = Unmanaged.passUnretained(value).toOpaque()
+            return Unmanaged<AXValue>.fromOpaque(pointer).takeUnretainedValue()
         }
 
         private static func exactAXWindow(target: ComputerUseNativeHostTarget) -> AXUIElement? {
-            guard let bounds = targetBounds(target) else { return nil }
-            let app = AXUIElementCreateApplication(target.pid)
-            guard let windows = attribute(kAXWindowsAttribute as CFString, from: app) as? [AXUIElement] else {
+            let quartzWindows = listWindows(bundleID: nil)
+            guard let targetQuartzWindow = quartzWindows.first(where: { $0.target == target }) else {
                 return nil
             }
+            let bounds = targetQuartzWindow.bounds
+            let targetTitle: String? = targetQuartzWindow.title
+            let app = AXUIElementCreateApplication(target.pid)
+            guard let windows = attribute(kAXWindowsAttribute as CFString, from: app)
+                    .flatMap(axElements(from:)) else { return nil }
             let frameMatches = windows.filter { matches($0, bounds: bounds) }
-            guard frameMatches.count != 0 else { return nil }
             if frameMatches.count == 1 { return frameMatches[0] }
 
             // Multiple AX windows can report the same frame (for example a
             // sheet and its owner). A frame alone is not an exact identity;
             // use the Quartz title only when it disambiguates exactly one
             // candidate, and otherwise fail closed.
-            guard let title = listWindows(bundleID: nil)
-                .first(where: { $0.target == target })?.title,
-                  !title.isEmpty else { return nil }
+            guard let title = targetTitle, !title.isEmpty else { return nil }
+            guard quartzTitleUniquelyIdentifiesTarget(title, target: target, windows: quartzWindows) else {
+                return nil
+            }
             let titleMatches = frameMatches.filter {
                 (attribute(kAXTitleAttribute as CFString, from: $0) as? String) == title
             }
-            return titleMatches.count == 1 ? titleMatches[0] : nil
+            if titleMatches.count == 1 { return titleMatches[0] }
+
+            // Some macOS 26 targets expose AXWindows but temporarily reject
+            // AXPosition/AXSize while the display is asleep. A unique title
+            // is still an exact, non-activating identity; ambiguity remains
+            // fail-closed rather than selecting the first element.
+            guard frameMatches.isEmpty else { return nil }
+            let titleOnlyMatches = windows.filter {
+                (attribute(kAXTitleAttribute as CFString, from: $0) as? String) == title
+            }
+            return titleOnlyMatches.count == 1 ? titleOnlyMatches[0] : nil
         }
 
-        private static func targetBounds(_ target: ComputerUseNativeHostTarget) -> CGRect? {
-            listWindows(bundleID: nil).first { $0.target == target }?.bounds
+        static func axElements(from value: CFTypeRef) -> [AXUIElement]? {
+            guard CFGetTypeID(value) == CFArrayGetTypeID() else { return nil }
+            let array = value as! CFArray
+            var elements: [AXUIElement] = []
+            elements.reserveCapacity(CFArrayGetCount(array))
+            for index in 0..<CFArrayGetCount(array) {
+                guard let raw = CFArrayGetValueAtIndex(array, index) else {
+                    return nil
+                }
+                let object = Unmanaged<AnyObject>.fromOpaque(raw).takeUnretainedValue()
+                guard CFGetTypeID(object) == AXUIElementGetTypeID() else { return nil }
+                let element = Unmanaged<AXUIElement>.fromOpaque(raw).takeUnretainedValue()
+                elements.append(element)
+            }
+            return elements
+        }
+
+        private static func axElement(from value: CFTypeRef) -> AXUIElement? {
+            guard CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+            let pointer = Unmanaged.passUnretained(value).toOpaque()
+            return Unmanaged<AXUIElement>.fromOpaque(pointer).takeUnretainedValue()
         }
 
         private static func sameAXWindow(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool {
             CFEqual(lhs, rhs)
+        }
+
+        private static func targetBounds(_ target: ComputerUseNativeHostTarget) -> CGRect? {
+            listWindows(bundleID: nil).first { $0.target == target }?.bounds
         }
 
         private static func matches(_ element: AXUIElement, bounds: CGRect) -> Bool {
@@ -1070,7 +1372,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             if let value = attribute(kAXValueAttribute as CFString, from: element) as? String, !value.isEmpty {
                 result["value"] = String(value.prefix(512))
             }
-            if let children = attribute(kAXChildrenAttribute as CFString, from: element) as? [AXUIElement],
+            if let children = attribute(kAXChildrenAttribute as CFString, from: element)
+                    .flatMap(axElements(from:)),
                !children.isEmpty {
                 result["children"] = children.map { serialize(element: $0, depth: depth + 1, budget: &budget) }
             }
@@ -1086,7 +1389,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
                 return true
             }
-            guard let children = attribute(kAXChildrenAttribute as CFString, from: element) as? [AXUIElement] else {
+            guard let children = attribute(kAXChildrenAttribute as CFString, from: element)
+                    .flatMap(axElements(from:)) else {
                 return false
             }
             return children.contains { find(element: $0, role: role, label: label, depth: depth + 1) }

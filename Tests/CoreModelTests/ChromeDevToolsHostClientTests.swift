@@ -42,10 +42,10 @@ final class ChromeDevToolsHostClientTests: XCTestCase {
                       "Every target must be requested in background so Chrome is never activated.")
         XCTAssertTrue(creates.allSatisfy { ($0.parameters["hidden"] as? Bool) == true },
                       "Every logical Bot target must be hidden rather than a visible-tab fallback.")
-        XCTAssertEqual(creates.compactMap { $0.parameters["focus"] as? Bool }, [false, false],
-                       "The safe creation request must explicitly prohibit focus changes.")
-        XCTAssertEqual(creates.compactMap { $0.parameters["newWindow"] as? Bool }, [false, false],
-                       "A background target must stay in the existing Chrome window.")
+        XCTAssertTrue(creates.allSatisfy { $0.parameters["focus"] == nil },
+                      "Target.createTarget must not request focus or alter user focus.")
+        XCTAssertTrue(creates.allSatisfy { $0.parameters["newWindow"] == nil },
+                      "A hidden target must not request new-window semantics that Chrome rejects.")
         XCTAssertFalse(transport.calls.contains { $0.method == "Target.activateTarget" },
                        "The client must never activate a target to perform a browser action.")
     }
@@ -61,7 +61,11 @@ final class ChromeDevToolsHostClientTests: XCTestCase {
             ]
         ]
         transport.responses["Runtime.evaluate"] = [
-            "result": ["result": ["value": ["url": "https://example.com", "title": "Example"]]]
+            "result": ["result": ["value": [
+                "url": "https://example.com",
+                "title": "Example",
+                "ready": true
+            ]]]
         ]
         let client = ChromeDevToolsHostClient(
             endpointDiscovery: FakeEndpointDiscovery(),
@@ -71,7 +75,26 @@ final class ChromeDevToolsHostClientTests: XCTestCase {
 
         let opened = try client.open(botID: bot, url: "https://example.com")
         XCTAssertEqual(opened.url, "https://example.com")
-        _ = try client.state(botID: bot)
+        let state = try client.state(botID: bot)
+        XCTAssertTrue(state.isReady, "Native page state must carry CDP document readiness.")
+        XCTAssertTrue(
+            transport.calls.contains {
+                $0.method == "Runtime.evaluate"
+                    && (($0.parameters["expression"] as? String)?.contains("document.readyState") == true)
+            },
+            "Page state must query readiness through CDP rather than sleeping blindly."
+        )
+        transport.responses["Runtime.evaluate"] = [
+            "result": ["result": ["value": [
+                "url": "https://example.com",
+                "title": "Example",
+            ]]]
+        ]
+        let missingReadiness = try client.state(botID: bot)
+        XCTAssertFalse(
+            missingReadiness.isReady,
+            "A page state without an explicit CDP readiness bit must fail closed."
+        )
         transport.responses["Runtime.evaluate"] = [
             "result": ["result": ["value": ["elements": [
                 ["role": "button", "name": "Save", "value": ""]
@@ -155,14 +178,20 @@ final class ChromeDevToolsHostClientTests: XCTestCase {
                        "Context failure must not fall back to a visible or shared target.")
 
         let rejectedTransport = FakeChromeDevToolsTransport()
-        rejectedTransport.sendErrors["Target.createTarget"] = ChromeDevToolsHostClientError.protocolError("hidden is unsupported")
+        rejectedTransport.responses["Target.createTarget"] = [
+            "error": ["code": -32602, "message": "invalid target creation combination"]
+        ]
         let rejectedClient = ChromeDevToolsHostClient(
             endpointDiscovery: FakeEndpointDiscovery(),
             transport: rejectedTransport
         )
         XCTAssertThrowsError(try rejectedClient.open(botID: BotID(), url: "https://example.com")) { error in
-            XCTAssertTrue(error is BrowserBackgroundUnsupported,
-                          "CDP rejection of hidden creation must surface as BrowserBackgroundUnsupported.")
+            guard let error = error as? BrowserBackgroundUnsupported else {
+                return XCTFail("CDP rejection of hidden creation must surface as BrowserBackgroundUnsupported.")
+            }
+            XCTAssertTrue(error.description.contains("code=-32602"),
+                          "CDP rejection details must remain available for diagnosing the safe-target boundary.")
+            XCTAssertTrue(error.description.contains("invalid target creation combination"))
         }
         XCTAssertEqual(rejectedTransport.calls.filter { $0.method == "Target.createTarget" }.count, 1,
                        "A rejected hidden request must not retry as a visible or focused target.")
@@ -254,11 +283,9 @@ private final class FakeChromeDevToolsTransport: ChromeDevToolsTransport {
     var browserContextIDs: [String] = []
     var runtimeValue: [String: Any] = ["url": "https://example.com", "title": "Example"]
     var sendError: Error?
-    var sendErrors: [String: Error] = [:]
 
     func send(method: String, parameters: [String: Any], webSocketURL: URL) throws -> [String: Any] {
         calls.append(Call(method: method, parameters: parameters, webSocketURL: webSocketURL))
-        if let error = sendErrors[method] { throw error }
         if let sendError { throw sendError }
         if method == "Target.createBrowserContext" {
             let contextID = nextBrowserContextID

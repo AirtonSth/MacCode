@@ -18,6 +18,8 @@ final class ChromeHostBrowserBridgeTests: XCTestCase {
         private(set) var calls: [String] = []
         let endpoint: ChromeDevToolsEndpoint
         var stateSequence: [String] = []
+        var titleSequence: [String] = []
+        var readinessSequence: [Bool] = []
         private var currentURL = "https://example.test/current"
 
         init(endpoint: ChromeDevToolsEndpoint) {
@@ -33,7 +35,9 @@ final class ChromeHostBrowserBridgeTests: XCTestCase {
         func state(botID: BotID) throws -> ChromeDevToolsPageState {
             calls.append("state")
             let url = stateSequence.isEmpty ? currentURL : stateSequence.removeFirst()
-            return ChromeDevToolsPageState(url: url, title: "Current")
+            let title = titleSequence.isEmpty ? "Current" : titleSequence.removeFirst()
+            let isReady = readinessSequence.isEmpty ? true : readinessSequence.removeFirst()
+            return ChromeDevToolsPageState(url: url, title: title, isReady: isReady)
         }
 
         func snapshot(botID: BotID) throws -> ChromeDevToolsSnapshot {
@@ -148,7 +152,8 @@ final class ChromeHostBrowserBridgeTests: XCTestCase {
     func test_chromeHostLaunchesOneHeadlessProfileAndMapsEveryAction() throws {
         // WHY: the app must start its own hidden Chrome endpoint, never depend
         // on a user debug flag, preserve the established payload shape, and
-        // accept a changed OAuth/redirect URL after a bounded settle poll.
+        // accept a changed OAuth/redirect URL only after the CDP page reports
+        // a complete document, so a matching URL cannot expose an empty title.
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("RCChromeHost-\(UUID().uuidString)", isDirectory: true)
         let executable = URL(fileURLWithPath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
@@ -169,9 +174,11 @@ final class ChromeHostBrowserBridgeTests: XCTestCase {
                 let client = FakeNativeClient(endpoint: endpoint)
                 client.stateSequence = [
                     "https://prior.test",
-                    "https://prior.test",
+                    "https://oauth.example/callback",
                     "https://oauth.example/callback",
                 ]
+                client.titleSequence = ["Current", "", "Current"]
+                client.readinessSequence = [true, false, true]
                 clientBox.client = client
                 return client
             },
@@ -298,6 +305,91 @@ final class ChromeHostBrowserBridgeTests: XCTestCase {
             transport.targetContextIDs,
             ["target-1": "context-1", "target-2": "context-2"],
             "Each Bot's distinct BrowserContext must reach its own distinct target."
+        )
+    }
+
+    func test_liveManagedChromeCreatesIsolatedPrivateTargetsWhenOptedIn() throws {
+        guard ProcessInfo.processInfo.environment["RC_RUN_LIVE_CHROME"] == "1" else {
+            throw XCTSkip("Set RC_RUN_LIVE_CHROME=1 to run the live managed-Chrome acceptance test.")
+        }
+        guard ManagedChromeHostBrowserBridge.installedChromeExecutable() != nil else {
+            throw XCTSkip("Google Chrome is not installed on this Mac.")
+        }
+
+        // WHY: this opt-in acceptance test proves the shipped default bridge
+        // starts its own headless Chrome, creates isolated hidden targets, and
+        // keeps each Bot's page state independent without touching user focus.
+        let fileManager = FileManager.default
+        let appSupport = fileManager.temporaryDirectory
+            .appendingPathComponent("RemoteCodeLiveChrome-\(UUID().uuidString)", isDirectory: true)
+        var bridge: ManagedChromeHostBrowserBridge? = ManagedChromeHostBrowserBridge()
+        func cleanup() {
+            let managedChromeExited = bridge?.shutdown(timeout: 5) ?? true
+            bridge = nil
+            XCTAssertTrue(
+                managedChromeExited,
+                "All app-managed Chrome processes must exit before profile disposal."
+            )
+            let deadline = Date().addingTimeInterval(5)
+            while fileManager.fileExists(atPath: appSupport.path), Date() < deadline {
+                do {
+                    try fileManager.removeItem(at: appSupport)
+                } catch {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+            XCTAssertFalse(
+                fileManager.fileExists(atPath: appSupport.path),
+                "The fresh live-test profile must be disposed after managed Chrome exits."
+            )
+        }
+        defer {
+            cleanup()
+        }
+
+        let firstBot = BotID(UUID(uuidString: "11111111-1111-1111-1111-111111111111")!)
+        let secondBot = BotID(UUID(uuidString: "22222222-2222-2222-2222-222222222222")!)
+        let firstURL = "data:text/html;base64,PHRpdGxlPmJvdC1vbmU8L3RpdGxlPjxidXR0b24+b25lPC9idXR0b24+"
+        let secondURL = "data:text/html;base64,PHRpdGxlPmJvdC10d288L3RpdGxlPjxidXR0b24+dHdvPC9idXR0b24+"
+
+        func perform(
+            botID: BotID,
+            kind: String,
+            url: String = ""
+        ) throws -> [String: Any] {
+            try bridge!.perform(
+                botID: botID,
+                route: .chromeHost,
+                kind: kind,
+                action: "",
+                ref: "",
+                text: "",
+                url: url,
+                appSupport: appSupport
+            )
+        }
+
+        let firstOpen = try perform(botID: firstBot, kind: BotBrowserPlaywrightKind.open, url: firstURL)
+        let secondOpen = try perform(botID: secondBot, kind: BotBrowserPlaywrightKind.open, url: secondURL)
+        let firstState = try perform(botID: firstBot, kind: BotBrowserPlaywrightKind.state)
+        let secondState = try perform(botID: secondBot, kind: BotBrowserPlaywrightKind.state)
+        let firstSnapshot = try perform(botID: firstBot, kind: BotBrowserPlaywrightKind.snapshot)
+        let secondSnapshot = try perform(botID: secondBot, kind: BotBrowserPlaywrightKind.snapshot)
+
+        XCTAssertEqual(firstOpen["url"] as? String, firstURL)
+        XCTAssertEqual(secondOpen["url"] as? String, secondURL)
+        XCTAssertEqual(firstOpen["title"] as? String, "bot-one")
+        XCTAssertEqual(secondOpen["title"] as? String, "bot-two")
+        XCTAssertEqual(firstState["title"] as? String, "bot-one",
+                      "The first Bot must retain its own page after the second Bot opens another page.")
+        XCTAssertEqual(secondState["title"] as? String, "bot-two")
+        XCTAssertTrue((firstSnapshot["content"] as? String)?.contains("button \"one\"") == true,
+                      "The first Bot snapshot must come from its own hidden target.")
+        XCTAssertTrue((secondSnapshot["content"] as? String)?.contains("button \"two\"") == true,
+                      "The second Bot snapshot must come from its own hidden target.")
+        XCTAssertTrue(
+            fileManager.fileExists(atPath: ManagedChromeHostBrowserBridge.activePortFile(appSupport: appSupport).path),
+            "The live endpoint must be under the fresh app-owned profile."
         )
     }
 
