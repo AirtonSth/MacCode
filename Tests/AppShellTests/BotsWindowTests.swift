@@ -4371,6 +4371,48 @@ final class BotsWindowTests: XCTestCase {
         context.coordinator.afterSpawnClaimForTesting = nil
     }
 
+    func test_stopIssuesRunBeforeBlockedAcceptedSendSettles() async throws {
+        // WHY: once a provider has claimed acceptance and blocked inside
+        // sendTurn, Desk must still issue stopRun immediately — not only
+        // after that blocked write is released.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = BlockingAcceptanceRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        let routing = BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        _ = try vm.enqueueHostMessage(botID: bot.id, text: "go", conversationID: nil, routing: routing)
+        await runner.waitUntilAcceptanceEntered()
+        let settled = expectation(description: "stop settled after releasing claimed write")
+        var settledOK: Bool?
+        vm.stopLiveRuns(for: bot.id, force: true) { ok in
+            settledOK = ok
+            settled.fulfill()
+        }
+        XCTAssertGreaterThan(
+            vm.deskStopRunIssuedCountForTesting,
+            0,
+            "stopRun must be issued while the claimed send is still blocked"
+        )
+        XCTAssertEqual(runner.physicalWrites, 0, "blocked claimed write must not finish before Stop")
+        runner.releaseWrite()
+        await fulfillment(of: [settled], timeout: 5)
+        XCTAssertEqual(settledOK, true)
+    }
+
     func test_openHomeFileRevealsOwnedSkillInStudioFiles() throws {
         // WHY: Skills Open used to write homeDraft only. Studio Files now
         // hosts FilesSurfaceRoot, so that path left the preview on
@@ -12396,6 +12438,70 @@ private struct T005PeerHandoffRecordFixture: Codable, Equatable {
     let replyText: String?
     let replyCreatedAt: Date?
     let phase: BotPeerHandoffPhase
+}
+
+private final class BlockingAcceptanceRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider
+    private let lock = NSLock()
+    private var writes = 0
+    private var entered = 0
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private let gate = DispatchSemaphore(value: 0)
+
+    init(provider: AgentProvider) {
+        self.provider = provider
+    }
+
+    var physicalWrites: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return writes
+    }
+
+    func waitUntilAcceptanceEntered() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if entered > 0 {
+                lock.unlock()
+                cont.resume()
+                return
+            }
+            entryWaiters.append(cont)
+            lock.unlock()
+        }
+    }
+
+    func releaseWrite() {
+        gate.signal()
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        try await Task.detached { [self] in
+            guard let permit = request.acceptancePermit else {
+                throw AgentRunAcceptanceError.cancelled
+            }
+            try permit.withAcceptance {
+                self.lock.lock()
+                self.entered += 1
+                let waiters = self.entryWaiters
+                self.entryWaiters.removeAll()
+                self.lock.unlock()
+                waiters.forEach { $0.resume() }
+                self.gate.wait()
+                self.lock.lock()
+                self.writes += 1
+                self.lock.unlock()
+            }
+            onEvent(.status(.running))
+            onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: nil))
+            return AgentRunHandle(runId: request.runId, process: nil) {}
+        }.value
+    }
 }
 
 final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable {

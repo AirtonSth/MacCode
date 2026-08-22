@@ -2559,6 +2559,8 @@ public final class BotsViewModel: ObservableObject {
     /// Test seam: force `liveThreadIDs` to throw so stop must still await cancelled sends.
     public var liveThreadDiscoveryErrorForTesting: Error?
     public private(set) var deskStopJoinStartCountForTesting = 0
+    /// Snapshot-time `stopRun` calls issued before awaiting a blocked send.
+    public private(set) var deskStopRunIssuedCountForTesting = 0
     /// Test seam: how many times Desk actually decoded stream events.
     public private(set) var deskLiveReplayFetchCountForTesting = 0
     /// Test seam: dest at the moment send first acknowledged the click.
@@ -4118,7 +4120,8 @@ public final class BotsViewModel: ObservableObject {
         sendWorks.forEach { work in
             work.task.cancel()
             if let threadID = work.threadID {
-                context.coordinator.cancelPreparation(threadId: threadID)
+                context.coordinator.stopRun(threadId: threadID)
+                deskStopRunIssuedCountForTesting += 1
             }
         }
         join.task = Task { @MainActor [weak self] in
@@ -4132,7 +4135,17 @@ public final class BotsViewModel: ObservableObject {
             }
             if discoveryError == nil {
                 for threadID in threadIDs {
-                    self.context.coordinator.cancelPreparation(threadId: threadID)
+                    self.context.coordinator.stopRun(threadId: threadID)
+                }
+            }
+            var seen = Set<AgentThreadID>()
+            let toStop = (sendWorks.compactMap(\.threadID) + threadIDs).filter {
+                seen.insert($0).inserted
+            }
+            let coordinator = self.context.coordinator
+            let termination = Task {
+                if !toStop.isEmpty {
+                    try await coordinator.stopAndAwaitTermination(threadIds: toStop)
                 }
             }
             for work in sendWorks {
@@ -4145,18 +4158,11 @@ public final class BotsViewModel: ObservableObject {
                 self.isStopping = false
             }
             if discoveryError != nil {
-                return false
-            }
-            let remaining: [AgentThreadID]
-            do {
-                remaining = try self.liveThreadIDs(for: botID, includeInFlightSends: false)
-            } catch {
+                _ = await termination.result
                 return false
             }
             do {
-                if !remaining.isEmpty {
-                    try await self.context.coordinator.stopAndAwaitTermination(threadIds: remaining)
-                }
+                try await termination.value
                 return try self.liveThreadIDs(for: botID, includeInFlightSends: false).isEmpty
             } catch {
                 self.errorMessage = force

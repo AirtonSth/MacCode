@@ -1329,6 +1329,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// After a successful spawn claim and before `sendTurn`. Tests park here so
     /// Stop can win the pending start's acceptance without racing durable prep.
     var afterSpawnClaimForTesting: (@Sendable (_ request: AgentRunRequest) async -> Void)?
+    /// After the post-claim Stop re-check and immediately before `sendTurn`.
+    var afterSpawnConfirmForTesting: (@Sendable (_ request: AgentRunRequest) async -> Void)?
 
     /// Fired (on an arbitrary executor) when a final assistant message was wire-rendered
     /// and persisted. Callers can use the id to badge the message in the UI.
@@ -2129,6 +2131,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let coordinator = self
         let handle: AgentRunHandle
         do {
+            await afterSpawnConfirmForTesting?(effectiveRequest)
+            guard confirmSpawnClaimStillLive(threadId: effectiveRequest.threadId) else {
+                markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
+                throw AgentRunAcceptanceError.cancelled
+            }
             sendTurnEntered = true
             handle = try await runner.sendTurn(effectiveRequest) { ev in
                 coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
@@ -2882,10 +2889,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// so a late claimSpawn/sendTurn cannot start the provider.
     /// Arms `pendingThreadStops` only when a pending start or surface reservation
     /// exists — pure Graphify-only cancel before claim must not poison resend.
-    /// Also invalidates the pending start's acceptance permit so a post-claim
-    /// `sendTurn` cannot write after this Stop.
+    /// Invalidates the pending start's acceptance permit under the coordinator
+    /// lock so a concurrent `withAcceptance` cannot claim after Stop is recorded.
     public func cancelPreparation(threadId: AgentThreadID) {
         lock.lock()
+        let pendingStart = pendingProviderStarts[threadId]
+        // Invalidate before unlock so a concurrent withAcceptance cannot
+        // claim a still-pending permit after Stop is recorded.
+        _ = pendingStart?.invalidateAcceptance()
         _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
         let reservedForThread = reservedProviderStarts.filter { $0.value == threadId }
         // Per-run cancel tokens so one Stop cancels every reserved run. Do not
@@ -2894,13 +2905,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         for runId in reservedForThread.keys {
             cancelledProviderStartRuns[runId] = threadId
         }
-        let pendingStart = pendingProviderStarts[threadId]
         if pendingStart != nil {
             pendingThreadStops.insert(threadId)
         }
         reservedProviderStarts = reservedProviderStarts.filter { $0.value != threadId }
         lock.unlock()
-        _ = pendingStart?.invalidateAcceptance()
     }
 
     /// Surface finished Graphify claim and is about to call startRun. Stop in the

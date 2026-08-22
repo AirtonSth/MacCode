@@ -175,6 +175,99 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         XCTAssertEqual(runner.startCount, 0, "sendTurn must not run after stopRun won post-claim")
     }
 
+    func test_cancelAfterSpawnConfirm_blocksSendTurn() async throws {
+        // WHY: confirmSpawnClaimStillLive unlocks before sendTurn. Stop that
+        // arrives in that last gap must still prevent the provider write.
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-after-confirm")
+        let thread = AgentThread(title: "prep-after-confirm", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+        coordinator.afterSpawnConfirmForTesting = { request in
+            coordinator.cancelPreparation(threadId: request.threadId)
+        }
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "should not spawn after confirm"
+            ))
+            XCTFail("expected cancel after spawn confirm")
+        } catch is AgentRunAcceptanceError {
+            // expected
+        } catch {
+            XCTAssertTrue(
+                "\(error)".localizedCaseInsensitiveContains("cancel")
+                    || error is AgentRunAcceptanceError,
+                "unexpected error: \(error)"
+            )
+        }
+
+        XCTAssertEqual(runner.startCount, 0, "sendTurn must not run after Stop won post-confirm")
+    }
+
+    func test_cancelPreparation_invalidatesPermitBeforeWithAcceptance() async throws {
+        // WHY: cancelPreparation used to unlock before invalidateAcceptance,
+        // so a concurrent withAcceptance could still claim the write.
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-permit-invalidate")
+        let thread = AgentThread(title: "prep-permit-invalidate", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+        coordinator.afterSpawnConfirmForTesting = { request in
+            guard let permit = request.acceptancePermit else {
+                XCTFail("startRun must carry an acceptance permit")
+                return
+            }
+            coordinator.cancelPreparation(threadId: request.threadId)
+            do {
+                try permit.withAcceptance { }
+                XCTFail("withAcceptance must not claim after Stop recorded")
+            } catch {
+                XCTAssertTrue(
+                    error is AgentRunAcceptanceError,
+                    "unexpected error: \(error)"
+                )
+            }
+        }
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "permit already revoked"
+            ))
+            XCTFail("expected cancel after permit invalidation")
+        } catch is AgentRunAcceptanceError {
+            // expected
+        } catch {
+            XCTAssertTrue(
+                "\(error)".localizedCaseInsensitiveContains("cancel")
+                    || error is AgentRunAcceptanceError,
+                "unexpected error: \(error)"
+            )
+        }
+
+        XCTAssertEqual(runner.startCount, 0)
+    }
+
     func test_happyPath_claimSpawnAllowsProviderStart() async throws {
         let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-happy")
         let thread = AgentThread(title: "prep-ok", provider: .codex, model: "fake-model")
