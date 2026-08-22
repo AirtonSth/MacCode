@@ -717,6 +717,37 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
         )
     }
 
+    func test_admittedProviderMatrix_sharesArbitraryCommandInterceptionAndExactOutputSafety() {
+        // WHY: the global interceptor is admitted by the provider-neutral Token
+        // Saver signal, not by provider name or a finite command catalog.
+        let arbitrary = "workspace-specific-report"
+        for provider in providers {
+            let receipt = admit(provider)
+            let environment = TokenSaverExecutionReceiptSeam.environment(from: receipt)
+
+            XCTAssertEqual(environment["RC_TOKEN_SAVER_DISTILL_HINT"], "1", "(provider) admission")
+            XCTAssertEqual(receipt.capabilities.managedPath, true, "(provider) managed path")
+            XCTAssertTrue(CommandWrapPolicy.isWrapped(arbitrary), "(provider) arbitrary command")
+            XCTAssertNil(
+                CommandWrapPolicy.passthroughReason(
+                    command: arbitrary,
+                    args: ["--summary"],
+                    environment: environment
+                ),
+                "(provider) arbitrary command must reach the shared compressor"
+            )
+            XCTAssertEqual(
+                CommandWrapPolicy.passthroughReason(
+                    command: "cat",
+                    args: ["output.txt"],
+                    environment: environment
+                ),
+                "exact_output_command",
+                "(provider) exact-output command must remain raw"
+            )
+        }
+    }
+
     func test_outputPolicy_allProviders_requirePipeAndDocumentNoAllowlist() {
         // WHY: voluntary | distill + wrapper policy must be identical for every
         // admitted provider and nested shape (gate = DISTILL_HINT, not provider).

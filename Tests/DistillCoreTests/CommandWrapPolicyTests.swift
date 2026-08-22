@@ -10,10 +10,36 @@ final class CommandWrapPolicyTests: XCTestCase {
                   "curl", "aws", "python3"] {
             XCTAssertTrue(CommandWrapPolicy.isWrapped(c), "\(c) must be wrapped")
         }
-        // Exact-output tools must NOT be PATH-wrapped (agent needs full stdout).
+        // Exact-output tools enter the interceptor, which keeps their full stdout raw.
         // `node` stays unwrapped (agent runtime / bridge); use bun/python for script compress.
-        for c in ["rg", "grep", "sed", "cat", "head", "tail", "awk", "jq", "echo", "node", "env", "rm"] {
+        for c in ["node", "env"] {
             XCTAssertFalse(CommandWrapPolicy.isWrapped(c), "\(c) must NOT be wrapped")
+        }
+        for c in ["rg", "grep", "sed", "cat", "head", "tail", "awk", "jq"] {
+            XCTAssertTrue(CommandWrapPolicy.isWrapped(c), "\(c) must enter the global interceptor")
+        }
+        // The global interceptor may fail open at decision time.
+        XCTAssertTrue(CommandWrapPolicy.isWrapped("echo"))
+        XCTAssertTrue(CommandWrapPolicy.isWrapped("rm"))
+    }
+
+    func test_isWrapped_admitsNonCatalogCommandsAndExactOutputThroughOneInterceptor() {
+        // WHY: one global interceptor must cover provider-launched tools that
+        // RemoteCode has never listed, while exact-output tools remain raw.
+        XCTAssertFalse(WrappedCommandCatalog.commands.contains("workspace-report"))
+        XCTAssertTrue(CommandWrapPolicy.isWrapped("workspace-report"))
+        XCTAssertTrue(CommandWrapPolicy.isWrapped("/opt/acme/bin/workspace-report"))
+
+        for exact in ["rg", "grep", "sed", "cat", "jq"] {
+            XCTAssertTrue(CommandWrapPolicy.isWrapped(exact), "(exact) must enter the shared interceptor")
+            XCTAssertEqual(
+                CommandWrapPolicy.passthroughReason(
+                    command: exact,
+                    args: [],
+                    environment: noEnv
+                ),
+                "exact_output_command"
+            )
         }
     }
 

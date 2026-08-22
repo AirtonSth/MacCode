@@ -9,15 +9,16 @@ import Foundation
 ///
 /// Split:
 /// - **exact-output family**: line slices, search matches, file dumps — agent needs every line.
-///   Never install wrappers; skip auto `| distill`. Voluntary last-pipe `… | distill "<q>"` is allowed.
-/// - **compressible family**: everything else that gets a PATH wrapper. Subcommands are not
-///   allowlisted — `CommandWrapPolicy` compresses any terminal-to-agent stdout above threshold
-///   (except exact-output / exact-patch carve-outs).
+///   The global interceptor may still see these commands, but `CommandWrapPolicy` passes their
+///   stdout through unchanged. Voluntary last-pipe `… | distill "<q>"` is allowed.
+/// - **compressible family**: commands whose stdout may be distilled by the global interceptor.
+///   Subcommands are not allowlisted — `CommandWrapPolicy` compresses any terminal-to-agent
+///   stdout above threshold (except exact-output / exact-patch carve-outs).
 ///
 /// Provider basenames (`grok` / `claude` / `codex`) are **not** listed here. Nested
 /// provider interception is a separate always-on controller — see `ProviderProxyCatalog`.
 public enum WrappedCommandCatalog {
-    // MARK: Exact-output (no wrap, no | distill)
+    // MARK: Exact-output (intercepted, but passthrough by policy)
 
     /// Commands whose stdout *is* the payload the agent will reason over line-by-line.
     /// Lossy distill here drops match lines, code slices, or structure the model needs next.
@@ -78,8 +79,7 @@ public enum WrappedCommandCatalog {
 
     public static let commandSet: Set<String> = Set(commands)
 
-    /// Symlinks to remove on install/uninstall: current wrap targets plus exact-output
-    /// basenames that may still exist from older installs that wrapped sed/rg/cat/etc.
+    /// Symlinks to remove on uninstall: current intercept targets plus exact-output basenames.
     public static var symlinkBasenamesToRemove: [String] {
         var seen = Set<String>()
         var ordered: [String] = []
