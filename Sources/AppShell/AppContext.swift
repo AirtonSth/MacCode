@@ -64,7 +64,7 @@ public enum TokenSaverLaneKillSwitch: Sendable {
     /// without requiring the sidecar writer to know about them yet.
     public static func loadCLIStateOverlay(from url: URL?) -> CLIStateOverlay {
         guard let url,
-              let data = try? Data(contentsOf: url),
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return .empty
         }

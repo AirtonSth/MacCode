@@ -367,12 +367,12 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     private func refreshLegacyStartScriptIfNeeded(at target: URL, from source: URL) throws {
-        let existing = try Data(contentsOf: target)
+        let existing = try Data(contentsOf: target, options: .mappedIfSafe)
         let digest = SHA256.hash(data: existing).map { String(format: "%02x", $0) }.joined()
         guard digest == Self.legacyUnauthenticatedStartScriptSHA256,
               FileManager.default.fileExists(atPath: source.path)
         else { return }
-        try Data(contentsOf: source).write(to: target, options: .atomic)
+        try Data(contentsOf: source, options: .mappedIfSafe).write(to: target, options: .atomic)
     }
 
     public static func pngMagic(_ data: Data) -> String {
