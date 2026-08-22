@@ -232,7 +232,7 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
             loadProjectionRecordUnlocked(url: url)?.projection
         }
         private func loadProjectionRecordUnlocked(url: URL) -> DiskProjection? {
-            guard let data = try? Data(contentsOf: url) else { return nil }
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
             if let record = try? decoder.decode(DiskProjection.self, from: data) {
                 return record
             }

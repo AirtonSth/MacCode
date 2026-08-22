@@ -7786,7 +7786,7 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
     }
 
     private func decodeAnchor(at url: URL) throws -> TerminalHistoryFailureAnchor {
-        let data = try Data(contentsOf: url)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         guard let anchor = try? decoder.decode(
             TerminalHistoryFailureAnchor.self,
             from: data
@@ -7799,18 +7799,22 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
     }
 
     private func pendingDeletesLocked() throws -> [TerminalHistoryPendingDelete] {
-        try fileManager.contentsOfDirectory(
+        let urls = try fileManager.contentsOfDirectory(
             at: rootURL,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         )
-        .filter { $0.lastPathComponent.hasPrefix("delete-") && $0.pathExtension == "tombstone" }
-        .map { try decodePendingDelete(at: $0) }
-        .sorted { $0.id < $1.id }
+        var pending: [TerminalHistoryPendingDelete] = []
+        pending.reserveCapacity(urls.count)
+        for url in urls where url.lastPathComponent.hasPrefix("delete-") && url.pathExtension == "tombstone" {
+            pending.append(try decodePendingDelete(at: url))
+        }
+        pending.sort { $0.id < $1.id }
+        return pending
     }
 
     private func decodePendingDelete(at url: URL) throws -> TerminalHistoryPendingDelete {
-        let data = try Data(contentsOf: url)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         guard let pending = try? decoder.decode(
             TerminalHistoryPendingDelete.self,
             from: data

@@ -268,12 +268,12 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
     }
 
     public func loadManifest() -> TokenSaverModelManifest? {
-        guard let data = try? Data(contentsOf: manifestURL) else { return nil }
+        guard let data = try? Data(contentsOf: manifestURL, options: .mappedIfSafe) else { return nil }
         return try? decoder.decode(TokenSaverModelManifest.self, from: data)
     }
 
     public func loadEncoderManifest() -> TokenSaverRequiredModelsInstallManifest? {
-        guard let data = try? Data(contentsOf: encoderManifestURL) else { return nil }
+        guard let data = try? Data(contentsOf: encoderManifestURL, options: .mappedIfSafe) else { return nil }
         return try? decoder.decode(TokenSaverRequiredModelsInstallManifest.self, from: data)
     }
 
@@ -291,7 +291,7 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
 
     // Returns the validation cache keyed by relativePath, or empty dict on missing/corrupt cache.
     func loadValidationCache() -> [String: ModelValidationCacheEntry] {
-        guard let data = try? Data(contentsOf: validationCacheURL),
+        guard let data = try? Data(contentsOf: validationCacheURL, options: .mappedIfSafe),
               let entries = try? decoder.decode([ModelValidationCacheEntry].self, from: data) else {
             return [:]
         }

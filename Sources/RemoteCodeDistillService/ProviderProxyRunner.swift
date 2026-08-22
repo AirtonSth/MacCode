@@ -671,7 +671,7 @@ enum ProviderProxyRunner {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let plistURL = contentsDirectory.appendingPathComponent("Info.plist")
-        guard let data = try? Data(contentsOf: plistURL),
+        guard let data = try? Data(contentsOf: plistURL, options: .mappedIfSafe),
               let plist = try? PropertyListSerialization.propertyList(
                 from: data,
                 options: [],

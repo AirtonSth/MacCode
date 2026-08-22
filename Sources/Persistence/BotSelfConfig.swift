@@ -319,6 +319,28 @@ public struct BotSelfConfigPatch: Equatable, Sendable {
 
 /// Same persist path Studio uses. Bound to one calling bot.
 public struct BotSelfConfigService: Sendable {
+    // PERF: share JSON codec
+    private static let sharedEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        return e
+    }()
+    private static let sortedEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.sortedKeys]
+        return e
+    }()
+    private static let codecLock = NSLock()
+    private static func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
+        Self.codecLock.lock()
+        defer { Self.codecLock.unlock() }
+        return try Self.sharedEncoder.encode(value)
+    }
+    private static func encodeSortedJSON<T: Encodable>(_ value: T) throws -> Data {
+        Self.codecLock.lock()
+        defer { Self.codecLock.unlock() }
+        return try Self.sortedEncoder.encode(value)
+    }
+
     public let callerBotID: BotID
     public let store: BotStore
     public let appSupportDirectory: URL
@@ -601,7 +623,7 @@ public struct BotSelfConfigService: Sendable {
     }
 
     static func snapshotObject(_ snapshot: BotSelfConfigSnapshot) throws -> [String: Any] {
-        let data = try JSONEncoder().encode(snapshot)
+        let data = try Self.encodeJSON(snapshot)
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw BotSelfConfigError.invalid("Could not encode settings.")
         }
@@ -736,9 +758,7 @@ public struct BotSelfConfigService: Sendable {
     }
 
     public func encodeSnapshot(_ snapshot: BotSelfConfigSnapshot) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(snapshot)
+        let data = try Self.encodeSortedJSON(snapshot)
         guard let text = String(data: data, encoding: .utf8) else {
             throw BotSelfConfigError.invalid("Could not encode settings.")
         }

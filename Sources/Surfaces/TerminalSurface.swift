@@ -1965,7 +1965,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             // The batch is first placed in an ownership mailbox so quit can
             // claim bytes already read before finalizing durable history.
             readerMainHandoffHook.fire()
-            DispatchQueue.main.sync {
+            let handoffBlock = {
                 guard let batch = readerHandoffState.claim(batchID) else { return }
                 if !batch.data.isEmpty {
                     self.maxPTYReadBatchBytesObserved = max(
@@ -1984,6 +1984,11 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                 if batch.shouldClose {
                     self.handlePTYEOF()
                 }
+            }
+            if Thread.isMainThread {
+                handoffBlock()
+            } else {
+                DispatchQueue.main.sync(execute: handoffBlock)
             }
         }
         if historyReplayBackpressureActive {

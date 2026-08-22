@@ -179,6 +179,30 @@ public struct CapacityHardwareTierClaim: Sendable, Codable, Equatable {
 }
 
 public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
+    // PERF: share formatters/codecs
+    private static let isoFormatterWithFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    private static let prettyEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return e
+    }()
+    private static let sharedDecoder = JSONDecoder()
+    private static let codecLock = NSLock()
+    private static func decodeManifest(from data: Data) throws -> CapacityQualificationManifest {
+        Self.codecLock.lock()
+        defer { Self.codecLock.unlock() }
+        return try Self.sharedDecoder.decode(CapacityQualificationManifest.self, from: data)
+    }
+
     public static let currentSchemaVersion = "1.0.0"
 
     public var schemaVersion: String
@@ -310,12 +334,9 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
                     "physicallyExecuted tier \(tier.tierName) must declare artifactExpiryISO8601"
                 )
             }
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            var expiryDate = formatter.date(from: expiry)
+            var expiryDate = Self.isoFormatterWithFractional.date(from: expiry)
             if expiryDate == nil {
-                formatter.formatOptions = [.withInternetDateTime]
-                expiryDate = formatter.date(from: expiry)
+                expiryDate = Self.isoFormatter.date(from: expiry)
             }
             guard let expiryDate else {
                 throw CapacityContractError.invalidWorkload(
@@ -331,23 +352,33 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
     }
 
     public static func decodeAndValidate(from data: Data) throws -> CapacityQualificationManifest {
-        let decoded = try JSONDecoder().decode(CapacityQualificationManifest.self, from: data)
+        let decoded = try decodeManifest(from: data)
         try decoded.validate()
         return decoded
     }
 
     public func encodePretty() throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return try encoder.encode(self)
+        Self.codecLock.lock()
+        defer { Self.codecLock.unlock() }
+        return try Self.prettyEncoder.encode(self)
     }
+
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
 
     /// Stable content digest for artifact binding (not just id equality).
     public func contentDigest() throws -> String {
         let data = try encodePretty()
         var hasher = SHA256()
         hasher.update(data: data)
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let digest = hasher.finalize()
+        // PERF: nibble table avoids 32 String(format:) calls per hash; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(Self.hexAlphabet[Int(b >> 4)])
+            out.append(Self.hexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 }
 

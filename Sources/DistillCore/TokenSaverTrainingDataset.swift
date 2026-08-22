@@ -92,7 +92,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
                 "model": modelID,
                 "source": source,
                 "input_sha256": sha,
-                "created_at": ISO8601DateFormatter().string(from: Date()),
+                "created_at": Self.isoNow(),
             ],
         ]
         appendJSONL(record, to: sftURL(for: request.mode), split: "sft")
@@ -116,7 +116,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
                 "source": source,
                 "reason": reason,
                 "input_sha256": sha256(request.input),
-                "created_at": ISO8601DateFormatter().string(from: Date()),
+                "created_at": Self.isoNow(),
             ],
         ]
         appendJSONL(record, to: root.appendingPathComponent("rejected", isDirectory: true).appendingPathComponent("\(day).jsonl"), split: "rejected")
@@ -149,7 +149,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
                 "model": modelID,
                 "source": source,
                 "input_sha256": sha,
-                "created_at": ISO8601DateFormatter().string(from: Date()),
+                "created_at": Self.isoNow(),
             ],
         ]
         appendJSONL(
@@ -178,7 +178,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
                 "source": source,
                 "reason": reason,
                 "input_sha256": sha256(system + "\n" + user),
-                "created_at": ISO8601DateFormatter().string(from: Date()),
+                "created_at": Self.isoNow(),
             ],
         ]
         appendJSONL(
@@ -237,12 +237,12 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
     private func updateManifestLocked(split: String, file: URL) {
         let manifestURL = root.appendingPathComponent("manifest.json")
         var obj: [String: Any] = [:]
-        if let data = try? Data(contentsOf: manifestURL),
+        if let data = try? Data(contentsOf: manifestURL, options: .mappedIfSafe),
            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             obj = parsed
         }
         obj["schema_version"] = Self.schemaVersion
-        obj["last_write"] = ISO8601DateFormatter().string(from: Date())
+        obj["last_write"] = Self.isoNow()
         var counts = obj["counts"] as? [String: Int] ?? [:]
         counts[split, default: 0] += 1
         obj["counts"] = counts
@@ -256,8 +256,18 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         _ = try? fileManager.replaceItem(at: manifestURL, withItemAt: tmp, backupItemName: nil, options: [], resultingItemURL: nil)
     }
 
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     private func sha256(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hash(data: Data(text.utf8))
+        // PERF: nibble table avoids 32 String(format:) calls per hash; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(Self.hexAlphabet[Int(b >> 4)])
+            out.append(Self.hexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     /// Strict: unclosed think / leftover traces are not SFT material.
@@ -271,22 +281,45 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         redact(LibrarianThinkStrip.stripLenient(text))
     }
 
+    // PERF: NSRegularExpression recompilation is expensive. Share precompiled regexes.
+    private static let liveRegex = try! NSRegularExpression(pattern: #"sk_live_[A-Za-z0-9]+"#)
+    private static let keyedRegex = try! NSRegularExpression(pattern: #"(?i)(api[_-]?key|password|secret|token|bearer)\s*[:=]\s*\S+"#)
+
     private func redact(_ text: String) -> String {
         var s = text
-        if let live = try? NSRegularExpression(pattern: #"sk_live_[A-Za-z0-9]+"#) {
-            s = live.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "<redacted>")
-        }
-        if let keyed = try? NSRegularExpression(pattern: #"(?i)(api[_-]?key|password|secret|token|bearer)\s*[:=]\s*\S+"#) {
-            s = keyed.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "$1=<redacted>")
-        }
+        s = Self.liveRegex.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "<redacted>")
+        s = Self.keyedRegex.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "$1=<redacted>")
         return s
     }
 
-    private static func dayStamp(_ date: Date) -> String {
+    // PERF: DateFormatter ICU init is expensive. Share one for yyyy-MM-dd behind lock.
+    private static let dayStampLock = NSLock()
+    private static let dayStampFormatter: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone(secondsFromGMT: 0)
         f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: date)
+        return f
+    }()
+
+    private static let isoLock = NSLock()
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    private static func isoNow() -> String {
+        isoLock.lock()
+        let s = isoFormatter.string(from: Date())
+        isoLock.unlock()
+        return s
+    }
+
+    private static func dayStamp(_ date: Date) -> String {
+        dayStampLock.lock()
+        let s = dayStampFormatter.string(from: date)
+        dayStampLock.unlock()
+        return s
     }
 }

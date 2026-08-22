@@ -432,7 +432,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     private func loadFingerprint(_ checkout: GraphifyCheckout) -> Fingerprint? {
         let url = fingerprintPath(for: checkout)
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         fingerprintCodecLock.lock()
         let decoded = try? fingerprintDecoder.decode(Fingerprint.self, from: data)
         fingerprintCodecLock.unlock()

@@ -67,7 +67,7 @@ public struct SessionLearnRegion {
     // MARK: - region plumbing
 
     private func readFile() -> String {
-        (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+        ((try? Data(contentsOf: fileURL, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
     }
 
     private func currentRules(in text: String) -> [String] {

@@ -113,7 +113,7 @@ public struct BotHome: Sendable {
         if FileManager.default.fileExists(atPath: memoryURL.path) { return }
         let legacyURL = root.appendingPathComponent(Self.legacyMemoryName)
         if FileManager.default.fileExists(atPath: legacyURL.path) {
-            let raw = try String(contentsOf: legacyURL, encoding: .utf8)
+            let raw = try mappedString(at: legacyURL)
             let body = Self.stripProjectionHeader(raw)
             try writeAtomic(
                 body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -133,6 +133,16 @@ public struct BotHome: Sendable {
         try writeAtomic(lines.joined(separator: "\n") + "\n", to: memoryURL)
     }
 
+    // PERF: DateFormatter ICU init is expensive. Share one for bootstrap yyyy-MM-dd
+    // behind a lock; DateFormatter is not thread-safe and calendar varies per call.
+    private static let bootstrapDateLock = NSLock()
+    private static let bootstrapDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
     public func readBootstrapMemory(
         now: Date = Date(),
         calendar: Calendar = .current
@@ -143,14 +153,13 @@ public struct BotHome: Sendable {
                 files.append(file)
             }
         }
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        let today = formatter.string(from: now)
+        Self.bootstrapDateLock.lock()
+        Self.bootstrapDateFormatter.calendar = calendar
+        Self.bootstrapDateFormatter.timeZone = calendar.timeZone
+        let today = Self.bootstrapDateFormatter.string(from: now)
         let yesterdayDate = calendar.date(byAdding: .day, value: -1, to: now) ?? now
-        let yesterday = formatter.string(from: yesterdayDate)
+        let yesterday = Self.bootstrapDateFormatter.string(from: yesterdayDate)
+        Self.bootstrapDateLock.unlock()
         for day in [today, yesterday] {
             files.append(contentsOf: try dailyNotes(dayPrefix: day))
         }
@@ -191,10 +200,24 @@ public struct BotHome: Sendable {
         return body
     }
 
+    // PERF: map file via Data to avoid heap copy for read-heavy memory/soul paths.
+    private func mappedString(at url: URL) throws -> String {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard let str = String(data: data, encoding: .utf8) else {
+            throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [NSFilePathErrorKey: url.path])
+        }
+        return str
+    }
+    private func mappedStringIfPresent(at url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              let str = String(data: data, encoding: .utf8) else { return nil }
+        return str
+    }
+
     private func readMemoryFile(relativePath: String) throws -> MemoryFile? {
         let url = try resolvedURL(relativePath)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        let body = try String(contentsOf: url, encoding: .utf8)
+        let body = try mappedString(at: url)
         guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         return MemoryFile(path: relativePath, body: body)
     }
@@ -214,7 +237,7 @@ public struct BotHome: Sendable {
             }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
             .compactMap { url in
-                guard let body = try? String(contentsOf: url, encoding: .utf8),
+                guard let body = mappedStringIfPresent(at: url),
                       !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
                 return MemoryFile(
                     path: "\(Self.memoryDirectoryName)/\(url.lastPathComponent)",
@@ -224,15 +247,15 @@ public struct BotHome: Sendable {
     }
 
     public func readSoul() throws -> String {
-        try String(contentsOf: soulURL, encoding: .utf8)
+        try mappedString(at: soulURL)
     }
 
     public func readDescription() throws -> String {
-        try String(contentsOf: descriptionURL, encoding: .utf8)
+        try mappedString(at: descriptionURL)
     }
 
     public func readIdentity() throws -> String {
-        try String(contentsOf: identityURL, encoding: .utf8)
+        try mappedString(at: identityURL)
     }
 
     public func listRelativePaths() throws -> [String] {
@@ -256,7 +279,7 @@ public struct BotHome: Sendable {
 
     public func readFile(relativePath: String) throws -> String {
         let url = try resolvedURL(relativePath)
-        return try String(contentsOf: url, encoding: .utf8)
+        return try mappedString(at: url)
     }
 
     public func writeFile(relativePath: String, contents: String) throws {
@@ -290,7 +313,7 @@ public struct BotHome: Sendable {
             guard isDir else { continue }
             let skillFile = url.appendingPathComponent("SKILL.md")
             guard FileManager.default.fileExists(atPath: skillFile.path) else { continue }
-            let body = try String(contentsOf: skillFile, encoding: .utf8)
+            let body = try mappedString(at: skillFile)
             skills.append(OwnedSkill(slug: url.lastPathComponent, body: body))
         }
         return skills

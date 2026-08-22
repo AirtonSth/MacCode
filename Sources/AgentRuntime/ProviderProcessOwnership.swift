@@ -150,7 +150,7 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
 
     private func loadUnlocked() throws -> [SpawnedProcessTag] {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
-        return try decoder.decode([SpawnedProcessTag].self, from: Data(contentsOf: fileURL))
+        return try decoder.decode([SpawnedProcessTag].self, from: Data(contentsOf: fileURL, options: .mappedIfSafe))
     }
 
     private func replaceUnlocked(_ tags: [SpawnedProcessTag], alreadyLocked: Bool = false) throws {

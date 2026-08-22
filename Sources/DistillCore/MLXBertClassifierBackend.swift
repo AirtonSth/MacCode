@@ -79,7 +79,7 @@ public actor MLXBertClassifierBackend {
             useLatest: false, progressHandler: { _ in })
 
         // Build the trunk from config.json.
-        let configData = try Data(contentsOf: dir.appending(component: "config.json"))
+        let configData = try Data(contentsOf: dir.appending(component: "config.json"), options: .mappedIfSafe)
         let config = try JSONDecoder().decode(BertConfiguration.self, from: configData)
         let trunk = BertModel(config, lmHead: false)
 
@@ -265,7 +265,7 @@ struct BertWordPieceTokenizer: Sendable {
     private static let crOnlyTrimSet = CharacterSet(charactersIn: "\r")
 
     init?(vocabFile: URL, lowercase: Bool) {
-        guard let text = try? String(contentsOf: vocabFile, encoding: .utf8) else { return nil }
+        guard let data = try? Data(contentsOf: vocabFile, options: .mappedIfSafe), let text = String(data: data, encoding: .utf8) else { return nil }
         var v: [String: Int] = [:]
         var arr: [String] = []
         // vocab.txt: one token per line; the line index IS the token id. Tokens never

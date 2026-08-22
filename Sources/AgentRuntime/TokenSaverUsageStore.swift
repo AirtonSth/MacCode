@@ -387,7 +387,7 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
     }
 
     private func loadUnlocked(period: TokenSaverPeriod) -> TokenSaverUsageSnapshot {
-        guard let data = try? Data(contentsOf: url) else {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
             return .empty(period: period)
         }
         Self.codecLock.lock()

@@ -2056,7 +2056,7 @@ enum SSHConfigParser {
     // Read and parse the file at the given URL. Returns [] when the file is
     // unreadable (missing, permission denied).
     static func parse(fileURL: URL) -> [SSHHostProfile] {
-        guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return [] }
+        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe), let text = String(data: data, encoding: .utf8) else { return [] }
         return parse(text: text)
     }
 

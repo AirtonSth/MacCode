@@ -8401,7 +8401,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         files.map { file in
             guard file.kind != GitFileStatus.deleted.rawValue,
                   let url = safeWorkspaceURL(cwd: cwd, relativePath: file.path),
-                  let data = try? Data(contentsOf: url) else {
+                  let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
                 return AgentTurnCheckpointFileSnapshot(path: file.path, kind: file.kind, contentsBase64: nil)
             }
             // P2: cap transient allocation + DB row size. Large or binary files
@@ -8756,7 +8756,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let forwardFiles: [CheckpointRevertUndo.CapturedFile] = paths.sorted().map { path in
             guard let url = safeWorkspaceURL(cwd: cwd, relativePath: path),
                   FileManager.default.fileExists(atPath: url.path),
-                  let data = try? Data(contentsOf: url) else {
+                  let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
                 return CheckpointRevertUndo.CapturedFile(path: path, contentsBase64: nil)
             }
             return CheckpointRevertUndo.CapturedFile(path: path, contentsBase64: data.base64EncodedString())

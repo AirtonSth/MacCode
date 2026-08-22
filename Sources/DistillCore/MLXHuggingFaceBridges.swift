@@ -50,7 +50,7 @@ enum MLXHuggingFaceBridges {
         guard fileManager.fileExists(atPath: configURL.path) else {
             throw TokenizerConfigValidationError.missingTokenizerConfig(configURL.path)
         }
-        let object = (try? JSONSerialization.jsonObject(with: Data(contentsOf: configURL))) as? [String: Any]
+        let object = (try? JSONSerialization.jsonObject(with: Data(contentsOf: configURL, options: .mappedIfSafe))) as? [String: Any]
         guard let object, object["tokenizer_class"] is String else {
             throw TokenizerConfigValidationError.missingTokenizerClass(configURL.path)
         }

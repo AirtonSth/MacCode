@@ -40,7 +40,7 @@ public enum ProjectScripts {
         }
 
         // Makefile phony-ish targets → `make <target>`
-        if let mk = try? String(contentsOfFile: cwd + "/Makefile", encoding: .utf8) {
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: cwd + "/Makefile"), options: .mappedIfSafe), let mk = String(data: data, encoding: .utf8) {
             for raw in mk.split(separator: "\n", omittingEmptySubsequences: true) {
                 let line = String(raw)
                 guard !line.hasPrefix("\t"), !line.hasPrefix("."), !line.hasPrefix("#"),

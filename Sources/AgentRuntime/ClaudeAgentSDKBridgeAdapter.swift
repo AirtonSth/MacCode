@@ -337,7 +337,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     private static func bridgeSupportsNativeSessionMutation(at path: String) -> Bool {
         guard pinnedNPMVersion(in: sdkPackageSpec()) == "0.3.157",
-              let source = try? String(contentsOfFile: path, encoding: .utf8) else {
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe), let source = String(data: data, encoding: .utf8) else {
             return false
         }
         return source.contains("const BRIDGE_PROTOCOL_VERSION = 3")
@@ -944,11 +944,19 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let specs: [String]             // exact-pinned install argv: sdk + native + peers
     }
 
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     static func cachedBridgeFileName(source: String) -> String {
         let digest = SHA256.hash(data: Data(source.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
-        return "ClaudeAgentSDKBridge-\(digest).mjs"
+        // PERF: nibble table avoids 32 String(format:) calls; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(Self.hexAlphabet[Int(b >> 4)])
+            out.append(Self.hexAlphabet[Int(b & 0x0F)])
+        }
+        let hex = String(bytes: out, encoding: .utf8) ?? ""
+        return "ClaudeAgentSDKBridge-\(hex).mjs"
     }
 
     private func resolvedBridgeScriptPath(onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws -> String {
@@ -973,7 +981,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     private func runtimeProvisionPlan(sourcePath: String) throws -> RuntimeProvisionPlan? {
         let url = URL(fileURLWithPath: sourcePath)
         guard FileManager.default.isReadableFile(atPath: url.path) else { return nil }
-        let source = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let source = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
         guard source.contains("@anthropic-ai/claude-agent-sdk") else { return nil }
         let localPackage = url.deletingLastPathComponent()
             .appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json")
@@ -990,7 +998,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         // cannot overwrite a newer PostToolUse implementation during launch.
         let cachedBridge = cache.appendingPathComponent(Self.cachedBridgeFileName(source: source))
         if !FileManager.default.isReadableFile(atPath: cachedBridge.path)
-            || ((try? String(contentsOf: cachedBridge, encoding: .utf8)) != source) {
+            || (((try? Data(contentsOf: cachedBridge, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) != source) {
             try source.write(to: cachedBridge, atomically: true, encoding: .utf8)
         }
         let sdkSpec = Self.sdkPackageSpec()
@@ -1311,7 +1319,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     static func installedPackageVersion(at packageJSON: URL) -> String? {
-        guard let data = try? Data(contentsOf: packageJSON),
+        guard let data = try? Data(contentsOf: packageJSON, options: .mappedIfSafe),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return object["version"] as? String
     }
@@ -1324,7 +1332,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     static func installedSDKPackage(at packageJSON: URL, matches packageSpec: String) -> Bool {
         guard FileManager.default.isReadableFile(atPath: packageJSON.path) else { return false }
-        guard let data = try? Data(contentsOf: packageJSON),
+        guard let data = try? Data(contentsOf: packageJSON, options: .mappedIfSafe),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return false
         }

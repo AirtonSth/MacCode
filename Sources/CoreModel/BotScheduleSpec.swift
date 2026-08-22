@@ -102,7 +102,10 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     }
 
     public func displayNote() -> String {
-        let time = String(format: "%02d:%02d", localTimeHour, localTimeMinute)
+        // PERF: manual two-digit decimal avoids String(format:) ICU per schedule display.
+        let hh = localTimeHour < 10 ? "0\(localTimeHour)" : "\(localTimeHour)"
+        let mm = localTimeMinute < 10 ? "0\(localTimeMinute)" : "\(localTimeMinute)"
+        let time = "\(hh):\(mm)"
         switch frequency {
         case .once:
             return "Once"
@@ -119,20 +122,34 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
         }
     }
 
+    // PERF: JSONEncoder/Decoder with iso8601 strategy are expensive. Share one pair behind lock.
+    private static let codecLock = NSLock()
+    private static let sharedEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }()
+    private static let sharedDecoder: JSONDecoder = {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }()
+
     public func encodedJSON() -> String {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(self),
-              let text = String(data: data, encoding: .utf8) else { return "" }
+        Self.codecLock.lock()
+        let data = try? Self.sharedEncoder.encode(self)
+        Self.codecLock.unlock()
+        guard let data, let text = String(data: data, encoding: .utf8) else { return "" }
         return text
     }
 
     public static func decodeJSON(_ raw: String) -> BotScheduleSpec? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return nil }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(BotScheduleSpec.self, from: data)
+        Self.codecLock.lock()
+        let decoded = try? Self.sharedDecoder.decode(BotScheduleSpec.self, from: data)
+        Self.codecLock.unlock()
+        return decoded
     }
 
     /// JSON wins. Otherwise recover Frequency + local time from `displayNote()`

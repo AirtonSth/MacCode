@@ -467,7 +467,7 @@ public final class AgentAttachmentStore: @unchecked Sendable {
         let url = metadataURL(referenceID: referenceID)
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         do {
-            return try decoder.decode(Metadata.self, from: Data(contentsOf: url))
+            return try decoder.decode(Metadata.self, from: Data(contentsOf: url, options: .mappedIfSafe))
         } catch {
             throw AgentAttachmentResolverError.malformedReference("corrupt host attachment metadata")
         }

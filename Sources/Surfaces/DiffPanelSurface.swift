@@ -507,7 +507,7 @@ public final class DiffPanelViewModel: ObservableObject {
                     // `git diff HEAD` produces nothing. Synthesize an
                     // all-addition patch by reading the file content directly.
                     let fullPath = (cwd as NSString).appendingPathComponent(p)
-                    let content = (try? String(contentsOfFile: fullPath, encoding: .utf8)) ?? ""
+                    let content = ((try? Data(contentsOf: URL(fileURLWithPath: fullPath), options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
                     d = gc.synthesizeUntrackedDiff(content: content, path: p)
                 } else {
                     d = gc.diff(in: cwd, path: p, ignoreWhitespace: ws)

@@ -56,8 +56,19 @@ public struct CapacitySeededRNG: Sendable {
         return nextUInt64() <= threshold
     }
 
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+    private static func hex16(_ value: UInt64) -> String {
+        var out: [UInt8] = Array(repeating: 0, count: 16)
+        var v = value
+        for i in (0..<16).reversed() {
+            out[i] = hexAlphabet[Int(v & 0xf)]
+            v >>= 4
+        }
+        return String(bytes: out, encoding: .utf8) ?? String(format: "%016llx", value)
+    }
+
     public mutating func deterministicID(prefix: String) -> String {
-        String(format: "%@-%016llx", prefix, nextUInt64())
+        "\(prefix)-\(Self.hex16(nextUInt64()))"
     }
 }
 

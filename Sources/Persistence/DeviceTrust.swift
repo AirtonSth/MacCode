@@ -278,8 +278,15 @@ public final class DeviceTrustRepository {
         return Data(b).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
     }
 
+    private static func sixDigitCode() -> String {
+        // PERF: manual zero-pad avoids String(format:) ICU per pairing code.
+        let v = Int.random(in: 0..<1_000_000)
+        let s = String(v)
+        return String(repeating: "0", count: 6 - s.count) + s
+    }
+
     public func createPairingCode(ttlSeconds: TimeInterval = 600, at now: Date = Date()) throws -> PairingCode {
-        let code = String(format: "%06d", Int.random(in: 0..<1_000_000))
+        let code = Self.sixDigitCode()
         let exp = now.addingTimeInterval(ttlSeconds)
         let st = try db.prepare("""
             INSERT INTO pairing_codes(code, created_at, expires_at) VALUES(?, ?, ?);
@@ -351,7 +358,7 @@ public final class DeviceTrustRepository {
     /// match before approving (anti-MITM, like Bluetooth pairing).
     public func createPairingRequest(deviceName: String, clientDeviceID: String? = nil, ttlSeconds: TimeInterval = 300, at now: Date = Date()) throws -> PairingRequest {
         let id = UUID().uuidString
-        let code = String(format: "%06d", Int.random(in: 0..<1_000_000))
+        let code = Self.sixDigitCode()
         let exp = now.addingTimeInterval(ttlSeconds)
         let st = try db.prepare("""
             INSERT INTO pairing_requests(id, code, device_name, created_at, expires_at, status, client_device_id)

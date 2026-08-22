@@ -143,7 +143,7 @@ public struct CodexForkProtocolSupport: Sendable, Equatable {
     }
 
     private static func object(at url: URL) throws -> [String: Any] {
-        let value = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
+        let value = try JSONSerialization.jsonObject(with: Data(contentsOf: url, options: .mappedIfSafe))
         guard let object = value as? [String: Any] else {
             throw SchemaInspectionError.notObject(url.lastPathComponent)
         }

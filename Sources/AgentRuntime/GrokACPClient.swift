@@ -831,7 +831,7 @@ public final class GrokACPClient: @unchecked Sendable {
                         "Grok ACP \(capabilities.agentVersion ?? "v1") does not support image prompts"
                     )
                 }
-                let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path))
+                let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path), options: .mappedIfSafe)
                 blocks.append([
                     "type": "image",
                     "data": data.base64EncodedString(),
@@ -841,7 +841,7 @@ public final class GrokACPClient: @unchecked Sendable {
                 guard capabilities.embeddedContext else {
                     throw GrokACPError.unsupported("Grok ACP does not negotiate embedded file context")
                 }
-                let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path))
+                let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path), options: .mappedIfSafe)
                 guard let text = String(data: data, encoding: .utf8) else {
                     throw GrokACPError.unsupported("Grok ACP embedded context requires UTF-8 text: \(attachment.displayName)")
                 }

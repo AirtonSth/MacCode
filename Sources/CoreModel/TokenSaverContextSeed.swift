@@ -1,4 +1,6 @@
 import CryptoKit
+
+private let _tokenSaverContextSeedHexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
 import Foundation
 
 /// Host-owned, provider-neutral conversation seed (`RCSEED1/1`).
@@ -310,7 +312,15 @@ public struct TokenSaverCanonicalConversationSnapshot: Sendable, Equatable {
         let material = items.map { item in
             "\(item.ordinal)\u{1e}\(item.role.rawValue)\u{1e}\(item.messageId)\u{1e}\(item.canonicalText)"
         }.joined(separator: "\n")
-        return SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hash(data: Data(material.utf8))
+        // PERF: nibble table avoids 32 String(format:) calls; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(_tokenSaverContextSeedHexAlphabet[Int(b >> 4)])
+            out.append(_tokenSaverContextSeedHexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 }
 
@@ -537,7 +547,15 @@ public enum TokenSaverContextItemSelector {
     }
 
     private static func sha256Hex(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hash(data: Data(text.utf8))
+        // PERF: nibble table avoids 32 String(format:) calls; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(_tokenSaverContextSeedHexAlphabet[Int(b >> 4)])
+            out.append(_tokenSaverContextSeedHexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 }
 
