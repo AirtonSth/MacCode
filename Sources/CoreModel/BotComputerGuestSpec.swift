@@ -4,7 +4,7 @@ public enum BotComputerGuestSpec {
     public static let imageTag = "remotecode/computer:local"
     public static let recipeLabelKey = "remotecode.recipe"
     /// Bump when start.sh / Dockerfile change. Missing label rebuilds the image.
-    public static let recipeRevision = "3"
+    public static let recipeRevision = "4"
     public static let guestUserHome = "/home/remotecode"
     public static let screenPort = 6080
     public static let minimumShmBytes: Int = 256 * 1024 * 1024
@@ -91,6 +91,21 @@ public enum BotComputerGuestSpec {
 
     public static func terminalCommand() -> [String] {
         ["env", "DISPLAY=:1", "xterm"]
+    }
+
+    /// Playwright MCP inside the guest: headed on the Xvfb display so the user
+    /// can watch and log in through the guest screen. Uses the image's chromium;
+    /// Playwright must not download browsers in the guest.
+    public static let playwrightGuestUserDataDir = "/home/remotecode/.browser-profiles/playwright"
+
+    public static func playwrightMCPCommand(userDataDir: String = playwrightGuestUserDataDir) -> [String] {
+        [
+            "env", "DISPLAY=:1",
+            "npx", "--yes", "@playwright/mcp@latest",
+            "--executable-path", "/usr/bin/chromium",
+            "--no-sandbox",
+            "--user-data-dir", userDataDir,
+        ]
     }
 
     public static func execUsesRoot(_ command: String) -> Bool {

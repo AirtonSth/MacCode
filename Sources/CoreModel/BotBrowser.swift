@@ -193,3 +193,22 @@ public enum BotBrowserHostState: Sendable {
         return payload
     }
 }
+
+/// Which executor serves bot_browser_* for a published desktop kind.
+/// Bots never get the RemoteCode in-app browser.
+public enum BotBrowserRoute: Equatable, Sendable {
+    case playwrightLocal
+    case playwrightGuest
+    case refused(String)
+
+    public static let refusedMessage =
+        "This bot browses with the owner's Google Chrome on this Mac — drive it with macos-harness. bot_browser_* tools exist only when the bot's Desktop is \"macOS with the bot's own browser\" (Playwright) or \"Docker with GUI\" (Playwright inside the guest). The RemoteCode in-app browser is never available to bots."
+
+    public static func forPublished(_ kind: BotDesktopKind) -> BotBrowserRoute {
+        switch kind.advertisedOrLogical {
+        case .botOwnedBrowser: return .playwrightLocal
+        case .dockerDesktop: return .playwrightGuest
+        case .logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac: return .refused(refusedMessage)
+        }
+    }
+}

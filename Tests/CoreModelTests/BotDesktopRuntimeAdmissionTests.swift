@@ -8,7 +8,7 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
         XCTAssertEqual(
             BotDesktopKind.advertisedKinds.map(\.displayTitle),
             [
-                "macOS with the default macOS browser",
+                "macOS with the owner's Google Chrome",
                 "macOS with the bot's own browser",
                 "Docker with GUI",
             ]
@@ -18,6 +18,10 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
         XCTAssertTrue(host.allowsHostDefaultBrowser)
         XCTAssertTrue(host.allowsMacOSHarness)
         XCTAssertFalse(host.allowsGuestComputer)
+        XCTAssertFalse(
+            host.allowsBotOwnedBrowser,
+            "this-Mac bots browse with the owner's Google Chrome, never bot_browser_*"
+        )
 
         let owned = BotDesktopAdmission.forPublished(.botOwnedBrowser)
         XCTAssertTrue(owned.allowsBotOwnedBrowser)
@@ -27,7 +31,10 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
         let docker = BotDesktopAdmission.forPublished(.dockerDesktop)
         XCTAssertTrue(docker.allowsGuestComputer)
         XCTAssertFalse(docker.allowsMacOSHarness)
-        XCTAssertFalse(docker.allowsBotOwnedBrowser)
+        XCTAssertTrue(
+            docker.allowsBotOwnedBrowser,
+            "a docker bot's own browser is Playwright inside its guest"
+        )
 
         XCTAssertThrowsError(
             try BotDesktopAdmission.requireSend(kind: .dockerDesktop, guestReady: false)
@@ -59,18 +66,49 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
     func test_compileFollowsAdmission_becauseSendMustSeeTheSameTools() {
         let host = BotStandingInstructions.admittedToolsText(for: .logicalExecutionSpace)
         XCTAssertTrue(host.contains(BotStandingInstructions.macosHarnessTool))
-        XCTAssertTrue(host.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertTrue(host.contains("Google Chrome"), "this-Mac bots must be told to browse in the owner's Chrome")
+        XCTAssertFalse(
+            host.contains(BotStandingInstructions.openBrowserTool),
+            "naming bot_browser_* on an owner's-Chrome desktop would advertise a refused tool"
+        )
         XCTAssertFalse(host.contains(BotStandingInstructions.computerObserveTool))
 
         let owned = BotStandingInstructions.admittedToolsText(for: .botOwnedBrowser)
         XCTAssertFalse(owned.contains(BotStandingInstructions.generatedMacOSHarnessLine))
         XCTAssertTrue(owned.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertTrue(owned.contains("Playwright"), "the bot's own browser must be named as Playwright, not a RemoteCode tab")
 
         let docker = BotStandingInstructions.admittedToolsText(for: .dockerDesktop)
         XCTAssertTrue(docker.contains(BotStandingInstructions.computerObserveTool))
         XCTAssertTrue(docker.contains(BotStandingInstructions.computerExecTool))
         XCTAssertTrue(docker.contains(BotStandingInstructions.computerRebuildTool))
         XCTAssertFalse(docker.contains(BotStandingInstructions.generatedMacOSHarnessLine))
-        XCTAssertFalse(docker.contains(BotStandingInstructions.generatedBrowserLine))
+        XCTAssertTrue(
+            docker.contains(BotStandingInstructions.openBrowserTool),
+            "docker bots browse via bot_browser_* backed by Playwright inside the guest"
+        )
+        XCTAssertTrue(docker.contains("Playwright"))
+        XCTAssertTrue(
+            docker.contains("If those browser tools fail"),
+            "docker fallback is the guest's Chrome-engine browser driven by computer-use, not the host"
+        )
+    }
+
+    func test_browserRouteFollowsPublishedDesktopKind_becauseBotsNeverGetTheInAppBrowser() {
+        // WHY: bot_browser_* must run Playwright locally for a bot-owned
+        // browser and Playwright inside the guest for Docker. Owner's-Chrome
+        // desktops (and leftover VM kinds) must refuse with copy that points
+        // at macos-harness — never at a RemoteCode in-app browser tab.
+        XCTAssertEqual(BotBrowserRoute.forPublished(.botOwnedBrowser), .playwrightLocal)
+        XCTAssertEqual(BotBrowserRoute.forPublished(.dockerDesktop), .playwrightGuest)
+        for kind: BotDesktopKind in [.logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac] {
+            guard case let .refused(message) = BotBrowserRoute.forPublished(kind) else {
+                XCTFail("\(kind) must refuse bot_browser_*")
+                continue
+            }
+            XCTAssertTrue(message.contains("Google Chrome"), "refusal must name the browser the bot really gets")
+            XCTAssertTrue(message.contains("never"), "refusal must forbid the in-app browser, not merely omit it")
+            XCTAssertTrue(message.contains("RemoteCode"), "refusal must name the banned in-app browser")
+        }
     }
 }

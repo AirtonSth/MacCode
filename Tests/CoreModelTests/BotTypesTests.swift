@@ -79,7 +79,7 @@ final class BotTypesTests: XCTestCase {
     func test_desktopLabel_statesSharedAccount_becauseUsersMustNotThinkP1aIsAnIsolatedVM() throws {
         XCTAssertEqual(
             BotDesktopKind.logicalExecutionSpace.honestyLabel,
-            "This Mac · default browser. Same macOS account; not isolated."
+            "This Mac · owner's Google Chrome. Same macOS account; not isolated."
         )
         XCTAssertFalse(
             BotDesktopKind.logicalExecutionSpace.honestyLabel.localizedCaseInsensitiveContains("virtual machine")
@@ -114,7 +114,7 @@ final class BotTypesTests: XCTestCase {
         )
         XCTAssertEqual(
             BotDesktopKind.logicalExecutionSpace.displayTitle,
-            "macOS with the default macOS browser"
+            "macOS with the owner's Google Chrome"
         )
         XCTAssertEqual(
             BotDesktopKind.botOwnedBrowser.displayTitle,
@@ -221,10 +221,14 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(tools.contains(BotStandingInstructions.removeSkillTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.saveRoutineTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.setRoutineEnabledTool))
-        XCTAssertTrue(tools.contains(BotStandingInstructions.openBrowserTool))
-        XCTAssertTrue(tools.contains(BotStandingInstructions.getBrowserTool))
-        XCTAssertTrue(tools.contains(BotStandingInstructions.waitLoginTool))
-        XCTAssertTrue(tools.contains("teammate's"))
+        // Browser tools are desktop-gated: the owner's-Chrome desktop admits
+        // none, the bot-owned-browser desktop still owns the catalog names.
+        let browserTools = BotStandingInstructions.admittedToolsText(for: .botOwnedBrowser)
+        XCTAssertFalse(tools.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertTrue(browserTools.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertTrue(browserTools.contains(BotStandingInstructions.getBrowserTool))
+        XCTAssertTrue(browserTools.contains(BotStandingInstructions.waitLoginTool))
+        XCTAssertTrue(browserTools.contains("teammate's"))
         XCTAssertTrue(tools.contains(BotStandingInstructions.macosHarnessTool))
         XCTAssertTrue(tools.contains(BotStandingInstructions.generatedMacOSHarnessLine))
         XCTAssertFalse(tools.contains("desktop"), "leftover desktop is not a live write")
