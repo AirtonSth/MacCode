@@ -94,6 +94,51 @@ function tokenSaverAppliedReceipt(prefix, state) {
   const mac = createHmac('sha256', key).update(Buffer.concat(canonical)).digest();
   return `[[rcd:v2.${nonce.toString('base64url')}.${mac.toString('base64url')}]]`;
 }
+
+const TOKEN_SAVER_MEDIA_BLOCK_TYPES = new Set([
+  'image',
+  'inputimage',
+  'outputimage',
+  'screenshot',
+  'media',
+  'audio',
+  'video',
+]);
+const TOKEN_SAVER_MEDIA_KEYS = new Set([
+  'image',
+  'image_url',
+  'imageUrl',
+  'screenshot',
+  'media',
+  'media_url',
+  'mediaUrl',
+  'audio',
+  'video',
+]);
+const TOKEN_SAVER_MEDIA_MIME_KEYS = new Set(['media_type', 'mediaType', 'mime_type', 'mimeType']);
+
+function tokenSaverToolResponseContainsMedia(value, seen = new Set()) {
+  if (value == null) return false;
+  if (typeof value === 'string') {
+    return value.length >= 64
+      && (value.includes('/9j/') || value.includes('iVBOR') || value.includes('data:image/'));
+  }
+  if (typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((item) => tokenSaverToolResponseContainsMedia(item, seen));
+  if (value.isImage === true || value.is_image === true) return true;
+  if (typeof value.type === 'string'
+      && TOKEN_SAVER_MEDIA_BLOCK_TYPES.has(normalizeToolName(value.type))) return true;
+  for (const key of TOKEN_SAVER_MEDIA_MIME_KEYS) {
+    if (typeof value[key] === 'string' && /^(image|audio|video)\//i.test(value[key])) return true;
+  }
+  for (const key of TOKEN_SAVER_MEDIA_KEYS) {
+    if (value[key] != null) return true;
+  }
+  if (typeof value.data === 'string' && tokenSaverToolResponseContainsMedia(value.data)) return true;
+  return Object.values(value).some((nested) => tokenSaverToolResponseContainsMedia(nested, seen));
+}
 // Edit echoes + Skill bodies stay full (verbatim edits / complete skills).
 // Read/Grep are compressed with reversible [[rc:handle]] so large exploration
 // reaches the ledger (previously excluded → near-zero PTU savings on advisors).
@@ -529,6 +574,9 @@ async function bestEffortRecordTokenSaverSavings(
 async function tokenSaverPostToolUse(input) {
   if (current.env.RC_TOKEN_SAVER_POST_TOOL_USE !== '1') return {};
   if (!input || input.hook_event_name !== 'PostToolUse') return {};
+  // Text extraction flattens mixed content; replacing the response would drop
+  // image/media bytes and incorrectly mint a persisted Distilled receipt.
+  if (tokenSaverToolResponseContainsMedia(input.tool_response)) return {};
   const rawOutput = extractToolOutputText(input.tool_response);
   const decision = tokenSaverToolDecision(input.tool_name, input.tool_input, rawOutput);
   if (!decision.shouldCompress) return {};

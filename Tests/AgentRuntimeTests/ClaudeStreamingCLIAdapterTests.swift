@@ -2067,6 +2067,131 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(json["webMCPUpdated"] as? String, "DISTILLED_NON_BASH")
     }
 
+    func test_agentSDKBridgePostToolUse_skipsNestedMixedMediaAndPreservesTextOnlyControl() throws {
+        let node = try XCTUnwrap(
+            ProcessLocator.resolve("node"),
+            "node is required for the bridge multimodal PostToolUse contract test"
+        )
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+
+        // WHY: extractToolOutputText flattens text from mixed content, while the
+        // replacement API replaces the entire tool_response. A media response must
+        // therefore fail open so the SDK keeps the exact shape/bytes and no receipt
+        // can drive the persisted Distilled badge. Text-only output remains eligible.
+        let harness = #"""
+        import { readFileSync } from 'fs';
+        const src = readFileSync(process.argv[2], 'utf8');
+        const helperStart = src.indexOf('const TOKEN_SAVER_MIN_BYTES');
+        const helperEnd = src.indexOf('function tokenSaverContractQuestion');
+        const hookStart = src.indexOf('async function tokenSaverPostToolUse');
+        const hookEnd = src.indexOf('function tokenSaverHooks');
+        if ([helperStart, helperEnd, hookStart, hookEnd].some((offset) => offset < 0)) {
+          throw new Error('bridge multimodal slice not found');
+        }
+        const factory = new Function(
+          'current',
+          'loadTokenSaverState',
+          'postTokenSaverDistill',
+          'bestEffortRecordTokenSaverSavings',
+          'randomUUID',
+          'tokenSaverContractQuestion',
+          src.slice(helperStart, helperEnd) + '\n' + src.slice(hookStart, hookEnd)
+            + '\nreturn tokenSaverPostToolUse;'
+        );
+        let sidecarCalls = 0;
+        let ledgerCalls = 0;
+        const hook = factory(
+          { env: { RC_TOKEN_SAVER_POST_TOOL_USE: '1', REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
+          () => ({ baseURL: 'http://127.0.0.1', authToken: 'tok' }),
+          async () => {
+            sidecarCalls += 1;
+            return { output: 'DISTILLED_TEXT\n[[rcd:applied]]', routeStage: 'deterministic', recoveryConfirmations: [] };
+          },
+          async () => { ledgerCalls += 1; },
+          () => '123e4567-e89b-12d3-a456-426614174000',
+          () => 'Compress fixture'
+        );
+        const raw = Array.from({ length: 80 }, (_, i) => `diagnostic line ${i}`).join('\n');
+        const imageBytes = 'iVBORw0KGgoAAAANSUhEUgAAAAE=';
+        const metadataImageBytes = 'METADATA_IMAGE_BYTES';
+        const screenshotBytes = 'SCREENSHOT_BYTES';
+        const mixed = {
+          content: [
+            { type: 'text', text: raw },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageBytes } },
+            { wrapper: { content: [
+              { type: 'text', text: 'nested text' },
+              { type: 'screenshot', mimeType: 'image/png', data: screenshotBytes },
+            ] } },
+          ],
+          metadata: { parts: [{ type: 'media', media_type: 'image/png', data: metadataImageBytes }] },
+        };
+        const mixedBefore = JSON.stringify(mixed);
+        const mixedResult = await hook({
+          hook_event_name: 'PostToolUse',
+          tool_name: 'WebFetch',
+          tool_input: { url: 'https://example.invalid/mixed' },
+          tool_response: mixed,
+        });
+        const mixedDelivered = mixedResult.hookSpecificOutput?.updatedToolOutput || mixed;
+        const mixedAfter = JSON.stringify(mixedDelivered);
+        const textResult = await hook({
+          hook_event_name: 'PostToolUse',
+          tool_name: 'WebFetch',
+          tool_input: { url: 'https://example.invalid/text' },
+          tool_response: raw,
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        console.log(JSON.stringify({
+          mixedResult,
+          mixedBefore,
+          mixedAfter,
+          mixedDeliveredContainsImageBytes: mixedAfter.includes(imageBytes),
+          mixedDeliveredContainsScreenshotBytes: mixedAfter.includes(screenshotBytes),
+          textUpdated: textResult.hookSpecificOutput?.updatedToolOutput,
+          textMCPUpdated: textResult.hookSpecificOutput?.updatedMCPToolOutput,
+          sidecarCalls,
+          ledgerCalls,
+        }));
+        """#
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-sdk-mixed-media-\(UUID().uuidString).mjs")
+        try harness.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [tmp.path, bridge.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
+        let data = try XCTUnwrap(out.data(using: .utf8))
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual((json["mixedResult"] as? [String: Any])?.count, 0,
+                       "mixed media must return an empty hook update so Claude retains the original response")
+        XCTAssertEqual(json["mixedBefore"] as? String, json["mixedAfter"] as? String,
+                       "mixed media must preserve the exact original response shape and bytes")
+        XCTAssertEqual(json["mixedDeliveredContainsImageBytes"] as? Bool, true)
+        XCTAssertEqual(json["mixedDeliveredContainsScreenshotBytes"] as? Bool, true)
+        XCTAssertFalse((json["mixedAfter"] as? String)?.contains("[[rcd:") == true,
+                        "mixed media must not persist an applied receipt/badge marker")
+        XCTAssertEqual(json["textUpdated"] as? String, "DISTILLED_TEXT\n[[rcd:applied]]",
+                       "text-only output must remain eligible for the existing replacement path")
+        XCTAssertEqual(json["textMCPUpdated"] as? String, "DISTILLED_TEXT\n[[rcd:applied]]")
+        XCTAssertEqual(json["sidecarCalls"] as? Int, 1,
+                       "only the text-only control may call the Distill sidecar")
+        XCTAssertEqual(json["ledgerCalls"] as? Int, 1,
+                       "only the accepted text replacement may enqueue savings accounting")
+    }
+
     func test_agentSDKBridgePostToolUse_appliesReceiptOnlyForNetShrink() throws {
         let node = try XCTUnwrap(
             ProcessLocator.resolve("node"),
