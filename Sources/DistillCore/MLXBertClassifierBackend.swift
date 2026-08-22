@@ -265,7 +265,7 @@ struct BertWordPieceTokenizer: Sendable {
     private static let crOnlyTrimSet = CharacterSet(charactersIn: "\r")
 
     init?(vocabFile: URL, lowercase: Bool) {
-        guard let text = try? String(contentsOf: vocabFile, encoding: .utf8) else { return nil }
+        guard let data = try? Data(contentsOf: vocabFile, options: .mappedIfSafe), let text = String(data: data, encoding: .utf8) else { return nil }
         var v: [String: Int] = [:]
         var arr: [String] = []
         // vocab.txt: one token per line; the line index IS the token id. Tokens never
