@@ -563,6 +563,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     }
 
     public func show() {
+        if LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
+            return
+        }
         NSApp.activate(ignoringOtherApps: true)
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
