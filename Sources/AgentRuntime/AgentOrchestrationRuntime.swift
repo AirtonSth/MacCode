@@ -716,7 +716,7 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
                 limit: max(1, limit) * 4
             )
         case .file(let url):
-            guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else { return [] }
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe), let text = String(data: data, encoding: .utf8) else { return [] }
             // Match the audit database contract: callers see the newest
             // append-only correction first on either storage backend.
             details = text.split(separator: "\n").reversed().map(String.init)
@@ -758,7 +758,7 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
                 limit: max(1, limit) * 4
             ).compactMap(decodeReceiptDetail)
         case .file(let url):
-            guard let data = try? Data(contentsOf: url),
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
                   let text = String(data: data, encoding: .utf8) else { return [] }
             records = text.split(separator: "\n")
                 .compactMap { try? decoder.decode(AgentOrchestrationAdmissionReceipt.self, from: Data($0.utf8)) }
@@ -3016,7 +3016,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         )
         guard isRegularFileWithoutSymlink(manifestURL),
               isDirectoryWithoutSymlink(canonicalPackageURL),
-              let data = try? Data(contentsOf: manifestURL) else {
+              let data = try? Data(contentsOf: manifestURL, options: .mappedIfSafe) else {
             return false
         }
         packageManifestDecodeLock.lock()
@@ -3048,7 +3048,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             let fileURL = canonicalPackageURL.appendingPathComponent(file.relativePath).standardizedFileURL
             guard fileURL.path.hasPrefix(root),
                   isRegularFileWithoutSymlink(fileURL),
-                  let fileData = try? Data(contentsOf: fileURL),
+                  let fileData = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
                   fileData.count == file.byteCount,
                   sha256Hex(fileData) == file.sha256.lowercased() else { return false }
         }
