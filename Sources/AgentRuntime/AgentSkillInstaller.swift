@@ -213,6 +213,10 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     The CLI preloads `mac`, `browser`, `Path`, and `subprocess`. Prefer bounded stdin
     programs; reserve `macos-harness repl` for manual exploration and always exit it.
 
+    In a RemoteCode checkout, invoke it through `scripts/macos-ui-lease.sh -- ...`.
+    The lease is cooperative and read-only by default; use `--allow-input` only for one
+    bounded E2E, and never run input-capable Computer Use while the user is using the Mac.
+
     Think in six verbs: `see`, `key`, `type`, `click`, `ax`, `script`.
 
     ```python
@@ -1324,23 +1328,22 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return .notPresent
     }
 
-    /// Install the RTK-style transparent command wrappers: a symlink per *compressible*
-    /// wrapped command in the managed bin dir (`~/.remote-code/bin`, PREPENDED to the agent
-    /// PATH only). Exact-output tools (sed, rg, grep, cat, …) are never wrapped — agents
-    /// need full stdout. Also removes any legacy exact-output symlinks from older installs.
+    /// Install the global interceptor symlink for every executable command visible on the
+    /// system PATH in the managed bin dir (`~/.remote-code/bin`, PREPENDED to the agent PATH
+    /// only). Exact-output tools (sed, rg, grep, cat, …) are intercepted but pass through raw
+    /// stdout by policy. Provider basenames and shebang interpreters stay on their native paths.
     /// Provider basenames (`grok`/`claude`/`codex`) are **not** part of this catalog —
     /// see `installProviderProxies()`.
+    /// - Parameter searchDirectoriesOverride: effective provider/workspace PATH directories.
     @discardableResult
-    public func installCommandWrappers(serviceBinaryURL: URL? = nil) throws -> [String] {
+    public func installCommandWrappers(
+        serviceBinaryURL: URL? = nil,
+        searchDirectoriesOverride: [String]? = nil
+    ) throws -> [String] {
         try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
         }
-        // Drop exact-output wrappers left by older catalogs (sed/rg/cat/…).
-        _ = try removeManagedWrapperSymlinks(
-            basenames: WrappedCommandCatalog.exactOutputCommands,
-            binaryURL: binary
-        )
         // Drop leftover Distill symlinks that are not catalog wrappers or
         // always-on controllers. A stray `node` wrapper makes
         // `#!/usr/bin/env node` (Homebrew Codex) start the sidecar instead.
@@ -1348,10 +1351,25 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             keeping: reservedManagedBinBasenames(includingCommandWrappers: true),
             serviceBinaryURL: binary
         )
-        let searchDirectories = systemCommandSearchDirectories()
+        let searchDirectories = (searchDirectoriesOverride ?? systemCommandSearchDirectories())
+            .filter { !$0.isEmpty && $0 != cliBinDirectory.path }
+        var candidates = WrappedCommandCatalog.commands
+        for directory in searchDirectories {
+            let names = (try? fileManager.contentsOfDirectory(atPath: directory)) ?? []
+            candidates.append(contentsOf: names.sorted())
+        }
+        var seen = Set<String>()
         var installed: [String] = []
-        for command in WrappedCommandCatalog.commands {
-            guard !WrappedCommandCatalog.isShebangInterpreter(command) else { continue }
+        for command in candidates {
+            guard seen.insert(command).inserted,
+                  !command.isEmpty,
+                  !command.contains("/"),
+                  !WrappedCommandCatalog.isShebangInterpreter(command),
+                  !ProviderProxyCatalog.providerSet.contains(command),
+                  command != "distill",
+                  command != "remote-code",
+                  command != "rc-retrieve-mcp"
+            else { continue }
             guard commandExistsOnSystem(command, searchDirectories: searchDirectories) else { continue }
             let link = cliBinDirectory.appendingPathComponent(command)
             if let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) {

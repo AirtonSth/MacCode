@@ -415,8 +415,22 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     public func teardown(botID: BotID) {
-        try? docker.remove(name: BotComputerGuestSpec.containerName(botID: botID))
-        try? docker.removeNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
+        try? removeGuestRuntime(botID: botID)
         try? BotGuestHome.wipe(appSupport: appSupport, botID: botID)
+    }
+
+    public func removeGuestRuntime(botID: BotID) throws {
+        var firstError: Error?
+        do {
+            try docker.remove(name: BotComputerGuestSpec.containerName(botID: botID))
+        } catch {
+            firstError = error
+        }
+        do {
+            try docker.removeNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
+        } catch {
+            if firstError == nil { firstError = error }
+        }
+        if let firstError { throw firstError }
     }
 }

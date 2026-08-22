@@ -88,6 +88,15 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     ) throws -> JSONValue {
         throw JSONRPCError.notSupported("host Bot skill view")
     }
+
+    var pairedBotRemoteResult: JSONValue?
+    var lastPairedBotRemote: (method: String, params: [String: JSONValue])?
+
+    func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
+        lastPairedBotRemote = (method, params)
+        if let pairedBotRemoteResult { return pairedBotRemoteResult }
+        throw JSONRPCError.notSupported("paired Bot remote control")
+    }
     func selectWorkspace(_ id: WorkspaceID) throws { window.selectedWorkspaceID = id }
     func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws { workspaces.removeAll { $0.id == id } }
     func renameWorkspace(_ id: WorkspaceID, _ newName: String) throws {}
@@ -1325,6 +1334,38 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(result["partial_reason"], .string("history_retention_cap"),
                        "authoritative history must preserve the host's permanent partial-output truth")
         XCTAssertEqual(result["pending_bytes"], .number(4096))
+    }
+
+    @MainActor
+    func test_httpBotCreateKeepsClientRequestIdOnPairedRemote() async {
+        let router = FakeRouter()
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "receipt_id": .string("r1"),
+            "bot_id": .string("bot-1"),
+            "request_id": .string("e2e"),
+        ])
+        let d = JSONRPCDispatcher(router: router)
+        let resp = await d.dispatchHTTP(
+            JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "bot.create",
+                params: [
+                    "client_request_id": .string("e2e"),
+                    "name": .string("Piper"),
+                ]
+            ),
+            mutationContext: MutationRequestContext(
+                ownerFingerprint: "owner",
+                hostId: "host",
+                bootEpoch: 1
+            )
+        )
+        XCTAssertNil(resp.error, "paired Bot create must not fall through to methodNotFound")
+        XCTAssertEqual(router.lastPairedBotRemote?.method, "bot.create")
+        XCTAssertEqual(router.lastPairedBotRemote?.params["client_request_id"], .string("e2e"))
+        XCTAssertEqual(resp.result?.objectValue?["receipt_id"], .string("r1"))
     }
 
     @MainActor
@@ -5757,6 +5798,24 @@ final class DispatcherTests: XCTestCase {
             XCTAssertEqual(resp.error?.code, -32602, "case \(idx) must be invalid params")
             XCTAssertEqual(fixture.router.agentCheckpointDiffCallCount, 0,
                            "case \(idx) must not invoke router.agentCheckpointDiff before validation")
+        }
+    }
+
+    @MainActor
+    func test_botPeerMethodsAreNotInterceptedByPairedBotRemote() async {
+        let d = JSONRPCDispatcher(router: FakeRouter())
+        for method in ["bot.peer.list", "bot.peer.ask", "bot.peer.self_config"] {
+            let resp = await d.dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: method,
+                params: [:]
+            ))
+            XCTAssertEqual(
+                resp.error?.code,
+                -32601,
+                "\(method) must remain Unix-catalog-only (method not found on local IPC), not paired Bot remote (-32004)"
+            )
         }
     }
 }

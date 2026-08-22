@@ -181,7 +181,27 @@ public final class LocalAuthAdapter: DirectAuthProvider {
         return ((try? repo.alwaysAllowedPairingDevice(clientDeviceID: clientDeviceID)) ?? nil) != nil
     }
 
+    /// Isolated E2E host pairing: `RC2_E2E_AUTO_APPROVE_PAIRING=1` skips the
+    /// Mac Approve panel. Compiled out of Release so an env var cannot bypass
+    /// pairing in production. `ProcessInfo.environment` is snapshotted; `getenv`
+    /// sees XCTest `setenv` after that snapshot.
+    static var isE2EPairingAutoApproveEnabled: Bool {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["RC2_E2E_AUTO_APPROVE_PAIRING"] == "1" {
+            return true
+        }
+        return getenv("RC2_E2E_AUTO_APPROVE_PAIRING").map { String(cString: $0) } == "1"
+        #else
+        return false
+        #endif
+    }
+
     private func canAutoApprovePairing(privateAccountAccessToken: String?) -> Bool {
+        // Isolated E2E AppSupport has no subscribed session. Honor this env
+        // before the blocking remote check so pairing never presents the Mac
+        // Approve panel (and never NSApp.activate-steals focus).
+        if Self.isE2EPairingAutoApproveEnabled { return true }
+
         // The non-blocking early return below is main-thread safe (no token / no
         // subscription => no remote check). Only the blocking tail must be guarded.
         guard let privateAccountAccessToken,

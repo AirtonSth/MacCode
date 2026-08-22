@@ -43,10 +43,17 @@ struct RemoteCodeMain {
             }
             return
         }
-        app.setActivationPolicy(.regular)
+        if LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
+            // Isolated iOS E2E: stay accessory and never steal the user's frontmost app.
+            app.setActivationPolicy(.accessory)
+        } else {
+            app.setActivationPolicy(.regular)
+        }
         let delegate = AppDelegate(channel: channel, appSupportOverride: appSupportOverride, dbOverride: dbOverride)
         app.delegate = delegate
-        app.activate(ignoringOtherApps: true)
+        if !LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
+            app.activate(ignoringOtherApps: true)
+        }
         withExtendedLifetime(delegate) {
             app.run()
         }

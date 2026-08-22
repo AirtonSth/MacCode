@@ -563,6 +563,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     }
 
     public func show() {
+        if LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
+            // Keep the session alive for paired HTTP without becoming key/frontmost.
+            window.orderFrontRegardless()
+            return
+        }
         NSApp.activate(ignoringOtherApps: true)
         window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)

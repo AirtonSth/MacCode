@@ -178,6 +178,10 @@ public struct BotBrowserStore: Sendable {
         return pending
     }
 
+    public func replacePendingOpens(_ pending: [BotBrowserPendingOpen]) throws {
+        try writeJSON(pending, to: pendingOpensURL)
+    }
+
     public func enqueueAction(_ action: BotBrowserPendingAction) throws {
         var pending = try loadPendingActions()
         pending.removeAll { $0.id == action.id }
@@ -371,14 +375,14 @@ public enum BotBrowserHost: Sendable {
         botID: BotID,
         url: String,
         title: String?,
-        notify: (Notification.Name) -> Void = { name in
+        notify: (Notification.Name) throws -> Void = { name in
             DistributedNotificationCenter.default().post(name: name, object: nil)
         }
     ) throws -> BotBrowserTarget {
         let service = BotBrowserService(callerBotID: botID, store: store)
         let target = try service.persistNavigation(url: url, title: title)
         try store.enqueuePendingOpen(target, botID: botID)
-        notify(pendingOpenNotification)
+        try notify(pendingOpenNotification)
         return target
     }
 
@@ -386,10 +390,21 @@ public enum BotBrowserHost: Sendable {
         store: BotBrowserStore,
         open: (BotID, String, String?) throws -> BotBrowserTarget
     ) throws -> [BotBrowserTarget] {
-        try store.takePendingOpens().compactMap { item in
-            guard let uuid = UUID(uuidString: item.botID) else { return nil }
-            return try open(BotID(uuid), item.url, item.title.isEmpty ? nil : item.title)
+        var pending = try store.loadPendingOpens()
+        var applied: [BotBrowserTarget] = []
+        while !pending.isEmpty {
+            let item = pending.removeFirst()
+            guard let uuid = UUID(uuidString: item.botID) else { continue }
+            do {
+                let target = try open(BotID(uuid), item.url, item.title.isEmpty ? nil : item.title)
+                applied.append(target)
+                try store.replacePendingOpens(pending)
+            } catch {
+                try store.replacePendingOpens([item] + pending)
+                throw error
+            }
         }
+        return applied
     }
 
     public static func requestAction(
