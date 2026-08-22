@@ -180,7 +180,6 @@ public struct ChromeDevToolsActionResult: Equatable, Sendable {
 public final class ChromeDevToolsHostClient: @unchecked Sendable {
     private struct Reference: Sendable {
         let target: ChromeDevToolsTarget
-        let snapshotToken: String
         let domRef: String
     }
 
@@ -365,31 +364,16 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
             throw ChromeDevToolsHostClientError.unavailableDebugEndpoint
         }
         let browserContextID = try browserContext(for: botID, endpoint: endpoint)
-        let creation: [String: Any]
-        do {
-            creation = try transport.send(
-                method: "Target.createTarget",
-                parameters: [
-                    "url": "about:blank",
-                    "browserContextId": browserContextID,
-                    "background": true,
-                    "hidden": true
-                ],
-                webSocketURL: endpoint.browserWebSocketURL
-            )
-        } catch let error as BrowserBackgroundUnsupported {
-            throw error
-        } catch let error as ChromeDevToolsHostClientError {
-            if case .protocolError(let message) = error {
-                throw BrowserBackgroundUnsupported.protocolError(message)
-            }
-            throw error
-        } catch {
-            throw BrowserBackgroundUnsupported.unsupported
-        }
-        if let protocolError = Self.backgroundProtocolError(in: creation) {
-            throw protocolError
-        }
+        let creation = try backgroundCommand(
+            method: "Target.createTarget",
+            parameters: [
+                "url": "about:blank",
+                "browserContextId": browserContextID,
+                "background": true,
+                "hidden": true
+            ],
+            webSocketURL: endpoint.browserWebSocketURL
+        )
         guard let result = creation["result"] as? [String: Any],
               let targetID = result["targetId"] as? String,
               !targetID.isEmpty else {
@@ -432,26 +416,11 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
     private func browserContext(for botID: BotID, endpoint: ChromeDevToolsEndpoint) throws -> String {
         if let existing = browserContexts[botID] { return existing }
 
-        let creation: [String: Any]
-        do {
-            creation = try transport.send(
-                method: "Target.createBrowserContext",
-                parameters: ["disposeOnDetach": false],
-                webSocketURL: endpoint.browserWebSocketURL
-            )
-        } catch let error as BrowserBackgroundUnsupported {
-            throw error
-        } catch let error as ChromeDevToolsHostClientError {
-            if case .protocolError(let message) = error {
-                throw BrowserBackgroundUnsupported.protocolError(message)
-            }
-            throw error
-        } catch {
-            throw BrowserBackgroundUnsupported.unsupported
-        }
-        if let protocolError = Self.backgroundProtocolError(in: creation) {
-            throw protocolError
-        }
+        let creation = try backgroundCommand(
+            method: "Target.createBrowserContext",
+            parameters: ["disposeOnDetach": false],
+            webSocketURL: endpoint.browserWebSocketURL
+        )
         guard let result = creation["result"] as? [String: Any],
               let contextID = result["browserContextId"] as? String,
               !contextID.isEmpty else {
@@ -474,6 +443,34 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
             return .protocolError("code=\(code), message=\(message)")
         }
         return .protocolError("message=\(message)")
+    }
+
+    private func backgroundCommand(
+        method: String,
+        parameters: [String: Any],
+        webSocketURL: URL
+    ) throws -> [String: Any] {
+        let response: [String: Any]
+        do {
+            response = try transport.send(
+                method: method,
+                parameters: parameters,
+                webSocketURL: webSocketURL
+            )
+        } catch let error as BrowserBackgroundUnsupported {
+            throw error
+        } catch let error as ChromeDevToolsHostClientError {
+            if case .protocolError(let message) = error {
+                throw BrowserBackgroundUnsupported.protocolError(message)
+            }
+            throw error
+        } catch {
+            throw BrowserBackgroundUnsupported.unsupported
+        }
+        if let protocolError = Self.backgroundProtocolError(in: response) {
+            throw protocolError
+        }
+        return response
     }
 
     private func send(
@@ -555,7 +552,6 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
         for element in elements {
             stored[element.ref] = Reference(
                 target: target,
-                snapshotToken: token,
                 domRef: element.ref
             )
         }

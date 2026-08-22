@@ -394,11 +394,10 @@ public final class ManagedChromeHostBrowserBridge: BotBrowserBridging, @unchecke
             return candidate.url != baseline
         }
         if settled(page) { return page }
-        for attempt in 0..<attempts {
+        for _ in 0..<attempts {
             if interval > 0 { sleep(interval) }
             page = try client.state(botID: botID)
             if settled(page) { return page }
-            if attempt == attempts - 1 { break }
         }
         throw ChromeDevToolsHostClientError.timeout
     }

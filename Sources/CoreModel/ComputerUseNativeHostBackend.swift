@@ -331,8 +331,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return captureResult(
                 observation: observation,
                 image: capture,
-                failureReason: captureFailure,
-                arguments: arguments
+                failureReason: captureFailure
             )
         case "doctor":
             let observation = await makeObservation(window: window, kind: .semantic)
@@ -429,8 +428,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     private func captureResult(
         observation: ComputerUseNativeHostObservation,
         image: ComputerUseNativeCapture?,
-        failureReason: String?,
-        arguments: [String: Any]
+        failureReason: String?
     ) -> ComputerUseToolResult {
         guard observation.screenCapturePermission,
               !observation.isMinimized,
@@ -441,7 +439,6 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             let diagnostic = failureReason.map { "\n capture_failure: \($0)" } ?? ""
             return failure(.capture_unavailable, encodeObservation(observation) + diagnostic)
         }
-        _ = arguments
         return ComputerUseToolResult(content: [
             .text(encodeObservation(observation)),
             .image(data: image.data, mimeType: image.mimeType),
@@ -520,10 +517,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         case "right_click", "mouse_move", "scroll", "key":
             // These operations traditionally depend on focus or a physical
             // cursor. Native host control cannot steal either from the human.
-            _ = window
-            _ = target
             return failure(
-                name == "type" || name == "key" ? .focus_required : .pixel_target_not_renderable,
+                name == "key" ? .focus_required : .pixel_target_not_renderable,
                 encodeObservation(freshObservation)
             )
         default:
@@ -1036,17 +1031,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                   imageSize.height > 0 else {
                 return "quartz_fallback_image_unavailable"
             }
-            guard let after,
-                  after == before,
-                  after.pid == target.pid,
-                  after.windowID == target.windowID,
-                  after.isOnScreen,
-                  after.bounds.width > 0,
-                  after.bounds.height > 0,
-                  after.bounds.origin.x.isFinite,
-                  after.bounds.origin.y.isFinite,
-                  after.bounds.width.isFinite,
-                  after.bounds.height.isFinite else {
+            guard let after, after == before else {
                 return "window_identity_or_bounds_drifted_after"
             }
             return nil
