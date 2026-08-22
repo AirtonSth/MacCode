@@ -269,10 +269,19 @@ public enum TokenSaverRequestSelectionReceipt {
         return Record(winner: winner, arms: arms)
     }
 
+    // PERF: JSONEncoder sortedKeys is ICU-heavy and not thread-safe. Share one behind lock.
+    private static let encodeLock = NSLock()
+    private static let sortedEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.sortedKeys]
+        return e
+    }()
+
     public static func encodeReport(_ report: Report) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return try encoder.encode(report)
+        encodeLock.lock()
+        let data = try sortedEncoder.encode(report)
+        encodeLock.unlock()
+        return data
     }
 
     public static func identityMatches(_ lhs: Record, _ rhs: Record) -> Bool {

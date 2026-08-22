@@ -128,12 +128,20 @@ public final class LibrarianDispatcher: @unchecked Sendable {
         return await LibrarianHandlers.run(request, function: fn, store: store, generate: generate)
     }
 
+    // PERF: JSONEncoder sortedKeys is ICU-heavy. Share one behind lock.
+    private static let statsEncoderLock = NSLock()
+    private static let statsEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.sortedKeys]
+        return e
+    }()
+
     private func statsOutput() -> LibrarianHandlerOutput {
         let modes = analytics.modeBreakdown()
         let total = analytics.totalSavedTokens()
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let modesJSON = (try? encoder.encode(modes)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        Self.statsEncoderLock.lock()
+        let modesJSON = (try? Self.statsEncoder.encode(modes)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        Self.statsEncoderLock.unlock()
         let text = "{\"total_saved_tokens\":\(total),\"modes\":\(modesJSON)}"
         return LibrarianHandlerOutput(status: .ok, text: text, originalForSavings: text)
     }
