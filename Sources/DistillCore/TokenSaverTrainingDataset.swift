@@ -256,8 +256,18 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         _ = try? fileManager.replaceItem(at: manifestURL, withItemAt: tmp, backupItemName: nil, options: [], resultingItemURL: nil)
     }
 
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     private func sha256(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hash(data: Data(text.utf8))
+        // PERF: nibble table avoids 32 String(format:) calls per hash; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(Self.hexAlphabet[Int(b >> 4)])
+            out.append(Self.hexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     /// Strict: unclosed think / leftover traces are not SFT material.
