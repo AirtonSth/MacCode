@@ -216,15 +216,34 @@ public struct BotComputerStore: Sendable {
         try readJSON([BotComputerActionResult].self, from: resultsURL) ?? []
     }
 
+    // PERF: share JSON codec to avoid per-call allocation (many pending/result I/Os per loop).
+    private static let sharedEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        return e
+    }()
+    private static let sharedDecoder = JSONDecoder()
+    private static let codecLock = NSLock()
+
     private func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
         try FileManager.default.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
-        let data = try JSONEncoder().encode(value)
+        Self.codecLock.lock()
+        let data: Data
+        do {
+            data = try Self.sharedEncoder.encode(value)
+        } catch {
+            Self.codecLock.unlock()
+            throw error
+        }
+        Self.codecLock.unlock()
         try data.write(to: url, options: .atomic)
     }
 
     private func readJSON<T: Decodable>(_ type: T.Type, from url: URL) throws -> T? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return try JSONDecoder().decode(type, from: Data(contentsOf: url))
+        let data = try Data(contentsOf: url)
+        Self.codecLock.lock()
+        defer { Self.codecLock.unlock() }
+        return try Self.sharedDecoder.decode(type, from: data)
     }
 }
 
