@@ -5,11 +5,21 @@ public enum BotComputerGuestObserve {
     public static let pngSignature = Data([0x89, 0x50, 0x4E, 0x47])
     public static let maxActSteps = 24
 
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     public static func validatePNG(_ data: Data) throws -> String {
         guard data.count >= 8, data.prefix(4) == pngSignature else {
             throw BotComputerGuestError.observeFailed
         }
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hash(data: data)
+        // PERF: nibble table avoids 32 String(format:) calls; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(Self.hexAlphabet[Int(b >> 4)])
+            out.append(Self.hexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     public static func assertActStepCount(_ count: Int) throws {
