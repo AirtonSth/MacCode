@@ -10217,12 +10217,23 @@ public struct AgentAppView: View {
         static let maximumRawBytes = 256 * 1_024
         static let maximumItemKeyBytes = 1_024
 
+        // PERF: JSONEncoder is ICU-heavy. Share one for display selections behind lock.
+        private static let codecLock = NSLock()
+        private static let encoder: JSONEncoder = JSONEncoder()
+        private static let decoder: JSONDecoder = JSONDecoder()
+
         private(set) var originalItemKeys: [String]
 
         init(rawValue: String = "[]") {
             guard rawValue.utf8.count <= Self.maximumRawBytes,
-                  let data = rawValue.data(using: .utf8),
-                  let decoded = try? JSONDecoder().decode([String].self, from: data) else {
+                  let data = rawValue.data(using: .utf8) else {
+                originalItemKeys = []
+                return
+            }
+            Self.codecLock.lock()
+            let decoded = try? Self.decoder.decode([String].self, from: data)
+            Self.codecLock.unlock()
+            guard let decoded else {
                 originalItemKeys = []
                 return
             }
@@ -10262,8 +10273,10 @@ public struct AgentAppView: View {
         }
 
         var rawValue: String {
-            guard let data = try? JSONEncoder().encode(originalItemKeys),
-                  let value = String(data: data, encoding: .utf8) else {
+            Self.codecLock.lock()
+            let data = try? Self.encoder.encode(originalItemKeys)
+            Self.codecLock.unlock()
+            guard let data, let value = String(data: data, encoding: .utf8) else {
                 return "[]"
             }
             return value
@@ -10271,7 +10284,10 @@ public struct AgentAppView: View {
 
         private mutating func trimToEncodedByteLimit() {
             while !originalItemKeys.isEmpty {
-                guard let data = try? JSONEncoder().encode(originalItemKeys) else {
+                Self.codecLock.lock()
+                let data = try? Self.encoder.encode(originalItemKeys)
+                Self.codecLock.unlock()
+                guard let data else {
                     originalItemKeys = []
                     return
                 }
