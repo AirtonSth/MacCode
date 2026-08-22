@@ -367,6 +367,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Downloads (that forced multi-folder TCC spam). Every button marks
     /// onboarding *handled* (not “permissions granted”) so launch never nags.
     func presentHostFileAccessOnboardingIfNeeded() {
+        if LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
+            return
+        }
         guard let context else { return }
         let repo = SettingsRepository(db: context.db)
         guard HostFileAccessOnboarding.shouldPresent(
