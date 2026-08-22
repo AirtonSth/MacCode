@@ -363,6 +363,7 @@ public enum ToonCodec: Sendable {
         return false
     }
 
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
     private static func escape(_ string: String) -> String {
         var out = ""
         for scalar in string.unicodeScalars {
@@ -373,7 +374,14 @@ public enum ToonCodec: Sendable {
             case 0x0D: out += "\\r"
             case 0x09: out += "\\t"
             case 0x00...0x1F:
-                out += String(format: "\\u%04x", scalar.value)
+                // PERF: nibble table avoids String(format:) per control scalar (Toon escape hot for tool outputs).
+                let v = scalar.value
+                var hex: [UInt8] = [92, 117, 48, 48, 48, 48] // \u0000
+                hex[2] = hexAlphabet[Int((v >> 12) & 0xf)]
+                hex[3] = hexAlphabet[Int((v >> 8) & 0xf)]
+                hex[4] = hexAlphabet[Int((v >> 4) & 0xf)]
+                hex[5] = hexAlphabet[Int(v & 0xf)]
+                out += String(bytes: hex, encoding: .utf8) ?? String(format: "\\u%04x", v)
             default:
                 out.unicodeScalars.append(scalar)
             }
