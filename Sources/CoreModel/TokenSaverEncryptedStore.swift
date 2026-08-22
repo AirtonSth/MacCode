@@ -491,7 +491,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         }
         for f in files {
             if f.lastPathComponent == "dek.bin" || f.lastPathComponent == "meta.json" { continue }
-            if let data = try? Data(contentsOf: f), data.range(of: payload) != nil {
+            if let data = try? Data(contentsOf: f, options: .mappedIfSafe), data.range(of: payload) != nil {
                 return true
             }
         }

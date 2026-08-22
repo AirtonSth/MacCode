@@ -183,7 +183,7 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         }
         public func loadSnapshot() -> Snapshot? {
             lock.lock(); defer { lock.unlock() }
-            guard let data = try? Data(contentsOf: url) else { return nil }
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
             return try? decoder.decode(Snapshot.self, from: data)
         }
         public func saveSnapshot(_ snapshot: Snapshot, expectedRevision: UInt64) -> Bool {
@@ -201,7 +201,7 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
             do {
                 let current: Snapshot?
                 if FileManager.default.fileExists(atPath: url.path) {
-                    current = try decoder.decode(Snapshot.self, from: Data(contentsOf: url))
+                    current = try decoder.decode(Snapshot.self, from: Data(contentsOf: url, options: .mappedIfSafe))
                 } else {
                     current = nil
                 }
