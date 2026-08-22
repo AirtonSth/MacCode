@@ -752,7 +752,7 @@ case "agent-app":
     let trailingPrompt = positional.dropFirst().joined(separator: " ")
     let prompt: String
     if let path = flags["prompt-file"] {
-        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe), let contents = String(data: data, encoding: .utf8) else {
             FileHandle.standardError.write(Data("\(AgentAppCLIError.invalidPromptFile(path).localizedDescription)\n".utf8))
             Darwin.exit(RC2ExitCode.rpcError)
         }

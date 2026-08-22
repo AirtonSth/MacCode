@@ -321,9 +321,17 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
         // else leave nil — first `rowCountLocked` cold-fills including this line
     }
 
+    private func mappedString(at url: URL) throws -> String {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard let str = String(data: data, encoding: .utf8) else {
+            throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [NSFilePathErrorKey: url.path])
+        }
+        return str
+    }
+
     private func loadLocked() throws -> [TerminalTransitionRecord] {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
-        let text = try String(contentsOf: fileURL, encoding: .utf8)
+        let text = try mappedString(at: fileURL)
         return text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
             guard let data = line.data(using: .utf8) else { return nil }
             return try? decoder.decode(TerminalTransitionRecord.self, from: data)
