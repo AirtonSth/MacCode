@@ -1480,7 +1480,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
             )) ?? []
             for jobDir in jobs {
                 let url = manifestURL(in: jobDir)
-                guard let data = try? Data(contentsOf: url),
+                guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
                       var manifest = try? decoder.decode(Manifest.self, from: data),
                       manifest.phase == .receiving,
                       manifest.updatedAtEpochSeconds <= cutoff else {
@@ -1529,7 +1529,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
             for jobDirectory in jobs {
                 let terminalJob: TerminalJob?
                 let manifestURL = manifestURL(in: jobDirectory)
-                if let data = try? Data(contentsOf: manifestURL),
+                if let data = try? Data(contentsOf: manifestURL, options: .mappedIfSafe),
                    let manifest = try? decoder.decode(Manifest.self, from: data),
                    manifest.phase != .receiving {
                     terminalJob = TerminalJob(
@@ -1544,7 +1544,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
                 } else {
                     let tombstoneURL = jobDirectory
                         .appendingPathComponent("cancelled.json", isDirectory: false)
-                    if let data = try? Data(contentsOf: tombstoneURL),
+                    if let data = try? Data(contentsOf: tombstoneURL, options: .mappedIfSafe),
                        let tombstone = try? decoder.decode(
                            CancellationTombstone.self,
                            from: data
@@ -1646,7 +1646,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         for job in jobs {
             let manifestURL = job.appendingPathComponent("manifest.json")
             guard fileManager.fileExists(atPath: manifestURL.path),
-                  let data = try? Data(contentsOf: manifestURL),
+                  let data = try? Data(contentsOf: manifestURL, options: .mappedIfSafe),
                   let manifest = try? decoder.decode(Manifest.self, from: data),
                   manifest.ownerFingerprint == owner,
                   manifest.phase == .receiving else { continue }
@@ -1673,7 +1673,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
             )) ?? []
             for job in jobs {
                 let manifestURL = job.appendingPathComponent("manifest.json")
-                guard let data = try? Data(contentsOf: manifestURL),
+                guard let data = try? Data(contentsOf: manifestURL, options: .mappedIfSafe),
                       let manifest = try? decoder.decode(Manifest.self, from: data),
                       manifest.phase == .receiving else {
                     continue
