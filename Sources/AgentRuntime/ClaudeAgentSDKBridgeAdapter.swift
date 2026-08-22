@@ -1311,7 +1311,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     static func installedPackageVersion(at packageJSON: URL) -> String? {
-        guard let data = try? Data(contentsOf: packageJSON),
+        guard let data = try? Data(contentsOf: packageJSON, options: .mappedIfSafe),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return object["version"] as? String
     }
@@ -1324,7 +1324,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     static func installedSDKPackage(at packageJSON: URL, matches packageSpec: String) -> Bool {
         guard FileManager.default.isReadableFile(atPath: packageJSON.path) else { return false }
-        guard let data = try? Data(contentsOf: packageJSON),
+        guard let data = try? Data(contentsOf: packageJSON, options: .mappedIfSafe),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return false
         }

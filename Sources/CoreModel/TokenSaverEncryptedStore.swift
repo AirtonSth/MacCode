@@ -409,7 +409,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         guard let key else { throw StoreError.shredded }
         let url = fileURL(for: id)
         guard FileManager.default.fileExists(atPath: url.path) else { throw StoreError.missing }
-        let data = try Data(contentsOf: url)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         let record = try decoder.decode(DiskRecord.self, from: data)
         guard record.scope == expectedScope else { throw StoreError.denied }
         guard Self.readerSupports(formatVersion: record.formatVersion) else { throw StoreError.unsupportedFormat }
@@ -428,7 +428,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         guard expectedScope.isComplete else { throw StoreError.denied }
         let url = fileURL(for: id)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
-        let data = try Data(contentsOf: url)
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
         let record = try decoder.decode(DiskRecord.self, from: data)
         guard record.scope == expectedScope else { throw StoreError.denied }
         try FileManager.default.removeItem(at: url)
