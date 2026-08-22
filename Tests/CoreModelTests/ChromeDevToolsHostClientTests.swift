@@ -14,10 +14,28 @@ final class ChromeDevToolsHostClientTests: XCTestCase {
         _ = try client.open(botID: firstBot, url: "https://one.example")
         _ = try client.open(botID: firstBot, url: "https://one.example/two")
         _ = try client.open(botID: secondBot, url: "https://two.example")
+        _ = try client.open(botID: secondBot, url: "https://two.example/again")
 
         let creates = transport.calls.filter { $0.method == "Target.createTarget" }
+        let contextCreates = transport.calls.filter { $0.method == "Target.createBrowserContext" }
         XCTAssertEqual(creates.count, 2,
                        "A Bot reuses its target, while a second Bot receives a distinct target.")
+        XCTAssertEqual(contextCreates.count, 2,
+                       "A Bot creates one isolated BrowserContext, while repeated calls reuse it.")
+        XCTAssertEqual(Set(contextCreates.compactMap { $0.parameters["browserContextId"] as? String }).count, 0,
+                       "BrowserContext creation must not borrow or accept another Bot's context.")
+        let contextIDs = transport.browserContextIDs
+        XCTAssertEqual(contextIDs.count, 2,
+                       "Chrome must return one context ID per Bot.")
+        XCTAssertEqual(Set(contextIDs).count, 2,
+                       "Different Bots must never share a BrowserContext ID.")
+        let targetContextIDs = creates.compactMap { $0.parameters["browserContextId"] as? String }
+        XCTAssertEqual(targetContextIDs, contextIDs,
+                       "Each hidden target must be created inside its own Bot's isolated context.")
+        XCTAssertEqual(transport.targetIDs.count, 2,
+                       "Repeated opens must reuse each Bot's existing target.")
+        XCTAssertEqual(transport.targetIDs.count, Set(transport.targetIDs).count,
+                       "Different Bots must never reuse a target ID.")
         XCTAssertEqual(Set(creates.compactMap { ($0.parameters["url"] as? String) }), ["about:blank"],
                        "Target creation must not navigate or borrow another Bot's current page.")
         XCTAssertTrue(creates.allSatisfy { ($0.parameters["background"] as? Bool) == true },
@@ -123,8 +141,21 @@ final class ChromeDevToolsHostClientTests: XCTestCase {
                           "A target without a safe background transport must be rejected explicitly.")
         }
 
+        let contextFailureTransport = FakeChromeDevToolsTransport()
+        contextFailureTransport.responses["Target.createBrowserContext"] = ["result": [:]]
+        let contextFailureClient = ChromeDevToolsHostClient(
+            endpointDiscovery: FakeEndpointDiscovery(),
+            transport: contextFailureTransport
+        )
+        XCTAssertThrowsError(try contextFailureClient.open(botID: BotID(), url: "https://example.com")) { error in
+            XCTAssertTrue(error is BrowserBackgroundUnsupported,
+                          "A failed BrowserContext creation must fail closed before any target is created.")
+        }
+        XCTAssertEqual(contextFailureTransport.calls.filter { $0.method == "Target.createTarget" }.count, 0,
+                       "Context failure must not fall back to a visible or shared target.")
+
         let rejectedTransport = FakeChromeDevToolsTransport()
-        rejectedTransport.sendError = ChromeDevToolsHostClientError.protocolError("hidden is unsupported")
+        rejectedTransport.sendErrors["Target.createTarget"] = ChromeDevToolsHostClientError.protocolError("hidden is unsupported")
         let rejectedClient = ChromeDevToolsHostClient(
             endpointDiscovery: FakeEndpointDiscovery(),
             transport: rejectedTransport
@@ -218,13 +249,25 @@ private final class FakeChromeDevToolsTransport: ChromeDevToolsTransport {
     var calls: [Call] = []
     var responses: [String: [String: Any]] = [:]
     var nextTargetID = "target-1"
+    var targetIDs: [String] = []
+    var nextBrowserContextID = "context-1"
+    var browserContextIDs: [String] = []
     var runtimeValue: [String: Any] = ["url": "https://example.com", "title": "Example"]
     var sendError: Error?
+    var sendErrors: [String: Error] = [:]
 
     func send(method: String, parameters: [String: Any], webSocketURL: URL) throws -> [String: Any] {
         calls.append(Call(method: method, parameters: parameters, webSocketURL: webSocketURL))
+        if let error = sendErrors[method] { throw error }
         if let sendError { throw sendError }
+        if method == "Target.createBrowserContext" {
+            let contextID = nextBrowserContextID
+            browserContextIDs.append(contextID)
+            nextBrowserContextID = "context-\(browserContextIDs.count + 1)"
+            return responses[method] ?? ["result": ["browserContextId": contextID]]
+        }
         if method == "Target.createTarget" {
+            targetIDs.append(nextTargetID)
             let result = [
                 "targetId": nextTargetID,
                 "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/\(nextTargetID)"

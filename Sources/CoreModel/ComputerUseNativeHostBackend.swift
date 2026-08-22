@@ -190,6 +190,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     public struct Hooks: @unchecked Sendable {
         public var listWindows: @Sendable (String?) -> [ComputerUseNativeWindow]
         public var userActivity: @Sendable (ComputerUseNativeHostTarget) -> ComputerUseNativeUserActivity
+        public var activityMonitorAvailable: @Sendable () -> Bool
         public var accessibilityPermission: @Sendable () -> Bool
         public var screenCapturePermission: @Sendable () -> Bool
         public var capture: @Sendable (ComputerUseNativeHostTarget) async -> ComputerUseNativeCapture?
@@ -206,6 +207,9 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             },
             userActivity: @escaping @Sendable (ComputerUseNativeHostTarget) -> ComputerUseNativeUserActivity = {
                 NativePlatform.userActivity(target: $0)
+            },
+            activityMonitorAvailable: @escaping @Sendable () -> Bool = {
+                NativePlatform.activityMonitoringAvailable()
             },
             accessibilityPermission: @escaping @Sendable () -> Bool = {
                 NativePlatform.accessibilityPermission()
@@ -235,6 +239,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         ) {
             self.listWindows = listWindows
             self.userActivity = userActivity
+            self.activityMonitorAvailable = activityMonitorAvailable
             self.accessibilityPermission = accessibilityPermission
             self.screenCapturePermission = screenCapturePermission
             self.capture = capture
@@ -253,6 +258,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         case missing_state_token
         case stale_state_token
         case human_activity
+        case activity_monitor_unavailable
         case permission_required
         case pixel_target_not_renderable
         case focus_required
@@ -260,6 +266,12 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         case semantic_action_failed
         case capture_unavailable
         case ui_tree_unavailable
+    }
+
+    private enum TokenKind: String {
+        case semantic
+        case pixel
+        case geometry
     }
 
     private let hooks: Hooks
@@ -283,27 +295,44 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return failure(.target_not_found, "the exact PID/window target is not present")
         }
 
-        let observation = makeObservation(window: window)
         switch name {
         case "screenshot", "zoom":
-            return await captureResult(observation: observation, arguments: arguments)
+            let capture: ComputerUseNativeCapture?
+            if hooks.screenCapturePermission(), window.isOnScreen, !window.isMinimized {
+                capture = await hooks.capture(target)
+            } else {
+                capture = nil
+            }
+            let observation = await makeObservation(
+                window: window,
+                kind: .pixel,
+                content: capture?.data
+            )
+            return captureResult(observation: observation, image: capture, arguments: arguments)
         case "doctor":
+            let observation = await makeObservation(window: window, kind: .semantic)
             return ComputerUseToolResult(text: encodeObservation(observation))
         case "get_ui_tree":
+            let tree = hooks.uiTree(target)
+            let observation = await makeObservation(window: window, kind: .semantic, content: tree)
             guard observation.accessibilityPermission,
-                  let tree = hooks.uiTree(target) else {
+                  let tree else {
                 return failure(.ui_tree_unavailable, encodeObservation(observation))
             }
             return ComputerUseToolResult(text: encodeObservation(observation) + "\nui_tree: \(tree)")
         case "cursor_position":
+            let observation = await makeObservation(window: window, kind: .geometry)
             return ComputerUseToolResult(text: encodeObservation(observation) + "\n"
                 + "cursor_position: \(Self.cursorPosition())")
         case "left_click", "right_click", "mouse_move", "scroll", "type", "key", "click_element", "open_application":
-            return mutate(
+            let kind: TokenKind = ["type", "click_element"].contains(name) ? .semantic : .pixel
+            let observation = await makeObservation(window: window, kind: kind)
+            return await mutate(
                 name: name,
                 target: target,
                 window: window,
                 observation: observation,
+                tokenKind: kind,
                 arguments: arguments
             )
         default:
@@ -319,7 +348,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         return hooks.listWindows(bundleID).first { $0.target == target }
     }
 
-    private func makeObservation(window: ComputerUseNativeWindow) -> ComputerUseNativeHostObservation {
+    private func makeObservation(
+        window: ComputerUseNativeWindow,
+        kind: TokenKind,
+        content: String? = nil
+    ) async -> ComputerUseNativeHostObservation {
         let accessibility = hooks.accessibilityPermission()
         let screenCapture = hooks.screenCapturePermission()
         let renderable = screenCapture && window.isOnScreen && !window.isMinimized
@@ -327,10 +360,27 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         if renderable { capabilities.append("window_capture") }
         if accessibility { capabilities.append("semantic_ax") }
         let activity = hooks.userActivity(window.target)
+        let observedContent: String
+        switch kind {
+        case .semantic:
+            observedContent = content ?? hooks.uiTree(window.target) ?? "<ui-tree-unavailable>"
+        case .pixel:
+            if let content {
+                observedContent = content
+            } else if renderable, let capture = await hooks.capture(window.target) {
+                observedContent = capture.data
+            } else {
+                observedContent = "<pixels-unavailable>"
+            }
+        case .geometry:
+            observedContent = "<geometry-only>"
+        }
         let token = stateToken(
             window: window,
             accessibilityPermission: accessibility,
-            screenCapturePermission: screenCapture
+            screenCapturePermission: screenCapture,
+            kind: kind,
+            content: observedContent
         )
         return ComputerUseNativeHostObservation(
             target: window.target,
@@ -347,14 +397,15 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
 
     private func captureResult(
         observation: ComputerUseNativeHostObservation,
+        image: ComputerUseNativeCapture?,
         arguments: [String: Any]
-    ) async -> ComputerUseToolResult {
+    ) -> ComputerUseToolResult {
         guard observation.screenCapturePermission,
               !observation.isMinimized,
               observation.isOnScreen else {
             return failure(.pixel_target_not_renderable, encodeObservation(observation))
         }
-        guard let image = await hooks.capture(observation.target) else {
+        guard let image else {
             return failure(.capture_unavailable, encodeObservation(observation))
         }
         _ = arguments
@@ -369,19 +420,32 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         target: ComputerUseNativeHostTarget,
         window: ComputerUseNativeWindow,
         observation: ComputerUseNativeHostObservation,
+        tokenKind: TokenKind,
         arguments: [String: Any]
-    ) -> ComputerUseToolResult {
+    ) async -> ComputerUseToolResult {
         // Check the physical user before any permission or action probe: human
         // activity always wins and cannot be hidden by a stale automation call.
+        guard hooks.activityMonitorAvailable() else {
+            return failure(.activity_monitor_unavailable, encodeObservation(observation))
+        }
         if hooks.userActivity(target) == .human {
             return failure(.human_activity, encodeObservation(observation))
         }
+        // Re-read the capability-specific content immediately before the
+        // mutation. The observation token is never a substitute for this
+        // final race check.
+        let freshObservation = await makeObservation(window: window, kind: tokenKind)
         guard let expected = arguments["expected_state_token"] as? String,
               !expected.isEmpty else {
-            return failure(.missing_state_token, encodeObservation(observation))
+            return failure(.missing_state_token, encodeObservation(freshObservation))
         }
-        guard expected == observation.stateToken else {
-            return failure(.stale_state_token, encodeObservation(observation))
+        guard expected == freshObservation.stateToken else {
+            return failure(.stale_state_token, encodeObservation(freshObservation))
+        }
+        // The content read above can take time (AX traversal or a screenshot).
+        // Give a physical user event observed during that window priority too.
+        if hooks.userActivity(target) == .human {
+            return failure(.human_activity, encodeObservation(freshObservation))
         }
 
         switch name {
@@ -389,35 +453,35 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             let coordinate = arguments["coordinate"] as? [Double]
                 ?? (arguments["coordinate"] as? [NSNumber])?.map(\.doubleValue)
                 ?? []
-            guard observation.screenCapturePermission,
-                  observation.isOnScreen,
-                  !observation.isMinimized else {
-                return failure(.pixel_target_not_renderable, encodeObservation(observation))
+            guard freshObservation.screenCapturePermission,
+                  freshObservation.isOnScreen,
+                  !freshObservation.isMinimized else {
+                return failure(.pixel_target_not_renderable, encodeObservation(freshObservation))
             }
             guard hooks.leftClick(target, coordinate) else {
-                return failure(.semantic_action_failed, encodeObservation(observation))
+                return failure(.semantic_action_failed, encodeObservation(freshObservation))
             }
-            return ComputerUseToolResult(text: "native left click applied\n\(encodeObservation(observation))")
+            return ComputerUseToolResult(text: "native left click applied\n\(encodeObservation(freshObservation))")
         case "click_element":
-            guard observation.accessibilityPermission else {
-                return failure(.permission_required, encodeObservation(observation))
+            guard freshObservation.accessibilityPermission else {
+                return failure(.permission_required, encodeObservation(freshObservation))
             }
             let role = arguments["role"] as? String ?? ""
             let label = arguments["label"] as? String ?? ""
             guard !role.isEmpty, !label.isEmpty,
                   hooks.semanticAction(target, role, label) else {
-                return failure(.semantic_action_failed, encodeObservation(observation))
+                return failure(.semantic_action_failed, encodeObservation(freshObservation))
             }
-            return ComputerUseToolResult(text: "native semantic action applied\n\(encodeObservation(observation))")
+            return ComputerUseToolResult(text: "native semantic action applied\n\(encodeObservation(freshObservation))")
         case "open_application":
             // Activation changes the human's active app and is never implicit.
-            return failure(.activation_forbidden, encodeObservation(observation))
+            return failure(.activation_forbidden, encodeObservation(freshObservation))
         case "type":
             let text = arguments["text"] as? String ?? ""
             guard !text.isEmpty, hooks.typeText(target, text) else {
-                return failure(.focus_required, encodeObservation(observation))
+                return failure(.focus_required, encodeObservation(freshObservation))
             }
-            return ComputerUseToolResult(text: "native background typing applied\n\(encodeObservation(observation))")
+            return ComputerUseToolResult(text: "native background typing applied\n\(encodeObservation(freshObservation))")
         case "right_click", "mouse_move", "scroll", "key":
             // These operations traditionally depend on focus or a physical
             // cursor. Native host control cannot steal either from the human.
@@ -425,7 +489,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             _ = target
             return failure(
                 name == "type" || name == "key" ? .focus_required : .pixel_target_not_renderable,
-                encodeObservation(observation)
+                encodeObservation(freshObservation)
             )
         default:
             return failure(.invalid_target, "unsupported native mutation")
@@ -482,7 +546,9 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     private func stateToken(
         window: ComputerUseNativeWindow,
         accessibilityPermission: Bool,
-        screenCapturePermission: Bool
+        screenCapturePermission: Bool,
+        kind: TokenKind,
+        content: String
     ) -> String {
         let pid = String(window.target.pid)
         let windowID = String(window.target.windowID)
@@ -496,9 +562,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         let height = String(describing: window.bounds.size.height)
         let accessibility = String(accessibilityPermission)
         let screenCapture = String(screenCapturePermission)
+        let contentDigest = SHA256.hash(data: Data(content.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
         let material = [
             pid, windowID, title, bundleID, onScreen, minimized,
             originX, originY, width, height, accessibility, screenCapture,
+            kind.rawValue, contentDigest,
         ].joined(separator: "|")
         return SHA256.hash(data: Data(material.utf8))
             .map { String(format: "%02x", $0) }
@@ -575,36 +645,168 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         }
 
         private static let activityMonitor = ComputerUseNativeActivityMonitor()
-        private static let activityMonitorToken: Any? = {
-            NSEvent.addGlobalMonitorForEvents(
-                matching: [.keyDown, .leftMouseDown, .rightMouseDown, .mouseMoved, .scrollWheel]
-            ) { event in
-                guard let cgEvent = event.cgEvent else { return }
-                let synthetic = cgEvent.getIntegerValueField(.eventSourceUserData)
+
+        /// A global NSEvent monitor is delivered on AppKit's run loop and can
+        /// stop observing while the stdio host is blocked. Keep the native tap
+        /// on its own thread/run loop instead. A listen-only tap never changes
+        /// the event stream and the source-user-data tag remains fail-closed.
+        private final class ActivityTap: @unchecked Sendable {
+            private let monitor: ComputerUseNativeActivityMonitor
+            private let lock = NSLock()
+            private var started = false
+            private var available = false
+            private var shouldStop = false
+            private var runLoop: CFRunLoop?
+            private var tap: CFMachPort?
+            private var readiness: DispatchGroup?
+
+            init(monitor: ComputerUseNativeActivityMonitor) {
+                self.monitor = monitor
+            }
+
+            deinit {
+                stop()
+            }
+
+            func start() -> Bool {
+                lock.lock()
+                if started {
+                    let readiness = self.readiness
+                    lock.unlock()
+                    readiness?.wait()
+                    lock.lock()
+                    let result = available
+                    lock.unlock()
+                    return result
+                }
+                started = true
+                let ready = DispatchGroup()
+                ready.enter()
+                readiness = ready
+                let thread = Thread { [weak self] in
+                    self?.run(ready: ready)
+                }
+                thread.name = "RemoteCode.ComputerUseActivityTap"
+                thread.start()
+                lock.unlock()
+                ready.wait()
+                lock.lock()
+                let result = available
+                lock.unlock()
+                return result
+            }
+
+            func stop() {
+                lock.lock()
+                shouldStop = true
+                let loop = runLoop
+                let currentTap = tap
+                tap = nil
+                lock.unlock()
+                if let loop {
+                    CFRunLoopStop(loop)
+                }
+                if let currentTap {
+                    CGEvent.tapEnable(tap: currentTap, enable: false)
+                }
+            }
+
+            private func run(ready: DispatchGroup) {
+                let keyboard = CGEventMask(1 << CGEventType.keyDown.rawValue)
+                    | CGEventMask(1 << CGEventType.keyUp.rawValue)
+                let mouse = CGEventMask(1 << CGEventType.mouseMoved.rawValue)
+                    | CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+                    | CGEventMask(1 << CGEventType.rightMouseDown.rawValue)
+                    | CGEventMask(1 << CGEventType.scrollWheel.rawValue)
+                let mask = keyboard | mouse
+                let context = Unmanaged.passUnretained(self).toOpaque()
+                guard let eventTap = CGEvent.tapCreate(
+                    tap: .cgSessionEventTap,
+                    place: .headInsertEventTap,
+                    options: .listenOnly,
+                    eventsOfInterest: mask,
+                    callback: Self.eventTapCallback,
+                    userInfo: context
+                ) else {
+                    lock.lock()
+                    available = false
+                    lock.unlock()
+                    ready.leave()
+                    return
+                }
+
+                let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+                let loop = CFRunLoopGetCurrent()
+                lock.lock()
+                tap = eventTap
+                runLoop = loop
+                available = source != nil
+                let stopImmediately = shouldStop
+                lock.unlock()
+                ready.leave()
+                guard let source, !stopImmediately else {
+                    CGEvent.tapEnable(tap: eventTap, enable: false)
+                    return
+                }
+                CFRunLoopAddSource(loop, source, .commonModes)
+                CGEvent.tapEnable(tap: eventTap, enable: true)
+                CFRunLoopRun()
+                CFRunLoopRemoveSource(loop, source, .commonModes)
+                CGEvent.tapEnable(tap: eventTap, enable: false)
+                lock.lock()
+                tap = nil
+                runLoop = nil
+                available = false
+                lock.unlock()
+            }
+
+            private static let eventTapCallback: CGEventTapCallBack = { _, type, event, refcon in
+                guard let refcon else { return Unmanaged.passUnretained(event) }
+                let tap = Unmanaged<ActivityTap>.fromOpaque(refcon).takeUnretainedValue()
+                tap.record(type: type, event: event)
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    tap.lock.lock()
+                    let currentTap = tap.tap
+                    tap.lock.unlock()
+                    if let currentTap {
+                        CGEvent.tapEnable(tap: currentTap, enable: true)
+                    }
+                }
+                return Unmanaged.passUnretained(event)
+            }
+
+            private func record(type: CGEventType, event: CGEvent) {
+                let synthetic = event.getIntegerValueField(.eventSourceUserData)
                     == ComputerUseNativeActivityMonitor.syntheticEventUserData
-                if event.type == .keyDown {
+                guard !synthetic else { return }
+                let timestamp = DispatchTime.now().uptimeNanoseconds
+                if type == .keyDown || type == .keyUp {
                     guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
-                    activityMonitor.record(.init(
+                    monitor.record(.init(
                         kind: .keyboard,
                         pid: pid,
-                        timestampNanoseconds: DispatchTime.now().uptimeNanoseconds,
-                        isSynthetic: synthetic
+                        timestampNanoseconds: timestamp
                     ))
-                } else if let target = windowUnderPointer(cgEvent.location) {
-                    activityMonitor.record(.init(
+                } else if let target = NativePlatform.windowUnderPointer(event.location) {
+                    monitor.record(.init(
                         kind: .mouse,
                         pid: target.pid,
                         windowID: target.windowID,
-                        timestampNanoseconds: DispatchTime.now().uptimeNanoseconds,
-                        isSynthetic: synthetic
+                        timestampNanoseconds: timestamp
                     ))
                 }
             }
-        }()
+        }
+
+        private static let activityTap = ActivityTap(monitor: activityMonitor)
 
         public static func userActivity(target: ComputerUseNativeHostTarget) -> ComputerUseNativeUserActivity {
-            _ = activityMonitorToken
+            _ = activityTap.start()
             return activityMonitor.activity(for: target)
+        }
+
+        public static func activityMonitoringAvailable() -> Bool {
+            activityTap.start()
         }
 
         public static func capture(target: ComputerUseNativeHostTarget) async -> ComputerUseNativeCapture? {
@@ -703,6 +905,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         ) -> Bool {
             guard AXIsProcessTrusted(), coordinate.count >= 2,
                   let targetBounds = targetBounds(target),
+                  let targetWindow = exactAXWindow(target: target),
                   targetBounds.contains(CGPoint(x: coordinate[0], y: coordinate[1])) else {
                 return false
             }
@@ -716,7 +919,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             ) == .success,
             let element,
             let ownerWindow = elementAttribute(kAXWindowAttribute as CFString, from: element),
-            matches(ownerWindow, bounds: targetBounds) else {
+            sameAXWindow(ownerWindow, targetWindow) else {
                 return false
             }
             return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
@@ -786,7 +989,21 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             guard let windows = attribute(kAXWindowsAttribute as CFString, from: app) as? [AXUIElement] else {
                 return nil
             }
-            return windows.first { matches($0, bounds: bounds) }
+            let frameMatches = windows.filter { matches($0, bounds: bounds) }
+            guard frameMatches.count != 0 else { return nil }
+            if frameMatches.count == 1 { return frameMatches[0] }
+
+            // Multiple AX windows can report the same frame (for example a
+            // sheet and its owner). A frame alone is not an exact identity;
+            // use the Quartz title only when it disambiguates exactly one
+            // candidate, and otherwise fail closed.
+            guard let title = listWindows(bundleID: nil)
+                .first(where: { $0.target == target })?.title,
+                  !title.isEmpty else { return nil }
+            let titleMatches = frameMatches.filter {
+                (attribute(kAXTitleAttribute as CFString, from: $0) as? String) == title
+            }
+            return titleMatches.count == 1 ? titleMatches[0] : nil
         }
 
         private static func targetBounds(_ target: ComputerUseNativeHostTarget) -> CGRect? {
@@ -794,8 +1011,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         }
 
         private static func sameAXWindow(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool {
-            guard let lhsFrame = frame(of: lhs), let rhsFrame = frame(of: rhs) else { return false }
-            return framesEqual(lhsFrame, rhsFrame)
+            CFEqual(lhs, rhs)
         }
 
         private static func matches(_ element: AXUIElement, bounds: CGRect) -> Bool {

@@ -54,11 +54,50 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertEqual(probe.semanticMutations, 0, "stale state must fail before any AX mutation")
     }
 
+    func test_semanticContentChangeWithStableGeometryRejectsStaleMutation() async throws {
+        let probe = Probe()
+        let backend = makeBackend(probe: probe)
+        let token = try await stateToken(from: backend, name: "doctor")
+        probe.uiTree = "{\"role\":\"AXWindow\",\"children\":[{\"role\":\"AXButton\",\"title\":\"Cancel\"}]}"
+
+        let result = await backend.invoke(
+            name: "click_element",
+            arguments: baseArguments(token: token).merging([
+                "role": "AXButton", "label": "Save"
+            ]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("stale_state_token") == true)
+        XCTAssertEqual(probe.semanticMutations, 0, "AX content changes must invalidate semantic tokens even when geometry is unchanged")
+    }
+
+    func test_pixelContentChangeWithStableGeometryRejectsStaleMutation() async throws {
+        let probe = Probe()
+        let backend = makeBackend(probe: probe)
+        // Both screenshot and left_click use the pixel token capability. The
+        // only state change below is captured content; PID, title and bounds
+        // remain unchanged, so kind mismatch cannot explain the rejection.
+        let token = try await stateToken(from: backend, name: "screenshot")
+        probe.captureData = "changed-pixels"
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: token).merging([
+                "coordinate": [12, 34]
+            ]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("stale_state_token") == true)
+        XCTAssertEqual(probe.leftClickMutations, 0, "pixel changes must invalidate pixel tokens even when geometry is unchanged")
+    }
+
     func testHumanActivityWinsAndExecutesNoMutation() async throws {
         let probe = Probe()
         probe.activity = .human
         let backend = makeBackend(probe: probe)
-        let token = try await stateToken(from: backend)
+        let token = try await stateToken(from: backend, name: "doctor")
 
         let result = await backend.invoke(
             name: "click_element",
@@ -70,6 +109,42 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertTrue(result.isError)
         XCTAssertTrue(result.content.first?.text?.contains("human_activity") == true)
         XCTAssertEqual(probe.semanticMutations, 0, "physical user activity has priority over semantic automation")
+    }
+
+    func testUnavailableActivityMonitorFailsClosedBeforeMutation() async throws {
+        let probe = Probe()
+        probe.activityMonitorAvailable = false
+        let backend = makeBackend(probe: probe)
+        let token = try await stateToken(from: backend, name: "doctor")
+
+        let result = await backend.invoke(
+            name: "click_element",
+            arguments: baseArguments(token: token).merging([
+                "role": "AXButton", "label": "Save"
+            ]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("activity_monitor_unavailable") == true)
+        XCTAssertEqual(probe.semanticMutations, 0)
+    }
+
+    func testHumanActivityRecheckWinsImmediatelyBeforeMutationHook() async throws {
+        let probe = Probe()
+        probe.activitySequence = [.none, .none, .none, .none, .human]
+        let backend = makeBackend(probe: probe)
+        let token = try await stateToken(from: backend, name: "doctor")
+
+        let result = await backend.invoke(
+            name: "click_element",
+            arguments: baseArguments(token: token).merging([
+                "role": "AXButton", "label": "Save"
+            ]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("human_activity") == true)
+        XCTAssertEqual(probe.semanticMutations, 0, "a physical event during token validation must stop the mutation hook")
     }
 
     func testUnrelatedAndTaggedSyntheticActivityDoNotBlockTarget() {
@@ -122,7 +197,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         let probe = Probe()
         probe.accessibilityPermission = false
         let backend = makeBackend(probe: probe)
-        let token = try await stateToken(from: backend)
+        let token = try await stateToken(from: backend, name: "doctor")
 
         let result = await backend.invoke(
             name: "click_element",
@@ -140,7 +215,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         let probe = Probe()
         probe.isMinimized = true
         let backend = makeBackend(probe: probe)
-        let token = try await stateToken(from: backend)
+        let token = try await stateToken(from: backend, name: "screenshot")
 
         let result = await backend.invoke(
             name: "left_click",
@@ -157,7 +232,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
     func testFocusOnlyActionsExecuteNoMutation() async throws {
         let probe = Probe()
         let backend = makeBackend(probe: probe)
-        let token = try await stateToken(from: backend)
+        let token = try await stateToken(from: backend, name: "doctor")
 
         let result = await backend.invoke(
             name: "type",
@@ -175,7 +250,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         let probe = Probe()
         probe.typeTextResult = true
         let backend = makeBackend(probe: probe)
-        let token = try await stateToken(from: backend)
+        let token = try await stateToken(from: backend, name: "doctor")
 
         let result = await backend.invoke(
             name: "type",
@@ -192,7 +267,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
     func testLeftClickUsesExactTargetAXHookWithoutActivation() async throws {
         let probe = Probe()
         let backend = makeBackend(probe: probe)
-        let token = try await stateToken(from: backend)
+        let token = try await stateToken(from: backend, name: "screenshot")
 
         let result = await backend.invoke(
             name: "left_click",
@@ -218,6 +293,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertFalse(result.isError)
         XCTAssertTrue(result.content.first?.text?.contains("AXButton") == true)
         XCTAssertFalse(result.content.first?.text?.contains("unavailable") == true)
+        XCTAssertEqual(probe.uiTreeCalls, 1, "get_ui_tree must hash and return the same single AX traversal")
     }
 
     func testSemanticAXActionCanMutateBackgroundTarget() async throws {
@@ -237,15 +313,19 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertEqual(probe.activations, 0)
     }
 
-    private func stateToken(from backend: ComputerUseNativeHostBackend) async throws -> String {
+    private func stateToken(from backend: ComputerUseNativeHostBackend, name: String = "doctor") async throws -> String {
         let result = await backend.invoke(
-            name: "doctor",
+            name: name,
             arguments: ["target_pid": 17, "target_window_id": 29]
         )
         let text = try XCTUnwrap(result.content.first?.text)
-        let data = try XCTUnwrap(text.data(using: .utf8))
-        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        return try XCTUnwrap(json["state_token"] as? String)
+        for line in text.split(separator: "\n").reversed() {
+            guard let data = String(line).data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let token = json["state_token"] as? String else { continue }
+            return token
+        }
+        throw XCTSkip("native response did not contain an observation token")
     }
 
     private func baseArguments(token: String) -> [String: Any] {
@@ -259,14 +339,18 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
     private func makeBackend(probe: Probe) -> ComputerUseNativeHostBackend {
         ComputerUseNativeHostBackend(hooks: .init(
             listWindows: { _ in [probe.window] },
-            userActivity: { _ in probe.activity },
+            userActivity: { _ in probe.nextActivity() },
+            activityMonitorAvailable: { probe.activityMonitorAvailable },
             accessibilityPermission: { probe.accessibilityPermission },
             screenCapturePermission: { probe.screenCapturePermission },
             capture: { _ in
                 probe.captureCalls += 1
-                return probe.isMinimized ? nil : .init(data: "cGl4ZWxz", mimeType: "image/png")
+                return probe.isMinimized ? nil : .init(data: probe.captureData, mimeType: "image/png")
             },
-            uiTree: { _ in probe.uiTree },
+            uiTree: { _ in
+                probe.uiTreeCalls += 1
+                return probe.uiTree
+            },
             semanticAction: { _, _, _ in
                 probe.semanticMutations += 1
                 return true
@@ -292,6 +376,9 @@ private final class Probe: @unchecked Sendable {
     private let lock = NSLock()
     var windowTitle = "RemoteCode"
     var activity: ComputerUseNativeUserActivity = .none
+    var activitySequence: [ComputerUseNativeUserActivity] = []
+    private var activityIndex = 0
+    var activityMonitorAvailable = true
     var accessibilityPermission = true
     var screenCapturePermission = true
     var isMinimized = false
@@ -302,7 +389,9 @@ private final class Probe: @unchecked Sendable {
     var pixelMutations = 0
     var activations = 0
     var captureCalls = 0
-    var uiTree: String?
+    var uiTree: String? = "{\"role\":\"AXWindow\",\"title\":\"RemoteCode\"}"
+    var uiTreeCalls = 0
+    var captureData = "cGl4ZWxz"
 
     var window: ComputerUseNativeWindow {
         lock.lock(); defer { lock.unlock() }
@@ -314,5 +403,12 @@ private final class Probe: @unchecked Sendable {
             isMinimized: isMinimized,
             bounds: .zero
         )
+    }
+
+    func nextActivity() -> ComputerUseNativeUserActivity {
+        lock.lock()
+        defer { lock.unlock() }
+        defer { activityIndex += 1 }
+        return activitySequence.indices.contains(activityIndex) ? activitySequence[activityIndex] : activity
     }
 }

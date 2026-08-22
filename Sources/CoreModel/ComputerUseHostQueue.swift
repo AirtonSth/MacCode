@@ -28,12 +28,20 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
     private struct Waiter {
         var id: UUID
         var continuation: CheckedContinuation<Void, Error>
+        var ticket: Ticket
+    }
+
+    private struct Ticket {
+        var url: URL
     }
 
     private final class TargetState {
         var busy = false
         var waiters: [Waiter] = []
         var fd: Int32 = -1
+        var activeID: UUID?
+        var activeTicket: Ticket?
+        var activeContinuation: CheckedContinuation<Void, Error>?
     }
 
     private let state = NSLock()
@@ -60,13 +68,20 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
 
     deinit {
         state.lock()
-        let fds = targets.values.map(\.fd)
+        let active = targets.values.compactMap { state -> (Int32, Ticket?)? in
+            guard state.fd >= 0 || state.activeTicket != nil else { return nil }
+            return (state.fd, state.activeTicket)
+        }
+        let waiters = targets.values.flatMap(\.waiters)
         targets.removeAll()
         state.unlock()
-        for fd in fds where fd >= 0 {
+        for (fd, ticket) in active {
+            removeTicket(ticket)
+            guard fd >= 0 else { continue }
             flock(fd, LOCK_UN)
             close(fd)
         }
+        for waiter in waiters { removeTicket(waiter.ticket) }
     }
 
     /// Exclusive critical section. Observation uses the same lock so a screenshot
@@ -125,11 +140,18 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
         try Task.checkCancellation()
         let id = UUID()
         let key = key(for: targetPID)
+        let ticket: Ticket
+        do {
+            ticket = try createTicket(for: targetPID)
+        } catch {
+            throw ComputerUseHostQueueError.lockFileUnavailable(lockURL.path)
+        }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 state.lock()
                 if Task.isCancelled {
                     state.unlock()
+                    removeTicket(ticket)
                     continuation.resume(throwing: CancellationError())
                     return
                 }
@@ -143,24 +165,21 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
                 }
                 if !target.busy {
                     target.busy = true
+                    target.activeID = id
+                    target.activeTicket = ticket
+                    target.activeContinuation = continuation
                     state.unlock()
-                    let fd = openLockFile(for: targetPID)
-                    state.lock()
-                    target.fd = fd
-                    state.unlock()
-                    if fd >= 0 {
-                        continuation.resume()
-                    } else {
-                        state.lock()
-                        target.busy = false
-                        target.fd = -1
-                        targets.removeValue(forKey: key)
-                        state.unlock()
-                        continuation.resume(throwing: ComputerUseHostQueueError.lockFileUnavailable(lockURL.path))
-                    }
+                    startLease(
+                        id: id,
+                        ticket: ticket,
+                        targetPID: targetPID,
+                        key: key,
+                        target: target,
+                        continuation: continuation
+                    )
                     return
                 }
-                target.waiters.append(Waiter(id: id, continuation: continuation))
+                target.waiters.append(Waiter(id: id, continuation: continuation, ticket: ticket))
                 state.unlock()
             }
         } onCancel: {
@@ -175,13 +194,49 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
             state.unlock()
             return
         }
-        guard let index = target.waiters.firstIndex(where: { $0.id == id }) else {
+        if let index = target.waiters.firstIndex(where: { $0.id == id }) {
+            let waiter = target.waiters.remove(at: index)
+            state.unlock()
+            removeTicket(waiter.ticket)
+            waiter.continuation.resume(throwing: CancellationError())
+            return
+        }
+
+        // The first local lease can be asynchronously waiting behind another
+        // process's ticket. Cancellation must remove that active ticket and
+        // promote the next local waiter, otherwise the detached starter could
+        // later acquire the lock after its caller has already been cancelled.
+        guard target.activeID == id, target.fd < 0,
+              let continuation = target.activeContinuation else {
             state.unlock()
             return
         }
-        let waiter = target.waiters.remove(at: index)
+        let ticket = target.activeTicket
+        let next = target.waiters.isEmpty ? nil : target.waiters.removeFirst()
+        if let next {
+            target.activeID = next.id
+            target.activeTicket = next.ticket
+            target.activeContinuation = next.continuation
+        } else {
+            target.activeID = nil
+            target.activeTicket = nil
+            target.activeContinuation = nil
+            target.busy = false
+            targets.removeValue(forKey: key)
+        }
         state.unlock()
-        waiter.continuation.resume(throwing: CancellationError())
+        removeTicket(ticket)
+        continuation.resume(throwing: CancellationError())
+        if let next {
+            startLease(
+                id: next.id,
+                ticket: next.ticket,
+                targetPID: targetPID,
+                key: key,
+                target: target,
+                continuation: next.continuation
+            )
+        }
     }
 
     private func releaseToken(targetPID: Int32?) {
@@ -192,7 +247,11 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
             return
         }
         let releasedFD = target.fd
+        let releasedTicket = target.activeTicket
         target.fd = -1
+        target.activeID = nil
+        target.activeTicket = nil
+        target.activeContinuation = nil
         if releasedFD >= 0 {
             flock(releasedFD, LOCK_UN)
             close(releasedFD)
@@ -201,30 +260,23 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
             target.busy = false
             targets.removeValue(forKey: key)
             state.unlock()
+            removeTicket(releasedTicket)
             return
         }
         let next = target.waiters.removeFirst()
+        target.activeID = next.id
+        target.activeTicket = next.ticket
+        target.activeContinuation = next.continuation
         state.unlock()
-
-        // Keep the target busy while the next local waiter acquires the
-        // same PID's file lock. Different target PIDs use different files.
-        let fd = openLockFile(for: targetPID)
-        state.lock()
-        target.fd = fd
-        if fd < 0 {
-            target.busy = false
-            let remaining = target.waiters
-            target.waiters.removeAll()
-            targets.removeValue(forKey: key)
-            state.unlock()
-            next.continuation.resume(throwing: ComputerUseHostQueueError.lockFileUnavailable(lockURL.path))
-            for waiter in remaining {
-                waiter.continuation.resume(throwing: ComputerUseHostQueueError.lockFileUnavailable(lockURL.path))
-            }
-            return
-        }
-        state.unlock()
-        next.continuation.resume()
+        removeTicket(releasedTicket)
+        startLease(
+            id: next.id,
+            ticket: next.ticket,
+            targetPID: targetPID,
+            key: key,
+            target: target,
+            continuation: next.continuation
+        )
     }
 
     private func key(for targetPID: Int32?) -> String {
@@ -250,6 +302,162 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
             return -1
         }
         return fd
+    }
+
+    private func startLease(
+        id: UUID,
+        ticket: Ticket,
+        targetPID: Int32?,
+        key: String,
+        target: TargetState,
+        continuation: CheckedContinuation<Void, Error>
+    ) {
+        Task {
+            do {
+                try await waitForTurn(ticket, targetPID: targetPID)
+                try Task.checkCancellation()
+                let fd = openLockFile(for: targetPID)
+                guard fd >= 0 else {
+                    throw ComputerUseHostQueueError.lockFileUnavailable(lockURL.path)
+                }
+                guard installLease(fd: fd, id: id, target: target, ticket: ticket) else {
+                    return
+                }
+                continuation.resume()
+            } catch {
+                removeTicket(ticket)
+                let (isCurrent, remaining) = failLease(id: id, key: key, target: target)
+                if isCurrent {
+                    continuation.resume(throwing: error)
+                } else {
+                    return
+                }
+                for waiter in remaining {
+                    removeTicket(waiter.ticket)
+                    waiter.continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func installLease(fd: Int32, id: UUID, target: TargetState, ticket: Ticket) -> Bool {
+        state.lock()
+        guard target.activeID == id else {
+            state.unlock()
+            flock(fd, LOCK_UN)
+            close(fd)
+            removeTicket(ticket)
+            return false
+        }
+        target.fd = fd
+        state.unlock()
+        return true
+    }
+
+    private func failLease(id: UUID, key: String, target: TargetState) -> (Bool, [Waiter]) {
+        state.lock()
+        let isCurrent = target.activeID == id
+        if isCurrent {
+            target.activeID = nil
+            target.activeTicket = nil
+            target.activeContinuation = nil
+            target.busy = false
+            targets.removeValue(forKey: key)
+        }
+        let remaining = isCurrent ? target.waiters : []
+        if isCurrent { target.waiters.removeAll() }
+        state.unlock()
+        return (isCurrent, remaining)
+    }
+
+    private func queueDirectory(for targetPID: Int32?) -> URL {
+        let base = lockURL.deletingPathExtension().lastPathComponent
+        let suffix = targetPID.map { ".pid-\($0)" } ?? ".global"
+        return lockURL.deletingLastPathComponent()
+            .appendingPathComponent("\(base)\(suffix).queue", isDirectory: true)
+    }
+
+    private func createTicket(for targetPID: Int32?) throws -> Ticket {
+        let directory = queueDirectory(for: targetPID)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let counterURL = directory.appendingPathComponent("counter")
+        let counterFD = open(counterURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard counterFD >= 0, flock(counterFD, LOCK_EX) == 0 else {
+            if counterFD >= 0 { close(counterFD) }
+            throw ComputerUseHostQueueError.lockFileUnavailable(lockURL.path)
+        }
+        defer {
+            flock(counterFD, LOCK_UN)
+            close(counterFD)
+        }
+
+        var counterBytes = [UInt8](repeating: 0, count: 32)
+        lseek(counterFD, 0, SEEK_SET)
+        let readCount = read(counterFD, &counterBytes, counterBytes.count)
+        let current = readCount > 0
+            ? UInt64(String(decoding: counterBytes[..<readCount], as: UTF8.self)) ?? 0
+            : 0
+        let sequence = current &+ 1
+        let id = UUID()
+        let filename = String(format: "ticket-%020llu-%@", sequence, id.uuidString)
+        let url = directory.appendingPathComponent(filename)
+        let ticketFD = open(url.path, O_CREAT | O_EXCL | O_WRONLY, S_IRUSR | S_IWUSR)
+        guard ticketFD >= 0 else {
+            throw ComputerUseHostQueueError.lockFileUnavailable(lockURL.path)
+        }
+        let payload = "\(getpid())|\(DispatchTime.now().uptimeNanoseconds)"
+        payload.data(using: .utf8)!.withUnsafeBytes { bytes in
+            _ = write(ticketFD, bytes.baseAddress, bytes.count)
+        }
+        fsync(ticketFD)
+        close(ticketFD)
+        let encoded = sequence
+        let output = String(encoded).data(using: .utf8)!
+        lseek(counterFD, 0, SEEK_SET)
+        ftruncate(counterFD, 0)
+        output.withUnsafeBytes { bytes in
+            _ = write(counterFD, bytes.baseAddress, bytes.count)
+        }
+        fsync(counterFD)
+        return Ticket(url: url)
+    }
+
+    private func waitForTurn(_ ticket: Ticket, targetPID: Int32?) async throws {
+        let directory = queueDirectory(for: targetPID)
+        while true {
+            try Task.checkCancellation()
+            cleanupStaleTickets(in: directory)
+            let earlier = (try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            ).filter { $0.lastPathComponent.hasPrefix("ticket-") }
+                .contains { $0.lastPathComponent < ticket.url.lastPathComponent }) ?? false
+            if !earlier { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func cleanupStaleTickets(in directory: URL) {
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasPrefix("ticket-") }) ?? []
+        for url in urls {
+            guard let data = try? Data(contentsOf: url),
+                  let record = String(data: data, encoding: .utf8),
+                  let owner = Int32(record.split(separator: "|").first ?? "") else {
+                continue
+            }
+            let ownerDead = owner != getpid() && kill(owner, 0) != 0 && errno == ESRCH
+            if ownerDead {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
+    private func removeTicket(_ ticket: Ticket?) {
+        guard let ticket else { return }
+        try? FileManager.default.removeItem(at: ticket.url)
     }
 }
 

@@ -180,6 +180,7 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
     private let transport: any ChromeDevToolsTransport
     private let lock = NSLock()
     private var targets: [BotID: ChromeDevToolsTarget] = [:]
+    private var browserContexts: [BotID: String] = [:]
     private var references: [BotID: [String: Reference]] = [:]
 
     public init(
@@ -352,12 +353,14 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
         } catch {
             throw ChromeDevToolsHostClientError.unavailableDebugEndpoint
         }
+        let browserContextID = try browserContext(for: botID, endpoint: endpoint)
         let creation: [String: Any]
         do {
             creation = try transport.send(
                 method: "Target.createTarget",
                 parameters: [
                     "url": "about:blank",
+                    "browserContextId": browserContextID,
                     "background": true,
                     "hidden": true,
                     "newWindow": false,
@@ -412,6 +415,40 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
         )
         targets[botID] = target
         return target
+    }
+
+    private func browserContext(for botID: BotID, endpoint: ChromeDevToolsEndpoint) throws -> String {
+        if let existing = browserContexts[botID] { return existing }
+
+        let creation: [String: Any]
+        do {
+            creation = try transport.send(
+                method: "Target.createBrowserContext",
+                parameters: ["disposeOnDetach": false],
+                webSocketURL: endpoint.browserWebSocketURL
+            )
+        } catch let error as BrowserBackgroundUnsupported {
+            throw error
+        } catch let error as ChromeDevToolsHostClientError {
+            if case .protocolError = error {
+                throw BrowserBackgroundUnsupported.unsupported
+            }
+            throw error
+        } catch {
+            throw BrowserBackgroundUnsupported.unsupported
+        }
+        guard let result = creation["result"] as? [String: Any],
+              let contextID = result["browserContextId"] as? String,
+              !contextID.isEmpty else {
+            throw BrowserBackgroundUnsupported.unsupported
+        }
+        if browserContexts.values.contains(contextID) {
+            // BrowserContext IDs are isolation boundaries. Never silently
+            // attach two Bot IDs to one context if Chrome returns a duplicate.
+            throw BrowserBackgroundUnsupported.unsupported
+        }
+        browserContexts[botID] = contextID
+        return contextID
     }
 
     private func send(

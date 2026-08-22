@@ -297,17 +297,40 @@ final class BotTypesTests: XCTestCase {
 
     func test_admittedToolsNameNativeHostComputerUse() {
         // WHY: logical Desktop bots must observe the native host before
-        // mutating it, while the starter soul must not claim these tools.
+        // mutating it with the capability-specific token, while the starter
+        // soul must not claim these tools.
         let tools = BotStandingInstructions.admittedToolsText
         XCTAssertTrue(tools.contains(BotStandingInstructions.generatedNativeHostComputerLine))
-        XCTAssertTrue(tools.contains("first call screenshot or list_windows"))
-        XCTAssertTrue(tools.contains("expected_state_token"))
+        XCTAssertTrue(tools.contains("first call list_windows to discover the exact target_pid and target_window_id"))
+        XCTAssertTrue(tools.contains("screenshot or zoom for that target"))
+        XCTAssertTrue(tools.contains("pixel state token as expected_state_token"))
+        XCTAssertTrue(tools.contains("doctor or get_ui_tree"))
+        XCTAssertTrue(tools.contains("semantic state token as expected_state_token"))
+        XCTAssertTrue(tools.contains("Before a pixel or coordinate mutation, if its pixel token is stale or the target is minimized/off-screen"))
+        XCTAssertTrue(tools.contains("A semantic AX mutation may proceed in a background or minimized window"))
+        XCTAssertTrue(tools.contains("accessibility permission/capabilities and a fresh semantic token allow it"))
+        XCTAssertTrue(tools.contains("If a token is stale, permissions/capabilities are insufficient"))
         XCTAssertTrue(tools.contains("must never activate an app"))
+        XCTAssertTrue(tools.contains("focus, raise, maximize, or unminimize"))
+        XCTAssertTrue(tools.contains("move the physical cursor"))
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")
                 .contains(BotStandingInstructions.generatedNativeHostComputerLine),
             "tools layer owns native host computer-use"
         )
+    }
+
+    func test_guestInstructionsKeepTheirOwnBrowserAndComputerPaths() {
+        // WHY: typed native-host guidance belongs only to logical Desktop.
+        // Docker must retain guest computer-use and Playwright instructions,
+        // so a host token can never steer a guest mutation.
+        let guest = BotStandingInstructions.admittedToolsText(for: .dockerDesktop)
+        XCTAssertTrue(guest.contains(BotStandingInstructions.generatedGuestComputerLine))
+        XCTAssertTrue(guest.contains(BotStandingInstructions.computerObserveTool))
+        XCTAssertTrue(guest.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertFalse(guest.contains(BotStandingInstructions.generatedNativeHostComputerLine))
+        XCTAssertFalse(guest.contains("pixel state token as expected_state_token"))
+        XCTAssertFalse(guest.contains("semantic state token as expected_state_token"))
     }
 
     func test_admittedToolsNameAddSkill_becauseSetSkillAlreadyBindsTheCatalogId() {

@@ -88,17 +88,27 @@ final class ChromeHostBrowserBridgeTests: XCTestCase {
 
     private final class RecordingCDPTransport: ChromeDevToolsTransport, @unchecked Sendable {
         private(set) var createdTargetIDs: [String] = []
+        private(set) var createdBrowserContextIDs: [String] = []
+        private(set) var targetContextIDs: [String: String] = [:]
 
         func send(
             method: String,
             parameters: [String: Any],
             webSocketURL: URL
         ) throws -> [String: Any] {
+            if method == "Target.createBrowserContext" {
+                let contextID = "context-\(createdBrowserContextIDs.count + 1)"
+                createdBrowserContextIDs.append(contextID)
+                return ["result": ["browserContextId": contextID]]
+            }
             guard method == "Target.createTarget" else {
                 return ["result": [String: Any]()]
             }
             let targetID = "target-\(createdTargetIDs.count + 1)"
             createdTargetIDs.append(targetID)
+            if let contextID = parameters["browserContextId"] as? String {
+                targetContextIDs[targetID] = contextID
+            }
             return [
                 "result": [
                     "targetId": targetID,
@@ -283,6 +293,12 @@ final class ChromeHostBrowserBridgeTests: XCTestCase {
         _ = try client.open(botID: BotID(), url: "https://one.example")
         _ = try client.open(botID: BotID(), url: "https://two.example")
         XCTAssertEqual(transport.createdTargetIDs, ["target-1", "target-2"])
+        XCTAssertEqual(transport.createdBrowserContextIDs, ["context-1", "context-2"])
+        XCTAssertEqual(
+            transport.targetContextIDs,
+            ["target-1": "context-1", "target-2": "context-2"],
+            "Each Bot's distinct BrowserContext must reach its own distinct target."
+        )
     }
 
     func test_playwrightRoutesRemainDelegatedWithoutChromeLaunch() throws {

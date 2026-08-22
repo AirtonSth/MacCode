@@ -204,17 +204,17 @@ public struct ManagedComputerUseMCP: Sendable {
         case "zoom":
             return "Inspect a screen region at full resolution."
         case leftClickTool:
-            return "Left-click at coordinates. Optional target_app / target_window_id."
+            return "Left-click at coordinates in the exact background target; requires a state token and never activates."
         case "right_click":
-            return "Right-click at coordinates. Optional target_app / target_window_id."
+            return "Right-click at coordinates for the exact target; requires a state token and fails closed without focus-safe support."
         case "mouse_move":
-            return "Move the pointer without clicking."
+            return "Move the pointer for the exact target; requires a state token and fails closed without activation."
         case "scroll":
-            return "Scroll at coordinates."
+            return "Scroll the exact target; requires a state token and fails closed without activation."
         case typeTool:
-            return "Type Unicode text into the targeted window."
+            return "Type Unicode text into a settable AX-focused element in the exact background target."
         case keyTool:
-            return "Press a key or combo (e.g. command+s)."
+            return "Press a key or combo only with an exact target state token; unsupported focus-stealing input fails closed."
         case "cursor_position":
             return "Read the current pointer position."
         case "list_windows":
@@ -222,9 +222,9 @@ public struct ManagedComputerUseMCP: Sendable {
         case "get_ui_tree":
             return "Accessibility tree for a window."
         case "open_application":
-            return "Open and focus an app by bundle id."
+            return "Report activation as forbidden; the native backend never opens or focuses an application."
         case "click_element":
-            return "Click a UI element by role and label."
+            return "Press an AX element by role and label in the exact background target."
         case "doctor":
             return "Permission and native-backend diagnostics."
         default:
@@ -248,12 +248,15 @@ public struct ManagedComputerUseMCP: Sendable {
                     "width": ["type": "number"],
                     "quality": ["type": "number"],
                 ]) { _, new in new },
+                "required": ["target_pid", "target_window_id"],
             ]
         case "zoom":
             return [
                 "type": "object",
-                "properties": ["region": ["type": "array", "items": ["type": "number"]]],
-                "required": ["region"],
+                "properties": targeting.merging([
+                    "region": ["type": "array", "items": ["type": "number"]],
+                ]) { _, new in new },
+                "required": ["target_pid", "target_window_id", "region"],
             ]
         case leftClickTool, "right_click", "mouse_move":
             return [
@@ -261,7 +264,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "properties": targeting.merging([
                     "coordinate": ["type": "array", "items": ["type": "number"]],
                 ]) { _, new in new },
-                "required": ["coordinate"],
+                "required": ["target_pid", "target_window_id", "expected_state_token", "coordinate"],
             ]
         case "scroll":
             return [
@@ -271,25 +274,25 @@ public struct ManagedComputerUseMCP: Sendable {
                     "direction": ["type": "string"],
                     "amount": ["type": "number"],
                 ]) { _, new in new },
-                "required": ["coordinate", "direction"],
+                "required": ["target_pid", "target_window_id", "expected_state_token", "coordinate", "direction"],
             ]
         case typeTool:
             return [
                 "type": "object",
                 "properties": targeting.merging(["text": ["type": "string"]]) { _, new in new },
-                "required": ["text"],
+                "required": ["target_pid", "target_window_id", "expected_state_token", "text"],
             ]
         case keyTool:
             return [
                 "type": "object",
                 "properties": targeting.merging(["text": ["type": "string"]]) { _, new in new },
-                "required": ["text"],
+                "required": ["target_pid", "target_window_id", "expected_state_token", "text"],
             ]
         case "open_application":
             return [
                 "type": "object",
-                "properties": ["bundle_id": ["type": "string"]],
-                "required": ["bundle_id"],
+                "properties": targeting.merging(["bundle_id": ["type": "string"]]) { _, new in new },
+                "required": ["target_pid", "target_window_id", "expected_state_token", "bundle_id"],
             ]
         case "click_element":
             return [
@@ -298,15 +301,25 @@ public struct ManagedComputerUseMCP: Sendable {
                     "role": ["type": "string"],
                     "label": ["type": "string"],
                 ]) { _, new in new },
-                "required": ["role", "label"],
+                "required": ["target_pid", "target_window_id", "expected_state_token", "role", "label"],
             ]
         case "list_windows":
             return [
                 "type": "object",
                 "properties": ["bundle_id": ["type": "string"]],
             ]
+        case "doctor", "get_ui_tree", "cursor_position":
+            return [
+                "type": "object",
+                "properties": targeting,
+                "required": ["target_pid", "target_window_id"],
+            ]
         default:
-            return ["type": "object", "properties": [String: Any]()]
+            return [
+                "type": "object",
+                "properties": targeting,
+                "required": ["target_pid", "target_window_id"],
+            ]
         }
     }
 
