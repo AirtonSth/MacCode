@@ -442,9 +442,9 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         let s2 = try eventJSON(seq: 3, kind: "surface.output.summary",
                                payload: ["surface_id": "s1", "v": 2])
         let d1 = try eventJSON(seq: 4, kind: "agent.item.delta",
-                               payload: ["item_id": "i1", "text": "Hel"])
+                               payload: ["thread_id": "t", "turn_id": "turn-1", "item_id": "i1", "text": "Hel"])
         let d2 = try eventJSON(seq: 5, kind: "agent.item.delta",
-                               payload: ["item_id": "i1", "text": "lo"])
+                               payload: ["thread_id": "t", "turn_id": "turn-1", "item_id": "i1", "text": "lo"])
 
         let coalesced = WebSocketOutboundQueue.coalesceApplicationFrames(
             [s1, critical, s2, d1, d2]
@@ -469,6 +469,171 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         let text = payload?["text"] as? String
         XCTAssertEqual(text, "Hello",
                        "delta coalesce must concatenate append fields, not last-write-wins")
+    }
+
+    func test_coalesceApplicationFrames_agentDeltaUsesThreadItemTupleAndMonotonicReceipt() throws {
+        // WHY: provider item IDs can repeat across threads, while a trusted
+        // distill_applied bit must survive later nil/false append frames.
+        let trustedA = try eventJSON(
+            seq: 1,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-a",
+                "turn_id": "turn-a",
+                "item_id": "shared",
+                "text": "A",
+                "distill_applied": true,
+            ]
+        )
+        let threadB = try eventJSON(
+            seq: 2,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-b",
+                "turn_id": "turn-b",
+                "item_id": "shared",
+                "text": "X",
+                "distill_applied": false,
+            ]
+        )
+        let laterA = try eventJSON(
+            seq: 3,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-a",
+                "turn_id": "turn-a",
+                "item_id": "shared",
+                "text": "B",
+                "distill_applied": false,
+            ]
+        )
+        let legacyWithoutThread = try eventJSON(
+            seq: 4,
+            kind: "agent.item.delta",
+            payload: ["item_id": "shared", "text": "legacy"]
+        )
+
+        let frames = WebSocketOutboundQueue.coalesceApplicationFrames([
+            trustedA,
+            threadB,
+            laterA,
+            legacyWithoutThread,
+        ])
+
+        XCTAssertEqual(frames.count, 3,
+                       "only deltas sharing both thread_id and item_id may coalesce")
+        let payloads = try frames.map { frame -> [String: Any] in
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: frame) as? [String: Any]
+            )
+            return try XCTUnwrap(object["payload"] as? [String: Any])
+        }
+        XCTAssertEqual(payloads[0]["thread_id"] as? String, "thread-a")
+        XCTAssertEqual(payloads[0]["text"] as? String, "AB")
+        XCTAssertEqual(payloads[0]["distill_applied"] as? Bool, true,
+                       "false from a later delta must not erase trusted true")
+        XCTAssertEqual(payloads[1]["thread_id"] as? String, "thread-b")
+        XCTAssertEqual(payloads[1]["text"] as? String, "X")
+        XCTAssertNil(payloads[2]["thread_id"],
+                     "legacy frames without thread identity stay independently deliverable")
+        XCTAssertEqual(payloads[2]["text"] as? String, "legacy")
+    }
+
+    func test_coalesceApplicationFrames_keepsTurnScopedDistillTruthSeparateFromReusedItemID() throws {
+        // WHY: a provider may reuse an item id in another turn. The host-only
+        // attestation must remain its own turn-scoped reducer frame instead of
+        // being OR-carried onto ordinary or later-turn content.
+        let trusted = try eventJSON(
+            seq: 1,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-a",
+                "turn_id": "turn-a",
+                "item_id": "shared",
+                "distill_applied": true,
+            ]
+        )
+        let ordinary = try eventJSON(
+            seq: 2,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-a",
+                "item_id": "shared",
+                "text": "new turn content",
+            ]
+        )
+        let otherTurn = try eventJSON(
+            seq: 3,
+            kind: "agent.item.delta",
+            payload: [
+                "thread_id": "thread-a",
+                "turn_id": "turn-b",
+                "item_id": "shared",
+                "distill_applied": false,
+            ]
+        )
+
+        let frames = WebSocketOutboundQueue.coalesceApplicationFrames([
+            trusted,
+            ordinary,
+            otherTurn,
+        ])
+
+        XCTAssertEqual(frames.count, 3)
+        let payloads = try frames.map { frame -> [String: Any] in
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: frame) as? [String: Any]
+            )
+            return try XCTUnwrap(object["payload"] as? [String: Any])
+        }
+        XCTAssertEqual(payloads[0]["turn_id"] as? String, "turn-a")
+        XCTAssertEqual(payloads[0]["distill_applied"] as? Bool, true)
+        XCTAssertNil(payloads[1]["distill_applied"])
+        XCTAssertEqual(payloads[1]["text"] as? String, "new turn content")
+        XCTAssertEqual(payloads[2]["turn_id"] as? String, "turn-b")
+    }
+
+    func test_coalesceApplicationFrames_doesNotCrossNewTurnStartForUnscopedDeltas() throws {
+        // WHY: AppContext ordinary deltas currently omit turn_id. If an adapter
+        // reuses an item id, a new item-start event is the ordering fence; global
+        // keyed coalescing must not move or concatenate bytes across that fence.
+        let firstTurnDelta = try eventJSON(
+            seq: 1,
+            kind: "agent.item.delta",
+            payload: ["thread_id": "thread-a", "item_id": "shared", "text": "A"]
+        )
+        let nextTurnStart = try eventJSON(
+            seq: 2,
+            kind: "agent.item.started",
+            payload: [
+                "thread_id": "thread-a",
+                "item": ["id": "shared", "turnId": "turn-b"],
+            ]
+        )
+        let secondTurnDelta = try eventJSON(
+            seq: 3,
+            kind: "agent.item.delta",
+            payload: ["thread_id": "thread-a", "item_id": "shared", "text": "B"]
+        )
+
+        let frames = WebSocketOutboundQueue.coalesceApplicationFrames([
+            firstTurnDelta,
+            nextTurnStart,
+            secondTurnDelta,
+        ])
+
+        XCTAssertEqual(frames.count, 3)
+        XCTAssertEqual(
+            frames.compactMap { WebSocketOutboundQueue.eventSequence(in: $0) },
+            [1, 2, 3]
+        )
+        let deltaTexts = try [frames[0], frames[2]].map { frame -> String? in
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: frame) as? [String: Any]
+            )
+            return (object["payload"] as? [String: Any])?["text"] as? String
+        }
+        XCTAssertEqual(deltaTexts, ["A", "B"])
     }
 
     func test_degradePreservesControlFramesWhileSheddingBulk() throws {

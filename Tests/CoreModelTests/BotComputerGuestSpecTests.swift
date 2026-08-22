@@ -117,4 +117,44 @@ final class BotComputerGuestSpecTests: XCTestCase {
         XCTAssertEqual(String(describing: BotComputerGuestError.notReady), "Docker desktop is not ready.")
         XCTAssertNotEqual(String(describing: BotComputerGuestError.notReady), "notReady")
     }
+
+    func test_playwrightMCPCommandDrivesGuestChromiumHeadedOnXvfb() {
+        // WHY: the host bridge builds `docker exec -i <container>` around this
+        // exact argv; a drifted flag silently breaks bot browsing. It must run
+        // headed on DISPLAY=:1 so the user can watch/log in via the guest
+        // screen, and use /usr/bin/chromium so Playwright never downloads
+        // browsers in the guest.
+        XCTAssertEqual(BotComputerGuestSpec.playwrightMCPCommand(), [
+            "env", "DISPLAY=:1",
+            "npx", "--yes", "@playwright/mcp@latest",
+            "--executable-path", "/usr/bin/chromium",
+            "--no-sandbox",
+            "--user-data-dir", "/home/remotecode/.browser-profiles/playwright",
+        ])
+        XCTAssertEqual(
+            Array(BotComputerGuestSpec.playwrightMCPCommand(userDataDir: "/home/remotecode/custom").suffix(2)),
+            ["--user-data-dir", "/home/remotecode/custom"]
+        )
+        XCTAssertTrue(
+            BotComputerGuestSpec.playwrightGuestUserDataDir.hasPrefix(BotComputerGuestSpec.guestUserHome + "/"),
+            "the profile must live in the bind-mounted guest home so logins persist"
+        )
+    }
+
+    func test_recipeRevision4ShipsNodeForGuestPlaywrightMCP() throws {
+        // WHY: playwrightMCPCommand needs npx inside the guest, and only the
+        // revision bump makes existing guests rebuild (a stale label rebuilds
+        // the image) — Dockerfile content and revision must move together.
+        XCTAssertEqual(BotComputerGuestSpec.recipeRevision, "4")
+        let dockerfile = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/Resources/ComputerGuest/Dockerfile"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(dockerfile.contains("nodejs"))
+        XCTAssertTrue(dockerfile.contains("npm"))
+    }
 }

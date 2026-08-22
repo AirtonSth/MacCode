@@ -62,7 +62,10 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                 prompt.contains("non-GUI") || prompt.contains("GUI"),
                 "\(provider) must exempt GUI from | distill"
             )
-            XCTAssertTrue(prompt.contains("NEVER pipe"), "\(provider) exact-output still forbidden")
+            XCTAssertTrue(
+                prompt.contains("NEVER auto-distill raw exact-output"),
+                "\(provider) exact-output still forbidden"
+            )
             XCTAssertTrue(prompt.contains(AgentSkillInstaller.rcWireAgentInstructionsTemplate),
                           "every Token Saver session must trust RCW1 before a later encoded follow-up arrives")
             assertWireResponseProfitabilityContract(prompt, context: "\(provider) primary")
@@ -712,6 +715,37 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             CommandWrapPolicy.passthroughReason(command: "git", args: ["show", "HEAD:file"], environment: noEnv),
             "exact_output_subcommand"
         )
+    }
+
+    func test_admittedProviderMatrix_sharesArbitraryCommandInterceptionAndExactOutputSafety() {
+        // WHY: the global interceptor is admitted by the provider-neutral Token
+        // Saver signal, not by provider name or a finite command catalog.
+        let arbitrary = "workspace-specific-report"
+        for provider in providers {
+            let receipt = admit(provider)
+            let environment = TokenSaverExecutionReceiptSeam.environment(from: receipt)
+
+            XCTAssertEqual(environment["RC_TOKEN_SAVER_DISTILL_HINT"], "1", "(provider) admission")
+            XCTAssertEqual(receipt.capabilities.managedPath, true, "(provider) managed path")
+            XCTAssertTrue(CommandWrapPolicy.isWrapped(arbitrary), "(provider) arbitrary command")
+            XCTAssertNil(
+                CommandWrapPolicy.passthroughReason(
+                    command: arbitrary,
+                    args: ["--summary"],
+                    environment: environment
+                ),
+                "(provider) arbitrary command must reach the shared compressor"
+            )
+            XCTAssertEqual(
+                CommandWrapPolicy.passthroughReason(
+                    command: "cat",
+                    args: ["output.txt"],
+                    environment: environment
+                ),
+                "exact_output_command",
+                "(provider) exact-output command must remain raw"
+            )
+        }
     }
 
     func test_outputPolicy_allProviders_requirePipeAndDocumentNoAllowlist() {

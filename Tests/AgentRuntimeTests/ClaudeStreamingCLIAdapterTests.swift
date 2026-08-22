@@ -1985,6 +1985,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           'current',
           'loadTokenSaverState',
           'postTokenSaverDistill',
+          'bestEffortRecordTokenSaverSavings',
           'randomUUID',
           'tokenSaverContractQuestion',
           src.slice(helperStart, helperEnd) + '\\n' + src.slice(hookStart, hookEnd)
@@ -1995,7 +1996,11 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         const hook = factory(
           { env: { RC_TOKEN_SAVER_POST_TOOL_USE: '1', REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
           () => { stateLoads += 1; return { base_url: 'http://127.0.0.1', auth_token: 'tok' }; },
-          async () => { sidecarCalls += 1; return 'DISTILLED_NON_BASH'; },
+          async () => {
+            sidecarCalls += 1;
+            return { output: 'DISTILLED_NON_BASH', routeStage: 'deterministic', recoveryConfirmations: [] };
+          },
+          async () => {},
           () => '123e4567-e89b-12d3-a456-426614174000',
           () => 'contract'
         );
@@ -2060,6 +2065,445 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(json["stateLoads"] as? Int, 1)
         XCTAssertEqual(json["webUpdated"] as? String, "DISTILLED_NON_BASH")
         XCTAssertEqual(json["webMCPUpdated"] as? String, "DISTILLED_NON_BASH")
+    }
+
+    func test_agentSDKBridgePostToolUse_skipsNestedMixedMediaAndPreservesTextOnlyControl() throws {
+        let node = try XCTUnwrap(
+            ProcessLocator.resolve("node"),
+            "node is required for the bridge multimodal PostToolUse contract test"
+        )
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+
+        // WHY: extractToolOutputText flattens text from mixed content, while the
+        // replacement API replaces the entire tool_response. A media response must
+        // therefore fail open so the SDK keeps the exact shape/bytes and no receipt
+        // can drive the persisted Distilled badge. Text-only output remains eligible.
+        let harness = #"""
+        import { readFileSync } from 'fs';
+        const src = readFileSync(process.argv[2], 'utf8');
+        const helperStart = src.indexOf('const TOKEN_SAVER_MIN_BYTES');
+        const helperEnd = src.indexOf('function tokenSaverContractQuestion');
+        const hookStart = src.indexOf('async function tokenSaverPostToolUse');
+        const hookEnd = src.indexOf('function tokenSaverHooks');
+        if ([helperStart, helperEnd, hookStart, hookEnd].some((offset) => offset < 0)) {
+          throw new Error('bridge multimodal slice not found');
+        }
+        const factory = new Function(
+          'current',
+          'loadTokenSaverState',
+          'postTokenSaverDistill',
+          'bestEffortRecordTokenSaverSavings',
+          'randomUUID',
+          'tokenSaverContractQuestion',
+          src.slice(helperStart, helperEnd) + '\n' + src.slice(hookStart, hookEnd)
+            + '\nreturn tokenSaverPostToolUse;'
+        );
+        let sidecarCalls = 0;
+        let ledgerCalls = 0;
+        const hook = factory(
+          { env: { RC_TOKEN_SAVER_POST_TOOL_USE: '1', REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
+          () => ({ baseURL: 'http://127.0.0.1', authToken: 'tok' }),
+          async () => {
+            sidecarCalls += 1;
+            return { output: 'DISTILLED_TEXT\n[[rcd:applied]]', routeStage: 'deterministic', recoveryConfirmations: [] };
+          },
+          async () => { ledgerCalls += 1; },
+          () => '123e4567-e89b-12d3-a456-426614174000',
+          () => 'Compress fixture'
+        );
+        const raw = Array.from({ length: 80 }, (_, i) => `diagnostic line ${i}`).join('\n');
+        const imageBytes = 'iVBORw0KGgoAAAANSUhEUgAAAAE=';
+        const metadataImageBytes = 'METADATA_IMAGE_BYTES';
+        const screenshotBytes = 'SCREENSHOT_BYTES';
+        const mixed = {
+          content: [
+            { type: 'text', text: raw },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageBytes } },
+            { wrapper: { content: [
+              { type: 'text', text: 'nested text' },
+              { type: 'screenshot', mimeType: 'image/png', data: screenshotBytes },
+            ] } },
+          ],
+          metadata: { parts: [{ type: 'media', media_type: 'image/png', data: metadataImageBytes }] },
+        };
+        const mixedBefore = JSON.stringify(mixed);
+        const mixedResult = await hook({
+          hook_event_name: 'PostToolUse',
+          tool_name: 'WebFetch',
+          tool_input: { url: 'https://example.invalid/mixed' },
+          tool_response: mixed,
+        });
+        const mixedDelivered = mixedResult.hookSpecificOutput?.updatedToolOutput || mixed;
+        const mixedAfter = JSON.stringify(mixedDelivered);
+        const textResult = await hook({
+          hook_event_name: 'PostToolUse',
+          tool_name: 'WebFetch',
+          tool_input: { url: 'https://example.invalid/text' },
+          tool_response: raw,
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        console.log(JSON.stringify({
+          mixedResult,
+          mixedBefore,
+          mixedAfter,
+          mixedDeliveredContainsImageBytes: mixedAfter.includes(imageBytes),
+          mixedDeliveredContainsScreenshotBytes: mixedAfter.includes(screenshotBytes),
+          textUpdated: textResult.hookSpecificOutput?.updatedToolOutput,
+          textMCPUpdated: textResult.hookSpecificOutput?.updatedMCPToolOutput,
+          sidecarCalls,
+          ledgerCalls,
+        }));
+        """#
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-sdk-mixed-media-\(UUID().uuidString).mjs")
+        try harness.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [tmp.path, bridge.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
+        let data = try XCTUnwrap(out.data(using: .utf8))
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual((json["mixedResult"] as? [String: Any])?.count, 0,
+                       "mixed media must return an empty hook update so Claude retains the original response")
+        XCTAssertEqual(json["mixedBefore"] as? String, json["mixedAfter"] as? String,
+                       "mixed media must preserve the exact original response shape and bytes")
+        XCTAssertEqual(json["mixedDeliveredContainsImageBytes"] as? Bool, true)
+        XCTAssertEqual(json["mixedDeliveredContainsScreenshotBytes"] as? Bool, true)
+        XCTAssertFalse((json["mixedAfter"] as? String)?.contains("[[rcd:") == true,
+                        "mixed media must not persist an applied receipt/badge marker")
+        XCTAssertEqual(json["textUpdated"] as? String, "DISTILLED_TEXT\n[[rcd:applied]]",
+                       "text-only output must remain eligible for the existing replacement path")
+        XCTAssertEqual(json["textMCPUpdated"] as? String, "DISTILLED_TEXT\n[[rcd:applied]]")
+        XCTAssertEqual(json["sidecarCalls"] as? Int, 1,
+                       "only the text-only control may call the Distill sidecar")
+        XCTAssertEqual(json["ledgerCalls"] as? Int, 1,
+                       "only the accepted text replacement may enqueue savings accounting")
+    }
+
+    func test_agentSDKBridgePostToolUse_appliesReceiptOnlyForNetShrink() throws {
+        let node = try XCTUnwrap(
+            ProcessLocator.resolve("node"),
+            "node is required for the bridge receipt contract test"
+        )
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+
+        // WHY: command syntax cannot prove that Distill actually replaced bytes.
+        // Exercise the bridge's direct sidecar lane so only a real, marker-inclusive
+        // UTF-8 shrink emits the receipt that drives the persisted UI badge.
+        let harness = #"""
+        import { readFileSync } from 'fs';
+        import { Buffer } from 'buffer';
+        import { createHash, createHmac } from 'crypto';
+        const src = readFileSync(process.argv[2], 'utf8');
+        const start = src.indexOf('function tokenSaverAppliedReceipt');
+        const end = src.indexOf('async function tokenSaverPostToolUse');
+        if (start < 0 || end < 0) throw new Error('bridge receipt slice not found');
+        let decoded = {};
+        const factory = new Function(
+          'current',
+          'fetch',
+          'randomUUID',
+          'randomBytes',
+          'createHash',
+          'createHmac',
+          'TOKEN_SAVER_HOOK_TIMEOUT_MS',
+          src.slice(start, end) + '\nreturn postTokenSaverDistill;'
+        );
+        const bridgeCurrent = { env: {
+          REMOTE_CODE_AGENT_PROVIDER: 'claude',
+          RC_TOKEN_SAVER_ROOT_RUN_ID: '123e4567-e89b-12d3-a456-426614174000'
+        } };
+        const post = factory(
+          bridgeCurrent,
+          async () => ({ ok: true, json: async () => decoded }),
+          () => '123e4567-e89b-12d3-a456-426614174000',
+          () => Buffer.alloc(16, 0xaa),
+          createHash,
+          createHmac,
+          100
+        );
+        const state = {
+          baseURL: 'http://127.0.0.1',
+          authToken: 'tok',
+          receiptKey: Buffer.from(Array.from({ length: 32 }, (_, i) => i))
+        };
+        const largeInput = 'é'.repeat(120);
+
+        decoded = { output: 'COMPRESSED', routeStage: 'deterministic' };
+        const lossless = await post(state, { id: 'one', input: largeInput });
+        decoded = {
+          output: 'LOSSY',
+          originalHandle: 'rcv1.ABCDEFGHIJKLMNOPQRSTUV',
+          routeStage: 'model'
+        };
+        const lossy = await post(state, { id: 'two', input: largeInput });
+        decoded = { output: largeInput, routeStage: 'deterministic' };
+        const unchanged = await post(state, { id: 'three', input: largeInput });
+        decoded = { output: 'short', routeStage: 'verbatim' };
+        const verbatim = await post(state, { id: 'four', input: largeInput });
+        decoded = { output: 'x', routeStage: 'deterministic' };
+        const noNetShrink = await post(state, { id: 'five', input: 'tiny' });
+        decoded = { output: 'COMPRESSED', routeStage: 'deterministic' };
+        const noKey = await post(
+          { baseURL: state.baseURL, authToken: state.authToken },
+          { id: 'six', input: largeInput }
+        );
+        delete bridgeCurrent.env.RC_TOKEN_SAVER_ROOT_RUN_ID;
+        const noRoot = await post(state, { id: 'seven', input: largeInput });
+
+        console.log(JSON.stringify({
+          lossless: lossless?.output,
+          lossy: lossy?.output,
+          unchanged,
+          verbatim,
+          noNetShrink,
+          noKey: noKey ?? null,
+          noRoot: noRoot ?? null
+        }));
+        """#
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-sdk-distill-receipt-\(UUID().uuidString).mjs")
+        try harness.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [tmp.path, bridge.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
+        let data = try XCTUnwrap(out.data(using: .utf8))
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let trustedReceipt = "[[rcd:v2.qqqqqqqqqqqqqqqqqqqqqg.TGBL0F4FLPCrX7LMh5OGUsnui3T65Z3_HuZrCa08rzw]]"
+        XCTAssertEqual(json["lossless"] as? String, "COMPRESSED\n\(trustedReceipt)",
+                       "Node must match the Swift canonical HMAC vector byte-for-byte")
+        XCTAssertTrue((json["lossy"] as? String)?.contains("[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]") == true)
+        XCTAssertNotNil((json["lossy"] as? String)?.range(
+            of: #"\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]$"#,
+            options: .regularExpression
+        ))
+        XCTAssertTrue(json["unchanged"] is NSNull)
+        XCTAssertTrue(json["verbatim"] is NSNull)
+        XCTAssertTrue(json["noNetShrink"] is NSNull)
+        XCTAssertTrue(json["noKey"] is NSNull,
+                      "missing receipt key must fail open before replacing provider output")
+        XCTAssertTrue(json["noRoot"] is NSNull,
+                      "missing root run ID must fail open before replacing provider output")
+    }
+
+    func test_agentSDKBridgePostToolUse_recordsOnlyExactAcceptedReplacement() throws {
+        let node = try XCTUnwrap(
+            ProcessLocator.resolve("node"),
+            "node is required for the bridge delivered-savings contract test"
+        )
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+
+        // WHY: the compression POST precedes the receipt-inclusive client gate.
+        // It must be accounting-disabled; only an accepted updatedToolOutput may
+        // enqueue one precomputed-output POST with those exact provider-visible bytes.
+        let harness = #"""
+        import { readFileSync } from 'fs';
+        import { createHash, createHmac, randomBytes, randomUUID } from 'crypto';
+        const src = readFileSync(process.argv[2], 'utf8');
+        const start = src.indexOf('function tokenSaverAppliedReceipt');
+        const end = src.indexOf('function tokenSaverHooks');
+        if (start < 0 || end < 0) throw new Error('bridge delivered-savings slice not found');
+
+        let scenario = 'accepted';
+        let stateMode = 0o100600;
+        let includeReceiptKey = true;
+        let requests = [];
+        let deferredHeaders = [];
+        const fakeFetch = async (_url, options) => {
+          const body = JSON.parse(options.body);
+          requests.push(body);
+          deferredHeaders.push(options.headers['X-RemoteCode-Delivery-Deferred'] || null);
+          if (body.recordSavings === true) {
+            return { ok: true, json: async () => ({
+              output: body.precomputedOutput,
+              routeStage: body.precomputedRouteStage
+            }) };
+          }
+          if (scenario === 'accepted') {
+            return { ok: true, json: async () => ({
+              output: 'BUILD FAILED: 3 errors',
+              originalHandle: 'rcv1.ABCDEFGHIJKLMNOPQRSTUV',
+              recoveryIdempotencyKey: 'recovery-key',
+              routeStage: 'llm_mlx'
+            }) };
+          }
+          return { ok: true, json: async () => ({
+            output: 'x'.repeat(Buffer.byteLength(body.input, 'utf8') - 1),
+            routeStage: 'deterministic'
+          }) };
+        };
+        const factory = new Function(
+          'current',
+          'fetch',
+          'randomUUID',
+          'randomBytes',
+          'createHash',
+          'createHmac',
+          'fs',
+          'TOKEN_SAVER_HOOK_TIMEOUT_MS',
+          'TOKEN_SAVER_MIN_BYTES',
+          'TOKEN_SAVER_MIN_LINES',
+          'TOKEN_SAVER_STORE_MIN_BYTES',
+          src.slice(start, end) + '\nreturn tokenSaverPostToolUse;'
+        );
+        const hook = factory(
+          { env: {
+            RC_TOKEN_SAVER_POST_TOOL_USE: '1',
+            REMOTE_CODE_AGENT_PROVIDER: 'claude',
+            RC_TOKEN_SAVER_ROOT_RUN_ID: '123e4567-e89b-12d3-a456-426614174000',
+            REMOTE_CODE_DISTILL_STATE_PATH: '/tmp/state.json'
+          } },
+          fakeFetch,
+          randomUUID,
+          randomBytes,
+          createHash,
+          createHmac,
+          {
+            statSync: () => ({ isFile: () => true, uid: process.getuid(), mode: stateMode }),
+            readFileSync: () => JSON.stringify({
+              base_url: 'http://127.0.0.1',
+              auth_token: 'tok',
+              ...(includeReceiptKey ? {
+                receipt_key: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
+              } : {})
+            })
+          },
+          100,
+          1024,
+          10,
+          2048
+        );
+        const raw = Array.from({ length: 80 }, (_, i) => `diagnostic line ${i}`).join('\n');
+        const envelope = () => ({
+          hook_event_name: 'PostToolUse',
+          tool_name: 'WebFetch',
+          tool_input: { url: 'https://example.invalid/noisy' },
+          tool_response: raw,
+        });
+
+        const accepted = await hook(envelope());
+        const acceptedRequestCountAtReturn = requests.length;
+        await new Promise((resolve) => setImmediate(resolve));
+        const acceptedRequests = requests.splice(0);
+        const acceptedDeferredHeaders = deferredHeaders.splice(0);
+        scenario = 'rejected';
+        const rejected = await hook(envelope());
+        await new Promise((resolve) => setImmediate(resolve));
+        const rejectedRequests = requests.splice(0);
+        const rejectedDeferredHeaders = deferredHeaders.splice(0);
+        scenario = 'accepted';
+        stateMode = 0o100644;
+        const worldReadable = await hook(envelope());
+        await new Promise((resolve) => setImmediate(resolve));
+        const worldReadableRequests = requests.splice(0);
+        stateMode = 0o100600;
+        includeReceiptKey = false;
+        const legacyState = await hook(envelope());
+        await new Promise((resolve) => setImmediate(resolve));
+        const legacyStateRequests = requests.splice(0);
+        console.log(JSON.stringify({
+          accepted,
+          acceptedRequestCountAtReturn,
+          acceptedRequests,
+          acceptedDeferredHeaders,
+          rejected,
+          rejectedRequests,
+          rejectedDeferredHeaders,
+          worldReadable,
+          worldReadableRequests,
+          legacyState,
+          legacyStateRequests
+        }));
+        """#
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-sdk-delivered-savings-\(UUID().uuidString).mjs")
+        try harness.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [tmp.path, bridge.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
+        let data = try XCTUnwrap(out.data(using: .utf8))
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        let accepted = try XCTUnwrap(json["accepted"] as? [String: Any])
+        let acceptedHook = try XCTUnwrap(accepted["hookSpecificOutput"] as? [String: Any])
+        let updated = try XCTUnwrap(acceptedHook["updatedToolOutput"] as? String)
+        XCTAssertTrue(updated.contains("[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"))
+        XCTAssertNotNil(updated.range(
+            of: #"\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]$"#,
+            options: .regularExpression
+        ))
+        XCTAssertEqual(json["acceptedRequestCountAtReturn"] as? Int, 1,
+                       "the ledger POST must not start until after the native hook result returns")
+        let acceptedRequests = try XCTUnwrap(json["acceptedRequests"] as? [[String: Any]])
+        XCTAssertEqual(acceptedRequests.count, 2)
+        XCTAssertEqual(acceptedRequests[0]["recordSavings"] as? Bool, false)
+        XCTAssertNil(acceptedRequests[0]["precomputedOutput"])
+        XCTAssertEqual(acceptedRequests[1]["recordSavings"] as? Bool, true)
+        XCTAssertEqual(acceptedRequests[1]["precomputedOutput"] as? String, updated)
+        XCTAssertEqual(acceptedRequests[1]["precomputedRouteStage"] as? String, "llm_mlx")
+        let confirmations = try XCTUnwrap(
+            acceptedRequests[1]["precomputedRecoveryConfirmations"] as? [[String: Any]]
+        )
+        XCTAssertEqual(confirmations.count, 1)
+        XCTAssertEqual(confirmations[0]["capability"] as? String, "rcv1.ABCDEFGHIJKLMNOPQRSTUV")
+        XCTAssertEqual(confirmations[0]["idempotencyKey"] as? String, "recovery-key")
+        let acceptedDeferredHeaders = try XCTUnwrap(json["acceptedDeferredHeaders"] as? [Any])
+        XCTAssertEqual(acceptedDeferredHeaders.first as? String, "1")
+        XCTAssertTrue(acceptedDeferredHeaders.last is NSNull)
+
+        XCTAssertEqual((json["rejected"] as? [String: Any])?.count, 0)
+        let rejectedRequests = try XCTUnwrap(json["rejectedRequests"] as? [[String: Any]])
+        XCTAssertEqual(rejectedRequests.count, 1)
+        XCTAssertEqual(rejectedRequests[0]["recordSavings"] as? Bool, false)
+        XCTAssertFalse(rejectedRequests.contains { $0["recordSavings"] as? Bool == true })
+        XCTAssertEqual(json["rejectedDeferredHeaders"] as? [String], ["1"])
+        XCTAssertEqual((json["worldReadable"] as? [String: Any])?.count, 0,
+                       "a group/world-readable key file must fail open")
+        XCTAssertEqual((json["worldReadableRequests"] as? [[String: Any]])?.count, 0,
+                       "an insecure state file must be rejected before sidecar I/O")
+        XCTAssertEqual((json["legacyState"] as? [String: Any])?.count, 0,
+                       "a secure pre-v2 state must decode but cannot authorize replacement")
+        let legacyRequests = try XCTUnwrap(json["legacyStateRequests"] as? [[String: Any]])
+        XCTAssertEqual(legacyRequests.count, 1)
+        XCTAssertEqual(legacyRequests.first?["recordSavings"] as? Bool, false)
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {

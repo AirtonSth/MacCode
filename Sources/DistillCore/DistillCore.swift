@@ -53,6 +53,16 @@ public struct CommandOutputIntentDecision: Equatable, Sendable {
 
 public typealias CommandOutputIntentClassifier = @Sendable (String) -> CommandOutputIntentDecision?
 
+public struct DistillRecoveryDeliveryConfirmation: Codable, Sendable, Equatable {
+    public let capability: String
+    public let idempotencyKey: String
+
+    public init(capability: String, idempotencyKey: String) {
+        self.capability = capability
+        self.idempotencyKey = idempotencyKey
+    }
+}
+
 public enum DistillRunMode: String, Codable, Sendable, Equatable {
     case audit
     case optimize
@@ -108,6 +118,13 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
     /// original→precomputed delta via the normal savings path and must NOT re-run
     /// compression / call the model.
     public let precomputedOutput: String?
+    /// Producing route for `precomputedOutput`. Optional so older clients keep the
+    /// existing deterministic default while deferred ledger clients preserve the
+    /// route that produced the provider-visible bytes.
+    public let precomputedRouteStage: TokenSaverRouteStage?
+    /// Recovery capabilities whose markers are present in `precomputedOutput` and
+    /// may transition from prepared to delivered at this final acceptance boundary.
+    public let precomputedRecoveryConfirmations: [DistillRecoveryDeliveryConfirmation]?
 
     public init(
         id: UUID = UUID(),
@@ -124,7 +141,9 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         encoderLane: String? = nil,
         maxOutputCharacters: Int = 4_000,
         reversibleStoreMinBytes: Int? = nil,
-        precomputedOutput: String? = nil
+        precomputedOutput: String? = nil,
+        precomputedRouteStage: TokenSaverRouteStage? = nil,
+        precomputedRecoveryConfirmations: [DistillRecoveryDeliveryConfirmation]? = nil
     ) {
         self.id = id
         self.mode = mode
@@ -141,6 +160,8 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         self.maxOutputCharacters = max(128, maxOutputCharacters)
         self.reversibleStoreMinBytes = reversibleStoreMinBytes.map { max(1, $0) }
         self.precomputedOutput = precomputedOutput
+        self.precomputedRouteStage = precomputedRouteStage
+        self.precomputedRecoveryConfirmations = precomputedRecoveryConfirmations
     }
 
     public var effectiveRunMode: DistillRunMode {
@@ -161,14 +182,14 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
             inputTokens: TokenEstimator.estimate(input),
             outputTokens: TokenEstimator.estimate(out),
             runMode: effectiveRunMode,
-            routeStage: .deterministic
+            routeStage: precomputedRouteStage ?? .deterministic
         )
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, mode, priority, input, question, provider
         case recordSavings, runMode, cacheState, rerankQuery, topK, encoderLane, maxOutputCharacters
-        case reversibleStoreMinBytes, precomputedOutput
+        case reversibleStoreMinBytes, precomputedOutput, precomputedRouteStage, precomputedRecoveryConfirmations
     }
 
     /// Tolerant decoder: identical to the synthesized one EXCEPT a wire client may omit
@@ -193,6 +214,11 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         self.maxOutputCharacters = try c.decode(Int.self, forKey: .maxOutputCharacters)
         self.reversibleStoreMinBytes = try c.decodeIfPresent(Int.self, forKey: .reversibleStoreMinBytes).map { max(1, $0) }
         self.precomputedOutput = try c.decodeIfPresent(String.self, forKey: .precomputedOutput)
+        self.precomputedRouteStage = try c.decodeIfPresent(TokenSaverRouteStage.self, forKey: .precomputedRouteStage)
+        self.precomputedRecoveryConfirmations = try c.decodeIfPresent(
+            [DistillRecoveryDeliveryConfirmation].self,
+            forKey: .precomputedRecoveryConfirmations
+        )
     }
 }
 
@@ -482,6 +508,9 @@ public struct DistillSavingsRecord: Sendable, Equatable {
     /// Agent thread that produced this saving (from `X-RemoteCode-Thread-ID` /
     /// `RC_TOKEN_SAVER_THREAD_ID`). Empty when unscoped (bare CLI).
     public let threadID: String
+    /// Stable identity of the logical distill request. Transport retries reuse
+    /// this key so a lost HTTP response cannot credit the same delivery twice.
+    public let idempotencyKey: String
 
     public init(
         provider: String,
@@ -493,7 +522,8 @@ public struct DistillSavingsRecord: Sendable, Equatable {
         routeStage: TokenSaverRouteStage? = nil,
         attributability: String = "unknown",
         delivered: Bool = true,
-        threadID: String = ""
+        threadID: String = "",
+        idempotencyKey: String = ""
     ) {
         self.provider = provider
         self.mode = mode
@@ -505,6 +535,7 @@ public struct DistillSavingsRecord: Sendable, Equatable {
         self.attributability = attributability
         self.delivered = delivered
         self.threadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.idempotencyKey = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -541,7 +572,8 @@ public enum DistillSavingsCalculator {
                 routeStage: response.routeStage,
                 attributability: "not_prompt_bound",
                 delivered: delivered,
-                threadID: thread
+                threadID: thread,
+                idempotencyKey: request.id.uuidString.lowercased()
             )
         case .wireRenderEnglish:
             // Rendering changes only local display text. It does not establish a
@@ -569,7 +601,8 @@ public enum DistillSavingsCalculator {
                 routeStage: response.routeStage,
                 attributability: attributability,
                 delivered: delivered,
-                threadID: thread
+                threadID: thread,
+                idempotencyKey: request.id.uuidString.lowercased()
             )
         }
     }
@@ -1021,17 +1054,18 @@ public struct LocalDistillRuntime: DistillRuntime {
     /// wrapped in ANSI CSI sequences. Classifying those bytes as prose sends them through the
     /// model, where a rejected answer fails open to the full multi-KB payload. Remove display-
     /// only control sequences, then losslessly minify the JSON before any intent/model path.
-    /// The service still stores the byte-exact colored original before serving this reduction.
+    /// If even the minified form exceeds the budget, preserve valid JSON instead of truncating
+    /// its structure. The service still stores the byte-exact colored original before serving it.
     static func structuredCommandOutput(for request: DistillRequest) -> String? {
         guard request.mode == .commandOutput else { return nil }
         let parsed = splitLegacyCommandPayload(request.input)
         let source = strippingANSIControlSequences(parsed.output)
-        guard JSONCrusher.looksLikeJSON(source),
-              let routed = contentRouter.route(source, options: routerOptions(for: request)),
-              routed.contentType == .json else {
-            return nil
+        guard JSONCrusher.looksLikeJSON(source) else { return nil }
+        guard let minified = JSONCrusher.minify(source) else { return source }
+        guard minified.count <= request.maxOutputCharacters else {
+            return source
         }
-        return boundedCommandOutput(routed.output, maxOutputCharacters: request.maxOutputCharacters)
+        return minified
     }
 
     private static let ansiCSIRegex = try! NSRegularExpression(

@@ -1,5 +1,6 @@
 import XCTest
 @testable import AgentRuntime
+import CoreModel
 
 final class ManagedDistillCLIInstallTests: XCTestCase {
     private func tempHome() -> URL {
@@ -179,13 +180,19 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         let installer = AgentSkillInstaller(homeDirectory: home)
 
         let installed = try installer.installCommandWrappers(serviceBinaryURL: binary)
-        // ls exists on every macOS system and is compressible; cat is exact-output and must not wrap.
+        // Exact-output commands still pass through the global interceptor;
+        // CommandWrapPolicy is responsible for preserving their raw output.
         XCTAssertTrue(installed.contains("ls"))
-        XCTAssertFalse(installed.contains("cat"))
-        XCTAssertFalse(installed.contains("sed"))
-        XCTAssertFalse(installed.contains("rg"))
         let lsLink = home.appendingPathComponent(".remote-code/bin/ls")
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: lsLink.path), binary.path)
+        for command in ["cat", "sed", "rg"] {
+            XCTAssertTrue(installed.contains(command))
+            let link = home.appendingPathComponent(".remote-code/bin/\(command)")
+            XCTAssertEqual(
+                try FileManager.default.destinationOfSymbolicLink(atPath: link.path),
+                binary.path
+            )
+        }
         // Idempotent: a second install keeps the same links, no throw.
         XCTAssertEqual(Set(try installer.installCommandWrappers(serviceBinaryURL: binary)), Set(installed))
 
@@ -194,26 +201,80 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: lsLink.path))
     }
 
-    func test_installCommandWrappers_removesLegacyExactOutputSymlinks() throws {
+    func test_installCommandWrappers_coversAnArbitraryExecutableOutsideTheCatalog() throws {
+        // WHY: every executable visible to an admitted provider must reach the
+        // shared interceptor; catalog membership cannot be the coverage boundary.
         let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
         let binary = try fakeServiceBinary(in: home)
+        let arbitrary = "true"
+        XCTAssertFalse(WrappedCommandCatalog.commands.contains(arbitrary))
+
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let installed = try installer.installCommandWrappers(serviceBinaryURL: binary)
+        XCTAssertTrue(installed.contains(arbitrary), "(arbitrary) must be wired even though it is not catalog-listed")
+
+        let link = home.appendingPathComponent(".remote-code/bin/\(arbitrary)")
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: link.path),
+            binary.path
+        )
+    }
+
+    func test_installCommandWrappers_coversExecutableOnlyInEffectiveProviderPath() throws {
+        // WHY: project-local tools can be absent from the GUI app PATH but present
+        // in the admitted provider/workspace environment.
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let workspaceBin = home.appendingPathComponent("workspace-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceBin, withIntermediateDirectories: true)
+        let command = "workspace-report"
+        let executable = workspaceBin.appendingPathComponent(command)
+        try Data("#!/bin/sh\necho workspace\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let installed = try installer.installCommandWrappers(
+            serviceBinaryURL: binary,
+            searchDirectoriesOverride: [workspaceBin.path]
+        )
+
+        XCTAssertTrue(installed.contains(command))
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(
+                atPath: home.appendingPathComponent(".remote-code/bin/\(command)").path
+            ),
+            binary.path
+        )
+    }
+
+    func test_installCommandWrappers_reconcilesLegacyExactOutputSymlinksToServiceInterceptor() throws {
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let legacyBinary = home.appendingPathComponent("legacy/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(
+            at: legacyBinary.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("legacy-binary".utf8).write(to: legacyBinary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: legacyBinary.path)
         let binDir = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
         try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
         // Simulate older install that wrapped sed/rg/cat.
         for legacy in ["sed", "rg", "cat"] {
             try FileManager.default.createSymbolicLink(
                 at: binDir.appendingPathComponent(legacy),
-                withDestinationURL: binary
+                withDestinationURL: legacyBinary
             )
         }
         let installer = AgentSkillInstaller(homeDirectory: home)
         _ = try installer.installCommandWrappers(serviceBinaryURL: binary)
         for legacy in ["sed", "rg", "cat"] {
-            XCTAssertNil(
-                try? FileManager.default.destinationOfSymbolicLink(
+            XCTAssertEqual(
+                try FileManager.default.destinationOfSymbolicLink(
                     atPath: binDir.appendingPathComponent(legacy).path
                 ),
-                "legacy exact-output wrapper \(legacy) must be unlinked on install"
+                binary.path,
+                "legacy exact-output wrapper \(legacy) must use the current service interceptor"
             )
         }
     }
@@ -249,7 +310,7 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         let binary = try fakeServiceBinary(in: home)
         let binDir = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
         try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
-        for stray in ["node", "env", "AssetCacheLocatorUtil"] {
+        for stray in ["node", "env"] {
             try FileManager.default.createSymbolicLink(
                 at: binDir.appendingPathComponent(stray),
                 withDestinationURL: binary
@@ -263,7 +324,7 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         let installer = AgentSkillInstaller(homeDirectory: home)
         _ = try installer.installCommandWrappers(serviceBinaryURL: binary)
 
-        for stray in ["node", "env", "AssetCacheLocatorUtil"] {
+        for stray in ["node", "env"] {
             XCTAssertNil(
                 try? FileManager.default.destinationOfSymbolicLink(
                     atPath: binDir.appendingPathComponent(stray).path

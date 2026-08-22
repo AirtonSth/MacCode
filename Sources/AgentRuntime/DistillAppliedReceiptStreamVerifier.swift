@@ -1,0 +1,208 @@
+import CoreModel
+import CryptoKit
+import Foundation
+
+/// Bounded verifier for receipt-bearing provider item streams.
+///
+/// The full output is hashed incrementally. Only enough trailing bytes to hold
+/// one complete receipt line are retained, so a large tool result cannot become
+/// a second in-memory copy merely to attest its final marker.
+package struct DistillAppliedReceiptStreamVerifier: Sendable {
+    package struct VerifiedItem: Sendable, Equatable {
+        package let itemType: AssistantItemType
+        package let body: AssistantContentFingerprint
+        package let output: AssistantContentFingerprint?
+    }
+
+    package struct Scope: Sendable, Equatable {
+        package let rootRunID: String
+        package let key: Data
+
+        package init(rootRunID: String, key: Data) {
+            self.rootRunID = rootRunID
+            self.key = key
+        }
+    }
+
+    private struct Channel: Sendable {
+        private static let retainedTailByteCount =
+            DistillAppliedReceipt.maximumV2MarkerByteCount + 3 // preceding LF + terminal CRLF
+
+        private var hasher = SHA256()
+        private var tail = Data()
+        private var totalByteCount = 0
+
+        mutating func append(_ text: String?) {
+            guard let text, !text.isEmpty else { return }
+            append(Data(text.utf8))
+        }
+
+        private mutating func append(_ data: Data) {
+            guard !data.isEmpty else { return }
+            totalByteCount += data.count
+            tail.append(data)
+            let overflow = tail.count - Self.retainedTailByteCount
+            guard overflow > 0 else { return }
+            hasher.update(data: tail.prefix(overflow))
+            tail.removeFirst(overflow)
+        }
+
+        func verifiedNonce(scope: Scope) -> Data? {
+            guard let marker = DistillAppliedReceipt.parseTrailingV2Marker(in: tail) else {
+                return nil
+            }
+            let signedTail = tail.prefix(marker.markerByteRange.lowerBound)
+            var finalHasher = hasher
+            finalHasher.update(data: signedTail)
+            let digest = Data(finalHasher.finalize())
+            let signedByteCount = totalByteCount
+                - (tail.count - marker.markerByteRange.lowerBound)
+            guard DistillAppliedReceipt.verify(
+                marker,
+                rootRunID: scope.rootRunID,
+                payloadByteCount: signedByteCount,
+                payloadSHA256: digest,
+                key: scope.key
+            ) else {
+                return nil
+            }
+            return marker.nonce
+        }
+
+        func fingerprint() -> AssistantContentFingerprint {
+            var finalHasher = hasher
+            finalHasher.update(data: tail)
+            return AssistantContentFingerprint(
+                byteCount: totalByteCount,
+                sha256: Data(finalHasher.finalize())
+            )
+        }
+    }
+
+    private struct Item: Sendable {
+        var orderingIsValid: Bool
+        let itemType: AssistantItemType
+        var body = Channel()
+        var output = Channel()
+        var outputIsPresent = false
+    }
+
+    private static let itemLimit = 5_000
+    package static let maximumTrackedReceiptNoncesPerRun = 5_000
+    private var items: [String: Item] = [:]
+    private var itemOrder: [String] = []
+    private var consumedNonces: Set<Data> = []
+
+    package init() {}
+
+    package mutating func startItem(
+        id: String,
+        itemType: AssistantItemType = .tool,
+        body: String,
+        output: String?
+    ) {
+        guard items[id] == nil else {
+            // Duplicate starts or a delta-before-start make byte ordering
+            // ambiguous. Fail closed for the badge while leaving text untouched.
+            items[id]?.orderingIsValid = false
+            return
+        }
+        var item = Item(orderingIsValid: true, itemType: itemType)
+        item.body.append(body)
+        item.output.append(output)
+        item.outputIsPresent = output != nil
+        items[id] = item
+        itemOrder.append(id)
+        trimItems()
+    }
+
+    package mutating func append(
+        itemID: String,
+        body: String?,
+        output: String?
+    ) {
+        guard var item = items[itemID] else {
+            items[itemID] = Item(orderingIsValid: false, itemType: .tool)
+            itemOrder.append(itemID)
+            trimItems()
+            return
+        }
+        item.body.append(body)
+        item.output.append(output)
+        if output != nil { item.outputIsPresent = true }
+        items[itemID] = item
+    }
+
+    /// Finalizes one item and consumes a valid nonce exactly once per run.
+    package mutating func complete(itemID: String, scope: Scope) -> Bool {
+        completeWithFingerprint(itemID: itemID, scope: scope) != nil
+    }
+
+    /// Finalizes one item and returns the exact full-channel identity used by
+    /// durable replay. The UI may cap text later; this digest never does.
+    package mutating func completeWithFingerprint(
+        itemID: String,
+        scope: Scope
+    ) -> VerifiedItem? {
+        guard let item = items.removeValue(forKey: itemID) else { return nil }
+        itemOrder.removeAll { $0 == itemID }
+        guard item.orderingIsValid else { return nil }
+        for channel in [item.output, item.body] {
+            guard let nonce = channel.verifiedNonce(scope: scope) else { continue }
+            guard consume(nonce) else { return nil }
+            return VerifiedItem(
+                itemType: item.itemType,
+                body: item.body.fingerprint(),
+                output: item.outputIsPresent ? item.output.fingerprint() : nil
+            )
+        }
+        return nil
+    }
+
+    /// Authenticates a terminal prose payload without retaining it in the item map.
+    package mutating func authenticateStandalone(_ text: String, scope: Scope) -> Bool {
+        var channel = Channel()
+        channel.append(text)
+        guard let nonce = channel.verifiedNonce(scope: scope) else { return false }
+        return consume(nonce)
+    }
+
+    /// Verifies terminal display bytes without minting receipt authority. A
+    /// provider commonly repeats its completed assistant item as turnCompleted;
+    /// the first copy consumes the nonce for the badge, while the byte-identical
+    /// terminal copy still needs its authenticated marker removed from the UI.
+    package func validatesStandaloneForSanitization(_ text: String, scope: Scope) -> Bool {
+        var channel = Channel()
+        channel.append(text)
+        return channel.verifiedNonce(scope: scope) != nil
+    }
+
+    package mutating func endTurn() {
+        items.removeAll(keepingCapacity: true)
+        itemOrder.removeAll(keepingCapacity: true)
+    }
+
+    package mutating func reset() {
+        endTurn()
+        consumedNonces.removeAll(keepingCapacity: true)
+    }
+
+    private mutating func consume(_ nonce: Data) -> Bool {
+        guard !consumedNonces.contains(nonce),
+              consumedNonces.count < Self.maximumTrackedReceiptNoncesPerRun else {
+            // Never evict: accepting an old nonce again would let provider-owned
+            // text replay a previously valid receipt. Saturation only removes the
+            // badge claim; the provider output itself still passes through.
+            return false
+        }
+        consumedNonces.insert(nonce)
+        return true
+    }
+
+    private mutating func trimItems() {
+        while itemOrder.count > Self.itemLimit {
+            let oldest = itemOrder.removeFirst()
+            items.removeValue(forKey: oldest)
+        }
+    }
+}

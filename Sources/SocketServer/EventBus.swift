@@ -765,6 +765,17 @@ public final class EventBus: @unchecked Sendable {
     }
 }
 
+enum AgentItemDeltaCoalescingIdentity {
+    static func key(threadID: String, itemID: String, turnID: String?) -> String? {
+        // Ordinary AppContext deltas do not carry a turn id. They must remain
+        // in arrival-order buffering so an item-start boundary fences providers
+        // that reuse the same item id in a later turn.
+        guard let turnID, !turnID.isEmpty else { return nil }
+        let base = "agent.item.delta:\(threadID.utf8.count):\(threadID):\(itemID.utf8.count):\(itemID)"
+        return base + ":turn:\(turnID.utf8.count):\(turnID)"
+    }
+}
+
 public enum EventStreamFilter: Sendable, Equatable {
     case full
     /// Cellular volume filter. Optional interest thread ids drop high-volume
@@ -864,11 +875,16 @@ public enum EventStreamFilter: Sendable, Equatable {
            let surfaceID = payload["surface_id"]?.stringValue {
             return "\(event.kind):\(surfaceID)"
         }
-        // C-16: same item_id merges by *concat* of append fields (not LWW) so
-        // agent text stays byte-identical to the unaggregated stream.
+        // C-16: same thread_id + item_id merges by *concat* of append fields
+        // (not LWW) so agent text stays byte-identical without crossing threads.
         if event.kind == "agent.item.delta",
+           let threadID = payload["thread_id"]?.stringValue,
            let itemID = payload["item_id"]?.stringValue {
-            return "\(event.kind):\(itemID)"
+            return AgentItemDeltaCoalescingIdentity.key(
+                threadID: threadID,
+                itemID: itemID,
+                turnID: payload["turn_id"]?.stringValue
+            )
         }
         return nil
     }

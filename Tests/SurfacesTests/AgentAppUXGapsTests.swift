@@ -687,6 +687,47 @@ final class AgentAppUXGapsTests: XCTestCase {
         )
     }
 
+    func test_tokenSaverUserMessageDisplayText_keepsImageMarkersInHumanAndRCW1() {
+        // WHY: Token Saver RCW1 replaces the bubble with wire bytes that never
+        // carried `[Image #1]`. The shared transform must still show the marker.
+        let shot = AgentAttachment(path: "/tmp/shot.png", displayName: "shot.png", kind: .image)
+        let extra = AgentAttachment(path: "/tmp/extra.jpg", displayName: "extra.jpg", kind: .image)
+        let humanOne = AgentChatTranscriptChrome.displayUserLine(
+            text: "Describe this",
+            attachments: [shot]
+        )
+        let humanTwo = AgentChatTranscriptChrome.displayUserLine(
+            text: "Compare these",
+            attachments: [shot, extra]
+        )
+        let wire = "RCW1\tQ\t1\nG\tDescribe this\n.\n"
+        XCTAssertTrue(humanOne.contains("[Image #1]"))
+        XCTAssertTrue(humanTwo.contains("[Image #1]"))
+        XCTAssertTrue(humanTwo.contains("[Image #2]"))
+        XCTAssertEqual(
+            AgentAppView.tokenSaverUserMessageDisplayText(
+                human: humanOne,
+                wireRequest: wire,
+                mode: .translated
+            ),
+            humanOne
+        )
+        let rcw1 = AgentAppView.tokenSaverUserMessageDisplayText(
+            human: humanOne,
+            wireRequest: wire,
+            mode: .original
+        )
+        XCTAssertTrue(rcw1.contains("[Image #1]"), "RCW1 mode must not strip the image marker")
+        XCTAssertTrue(rcw1.contains("RCW1\tQ\t1"))
+        let rcw1Two = AgentAppView.tokenSaverUserMessageDisplayText(
+            human: humanTwo,
+            wireRequest: wire,
+            mode: .original
+        )
+        XCTAssertTrue(rcw1Two.contains("[Image #1]"))
+        XCTAssertTrue(rcw1Two.contains("[Image #2]"))
+    }
+
     /// WHY: stream events are a bounded replay cache. The disclosure attached
     /// to a retained human message must stay visible after a live timeline
     /// refresh evicts its event and after the app constructs a fresh view model.

@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import CryptoKit
 import SwiftUI
 import Combine
 import UniformTypeIdentifiers
@@ -786,7 +787,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    nonisolated static func persistTokenSaverDisplayModeOffMain(
+    public nonisolated static func persistTokenSaverDisplayModeOffMain(
         repository: AgentMessageRepository,
         messageId: AgentMessageID,
         mode: AgentMessageTokenSaverDisplayMode
@@ -1703,7 +1704,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// Skip equal token-saver footer publishes (soft reselect / idle multipass).
-    nonisolated public static func shouldPublishTokenSaverFooter(
+    public nonisolated static func shouldPublishTokenSaverFooter(
         currentEnabled: Bool,
         nextEnabled: Bool,
         currentMeasured: Int,
@@ -2557,7 +2558,280 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// history) still fall back to the snapshot.
     nonisolated static func chooseReplayEvents(persisted: [AssistantEvent], snapshot: [AssistantEvent]?) -> [AssistantEvent] {
         guard let snapshot else { return persisted }
-        return renderableItemCount(persisted) > renderableItemCount(snapshot) ? persisted : snapshot
+        guard renderableItemCount(persisted) <= renderableItemCount(snapshot) else { return persisted }
+        return snapshotPreservingPersistedHostMetadata(snapshot, persisted: persisted)
+    }
+
+    /// Provider snapshots can be richer than local replay, but cannot recreate
+    /// host-owned attestations. Pair the same turn occurrence, then the same
+    /// `(id, type)` ordinal within that turn. Provider timestamps and turn IDs
+    /// are adapter-local and cannot safely participate in replay identity.
+    nonisolated private static func snapshotPreservingPersistedHostMetadata(
+        _ snapshot: [AssistantEvent],
+        persisted: [AssistantEvent]
+    ) -> [AssistantEvent] {
+        let providerSnapshot = snapshot.filter { event in
+            if case .itemHostMetadata = event { return false }
+            return true
+        }
+        guard persisted.contains(where: { event in
+            if case .itemHostMetadata(_, _, let applied, _) = event { return applied == true }
+            return false
+        }) else { return providerSnapshot }
+        let persistedOccurrences = replayItemOccurrences(persisted)
+        let snapshotOccurrences = replayItemOccurrences(providerSnapshot)
+        var insertions: [(afterEventIndex: Int, occurrenceSequence: Int, event: AssistantEvent)] = []
+        var insertedOccurrenceSequences = Set<Int>()
+        let fallback = renderableItemCount(persisted) > 0 ? persisted : providerSnapshot
+
+        for (turnOrdinal, persistedTurn) in persistedOccurrences.turns.enumerated() {
+            for (itemIndex, persistedItem) in persistedTurn.items.enumerated()
+            where persistedItem.distillApplied == true {
+                let itemOrdinal = persistedTurn.items[..<itemIndex].reduce(into: 0) { count, item in
+                    if item.id == persistedItem.id, item.type == persistedItem.type {
+                        count += 1
+                    }
+                }
+                guard snapshotOccurrences.turns.indices.contains(turnOrdinal) else {
+                    return fallback
+                }
+                let snapshotOccurrenceTurn = snapshotOccurrences.turns[turnOrdinal]
+                let occurrenceMatches = snapshotOccurrenceTurn.items.filter {
+                    $0.id == persistedItem.id && $0.type == persistedItem.type
+                }
+                guard occurrenceMatches.indices.contains(itemOrdinal),
+                      replayOccurrenceMatches(
+                          persistedItem,
+                          occurrenceMatches[itemOrdinal]
+                      ) else {
+                    // A richer snapshot is not worth losing or moving durable host
+                    // truth. Keep the exact persisted replay when occurrences no
+                    // longer pair or provider history changed attested bytes.
+                    return fallback
+                }
+                let snapshotItem = occurrenceMatches[itemOrdinal]
+                guard insertedOccurrenceSequences.insert(snapshotItem.sequence).inserted else {
+                    return fallback
+                }
+                insertions.append((
+                    snapshotItem.lastEventIndex,
+                    snapshotItem.sequence,
+                    .itemHostMetadata(
+                        turnId: snapshotOccurrenceTurn.id,
+                        itemId: snapshotItem.id,
+                        distillApplied: true,
+                        attestation: persistedItem.attestation
+                    )
+                ))
+            }
+        }
+
+        for orphan in persistedOccurrences.orphanAttestations {
+            guard let attestation = orphan.attestation,
+                  attestation.isWellFormed else {
+                return fallback
+            }
+            let candidates = snapshotOccurrences.turns.flatMap { turn in
+                turn.items.filter { item in
+                    item.id == orphan.itemID
+                        && item.type == attestation.itemType
+                        && item.matches(attestation)
+                }.map { (turn, $0) }
+            }
+            guard candidates.count == 1, let candidate = candidates.first else {
+                return fallback
+            }
+            guard insertedOccurrenceSequences.insert(candidate.1.sequence).inserted else {
+                return fallback
+            }
+            insertions.append((
+                candidate.1.lastEventIndex,
+                candidate.1.sequence,
+                .itemHostMetadata(
+                    turnId: candidate.0.id,
+                    itemId: candidate.1.id,
+                    distillApplied: true,
+                    attestation: attestation
+                )
+            ))
+        }
+        let insertionsByIndex = Dictionary(grouping: insertions, by: \.afterEventIndex)
+        var merged: [AssistantEvent] = []
+        merged.reserveCapacity(providerSnapshot.count + insertions.count)
+        for (eventIndex, event) in providerSnapshot.enumerated() {
+            merged.append(event)
+            for insertion in (insertionsByIndex[eventIndex] ?? [])
+                .sorted(by: { $0.occurrenceSequence < $1.occurrenceSequence }) {
+                merged.append(insertion.event)
+            }
+        }
+        return merged
+    }
+
+    nonisolated private static func replayOccurrenceMatches(
+        _ persisted: ReplayItemOccurrence,
+        _ snapshot: ReplayItemOccurrence
+    ) -> Bool {
+        if let attestation = persisted.attestation {
+            return persisted.matches(attestation) && snapshot.matches(attestation)
+        }
+        return persisted.body.fingerprint == snapshot.body.fingerprint
+            && persisted.output?.fingerprint == snapshot.output?.fingerprint
+    }
+
+    private struct ReplayItemOccurrence: Sendable {
+        let sequence: Int
+        var lastEventIndex: Int
+        let id: String
+        let type: AssistantItemType
+        var body: ReplayContentFingerprintBuilder
+        var output: ReplayContentFingerprintBuilder?
+        var distillApplied = false
+        var attestation: AssistantItemHostAttestation?
+
+        func matches(_ attestation: AssistantItemHostAttestation) -> Bool {
+            attestation.isWellFormed
+                && type == attestation.itemType
+                && body.fingerprint == attestation.body
+                && output?.fingerprint == attestation.output
+        }
+    }
+
+    private struct ReplayTurnOccurrence: Sendable {
+        let id: String
+        var items: [ReplayItemOccurrence] = []
+    }
+
+    private struct ReplayContentFingerprintBuilder: Sendable {
+        private var hasher = SHA256()
+        private(set) var byteCount = 0
+
+        init(_ text: String = "") {
+            append(text)
+        }
+
+        mutating func append(_ text: String) {
+            guard !text.isEmpty else { return }
+            let data = Data(text.utf8)
+            byteCount += data.count
+            hasher.update(data: data)
+        }
+
+        var fingerprint: AssistantContentFingerprint {
+            var finalHasher = hasher
+            return AssistantContentFingerprint(
+                byteCount: byteCount,
+                sha256: Data(finalHasher.finalize())
+            )
+        }
+    }
+
+    private struct ReplayHostMetadataKey: Hashable {
+        let turnID: String
+        let itemID: String
+    }
+
+    private struct ReplayOrphanAttestation: Sendable {
+        let key: ReplayHostMetadataKey
+        let attestation: AssistantItemHostAttestation?
+
+        var itemID: String { key.itemID }
+    }
+
+    private struct ReplayOccurrenceState: Sendable {
+        var turns: [ReplayTurnOccurrence] = []
+        var orphanAttestations: [ReplayOrphanAttestation] = []
+    }
+
+    /// Replays content while assigning a fresh internal identity to every raw
+    /// itemStarted event. The production timeline intentionally merges duplicate
+    /// provider IDs for paint; replay trust must observe those occurrences first.
+    nonisolated private static func replayItemOccurrences(
+        _ events: [AssistantEvent]
+    ) -> ReplayOccurrenceState {
+        var state = ReplayOccurrenceState()
+        var latestTurnIndexByID: [String: Int] = [:]
+        var latestItemLocationByID: [String: (turn: Int, item: Int)] = [:]
+        var nextItemSequence = 0
+
+        func appendTurn(_ turnID: String) -> Int {
+            state.turns.append(ReplayTurnOccurrence(id: turnID))
+            let index = state.turns.index(before: state.turns.endIndex)
+            latestTurnIndexByID[turnID] = index
+            return index
+        }
+
+        for (eventIndex, event) in events.enumerated() {
+            switch event {
+            case .turnStarted(let turnID):
+                _ = appendTurn(turnID)
+
+            case .itemStarted(let item):
+                let turnIndex = latestTurnIndexByID[item.turnId] ?? appendTurn(item.turnId)
+                var occurrence = ReplayItemOccurrence(
+                    sequence: nextItemSequence,
+                    lastEventIndex: eventIndex,
+                    id: item.id,
+                    type: item.type,
+                    body: ReplayContentFingerprintBuilder(item.body),
+                    output: item.output.map(ReplayContentFingerprintBuilder.init)
+                )
+                nextItemSequence += 1
+                let metadataKey = ReplayHostMetadataKey(
+                    turnID: item.turnId,
+                    itemID: item.id
+                )
+                if let pendingIndex = state.orphanAttestations.lastIndex(where: { $0.key == metadataKey }) {
+                    let pending = state.orphanAttestations.remove(at: pendingIndex)
+                    occurrence.distillApplied = true
+                    occurrence.attestation = pending.attestation
+                }
+                state.turns[turnIndex].items.append(occurrence)
+                latestItemLocationByID[item.id] = (
+                    turn: turnIndex,
+                    item: state.turns[turnIndex].items.index(before: state.turns[turnIndex].items.endIndex)
+                )
+
+            case .itemDelta(let itemID, let bodyAppend, let outputAppend, _):
+                if let location = latestItemLocationByID[itemID] {
+                    state.turns[location.turn].items[location.item].lastEventIndex = eventIndex
+                    if let bodyAppend {
+                        state.turns[location.turn].items[location.item].body.append(bodyAppend)
+                    }
+                    if let outputAppend {
+                        if state.turns[location.turn].items[location.item].output == nil {
+                            state.turns[location.turn].items[location.item].output =
+                                ReplayContentFingerprintBuilder()
+                        }
+                        state.turns[location.turn].items[location.item].output?.append(outputAppend)
+                    }
+                }
+
+            case .itemState(let itemID, _),
+                 .itemProgress(let itemID, _),
+                 .itemCompleted(let itemID, _):
+                if let location = latestItemLocationByID[itemID] {
+                    state.turns[location.turn].items[location.item].lastEventIndex = eventIndex
+                }
+
+            case .itemHostMetadata(let turnID, let itemID, let distillApplied, let attestation):
+                guard distillApplied == true else { continue }
+                if let turnIndex = latestTurnIndexByID[turnID],
+                   let itemIndex = state.turns[turnIndex].items.lastIndex(where: { $0.id == itemID }) {
+                    state.turns[turnIndex].items[itemIndex].distillApplied = true
+                    state.turns[turnIndex].items[itemIndex].attestation = attestation
+                } else {
+                    state.orphanAttestations.append(ReplayOrphanAttestation(
+                        key: ReplayHostMetadataKey(turnID: turnID, itemID: itemID),
+                        attestation: attestation
+                    ))
+                }
+
+            default:
+                break
+            }
+        }
+        return state
     }
 
     nonisolated static func renderableItemCount(_ events: [AssistantEvent]) -> Int {
@@ -6683,8 +6957,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         suppressPersistedFinalDuplicatedByTimeline()
         lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
         selectedThreadHasRecoverableContext = false  // UX-MAC_AGENT-CONTINUE: run started; hide Continue
-        let display = attached.isEmpty ? text
-            : text + "\n\n📎 " + attached.map(\.displayName).joined(separator: ", ")
+        let display = AgentChatTranscriptChrome.displayUserLine(text: text, attachments: attached)
         // The coordinator is the single writer of run messages — mirror
         // the user message in-memory only (no double-persist). Queue drain
         // passes the same UUID as runId, so the optimistic bubble is stable.
@@ -7169,9 +7442,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private static func retryPrompt(_ message: AgentMessage) -> String {
-        guard !message.attachments.isEmpty else { return message.content }
-        let suffix = "\n\n📎 " + message.attachments.map(\.displayName).joined(separator: ", ")
-        return message.content.hasSuffix(suffix) ? String(message.content.dropLast(suffix.count)) : message.content
+        AgentChatTranscriptChrome.promptByRemovingDisplayDecorations(
+            from: message.content,
+            attachments: message.attachments
+        )
     }
 
     @discardableResult
@@ -9089,7 +9363,6 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         pattern: #"(?::\s*|\s+)call-[0-9a-f-]{8,}\s*$"#,
         options: [.caseInsensitive]
     )
-    private static let distillPipePresentRegex = try! NSRegularExpression(pattern: #"\|\s*distill\b"#)
     private static let distillPipeWithStderrRegex = try! NSRegularExpression(
         pattern: #"\s*2>&1\s*\|\s*distill\b[\s\S]*$"#
     )
@@ -9253,16 +9526,10 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return showsLiveToolElapsed(for: item)
     }
 
-    /// Token Saver ran for this tool (display chip only). Explicit pipes are visible
-    /// in the command; transparent PATH interception is proven by its scoped recovery
-    /// receipt in the delivered output.
+    /// Token Saver ran for this tool (display chip only). The host verifier owns
+    /// this truth; provider-visible receipt/handle text is never authoritative.
     static func toolCommandWasDistilled(for item: AssistantItem) -> Bool {
-        if let raw = rawShellCommand(for: item) ?? toolCommandPreview(for: item),
-           firstMatchRange(distillPipePresentRegex, in: raw) != nil {
-            return true
-        }
-        guard let detail = detailText(for: item) else { return false }
-        return RetrieveHandleSanitizer.containsHandle(detail)
+        item.distillApplied == true
     }
 
     /// Compact elapsed label (`12s`, `1m 53s`) from start→end timestamps.
@@ -9550,7 +9817,10 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     /// count — an exact grapheme delta would need the O(n) walk this avoids — so
     /// the marker reports a size, not a character count.
     static func cappedDetail(_ text: String, limit: Int = 6_000, for item: AssistantItem? = nil) -> String {
-        let clean = stripANSI(text)
+        let ansiStripped = stripANSI(text)
+        let clean = item?.distillApplied == true
+            ? DistillAppliedReceipt.strip(ansiStripped)
+            : ansiStripped
         if let item, isSkillToolItem(item) {
             return clean
         }
@@ -9934,12 +10204,12 @@ public struct AgentAppView: View {
         let offersRetry: Bool
     }
 
-    enum TokenSaverDisplayMode: String, CaseIterable, Identifiable {
+    public enum TokenSaverDisplayMode: String, CaseIterable, Identifiable {
         case translated
         case original
 
-        var id: String { rawValue }
-        var label: String { self == .translated ? "Human" : "RCW1" }
+        public var id: String { rawValue }
+        public var label: String { self == .translated ? "Human" : "RCW1" }
     }
 
     struct TokenSaverDisplaySelections: Equatable {
@@ -10105,15 +10375,15 @@ public struct AgentAppView: View {
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
     /// Pure seam for the low-chrome Token Saver disclosure.
-    static func showsTokenSaverOptimizedBadge(wasTokenSaverOptimized: Bool) -> Bool {
+    public static func showsTokenSaverOptimizedBadge(wasTokenSaverOptimized: Bool) -> Bool {
         wasTokenSaverOptimized
     }
 
-    static func tokenSaverBadgeLabel(hasOriginalText _: Bool) -> String {
+    public static func tokenSaverBadgeLabel(hasOriginalText _: Bool) -> String {
         "Token Saver optimized"
     }
 
-    static func tokenSaverCopyText(
+    public static func tokenSaverCopyText(
         translated: String,
         original: String,
         request: String?,
@@ -10127,7 +10397,7 @@ public struct AgentAppView: View {
 
     /// A request or plain fallback is never a raw assistant response. Accept a
     /// strict RCW1 response envelope only; malformed/preamble-only text fails safe.
-    static func hasInspectableAssistantRCW1Response(_ original: String) -> Bool {
+    public static func hasInspectableAssistantRCW1Response(_ original: String) -> Bool {
         let trimmed = original.trimmingCharacters(in: .whitespacesAndNewlines)
         let payload = RCWireProtocol.transportEnvelope(in: trimmed)?.payload ?? trimmed
         guard let frames = try? RCWireProtocol.parse(payload), !frames.isEmpty else {
@@ -10136,7 +10406,7 @@ public struct AgentAppView: View {
         return frames.allSatisfy { $0.direction == .response }
     }
 
-    static func hasInspectableUserRCW1Request(_ request: String?) -> Bool {
+    public static func hasInspectableUserRCW1Request(_ request: String?) -> Bool {
         guard let request else { return false }
         let trimmed = request.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let frames = try? RCWireProtocol.parse(trimmed), !frames.isEmpty else {
@@ -10148,7 +10418,7 @@ public struct AgentAppView: View {
     /// Composition gate shared by every picker call site. Assistant/progress
     /// rows require actual RCW1 A bytes; only the durable user row may disclose
     /// an outbound RCW1 Q before any provider response exists.
-    static func showsTokenSaverDisplayControl(
+    public static func showsTokenSaverDisplayControl(
         original: String,
         request: String?,
         allowsRequestOnlyRCW1: Bool
@@ -10157,25 +10427,28 @@ public struct AgentAppView: View {
             || (allowsRequestOnlyRCW1 && hasInspectableUserRCW1Request(request))
     }
 
-    static func showsTokenSaverOriginalContent(
+    public static func showsTokenSaverOriginalContent(
         original: String,
         mode: TokenSaverDisplayMode
     ) -> Bool {
         mode == .original && hasInspectableAssistantRCW1Response(original)
     }
 
-    static func tokenSaverUserMessageDisplayText(
+    public static func tokenSaverUserMessageDisplayText(
         human: String,
         wireRequest: String?,
         mode: TokenSaverDisplayMode
     ) -> String {
-        guard mode == .original, let wireRequest, RCWireProtocol.isWire(wireRequest) else {
-            return human
+        let body: String
+        if mode == .original, let wireRequest, RCWireProtocol.isWire(wireRequest) {
+            body = wireRequest
+        } else {
+            body = human
         }
-        return wireRequest
+        return AgentChatTranscriptChrome.preservingImageMarkers(in: body, source: human)
     }
 
-    static func tokenSaverMessageDisplayKey(_ messageId: String) -> String {
+    public static func tokenSaverMessageDisplayKey(_ messageId: String) -> String {
         "message|\(messageId.utf8.count)|\(messageId)"
     }
 
@@ -13412,7 +13685,7 @@ public struct AgentAppView: View {
     ///
     /// Invariant: result ≥ measuredDelivered when enabled (estimates never lower
     /// the thread figure).
-    nonisolated static func tokenSaverThreadFooterDisplayTokens(
+    public nonisolated static func tokenSaverThreadFooterDisplayTokens(
         measuredDelivered: Int,
         assistantChars: Int,
         tokenSaverEnabled: Bool,
@@ -13457,7 +13730,7 @@ public struct AgentAppView: View {
     ///   figure — never invent a chip from assistant text alone.
     /// - Product copy: full stack in plain language (tool output, shorter answers,
     ///   multi-turn cache). Optional Auto note for cheaper models.
-    nonisolated static func tokenSaverThreadFooterText(
+    public nonisolated static func tokenSaverThreadFooterText(
         displayTokens: Int,
         measuredTokens: Int,
         enabled: Bool,
@@ -13515,31 +13788,7 @@ public struct AgentAppView: View {
             enabled: vm.tokenSaverFooterEnabled,
             autoRoutingActive: autoRouting
         ) {
-            HStack(spacing: DS.Space.xs) {
-                Image(systemName: "leaf.fill")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(DS.Palette.success)
-                    .accessibilityHidden(true)
-                Text(text)
-                    .font(DS.Font.caption2.weight(.medium))
-                    .foregroundColor(DS.Palette.success)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, DS.Space.sm)
-            .padding(.vertical, 5)
-            .background(DS.Palette.success.opacity(0.12))
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel(text)
-            .accessibilityIdentifier("agent.tokenSaver.threadFooter")
-            .help(
-                autoRouting
-                    ? "Measured tool/command-output savings from the local Token Saver ledger (not full provider usage), plus Auto routing to cheaper models"
-                    : "Measured tool/command-output savings from the local Token Saver ledger only — not total provider or context tokens"
-            )
-            .transition(.opacity.combined(with: .move(edge: .top)))
+            AgentChatTokenSaverThreadFooter(text: text, autoRouting: autoRouting)
         }
     }
 
@@ -13916,11 +14165,9 @@ public struct AgentAppView: View {
                         content: AnyView(
                             VStack(alignment: .leading, spacing: DS.Space.xs) {
                                 if showBadge {
-                                    Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
-                                        .font(DS.Font.caption2)
-                                        .foregroundColor(DS.Palette.textTertiary)
-                                        .accessibilityLabel("Token Saver optimized this reply")
-                                        .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(msg.id.value.uuidString)")
+                                    AgentChatTokenSaverOptimizedBadge(
+                                        messageId: msg.id.value.uuidString
+                                    )
                                 }
                                 AgentChatPeerIdentityHeader(
                                     name: parsed.name,
@@ -13974,11 +14221,9 @@ public struct AgentAppView: View {
                             content: showBadge
                                 ? AnyView(
                                     VStack(alignment: .leading, spacing: DS.Space.xs) {
-                                        Text(Self.tokenSaverBadgeLabel(hasOriginalText: false))
-                                            .font(DS.Font.caption2)
-                                            .foregroundColor(DS.Palette.textTertiary)
-                                            .accessibilityLabel("Token Saver optimized this reply")
-                                            .accessibilityIdentifier("agent.assistantMessage.tokenSaverBadge.\(msg.id.value.uuidString)")
+                                        AgentChatTokenSaverOptimizedBadge(
+                                            messageId: msg.id.value.uuidString
+                                        )
                                         assistantProse(msg.content)
                                     }
                                 )
@@ -14060,27 +14305,21 @@ public struct AgentAppView: View {
         )
         let displayMode = tokenSaverDisplayMode(for: itemKey, messageId: messageId)
         if showsControl {
-            HStack(spacing: DS.Space.sm) {
-                Label("Token Saver optimized", systemImage: "arrow.left.arrow.right")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(1)
-                Picker("Token Saver display", selection: tokenSaverDisplayModeBinding(for: itemKey, messageId: messageId)) {
-                    Text("Human").tag(TokenSaverDisplayMode.translated)
-                    Text("RCW1").tag(TokenSaverDisplayMode.original)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .controlSize(.small)
-                .frame(width: 150)
-                .accessibilityLabel("Token Saver display")
-                .accessibilityValue(displayMode == .translated ? "Human" : "RCW1")
-                .accessibilityHint("Switches only this transcript item between readable and original transport text.")
-                .accessibilityIdentifier("agent.tokenSaver.displayMode.\(selectionKey)")
-                .help("Show translated text or the exact Token Saver transport")
-            }
-            .frame(minHeight: 32)
-            .frame(maxWidth: .infinity, alignment: alignment)
+            AgentChatTokenSaverDisplayControl(
+                mode: Binding(
+                    get: {
+                        displayMode == .original
+                            ? AgentChatTokenSaverDisplayMode.rcw1
+                            : AgentChatTokenSaverDisplayMode.human
+                    },
+                    set: { mode in
+                        tokenSaverDisplayModeBinding(for: itemKey, messageId: messageId)
+                            .wrappedValue = mode == .rcw1 ? .original : .translated
+                    }
+                ),
+                identifier: selectionKey,
+                alignment: alignment
+            )
         }
     }
 
@@ -14091,48 +14330,26 @@ public struct AgentAppView: View {
         identifierSuffix: String,
         retryMessageId: AgentMessageID? = nil
     ) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            if let request, !request.isEmpty {
-                Text("What was sent")
-                    .font(DS.Font.caption2.weight(.semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                Text(request)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                Button("Copy what was sent") { copyToPasteboard(request) }
-                    .buttonStyle(.plain)
-                    .font(DS.Font.caption2)
-                    .accessibilityIdentifier("agent.tokenSaver.copyRequest.\(identifierSuffix)")
+        AgentChatTokenSaverOriginalContent(
+            original: original,
+            request: request,
+            identifierSuffix: identifierSuffix,
+            onCopy: { copyToPasteboard($0) },
+            retryLabel: retryMessageId.map { id in
+                vm.tokenSaverTranslationRetryMessageIds.contains(id)
+                    ? "Retrying translation…"
+                    : "Retry translation"
+            },
+            retryDisabled: retryMessageId.map {
+                vm.tokenSaverTranslationRetryMessageIds.contains($0)
+            } ?? false,
+            retryIdentifier: retryMessageId.map {
+                "agent.assistantMessage.retryTokenSaverTranslation.\($0.value.uuidString)"
+            },
+            onRetry: retryMessageId.map { id in
+                { vm.retryTokenSaverTranslation(for: id) }
             }
-            Text("Original provider response")
-                .font(DS.Font.caption2.weight(.semibold))
-                .foregroundColor(DS.Palette.textTertiary)
-            Text(original)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundColor(DS.Palette.textSecondary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-            Button("Copy original provider response") { copyToPasteboard(original) }
-                .buttonStyle(.plain)
-                .font(DS.Font.caption2)
-                .accessibilityIdentifier("agent.tokenSaver.copyOriginal.\(identifierSuffix)")
-            if let messageId = retryMessageId {
-                Button(vm.tokenSaverTranslationRetryMessageIds.contains(messageId) ? "Retrying translation…" : "Retry translation") {
-                    vm.retryTokenSaverTranslation(for: messageId)
-                }
-                .buttonStyle(.plain)
-                .font(DS.Font.caption2)
-                .disabled(vm.tokenSaverTranslationRetryMessageIds.contains(messageId))
-                .accessibilityLabel("Retry local translation")
-                .accessibilityIdentifier("agent.assistantMessage.retryTokenSaverTranslation.\(messageId.value.uuidString)")
-            }
-        }
-        .padding(DS.Space.md)
-        .background(DS.Palette.surface.opacity(0.45))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .frame(maxWidth: .infinity, alignment: .leading)
+        )
     }
 
     @ViewBuilder

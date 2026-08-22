@@ -71,6 +71,60 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
         XCTAssertEqual(codex.savedTokens, 120)
     }
 
+    func test_sameLogicalDeliveryRetryIsCountedExactlyOnce() throws {
+        // WHY: the first HTTP 200 can be lost after SQLite commits. The managed
+        // CLI retries the same request, which must not inflate rows or totals.
+        let db = try makeDB()
+        let repo = TokenSaverSavingsRepository(db: db)
+        let key = "request-123"
+        let now = Date(timeIntervalSince1970: 1_000_000_000)
+
+        XCTAssertEqual(try repo.record(
+            provider: "claude", mode: "command-output", inputTokens: 1_000,
+            outputTokens: 100, savedTokens: 900, delivered: true,
+            threadID: "thread-1", idempotencyKey: key, at: now
+        ), 900)
+        XCTAssertEqual(try repo.record(
+            provider: "claude", mode: "command-output", inputTokens: 1_000,
+            outputTokens: 100, savedTokens: 900, delivered: true,
+            threadID: "thread-1", idempotencyKey: key, at: now.addingTimeInterval(1)
+        ), 0, "an exact retry must report no newly persisted savings")
+
+        let summary = try repo.summary(now: now.addingTimeInterval(1))
+        XCTAssertEqual(try rawCount(db), 1)
+        XCTAssertEqual(summary.totalRuns, 1)
+        XCTAssertEqual(summary.totalSavedTokens, 900)
+        XCTAssertEqual(try repo.savedTokens(forThreadID: "thread-1"), 900,
+                       "the permanent thread accumulator must also remain idempotent")
+    }
+
+    func test_reusedIdempotencyKeyWithDifferentSavingsFailsLoudAndAtomically() throws {
+        // WHY: silently treating a changed payload as a retry would conceal an
+        // identity collision and make the accounting unverifiable.
+        let db = try makeDB()
+        let repo = TokenSaverSavingsRepository(db: db)
+        _ = try repo.record(
+            provider: "codex", mode: "command-output", inputTokens: 500,
+            outputTokens: 100, savedTokens: 400, delivered: true,
+            idempotencyKey: "request-conflict"
+        )
+
+        XCTAssertThrowsError(try repo.record(
+            provider: "codex", mode: "command-output", inputTokens: 500,
+            outputTokens: 90, savedTokens: 410, delivered: true,
+            idempotencyKey: "request-conflict"
+        )) { error in
+            XCTAssertEqual(
+                error as? TokenSaverSavingsRepositoryError,
+                .idempotencyConflict("request-conflict")
+            )
+        }
+        XCTAssertEqual(try rawCount(db), 1)
+        XCTAssertEqual(try repo.summary().totalRuns, 1,
+                       "a conflicting retry must roll back before touching totals")
+        XCTAssertEqual(try repo.summary().totalSavedTokens, 400)
+    }
+
     func test_retentionKeepsAtLeastSevenDaysAndPrunesOnlyEventRows() throws {
         let db = try makeDB()
         let repo = TokenSaverSavingsRepository(db: db, retentionDays: 1)

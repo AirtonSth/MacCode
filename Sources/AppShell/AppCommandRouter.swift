@@ -300,6 +300,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
     public weak var botsViewModel: BotsViewModel?
+    /// Executes bot_browser_* against the app-owned Playwright MCP children.
+    /// Seam so tests inject a recorder instead of spawning npx/docker.
+    lazy var botBrowserBridge: any BotBrowserBridging = BotBrowserPlaywrightHost()
+    /// Replaces the real docker guest provision in tests (no docker in CI).
+    var botBrowserGuestEnsureForTesting: (@Sendable (BotID) throws -> Void)?
     public private(set) var lastAgentAppHopTextForTesting: String?
     var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
     var providerSignInTerminalInputSenderForTests: ((SurfaceID, String) -> TerminalInputStatus)?
@@ -6759,64 +6764,102 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    /// Open or retarget this bot's dedicated browser. Last URL/title persist by bot id.
+    /// Open or retarget this bot's own Playwright browser. Last URL/title
+    /// persist by bot id. Bots never get a RemoteCode in-app browser tab:
+    /// logical-space bots are refused toward the owner's Google Chrome.
     @discardableResult
     public func openBotBrowser(botID: BotID, url: String, title: String? = nil) throws -> BotBrowserTarget {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
         let service = BotBrowserService(callerBotID: botID, store: store)
         let target = try service.persistNavigation(url: url, title: title)
-        guard let parsed = URL(string: target.url) else { throw LayoutError.invalidLayout }
-        let bot = try ctx.botStore.get(id: botID)
-        let workspace = bot?.workspaceID ?? ctx.state.workspaces.keys.sorted { $0.value.uuidString < $1.value.uuidString }.first
-        guard let workspace, ctx.state.workspaces[workspace] != nil else {
-            throw LayoutError.workspaceNotFound
+        let route = try botBrowserRoute(botID: botID)
+        if case .refused(let message) = route {
+            throw BotBrowserError.invalid(message)
         }
-        if let existing = botBrowserSurface(botID: botID, workspace: workspace),
-           let browser = SurfaceRegistry.shared.surface(existing.id) as? BrowserSurface {
-            browser.navigate(to: parsed)
-            persistBrowserNavigation(surfaceID: existing.id, url: target.url, title: target.title)
-            let fields = BotBrowserHostState.makePayload(surfaceID: existing.id, url: target.url, title: target.title)
-            var payload: [String: JSONValue] = [:]
-            for (key, value) in fields { payload[key] = .string(value) }
-            EventBus.shared.publish(kind: BotBrowserHostState.eventKind, payload: .object(payload))
-            try? ctx.apply(.focusSurface(workspace, existing.id))
-            windowController?.refreshFromState()
-            return target
-        }
-        let tabTitle = title?.isEmpty == false ? title! : (parsed.host ?? "browser")
-        let browser = configureBrowserSurface(
-            BrowserSurface(workspaceID: workspace, initialURL: parsed, title: tabTitle, botID: botID)
-        )
-        SurfaceRegistry.shared.register(browser)
-        var desc = browser.descriptor
-        desc.metadata["url"] = target.url
-        desc.metadata["bot_id"] = botID.value.uuidString.lowercased()
-        try ctx.apply(.addSurface(workspace, paneID: nil, descriptor: desc))
-        persistBrowserNavigation(surfaceID: desc.id, url: target.url, title: target.title)
-        let fields = BotBrowserHostState.makePayload(surfaceID: desc.id, url: target.url, title: target.title)
-        var payload: [String: JSONValue] = [:]
-        for (key, value) in fields { payload[key] = .string(value) }
-        EventBus.shared.publish(kind: BotBrowserHostState.eventKind, payload: .object(payload))
-        windowController?.refreshFromState()
-        reconcileSurfaceVisibility()
+        // This legacy lane has no result channel, so the navigate is
+        // fire-and-forget off-main; failures NSLog. Result-carrying opens go
+        // through performBotBrowserPendingAction instead.
+        scheduleBotBrowserBridgeNavigate(botID: botID, route: route, target: target)
         return target
     }
 
-    private func botBrowserSurface(botID: BotID, workspace: WorkspaceID) -> SurfaceDescriptor? {
-        guard let ws = context?.state.workspaces[workspace] else { return nil }
-        var found: SurfaceDescriptor?
-        let expected = botID.value.uuidString.lowercased()
-        forEachSurface(in: ws.layout) { descriptor in
-            guard found == nil,
-                  descriptor.type == .browser,
-                  descriptor.metadata["bot_id"]?.lowercased() == expected else { return }
-            found = descriptor
+    /// Which executor serves this bot's browser. Same desktop-kind lookup as
+    /// reconcileBotComputerActions; no published revision resolves to refused.
+    private func botBrowserRoute(botID: BotID) throws -> BotBrowserRoute {
+        guard let ctx = context,
+              let bot = try ctx.botStore.get(id: botID),
+              let revisionID = bot.currentRevisionID,
+              let revision = try ctx.botStore.getRevision(id: revisionID) else {
+            return .refused(BotBrowserRoute.refusedMessage)
         }
-        return found
+        return BotBrowserRoute.forPublished(revision.desktopKind)
     }
 
-    /// Drain MCP pending snapshot/act commands onto this bot's WKWebView.
+    /// Docker route only: resume-or-create the bot's guest before the bridge
+    /// spawns `docker exec`. Built like reconcileBotComputerActions builds it.
+    /// Returned closure runs OFF-main (docker CLI work must never block MainActor).
+    private func botBrowserGuestEnsure(route: BotBrowserRoute, botID: BotID, appSupport: URL) -> (@Sendable () throws -> Void)? {
+        guard route == .playwrightGuest else { return nil }
+        if let fake = botBrowserGuestEnsureForTesting {
+            return { try fake(botID) }
+        }
+        let service = BotComputerGuestService(
+            appSupport: appSupport,
+            docker: BotComputerDockerCLI(),
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
+        )
+        return { _ = try service.provision(botID: botID) }
+    }
+
+    private func scheduleBotBrowserBridgeNavigate(botID: BotID, route: BotBrowserRoute, target: BotBrowserTarget) {
+        guard let ctx = context else { return }
+        let appSupport = ctx.appSupportDirectory
+        let bridge = botBrowserBridge
+        let ensureGuest = botBrowserGuestEnsure(route: route, botID: botID, appSupport: appSupport)
+        Task.detached(priority: .utility) {
+            do {
+                try ensureGuest?()
+                let payload = try bridge.perform(
+                    botID: botID,
+                    route: route,
+                    kind: BotBrowserCatalog.open,
+                    action: "",
+                    ref: "",
+                    text: "",
+                    url: target.url,
+                    appSupport: appSupport
+                )
+                Self.persistBotBrowserBridgePageState(payload: payload, botID: botID, appSupport: appSupport)
+            } catch {
+                NSLog(
+                    "RemoteCode bot browser navigate failed bot=%@ error=%@",
+                    botID.value.uuidString,
+                    String(describing: error)
+                )
+            }
+        }
+    }
+
+    /// Mirror the bridge-reported page into the store so `bot_browser_get`
+    /// and the login-wait fallback stay truthful. Cookies stay whatever the
+    /// store already holds (Playwright lanes feed none; legacy tabs may).
+    nonisolated private static func persistBotBrowserBridgePageState(
+        payload: [String: Any],
+        botID: BotID,
+        appSupport: URL
+    ) {
+        let url = payload["url"] as? String ?? ""
+        guard !url.isEmpty else { return }
+        let title = payload["title"] as? String ?? ""
+        let store = BotBrowserStore(appSupportDirectory: appSupport)
+        try? store.persistTarget(BotBrowserTarget(url: url, title: title), botID: botID)
+        let cookies = (try? store.readWebsiteData(botID: botID)) ?? [:]
+        try? store.persistPageState(BotBrowserPageState(url: url, title: title, cookies: cookies), botID: botID)
+    }
+
+    /// Drain MCP pending open/snapshot/act/state commands onto this bot's
+    /// app-owned Playwright MCP child.
     public func reconcileBotBrowserActions() async {
         guard let ctx = context else { return }
         let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
@@ -6847,37 +6890,53 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         action: BotBrowserPendingAction
     ) async throws -> String {
         guard let ctx = context else {
-            throw BotBrowserError.invalid("Bot browser is not available.")
+            throw BotBrowserError.invalid("Bot browser is not available. Keep the RemoteCode app running and try again.")
         }
-        let bot = try ctx.botStore.get(id: botID)
-        let workspace = bot?.workspaceID
-            ?? ctx.state.workspaces.keys.sorted { $0.value.uuidString < $1.value.uuidString }.first
-        guard let workspace,
-              let surface = botBrowserSurface(botID: botID, workspace: workspace) else {
-            throw BotBrowserError.invalid("Open a website first.")
+        let route = try botBrowserRoute(botID: botID)
+        if case .refused(let message) = route {
+            throw BotBrowserError.invalid(message)
         }
-        if action.kind == BotBrowserCatalog.snapshot {
-            return try await browserSnapshot(surface: surface.id)
+        let supportedKinds: Set<String> = [
+            BotBrowserCatalog.open,
+            BotBrowserCatalog.snapshot,
+            BotBrowserCatalog.act,
+            BotBrowserCatalog.stateKind,
+        ]
+        guard supportedKinds.contains(action.kind) else {
+            throw BotBrowserError.invalid("unknown bot browser action kind: \(action.kind)")
         }
-        let json = try await browserAction(
-            surface: surface.id,
-            kind: action.action,
-            ref: action.ref,
-            value: action.text.isEmpty ? nil : action.text
-        )
-        if action.action == "click" || action.action == "scroll",
-           let browser = SurfaceRegistry.shared.surface(surface.id) as? BrowserSurface {
-            let url = browser.currentURL()
-            let title = browser.currentTitle()
-            if !url.isEmpty {
-                persistBrowserNavigation(surfaceID: surface.id, url: url, title: title)
-                let fields = BotBrowserHostState.makePayload(surfaceID: surface.id, url: url, title: title)
-                var payload: [String: JSONValue] = [:]
-                for (key, value) in fields { payload[key] = .string(value) }
-                EventBus.shared.publish(kind: BotBrowserHostState.eventKind, payload: .object(payload))
+        let appSupport = ctx.appSupportDirectory
+        if action.kind == BotBrowserCatalog.open {
+            // Same URL validation + persist rule the old surface path applied.
+            _ = try BotBrowserService(callerBotID: botID, store: BotBrowserStore(appSupportDirectory: appSupport))
+                .persistNavigation(url: action.url, title: action.title.isEmpty ? nil : action.title)
+        }
+        let bridge = botBrowserBridge
+        let ensureGuest = botBrowserGuestEnsure(route: route, botID: botID, appSupport: appSupport)
+        // Guest provisioning (docker CLI) and child-process IO must never run
+        // on MainActor — hop to a utility queue and await the result.
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    try ensureGuest?()
+                    let payload = try bridge.perform(
+                        botID: botID,
+                        route: route,
+                        kind: action.kind,
+                        action: action.action,
+                        ref: action.ref,
+                        text: action.text,
+                        url: action.url,
+                        appSupport: appSupport
+                    )
+                    Self.persistBotBrowserBridgePageState(payload: payload, botID: botID, appSupport: appSupport)
+                    let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                    continuation.resume(returning: String(data: data, encoding: .utf8) ?? "{}")
+                } catch {
+                    continuation.resume(throwing: error)
+                }
             }
         }
-        return json
     }
 
     /// Drain MCP pending guest observe/act through the app-process Docker CLI.
@@ -6904,14 +6963,33 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    /// Drain MCP pending opens through the same `openBotBrowser` path tests drive.
+    /// Drain legacy MCP pending opens through the same `openBotBrowser`
+    /// bridge path tests drive. This lane has no result channel, so a
+    /// kind-refused or invalid open is skipped with an NSLog, never a surface.
     @discardableResult
     public func reconcileBotBrowserOpens() throws -> [BotBrowserTarget] {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
-        return try BotBrowserHost.applyPendingOpens(store: store) { botID, url, title in
-            try self.openBotBrowser(botID: botID, url: url, title: title)
+        var applied: [BotBrowserTarget] = []
+        for item in try store.takePendingOpens() {
+            guard let uuid = UUID(uuidString: item.botID) else { continue }
+            do {
+                applied.append(
+                    try openBotBrowser(
+                        botID: BotID(uuid),
+                        url: item.url,
+                        title: item.title.isEmpty ? nil : item.title
+                    )
+                )
+            } catch {
+                NSLog(
+                    "RemoteCode bot browser pending open skipped bot=%@ error=%@",
+                    item.botID,
+                    String(describing: error)
+                )
+            }
         }
+        return applied
     }
 
     /// Persist a per-surface agent thread binding into the surface descriptor

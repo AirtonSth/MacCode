@@ -517,6 +517,12 @@ public final class BotComputerDockerResolver: @unchecked Sendable {
         throw BotComputerDockerError.cliMissing
     }
 
+    /// Non-CLI executors (the bot Playwright guest bridge) share the CLI's
+    /// healthy-binary resolution instead of growing a second docker lookup.
+    public static func resolveSharedHealthyExecutable() throws -> String {
+        try shared.resolveHealthyExecutable()
+    }
+
     public func invalidate() {
         lock.lock()
         cachedExecutable = nil

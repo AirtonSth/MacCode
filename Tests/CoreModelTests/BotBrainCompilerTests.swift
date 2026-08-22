@@ -108,9 +108,9 @@ final class BotBrainCompilerTests: XCTestCase {
     }
 
     func test_desktopKindsAdmitDifferentTools_becauseTheOwnerPicksTheBrowser() {
-        // WHY: this Mac default browser must keep macos-harness. Bot browser
-        // must not send HID to the owner's Chrome. Docker must not fall back
-        // to this Mac.
+        // WHY: this-Mac bots keep macos-harness and the owner's Google Chrome
+        // — never bot_browser_*. Bot browser is the bot's own Playwright.
+        // Docker browses via Playwright inside its guest, never this Mac.
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
         func revision(_ kind: BotDesktopKind) -> BotRevision {
             BotRevision(
@@ -132,7 +132,10 @@ final class BotBrainCompilerTests: XCTestCase {
         }
         let host = BotBrainCompiler.assemble(bot: bot, revision: revision(.logicalExecutionSpace), userText: "Hi")
         XCTAssertTrue(host.compiledPayload.contains(BotStandingInstructions.macosHarnessTool))
-        XCTAssertTrue(host.compiledPayload.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertFalse(
+            host.compiledPayload.contains(BotStandingInstructions.openBrowserTool),
+            "an owner's-Chrome bot must not be taught refused bot_browser_* tools"
+        )
 
         let owned = BotBrainCompiler.assemble(bot: bot, revision: revision(.botOwnedBrowser), userText: "Hi")
         XCTAssertFalse(owned.compiledPayload.contains(BotStandingInstructions.macosHarnessTool))
@@ -141,7 +144,10 @@ final class BotBrainCompilerTests: XCTestCase {
 
         let docker = BotBrainCompiler.assemble(bot: bot, revision: revision(.dockerDesktop), userText: "Hi")
         XCTAssertFalse(docker.compiledPayload.contains(BotStandingInstructions.generatedMacOSHarnessLine))
-        XCTAssertFalse(docker.compiledPayload.contains(BotStandingInstructions.generatedBrowserLine))
+        XCTAssertTrue(
+            docker.compiledPayload.contains(BotStandingInstructions.generatedBrowserLine),
+            "a docker bot browses via bot_browser_* backed by Playwright inside its guest"
+        )
         XCTAssertTrue(docker.compiledPayload.contains(BotStandingInstructions.computerObserveTool))
         XCTAssertTrue(docker.compiledPayload.contains(BotDesktopKind.dockerDesktop.displayTitle))
     }
@@ -1048,7 +1054,10 @@ final class BotBrainCompilerTests: XCTestCase {
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "Remember this")
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.admittedToolsText))
-        XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.getBrowserTool))
+        XCTAssertFalse(
+            receipt.compiledPayload.contains(BotStandingInstructions.getBrowserTool),
+            "browse tools are desktop-gated; an owner's-Chrome bot admits none"
+        )
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .tools })?.included, true)

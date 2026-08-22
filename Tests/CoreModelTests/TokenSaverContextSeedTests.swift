@@ -77,6 +77,38 @@ final class TokenSaverContextSeedTests: XCTestCase {
         XCTAssertNil(empty, "no prior context must not invent an empty seed snapshot")
     }
 
+    func test_snapshotExcludesCurrentUserByMessageIdWhenContentDiffers() {
+        // WHY: Desk stores Human on the run-id user row while the provider
+        // prompt is the compiled envelope. Text equality would keep the
+        // current turn in the seed and duplicate it on Codex fresh fallback.
+        let thread = AgentThreadID()
+        let priorUser = AgentMessage(threadId: thread, role: .user, content: "first question")
+        let priorAssistant = AgentMessage(threadId: thread, role: .assistant, content: repeatingHuman)
+        let current = AgentMessage(
+            id: AgentMessageID(),
+            threadId: thread,
+            role: .user,
+            content: "teammate line"
+        )
+        let snapshot = try? XCTUnwrap(TokenSaverCanonicalConversationSnapshot.capture(
+            messages: [priorUser, priorAssistant, current],
+            persistedRCW1ByMessageId: [:],
+            excludingCurrentUserText: "compiled provider envelope",
+            excludingCurrentUserMessageId: current.id
+        ))
+        XCTAssertEqual(snapshot?.items.map(\.canonicalText), ["first question", repeatingHuman])
+        XCTAssertFalse(
+            snapshot?.items.contains(where: { $0.messageId == current.id.value.uuidString }) ?? true
+        )
+        let empty = TokenSaverCanonicalConversationSnapshot.capture(
+            messages: [current],
+            persistedRCW1ByMessageId: [:],
+            excludingCurrentUserText: "compiled provider envelope",
+            excludingCurrentUserMessageId: current.id
+        )
+        XCTAssertNil(empty, "excluding the only row by id must not invent a seed")
+    }
+
     func test_snapshotDigestChangesWhenPriorConversationChanges() throws {
         let thread = AgentThreadID()
         let user = AgentMessage(threadId: thread, role: .user, content: "q")

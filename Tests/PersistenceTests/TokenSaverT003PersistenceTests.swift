@@ -73,6 +73,82 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         XCTAssertEqual(try store.retrieve(capability: prepared.capability, scope: scope()), original)
     }
 
+    func test_markDeliveredBatch_rollsBackEveryMemberAndCanRetryAfterInjectedFailure() throws {
+        // WHY: one chunked provider payload can reference multiple stored
+        // originals. A partial terminal transition makes the ledger retry
+        // permanently fail and strands later handles in prepared state.
+        let store = TokenSaverScopedRecoveryStore(db: try makeDB())
+        let first = try store.prepare(
+            Data("first chunk original".utf8),
+            scope: scope(), operationID: "batch-first", expiresAt: nil, disk: disk
+        )
+        let second = try store.prepare(
+            Data("second chunk original".utf8),
+            scope: scope(), operationID: "batch-second", expiresAt: nil, disk: disk
+        )
+        let members = [first, second].map {
+            TokenSaverSemanticRecoveryMember(
+                capability: $0.capability,
+                idempotencyKey: $0.idempotencyKey
+            )
+        }
+
+        TokenSaverScopedRecoveryStore.testInjectFailureBetweenDeliveryMembers = true
+        defer { TokenSaverScopedRecoveryStore.testInjectFailureBetweenDeliveryMembers = false }
+        XCTAssertFalse(try store.markDeliveredBatch(
+            members,
+            scope: scope(),
+            outcome: .sentUnknown
+        ))
+        XCTAssertEqual(try store.outboxState(
+            capability: first.capability, scope: scope(), idempotencyKey: first.idempotencyKey
+        ), .prepared)
+        XCTAssertEqual(try store.outboxState(
+            capability: second.capability, scope: scope(), idempotencyKey: second.idempotencyKey
+        ), .prepared)
+
+        TokenSaverScopedRecoveryStore.testInjectFailureBetweenDeliveryMembers = false
+        XCTAssertTrue(try store.markDeliveredBatch(
+            members,
+            scope: scope(),
+            outcome: .sentUnknown
+        ), "a clean retry must deliver the complete set after rollback")
+        XCTAssertEqual(try store.outboxState(
+            capability: first.capability, scope: scope(), idempotencyKey: first.idempotencyKey
+        ), .delivered)
+        XCTAssertEqual(try store.outboxState(
+            capability: second.capability, scope: scope(), idempotencyKey: second.idempotencyKey
+        ), .delivered)
+
+        TokenSaverScopedRecoveryStore.testInjectFailureBetweenDeliveryMembers = true
+        XCTAssertTrue(try store.markDeliveredBatch(
+            members,
+            scope: scope(),
+            outcome: .sentUnknown
+        ), "a lost response must allow the exact already-delivered batch to retry")
+        XCTAssertFalse(try store.markDeliveredBatch(
+            members,
+            scope: scope(),
+            outcome: .acked
+        ), "retry idempotency must not authorize a different transport outcome")
+        XCTAssertEqual(try store.outboxState(
+            capability: first.capability, scope: scope(), idempotencyKey: first.idempotencyKey
+        ), .delivered)
+        XCTAssertEqual(try store.outboxState(
+            capability: second.capability, scope: scope(), idempotencyKey: second.idempotencyKey
+        ), .delivered)
+        XCTAssertTrue(try store.ack(
+            capability: first.capability,
+            scope: scope(),
+            idempotencyKey: first.idempotencyKey
+        ))
+        XCTAssertFalse(try store.markDeliveredBatch(
+            members,
+            scope: scope(),
+            outcome: .sentUnknown
+        ), "a mixed acked/delivered set is not the same homogeneous retry")
+    }
+
     func test_scopedStore_mintsCompactURLSafeCapabilityWithoutWeakeningRecovery() throws {
         // WHY: every lossy tool result pays this marker in provider context; keep the
         // bearer compact while retaining a full 128 bits of random capability material.

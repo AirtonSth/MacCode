@@ -106,7 +106,7 @@ final class WebSocketEventBatcherAdmissionTests: XCTestCase {
     func test_keyedReplacement_doesNotConsumeExtraCountSlot() {
         let lock = NSLock()
         var overflowCount = 0
-        // cellularSafe coalesces agent.item.delta by item_id (concat merge).
+        // cellularSafe coalesces agent.item.delta by thread_id + item_id.
         let batcher = WebSocketEventBatcher(
             enabled: true,
             filter: .cellularSafe(),
@@ -144,6 +144,115 @@ final class WebSocketEventBatcherAdmissionTests: XCTestCase {
         batcher.stop()
     }
 
+    func test_unscopedDeltasRemainSeparatedByNewTurnItemStart() throws {
+        // WHY: an adapter may reuse one item id in a later turn. Ordinary
+        // deltas lack turn_id, so the intervening item-start must remain a hard
+        // ordering fence through cellular batching.
+        let lock = NSLock()
+        var sent: [Data] = []
+        let batcher = WebSocketEventBatcher(
+            enabled: true,
+            filter: .cellularSafe(),
+            delay: 0.02,
+            maxPendingBytes: 1_000_000,
+            maxPendingCount: 100,
+            maxPendingAge: 60,
+            send: { data in
+                lock.withLock { sent.append(data) }
+            }
+        )
+        defer { batcher.stop() }
+
+        func frame(seq: Int64, kind: String, payload: [String: Any]) throws -> Data {
+            try JSONSerialization.data(withJSONObject: [
+                "type": "event",
+                "sequence": seq,
+                "kind": kind,
+                "payload": payload,
+            ])
+        }
+
+        let firstDelta = EventBus.Event(
+            seq: 1,
+            kind: "agent.item.delta",
+            payload: .object([
+                "thread_id": .string("thread-a"),
+                "item_id": .string("shared"),
+                "text": .string("A"),
+            ]),
+            ts: 0
+        )
+        let nextTurnStart = EventBus.Event(
+            seq: 2,
+            kind: "agent.item.started",
+            payload: .object([
+                "thread_id": .string("thread-a"),
+                "item": .object([
+                    "id": .string("shared"),
+                    "turnId": .string("turn-b"),
+                ]),
+            ]),
+            ts: 0
+        )
+        let secondDelta = EventBus.Event(
+            seq: 3,
+            kind: "agent.item.delta",
+            payload: .object([
+                "thread_id": .string("thread-a"),
+                "item_id": .string("shared"),
+                "text": .string("B"),
+            ]),
+            ts: 0
+        )
+        batcher.enqueue(
+            event: firstDelta,
+            data: try frame(
+                seq: 1,
+                kind: "agent.item.delta",
+                payload: ["thread_id": "thread-a", "item_id": "shared", "text": "A"]
+            )
+        )
+        batcher.enqueue(
+            event: nextTurnStart,
+            data: try frame(
+                seq: 2,
+                kind: "agent.item.started",
+                payload: [
+                    "thread_id": "thread-a",
+                    "item": ["id": "shared", "turnId": "turn-b"],
+                ]
+            )
+        )
+        batcher.enqueue(
+            event: secondDelta,
+            data: try frame(
+                seq: 3,
+                kind: "agent.item.delta",
+                payload: ["thread_id": "thread-a", "item_id": "shared", "text": "B"]
+            )
+        )
+
+        let deadline = Date().addingTimeInterval(1)
+        while Date() < deadline {
+            if lock.withLock({ sent.count }) == 3 { break }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        let delivered = lock.withLock { sent }
+        XCTAssertEqual(delivered.count, 3)
+        guard delivered.count == 3 else { return }
+        XCTAssertEqual(
+            delivered.compactMap { WebSocketOutboundQueue.eventSequence(in: $0) },
+            [1, 2, 3]
+        )
+        let deltaTexts = try [delivered[0], delivered[2]].map { frame -> String? in
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: frame) as? [String: Any]
+            )
+            return (object["payload"] as? [String: Any])?["text"] as? String
+        }
+        XCTAssertEqual(deltaTexts, ["A", "B"])
+    }
+
     private func makeEventFrame(kind: String, sequence: Int64, body: String) -> Data {
         let object: [String: Any] = [
             "type": "event",
@@ -164,6 +273,8 @@ final class WebSocketEventBatcherAdmissionTests: XCTestCase {
             "sequence": sequence,
             "kind": "agent.item.delta",
             "payload": [
+                "thread_id": "thread-count-delta",
+                "turn_id": "turn-count-delta",
                 "item_id": itemId,
                 "text": text,
             ],
@@ -173,6 +284,8 @@ final class WebSocketEventBatcherAdmissionTests: XCTestCase {
             seq: sequence,
             kind: "agent.item.delta",
             payload: .object([
+                "thread_id": .string("thread-count-delta"),
+                "turn_id": .string("turn-count-delta"),
                 "item_id": .string(itemId),
                 "text": .string(text),
             ]),

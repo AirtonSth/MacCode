@@ -4,9 +4,9 @@ import CoreModel
 import Persistence
 @testable import DistillCore
 
-/// End-to-end proof of the NATIVE CLI: runs the actually-built RemoteCodeDistillService
-/// binary in `cli` mode as a subprocess against a live in-process sidecar. Proves both
-/// the success path and the fail-open (no-data-loss) contract on the real artifact.
+/// End-to-end proof of the native CLI and PATH wrapper: runs the actually-built
+/// RemoteCodeDistillService against a live in-process sidecar. Proves both the
+/// success path and the fail-open (no-data-loss) contract on the real artifact.
 final class ManagedDistillCLISubprocessTests: XCTestCase {
     private func builtBinary() -> URL? {
         let cwd = FileManager.default.currentDirectoryPath
@@ -18,12 +18,38 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
-    func test_realCLIBinary_compressesViaSidecar_andFailsOpen() async throws {
+    func test_crossProvider_realCLIAndWrapperInvocationMatrix_receiptsOnlyForNetShrink() async throws {
         guard let binary = builtBinary() else {
             throw XCTSkip("RemoteCodeDistillService debug binary not built")
         }
 
-        let config = try DistillServiceConfiguration(authToken: "tok", appSupportDirectory: NSTemporaryDirectory())
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("managed-distill-matrix-\(UUID().uuidString)", isDirectory: true)
+        let supportURL = root.appendingPathComponent("support", isDirectory: true)
+        let managedBin = root.appendingPathComponent("managed", isDirectory: true)
+        let realBin = root.appendingPathComponent("real", isDirectory: true)
+        try FileManager.default.createDirectory(at: managedBin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: realBin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let distill = managedBin.appendingPathComponent("distill")
+        try FileManager.default.createSymbolicLink(at: distill, withDestinationURL: binary)
+        let wrapper = managedBin.appendingPathComponent("swift")
+        try FileManager.default.createSymbolicLink(at: wrapper, withDestinationURL: binary)
+        let realSwift = realBin.appendingPathComponent("swift")
+        try Data("#!/bin/sh\nexec /bin/cat \"$RC_WRAP_FIXTURE_PATH\"\n".utf8).write(to: realSwift)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: realSwift.path)
+
+        // WHY: the applied receipt and recovery handle are part of provider-visible
+        // output. A tiny PASS fixture no longer represents a real net saving.
+        let fixtureText = (1...320)
+            .map { "build passed stage=\($0) tests=48 failures=0 repeated local-only diagnostic output" }
+            .joined(separator: "\n") + "\n"
+        let fixture = Data(fixtureText.utf8)
+        let fixtureURL = root.appendingPathComponent("build.log")
+        try fixture.write(to: fixtureURL)
+
+        let config = try DistillServiceConfiguration(authToken: "tok", appSupportDirectory: supportURL.path)
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
         let server = DistillHTTPServer(
             configuration: config,
@@ -33,8 +59,6 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         let ready = try await server.start()
         defer { server.stop() }
 
-        let supportURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("managed-distill-live-\(UUID().uuidString)", isDirectory: true)
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: supportURL.path).run()
         let settings = SettingsStore(db: db)
         settings.update { $0.tokenSaverEnabled = true }
@@ -53,64 +77,128 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         let stateJSON: [String: Any] = [
             "base_url": ready.baseURL,
             "auth_token": "tok",
+            "receipt_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
             "pid": ready.pid,
         ]
         try JSONSerialization.data(withJSONObject: stateJSON).write(to: stateURL, options: .atomic)
-        defer { try? FileManager.default.removeItem(at: supportURL) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
 
-        let liveEnvironment = [
+        let baseEnvironment = [
             "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
             "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": supportURL.path,
-            "REMOTE_CODE_AGENT_PROVIDER": "codex",
             "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace-subprocess",
             "RC_TOKEN_SAVER_PROJECT_ID": "project-subprocess",
             "RC_TOKEN_SAVER_THREAD_ID": "thread-subprocess",
-            "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-subprocess"
+            "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-subprocess",
+            "RC_TOKEN_SAVER_ROOT_RUN_ID": "managed-distill-subprocess-root",
+            "RC_WRAP_FIXTURE_PATH": fixtureURL.path,
+            "PATH": "\(managedBin.path):\(realBin.path):/usr/bin:/bin",
         ]
+        let prompt = "Did the build pass? Return PASS or FAIL only."
+        let shell = URL(fileURLWithPath: "/bin/sh")
 
-        // Success: real binary compresses live tool output through the sidecar.
-        let ok = try runProcess(
-            binary,
-            ["cli", "Did the build pass? Return PASS or FAIL only."],
-            env: liveEnvironment,
-            stdin: "build passed\n0 failures"
-        )
-        XCTAssertEqual(ok.code, 0)
-        XCTAssertTrue(ok.out.contains("PASS"), "real CLI binary compressed via the live sidecar; got: \(ok.out)")
+        for provider in ["claude", "codex", "grok"] {
+            var environment = baseEnvironment
+            environment["REMOTE_CODE_AGENT_PROVIDER"] = provider
 
-        // Codex and Grok use the global PATH wrapper rather than Claude's
-        // PostToolUse hook. They still must discover an isolated workspace's
-        // lease from the shared app-support contract alone.
-        for provider in ["codex", "grok"] {
-            var providerEnvironment = liveEnvironment
-            providerEnvironment.removeValue(forKey: "REMOTE_CODE_DISTILL_STATE_PATH")
-            providerEnvironment["REMOTE_CODE_AGENT_PROVIDER"] = provider
-            let providerResult = try runProcess(
-                binary,
-                ["cli", "Did the build pass? Return PASS or FAIL only."],
-                env: providerEnvironment,
-                stdin: "build passed\n0 failures"
+            // Actual direct CLI dispatch: argv[0] is the `distill` symlink, with
+            // no synthetic leading `cli` argument.
+            let direct = try runProcessData(
+                distill,
+                [prompt],
+                env: environment,
+                stdin: fixture
             )
-            XCTAssertEqual(providerResult.code, 0, "\(provider) app-support lease lookup")
-            XCTAssertTrue(
-                providerResult.out.contains("PASS"),
-                "\(provider) must reach Distill without a Claude-only state override; got: \(providerResult.out)"
+            assertSingleAppliedReceiptAndNetShrink(direct, original: fixture, context: "\(provider) direct distill symlink")
+
+            // Actual shell topology requested by the product contract: Distill is
+            // the final pipe stage and receives the fixture through stdin.
+            let finalPipe = try runProcessData(
+                shell,
+                ["-c", #"cat "$1" | distill "$2""#, "sh", fixtureURL.path, prompt],
+                env: environment,
+                stdin: Data()
+            )
+            assertSingleAppliedReceiptAndNetShrink(finalPipe, original: fixture, context: "\(provider) cat fixture | distill")
+
+            // The shell must resolve the compressible command through the managed
+            // PATH symlink; only the fake real `swift` executable owns the fixture.
+            let globalWrapper = try runProcessData(
+                shell,
+                ["-c", "swift"],
+                env: environment,
+                removingEnv: ["REMOTE_CODE_DISTILL_STATE_PATH"],
+                stdin: Data()
+            )
+            assertSingleAppliedReceiptAndNetShrink(globalWrapper, original: fixture, context: "\(provider) global PATH wrapper")
+
+            // Explicit Distill remains opt-in even when the shell backgrounds the
+            // pipeline and redirects its final output to a regular user file.
+            let backgroundURL = root.appendingPathComponent("explicit-background-\(provider).txt")
+            let background = try runProcessData(
+                shell,
+                [
+                    "-c", #"cat "$1" | distill "$2" > "$3" & wait"#,
+                    "sh", fixtureURL.path, prompt, backgroundURL.path,
+                ],
+                env: environment,
+                stdin: Data()
+            )
+            let backgroundOutput = try Data(contentsOf: backgroundURL)
+            assertSingleAppliedReceiptAndNetShrink(
+                (backgroundOutput, background.code),
+                original: fixture,
+                context: "\(provider) explicit background redirect"
+            )
+
+            // A transparent global wrapper cannot reinterpret an ordinary user
+            // redirect as provider transport, including when provider=claude.
+            let redirectURL = root.appendingPathComponent("wrapper-user-redirect-\(provider).txt")
+            let redirect = try runProcessData(
+                shell,
+                ["-c", #"swift > "$1""#, "sh", redirectURL.path],
+                env: environment,
+                removingEnv: ["REMOTE_CODE_DISTILL_STATE_PATH"],
+                stdin: Data()
+            )
+            XCTAssertEqual(redirect.code, 0, "\(provider) ordinary wrapper redirect")
+            assertByteExactWithoutAppliedReceipt(
+                try Data(contentsOf: redirectURL),
+                original: fixture,
+                context: "\(provider) ordinary wrapper redirect"
+            )
+        }
+
+        // A pre-v2 state file still decodes and keeps the CLI usable, but cannot
+        // authorize a lossy replacement. Every provider must receive exact raw bytes.
+        try JSONSerialization.data(withJSONObject: [
+            "base_url": ready.baseURL,
+            "auth_token": "tok",
+            "pid": ready.pid,
+        ]).write(to: stateURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
+        for provider in ["claude", "codex", "grok"] {
+            var environment = baseEnvironment
+            environment["REMOTE_CODE_AGENT_PROVIDER"] = provider
+            let legacy = try runProcessData(distill, [prompt], env: environment, stdin: fixture)
+            XCTAssertEqual(legacy.code, 0, "\(provider) legacy state")
+            assertByteExactWithoutAppliedReceipt(
+                legacy.out,
+                original: fixture,
+                context: "\(provider) legacy state without receipt authority"
             )
         }
 
         // A stale env + state + installed symlink cannot override the live paid
         // setting. No request reaches the still-running sidecar.
         settings.update { $0.tokenSaverEnabled = false }
-        let staleSymlink = supportURL.appendingPathComponent("stale-distill-link")
-        try FileManager.default.createSymbolicLink(at: staleSymlink, withDestinationURL: binary)
-        let off = try runProcess(
-            staleSymlink,
-            ["cli", "compress this"],
-            env: liveEnvironment,
-            stdin: "OFF BYTES MUST SURVIVE"
-        )
-        XCTAssertEqual(off.code, 0)
-        XCTAssertEqual(off.out, "OFF BYTES MUST SURVIVE")
+        for provider in ["claude", "codex", "grok"] {
+            var environment = baseEnvironment
+            environment["REMOTE_CODE_AGENT_PROVIDER"] = provider
+            let off = try runProcessData(distill, [prompt], env: environment, stdin: fixture)
+            XCTAssertEqual(off.code, 0, "\(provider) Token Saver Off")
+            assertByteExactWithoutAppliedReceipt(off.out, original: fixture, context: "\(provider) Token Saver Off")
+        }
 
         // Entitlement is part of live admission, not merely the user's toggle.
         settings.update { $0.tokenSaverEnabled = true }
@@ -118,14 +206,13 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             "private.account.session",
             #"{"user":{"subscribed":false}}"#
         )
-        let unsubscribed = try runProcess(
-            binary,
-            ["cli", "compress this"],
-            env: liveEnvironment,
-            stdin: "UNSUBSCRIBED BYTES MUST SURVIVE"
-        )
-        XCTAssertEqual(unsubscribed.code, 0)
-        XCTAssertEqual(unsubscribed.out, "UNSUBSCRIBED BYTES MUST SURVIVE")
+        for provider in ["claude", "codex", "grok"] {
+            var environment = baseEnvironment
+            environment["REMOTE_CODE_AGENT_PROVIDER"] = provider
+            let unsubscribed = try runProcessData(distill, [prompt], env: environment, stdin: fixture)
+            XCTAssertEqual(unsubscribed.code, 0, "\(provider) unsubscribed")
+            assertByteExactWithoutAppliedReceipt(unsubscribed.out, original: fixture, context: "\(provider) unsubscribed")
+        }
 
         // Teardown removes the live lease before the sidecar exits. Even with
         // enabled+subscribed DB state and stale inherited env, the CLI stays raw.
@@ -134,28 +221,34 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             #"{"user":{"subscribed":true}}"#
         )
         try FileManager.default.removeItem(at: stateURL)
-        let teardown = try runProcess(
-            binary,
-            ["cli", "compress this"],
-            env: liveEnvironment,
-            stdin: "TEARDOWN BYTES MUST SURVIVE"
-        )
-        XCTAssertEqual(teardown.code, 0)
-        XCTAssertEqual(teardown.out, "TEARDOWN BYTES MUST SURVIVE")
+        for provider in ["claude", "codex", "grok"] {
+            var environment = baseEnvironment
+            environment["REMOTE_CODE_AGENT_PROVIDER"] = provider
+            let teardown = try runProcessData(distill, [prompt], env: environment, stdin: fixture)
+            XCTAssertEqual(teardown.code, 0, "\(provider) lease teardown")
+            assertByteExactWithoutAppliedReceipt(teardown.out, original: fixture, context: "\(provider) lease teardown")
+        }
 
         // Fail-open: point at a non-existent state file (no service) => exact
         // raw stdin, exit 0. This is the data-loss bug the Python CLI had.
-        let failOpen = try runProcess(
-            binary,
-            ["cli", "compress this"],
-            env: [
-                "REMOTE_CODE_DISTILL_STATE_PATH": "/nonexistent/\(UUID().uuidString).json",
-                "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": supportURL.path,
-            ],
-            stdin: "RAW DATA MUST SURVIVE"
-        )
-        XCTAssertEqual(failOpen.code, 0, "fail-open exits 0")
-        XCTAssertEqual(failOpen.out, "RAW DATA MUST SURVIVE", "no service => raw stdin echoed verbatim, never lost")
+        for provider in ["claude", "codex", "grok"] {
+            let failOpen = try runProcessData(
+                distill,
+                [prompt],
+                env: [
+                    "REMOTE_CODE_AGENT_PROVIDER": provider,
+                    "REMOTE_CODE_DISTILL_STATE_PATH": "/nonexistent/\(UUID().uuidString).json",
+                    "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": supportURL.path,
+                ],
+                stdin: fixture
+            )
+            XCTAssertEqual(failOpen.code, 0, "\(provider) fail-open exits 0")
+            assertByteExactWithoutAppliedReceipt(
+                failOpen.out,
+                original: fixture,
+                context: "\(provider) missing service"
+            )
+        }
     }
 
     func test_realWrapper_claudeTaskCapture_preservesExactOriginalWithAndWithoutTerminalLF() async throws {
@@ -209,8 +302,10 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: [
             "base_url": ready.baseURL,
             "auth_token": "tok",
+            "receipt_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
             "pid": ready.pid,
         ]).write(to: stateURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
 
         let workspaceCaptureID = "-wrapper-byte-exact-\(UUID().uuidString)"
         let sessionID = UUID().uuidString
@@ -237,6 +332,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
             "RC_TOKEN_SAVER_PROJECT_ID": "project-wrapper",
             "RC_TOKEN_SAVER_THREAD_ID": "thread-wrapper",
             "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-wrapper",
+            "RC_TOKEN_SAVER_ROOT_RUN_ID": "managed-wrapper-subprocess-root",
         ]
 
         for hasTerminalLF in [false, true] {
@@ -290,31 +386,79 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         return String(output[marker.upperBound..<end.lowerBound])
     }
 
-    private func runProcess(_ url: URL, _ args: [String], env: [String: String], stdin: String) throws -> (out: String, code: Int32) {
-        let process = Process()
-        process.executableURL = url
-        process.arguments = args
-        var environment = ProcessInfo.processInfo.environment
-        for (key, value) in env { environment[key] = value }
-        process.environment = environment
+    private static let strictAppliedReceiptLineRegex = try! NSRegularExpression(
+        pattern: #"(?m)^\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]\r?$"#
+    )
 
-        let inPipe = Pipe()
-        let outPipe = Pipe()
-        process.standardInput = inPipe
-        process.standardOutput = outPipe
-        process.standardError = Pipe()
-        try process.run()
-        inPipe.fileHandleForWriting.write(Data(stdin.utf8))
-        inPipe.fileHandleForWriting.closeFile()
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return (String(decoding: data, as: UTF8.self), process.terminationStatus)
+    private func assertSingleAppliedReceiptAndNetShrink(
+        _ result: (out: Data, code: Int32),
+        original: Data,
+        context: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let emitted = String(decoding: result.out, as: UTF8.self)
+        let range = NSRange(emitted.startIndex..<emitted.endIndex, in: emitted)
+        XCTAssertEqual(result.code, 0, "\(context) exit", file: file, line: line)
+        XCTAssertTrue(
+            DistillAppliedReceipt.containsMarker(emitted),
+            "\(context) must end in one strict applied receipt; got: \(emitted)",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            Self.strictAppliedReceiptLineRegex.numberOfMatches(in: emitted, range: range),
+            1,
+            "\(context) must emit exactly one strict applied receipt",
+            file: file,
+            line: line
+        )
+        XCTAssertTrue(
+            DistillAppliedReceipt.strip(emitted).lowercased().contains("pass"),
+            "\(context) must preserve the fixture's passing verdict, not emit receipt-only output",
+            file: file,
+            line: line
+        )
+        XCTAssertLessThan(
+            result.out.count,
+            original.count,
+            "\(context) must shrink after receipt and recovery metadata",
+            file: file,
+            line: line
+        )
+        XCTAssertNotEqual(result.out, original, "\(context) must replace bytes", file: file, line: line)
+    }
+
+    private func assertByteExactWithoutAppliedReceipt(
+        _ output: Data,
+        original: Data,
+        context: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let emitted = String(decoding: output, as: UTF8.self)
+        let range = NSRange(emitted.startIndex..<emitted.endIndex, in: emitted)
+        XCTAssertEqual(output, original, "\(context) must remain byte-exact", file: file, line: line)
+        XCTAssertFalse(
+            DistillAppliedReceipt.containsMarker(emitted),
+            "\(context) must not claim applied distillation",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            Self.strictAppliedReceiptLineRegex.numberOfMatches(in: emitted, range: range),
+            0,
+            "\(context) must contain no strict applied receipt",
+            file: file,
+            line: line
+        )
     }
 
     private func runProcessData(
         _ url: URL,
         _ args: [String],
         env: [String: String],
+        removingEnv: Set<String> = [],
         stdin: Data
     ) throws -> (out: Data, code: Int32) {
         let process = Process()
@@ -322,6 +466,7 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         process.arguments = args
         var environment = ProcessInfo.processInfo.environment
         for (key, value) in env { environment[key] = value }
+        for key in removingEnv { environment.removeValue(forKey: key) }
         process.environment = environment
 
         let inPipe = Pipe()

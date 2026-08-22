@@ -34,7 +34,7 @@ public struct ManagedBotBrowserMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "This bot's own browser. Website data persist per bot. Wait for the user to finish login.",
+                "instructions": "This bot's own Playwright browser. Website data persist per bot. Never a RemoteCode in-app browser tab. Wait for the user to finish login.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": BotBrowserCatalog.toolCatalog()])

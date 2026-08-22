@@ -51,4 +51,24 @@ final class RetrieveHandleSanitizerTests: XCTestCase {
         XCTAssertEqual(RetrieveHandleSanitizer.strip(text), text)
         XCTAssertFalse(RetrieveHandleSanitizer.containsHandle(text))
     }
+
+    func test_containsScopedHandleAcceptsCompactAndLegacyCapabilities() {
+        let compact = "[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"
+        let legacy = "[[rc:rcv1.90a43e12-9e4b-49a4-99de-ab3cb929fa2d.2f1df7dc-ca87-474a-80d2-4cf886a1855d59c9c425-5f72-4455-b6e1-d196a2b84f40]]"
+
+        XCTAssertTrue(RetrieveHandleSanitizer.containsScopedHandle("x \(compact) y"))
+        XCTAssertTrue(RetrieveHandleSanitizer.containsScopedHandle(legacy))
+    }
+
+    func test_containsScopedHandleRejectsRawHexAndMalformedCapabilities() {
+        // WHY: raw legacy handles and arbitrary rc syntax may still need display
+        // sanitization, but cannot truthfully support a scoped-retrieval badge.
+        XCTAssertFalse(RetrieveHandleSanitizer.containsScopedHandle("[[rc:deadbeef]]"))
+        XCTAssertFalse(
+            RetrieveHandleSanitizer.containsScopedHandle(
+                "[[rc:rcv1.not-a-uuid.not-a-secret]]"
+            )
+        )
+        XCTAssertFalse(RetrieveHandleSanitizer.containsScopedHandle("no handle here"))
+    }
 }

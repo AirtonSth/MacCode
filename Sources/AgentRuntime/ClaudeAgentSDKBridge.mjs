@@ -2,7 +2,7 @@ import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk'
 import * as claudeSDK from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { execFile, execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -66,6 +66,79 @@ const TOKEN_SAVER_MIN_LINES = 10;
 const TOKEN_SAVER_STORE_MIN_BYTES = 2048;
 // Nested large Read/Grep + sidecar RTT; 1s caused silent fail-open / zero model-mode.
 const TOKEN_SAVER_HOOK_TIMEOUT_MS = 45000;
+
+function tokenSaverAppliedReceipt(prefix, state) {
+  const rootRunID = typeof current.env.RC_TOKEN_SAVER_ROOT_RUN_ID === 'string'
+    ? current.env.RC_TOKEN_SAVER_ROOT_RUN_ID.trim()
+    : '';
+  const key = Buffer.isBuffer(state?.receiptKey) ? state.receiptKey : null;
+  if (!rootRunID || !key || key.length !== 32) {
+    return null;
+  }
+  const payload = Buffer.from(prefix, 'utf8');
+  const nonce = randomBytes(16);
+  const fields = [
+    Buffer.from('io.remotecode.distill-applied-receipt', 'utf8'),
+    Buffer.from('v2', 'utf8'),
+    Buffer.from(rootRunID, 'utf8'),
+    Buffer.from(String(payload.length), 'utf8'),
+    createHash('sha256').update(payload).digest(),
+    nonce,
+  ];
+  const canonical = [];
+  for (const field of fields) {
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64BE(BigInt(field.length));
+    canonical.push(length, field);
+  }
+  const mac = createHmac('sha256', key).update(Buffer.concat(canonical)).digest();
+  return `[[rcd:v2.${nonce.toString('base64url')}.${mac.toString('base64url')}]]`;
+}
+
+const TOKEN_SAVER_MEDIA_BLOCK_TYPES = new Set([
+  'image',
+  'inputimage',
+  'outputimage',
+  'screenshot',
+  'media',
+  'audio',
+  'video',
+]);
+const TOKEN_SAVER_MEDIA_KEYS = new Set([
+  'image',
+  'image_url',
+  'imageUrl',
+  'screenshot',
+  'media',
+  'media_url',
+  'mediaUrl',
+  'audio',
+  'video',
+]);
+const TOKEN_SAVER_MEDIA_MIME_KEYS = new Set(['media_type', 'mediaType', 'mime_type', 'mimeType']);
+
+function tokenSaverToolResponseContainsMedia(value, seen = new Set()) {
+  if (value == null) return false;
+  if (typeof value === 'string') {
+    return value.length >= 64
+      && (value.includes('/9j/') || value.includes('iVBOR') || value.includes('data:image/'));
+  }
+  if (typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((item) => tokenSaverToolResponseContainsMedia(item, seen));
+  if (value.isImage === true || value.is_image === true) return true;
+  if (typeof value.type === 'string'
+      && TOKEN_SAVER_MEDIA_BLOCK_TYPES.has(normalizeToolName(value.type))) return true;
+  for (const key of TOKEN_SAVER_MEDIA_MIME_KEYS) {
+    if (typeof value[key] === 'string' && /^(image|audio|video)\//i.test(value[key])) return true;
+  }
+  for (const key of TOKEN_SAVER_MEDIA_KEYS) {
+    if (value[key] != null) return true;
+  }
+  if (typeof value.data === 'string' && tokenSaverToolResponseContainsMedia(value.data)) return true;
+  return Object.values(value).some((nested) => tokenSaverToolResponseContainsMedia(nested, seen));
+}
 // Edit echoes + Skill bodies stay full (verbatim edits / complete skills).
 // Read/Grep are compressed with reversible [[rc:handle]] so large exploration
 // reaches the ledger (previously excluded → near-zero PTU savings on advisors).
@@ -360,9 +433,27 @@ function loadTokenSaverState() {
   const candidates = override ? [override] : [];
   for (const candidate of candidates) {
     try {
+      const stat = fs.statSync(candidate);
+      const currentUID = typeof process.getuid === 'function' ? process.getuid() : null;
+      if (typeof stat?.isFile !== 'function'
+          || !stat.isFile()
+          || currentUID === null
+          || stat.uid !== currentUID
+          || !Number.isInteger(stat.mode)
+          || (stat.mode & 0o077) !== 0) {
+        continue;
+      }
       const parsed = JSON.parse(fs.readFileSync(candidate, 'utf8'));
       if (parsed.base_url && parsed.auth_token) {
-        return { baseURL: String(parsed.base_url), authToken: String(parsed.auth_token) };
+        const receiptKeyText = typeof parsed.receipt_key === 'string' ? parsed.receipt_key : '';
+        const receiptKey = /^[A-Za-z0-9+/]{43}=$/.test(receiptKeyText)
+          ? Buffer.from(receiptKeyText, 'base64')
+          : null;
+        return {
+          baseURL: String(parsed.base_url),
+          authToken: String(parsed.auth_token),
+          receiptKey: receiptKey?.length === 32 ? receiptKey : null,
+        };
       }
     } catch (_) {
       // fail open
@@ -390,7 +481,7 @@ function tokenSaverRecoveryHeaders(env) {
   return headers;
 }
 
-async function postTokenSaverDistill(state, body) {
+async function postTokenSaverRequest(state, body, extraHeaders = {}) {
   if (typeof fetch !== 'function') return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TOKEN_SAVER_HOOK_TIMEOUT_MS);
@@ -400,6 +491,7 @@ async function postTokenSaverDistill(state, body) {
       authorization: `Bearer ${state.authToken}`,
       'content-type': 'application/json',
       ...tokenSaverRecoveryHeaders(current.env),
+      ...extraHeaders,
       'X-RemoteCode-Invocation-ID': invocationID,
       'X-RemoteCode-Operation-ID': `ptuhook1.${invocationID}`,
     };
@@ -411,24 +503,7 @@ async function postTokenSaverDistill(state, body) {
     });
     if (!response.ok) return null;
     const decoded = await response.json();
-    if (typeof decoded.output !== 'string') return null;
-    // Preserve store-before-loss recoverability: the agent must see [[rc:handle]]
-    // when the sidecar stored the original (AGENTS.md).
-    let output = decoded.output;
-    const handle = (typeof decoded.originalHandle === 'string' && decoded.originalHandle.trim())
-      || (typeof decoded.original_handle === 'string' && decoded.original_handle.trim())
-      || '';
-    if (handle && !output.includes(`[[rc:${handle}]]`)) {
-      // Append only when the marker-inclusive payload is still a net shrink.
-      // Otherwise return null so the hook fails open without replacing tool output
-      // (and without leaving the agent on a lossy body it never chose).
-      const withMarker = `${output}\n[[rc:${handle}]]`;
-      if (withMarker.length >= (body && body.input ? String(body.input).length : withMarker.length + 1)) {
-        return null;
-      }
-      output = withMarker;
-    }
-    return output;
+    return decoded;
   } catch (_) {
     return null;
   } finally {
@@ -436,15 +511,78 @@ async function postTokenSaverDistill(state, body) {
   }
 }
 
+async function postTokenSaverDistill(state, body) {
+  const decoded = await postTokenSaverRequest(state, body, {
+    'X-RemoteCode-Delivery-Deferred': '1',
+  });
+  if (!decoded || typeof decoded.output !== 'string') return null;
+  try {
+    const input = body && typeof body.input === 'string' ? body.input : '';
+    const routeStage = decoded.routeStage ?? decoded.route_stage;
+    if (!input || routeStage === 'verbatim' || decoded.output === input) return null;
+    // Preserve store-before-loss recoverability: the agent must see [[rc:handle]]
+    // when the sidecar stored the original (AGENTS.md).
+    let output = decoded.output;
+    const handle = (typeof decoded.originalHandle === 'string' && decoded.originalHandle.trim())
+      || (typeof decoded.original_handle === 'string' && decoded.original_handle.trim())
+      || '';
+    if (handle && !output.includes(`[[rc:${handle}]]`)) {
+      output = `${output}\n[[rc:${handle}]]`;
+    }
+    // A distinct applied receipt drives the persisted Distilled badge. Command
+    // syntax is not proof: an explicit pipe can fail open and return raw bytes.
+    const receiptPrefix = `${output}\n`;
+    const receipt = tokenSaverAppliedReceipt(receiptPrefix, state);
+    if (!receipt) return null;
+    const withReceipt = `${receiptPrefix}${receipt}`;
+    if (Buffer.byteLength(withReceipt, 'utf8') >= Buffer.byteLength(input, 'utf8')) return null;
+    const capability = handle;
+    const idempotencyKey = (typeof decoded.recoveryIdempotencyKey === 'string'
+      && decoded.recoveryIdempotencyKey.trim())
+      || (typeof decoded.recovery_idempotency_key === 'string'
+        && decoded.recovery_idempotency_key.trim())
+      || '';
+    const recoveryConfirmations = capability && idempotencyKey
+      ? [{ capability, idempotencyKey }]
+      : [];
+    return { output: withReceipt, routeStage, recoveryConfirmations };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function bestEffortRecordTokenSaverSavings(
+  state,
+  candidate,
+  delivered,
+  routeStage,
+  recoveryConfirmations
+) {
+  if (!delivered || delivered === candidate.input) return;
+  await postTokenSaverRequest(state, {
+    ...candidate,
+    id: randomUUID(),
+    recordSavings: true,
+    precomputedOutput: delivered,
+    precomputedRouteStage: routeStage,
+    precomputedRecoveryConfirmations: recoveryConfirmations?.length
+      ? recoveryConfirmations
+      : undefined,
+  });
+}
+
 async function tokenSaverPostToolUse(input) {
   if (current.env.RC_TOKEN_SAVER_POST_TOOL_USE !== '1') return {};
   if (!input || input.hook_event_name !== 'PostToolUse') return {};
+  // Text extraction flattens mixed content; replacing the response would drop
+  // image/media bytes and incorrectly mint a persisted Distilled receipt.
+  if (tokenSaverToolResponseContainsMedia(input.tool_response)) return {};
   const rawOutput = extractToolOutputText(input.tool_response);
   const decision = tokenSaverToolDecision(input.tool_name, input.tool_input, rawOutput);
   if (!decision.shouldCompress) return {};
   const state = loadTokenSaverState();
   if (!state) return {};
-  const output = await postTokenSaverDistill(state, {
+  const candidate = {
     // The sidecar's DistillRequest requires a UUID `id`; without it the POST is
     // rejected 400 and this hook fails open silently — recording zero Token Saver
     // savings for Claude. Always send one so tool-output distillation is counted.
@@ -454,21 +592,21 @@ async function tokenSaverPostToolUse(input) {
     input: rawOutput,
     question: tokenSaverContractQuestion(input.tool_name, input.tool_input, decision.profile),
     provider: current.env.REMOTE_CODE_AGENT_PROVIDER || 'claude',
-    // Savings are measured on the sidecar for the compressed body (before the
-    // client appends [[rc:handle]]). We only apply the replacement when the
-    // marker-inclusive output is still shorter than raw, so the common path is
-    // honest; rare edge cases where the marker tips length are fail-open.
-    recordSavings: true,
+    // Candidate compression is never delivery proof. A separate precomputed-output
+    // request records only the exact receipt/handle-inclusive replacement below.
+    recordSavings: false,
     runMode: 'optimize',
     maxOutputCharacters: Math.max(512, Math.min(rawOutput.length, 48000)),
     cacheState: 'tool_output_hooked',
     reversibleStoreMinBytes: TOKEN_SAVER_STORE_MIN_BYTES,
-  });
-  if (!output || output.length >= rawOutput.length) return {};
+  };
+  const compressed = await postTokenSaverDistill(state, candidate);
+  const output = compressed && compressed.output;
+  if (!output || Buffer.byteLength(output, 'utf8') >= Buffer.byteLength(rawOutput, 'utf8')) return {};
   const replaced = replaceToolOutputText(input.tool_response, output);
   // SDK: updatedToolOutput works for built-in tools; updatedMCPToolOutput is
   // MCP-only. Set both so eligible non-Bash output is replaced in either lane.
-  return {
+  const hookOutput = {
     continue: true,
     hookSpecificOutput: {
       hookEventName: 'PostToolUse',
@@ -476,6 +614,18 @@ async function tokenSaverPostToolUse(input) {
       updatedMCPToolOutput: replaced,
     },
   };
+  // The bridge is long-lived, so the best-effort ledger write can run after the
+  // replacement has cleared every gate without delaying Claude's hook response.
+  setImmediate(() => {
+    void bestEffortRecordTokenSaverSavings(
+      state,
+      candidate,
+      output,
+      compressed.routeStage,
+      compressed.recoveryConfirmations
+    );
+  });
+  return hookOutput;
 }
 
 function tokenSaverHooks() {

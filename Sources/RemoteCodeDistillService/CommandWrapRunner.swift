@@ -96,9 +96,13 @@ enum CommandWrapRunner {
         case .compress:
             let query = CommandWrapPolicy.extractionQuery(forCommand: command)
             let (bytes, deferred) = await compressedOrRaw(captured.stdout, query: query, compress: compress)
-            // Write stdout first; caller awaits deferred only after this returns.
-            _ = GuardedStdoutWrite.writeAll(bytes)
-            return (captured.exitCode, deferred)
+            // The deferred ledger work is valid only when the complete payload
+            // reached the consumer. EPIPE/partial delivery must not claim savings.
+            let deliveredDeferred = GuardedStdoutWrite.deliveredValue(
+                deferred,
+                afterWriting: bytes
+            )
+            return (captured.exitCode, deliveredDeferred)
         }
     }
 

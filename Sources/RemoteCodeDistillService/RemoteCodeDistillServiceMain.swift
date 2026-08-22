@@ -41,7 +41,7 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
         let stateURL = URL(fileURLWithPath: statePath).standardizedFileURL
         guard stateURL.lastPathComponent == "DistillCLIState.json",
               stateURL.deletingLastPathComponent().lastPathComponent == "Distill",
-              Self.isOwnedRegularFile(stateURL),
+              Self.isOwnedRegularFile(stateURL, requiresOwnerOnlyPermissions: true),
               let lease = Self.readLease(stateURL),
               lease.baseURL == state.baseURL,
               lease.authToken == state.authToken,
@@ -92,7 +92,7 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
 
     func isAdmitted() -> Bool {
         let now = Date()
-        guard Self.isOwnedRegularFile(stateURL),
+        guard Self.isOwnedRegularFile(stateURL, requiresOwnerOnlyPermissions: true),
               let lease = Self.readLease(stateURL),
               lease.authToken == expectedAuthToken,
               lease.pid == expectedPID,
@@ -159,13 +159,21 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
         return true
     }
 
-    private static func isOwnedRegularFile(_ url: URL) -> Bool {
+    private static func isOwnedRegularFile(
+        _ url: URL,
+        requiresOwnerOnlyPermissions: Bool = false
+    ) -> Bool {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               attributes[.type] as? FileAttributeType == .typeRegular,
               let owner = attributes[.ownerAccountID] as? NSNumber else {
             return false
         }
-        return owner.uint32Value == getuid()
+        guard owner.uint32Value == getuid() else { return false }
+        if requiresOwnerOnlyPermissions {
+            guard let permissions = attributes[.posixPermissions] as? NSNumber else { return false }
+            return permissions.uint16Value & 0o077 == 0
+        }
+        return true
     }
 
     private static func processIsAlive(_ pid: Int32) -> Bool {
@@ -366,7 +374,8 @@ struct RemoteCodeDistillServiceMain {
                         engine: record.routeStage?.rawValue ?? "unknown",
                         attributability: record.attributability,
                         delivered: record.delivered,
-                        threadID: record.threadID
+                        threadID: record.threadID,
+                        idempotencyKey: record.idempotencyKey
                     )
                 } catch {
                     FileHandle.standardError.write(Data("RemoteCodeDistillService savings record failed: \(error)\n".utf8))
@@ -465,6 +474,7 @@ struct RemoteCodeDistillServiceMain {
             arguments: arguments,
             stdin: stdin,
             state: loadedState?.state,
+            rootRunID: env["RC_TOKEN_SAVER_ROOT_RUN_ID"],
             provider: provider,
             recoveryContext: recoveryContext,
             maxOutputCharacters: maxChars,
@@ -483,9 +493,11 @@ struct RemoteCodeDistillServiceMain {
         // Flush stdout before any deferred Wave A ledger POST so the pipe
         // consumer never waits on the sidecar RTT for already-compressed bytes.
         let result = await cli.runResult()
-        FileHandle.standardOutput.write(result.stdout)
-        try? FileHandle.standardOutput.synchronize()
-        if let deferred = result.deferredSideEffect {
+        let deliveredDeferred = GuardedStdoutWrite.deliveredValue(
+            result.deferredSideEffect,
+            afterWriting: result.stdout
+        )
+        if let deferred = deliveredDeferred {
             await deferred()
         }
         Darwin.exit(result.exitCode)
@@ -623,6 +635,7 @@ struct RemoteCodeDistillServiceMain {
                 arguments: query.map { [$0] } ?? [],
                 stdin: captured,
                 state: loadedState?.state,
+                rootRunID: env["RC_TOKEN_SAVER_ROOT_RUN_ID"],
                 provider: provider,
                 recoveryContext: recoveryContext,
                 maxOutputCharacters: maxChars,
@@ -712,6 +725,9 @@ struct RemoteCodeDistillServiceMain {
                 request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 applyRecoveryHeaders(to: &request, environment: environment)
+                if distillRequest.precomputedOutput == nil {
+                    request.setValue("1", forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred")
+                }
                 mcpCodecLock.lock()
                 request.httpBody = try? mcpSortedEncoder.encode(distillRequest)
                 mcpCodecLock.unlock()
@@ -755,11 +771,21 @@ struct RemoteCodeDistillServiceMain {
                 }
                 return (obj["envelope"] as? String) ?? (obj["text"] as? String)
             },
-            scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment)
+            scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment),
+            rootRunID: environment["RC_TOKEN_SAVER_ROOT_RUN_ID"],
+            receiptKey: state?.receiptKey,
+            distillAdmission: { admission?.isAdmitted() == true }
         )
         while let line = readLine(strippingNewline: true) {
-            if let response = await server.handle(line) {
-                FileHandle.standardOutput.write(Data((response + "\n").utf8))
+            let result = await server.handleForDelivery(line)
+            if let response = result.response {
+                let deliveredDeferred = GuardedStdoutWrite.deliveredValue(
+                    result.deferredSideEffect,
+                    afterWriting: Data((response + "\n").utf8)
+                )
+                if let deferred = deliveredDeferred {
+                    await deferred()
+                }
             }
         }
     }
@@ -885,7 +911,11 @@ struct RemoteCodeDistillServiceMain {
                 continue
             }
             return LoadedCLIState(
-                state: ManagedDistillCLI.State(baseURL: baseURL, authToken: token),
+                state: ManagedDistillCLI.State(
+                    baseURL: baseURL,
+                    authToken: token,
+                    receiptKey: DistillAppliedReceipt.decodeReceiptKey(obj["receipt_key"] as? String)
+                ),
                 path: path
             )
         }
@@ -990,6 +1020,24 @@ private struct SidecarScopedRecoveryStore: TokenSaverScopedRecoveryStoring {
             capability: capability,
             scope: scope(context),
             idempotencyKey: idempotencyKey,
+            outcome: mapped
+        )
+    }
+
+    func markDeliveredBatch(
+        confirmations: [DistillRecoveryDeliveryConfirmation],
+        context: TokenSaverRecoveryRequestContext,
+        outcome: TokenSaverScopedDeliveryOutcome
+    ) throws -> Bool {
+        let mapped = TokenSaverRecoveryTransportOutcome(rawValue: outcome.rawValue) ?? .failed
+        return try store.markDeliveredBatch(
+            confirmations.map {
+                TokenSaverSemanticRecoveryMember(
+                    capability: $0.capability,
+                    idempotencyKey: $0.idempotencyKey
+                )
+            },
+            scope: scope(context),
             outcome: mapped
         )
     }

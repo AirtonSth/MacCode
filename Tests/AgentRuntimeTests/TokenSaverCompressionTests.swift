@@ -1831,13 +1831,32 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertEqual(translation.rewrittenText, rendered)
     }
 
-    func test_finalAssistantHandleMarkerIsStrippedBeforePersistenceAndTurnCompletedDisplay() async throws {
+    func test_finalAssistantMarkersAreStrippedBeforePersistenceAndTurnCompletedDisplay() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-ts-final-handle-strip-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
-        let final = "Build passed. Full raw output available.\n[[rc:deadbeef]]"
+        let runID = AgentRunID()
+        let receiptKey = Data((0..<32).map(UInt8.init))
+        let receiptPrefix = Data("Build passed. Full raw output available.\n[[rc:deadbeef]]\n".utf8)
+        let receipt = try XCTUnwrap(DistillAppliedReceipt.makeV2Marker(
+            rootRunID: runID.value.uuidString,
+            payload: receiptPrefix,
+            key: receiptKey,
+            nonce: Data(repeating: 0x42, count: 16)
+        ))
+        let final = String(decoding: receiptPrefix, as: UTF8.self) + receipt
+        let stateURL = URL(fileURLWithPath: tmp, isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+        let state = try JSONSerialization.data(withJSONObject: [
+            "base_url": "http://127.0.0.1:1",
+            "auth_token": "test-token",
+            "receipt_key": try XCTUnwrap(DistillAppliedReceipt.encodeReceiptKey(receiptKey)),
+            "pid": ProcessInfo.processInfo.processIdentifier,
+        ], options: [.sortedKeys])
+        try state.write(to: stateURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
         let runner = ScriptedFinalRunner(provider: .codex, finalMessage: final)
         let thread = AgentThread(title: "final handle", provider: .codex, model: "fake-model")
         try threadRepo.upsert(thread)
@@ -1849,17 +1868,24 @@ final class TokenSaverCompressionTests: XCTestCase {
         coordinator.addObserver(observer)
 
         _ = try await coordinator.startRun(AgentRunRequest(
+            runId: runID,
             threadId: thread.id,
             provider: .codex,
             model: "fake-model",
             cwd: tmp,
-            prompt: "Summarize the build output."
+            prompt: "Summarize the build output.",
+            environment: [
+                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                "RC_TOKEN_SAVER_ROOT_RUN_ID": runID.value.uuidString,
+                "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
+            ]
         ))
         let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
 
         XCTAssertEqual(assistant.content, "Build passed. Full raw output available.",
-                       "final assistant persistence must strip retrieve handles so transcript text stays human-facing")
+                       "final assistant persistence must strip recovery and applied markers so transcript text stays human-facing")
         XCTAssertFalse(assistant.content.contains("[[rc:"))
+        XCTAssertFalse(assistant.content.contains("[[rcd:"))
         let turnCompleted = observer.recordedEvents.compactMap(\.turnCompletedFinalMessageForTest).last
         XCTAssertEqual(turnCompleted, assistant.content,
                        "turnCompleted display payload must match the sanitized persisted assistant text")

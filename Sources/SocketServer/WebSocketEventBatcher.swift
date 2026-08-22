@@ -414,8 +414,8 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             order.removeAll(keepingCapacity: true)
         }
         if !nilKeyQueue.isEmpty {
-            // C-16 (Wi-Fi / nil-key path): concatenate same item_id deltas that
-            // landed in one window so N tokens become one frame before send.
+            // C-16 (Wi-Fi / nil-key path): concatenate same thread_id + item_id
+            // deltas that landed in one window so N tokens become one frame.
             let (merged, absorbed) = Self.mergeAgentItemDeltasInOrder(nilKeyQueue)
             for dropped in absorbed {
                 onCoalescedAway?(dropped)
@@ -440,7 +440,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
 
     // MARK: - C-16 agent.item.delta concatenation
 
-    /// Merge two encoded `agent.item.delta` frames for the same `item_id` by
+    /// Merge two encoded `agent.item.delta` frames for the same thread + item by
     /// concatenating append fields. Returns nil when kinds/ids do not match.
     /// WHY: last-write-wins would drop tokens and corrupt agent text.
     static func mergeAgentItemDeltaFrames(_ earlier: Data, _ later: Data) -> Data? {
@@ -452,9 +452,17 @@ final class WebSocketEventBatcher: @unchecked Sendable {
               var rightPayload = right["payload"] as? [String: Any] else {
             return nil
         }
+        let leftThread = leftPayload["thread_id"] as? String
+        let rightThread = rightPayload["thread_id"] as? String
         let leftItem = leftPayload["item_id"] as? String
         let rightItem = rightPayload["item_id"] as? String
-        guard let leftItem, leftItem == rightItem else { return nil }
+        let leftTurn = leftPayload["turn_id"] as? String
+        let rightTurn = rightPayload["turn_id"] as? String
+        guard let leftThread,
+              leftThread == rightThread,
+              let leftItem,
+              leftItem == rightItem,
+              leftTurn == rightTurn else { return nil }
 
         for field in ["body_append", "output_append", "text"] {
             let a = leftPayload[field] as? String ?? ""
@@ -463,7 +471,14 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 rightPayload[field] = a + b
             }
         }
-        // summary / progress: last write wins (non-append semantics).
+        for field in ["summary", "progress"] where rightPayload[field] == nil {
+            rightPayload[field] = leftPayload[field]
+        }
+        if leftPayload["distill_applied"] as? Bool == true
+            || rightPayload["distill_applied"] as? Bool == true {
+            rightPayload["distill_applied"] = true
+        }
+        // summary / progress: latest present value wins (non-append semantics).
         right["payload"] = rightPayload
         // Keep the later (higher) sequence / eventId so the client watermark
         // advances once; earlier seq is reported via onCoalescedAway.

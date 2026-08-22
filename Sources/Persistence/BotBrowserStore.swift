@@ -28,6 +28,9 @@ public enum BotBrowserCatalog: Sendable {
     public static let waitLogin = "bot_browser_wait_login"
     public static let snapshot = "bot_browser_snapshot"
     public static let act = "bot_browser_act"
+    /// Host action kind for live page-state polls (login wait). NOT a tool;
+    /// `toolNames` stays the five advertised tools.
+    public static let stateKind = "state"
 
     public static var toolNames: [String] { [open, get, waitLogin, snapshot, act] }
 
@@ -168,6 +171,9 @@ public struct BotBrowserStore: Sendable {
 
     public func takePendingOpens() throws -> [BotBrowserPendingOpen] {
         let pending = try loadPendingOpens()
+        // Empty takes must not touch the file: rewriting [] here races a
+        // concurrent MCP-process enqueue (load-modify-write) and erases it.
+        guard !pending.isEmpty else { return pending }
         try writeJSON([BotBrowserPendingOpen](), to: pendingOpensURL)
         return pending
     }
@@ -189,6 +195,9 @@ public struct BotBrowserStore: Sendable {
 
     public func takePendingActions() throws -> [BotBrowserPendingAction] {
         let pending = try loadPendingActions()
+        // Empty takes must not touch the file: rewriting [] here races a
+        // concurrent MCP-process enqueue (load-modify-write) and erases it.
+        guard !pending.isEmpty else { return pending }
         try writeJSON([BotBrowserPendingAction](), to: pendingActionsURL)
         return pending
     }
@@ -270,14 +279,56 @@ public struct BotBrowserPendingAction: Codable, Equatable, Sendable {
     public var action: String
     public var ref: String
     public var text: String
+    public var url: String
+    public var title: String
 
-    public init(id: String, botID: String, kind: String, action: String, ref: String, text: String) {
+    public init(
+        id: String,
+        botID: String,
+        kind: String,
+        action: String,
+        ref: String,
+        text: String,
+        url: String = "",
+        title: String = ""
+    ) {
         self.id = id
         self.botID = botID
         self.kind = kind
         self.action = action
         self.ref = ref
         self.text = text
+        self.url = url
+        self.title = title
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, botID, kind, action, ref, text, url, title
+    }
+
+    // url/title arrived after ship; queued JSON without them must still decode.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        botID = try container.decode(String.self, forKey: .botID)
+        kind = try container.decode(String.self, forKey: .kind)
+        action = try container.decode(String.self, forKey: .action)
+        ref = try container.decode(String.self, forKey: .ref)
+        text = try container.decode(String.self, forKey: .text)
+        url = try container.decodeIfPresent(String.self, forKey: .url) ?? ""
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(botID, forKey: .botID)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(action, forKey: .action)
+        try container.encode(ref, forKey: .ref)
+        try container.encode(text, forKey: .text)
+        try container.encode(url, forKey: .url)
+        try container.encode(title, forKey: .title)
     }
 }
 
@@ -427,6 +478,8 @@ public struct BotBrowserService: Sendable {
         action: String,
         ref: String,
         text: String,
+        url: String = "",
+        title: String = "",
         timeoutMS: Double
     ) throws -> [String: Any] {
         let pending = BotBrowserPendingAction(
@@ -435,7 +488,9 @@ public struct BotBrowserService: Sendable {
             kind: kind,
             action: action,
             ref: ref,
-            text: text
+            text: text,
+            url: url,
+            title: title
         )
         try BotBrowserHost.requestAction(store: store, action: pending)
         let deadline = Date().addingTimeInterval(max(0.2, timeoutMS / 1000))
@@ -452,7 +507,7 @@ public struct BotBrowserService: Sendable {
             }
             Thread.sleep(forTimeInterval: 0.03)
         }
-        throw BotBrowserError.invalid("Bot browser is not available. Open a website first while RemoteCode is running.")
+        throw BotBrowserError.invalid("Bot browser is not available. Keep the RemoteCode app running and try again.")
     }
 
     public func waitLogin(page: BotBrowserPageState? = nil) throws -> BotBrowserLoginWait.Result {
@@ -473,8 +528,24 @@ public struct BotBrowserService: Sendable {
             guard let url = Self.firstString(arguments, keys: ["url", "website", "last_website"]) else {
                 throw BotBrowserError.invalid("url is required.")
             }
-            let target = try open(url: url, title: arguments["title"] as? String)
-            return ["url": target.url, "title": target.title]
+            // Persist first so bot_browser_get stays truthful, then drive the
+            // app-owned Playwright child through the host mailbox. A refused
+            // route or missing Node.js surfaces to the bot verbatim (fail
+            // loud) instead of the old fire-and-forget enqueue.
+            let target = try persistNavigation(url: url, title: arguments["title"] as? String)
+            let payload = try performHostAction(
+                kind: BotBrowserCatalog.open,
+                action: "",
+                ref: "",
+                text: "",
+                url: target.url,
+                title: target.title,
+                timeoutMS: 70_000
+            )
+            return [
+                "url": payload["url"] as? String ?? target.url,
+                "title": payload["title"] as? String ?? target.title,
+            ]
         case BotBrowserCatalog.get:
             let target = try current()
             let data = try store.readWebsiteData(botID: callerBotID)
@@ -488,11 +559,31 @@ public struct BotBrowserService: Sendable {
                 ?? (arguments["timeout_ms"] as? NSNumber)?.doubleValue
                 ?? BotBrowserLoginWait.defaultTimeoutMS
             let url = try current()?.url ?? ""
+            // The Playwright lanes feed no cookies, so login detection rides
+            // the leftLoginPage URL change polled LIVE through the host. Each
+            // poll is a full host round-trip — 2s cadence, not the 100ms
+            // store default. Host errors fall back to the persisted state
+            // (legacy restored tabs still persist cookies there).
             let result = try BotBrowserLoginWait.pollUntilLoggedIn(
                 url: url,
                 timeoutMS: timeout,
+                pollIntervalMS: 2_000,
                 loadPage: {
-                    try self.store.loadPageState(botID: self.callerBotID) ?? BotBrowserPageState(url: url)
+                    let cookies = (try? self.store.readWebsiteData(botID: self.callerBotID)) ?? [:]
+                    if let payload = try? self.performHostAction(
+                        kind: BotBrowserCatalog.stateKind,
+                        action: "",
+                        ref: "",
+                        text: "",
+                        timeoutMS: 10_000
+                    ) {
+                        return BotBrowserPageState(
+                            url: payload["url"] as? String ?? "",
+                            title: payload["title"] as? String ?? "",
+                            cookies: cookies
+                        )
+                    }
+                    return try self.store.loadPageState(botID: self.callerBotID) ?? BotBrowserPageState(url: url)
                 }
             )
             return [
@@ -506,7 +597,7 @@ public struct BotBrowserService: Sendable {
                 action: "",
                 ref: "",
                 text: "",
-                timeoutMS: 8_000
+                timeoutMS: 15_000
             )
         case BotBrowserCatalog.act:
             let action = (arguments["action"] as? String)?
@@ -520,12 +611,13 @@ public struct BotBrowserService: Sendable {
                   !ref.isEmpty else {
                 throw BotBrowserError.invalid("ref is required.")
             }
+            // Clicks can trigger full navigations — allow 15s, not 8s.
             return try performHostAction(
                 kind: BotBrowserCatalog.act,
                 action: action,
                 ref: ref,
                 text: arguments["text"] as? String ?? "",
-                timeoutMS: 8_000
+                timeoutMS: 15_000
             )
         default:
             throw BotBrowserError.invalid("unknown tool: \(name)")

@@ -10,10 +10,36 @@ final class CommandWrapPolicyTests: XCTestCase {
                   "curl", "aws", "python3"] {
             XCTAssertTrue(CommandWrapPolicy.isWrapped(c), "\(c) must be wrapped")
         }
-        // Exact-output tools must NOT be PATH-wrapped (agent needs full stdout).
+        // Exact-output tools enter the interceptor, which keeps their full stdout raw.
         // `node` stays unwrapped (agent runtime / bridge); use bun/python for script compress.
-        for c in ["rg", "grep", "sed", "cat", "head", "tail", "awk", "jq", "echo", "node", "env", "rm"] {
+        for c in ["node", "env"] {
             XCTAssertFalse(CommandWrapPolicy.isWrapped(c), "\(c) must NOT be wrapped")
+        }
+        for c in ["rg", "grep", "sed", "cat", "head", "tail", "awk", "jq"] {
+            XCTAssertTrue(CommandWrapPolicy.isWrapped(c), "\(c) must enter the global interceptor")
+        }
+        // The global interceptor may fail open at decision time.
+        XCTAssertTrue(CommandWrapPolicy.isWrapped("echo"))
+        XCTAssertTrue(CommandWrapPolicy.isWrapped("rm"))
+    }
+
+    func test_isWrapped_admitsNonCatalogCommandsAndExactOutputThroughOneInterceptor() {
+        // WHY: one global interceptor must cover provider-launched tools that
+        // RemoteCode has never listed, while exact-output tools remain raw.
+        XCTAssertFalse(WrappedCommandCatalog.commands.contains("workspace-report"))
+        XCTAssertTrue(CommandWrapPolicy.isWrapped("workspace-report"))
+        XCTAssertTrue(CommandWrapPolicy.isWrapped("/opt/acme/bin/workspace-report"))
+
+        for exact in ["rg", "grep", "sed", "cat", "jq"] {
+            XCTAssertTrue(CommandWrapPolicy.isWrapped(exact), "(exact) must enter the shared interceptor")
+            XCTAssertEqual(
+                CommandWrapPolicy.passthroughReason(
+                    command: exact,
+                    args: [],
+                    environment: noEnv
+                ),
+                "exact_output_command"
+            )
         }
     }
 
@@ -311,10 +337,74 @@ final class CommandWrapPolicyTests: XCTestCase {
         )
     }
 
+    func test_structuredCommandOutput_preservesValidJSONWhenMinifiedPayloadExceedsBudget() throws {
+        // WHY: truncating a losslessly minified payload to the character budget produces
+        // invalid JSON, so providers lose every field instead of receiving a faithful fallback.
+        let rows: [[String: Any]] = (1...96).map { index in
+            [
+                "id": index,
+                "state": "CHANGES_REQUESTED",
+                "body": "finding \(index): " + String(repeating: "evidence ", count: 8),
+            ]
+        }
+        let prettyData = try JSONSerialization.data(withJSONObject: rows, options: [.prettyPrinted, .sortedKeys])
+        let pretty = try XCTUnwrap(String(data: prettyData, encoding: .utf8))
+        let compactData = try JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys])
+        let compact = try XCTUnwrap(String(data: compactData, encoding: .utf8))
+        XCTAssertGreaterThan(compactData.count, 4_000, "the fixture must cross the structured-output budget")
+        for input in [pretty, compact] {
+            let request = DistillRequest(
+                mode: .commandOutput,
+                input: input,
+                question: try XCTUnwrap(CommandWrapPolicy.extractionQuery(forCommand: "gh")),
+                maxOutputCharacters: 4_000,
+                reversibleStoreMinBytes: 256
+            )
+
+            let output = try XCTUnwrap(LocalDistillRuntime.structuredCommandOutput(for: request))
+            let decoded = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(output.utf8)) as? [[String: Any]]
+            )
+
+            XCTAssertEqual(output, input, "an over-budget structured result must fail open verbatim")
+            XCTAssertGreaterThan(output.count, request.maxOutputCharacters)
+            XCTAssertEqual(decoded.count, rows.count)
+            XCTAssertEqual(decoded.last?["id"] as? Int, rows.count)
+            XCTAssertEqual(decoded.last?["state"] as? String, "CHANGES_REQUESTED")
+        }
+    }
+
     func test_faithfulnessGuard_rejectsTinyGarbageTokens() {
         XCTAssertFalse(CommandWrapPolicy.isFaithfulCompression(rawByteCount: 7_000, compressedContentByteCount: 4))
         XCTAssertTrue(CommandWrapPolicy.isFaithfulCompression(rawByteCount: 7_000, compressedContentByteCount: 200))
         XCTAssertTrue(CommandWrapPolicy.isFaithfulCompression(rawByteCount: 10, compressedContentByteCount: 10))
+    }
+
+    func test_faithfulnessContentCount_excludesRecoveryAndAppliedReceiptLines() {
+        // WHY: protocol markers can exceed the 24-byte floor by themselves. Only
+        // substantive compressed content may make a wrapped replacement faithful.
+        let receipt = DistillAppliedReceipt.makeMarker()
+        let recovery = "[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"
+        let content = "NONE"
+        let lossyEmitted = "\(content)\n\(recovery)\n\(receipt)\n"
+        let losslessEmitted = "\(content)\n\(receipt)\n"
+
+        XCTAssertEqual(CommandWrapPolicy.compressedContentByteCount(lossyEmitted), content.utf8.count)
+        XCTAssertEqual(CommandWrapPolicy.compressedContentByteCount(losslessEmitted), content.utf8.count)
+        XCTAssertFalse(
+            CommandWrapPolicy.isFaithfulCompression(
+                rawByteCount: 7_000,
+                compressedContentByteCount: CommandWrapPolicy.compressedContentByteCount(lossyEmitted)
+            ),
+            "recovery and applied receipt bytes must not rescue a degenerate body"
+        )
+
+        let markerInBody = "quoted \(receipt) text\nreal content"
+        XCTAssertEqual(
+            CommandWrapPolicy.compressedContentByteCount(markerInBody),
+            markerInBody.utf8.count,
+            "a non-trailing marker is user content, not a receipt"
+        )
     }
 
     func test_wrappedCommandCatalog_includesEndorsedForcedWrapCategories() {

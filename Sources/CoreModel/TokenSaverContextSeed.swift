@@ -245,11 +245,17 @@ public struct TokenSaverCanonicalConversationSnapshot: Sendable, Equatable {
     public static func capture(
         messages: [AgentMessage],
         persistedRCW1ByMessageId: [String: String],
-        excludingCurrentUserText: String?
+        excludingCurrentUserText: String?,
+        excludingCurrentUserMessageId: AgentMessageID? = nil
     ) -> TokenSaverCanonicalConversationSnapshot? {
         var prior = messages
-        if let excluded = excludingCurrentUserText, !excluded.isEmpty,
-           let currentIndex = prior.lastIndex(where: { $0.role == .user && $0.content == excluded }) {
+        if let excludedId = excludingCurrentUserMessageId,
+           let currentIndex = prior.lastIndex(where: { $0.role == .user && $0.id == excludedId }) {
+            prior.remove(at: currentIndex)
+        } else if let excluded = excludingCurrentUserText, !excluded.isEmpty,
+                  let currentIndex = prior.lastIndex(where: {
+                      $0.role == .user && $0.content == excluded
+                  }) {
             prior.remove(at: currentIndex)
         }
         let eligible = prior.compactMap { message -> Item? in

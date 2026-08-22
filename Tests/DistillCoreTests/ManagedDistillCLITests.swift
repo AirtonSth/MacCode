@@ -1,6 +1,40 @@
+import CryptoKit
 import XCTest
 import CoreModel
+import Persistence
 @testable import DistillCore
+
+private let managedDistillCLITestRootRunID = "managed-distill-cli-tests"
+private let managedDistillCLITestReceiptKey = Data(repeating: 0x42, count: 32)
+
+private extension ManagedDistillCLI {
+    init(
+        arguments: [String],
+        stdin: Data,
+        state: State?,
+        provider: String? = nil,
+        recoveryContext: TokenSaverRecoveryRequestContext? = nil,
+        invocationID: String = UUID().uuidString.lowercased(),
+        maxOutputCharacters: Int = 4_000,
+        reversibleStoreMinBytes: Int? = nil,
+        distillAdmission: @escaping DistillAdmission = { true },
+        transport: @escaping Transport
+    ) {
+        self.init(
+            arguments: arguments,
+            stdin: stdin,
+            state: state,
+            rootRunID: managedDistillCLITestRootRunID,
+            provider: provider,
+            recoveryContext: recoveryContext,
+            invocationID: invocationID,
+            maxOutputCharacters: maxOutputCharacters,
+            reversibleStoreMinBytes: reversibleStoreMinBytes,
+            distillAdmission: distillAdmission,
+            transport: transport
+        )
+    }
+}
 
 final class ManagedDistillCLITests: XCTestCase {
     override func tearDown() {
@@ -107,17 +141,145 @@ final class ManagedDistillCLITests: XCTestCase {
         func all() -> [[String: String]] { values }
     }
 
-    private let state = ManagedDistillCLI.State(baseURL: "http://127.0.0.1:9", authToken: "t")
+    private let state = ManagedDistillCLI.State(
+        baseURL: "http://127.0.0.1:9",
+        authToken: "t",
+        receiptKey: managedDistillCLITestReceiptKey
+    )
 
-    func test_compress_success_emitsOutputAndHandleMarker() async {
-        let resp = DistillResponse(requestID: UUID(), output: "PASS", inputCharacters: 100, inputTokens: 25, outputTokens: 1, originalHandle: "abc123")
+    func test_compress_success_recordsOnlyTheExactReceiptInclusiveDeliveredOutput() async throws {
+        let raw = Data(String(repeating: "verbose build output that passed\n", count: 20).utf8)
+        let resp = DistillResponse(
+            requestID: UUID(), output: "PASS", inputCharacters: raw.count,
+            inputTokens: 25, outputTokens: 1, originalHandle: "abc123",
+            recoveryIdempotencyKey: "delivery-key", routeStage: .llmMLX
+        )
         let data = try! JSONEncoder().encode(resp)
-        let cli = ManagedDistillCLI(arguments: ["Return PASS or FAIL only."], stdin: Data("build passed\n0 failures".utf8), state: state) { _ in (data, 200) }
+        let recorder = RequestRecorder()
+        let cli = ManagedDistillCLI(arguments: ["Return PASS or FAIL only."], stdin: raw, state: state) { request in
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await recorder.append(decoded)
+                if decoded.recordSavings != true {
+                    XCTAssertEqual(request.value(forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred"), "1")
+                }
+            }
+            return (data, 200)
+        }
         let (out, code) = await cli.run()
         XCTAssertEqual(code, 0)
         let s = String(decoding: out, as: UTF8.self)
         XCTAssertTrue(s.hasPrefix("PASS"))
         XCTAssertTrue(s.contains("[[rc:abc123]]"), "handle marker embedded so the agent can retrieve the original")
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(s), "an actual lossy replacement must carry an applied receipt")
+        XCTAssertTrue(s.hasSuffix("\n"), "successful CLI output must preserve its terminal LF contract")
+        XCTAssertLessThan(out.count, raw.count, "recovery and receipt lines are part of the net UTF-8 shrink gate")
+
+        let requests = await recorder.all()
+        XCTAssertEqual(requests.count, 2, "compression and delivered-savings recording must be separate requests")
+        XCTAssertEqual(requests.first?.recordSavings, false, "candidate compression must never claim delivery")
+        let ledger = try XCTUnwrap(requests.last)
+        XCTAssertEqual(ledger.recordSavings, true)
+        XCTAssertEqual(ledger.precomputedOutput, s, "ledger bytes must exactly match provider-visible receipt/handle output")
+        XCTAssertEqual(
+            ledger.precomputedRecoveryConfirmations,
+            [.init(capability: "abc123", idempotencyKey: "delivery-key")]
+        )
+        let record = try XCTUnwrap(DistillSavingsCalculator.record(
+            for: ledger,
+            response: try XCTUnwrap(ledger.responseUsingPrecomputedOutput())
+        ))
+        XCTAssertEqual(record.outputTokens, TokenEstimator.estimate(s))
+        XCTAssertEqual(record.savedTokens, max(TokenEstimator.estimate(String(decoding: raw, as: UTF8.self)) - TokenEstimator.estimate(s), 0))
+        XCTAssertEqual(record.routeStage, .llmMLX)
+    }
+
+    func test_compress_deterministicWithoutHandle_emitsAppliedReceiptAfterNetUTF8Shrink() async throws {
+        // WHY: lossless/deterministic compression has no recovery handle, so the
+        // distinct applied receipt is the only durable proof that bytes changed.
+        let rawText = String(repeating: "é: unchanged semantic field with excess spacing\n", count: 20)
+        let compact = "é: unchanged semantic field"
+        let response = DistillResponse(
+            requestID: UUID(),
+            output: compact + "\n",
+            inputCharacters: rawText.count,
+            routeStage: .deterministic
+        )
+        let encoded = try JSONEncoder().encode(response)
+        let raw = Data(rawText.utf8)
+        let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: state) { _ in (encoded, 200) }
+
+        let (out, code) = await cli.run()
+        let emitted = String(decoding: out, as: UTF8.self)
+
+        XCTAssertEqual(code, 0)
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(emitted))
+        XCTAssertTrue(emitted.hasSuffix("\n"), "successful CLI output must retain a terminal LF")
+        XCTAssertEqual(DistillAppliedReceipt.strip(emitted), compact)
+        XCTAssertFalse(emitted.contains("\n\n[[rcd:"), "an existing output LF must serve as the receipt separator")
+        XCTAssertFalse(DistillAppliedReceipt.strip(emitted).contains("[[rc:"), "lossless output needs no recovery handle")
+        XCTAssertLessThan(out.count, raw.count, "the comparison must use UTF-8 bytes, including the receipt")
+    }
+
+    func test_compressWithReceiptKeyAndRootEmitsVerifiableV2BoundToExactPrefix() async throws {
+        // WHY: a marker is trustworthy only when it authenticates the exact bytes
+        // the provider sees under this root run and the current On-lifecycle key.
+        let raw = Data(String(repeating: "verbose output line\n", count: 40).utf8)
+        let encoded = try JSONEncoder().encode(DistillResponse(
+            requestID: UUID(),
+            output: "COMPRESSED\n",
+            inputCharacters: raw.count,
+            routeStage: .deterministic
+        ))
+        let key = Data(0..<32)
+        let rootRunID = "123e4567-e89b-12d3-a456-426614174000"
+        let cli = ManagedDistillCLI(
+            arguments: [],
+            stdin: raw,
+            state: .init(baseURL: "http://127.0.0.1:9", authToken: "t", receiptKey: key),
+            rootRunID: rootRunID
+        ) { _ in (encoded, 200) }
+
+        let (out, code) = await cli.run()
+        let parsed = try XCTUnwrap(DistillAppliedReceipt.parseTrailingV2Marker(in: out))
+        let prefix = out.prefix(parsed.markerByteRange.lowerBound)
+
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(prefix, Data("COMPRESSED\n".utf8))
+        XCTAssertTrue(DistillAppliedReceipt.verify(
+            parsed,
+            rootRunID: rootRunID,
+            payloadByteCount: prefix.count,
+            payloadSHA256: Data(SHA256.hash(data: prefix)),
+            key: key
+        ))
+    }
+
+    func test_compressWithoutReceiptKeyOrRootFailsOpenVerbatim() async throws {
+        // WHY: lossy output without receipt authority cannot be authenticated by
+        // the host, so legacy state must preserve the exact input instead.
+        let raw = Data(String(repeating: "verbose output line\n", count: 40).utf8)
+        let encoded = try JSONEncoder().encode(DistillResponse(
+            requestID: UUID(), output: "short", inputCharacters: raw.count,
+            routeStage: .deterministic
+        ))
+        let key = Data(repeating: 0x55, count: 32)
+        let withoutKey = ManagedDistillCLI(
+            arguments: [], stdin: raw,
+            state: .init(baseURL: "http://127.0.0.1:9", authToken: "t"),
+            rootRunID: "root"
+        ) { _ in (encoded, 200) }
+        let withoutRoot = ManagedDistillCLI(
+            arguments: [], stdin: raw,
+            state: .init(baseURL: "http://127.0.0.1:9", authToken: "t", receiptKey: key),
+            rootRunID: nil
+        ) { _ in (encoded, 200) }
+
+        for result in [await withoutKey.run(), await withoutRoot.run()] {
+            XCTAssertEqual(result.1, 0)
+            XCTAssertNil(DistillAppliedReceipt.parseTrailingV2Marker(in: result.0))
+            XCTAssertEqual(result.0, raw, "missing receipt authority must fail open to verbatim stdin")
+        }
     }
 
     func test_compressDerivesStableDistinctOperationIDsPerCanonicalRequest() async throws {
@@ -274,6 +436,7 @@ final class ManagedDistillCLITests: XCTestCase {
         let (out, code) = await cli.run()
         XCTAssertEqual(code, 0)
         XCTAssertEqual(out, raw)
+        XCTAssertFalse(DistillAppliedReceipt.containsMarker(String(decoding: out, as: UTF8.self)))
     }
 
     func test_compress_non200_failsOpen() async {
@@ -357,6 +520,104 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(out, raw)
     }
 
+    func test_compress_verbatimAndIdentityResponsesFailOpenWithoutAppliedReceipt() async throws {
+        // WHY: a successful HTTP response is not proof that Distill changed bytes.
+        // Verbatim routing and identity output must remain exact passthrough.
+        let rawText = String(repeating: "original tool output line\n", count: 12)
+        let raw = Data(rawText.utf8)
+        let cases = [
+            DistillResponse(
+                requestID: UUID(), output: "short but explicitly verbatim",
+                inputCharacters: rawText.count, routeStage: .verbatim
+            ),
+            DistillResponse(
+                requestID: UUID(), output: rawText,
+                inputCharacters: rawText.count, routeStage: .deterministic
+            ),
+        ]
+
+        for response in cases {
+            let encoded = try JSONEncoder().encode(response)
+            let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: state) { _ in (encoded, 200) }
+            let (out, code) = await cli.run()
+
+            XCTAssertEqual(code, 0)
+            XCTAssertEqual(out, raw)
+            XCTAssertFalse(DistillAppliedReceipt.containsMarker(String(decoding: out, as: UTF8.self)))
+        }
+    }
+
+    func test_compress_markerInclusiveNoNetShrinkFailsOpenWithoutAppliedReceipt() async throws {
+        // WHY: comparing only the compressed body would claim a saving even when
+        // the mandatory receipt makes the provider-visible payload larger.
+        let receiptOverhead = Data(("\n" + DistillAppliedReceipt.makeMarker() + "\n").utf8).count
+        let rawText = String(repeating: "a", count: receiptOverhead + 16)
+        let almostSameSize = String(repeating: "b", count: rawText.utf8.count - 1)
+        let response = DistillResponse(
+            requestID: UUID(),
+            output: almostSameSize,
+            inputCharacters: rawText.count,
+            routeStage: .deterministic
+        )
+        let encoded = try JSONEncoder().encode(response)
+        let raw = Data(rawText.utf8)
+        let recorder = RequestRecorder()
+        let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: state) { request in
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await recorder.append(decoded)
+            }
+            return (encoded, 200)
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(out, raw)
+        XCTAssertFalse(DistillAppliedReceipt.containsMarker(String(decoding: out, as: UTF8.self)))
+        let requests = await recorder.all()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.recordSavings, false, "a receipt-inclusive rejection must never pre-record savings")
+        XCTAssertNil(requests.first?.precomputedOutput)
+    }
+
+    func test_wrapperFaithfulnessRejectionCanDropDeferredLedgerWithoutARecordedSaving() async throws {
+        // WHY: CommandWrapRunner applies a final faithfulness floor after the CLI.
+        // The candidate request must be accounting-disabled so dropping the deferred
+        // side effect also drops every savings write when a tiny summary is rejected.
+        let rawText = String(repeating: "verbose compiler progress line\n", count: 80)
+        let response = DistillResponse(
+            requestID: UUID(),
+            output: "x",
+            inputCharacters: rawText.count,
+            routeStage: .deterministic
+        )
+        let encoded = try JSONEncoder().encode(response)
+        let recorder = RequestRecorder()
+        let cli = ManagedDistillCLI(arguments: [], stdin: Data(rawText.utf8), state: state) { request in
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await recorder.append(decoded)
+            }
+            return (encoded, 200)
+        }
+
+        let result = await cli.runResult()
+        let emitted = String(decoding: result.stdout, as: UTF8.self)
+        XCTAssertNotNil(result.deferredSideEffect)
+        XCTAssertFalse(CommandWrapPolicy.isFaithfulCompression(
+            rawByteCount: Data(rawText.utf8).count,
+            compressedContentByteCount: CommandWrapPolicy.compressedContentByteCount(emitted)
+        ))
+
+        // Mirror the wrapper rejection: emit raw and deliberately drop `deferredSideEffect`.
+        await Task.yield()
+        let requests = await recorder.all()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.recordSavings, false)
+        XCTAssertFalse(requests.contains { $0.recordSavings == true })
+    }
+
     func test_emptyStdin_returnsEmptyExitZero() async {
         let cli = ManagedDistillCLI(arguments: [], stdin: Data(), state: state) { _ in (Data(), 200) }
         let (out, code) = await cli.run()
@@ -390,8 +651,9 @@ final class ManagedDistillCLITests: XCTestCase {
         // so TokenSaverSavingsRepository never saw a row. Real byte savings were
         // computed and then silently dropped for every provider.
         //
-        // WHY (BUG 1): the ledger POST must carry precomputedOutput == pre.output so
-        // the sidecar records the delivered delta — NOT an independent recompute.
+        // WHY (BUG 1): the ledger POST must carry the final receipt-inclusive output so
+        // the sidecar records the delivered delta — NOT an independent recompute or
+        // the smaller pre-receipt prepass body.
         // The stub intentionally returns DIFFERENT bytes than pre.output; if the
         // client (or server) used that response body for savings, numbers would diverge.
         TokenSaverWaveLiveRollout.activate(.waveA)
@@ -407,19 +669,6 @@ final class ManagedDistillCLITests: XCTestCase {
             return
         }
         XCTAssertGreaterThan(pre.savedBytes, 0)
-
-        let expectedRecord = ManagedDistillCLI.prepassSavingsRecord(
-            original: input,
-            compressed: pre.output,
-            provider: "grok",
-            waveID: pre.waveID
-        )
-        XCTAssertNotNil(expectedRecord, "DistillSavingsCalculator must accept prepass delta")
-        XCTAssertGreaterThan(expectedRecord?.savedTokens ?? 0, 0, "prepass must produce a positive token delta")
-        XCTAssertEqual(
-            expectedRecord?.savedTokens,
-            max(TokenEstimator.estimate(input) - TokenEstimator.estimate(pre.output), 0)
-        )
 
         // DIFFERENT from pre.output — proves the client does not rely on the response body
         // for the ledger delta (precomputed-output path ignores recompute).
@@ -455,9 +704,28 @@ final class ManagedDistillCLITests: XCTestCase {
 
         XCTAssertEqual(code, 0)
         let text = String(decoding: out, as: UTF8.self)
-        XCTAssertTrue(text.hasPrefix(pre.output), "caller must receive Wave A compressed output")
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(text), "a delivered Wave A shrink must carry an applied receipt")
+        XCTAssertTrue(text.hasSuffix("\n"), "Wave A CLI output must retain its terminal LF")
+        XCTAssertEqual(
+            ManagedDistillCLI.stripTrailingNewlines(DistillAppliedReceipt.strip(text)),
+            ManagedDistillCLI.stripTrailingNewlines(pre.output),
+            "caller must receive the Wave A compressed output before the receipt"
+        )
+        XCTAssertLessThan(out.count, input.utf8.count, "Wave A receipt-inclusive output must still shrink")
         XCTAssertFalse(text.contains(independentSidecarOutput), "caller must not see independent sidecar recompute")
         XCTAssertNotEqual(out, Data(input.utf8), "Wave A hit must not fail-open to raw stdin")
+
+        let expectedRecord = ManagedDistillCLI.prepassSavingsRecord(
+            original: input,
+            compressed: text,
+            provider: "grok",
+            waveID: pre.waveID
+        )
+        XCTAssertNotNil(expectedRecord, "DistillSavingsCalculator must accept the delivered delta")
+        XCTAssertEqual(
+            expectedRecord?.savedTokens,
+            max(TokenEstimator.estimate(input) - TokenEstimator.estimate(text), 0)
+        )
 
         let transportCalls = await calls.count()
         XCTAssertEqual(transportCalls, 1, "Wave A must emit exactly one recordSavings POST (no double-count)")
@@ -468,13 +736,14 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(posted.input, input, "ledger POST must send original pre-prepass bytes")
         XCTAssertEqual(
             posted.precomputedOutput,
-            pre.output,
-            "ledger POST must carry the delivered Wave A output, not leave delta to server recompute"
+            text,
+            "ledger POST must carry the exact receipt-inclusive Wave A output"
         )
+        XCTAssertEqual(posted.precomputedRouteStage, .deterministic)
         XCTAssertEqual(posted.cacheState, "wave_prepass_\(pre.waveID)")
         XCTAssertEqual(posted.provider, "grok")
 
-        // Honest delta is original→pre.output (precomputed path), not original→independentSidecarOutput.
+        // Honest delta is original→provider-visible receipt output, not independent recompute.
         let honest = DistillSavingsCalculator.record(
             for: posted,
             response: try XCTUnwrap(posted.responseUsingPrecomputedOutput())
@@ -533,7 +802,13 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let result = await cli.runResult()
         XCTAssertEqual(result.exitCode, 0)
-        XCTAssertEqual(String(decoding: result.stdout, as: UTF8.self), pre.output + "\n")
+        let emitted = String(decoding: result.stdout, as: UTF8.self)
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(emitted))
+        XCTAssertTrue(emitted.hasSuffix("\n"))
+        XCTAssertEqual(
+            ManagedDistillCLI.stripTrailingNewlines(DistillAppliedReceipt.strip(emitted)),
+            ManagedDistillCLI.stripTrailingNewlines(pre.output)
+        )
         XCTAssertNotNil(result.deferredSideEffect, "Wave A must defer ledger POST")
         let before = await calls.count()
         XCTAssertEqual(before, 0, "ledger transport must not run before deferred side effect")
@@ -573,7 +848,12 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let (out, code) = await cli.run()
         XCTAssertEqual(code, 0)
-        XCTAssertEqual(String(decoding: out, as: UTF8.self), pre.output + "\n")
+        let emitted = String(decoding: out, as: UTF8.self)
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(emitted))
+        XCTAssertEqual(
+            ManagedDistillCLI.stripTrailingNewlines(DistillAppliedReceipt.strip(emitted)),
+            ManagedDistillCLI.stripTrailingNewlines(pre.output)
+        )
         let transportCalls = await calls.count()
         XCTAssertEqual(transportCalls, 2, "one bounded retry after the initial failure, then gives up")
     }
@@ -612,9 +892,125 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let (out, code) = await cli.run()
         XCTAssertEqual(code, 0)
-        XCTAssertEqual(String(decoding: out, as: UTF8.self), pre.output + "\n")
+        let emitted = String(decoding: out, as: UTF8.self)
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(emitted))
+        XCTAssertEqual(
+            ManagedDistillCLI.stripTrailingNewlines(DistillAppliedReceipt.strip(emitted)),
+            ManagedDistillCLI.stripTrailingNewlines(pre.output)
+        )
         let transportCalls = await calls.count()
         XCTAssertEqual(transportCalls, 2, "retry must recover the saving after one transient failure, then stop")
+    }
+
+    func test_waveAHit_lostFirstHTTP200DoesNotDoubleSavingsLedger() async throws {
+        // WHY: the server can commit savings and send 200 while the client loses
+        // that response. Its bounded retry reuses the exact DistillRequest UUID,
+        // so persistence must credit the delivered bytes exactly once.
+        TokenSaverWaveLiveRollout.activate(.waveA)
+        setenv("RC_TOKEN_SAVER_DISTILL_HINT", "1", 1)
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let repo = TokenSaverSavingsRepository(db: db)
+        let token = "lost-200-token"
+        let configuration = try DistillServiceConfiguration(
+            authToken: token,
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
+            onSuccess: { request, response, threadID in
+                guard let record = DistillSavingsCalculator.record(
+                    for: request,
+                    response: response,
+                    threadID: threadID
+                ) else { return }
+                do {
+                    _ = try repo.record(
+                        provider: record.provider,
+                        mode: record.mode,
+                        inputTokens: record.inputTokens,
+                        outputTokens: record.outputTokens,
+                        savedTokens: record.savedTokens,
+                        cacheState: record.cacheState,
+                        engine: record.routeStage?.rawValue ?? "unknown",
+                        attributability: record.attributability,
+                        delivered: record.delivered,
+                        threadID: record.threadID,
+                        idempotencyKey: record.idempotencyKey
+                    )
+                } catch {
+                    XCTFail("savings persistence failed: \(error)")
+                }
+            }
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let line = "same log line that repeats many times for compression"
+        let input = String(repeating: line + "\n", count: 20) + "exit code: 0\n"
+        let calls = CallCounter()
+        let liveState = ManagedDistillCLI.State(
+            baseURL: ready.baseURL,
+            authToken: token,
+            receiptKey: managedDistillCLITestReceiptKey
+        )
+        let cli = ManagedDistillCLI(
+            arguments: [],
+            stdin: Data(input.utf8),
+            state: liveState,
+            provider: "claude"
+        ) { request in
+            let attempt = await calls.increment()
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if attempt == 1 { return nil } // server committed; client lost 200
+                return (data, status)
+            } catch {
+                return nil
+            }
+        }
+
+        let (output, exitCode) = await cli.run()
+
+        XCTAssertEqual(exitCode, 0)
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(String(decoding: output, as: UTF8.self)))
+        let transportCalls = await calls.count()
+        XCTAssertEqual(transportCalls, 2, "the hidden first 200 must trigger exactly one retry")
+        let summary = try repo.summary()
+        XCTAssertEqual(summary.totalRuns, 1, "both HTTP requests represent one delivered saving")
+        XCTAssertGreaterThan(summary.totalSavedTokens, 0)
+    }
+
+    func test_waveAHit_smallerBodyButReceiptEliminatesGain_failsOpenWithoutLedger() async throws {
+        // Three short repeated lines are byte-exact collapsible, but save only two
+        // bytes. The applied receipt would inflate the final payload, so Wave A must
+        // return the exact input and must not record a saving that was not delivered.
+        TokenSaverWaveLiveRollout.activate(.waveA)
+        setenv("RC_TOKEN_SAVER_DISTILL_HINT", "1", 1)
+
+        let input = "abcde\nabcde\nabcde"
+        let pre = try XCTUnwrap(TokenSaverWaveLosslessPrepass.apply(input: input))
+        XCTAssertGreaterThan(pre.savedBytes, 0)
+        XCTAssertLessThan(pre.savedBytes, Data(("\n" + DistillAppliedReceipt.makeMarker() + "\n").utf8).count)
+
+        let calls = CallCounter()
+        let raw = Data(input.utf8)
+        let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: state) { _ in
+            _ = await calls.increment()
+            return (Data("{}".utf8), 200)
+        }
+
+        let result = await cli.runResult()
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(result.stdout, raw)
+        XCTAssertNil(result.deferredSideEffect)
+        XCTAssertFalse(DistillAppliedReceipt.containsMarker(String(decoding: result.stdout, as: UTF8.self)))
+        let transportCalls = await calls.count()
+        XCTAssertEqual(transportCalls, 0, "an undelivered Wave A candidate must not write savings")
     }
 
     // MARK: - hook pre-tool-pipe
@@ -705,6 +1101,7 @@ final class ManagedDistillCLITests: XCTestCase {
             inputTokens: TokenEstimator.estimate(rawToolOutput),
             outputTokens: TokenEstimator.estimate(compressed),
             originalHandle: "hook1",
+            recoveryIdempotencyKey: "hook-delivery-key",
             routeStage: .deterministic
         )
         let encoded = try JSONEncoder().encode(sidecarResponse)
@@ -741,13 +1138,65 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(hookOut?["hookEventName"] as? String, "PostToolUse")
         let updated = hookOut?["updatedToolOutput"] as? String ?? ""
         XCTAssertTrue(updated.hasPrefix(compressed), "updatedToolOutput must carry compressed tool text")
-        XCTAssertTrue(updated.contains("[[rc:hook1]]") || updated.hasPrefix(compressed))
+        XCTAssertTrue(updated.contains("[[rc:hook1]]"), "lossy hook output must retain its recovery handle")
+        XCTAssertTrue(
+            DistillAppliedReceipt.containsMarker(updated),
+            "the nested CLI receipt must survive the hook JSON replacement automatically"
+        )
+        XCTAssertLessThan(updated.utf8.count, rawToolOutput.utf8.count)
 
         let requests = await recorder.all()
-        XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.recordSavings, true)
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests.first?.recordSavings, false)
         XCTAssertEqual(requests.first?.input, rawToolOutput)
         XCTAssertEqual(requests.first?.provider, "claude")
+        XCTAssertEqual(requests.last?.recordSavings, true)
+        XCTAssertEqual(requests.last?.precomputedOutput, updated)
+        XCTAssertEqual(requests.last?.precomputedRouteStage, .deterministic)
+        XCTAssertEqual(
+            requests.last?.precomputedRecoveryConfirmations,
+            [.init(capability: "hook1", idempotencyKey: "hook-delivery-key")]
+        )
+    }
+
+    func test_hookPostToolUse_receiptInclusiveRejectionNeverRecordsSavings() async throws {
+        // WHY: PostToolUse has its own final replacement gate. A sidecar candidate
+        // that loses its gain after the receipt must return `{}` and leave no ledger row.
+        let rawToolOutput = String(repeating: "tool diagnostic line\n", count: 60)
+        let response = DistillResponse(
+            requestID: UUID(),
+            output: String(repeating: "x", count: rawToolOutput.utf8.count - 1),
+            inputCharacters: rawToolOutput.count,
+            routeStage: .deterministic
+        )
+        let encoded = try JSONEncoder().encode(response)
+        let recorder = RequestRecorder()
+        let hookJSON: [String: Any] = [
+            "hook_event_name": "PostToolUse",
+            "tool_name": "WebFetch",
+            "tool_input": ["url": "https://example.invalid/large"],
+            "tool_response": rawToolOutput,
+        ]
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use"],
+            stdin: try JSONSerialization.data(withJSONObject: hookJSON),
+            state: state,
+            provider: "claude"
+        ) { request in
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await recorder.append(decoded)
+            }
+            return (encoded, 200)
+        }
+
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
+        let requests = await recorder.all()
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.recordSavings, false)
+        XCTAssertNil(requests.first?.precomputedOutput)
     }
 
     func test_hookPostToolUse_bashObject_withOrWithoutTerminalLF_failsOpenWithoutTransport() async throws {
@@ -832,8 +1281,12 @@ final class ManagedDistillCLITests: XCTestCase {
             _ = await calls.increment()
             if let body = request.httpBody,
                let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
-                // Must carry precomputed Wave A output even if transport is slow.
-                XCTAssertEqual(decoded.precomputedOutput, pre.output)
+                let delivered = decoded.precomputedOutput ?? ""
+                XCTAssertTrue(DistillAppliedReceipt.containsMarker(delivered))
+                XCTAssertEqual(
+                    ManagedDistillCLI.stripTrailingNewlines(DistillAppliedReceipt.strip(delivered)),
+                    ManagedDistillCLI.stripTrailingNewlines(pre.output)
+                )
             }
             return (Data("{}".utf8), 200)
         }
@@ -843,11 +1296,13 @@ final class ManagedDistillCLITests: XCTestCase {
         let obj = try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any]
         let hookOut = obj?["hookSpecificOutput"] as? [String: Any]
         let updated = hookOut?["updatedToolOutput"] as? String ?? ""
-        // Hook strips trailing newlines when building updatedToolOutput (same as shrink check).
-        let expected = ManagedDistillCLI.stripTrailingNewlines(pre.output)
+        XCTAssertTrue(
+            DistillAppliedReceipt.containsMarker(updated),
+            "the nested Wave A receipt must survive updatedToolOutput replacement"
+        )
         XCTAssertEqual(
-            updated,
-            expected,
+            ManagedDistillCLI.stripTrailingNewlines(DistillAppliedReceipt.strip(updated)),
+            ManagedDistillCLI.stripTrailingNewlines(pre.output),
             "hook must return Wave A compressed tool output before ledger POST"
         )
         XCTAssertNotNil(result.deferredSideEffect, "hook must propagate nested Wave A deferred ledger")
@@ -1072,7 +1527,9 @@ final class ManagedDistillCLITests: XCTestCase {
             inputCharacters: ManagedDistillCLI.stdinCapBytes,
             inputTokens: 1_000,
             outputTokens: 10,
-            originalHandle: "h"
+            originalHandle: "h",
+            recoveryIdempotencyKey: "chunk-delivery-key",
+            routeStage: .encoderBERT
         )
         let encoded = try JSONEncoder().encode(response)
         let recorder = RequestRecorder()
@@ -1088,12 +1545,33 @@ final class ManagedDistillCLITests: XCTestCase {
         let decodedRequests = await recorder.all()
 
         XCTAssertEqual(code, 0)
-        XCTAssertGreaterThan(decodedRequests.count, 1, "over-cap input must be split into multiple bounded requests")
-        XCTAssertTrue(decodedRequests.allSatisfy { $0.input.utf8.count <= ManagedDistillCLI.stdinCapBytes })
+        let candidates = decodedRequests.filter { $0.recordSavings != true }
+        let ledgerRequests = decodedRequests.filter { $0.recordSavings == true }
+        XCTAssertGreaterThan(candidates.count, 1, "over-cap input must be split into multiple bounded requests")
+        XCTAssertTrue(candidates.allSatisfy { $0.input.utf8.count <= ManagedDistillCLI.stdinCapBytes })
+        XCTAssertTrue(candidates.allSatisfy { $0.recordSavings == false })
         let text = String(decoding: out, as: UTF8.self)
         XCTAssertTrue(text.contains("chunk summary"))
         XCTAssertTrue(text.contains("[[rc:h]]"), "each lossy chunk must remain retrievable")
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(text), "the completed chunk set must carry one trailing applied receipt")
+        XCTAssertTrue(text.hasSuffix("\n"), "chunked CLI output must retain its terminal LF")
+        XCTAssertLessThan(out.count, oneMB.count, "all chunk handles plus the final receipt must be a net UTF-8 shrink")
         XCTAssertNotEqual(out, oneMB, "successful chunked compression should not fall back to raw output")
+        XCTAssertEqual(ledgerRequests.count, 1, "all chunks must produce one aggregate delivered-savings row")
+        let ledger = try XCTUnwrap(ledgerRequests.first)
+        XCTAssertEqual(ledger.input, String(decoding: oneMB, as: UTF8.self))
+        XCTAssertEqual(ledger.precomputedOutput, text)
+        XCTAssertEqual(ledger.precomputedRouteStage, .encoderBERT)
+        XCTAssertEqual(ledger.precomputedRecoveryConfirmations?.count, candidates.count)
+        XCTAssertTrue(ledger.precomputedRecoveryConfirmations?.allSatisfy {
+            $0.capability == "h" && $0.idempotencyKey == "chunk-delivery-key"
+        } == true)
+        let record = try XCTUnwrap(DistillSavingsCalculator.record(
+            for: ledger,
+            response: try XCTUnwrap(ledger.responseUsingPrecomputedOutput())
+        ))
+        XCTAssertEqual(record.outputTokens, TokenEstimator.estimate(text))
+        XCTAssertEqual(record.savedTokens, max(TokenEstimator.estimate(ledger.input) - TokenEstimator.estimate(text), 0))
     }
 
     func test_compress_overCapChunkFailureFailsOpenToExactRawInput() async {

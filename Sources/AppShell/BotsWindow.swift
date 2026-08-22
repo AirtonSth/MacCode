@@ -2557,6 +2557,13 @@ public final class BotsViewModel: ObservableObject {
     @Published public var isStopping = false
     @Published public private(set) var queuedFollowUps: [BotQueuedFollowUp] = []
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
+    /// Same Token Saver footer figures Agent App shows, from the same calculator.
+    @Published public private(set) var tokenSaverFooterEnabled = false
+    @Published public private(set) var tokenSaverThreadMeasuredTokens = 0
+    @Published public private(set) var tokenSaverThreadSavedTokens = 0
+    @Published public private(set) var tokenSaverOriginalDisplayMessageIds: Set<AgentMessageID> = []
+    private var tokenSaverDisplayModeWriteGeneration: [AgentMessageID: UInt64] = [:]
+    private var tokenSaverDisplayModeWriteTasks: [AgentMessageID: Task<Void, Never>] = [:]
     @Published public private(set) var deskWorkLog: [BotDeskWorkLogRow] = []
     @Published public private(set) var deskLiveTimeline = AssistantTimelineState()
     @Published public private(set) var deskStreamEventCount = 0
@@ -2729,6 +2736,10 @@ public final class BotsViewModel: ObservableObject {
     private var isApplyingStudioDraft = false
     private var shellSidebarVisibilityObserver: NSObjectProtocol?
     private var deskLiveTurnWatch: Task<Void, Never>?
+    private var tokenSaverFooterReloadTask: Task<Void, Never>?
+    private var tokenSaverFooterObserver: NSObjectProtocol?
+    private var tokenSaverFooterAccountObserver: NSObjectProtocol?
+    private var tokenSaverFooterStatusObserver: NSObjectProtocol?
     public var computerGuestService: BotComputerGuestService?
 
     public init(context: AppContext, router: AppCommandRouter? = nil) {
@@ -2762,6 +2773,7 @@ public final class BotsViewModel: ObservableObject {
         restoreUnpublishedNewBotIDsIfNeeded()
         restoreShellSidebarCollapsedIfNeeded()
         observeShellSidebarVisibility()
+        bindTokenSaverThreadFooter()
         reload()
         restoreScreenIfNeeded()
         studioDraftHydrated = true
@@ -2779,8 +2791,18 @@ public final class BotsViewModel: ObservableObject {
 
     deinit {
         deskLiveTurnWatch?.cancel()
+        tokenSaverFooterReloadTask?.cancel()
         if let shellSidebarVisibilityObserver {
             NotificationCenter.default.removeObserver(shellSidebarVisibilityObserver)
+        }
+        if let tokenSaverFooterObserver {
+            NotificationCenter.default.removeObserver(tokenSaverFooterObserver)
+        }
+        if let tokenSaverFooterAccountObserver {
+            NotificationCenter.default.removeObserver(tokenSaverFooterAccountObserver)
+        }
+        if let tokenSaverFooterStatusObserver {
+            NotificationCenter.default.removeObserver(tokenSaverFooterStatusObserver)
         }
         context.coordinator.removeObserver(self)
     }
@@ -3258,6 +3280,188 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// Same eligibility + ledger binding Agent App uses (`wireTokenSaverThreadFooter`).
+    func bindTokenSaverThreadFooter() {
+        let handler: (Notification) -> Void = { [weak self] _ in
+            self?.reloadTokenSaverThreadSavings()
+        }
+        if tokenSaverFooterObserver == nil {
+            tokenSaverFooterObserver = NotificationCenter.default.addObserver(
+                forName: Notification.Name("rc2TokenSaverUsageChanged"),
+                object: nil,
+                queue: .main,
+                using: handler
+            )
+        }
+        if tokenSaverFooterAccountObserver == nil {
+            tokenSaverFooterAccountObserver = NotificationCenter.default.addObserver(
+                forName: Notification.Name("rc2PrivateAccountChanged"),
+                object: nil,
+                queue: .main,
+                using: handler
+            )
+        }
+        if tokenSaverFooterStatusObserver == nil {
+            tokenSaverFooterStatusObserver = NotificationCenter.default.addObserver(
+                forName: Notification.Name("rc2TokenSaverDistillStatusChanged"),
+                object: nil,
+                queue: .main,
+                using: handler
+            )
+        }
+        reloadTokenSaverThreadSavings()
+    }
+
+    private func resetTokenSaverFooterSnapshot() {
+        tokenSaverFooterReloadTask?.cancel()
+        tokenSaverFooterEnabled = false
+        tokenSaverThreadMeasuredTokens = 0
+        tokenSaverThreadSavedTokens = 0
+    }
+
+    func reloadTokenSaverThreadSavings() {
+        tokenSaverFooterReloadTask?.cancel()
+        let ownerBotID = selectedBotID
+        let ownerConversationID = selectedConversation?.id
+        let threadId = selectedConversation?.linkedAgentThreadID
+        let assistantChars = deskMessages
+            .filter { $0.role == .assistant }
+            .reduce(0) { $0 + $1.text.utf8.count }
+        let turnCount = max(
+            deskLiveTimeline.turns.count,
+            deskMessages.filter { $0.role == .user }.count
+        )
+        let usage = deskLiveTimeline.tokenUsage
+        let observation = TokenSaverThreadFooterReload.Observation(
+            assistantChars: assistantChars,
+            turnCount: turnCount,
+            cacheReadInputTokens: usage?.cacheReadInputTokens ?? 0,
+            providerRawTokens: usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0,
+            providerBilledTokenUnits: usage.map(\.billedTotalTokenUnits).flatMap { $0 > 0 ? $0 : nil },
+            autoRoutingActive: deskRouting.routingMode == .auto
+        )
+        let db = context.db
+        let settingsRepo = context.settingsRepo
+        let savingsRepo = context.tokenSaverSavingsRepo
+        tokenSaverFooterReloadTask = Task { [weak self] in
+            let eligible = SettingsStore(db: db).load().tokenSaverEnabled
+                && PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
+            let graphifyActive = SettingsStore(db: db).load().isGraphifyRuntimeActive
+            let measured = await TokenSaverThreadFooterReload.loadMeasured(
+                eligible: eligible,
+                threadId: threadId,
+                repo: savingsRepo
+            )
+            guard !Task.isCancelled else { return }
+            let next = TokenSaverThreadFooterReload.snapshot(
+                measuredDelivered: measured,
+                eligible: eligible,
+                graphifyActive: graphifyActive,
+                observation: observation
+            )
+            await MainActor.run { [weak self] in
+                guard let self, !Task.isCancelled else { return }
+                guard self.selectedBotID == ownerBotID,
+                      self.selectedConversation?.id == ownerConversationID,
+                      self.selectedConversation?.linkedAgentThreadID == threadId else {
+                    return
+                }
+                let current = TokenSaverThreadFooterReload.Snapshot(
+                    enabled: self.tokenSaverFooterEnabled,
+                    measuredTokens: self.tokenSaverThreadMeasuredTokens,
+                    displayTokens: self.tokenSaverThreadSavedTokens
+                )
+                guard TokenSaverThreadFooterReload.shouldPublish(current: current, next: next) else {
+                    return
+                }
+                self.tokenSaverFooterEnabled = next.enabled
+                self.tokenSaverThreadMeasuredTokens = next.measuredTokens
+                self.tokenSaverThreadSavedTokens = next.displayTokens
+            }
+        }
+    }
+
+    func tokenSaverDisplaysOriginal(for messageId: AgentMessageID) -> Bool {
+        tokenSaverOriginalDisplayMessageIds.contains(messageId)
+    }
+
+    func setTokenSaverDisplaysOriginal(_ displaysOriginal: Bool, for messageId: AgentMessageID) {
+        let previousValue = tokenSaverOriginalDisplayMessageIds.contains(messageId)
+        guard previousValue != displaysOriginal else { return }
+        if displaysOriginal {
+            tokenSaverOriginalDisplayMessageIds.insert(messageId)
+        } else {
+            tokenSaverOriginalDisplayMessageIds.remove(messageId)
+        }
+        let generation = (tokenSaverDisplayModeWriteGeneration[messageId] ?? 0) &+ 1
+        tokenSaverDisplayModeWriteGeneration[messageId] = generation
+        let previousTask = tokenSaverDisplayModeWriteTasks[messageId]
+        let repository = context.messageRepo
+        let mode: AgentMessageTokenSaverDisplayMode = displaysOriginal ? .rcw1 : .human
+        tokenSaverDisplayModeWriteTasks[messageId] = Task { @MainActor [weak self] in
+            await previousTask?.value
+            do {
+                try await AgentAppViewModel.persistTokenSaverDisplayModeOffMain(
+                    repository: repository,
+                    messageId: messageId,
+                    mode: mode
+                )
+            } catch {
+                guard let self,
+                      self.tokenSaverDisplayModeWriteGeneration[messageId] == generation else {
+                    return
+                }
+                if previousValue {
+                    self.tokenSaverOriginalDisplayMessageIds.insert(messageId)
+                } else {
+                    self.tokenSaverOriginalDisplayMessageIds.remove(messageId)
+                }
+                self.errorMessage = "Token Saver display choice could not be saved: \(error.localizedDescription)"
+            }
+            guard let self,
+                  self.tokenSaverDisplayModeWriteGeneration[messageId] == generation else {
+                return
+            }
+            self.tokenSaverDisplayModeWriteGeneration.removeValue(forKey: messageId)
+            self.tokenSaverDisplayModeWriteTasks.removeValue(forKey: messageId)
+        }
+    }
+
+    var deskTokenSaverFooterText: String? {
+        AgentChatTokenSaverDisplayMode.footerText(
+            displayTokens: tokenSaverThreadSavedTokens,
+            measuredTokens: tokenSaverThreadMeasuredTokens,
+            enabled: tokenSaverFooterEnabled,
+            autoRoutingActive: deskRouting.routingMode == .auto
+        )
+    }
+
+    func tokenSaverFooterTextForTesting() -> String? { deskTokenSaverFooterText }
+
+    func applyTokenSaverFooterSnapshotForTesting(_ snapshot: TokenSaverThreadFooterReload.Snapshot) {
+        tokenSaverFooterEnabled = snapshot.enabled
+        tokenSaverThreadMeasuredTokens = snapshot.measuredTokens
+        tokenSaverThreadSavedTokens = snapshot.displayTokens
+    }
+
+    func awaitTokenSaverFooterReloadForTesting() async {
+        await tokenSaverFooterReloadTask?.value
+    }
+
+    func replaceDeskMessagesForTesting(_ messages: [BotDeskMessage]) {
+        deskMessages = messages
+    }
+
+    func replaceDeskLiveTimelineForTesting(_ timeline: AssistantTimelineState) {
+        deskLiveTimeline = timeline
+    }
+
+    func tokenSaverMessage(forTurnId turnId: String) -> BotDeskMessage? {
+        let matches = deskMessages.filter { $0.tokenSaverTurnId == turnId }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
+    }
+
     public func beginCreate() {
         requestLeaveUnsavedNewBot { [weak self] in
             self?.beginCreateNow()
@@ -3554,6 +3758,8 @@ public final class BotsViewModel: ObservableObject {
         messagesByBot[bot.id] = []
         messagesConversationIDByBot[bot.id] = nil
         deskMessages = []
+        resetTokenSaverFooterSnapshot()
+        tokenSaverOriginalDisplayMessageIds = []
         deskThreadSearchQuery = ""
         attentionItems.removeAll {
             $0.botID == bot.id && $0.conversationID != nil
@@ -3567,6 +3773,7 @@ public final class BotsViewModel: ObservableObject {
     public func selectDeskThread(_ id: BotConversationID) {
         guard let conversation = conversations.first(where: { $0.id == id }) else { return }
         captureDeskRouting()
+        resetTokenSaverFooterSnapshot()
         selectedConversation = conversation
         selectedConversationByBot[conversation.botID] = conversation.id
         applyDeskRouting(for: conversation)
@@ -3574,6 +3781,7 @@ public final class BotsViewModel: ObservableObject {
         restoreDeskMessages(botID: conversation.botID)
         restoreDeskWorkLog(botID: conversation.botID)
         restoreDeskLiveTurn(botID: conversation.botID)
+        reloadTokenSaverThreadSavings()
         deskTimelineRejoinToken &+= 1
     }
 
@@ -4315,12 +4523,14 @@ public final class BotsViewModel: ObservableObject {
             let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attached)
             let conversation = try persistUserMessage(bot: bot, text: display)
             appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: bot.id, conversationID: conversation.id)
-            _ = try enqueueSupervisedBotRun(
+            if let started = try enqueueSupervisedBotRun(
                 bot: bot,
                 conversation: conversation,
                 userText: message,
                 attachments: attached
-            )
+            ) {
+                stampDeskUserMessageIdentity(runID: started.runID, botID: bot.id)
+            }
             return true
         } catch {
             errorMessage = String(describing: error)
@@ -4395,6 +4605,7 @@ public final class BotsViewModel: ObservableObject {
         ) else {
             throw BotStoreError.invalidRow("Bot runtime is unavailable")
         }
+        stampDeskUserMessageIdentity(runID: prepared.runID, botID: bot.id)
         return .object([
             "bot_id": .string(bot.id.value.uuidString.lowercased()),
             "conversation_id": .string(prepared.conversation.id.value.uuidString.lowercased()),
@@ -5346,6 +5557,7 @@ public final class BotsViewModel: ObservableObject {
 
     private func reloadSelectedBot(id: BotID) {
         leaveDeskLiveWatch()
+        resetTokenSaverFooterSnapshot()
         let threadID = destConversation(for: id)?.linkedAgentThreadID
         deskLiveTimeline = threadID.flatMap { liveTimelineByThread[$0] } ?? AssistantTimelineState()
         deskStreamEventCount = threadID.flatMap { liveStreamCountByThread[$0] } ?? 0
@@ -5360,6 +5572,7 @@ public final class BotsViewModel: ObservableObject {
         restoreDeskWorkLog(botID: id)
         restoreDeskLiveTurn(botID: id)
         reloadStudioSupport(id: id)
+        reloadTokenSaverThreadSavings()
         if let bot = bots.first(where: { $0.id == id }) {
             settleTerminalWorkingConversation(bot: bot)
         }
@@ -6794,6 +7007,13 @@ public final class BotsViewModel: ObservableObject {
                         }
                         text = BotPeerTranscript.displayTextFromPeerAsk(text)
                     }
+                    text = AgentChatTranscriptChrome.displayUserLine(
+                        text: AgentChatTranscriptChrome.promptByRemovingDisplayDecorations(
+                            from: text,
+                            attachments: message.attachments
+                        ),
+                        attachments: message.attachments
+                    )
                 case .assistant:
                     role = .assistant
                     text = message.content
@@ -6830,6 +7050,9 @@ public final class BotsViewModel: ObservableObject {
         messagesConversationIDByBot[botID] = conversation?.id
         if selectedBotID == botID {
             deskMessages = visible
+            if selectedConversation?.botID == botID {
+                reloadTokenSaverThreadSavings()
+            }
         }
         if let last = visible.last, !last.text.isEmpty {
             lastPreviewByBot[botID] = last.text
@@ -6846,9 +7069,28 @@ public final class BotsViewModel: ObservableObject {
             threadId: threadID,
             messageIds: messageIds
         )) ?? [:]
+        let responses = (try? context.messageRepo.rcw1ResponseTranslations(
+            threadId: threadID,
+            messageIds: messageIds
+        )) ?? [:]
+        let modes = (try? context.messageRepo.tokenSaverDisplayModes(
+            threadId: threadID,
+            messageIds: messageIds
+        )) ?? [:]
+        var originalIds = tokenSaverOriginalDisplayMessageIds
         for index in messages.indices {
             guard let id = messages[index].agentMessageID else { continue }
             messages[index].tokenSaverWireRequest = requests[id]
+            if let response = responses[id] {
+                messages[index].tokenSaverOriginal = response.wireResponseText
+                messages[index].tokenSaverTurnId = response.turnId
+            }
+            if modes[id] == .rcw1 {
+                originalIds.insert(id)
+            }
+        }
+        if selectedBotID != nil {
+            tokenSaverOriginalDisplayMessageIds = originalIds
         }
     }
 
@@ -7089,6 +7331,35 @@ public final class BotsViewModel: ObservableObject {
         }
         lastPreviewByBot[botID] = message.text
         lastUpdatedByBot[botID] = message.createdAt
+    }
+
+    private func stampDeskUserMessageIdentity(runID: AgentRunID, botID: BotID) {
+        let messageID = AgentMessageID(runID.value)
+        func stamp(_ messages: inout [BotDeskMessage]) {
+            guard let index = messages.lastIndex(where: {
+                $0.role == .user && $0.agentMessageID == nil
+            }) else { return }
+            var next = messages[index]
+            next.agentMessageID = messageID
+            messages[index] = BotDeskMessage(
+                id: messageID.value,
+                role: next.role,
+                text: next.text,
+                createdAt: next.createdAt,
+                peer: next.peer,
+                agentMessageID: messageID,
+                tokenSaverWireRequest: next.tokenSaverWireRequest,
+                tokenSaverOriginal: next.tokenSaverOriginal,
+                tokenSaverTurnId: next.tokenSaverTurnId
+            )
+        }
+        if var cached = messagesByBot[botID] {
+            stamp(&cached)
+            messagesByBot[botID] = cached
+        }
+        if selectedBotID == botID {
+            stamp(&deskMessages)
+        }
     }
 
     @discardableResult
@@ -7770,13 +8041,15 @@ public final class BotsViewModel: ObservableObject {
                 botID: bot.id,
                 conversationID: target.id
             )
-            _ = try enqueueSupervisedBotRun(
+            if let started = try enqueueSupervisedBotRun(
                 bot: bot,
                 conversation: target,
                 userText: next.text,
                 attachments: next.attachments,
                 routingOverride: next.routing
-            )
+            ) {
+                stampDeskUserMessageIdentity(runID: started.runID, botID: bot.id)
+            }
         } catch {
             errorMessage = String(describing: error)
             return
@@ -9914,6 +10187,14 @@ public struct BotsRootView: View {
                         columnWidth: columnWidth
                     )
                 }
+                if !vm.deskRunIsLive && !vm.deskShowsLoading,
+                   let text = vm.deskTokenSaverFooterText {
+                    AgentChatTokenSaverThreadFooter(
+                        text: text,
+                        autoRouting: vm.deskRouting.routingMode == .auto
+                    )
+                    .id("agent.tokenSaver.footer")
+                }
                 deskTimelineStatusChrome()
             }
         }
@@ -9944,14 +10225,16 @@ public struct BotsRootView: View {
             AgentChatLiveTurnView(
                 turn: turn,
                 live: vm.deskRunIsLive && !turn.finished,
-                hideAssistantOutput: hideAssistantOutput
+                hideAssistantOutput: hideAssistantOutput,
+                renderFinal: deskTokenSaverFinal(for: turn)
             )
         case .liveTurnSegment(let segment, let hideAssistantOutput):
             AgentChatLiveTurnView(
                 turn: segment.snapshot,
                 live: vm.deskRunIsLive && !segment.snapshot.finished,
                 hideAssistantOutput: hideAssistantOutput,
-                showsWorkHeader: AgentChatLiveTurnChrome.showsWorkHeader(for: segment)
+                showsWorkHeader: AgentChatLiveTurnChrome.showsWorkHeader(for: segment),
+                renderFinal: deskTokenSaverFinal(for: segment.snapshot)
             )
         }
     }
@@ -9989,16 +10272,18 @@ public struct BotsRootView: View {
             Group {
                 if message.role == .user {
                     AgentChatUserBubble(
-                        text: message.text,
+                        text: deskUserDisplayText(message),
                         createdAt: message.createdAt,
                         columnWidth: columnWidth,
                         accessibilityIdentifier: "agent.userMessageBubble",
-                        roleIdentifier: "bots.desk.role.user"
+                        roleIdentifier: "bots.desk.role.user",
+                        belowBubble: deskTokenSaverUserControl(message)
                     )
                 } else {
                     AgentChatAssistantReply(
-                        text: message.text,
-                        roleIdentifier: "bots.desk.role.assistant"
+                        text: deskAssistantCopyText(message),
+                        roleIdentifier: "bots.desk.role.assistant",
+                        content: deskTokenSaverAssistantContent(message)
                     )
                 }
             }
@@ -10016,6 +10301,138 @@ public struct BotsRootView: View {
                     avatarSymbol: peer.avatarSymbol
                 )
             }
+        }
+    }
+
+    private func deskUserDisplayText(_ message: BotDeskMessage) -> String {
+        let mode = AgentChatTokenSaverDisplayMode.from(
+            displaysOriginal: message.agentMessageID.map { vm.tokenSaverDisplaysOriginal(for: $0) } ?? false
+        )
+        return AgentChatTokenSaverDisplayMode.userMessageDisplayText(
+            human: message.text,
+            wireRequest: message.tokenSaverWireRequest,
+            mode: mode
+        )
+    }
+
+    private func deskAssistantCopyText(_ message: BotDeskMessage) -> String {
+        guard let original = message.tokenSaverOriginal else { return message.text }
+        let mode = AgentChatTokenSaverDisplayMode.from(
+            displaysOriginal: message.agentMessageID.map { vm.tokenSaverDisplaysOriginal(for: $0) } ?? false
+        )
+        return AgentChatTokenSaverDisplayMode.copyText(
+            translated: message.text,
+            original: original,
+            request: message.tokenSaverWireRequest,
+            mode: mode
+        )
+    }
+
+    private func deskTokenSaverUserControl(_ message: BotDeskMessage) -> AnyView? {
+        guard let messageId = message.agentMessageID,
+              let request = message.tokenSaverWireRequest,
+              AgentChatTokenSaverDisplayMode.showsDisplayControl(
+                original: "",
+                request: request,
+                allowsRequestOnlyRCW1: true
+              ) else { return nil }
+        return AnyView(deskTokenSaverDisplayControl(messageId: messageId, alignment: .trailing))
+    }
+
+    private func deskTokenSaverAssistantContent(_ message: BotDeskMessage) -> AnyView? {
+        let showBadge = AgentChatTokenSaverDisplayMode.showsOptimizedBadge(
+            wasTokenSaverOptimized: message.tokenSaverOriginal != nil
+                || message.tokenSaverWireRequest != nil
+        )
+        guard showBadge else { return nil }
+        let messageId = message.agentMessageID
+        let original = message.tokenSaverOriginal
+        let mode = AgentChatTokenSaverDisplayMode.from(
+            displaysOriginal: messageId.map { vm.tokenSaverDisplaysOriginal(for: $0) } ?? false
+        )
+        return AnyView(
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                if let original,
+                   AgentChatTokenSaverDisplayMode.showsOriginalContent(original: original, mode: mode) {
+                    AgentChatTokenSaverOriginalContent(
+                        original: original,
+                        request: message.tokenSaverWireRequest,
+                        identifierSuffix: messageId?.value.uuidString ?? message.id.uuidString,
+                        onCopy: { AgentChatTranscriptChrome.copyToPasteboard($0) }
+                    )
+                } else {
+                    if original == nil {
+                        AgentChatTokenSaverOptimizedBadge(
+                            messageId: messageId?.value.uuidString ?? message.id.uuidString
+                        )
+                    }
+                    AgentMessageMarkdownView(text: message.text)
+                        .foregroundColor(DS.Palette.text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if let messageId, let original,
+                   AgentChatTokenSaverDisplayMode.showsDisplayControl(
+                    original: original,
+                    request: message.tokenSaverWireRequest,
+                    allowsRequestOnlyRCW1: false
+                   ) {
+                    deskTokenSaverDisplayControl(messageId: messageId, alignment: .leading)
+                }
+            }
+        )
+    }
+
+    private func deskTokenSaverDisplayControl(
+        messageId: AgentMessageID,
+        alignment: Alignment
+    ) -> AgentChatTokenSaverDisplayControl {
+        let key = AgentChatTokenSaverDisplayMode.messageDisplayKey(messageId.value.uuidString)
+        return AgentChatTokenSaverDisplayControl(
+            mode: Binding(
+                get: {
+                    AgentChatTokenSaverDisplayMode.from(
+                        displaysOriginal: vm.tokenSaverDisplaysOriginal(for: messageId)
+                    )
+                },
+                set: { mode in
+                    vm.setTokenSaverDisplaysOriginal(mode == .rcw1, for: messageId)
+                }
+            ),
+            identifier: key,
+            alignment: alignment
+        )
+    }
+
+    private func deskTokenSaverFinal(
+        for turn: AssistantTurnSnapshot
+    ) -> ((String) -> AnyView)? {
+        guard let linked = vm.tokenSaverMessage(forTurnId: turn.turnId),
+              let original = linked.tokenSaverOriginal else { return nil }
+        return { final in
+            AnyView(
+                AgentChatAssistantReply(
+                    text: deskAssistantCopyText(
+                        BotDeskMessage(
+                            role: .assistant,
+                            text: final,
+                            agentMessageID: linked.agentMessageID,
+                            tokenSaverWireRequest: linked.tokenSaverWireRequest,
+                            tokenSaverOriginal: original
+                        )
+                    ),
+                    roleIdentifier: "bots.desk.role.assistant",
+                    content: deskTokenSaverAssistantContent(
+                        BotDeskMessage(
+                            role: .assistant,
+                            text: final,
+                            agentMessageID: linked.agentMessageID,
+                            tokenSaverWireRequest: linked.tokenSaverWireRequest,
+                            tokenSaverOriginal: original
+                        )
+                    )
+                )
+            )
         }
     }
 
