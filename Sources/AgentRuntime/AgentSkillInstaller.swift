@@ -1315,7 +1315,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         }
         // Legacy: a pre-native Python script carrying our markers — clean it up too.
         if fileManager.fileExists(atPath: url.path),
-           let text = try? String(contentsOf: url, encoding: .utf8),
+           let text = (try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) },
            text.contains(Self.distillCLIBeginMarker),
            text.contains(Self.distillCLIEndMarker) {
             try fileManager.removeItem(at: url)
@@ -1829,7 +1829,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             }
         }
         let codex = codexConfigURL()
-        if let text = try? String(contentsOf: codex, encoding: .utf8) {
+        if let text = (try? Data(contentsOf: codex, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) } {
             let stripped = Self.removingMarkerBlock(
                 text,
                 begin: ComputerUseMCPAdmit.tomlBeginMarker,
@@ -1856,7 +1856,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     private func installCodexComputerUseMCP(binary: URL) throws {
         let url = codexConfigURL()
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
         let next = ComputerUseMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
         try Data(next.utf8).write(to: url, options: .atomic)
     }
@@ -1878,7 +1878,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     private func installCodexBotSelfConfigMCP(binary: URL) throws {
         let url = codexConfigURL()
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
         let next = BotSelfConfigMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
         try Data(next.utf8).write(to: url, options: .atomic)
     }
@@ -1900,7 +1900,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     private func installCodexBotBrowserMCP(binary: URL) throws {
         let url = codexConfigURL()
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
         let next = BotBrowserMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
         try Data(next.utf8).write(to: url, options: .atomic)
     }
@@ -1922,7 +1922,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     private func installCodexBotComputerMCP(binary: URL) throws {
         let url = codexConfigURL()
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
         let next = BotComputerMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
         try Data(next.utf8).write(to: url, options: .atomic)
     }
@@ -1944,7 +1944,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     private func installCodexBotWebMCP(binary: URL) throws {
         let url = codexConfigURL()
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
         let next = BotWebMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
         try Data(next.utf8).write(to: url, options: .atomic)
     }
@@ -1963,7 +1963,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         }
         // Codex: remove our marker block, keep the rest of config.toml.
         let codex = codexConfigURL()
-        if let text = try? String(contentsOf: codex, encoding: .utf8) {
+        if let text = (try? Data(contentsOf: codex, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) } {
             let stripped = Self.removingMarkerBlock(text, begin: Self.mcpBeginMarker, end: Self.mcpEndMarker)
             try? Data(stripped.utf8).write(to: codex, options: .atomic)
         }
@@ -1979,7 +1979,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         args = ["mcp"]
         \(Self.mcpEndMarker)
         """
-        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
         let migrated = Self.removingTOMLTable(existing, named: "mcp_servers.\(Self.retrieveMCPName)")
         let next = Self.upsertMarkerBlock(migrated, begin: Self.mcpBeginMarker, end: Self.mcpEndMarker, block: block)
         try Data(next.utf8).write(to: url, options: .atomic)
@@ -2232,7 +2232,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 if dest == target.path { return }
                 try fileManager.removeItem(at: link)
             } else if fileManager.fileExists(atPath: link.path) {
-                let existing = (try? String(contentsOf: link, encoding: .utf8)) ?? ""
+                let existing = ((try? Data(contentsOf: link, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
                 guard existing.contains(Self.distillCLIBeginMarker)
                     || existing.contains("distill/src/cli")
                     || existing.contains("dev/distill") else {
@@ -2605,6 +2605,14 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return found.sorted { $0.relativePath < $1.relativePath }
     }
 
+    private func mappedString(at url: URL) throws -> String {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard let str = String(data: data, encoding: .utf8) else {
+            throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [NSFilePathErrorKey: url.path])
+        }
+        return str
+    }
+
     private func validateManagedPackage(at directory: URL) throws -> RemoteCodeOrchestrateManifest {
         let manifestURL = directory.appendingPathComponent(Self.remoteCodeOrchestrateManifestName)
         let manifest = try decoder.decode(RemoteCodeOrchestrateManifest.self, from: Data(contentsOf: manifestURL, options: .mappedIfSafe))
@@ -2915,7 +2923,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let current: String
         if fileManager.fileExists(atPath: url.path) {
-            current = try String(contentsOf: url, encoding: .utf8)
+            current = try mappedString(at: url)
         } else {
             current = ""
         }
@@ -2941,7 +2949,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         guard fileManager.fileExists(atPath: url.path) else {
             return .notPresent
         }
-        let current = try String(contentsOf: url, encoding: .utf8)
+        let current = try mappedString(at: url)
         guard let range = Self.rangeOfDistillInstructionsBlock(in: current) else {
             return .notPresent
         }
