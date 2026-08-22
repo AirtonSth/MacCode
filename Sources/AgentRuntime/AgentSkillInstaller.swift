@@ -2607,7 +2607,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     private func validateManagedPackage(at directory: URL) throws -> RemoteCodeOrchestrateManifest {
         let manifestURL = directory.appendingPathComponent(Self.remoteCodeOrchestrateManifestName)
-        let manifest = try decoder.decode(RemoteCodeOrchestrateManifest.self, from: Data(contentsOf: manifestURL))
+        let manifest = try decoder.decode(RemoteCodeOrchestrateManifest.self, from: Data(contentsOf: manifestURL, options: .mappedIfSafe))
         guard manifest.schemaVersion == 1,
               manifest.managedBy == "RemoteCode",
               manifest.skillID == remoteCodeOrchestratePackage.skillID else {
@@ -2635,7 +2635,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         let runtimeManifestURL = directory.appendingPathComponent(Self.remoteCodeOrchestrateRuntimeManifestName)
         let runtimeManifest = try decoder.decode(
             RemoteCodeOrchestrateRuntimeManifest.self,
-            from: Data(contentsOf: runtimeManifestURL)
+            from: Data(contentsOf: runtimeManifestURL, options: .mappedIfSafe)
         )
         guard runtimeManifest.schemaVersion == 1,
               runtimeManifest.packageID == manifest.skillID,
