@@ -5025,6 +5025,46 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(timeline.turns[0].items[0].distillApplied, true)
     }
 
+    func test_chooseReplayRetainsPersistedHostTruthWhenSnapshotMutatesAttestedBytes() {
+        // WHY: adapters may retain a raw late delta that the live coordinator
+        // rejected after attestation. Reopening must never carry the trusted
+        // badge onto that richer but byte-different provider snapshot.
+        let persisted: [AssistantEvent] = [
+            .turnStarted(turnId: "persisted"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "persisted", type: .tool,
+                state: .completed, body: "trusted body", output: "trusted output",
+                startedAtMs: 7, finishedAtMs: 8
+            )),
+            .itemHostMetadata(turnId: "persisted", itemId: "tool", distillApplied: true)
+        ]
+        let snapshot: [AssistantEvent] = [
+            .turnStarted(turnId: "snapshot"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "snapshot", type: .tool,
+                state: .completed, body: "trusted body", output: "trusted output",
+                startedAtMs: 7, finishedAtMs: 8
+            )),
+            .itemDelta(
+                itemId: "tool",
+                bodyAppend: nil,
+                outputAppend: " unsigned late output",
+                summary: nil
+            ),
+            .itemStarted(item: AssistantItem(
+                id: "richer", turnId: "snapshot", type: .tool, startedAtMs: 9
+            ))
+        ]
+
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: snapshot)
+        let timeline = AgentAppViewModel.timelineByReplaying(chosen)
+
+        XCTAssertEqual(chosen, persisted,
+                       "byte-different provider history must not inherit persisted host truth")
+        XCTAssertEqual(timeline.turns[0].items[0].output, "trusted output")
+        XCTAssertEqual(timeline.turns[0].items[0].distillApplied, true)
+    }
+
     func test_chooseReplayRejectsProviderOwnedHostMetadata() {
         // WHY: snapshot/parser events are provider-owned and may not mint the
         // host-only badge even when local persisted history is empty.

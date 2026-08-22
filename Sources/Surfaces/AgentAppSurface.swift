@@ -2601,10 +2601,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             guard persistedIdentityCounts[identity] == 1,
                   let matches = snapshotItemsByIdentity[identity],
                   matches.count == 1,
-                  let match = matches.first else {
+                  let match = matches.first,
+                  replayItemAttestedContentMatches(persistedItem, match.item) else {
                 // A richer snapshot is not worth losing or moving durable host
                 // truth. Keep the exact persisted replay when correlation is not
-                // a one-to-one mapping.
+                // one-to-one or the provider history changed the attested bytes.
                 return persisted
             }
             merged.append(.itemHostMetadata(
@@ -2618,6 +2619,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     nonisolated private static func replayItemIdentity(_ item: AssistantItem) -> String {
         "\(item.id.utf8.count)|\(item.id)|\(item.type.rawValue)|\(item.startedAtMs)"
+    }
+
+    nonisolated private static func replayItemAttestedContentMatches(
+        _ persisted: AssistantItem,
+        _ snapshot: AssistantItem
+    ) -> Bool {
+        guard persisted.body.utf8.elementsEqual(snapshot.body.utf8) else { return false }
+        switch (persisted.output, snapshot.output) {
+        case (nil, nil):
+            return true
+        case (let persistedOutput?, let snapshotOutput?):
+            return persistedOutput.utf8.elementsEqual(snapshotOutput.utf8)
+        default:
+            return false
+        }
     }
 
     nonisolated static func renderableItemCount(_ events: [AssistantEvent]) -> Int {

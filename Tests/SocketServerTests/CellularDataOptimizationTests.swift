@@ -368,9 +368,10 @@ final class CellularDataOptimizationTests: XCTestCase {
                        "rendered text must be byte-identical to unaggregated stream")
     }
 
-    func test_C16_cellularCoalescingKey_scopesAgentItemDeltaToThreadAndItem() {
-        // WHY: provider item IDs are only meaningful inside a thread. Keying on
-        // item_id alone can concatenate output from two conversations.
+    func test_C16_cellularCoalescingKey_requiresThreadItemAndTurn() {
+        // WHY: provider item IDs can repeat across both threads and turns. A
+        // delta without turn identity must stay in arrival-order buffering so
+        // an item-start event can fence a later reuse.
         let event = EventBus.Event(
             seq: 1,
             kind: "agent.item.delta",
@@ -381,9 +382,9 @@ final class CellularDataOptimizationTests: XCTestCase {
             ]),
             ts: 0
         )
-        XCTAssertEqual(
+        XCTAssertNil(
             EventStreamFilter.cellularSafe().coalescingKey(for: event),
-            "agent.item.delta:8:thread-3:6:item-9:no-turn"
+            "ordinary deltas without turn_id must not enter cross-event keyed coalescing"
         )
         XCTAssertTrue(EventStreamFilter.cellularSafe().coalescingMergesByConcatenation(for: event))
         XCTAssertNil(EventStreamFilter.full.coalescingKey(for: event),
@@ -414,10 +415,10 @@ final class CellularDataOptimizationTests: XCTestCase {
             ]),
             ts: 0
         )
-        XCTAssertNotEqual(
-            EventStreamFilter.cellularSafe().coalescingKey(for: event),
+        XCTAssertEqual(
             EventStreamFilter.cellularSafe().coalescingKey(for: hostMetadata),
-            "host attestation must not coalesce with an item id reused outside its exact turn"
+            "agent.item.delta:8:thread-3:6:item-9:turn:6:turn-1",
+            "turn-scoped host metadata may coalesce only inside its exact item occurrence"
         )
     }
 

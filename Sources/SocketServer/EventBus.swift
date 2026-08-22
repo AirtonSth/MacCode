@@ -766,9 +766,12 @@ public final class EventBus: @unchecked Sendable {
 }
 
 enum AgentItemDeltaCoalescingIdentity {
-    static func key(threadID: String, itemID: String, turnID: String?) -> String {
+    static func key(threadID: String, itemID: String, turnID: String?) -> String? {
+        // Ordinary AppContext deltas do not carry a turn id. They must remain
+        // in arrival-order buffering so an item-start boundary fences providers
+        // that reuse the same item id in a later turn.
+        guard let turnID, !turnID.isEmpty else { return nil }
         let base = "agent.item.delta:\(threadID.utf8.count):\(threadID):\(itemID.utf8.count):\(itemID)"
-        guard let turnID else { return base + ":no-turn" }
         return base + ":turn:\(turnID.utf8.count):\(turnID)"
     }
 }

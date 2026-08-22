@@ -189,12 +189,47 @@ final class TokenSaverDistillReceiptCoordinatorTests: XCTestCase {
             XCTAssertTrue(timeline.turns.first?.items.first?.output?.contains("[[rcd:v2.") == true)
         }
     }
+
+    func test_durableTerminalReconcileRevokesReceiptAuthorityBeforeLateCallback() async throws {
+        // WHY: a durable terminal row can be reconciled before the provider
+        // callback closes. Its old receipt key/scope must not badge fresh bytes
+        // from that late callback or keep the callback lease resident.
+        let fixture = try ReceiptCoordinatorFixture.make(
+            provider: .claude,
+            scenario: .authenticated
+        )
+        defer { fixture.cleanUp() }
+
+        let runID = AgentRunID()
+        _ = try await fixture.coordinator.startRun(.init(
+            runId: runID,
+            threadId: fixture.thread.id,
+            provider: .claude,
+            model: "receipt-test",
+            cwd: fixture.root.path,
+            prompt: "exercise terminal receipt cleanup"
+        ))
+        try fixture.runRepository.markStopped(id: runID, status: .completed)
+
+        XCTAssertEqual(fixture.coordinator.reconcileStaleActiveOwnershipWithDurableState(), 1)
+        XCTAssertFalse(
+            fixture.coordinator.distillReceiptAuthorityRunIDsForTesting.contains(runID),
+            "terminal reconciliation must revoke every receipt authority map before late callbacks"
+        )
+
+        try fixture.runner.emitFreshAuthenticatedItemAfterTerminal()
+        XCTAssertFalse(fixture.observer.recordedEvents.contains { event in
+            if case .itemHostMetadata(_, "late-tool-item", true) = event { return true }
+            return false
+        }, "a late callback must not reuse receipt authority from the terminal run")
+    }
 }
 
 private struct ReceiptCoordinatorFixture {
     let root: URL
     let stateFile: URL
     let coordinator: AgentRunCoordinator
+    let runRepository: AgentRunRepository
     let thread: AgentThread
     let runner: ReceiptCoordinatorRunner
     let observer: ReceiptCoordinatorObserver
@@ -258,6 +293,7 @@ private struct ReceiptCoordinatorFixture {
             root: root,
             stateFile: stateFile,
             coordinator: coordinator,
+            runRepository: runRepository,
             thread: thread,
             runner: runner,
             observer: observer
@@ -295,6 +331,7 @@ private final class ReceiptCoordinatorRunner: AgentProviderRunner, @unchecked Se
     private let scenario: Scenario
     private let lock = NSLock()
     private var callback: (@Sendable (AgentRunEvent) -> Void)?
+    private var signedRootRunID: String?
 
     init(provider: AgentProvider, key: Data, scenario: Scenario) {
         self.provider = provider
@@ -319,6 +356,7 @@ private final class ReceiptCoordinatorRunner: AgentProviderRunner, @unchecked Se
              .removeStateBeforeCompletion, .worldReadableState:
             signedRoot = root
         }
+        lock.withLock { signedRootRunID = signedRoot }
         let prefix = Data("condensed provider output\n".utf8)
         guard let marker = DistillAppliedReceipt.makeV2Marker(
             rootRunID: signedRoot,
@@ -389,6 +427,37 @@ private final class ReceiptCoordinatorRunner: AgentProviderRunner, @unchecked Se
         return AgentRunHandle(runId: request.runId, process: nil) {}
     }
 
+    func emitFreshAuthenticatedItemAfterTerminal() throws {
+        let captured = lock.withLock { (callback, signedRootRunID) }
+        guard let callback = captured.0, let rootRunID = captured.1 else {
+            throw ReceiptCoordinatorTestError.callbackUnavailable
+        }
+        let prefix = Data("late condensed provider output\n".utf8)
+        guard let marker = DistillAppliedReceipt.makeV2Marker(
+            rootRunID: rootRunID,
+            payload: prefix,
+            key: key,
+            nonce: Data(repeating: 0xF3, count: 16)
+        ) else {
+            throw ReceiptCoordinatorTestError.markerCreationFailed
+        }
+        callback(.event(.turnStarted(turnId: "late-receipt-turn")))
+        callback(.event(.itemStarted(item: AssistantItem(
+            id: "late-tool-item",
+            turnId: "late-receipt-turn",
+            type: .commandExecution,
+            body: "late distill build output",
+            startedAtMs: 3
+        ))))
+        callback(.event(.itemDelta(
+            itemId: "late-tool-item",
+            bodyAppend: nil,
+            outputAppend: String(decoding: prefix, as: UTF8.self) + marker + "\n",
+            summary: "Late build"
+        )))
+        callback(.event(.itemCompleted(itemId: "late-tool-item", finalState: .completed)))
+    }
+
     func finish() {
         let callback = lock.withLock { self.callback }
         callback?(.event(.turnCompleted(turnId: "receipt-turn", finalMessage: "done")))
@@ -398,6 +467,7 @@ private final class ReceiptCoordinatorRunner: AgentProviderRunner, @unchecked Se
 
 private enum ReceiptCoordinatorTestError: Error {
     case markerCreationFailed
+    case callbackUnavailable
 }
 
 private final class ReceiptCoordinatorObserver: AgentRunObserver {

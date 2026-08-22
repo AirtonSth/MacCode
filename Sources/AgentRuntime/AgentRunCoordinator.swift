@@ -4197,6 +4197,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         pendingThreadStops.remove(threadId)
         orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
         externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
+        distillReceiptRunScopes.removeValue(forKey: runId)
+        distillReceiptVerifiers.removeValue(forKey: runId)
+        distillReceiptItemTurnIDs.removeValue(forKey: runId)
+        authenticatedDistillReceiptItems.removeValue(forKey: runId)
+        authenticatedFinalReceiptTexts.removeValue(forKey: runId)
         seq.removeValue(forKey: runId)
         discardRunThreadOwnershipIfReleasedLocked(runId)
         lastPersistedAssistantContent.removeValue(forKey: threadId)
@@ -4372,6 +4377,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 .union(receiptUsageEnrichmentRetryScheduled)
                 .union(pendingReceiptFinalizations.keys)
                 .union(receiptFinalizationRetryScheduled)
+        }
+    }
+
+    var distillReceiptAuthorityRunIDsForTesting: Set<AgentRunID> {
+        lock.withLock {
+            Set(distillReceiptRunScopes.keys)
+                .union(distillReceiptVerifiers.keys)
+                .union(distillReceiptItemTurnIDs.keys)
+                .union(authenticatedDistillReceiptItems.keys)
+                .union(authenticatedFinalReceiptTexts.keys)
         }
     }
     #endif
