@@ -128,6 +128,7 @@ private final class PendingProviderStart: @unchecked Sendable {
     private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
     private var settledHandle: AgentRunHandle?
     private var startFailed = false
+    private var acceptanceInvalidated = false
 
     init(runId: AgentRunID, acceptancePermit: AgentRunAcceptancePermit) {
         self.runId = runId
@@ -157,7 +158,13 @@ private final class PendingProviderStart: @unchecked Sendable {
 
     @discardableResult
     func invalidateAcceptance() -> AgentRunAcceptanceAttempt? {
-        acceptancePermit.invalidate()
+        let attempt = acceptancePermit.invalidate()
+        lock.withLock { acceptanceInvalidated = true }
+        return attempt
+    }
+
+    func isAcceptanceInvalidated() -> Bool {
+        lock.withLock { acceptanceInvalidated }
     }
 
     func record(handle: AgentRunHandle) {
@@ -1379,6 +1386,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// start. Payload consumers must remain content-free or store only scoped,
     /// retention-governed data.
     public var onRunPrepared: (@Sendable (_ request: AgentRunRequest, _ originalPrompt: String) async -> Void)?
+    /// After a successful spawn claim and before `sendTurn`. Tests park here so
+    /// Stop can win the pending start's acceptance without racing durable prep.
+    var afterSpawnClaimForTesting: (@Sendable (_ request: AgentRunRequest) async -> Void)?
+    /// After the post-claim Stop re-check and immediately before `sendTurn`.
+    var afterSpawnConfirmForTesting: (@Sendable (_ request: AgentRunRequest) async -> Void)?
 
     /// Fired (on an arbitrary executor) when a final assistant message was wire-rendered
     /// and persisted. Callers can use the id to badge the message in the UI.
@@ -2149,6 +2161,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
             throw AgentRunAcceptanceError.cancelled
         }
+        await afterSpawnClaimForTesting?(effectiveRequest)
+        guard confirmSpawnClaimStillLive(threadId: effectiveRequest.threadId) else {
+            markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
+            throw AgentRunAcceptanceError.cancelled
+        }
         if recordUserMessage, isWireOutbound {
             // The human prompt is stored on AgentMessage; persist only the
             // provider-bound RCW1 bytes here so the user row can disclose the
@@ -2196,6 +2213,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let coordinator = self
         let handle: AgentRunHandle
         do {
+            await afterSpawnConfirmForTesting?(effectiveRequest)
+            guard confirmSpawnClaimStillLive(threadId: effectiveRequest.threadId) else {
+                markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
+                throw AgentRunAcceptanceError.cancelled
+            }
             sendTurnEntered = true
             handle = try await runner.sendTurn(effectiveRequest) { ev in
                 coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
@@ -2790,13 +2812,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let activeRunId = activeThreads[threadId]
         let activeHandle = activeRunId.flatMap { active[$0] }
         let pendingResult = settledPendingStart?.result()
-        let runId = activeRunId ?? (pendingResult?.failed == true ? nil : settledPendingStart?.runId)
+        lock.unlock()
+        let durableRun = try durableActiveRun(threadId: threadId)
+        let runId = activeRunId
+            ?? (pendingResult?.failed == true ? nil : settledPendingStart?.runId)
+            ?? durableRun?.id
         let handle = activeHandle ?? pendingResult?.handle
+        let awaitsInMemoryProvider = activeRunId != nil || activeHandle != nil || settledPendingStart != nil
         if let runId {
+            lock.lock()
             awaitingTerminationRuns.insert(runId)
             awaitingRunIds.insert(runId)
+            lock.unlock()
         }
-        lock.unlock()
 
         let adapter = try? adapterForThread(threadId)
         var processTracker: ProcessTerminator.TreeTracker? = {
@@ -2808,26 +2836,33 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         stopRun(threadId: threadId)
         while true {
             lock.lock()
-            let providerTerminated = runId.map(providerTerminatedRuns.contains) ?? true
+            let providerTerminated = runId.map(providerTerminatedRuns.contains) ?? false
+            let pendingStill = pendingProviderStarts[threadId] != nil
             lock.unlock()
             processTracker?.refresh()
             let survivingPIDs = processTracker?.survivingPIDs() ?? []
             let processTreeDead = survivingPIDs.isEmpty
-            let terminationConfirmed = providerTerminated ||
-                (processTracker != nil && processTreeDead) ||
-                runId == nil
+            let durableStillActive = try durableActiveRun(threadId: threadId) != nil
+            let preparing = isPreparingProviderStart(threadId: threadId)
+            let providerSessionAlive = adapter.map {
+                providerSessionIsLive($0, threadId: threadId)
+            } ?? false
 
             // Terminal adapters can intentionally retain resumable sessions.
             // Deletion is different: once terminal is confirmed, release that
             // session before certifying that no provider child work remains.
-            if terminationConfirmed && processTreeDead,
+            if (providerTerminated || processTreeDead),
                adapter?.hasSession(threadId: threadId) == true {
                 try? adapter?.stopSession(threadId: threadId)
             }
-            let providerSessionAlive = adapter.map {
-                providerSessionIsLive($0, threadId: threadId)
-            } ?? false
-            if terminationConfirmed && processTreeDead && !providerSessionAlive {
+            if awaitsInMemoryProvider {
+                let terminationConfirmed = providerTerminated
+                    || (processTracker != nil && processTreeDead)
+                if terminationConfirmed && processTreeDead && !providerSessionAlive {
+                    return
+                }
+            } else if !durableStillActive && !preparing && !pendingStill
+                        && !providerSessionAlive && processTreeDead {
                 return
             }
 
@@ -2943,8 +2978,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// so a late claimSpawn/sendTurn cannot start the provider.
     /// Arms `pendingThreadStops` only when a pending start or surface reservation
     /// exists — pure Graphify-only cancel before claim must not poison resend.
+    /// Invalidates the pending start's acceptance permit under the coordinator
+    /// lock so a concurrent `withAcceptance` cannot claim after Stop is recorded.
     public func cancelPreparation(threadId: AgentThreadID) {
         lock.lock()
+        let pendingStart = pendingProviderStarts[threadId]
+        // Invalidate before unlock so a concurrent withAcceptance cannot
+        // claim a still-pending permit after Stop is recorded.
+        _ = pendingStart?.invalidateAcceptance()
         _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
         let reservedForThread = reservedProviderStarts.filter { $0.value == threadId }
         // Per-run cancel tokens so one Stop cancels every reserved run. Do not
@@ -2953,7 +2994,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         for runId in reservedForThread.keys {
             cancelledProviderStartRuns[runId] = threadId
         }
-        if pendingProviderStarts[threadId] != nil {
+        if pendingStart != nil {
             pendingThreadStops.insert(threadId)
         }
         reservedProviderStarts = reservedProviderStarts.filter { $0.value != threadId }
@@ -3050,6 +3091,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         lock.unlock()
         return ok
+    }
+
+    /// Re-checks Stop after the spawn-claim lock is released. A Desk stop can
+    /// arrive in that gap; `sendTurn` must not start the provider.
+    private func confirmSpawnClaimStillLive(threadId: AgentThreadID) -> Bool {
+        lock.lock()
+        let stopArmed = pendingThreadStops.remove(threadId) != nil
+        let acceptanceRevoked = pendingProviderStarts[threadId]?.isAcceptanceInvalidated() == true
+        if stopArmed || acceptanceRevoked {
+            _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
+            lock.unlock()
+            return false
+        }
+        lock.unlock()
+        return true
     }
 
     private func providerSessionIsLive(

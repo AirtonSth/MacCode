@@ -367,6 +367,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Downloads (that forced multi-folder TCC spam). Every button marks
     /// onboarding *handled* (not “permissions granted”) so launch never nags.
     func presentHostFileAccessOnboardingIfNeeded() {
+        if LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
+            return
+        }
         guard let context else { return }
         let repo = SettingsRepository(db: context.db)
         guard HostFileAccessOnboarding.shouldPresent(
@@ -1334,6 +1337,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     func presentPairingPrompt(_ prompt: PairingPrompt) {
+        if LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
+            localAuth?.approvePairingRequest(prompt.requestId)
+            NSLog("pairing.prompt.e2e_auto_approve request_id=%@", prompt.requestId)
+            return
+        }
         // Only one pairing sheet at a time. If a new request arrives while one
         // is open, deny the pending one first to avoid leaking approval state.
         if let pending = pairingPromptPending {
@@ -1446,9 +1454,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             panel.center()
         }
 
-        NSApp.activate(ignoringOtherApps: true)
-        panel.orderFrontRegardless()
-        panel.makeKeyAndOrderFront(nil)
+        if !LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
+            NSApp.activate(ignoringOtherApps: true)
+            panel.orderFrontRegardless()
+            panel.makeKeyAndOrderFront(nil)
+        }
         NSLog(
             "pairing.prompt.presented request_id=%@ visible=%d key=%d",
             prompt.requestId,

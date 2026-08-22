@@ -10,6 +10,11 @@ import XCTest
 /// bundle identifier and icon, so users can install it as an update.
 @MainActor
 final class AppIdentityNotificationTests: XCTestCase {
+    override func tearDown() {
+        unsetenv("RC2_E2E_AUTO_APPROVE_PAIRING")
+        super.tearDown()
+    }
+
     private func closeAndUnregisterAllSurfaces() {
         let surfaces = SurfaceRegistry.shared.all()
         surfaces.forEach { $0.close() }
@@ -250,6 +255,29 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(status.status, "approved")
         XCTAssertNotNil(status.token,
                         "same-account auto-approval must still mint a normal trusted-device token for later direct RPC auth")
+    }
+
+    func testE2EEnvPairingAutoApprovesWithoutMacPrompt() throws {
+        // Isolated E2E AppSupport has no private-account session, so the
+        // subscribed-account auto-approve path cannot fire. This env must
+        // approve without presenting the Mac panel or blocking the main thread.
+        setenv("RC2_E2E_AUTO_APPROVE_PAIRING", "1", 1)
+        defer { unsetenv("RC2_E2E_AUTO_APPROVE_PAIRING") }
+
+        let dir = NSTemporaryDirectory() + "RC2E2EPairing-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let auth = LocalAuthAdapter(repo: DeviceTrustRepository(db: ctx.db))
+        let prompted = PromptFlag()
+        auth.onPairingRequest = { _ in prompted.value = true }
+
+        let request = try XCTUnwrap(auth.createPairingRequest(deviceName: "iPhone"))
+        let status = try XCTUnwrap(auth.pairingRequestStatus(requestId: request.requestId))
+
+        XCTAssertFalse(prompted.value,
+                       "RC2_E2E_AUTO_APPROVE_PAIRING=1 must approve pairing without presenting the Mac Approve panel")
+        XCTAssertEqual(status.status, "approved")
+        XCTAssertNotNil(status.token,
+                        "E2E env auto-approval must still mint a trusted-device token for later direct RPC auth")
     }
 
     func testPrivateAccountRefreshUsesRefreshTokenBeforeDroppingOptionalSession() async throws {

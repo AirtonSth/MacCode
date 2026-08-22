@@ -13,6 +13,7 @@ final class BotHomeFilesRouter: FilesSurfaceRouting {
     var onDidSave: ((String, String) -> Void)?
     private let locksBotHomeProjections: Bool
     private(set) var lastOpenTabPath: String?
+    private(set) var lastOpenWasSplit = false
     private var state: [String: JSONValue] = [
         "current_directory": .string(""),
         "reader_mode": .string("source"),
@@ -122,6 +123,7 @@ final class BotHomeFilesRouter: FilesSurfaceRouting {
         path: String
     ) throws -> SurfaceDescriptor {
         lastOpenTabPath = path
+        lastOpenWasSplit = false
         return SurfaceDescriptor(type: .files, title: (path as NSString).lastPathComponent)
     }
 
@@ -132,6 +134,8 @@ final class BotHomeFilesRouter: FilesSurfaceRouting {
         direction: SplitDirection,
         path: String
     ) throws -> SurfaceDescriptor {
+        lastOpenTabPath = path
+        lastOpenWasSplit = true
         return SurfaceDescriptor(type: .files, title: (path as NSString).lastPathComponent)
     }
 

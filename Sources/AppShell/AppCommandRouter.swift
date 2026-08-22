@@ -315,7 +315,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Fires after inbound attachments pass `validatedForRetry` on the managed store.
     var sendAgentMessageResolvedAttachmentsProbeForTesting: (([AgentAttachment]) -> Void)?
     /// Fires after send preflight resolves, whether from cache or a catalog list.
-    var sendAgentMessageAfterPreflightProbeForTesting: (() -> Void)?
+    var sendAgentMessageAfterPreflightProbeForTesting: (() async -> Void)?
     var listAgentProviderSnapshotsCallCountForTesting = 0
     var preflightListedProviderSnapshotsForTesting = false
     private var cachedProviderSnapshots: [AgentProviderSnapshot] = []
@@ -2837,6 +2837,250 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return JSONValue.from(result)
     }
 
+    private var pairedBotRemote: BotRemoteControlAuthority?
+
+    public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
+        let authority = try pairedBotAuthority()
+        let foundation = Self.foundationObject(params)
+        do {
+            var result = try authority.dispatch(method: method, params: foundation)
+            botsViewModel?.reloadQueuedFollowUpsFromStore()
+            if method == "bot.get" || method == "bot.send" {
+                result = enrichPairedBotAssistant(params: foundation, result: result)
+            }
+            return JSONValue.from(result)
+        } catch let error as BotRemoteControlAuthority.Error {
+            throw JSONRPCError(code: error.code, message: error.message)
+        }
+    }
+
+    private func enrichPairedBotAssistant(params: [String: Any], result: [String: Any]) -> [String: Any] {
+        let rawID = (params["bot_id"] as? String)
+            ?? (result["bot_id"] as? String)
+            ?? (result["id"] as? String)
+        guard let rawID, let uuid = UUID(uuidString: rawID),
+              let reply = botsViewModel?.lastAssistantText(for: BotID(uuid)),
+              !reply.isEmpty else {
+            return result
+        }
+        var next = result
+        next["last_reply"] = reply
+        if var readback = next["readback"] as? [String: Any] {
+            if readback["reply"] == nil {
+                readback["reply"] = reply
+                next["readback"] = readback
+            }
+        }
+        return next
+    }
+
+    private func pairedBotAuthority() throws -> BotRemoteControlAuthority {
+        if let pairedBotRemote { return pairedBotRemote }
+        guard let ctx = context else {
+            throw JSONRPCError(code: -32004, message: "The calling session no longer exists.")
+        }
+        let created = BotRemoteControlAuthority(
+            db: ctx.db,
+            store: ctx.botStore,
+            settings: SettingsStore(db: ctx.db),
+            appSupportDirectory: ctx.appSupportDirectory
+        )
+        created.onHasLiveRun = { [weak self] id in
+            self?.botsViewModel?.hasLiveRun(botID: id) ?? false
+        }
+        created.onStopRun = { [weak self] id, force, requestID in
+            self?.botsViewModel?.stopLiveRuns(for: id, force: force) { ok in
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: ok,
+                    readback: [
+                        "accepted": true,
+                        "force": force,
+                        "terminal": ok,
+                    ]
+                )
+            }
+        }
+        created.onStartGuest = { [weak self] id, _, requestID in
+            self?.botsViewModel?.presentGuestDesktop(botID: id) { ok in
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: ok,
+                    readback: [
+                        "bot_id": id.value.uuidString.lowercased(),
+                        "status": ok ? "running" : "failed",
+                        "viewer": "/vnc.html",
+                        "embed_html_is_not_runtime": true,
+                    ]
+                )
+            }
+        }
+        created.onStopGuest = { [weak self] id, requestID in
+            self?.botsViewModel?.stopDockerGuest(botID: id) { ok in
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: ok,
+                    readback: [
+                        "bot_id": id.value.uuidString.lowercased(),
+                        "status": ok ? "stopped" : "failed",
+                        "viewer": "/vnc.html",
+                        "embed_html_is_not_runtime": true,
+                    ]
+                )
+            }
+        }
+        created.onRebuildGuest = { [weak self] id, requestID in
+            self?.botsViewModel?.rebuildDockerGuest(botID: id) { ok in
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: ok,
+                    readback: [
+                        "bot_id": id.value.uuidString.lowercased(),
+                        "status": ok ? "running" : "failed",
+                        "viewer": "/vnc.html",
+                        "embed_html_is_not_runtime": true,
+                    ]
+                )
+            }
+        }
+        created.onGuestInput = { [weak self] id, params, requestID in
+            guard let service = self?.botsViewModel?.computerGuestService else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32091,
+                    message: "Bot guest input is unavailable."
+                )
+            }
+            let steps = try Self.guestInputSteps(params)
+            Task.detached { [weak self] in
+                do {
+                    try service.act(botID: id, steps: steps)
+                    await MainActor.run {
+                        self?.settlePairedBot(
+                            requestID: requestID,
+                            ok: true,
+                            readback: [
+                                "bot_id": id.value.uuidString.lowercased(),
+                                "status": "running",
+                                "viewer": "/vnc.html",
+                                "embed_html_is_not_runtime": true,
+                            ]
+                        )
+                    }
+                } catch {
+                    await MainActor.run {
+                        self?.settlePairedBot(
+                            requestID: requestID,
+                            ok: false,
+                            readback: [
+                                "bot_id": id.value.uuidString.lowercased(),
+                                "status": "failed",
+                                "error": String(describing: error),
+                                "viewer": "/vnc.html",
+                                "embed_html_is_not_runtime": true,
+                            ]
+                        )
+                    }
+                }
+            }
+        }
+        created.onDockerClear = { [weak self] id in
+            guard let service = self?.botsViewModel?.computerGuestService else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32088,
+                    message: "Docker home clear failed."
+                )
+            }
+            try service.removeGuestRuntime(botID: id)
+        }
+        created.onSend = { [weak self] id, text in
+            guard let vm = self?.botsViewModel else { return }
+            _ = try vm.enqueueHostMessage(
+                botID: id,
+                text: text,
+                conversationID: nil,
+                routing: BotDeskRouting()
+            )
+        }
+        created.onOpenFile = { [weak self] botID, path, split, root in
+            guard let vm = self?.botsViewModel else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32089,
+                    message: "Bot files surface is unavailable."
+                )
+            }
+            try vm.openRemoteFile(botID: botID, relativePath: path, split: split, root: root)
+        }
+        created.notifyBrowserPendingOpen = { [weak self] name in
+            DistributedNotificationCenter.default().post(name: name, object: nil)
+            _ = try self?.reconcileBotBrowserOpens()
+        }
+        pairedBotRemote = created
+        return created
+    }
+
+    /// Settle after `dispatch` returns. `mutate` overwrites in-flight settle,
+    /// and `NSLock` is not recursive.
+    private func settlePairedBot(requestID: String, ok: Bool, readback: [String: Any]) {
+        DispatchQueue.main.async { [weak self] in
+            self?.pairedBotRemote?.settle(
+                requestID: requestID,
+                status: ok ? .completed : .failed,
+                readback: readback
+            )
+        }
+    }
+
+    private static func guestInputSteps(_ params: [String: Any]) throws -> [BotComputerActStep] {
+        if let raw = params["steps"] as? [[String: Any]] {
+            let steps = raw.map { dict in
+                BotComputerActStep(
+                    action: dict["action"] as? String ?? "",
+                    x: dict["x"] as? Int ?? (dict["x"] as? NSNumber)?.intValue,
+                    y: dict["y"] as? Int ?? (dict["y"] as? NSNumber)?.intValue,
+                    text: dict["text"] as? String,
+                    key: dict["key"] as? String
+                )
+            }
+            try BotComputerGuestObserve.assertActStepCount(steps.count)
+            return steps
+        }
+        if let text = params["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return [BotComputerActStep(action: "type", text: text)]
+        }
+        if let key = params["key"] as? String, !key.isEmpty {
+            return [BotComputerActStep(action: "key", key: key)]
+        }
+        if let x = params["x"] as? Int ?? (params["x"] as? NSNumber)?.intValue,
+           let y = params["y"] as? Int ?? (params["y"] as? NSNumber)?.intValue {
+            return [BotComputerActStep(action: "click", x: x, y: y)]
+        }
+        throw BotRemoteControlAuthority.Error.invalidParams
+    }
+
+    private static func foundationObject(_ params: [String: JSONValue]) -> [String: Any] {
+        var out: [String: Any] = [:]
+        for (key, value) in params {
+            out[key] = foundationValue(value)
+        }
+        return out
+    }
+
+    private static func foundationValue(_ value: JSONValue) -> Any {
+        switch value {
+        case .null: return NSNull()
+        case .bool(let flag): return flag
+        case .number(let number): return number
+        case .string(let text): return text
+        case .array(let items): return items.map(foundationValue)
+        case .object(let object):
+            var nested: [String: Any] = [:]
+            for (key, nestedValue) in object {
+                nested[key] = foundationValue(nestedValue)
+            }
+            return nested
+        }
+    }
+
     public func viewHostBotSkill(
         botID: BotID,
         skillID: String,
@@ -4067,7 +4311,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 allowProviderCatalogListing: allowProviderCatalogListingDuringPreflight
             )
         }
-        sendAgentMessageAfterPreflightProbeForTesting?()
+        if let probe = sendAgentMessageAfterPreflightProbeForTesting {
+            await probe()
+        }
+        if Task.isCancelled {
+            throw CancellationError()
+        }
         if existing.status == .running
             || ctx.coordinator.hasPendingProviderStart(threadId: thread)
             || ctx.coordinator.hasProviderSession(threadId: thread) {
@@ -6719,7 +6968,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// kind-refused or invalid open is skipped with an NSLog, never a surface.
     @discardableResult
     public func reconcileBotBrowserOpens() throws -> [BotBrowserTarget] {
-        guard let ctx = context else { return [] }
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let store = BotBrowserStore(appSupportDirectory: ctx.appSupportDirectory)
         var applied: [BotBrowserTarget] = []
         for item in try store.takePendingOpens() {

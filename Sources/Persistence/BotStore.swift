@@ -13,6 +13,34 @@ public enum BotStoreError: Error, Equatable, CustomStringConvertible {
     }
 }
 
+public struct BotQueuedFollowUpRecord: Equatable, Sendable {
+    public var id: String
+    public var botID: BotID
+    public var conversationID: String?
+    public var text: String
+    public var payloadJSON: String
+    public var sortOrder: Int
+    public var createdAt: Date
+
+    public init(
+        id: String = UUID().uuidString.lowercased(),
+        botID: BotID,
+        conversationID: String? = nil,
+        text: String,
+        payloadJSON: String = "{}",
+        sortOrder: Int = 0,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.botID = botID
+        self.conversationID = conversationID
+        self.text = text
+        self.payloadJSON = payloadJSON
+        self.sortOrder = sortOrder
+        self.createdAt = createdAt
+    }
+}
+
 public final class BotStore: @unchecked Sendable {
     // These values satisfy the pre-thread-routing NOT NULL columns only. They
     // are never decoded into BotRevision or consulted as an execution route.
@@ -372,6 +400,7 @@ public final class BotStore: @unchecked Sendable {
                     name: routine.definition.name,
                     prompt: routine.definition.prompt,
                     scheduleNote: routine.definition.scheduleNote,
+                    scheduleSpecJSON: routine.definition.scheduleSpecJSON,
                     createdAt: now,
                     updatedAt: now
                 )
@@ -425,6 +454,7 @@ public final class BotStore: @unchecked Sendable {
             try executeBound("DELETE FROM bot_skill_bindings WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_routine_activations WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_routine_definitions WHERE bot_id = ?;", id: id)
+            try executeBound("DELETE FROM bot_queued_follow_ups WHERE bot_id = ?;", id: id)
         }
     }
 
@@ -1260,6 +1290,109 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func listQueuedFollowUps(botID: BotID) throws -> [BotQueuedFollowUpRecord] {
+        try db.performSync { database in
+            try self.loadQueuedFollowUps(botID: botID, database: database)
+        }
+    }
+
+    public func listAllQueuedFollowUps() throws -> [BotQueuedFollowUpRecord] {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                """
+                SELECT id, bot_id, conversation_id, text, payload_json, sort_order, created_at
+                FROM bot_queued_follow_ups
+                ORDER BY bot_id ASC, sort_order ASC;
+                """
+            )
+            defer { statement.reset() }
+            var rows: [BotQueuedFollowUpRecord] = []
+            while try statement.step() {
+                rows.append(try decodeQueuedFollowUp(statement))
+            }
+            return rows
+        }
+    }
+
+    public func enqueueQueuedFollowUp(_ record: BotQueuedFollowUpRecord) throws -> BotQueuedFollowUpRecord {
+        try db.transaction {
+            guard let bot = try loadBot(id: record.botID, database: db), bot.deletedAt == nil else {
+                throw BotStoreError.notFound
+            }
+            let nextOrder = try nextQueuedFollowUpSortOrder(botID: record.botID, database: db)
+            let stored = BotQueuedFollowUpRecord(
+                id: record.id,
+                botID: record.botID,
+                conversationID: record.conversationID,
+                text: record.text,
+                payloadJSON: record.payloadJSON.isEmpty ? "{}" : record.payloadJSON,
+                sortOrder: nextOrder,
+                createdAt: record.createdAt
+            )
+            try insertQueuedFollowUp(stored, database: db)
+            return stored
+        }
+    }
+
+    public func replaceQueuedFollowUps(botID: BotID, items: [BotQueuedFollowUpRecord]) throws {
+        try db.transaction {
+            try deleteQueuedFollowUpsLocked(botID: botID, database: db)
+            for (index, item) in items.enumerated() {
+                try insertQueuedFollowUp(
+                    BotQueuedFollowUpRecord(
+                        id: item.id,
+                        botID: botID,
+                        conversationID: item.conversationID,
+                        text: item.text,
+                        payloadJSON: item.payloadJSON.isEmpty ? "{}" : item.payloadJSON,
+                        sortOrder: index,
+                        createdAt: item.createdAt
+                    ),
+                    database: db
+                )
+            }
+        }
+    }
+
+    public func removeQueuedFollowUp(botID: BotID, id: String) throws {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                "DELETE FROM bot_queued_follow_ups WHERE bot_id = ? AND id = ?;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, botID.value.uuidString.lowercased())
+            try statement.bind(2, id)
+            _ = try statement.step()
+        }
+    }
+
+    public func dequeueQueuedFollowUp(botID: BotID) throws -> BotQueuedFollowUpRecord? {
+        try db.transaction {
+            let statement = try db.prepare(
+                """
+                SELECT id, bot_id, conversation_id, text, payload_json, sort_order, created_at
+                FROM bot_queued_follow_ups
+                WHERE bot_id = ?
+                ORDER BY sort_order ASC
+                LIMIT 1;
+                """
+            )
+            defer { statement.reset() }
+            try statement.bind(1, botID.value.uuidString.lowercased())
+            guard try statement.step() else { return nil }
+            let record = try decodeQueuedFollowUp(statement)
+            statement.reset()
+            try removeQueuedFollowUpLocked(botID: botID, id: record.id, database: db)
+            return record
+        }
+    }
+
+    public func deleteQueuedFollowUps(botID: BotID) throws {
+        try db.performSync { database in
+            try deleteQueuedFollowUpsLocked(botID: botID, database: database)
+        }
+    }
+
     // MARK: - Internals
 
     private func publishLocked(
@@ -1546,6 +1679,88 @@ public final class BotStore: @unchecked Sendable {
         defer { statement.reset() }
         try statement.bind(1, id.value.uuidString.lowercased())
         _ = try statement.step()
+    }
+
+    private func loadQueuedFollowUps(botID: BotID, database: SQLiteDB) throws -> [BotQueuedFollowUpRecord] {
+        let statement = try database.prepare(
+            """
+            SELECT id, bot_id, conversation_id, text, payload_json, sort_order, created_at
+            FROM bot_queued_follow_ups
+            WHERE bot_id = ?
+            ORDER BY sort_order ASC;
+            """
+        )
+        defer { statement.reset() }
+        try statement.bind(1, botID.value.uuidString.lowercased())
+        var rows: [BotQueuedFollowUpRecord] = []
+        while try statement.step() {
+            rows.append(try decodeQueuedFollowUp(statement))
+        }
+        return rows
+    }
+
+    private func nextQueuedFollowUpSortOrder(botID: BotID, database: SQLiteDB) throws -> Int {
+        let statement = try database.prepare(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM bot_queued_follow_ups WHERE bot_id = ?;"
+        )
+        defer { statement.reset() }
+        try statement.bind(1, botID.value.uuidString.lowercased())
+        guard try statement.step() else { return 0 }
+        return Int(statement.columnInt64(0)) + 1
+    }
+
+    private func insertQueuedFollowUp(_ record: BotQueuedFollowUpRecord, database: SQLiteDB) throws {
+        let statement = try database.prepare(
+            """
+            INSERT INTO bot_queued_follow_ups(
+                id, bot_id, conversation_id, text, payload_json, sort_order, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?);
+            """
+        )
+        defer { statement.reset() }
+        try statement.bind(1, record.id)
+        try statement.bind(2, record.botID.value.uuidString.lowercased())
+        try statement.bind(3, record.conversationID)
+        try statement.bind(4, record.text)
+        try statement.bind(5, record.payloadJSON)
+        try statement.bind(6, record.sortOrder)
+        try statement.bind(7, string(record.createdAt))
+        _ = try statement.step()
+    }
+
+    private func deleteQueuedFollowUpsLocked(botID: BotID, database: SQLiteDB) throws {
+        let statement = try database.prepare("DELETE FROM bot_queued_follow_ups WHERE bot_id = ?;")
+        defer { statement.reset() }
+        try statement.bind(1, botID.value.uuidString.lowercased())
+        _ = try statement.step()
+    }
+
+    private func removeQueuedFollowUpLocked(botID: BotID, id: String, database: SQLiteDB) throws {
+        let statement = try database.prepare(
+            "DELETE FROM bot_queued_follow_ups WHERE bot_id = ? AND id = ?;"
+        )
+        defer { statement.reset() }
+        try statement.bind(1, botID.value.uuidString.lowercased())
+        try statement.bind(2, id)
+        _ = try statement.step()
+    }
+
+    private func decodeQueuedFollowUp(_ statement: SQLiteStatement) throws -> BotQueuedFollowUpRecord {
+        guard let id = statement.columnText(0),
+              let botRaw = statement.columnText(1),
+              let botUUID = UUID(uuidString: botRaw),
+              let text = statement.columnText(3) else {
+            throw BotStoreError.invalidRow("queued follow-up is missing identity")
+        }
+        return BotQueuedFollowUpRecord(
+            id: id,
+            botID: BotID(botUUID),
+            conversationID: statement.columnText(2),
+            text: text,
+            payloadJSON: statement.columnText(4) ?? "{}",
+            sortOrder: Int(statement.columnInt64(5)),
+            createdAt: date(statement.columnText(6)) ?? Date(timeIntervalSince1970: 0)
+        )
     }
 
     private func loadBot(id: BotID, database: SQLiteDB) throws -> BotDefinition? {

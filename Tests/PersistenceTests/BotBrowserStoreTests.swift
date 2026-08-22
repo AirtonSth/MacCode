@@ -209,6 +209,27 @@ final class BotBrowserStoreTests: XCTestCase {
         XCTAssertTrue(try store.loadPendingOpens().isEmpty)
     }
 
+    func test_applyPendingOpens_keepsIntentWhenOpenerFails() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-bot-browser-pending-fail-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bot = BotID()
+        let store = BotBrowserStore(appSupportDirectory: root)
+        _ = try BotBrowserHost.requestOpen(
+            store: store,
+            botID: bot,
+            url: "https://login.example.test/in",
+            title: "Sign in",
+            notify: { _ in }
+        )
+        XCTAssertThrowsError(
+            try BotBrowserHost.applyPendingOpens(store: store) { _, _, _ in
+                throw BotBrowserError.invalid("no workspace")
+            }
+        )
+        XCTAssertEqual(try store.loadPendingOpens().map(\.url), ["https://login.example.test/in"])
+    }
+
     func test_waitLoginUsesStoredPageState() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc-bot-browser-wait-\(UUID().uuidString)", isDirectory: true)

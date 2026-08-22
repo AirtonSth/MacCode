@@ -33,9 +33,10 @@ public enum Schema {
     /// shipped Token Saver receipts at that number), v76 owns Bot
     /// routine schedule spec (frequency, provider, model, reasoning),
     /// v77 owns nullable agent_runs.terminal_reason (downgrade-safe),
-    /// v78 deduplicates Token Saver savings by logical request, and v79 keeps
-    /// authenticated item metadata outside the rolling replay window.
-    public static let currentVersion: Int = 79
+    /// v78 deduplicates Token Saver savings by logical request, v79 keeps
+    /// authenticated item metadata outside the rolling replay window, and
+    /// v80 owns host-authoritative Bot queued follow-ups.
+    public static let currentVersion: Int = 80
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1736,6 +1737,19 @@ public enum Schema {
                h.stream_event_id AS ordering_id, h.run_id, r.thread_id
         FROM agent_item_host_attestations h
         JOIN agent_runs r ON r.id = h.run_id;
+        """),
+        SchemaStep(80, """
+        CREATE TABLE IF NOT EXISTS bot_queued_follow_ups (
+            id TEXT PRIMARY KEY,
+            bot_id TEXT NOT NULL,
+            conversation_id TEXT,
+            text TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            sort_order INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS bot_queued_follow_ups_bot_sort
+            ON bot_queued_follow_ups(bot_id, sort_order);
         """),
     ]
 
