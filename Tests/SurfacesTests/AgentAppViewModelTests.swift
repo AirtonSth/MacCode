@@ -4967,14 +4967,14 @@ final class AgentAppViewModelTests: XCTestCase {
     }
 
     func test_chooseReplayCarriesHostDistillTruthByUniqueProviderItemIdentity() {
-        // WHY: provider item IDs may repeat across turns and adapter snapshots
-        // can use different turn IDs. A stable item timestamp distinguishes the
-        // provider occurrence without trusting turn ordinal alone.
+        // WHY: provider item IDs may repeat across turns, while Codex live and
+        // thread/read assign different turn IDs and timestamps to the same item.
+        // Turn occurrence plus in-turn (id,type) ordinal is the stable identity.
         let persisted: [AssistantEvent] = [
             .turnStarted(turnId: "persisted-first"),
-            .itemStarted(item: AssistantItem(id: "shared", turnId: "persisted-first", type: .tool, startedAtMs: 1)),
+            .itemStarted(item: AssistantItem(id: "shared", turnId: "persisted-first", type: .tool, startedAtMs: 101)),
             .turnStarted(turnId: "persisted-second"),
-            .itemStarted(item: AssistantItem(id: "shared", turnId: "persisted-second", type: .tool, startedAtMs: 2)),
+            .itemStarted(item: AssistantItem(id: "shared", turnId: "persisted-second", type: .tool, startedAtMs: 202)),
             .itemHostMetadata(turnId: "persisted-second", itemId: "shared", distillApplied: true)
         ]
         let snapshot: [AssistantEvent] = [
@@ -5003,8 +5003,8 @@ final class AgentAppViewModelTests: XCTestCase {
     }
 
     func test_chooseReplayRetainsPersistedHostTruthWhenSnapshotMappingIsAmbiguous() {
-        // WHY: a richer provider snapshot may insert or reorder turns. If two
-        // snapshot items claim the same provider identity, no target is safe.
+        // WHY: a richer provider snapshot may insert or reorder turns. If the
+        // paired turn occurrence lacks the attested (id,type), no target is safe.
         let persisted: [AssistantEvent] = [
             .turnStarted(turnId: "persisted"),
             .itemStarted(item: AssistantItem(id: "shared", turnId: "persisted", type: .tool, startedAtMs: 7)),
@@ -5012,9 +5012,9 @@ final class AgentAppViewModelTests: XCTestCase {
         ]
         let snapshot: [AssistantEvent] = [
             .turnStarted(turnId: "inserted-leading"),
-            .itemStarted(item: AssistantItem(id: "shared", turnId: "inserted-leading", type: .tool, startedAtMs: 7)),
+            .itemStarted(item: AssistantItem(id: "other", turnId: "inserted-leading", type: .tool, startedAtMs: 7)),
             .turnStarted(turnId: "reordered-match"),
-            .itemStarted(item: AssistantItem(id: "shared", turnId: "reordered-match", type: .tool, startedAtMs: 7))
+            .itemStarted(item: AssistantItem(id: "shared", turnId: "reordered-match", type: .tool, startedAtMs: 8))
         ]
 
         let chosen = AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: snapshot)

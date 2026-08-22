@@ -147,6 +147,18 @@ final class TokenSaverDistillReceiptCoordinatorTests: XCTestCase {
                 if case .itemDelta(let itemId, _, _, _) = $0, itemId == "tool-item" { return true }
                 return false
             }.count, 1, "\(provider.rawValue) must drop the late unsigned delta")
+            XCTAssertFalse(events.contains {
+                if case .itemProgress(let itemId, _) = $0, itemId == "tool-item" { return true }
+                return false
+            }, "\(provider.rawValue) must drop late unsigned progress")
+            XCTAssertFalse(events.contains {
+                if case .itemState(let itemId, _) = $0, itemId == "tool-item" { return true }
+                return false
+            }, "\(provider.rawValue) must drop late unsigned state")
+            XCTAssertEqual(events.filter {
+                if case .itemCompleted(let itemId, _) = $0, itemId == "tool-item" { return true }
+                return false
+            }.count, 1, "\(provider.rawValue) must admit only the paired completion")
 
             fixture.runner.finish()
             var timeline = AssistantTimelineState()
@@ -157,6 +169,8 @@ final class TokenSaverDistillReceiptCoordinatorTests: XCTestCase {
             XCTAssertEqual(item.body, "distill build output")
             XCTAssertFalse(item.output?.contains("unsigned replacement") == true)
             XCTAssertFalse(item.output?.contains("late unsigned output") == true)
+            XCTAssertEqual(item.state, .completed)
+            XCTAssertNil(item.progress)
             XCTAssertEqual(item.distillApplied, true)
         }
     }
@@ -423,6 +437,9 @@ private final class ReceiptCoordinatorRunner: AgentProviderRunner, @unchecked Se
                 outputAppend: " late unsigned output",
                 summary: "late unsigned summary"
             )))
+            onEvent(.event(.itemProgress(itemId: "tool-item", progress: 0.25)))
+            onEvent(.event(.itemState(itemId: "tool-item", state: .streaming)))
+            onEvent(.event(.itemCompleted(itemId: "tool-item", finalState: .failed)))
         }
         return AgentRunHandle(runId: request.runId, process: nil) {}
     }

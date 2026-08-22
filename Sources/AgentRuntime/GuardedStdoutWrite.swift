@@ -58,4 +58,14 @@ public enum GuardedStdoutWrite {
         }
         return true
     }
+
+    /// Returns `value` only after every byte reaches the downstream consumer.
+    /// Callers use this to suppress delivery-dependent ledger work after EPIPE.
+    public static func deliveredValue<Value>(
+        _ value: Value?,
+        afterWriting data: Data,
+        to fd: Int32 = STDOUT_FILENO
+    ) -> Value? {
+        writeAll(data, to: fd) ? value : nil
+    }
 }

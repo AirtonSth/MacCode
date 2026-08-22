@@ -123,6 +123,34 @@ final class AssistantTimelineTests: XCTestCase {
         XCTAssertNil(state.turns[1].items[0].distillApplied)
     }
 
+    func test_distillMetadataAllowsPairedCompletionThenFreezesTerminalPresentation() {
+        // WHY: the receipt authenticates terminal bytes just before the genuine
+        // completion event. That completion must land once, while late provider
+        // progress/state/completion callbacks may not rewrite the attested row.
+        var state = AssistantTimelineState()
+        state.apply(.itemStarted(item: AssistantItem(
+            id: "tool",
+            turnId: "turn",
+            type: .commandExecution,
+            body: "trusted body",
+            output: "trusted output",
+            startedAtMs: 1
+        )))
+        state.apply(.itemHostMetadata(turnId: "turn", itemId: "tool", distillApplied: true))
+        state.apply(.itemCompleted(itemId: "tool", finalState: .completed), nowMs: 2)
+        state.apply(.itemProgress(itemId: "tool", progress: 0.25), nowMs: 3)
+        state.apply(.itemState(itemId: "tool", state: .streaming), nowMs: 4)
+        state.apply(.itemCompleted(itemId: "tool", finalState: .failed), nowMs: 5)
+
+        let item = state.turns[0].items[0]
+        XCTAssertEqual(item.state, .completed)
+        XCTAssertEqual(item.finishedAtMs, 2)
+        XCTAssertNil(item.progress)
+        XCTAssertEqual(item.body, "trusted body")
+        XCTAssertEqual(item.output, "trusted output")
+        XCTAssertEqual(item.distillApplied, true)
+    }
+
     func test_providerChosenItemIDCannotConsumeBufferedHostDistillTruth() {
         var timeline = AssistantTimelineState()
         timeline.apply(.turnStarted(turnId: "trusted-turn"))

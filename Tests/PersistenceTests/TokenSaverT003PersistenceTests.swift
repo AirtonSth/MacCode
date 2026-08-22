@@ -119,6 +119,34 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         XCTAssertEqual(try store.outboxState(
             capability: second.capability, scope: scope(), idempotencyKey: second.idempotencyKey
         ), .delivered)
+
+        TokenSaverScopedRecoveryStore.testInjectFailureBetweenDeliveryMembers = true
+        XCTAssertTrue(try store.markDeliveredBatch(
+            members,
+            scope: scope(),
+            outcome: .sentUnknown
+        ), "a lost response must allow the exact already-delivered batch to retry")
+        XCTAssertFalse(try store.markDeliveredBatch(
+            members,
+            scope: scope(),
+            outcome: .acked
+        ), "retry idempotency must not authorize a different transport outcome")
+        XCTAssertEqual(try store.outboxState(
+            capability: first.capability, scope: scope(), idempotencyKey: first.idempotencyKey
+        ), .delivered)
+        XCTAssertEqual(try store.outboxState(
+            capability: second.capability, scope: scope(), idempotencyKey: second.idempotencyKey
+        ), .delivered)
+        XCTAssertTrue(try store.ack(
+            capability: first.capability,
+            scope: scope(),
+            idempotencyKey: first.idempotencyKey
+        ))
+        XCTAssertFalse(try store.markDeliveredBatch(
+            members,
+            scope: scope(),
+            outcome: .sentUnknown
+        ), "a mixed acked/delivered set is not the same homogeneous retry")
     }
 
     func test_scopedStore_mintsCompactURLSafeCapabilityWithoutWeakeningRecovery() throws {

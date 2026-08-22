@@ -434,7 +434,11 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
         do {
             return try db.performSync { database in
                 try database.transaction {
-                    var authorized: [(objectID: String, idempotencyKey: String)] = []
+                    var authorized: [(
+                        objectID: String,
+                        idempotencyKey: String,
+                        disposition: DeliveryBatchDisposition
+                    )] = []
                     authorized.reserveCapacity(normalized.count)
                     for member in normalized {
                         guard let objectID = try self.authorizedObjectID(
@@ -443,19 +447,29 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
                             scope: scope,
                             nowMS: nowMS
                         ),
-                        try self.outboxMatches(
+                        let disposition = try self.deliveryBatchDisposition(
                             database: database,
                             objectID: objectID,
                             idempotencyKey: member.idempotencyKey,
-                            state: .prepared,
-                            transportOutcome: .notSent
+                            deliveredOutcome: outcome
                         ) else {
                             throw BatchAbort.deny
                         }
-                        authorized.append((objectID, member.idempotencyKey))
+                        authorized.append((objectID, member.idempotencyKey, disposition))
                     }
                     guard Set(authorized.map { $0.objectID }).count == authorized.count else {
                         throw BatchAbort.deny
+                    }
+                    guard let batchDisposition = authorized.first?.disposition,
+                          authorized.allSatisfy({ $0.disposition == batchDisposition }) else {
+                        // A prefix from a different attempt is never accepted as
+                        // a successful retry of the complete provider payload.
+                        throw BatchAbort.deny
+                    }
+                    if batchDisposition == .delivered {
+                        // The transaction committed but the prior HTTP response
+                        // may have been lost. Exact homogeneous retries are safe.
+                        return true
                     }
 
                     for (index, member) in authorized.enumerated() {
@@ -952,6 +966,44 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
         guard try statement.step() else { return false }
         return statement.columnText(0) == state.rawValue
             && statement.columnText(1) == transportOutcome.rawValue
+    }
+
+    private enum DeliveryBatchDisposition: Equatable {
+        case prepared
+        case delivered
+    }
+
+    private func deliveryBatchDisposition(
+        database: SQLiteDB,
+        objectID: String,
+        idempotencyKey: String,
+        deliveredOutcome: TokenSaverRecoveryTransportOutcome
+    ) throws -> DeliveryBatchDisposition? {
+        let statement = try database.prepare("""
+            SELECT recovery.state, outbox.state, outbox.transport_outcome
+            FROM token_saver_recovery_objects AS recovery
+            JOIN token_saver_recovery_outbox AS outbox ON outbox.object_id = recovery.id
+            WHERE recovery.id = ? AND outbox.idempotency_key = ?
+            LIMIT 1;
+        """)
+        defer { statement.reset() }
+        try statement.bind(1, objectID)
+        try statement.bind(2, idempotencyKey)
+        guard try statement.step() else { return nil }
+        let objectState = statement.columnText(0)
+        let outboxState = statement.columnText(1)
+        let transportOutcome = statement.columnText(2)
+        if objectState == TokenSaverRecoveryObjectState.prepared.rawValue,
+           outboxState == TokenSaverRecoveryObjectState.prepared.rawValue,
+           transportOutcome == TokenSaverRecoveryTransportOutcome.notSent.rawValue {
+            return .prepared
+        }
+        if objectState == TokenSaverRecoveryObjectState.delivered.rawValue,
+           outboxState == TokenSaverRecoveryObjectState.delivered.rawValue,
+           transportOutcome == deliveredOutcome.rawValue {
+            return .delivered
+        }
+        return nil
     }
 
     /// Applies a guarded outbox + object state transition. Returns false on

@@ -90,9 +90,9 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
             lock.lock(); defer { lock.unlock() }
             deliveryBatchCalls += 1
             guard outcome == .sentUnknown else { return false }
-            var invocationIDs: [String] = []
+            var authorized: [(invocationID: String, alreadyDelivered: Bool)] = []
             for confirmation in confirmations {
-                guard let invocationID = records.first(where: { _, record in
+                guard let match = records.first(where: { _, record in
                     record.capability == confirmation.capability
                         && confirmation.idempotencyKey == record.context.invocationID
                         && context.workspaceID == record.context.workspaceID
@@ -100,17 +100,27 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
                         && context.threadID == record.context.threadID
                         && context.provider == record.context.provider
                         && context.attemptID == record.context.attemptID
-                        && record.state == .prepared
-                        && record.outcome == .notSent
-                })?.key else { return false }
-                invocationIDs.append(invocationID)
+                }) else { return false }
+                let record = match.value
+                if record.state == .prepared, record.outcome == .notSent {
+                    authorized.append((match.key, false))
+                } else if record.state == .delivered, record.outcome == outcome {
+                    authorized.append((match.key, true))
+                } else {
+                    return false
+                }
             }
-            guard Set(invocationIDs).count == invocationIDs.count else { return false }
+            guard Set(authorized.map(\.invocationID)).count == authorized.count,
+                  let alreadyDelivered = authorized.first?.alreadyDelivered,
+                  authorized.allSatisfy({ $0.alreadyDelivered == alreadyDelivered }) else {
+                return false
+            }
+            if alreadyDelivered { return true }
             if failNextDeliveryBatch {
                 failNextDeliveryBatch = false
                 return false
             }
-            for invocationID in invocationIDs {
+            for invocationID in authorized.map(\.invocationID) {
                 guard var record = records[invocationID] else { return false }
                 record.state = .delivered
                 record.outcome = outcome
@@ -649,6 +659,20 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         XCTAssertEqual(store.invocationState(contextOne.invocationID)?.state, .delivered)
         XCTAssertEqual(store.invocationState(contextTwo.invocationID)?.state, .delivered)
         XCTAssertEqual(store.deliveryBatchCallCount, 2)
+
+        store.injectOneDeliveryBatchFailure()
+        let responseLostRetry = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "batch-token",
+            body: try JSONEncoder().encode(confirmation),
+            headers: headers
+        )
+        XCTAssertEqual(responseLostRetry.status, 200,
+                       "an exact retry after a lost success response must remain idempotent")
+        XCTAssertEqual(store.invocationState(contextOne.invocationID)?.state, .delivered)
+        XCTAssertEqual(store.invocationState(contextTwo.invocationID)?.state, .delivered)
+        XCTAssertEqual(store.deliveryBatchCallCount, 3)
     }
 
     func test_scopedUnchangedCandidateLeavesNoRecoveryRecord() async throws {

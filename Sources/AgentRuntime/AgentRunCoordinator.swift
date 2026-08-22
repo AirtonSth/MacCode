@@ -5937,12 +5937,28 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     ),
                     hostMetadataTrusted: true
                 ))
+            } else if authenticatedDistillReceiptTurnID(itemID: itemId, runId: runId) != nil {
+                // The first completion accompanies the newly authenticated
+                // metadata above. Later completions cannot rewrite terminal state.
+                return []
             }
             prepared.append(PreparedAssistantEvent(
                 event: .itemCompleted(itemId: itemId, finalState: finalState),
                 hostMetadataTrusted: false
             ))
             return prepared
+
+        case .itemState(let itemId, _):
+            guard authenticatedDistillReceiptTurnID(itemID: itemId, runId: runId) == nil else {
+                return []
+            }
+            return [PreparedAssistantEvent(event: event, hostMetadataTrusted: false)]
+
+        case .itemProgress(let itemId, _):
+            guard authenticatedDistillReceiptTurnID(itemID: itemId, runId: runId) == nil else {
+                return []
+            }
+            return [PreparedAssistantEvent(event: event, hostMetadataTrusted: false)]
 
         case .itemHostMetadata:
             // Providers and parsers share AssistantEvent but never this authority.
@@ -5984,6 +6000,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return authenticatedDistillReceiptItems[runId, default: []].insert(identity).inserted
                 ? turnId
                 : nil
+        }
+    }
+
+    private func authenticatedDistillReceiptTurnID(
+        itemID: String,
+        runId: AgentRunID
+    ) -> String? {
+        lock.withLock {
+            guard let turnId = distillReceiptItemTurnIDs[runId]?[itemID],
+                  authenticatedDistillReceiptItems[runId]?.contains(
+                      DistillReceiptItemIdentity(turnId: turnId, itemId: itemID)
+                  ) == true else {
+                return nil
+            }
+            return turnId
         }
     }
 

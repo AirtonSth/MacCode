@@ -1452,13 +1452,20 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 trimPendingItemDeltas()
             }
         case .itemState(let iid, let state):
+            guard item(withId: iid)?.distillApplied != true else { break }
             mutateItem(iid) { $0.state = state }
         case .itemProgress(let iid, let progress):
+            guard item(withId: iid)?.distillApplied != true else { break }
             mutateItem(iid) { $0.progress = progress.map(Self.normalizedProgress) }
             if let item = item(withId: iid) {
                 recordActivity(for: item, state: item.state)
             }
         case .itemCompleted(let iid, let state):
+            if let item = item(withId: iid),
+               item.distillApplied == true,
+               item.state != .streaming {
+                break
+            }
             mutateItem(iid) { item in
                 item.state = state
                 // Replay must not invent wall-clock now. Desk/Agent App

@@ -43,4 +43,42 @@ final class GuardedStdoutWriteTests: XCTestCase {
         close(readFD)
         close(writeFD)
     }
+
+    func test_deliveredValue_closedPipeSuppressesDeliveryDependentWork() throws {
+        // WHY: wrapper savings are recorded by a deferred closure only after
+        // stdout delivery. A closed consumer must not turn that closure loose.
+        var fds: [Int32] = [0, 0]
+        XCTAssertEqual(pipe(&fds), 0)
+        let readFD = fds[0]
+        let writeFD = fds[1]
+        close(readFD)
+
+        let delivered = GuardedStdoutWrite.deliveredValue(
+            "record-ledger",
+            afterWriting: Data("compressed output".utf8),
+            to: writeFD
+        )
+
+        XCTAssertNil(delivered)
+        close(writeFD)
+    }
+
+    func test_deliveredValue_completeWriteReleasesDeliveryDependentWork() throws {
+        // WHY: the delivery fence must not suppress the ledger closure after
+        // the compressed bytes were actually written in full.
+        var fds: [Int32] = [0, 0]
+        XCTAssertEqual(pipe(&fds), 0)
+        let readFD = fds[0]
+        let writeFD = fds[1]
+
+        let delivered = GuardedStdoutWrite.deliveredValue(
+            "record-ledger",
+            afterWriting: Data("compressed output".utf8),
+            to: writeFD
+        )
+
+        XCTAssertEqual(delivered, "record-ledger")
+        close(readFD)
+        close(writeFD)
+    }
 }
