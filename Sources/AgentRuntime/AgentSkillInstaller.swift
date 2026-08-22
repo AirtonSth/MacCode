@@ -1022,9 +1022,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             installPath: skillURL.path,
             installedAt: installedAt
         )
-        if let existingData = try? Data(contentsOf: skillURL),
+        if let existingData = try? Data(contentsOf: skillURL, options: .mappedIfSafe),
            Self.sha256Hex(existingData) == checksum,
-           let manifestData = try? Data(contentsOf: manifestURL),
+           let manifestData = try? Data(contentsOf: manifestURL, options: .mappedIfSafe),
            let existingManifest = try? decoder.decode(AgentSkillManifest.self, from: manifestData),
            existingManifest.sourceRevision == sourceRevision,
            existingManifest.localVersion == Self.distillLocalVersion {
@@ -1819,7 +1819,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     public func uninstallComputerUseMCP() throws {
         let claude = claudeSettingsURL()
-        if let data = try? Data(contentsOf: claude),
+        if let data = try? Data(contentsOf: claude, options: .mappedIfSafe),
            var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
            var servers = root["mcpServers"] as? [String: Any] {
             servers.removeValue(forKey: ComputerUseMCPAdmit.serverName)
@@ -1843,7 +1843,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         let url = claudeSettingsURL()
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url),
+        if let data = try? Data(contentsOf: url, options: .mappedIfSafe),
            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
             root = obj
         }
@@ -1865,7 +1865,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         let url = claudeSettingsURL()
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url),
+        if let data = try? Data(contentsOf: url, options: .mappedIfSafe),
            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
             root = obj
         }
@@ -1887,7 +1887,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         let url = claudeSettingsURL()
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url),
+        if let data = try? Data(contentsOf: url, options: .mappedIfSafe),
            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
             root = obj
         }
@@ -1909,7 +1909,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         let url = claudeSettingsURL()
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url),
+        if let data = try? Data(contentsOf: url, options: .mappedIfSafe),
            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
             root = obj
         }
@@ -1931,7 +1931,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         let url = claudeSettingsURL()
         try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url),
+        if let data = try? Data(contentsOf: url, options: .mappedIfSafe),
            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
             root = obj
         }
@@ -1952,7 +1952,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public func uninstallRetrieveMCP() throws {
         // Claude: drop only our server key, keep the rest of settings.json.
         let claude = claudeSettingsURL()
-        if let data = try? Data(contentsOf: claude),
+        if let data = try? Data(contentsOf: claude, options: .mappedIfSafe),
            var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
            var servers = root["mcpServers"] as? [String: Any] {
             servers.removeValue(forKey: Self.retrieveMCPName)
@@ -2766,9 +2766,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             installedAt: installedAt
         )
 
-        if let existingData = try? Data(contentsOf: skillURL),
+        if let existingData = try? Data(contentsOf: skillURL, options: .mappedIfSafe),
            Self.sha256Hex(existingData) == checksum,
-           let manifestData = try? Data(contentsOf: manifestURL),
+           let manifestData = try? Data(contentsOf: manifestURL, options: .mappedIfSafe),
            let existingManifest = try? decoder.decode(AgentSkillManifest.self, from: manifestData),
            existingManifest.sourceRevision == sourceRevision,
            existingManifest.localVersion == localVersion {
