@@ -237,7 +237,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
     private func updateManifestLocked(split: String, file: URL) {
         let manifestURL = root.appendingPathComponent("manifest.json")
         var obj: [String: Any] = [:]
-        if let data = try? Data(contentsOf: manifestURL),
+        if let data = try? Data(contentsOf: manifestURL, options: .mappedIfSafe),
            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             obj = parsed
         }

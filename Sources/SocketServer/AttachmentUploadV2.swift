@@ -923,7 +923,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         let url = manifestURL(in: jobDirectory(owner: owner, uploadId: uploadId))
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         do {
-            let data = try Data(contentsOf: url)
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
             let manifest = try decoder.decode(Manifest.self, from: data)
             guard manifest.protocolVersion == AttachmentUploadV2Policy.protocolVersion,
                   manifest.uploadId == uploadId,
@@ -947,7 +947,7 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         do {
             let tombstone = try decoder.decode(
                 CancellationTombstone.self,
-                from: Data(contentsOf: url)
+                from: Data(contentsOf: url, options: .mappedIfSafe)
             )
             guard tombstone.protocolVersion == AttachmentUploadV2Policy.protocolVersion,
                   tombstone.uploadId == uploadId,

@@ -79,7 +79,7 @@ public actor MLXBertClassifierBackend {
             useLatest: false, progressHandler: { _ in })
 
         // Build the trunk from config.json.
-        let configData = try Data(contentsOf: dir.appending(component: "config.json"))
+        let configData = try Data(contentsOf: dir.appending(component: "config.json"), options: .mappedIfSafe)
         let config = try JSONDecoder().decode(BertConfiguration.self, from: configData)
         let trunk = BertModel(config, lmHead: false)
 
