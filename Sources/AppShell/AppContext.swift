@@ -1919,13 +1919,9 @@ public final class AppContext {
                   distillClientOverrideForTesting != nil {
             // Unit tests that inject a live DistillServiceClient are exercising
             // environment admission, not the controller's process lifecycle.
-            // Dedicated controller tests still cover failed/blocked readiness.
-            switch tokenSaverDistillServiceController.status {
-            case .failed, .blocked:
-                sidecarAvailable = false
-            default:
-                sidecarAvailable = true
-            }
+            // Dedicated controller tests still cover failed/blocked readiness
+            // without an injected client.
+            sidecarAvailable = true
         } else if Self.isRunningUnitTests,
                   tokenSaverDistillServiceController.status == .notStarted {
             // Pure environment-matrix tests have no sidecar process to start.
@@ -1944,8 +1940,9 @@ public final class AppContext {
         }
         let live = TokenSaverWaveLiveRollout.liveWaves.map(\.rawValue).sorted().joined(separator: ",")
         let thread = try? threadRepo.get(id: threadId)
-        let workspaceID = thread?.workspaceId?.value.uuidString
-        let projectID = thread?.projectId?.value.uuidString ?? workspaceID
+        let scope = tokenSaverPersistentScope(threadId: threadId)
+        let workspaceID = scope?.workspaceID
+        let projectID = scope?.projectID
         let receipt = TokenSaverExecutionReceiptSeam.admit(
             tokenSaverEnabled: true,
             sameUser: true,
@@ -3142,14 +3139,26 @@ public final class AppContext {
     /// workspace UUID is still a stable, exact local boundary, so use it as the
     /// project component instead of silently disabling governed Token Saver on
     /// every top-level workspace thread.
+    ///
+    /// Bot Desk/peer threads stay workspace-less so they never appear on Agent
+    /// App rails. The linked bot conversation is their exact local boundary.
     private func tokenSaverPersistentScope(
         threadId: AgentThreadID
     ) -> (workspaceID: String, projectID: String)? {
-        guard let thread = try? threadRepo.get(id: threadId),
-              let workspaceID = thread.workspaceId?.value.uuidString else {
+        guard let thread = try? threadRepo.get(id: threadId) else {
             return nil
         }
-        return (workspaceID, thread.projectId?.value.uuidString ?? workspaceID)
+        if let workspaceID = thread.workspaceId?.value.uuidString {
+            return (workspaceID, thread.projectId?.value.uuidString ?? workspaceID)
+        }
+        if let projectID = thread.projectId?.value.uuidString {
+            return (projectID, projectID)
+        }
+        guard let conversation = try? botStore.conversationLinked(to: threadId) else {
+            return nil
+        }
+        let botScope = conversation.botID.value.uuidString
+        return (botScope, botScope)
     }
 
     private func tokenSaverProjectObservation(

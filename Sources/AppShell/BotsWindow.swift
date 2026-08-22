@@ -305,19 +305,31 @@ public struct BotDeskMessage: Identifiable, Equatable, Sendable {
     public let text: String
     public let createdAt: Date
     public var peer: BotDeskPeer?
+    public var agentMessageID: AgentMessageID?
+    public var tokenSaverWireRequest: String?
+    public var tokenSaverOriginal: String?
+    public var tokenSaverTurnId: String?
 
     public init(
         id: UUID = UUID(),
         role: Role,
         text: String,
         createdAt: Date = Date(),
-        peer: BotDeskPeer? = nil
+        peer: BotDeskPeer? = nil,
+        agentMessageID: AgentMessageID? = nil,
+        tokenSaverWireRequest: String? = nil,
+        tokenSaverOriginal: String? = nil,
+        tokenSaverTurnId: String? = nil
     ) {
-        self.id = id
+        self.id = agentMessageID?.value ?? id
         self.role = role
         self.text = text
         self.createdAt = createdAt
         self.peer = peer
+        self.agentMessageID = agentMessageID
+        self.tokenSaverWireRequest = tokenSaverWireRequest
+        self.tokenSaverOriginal = tokenSaverOriginal
+        self.tokenSaverTurnId = tokenSaverTurnId
     }
 }
 
@@ -6788,12 +6800,26 @@ public final class BotsViewModel: ObservableObject {
                 default:
                     return nil
                 }
-                var bubble = BotDeskMessage(role: role, text: text, createdAt: message.createdAt)
+                var bubble = BotDeskMessage(
+                    role: role,
+                    text: text,
+                    createdAt: message.createdAt,
+                    agentMessageID: message.id
+                )
                 if role == .user {
                     bubble.peer = self.peerAttribution(forUserText: text, hostID: botID)
                 }
                 return bubble
             }
+            attachTokenSaverTranscriptMetadata(
+                to: &persisted,
+                threadID: threadID,
+                messageIds: stored.map(\.id)
+            )
+            overlayCachedHumanTextOntoPersistedTokenSaverUsers(
+                cached: cached,
+                persisted: &persisted
+            )
         }
         var visible = BotsDeskFollowThrough.visibleDeskMessages(cached: cached, persisted: persisted)
         visible = mergePeerTurns(visible, conversationID: conversation?.id)
@@ -6809,6 +6835,84 @@ public final class BotsViewModel: ObservableObject {
             lastPreviewByBot[botID] = last.text
             lastUpdatedByBot[botID] = last.createdAt
         }
+    }
+
+    private func attachTokenSaverTranscriptMetadata(
+        to messages: inout [BotDeskMessage],
+        threadID: AgentThreadID,
+        messageIds: [AgentMessageID]
+    ) {
+        let requests = (try? context.messageRepo.rcw1RequestTranslations(
+            threadId: threadID,
+            messageIds: messageIds
+        )) ?? [:]
+        for index in messages.indices {
+            guard let id = messages[index].agentMessageID else { continue }
+            messages[index].tokenSaverWireRequest = requests[id]
+        }
+    }
+
+    /// Persist stores the compiled provider envelope (and may wire-encode the
+    /// User request). Desk Human must keep the teammate line that send() already
+    /// painted, then borrow RCW1 from the retained user message.
+    private func overlayCachedHumanTextOntoPersistedTokenSaverUsers(
+        cached: [BotDeskMessage],
+        persisted: inout [BotDeskMessage]
+    ) {
+        guard !cached.isEmpty else { return }
+        for index in persisted.indices {
+            guard persisted[index].role == .user,
+                  let id = persisted[index].agentMessageID,
+                  let live = cached.first(where: {
+                      $0.role == .user && $0.agentMessageID == id
+                  }) else { continue }
+            persisted[index] = BotDeskMessage(
+                id: persisted[index].id,
+                role: .user,
+                text: live.text,
+                createdAt: persisted[index].createdAt,
+                peer: persisted[index].peer ?? live.peer,
+                agentMessageID: id,
+                tokenSaverWireRequest: persisted[index].tokenSaverWireRequest
+                    ?? live.tokenSaverWireRequest,
+                tokenSaverOriginal: persisted[index].tokenSaverOriginal
+                    ?? live.tokenSaverOriginal,
+                tokenSaverTurnId: persisted[index].tokenSaverTurnId
+                    ?? live.tokenSaverTurnId
+            )
+        }
+    }
+
+    /// Create the Human user row (and RCW1 translation) before provider start
+    /// or queue. Coordinator skips append when this id already exists, so a
+    /// later throw or queue drain cannot leave compiled envelope as the
+    /// surviving transcript.
+    private func persistDeskTokenSaverUserTranslation(
+        threadID: AgentThreadID,
+        runID: AgentRunID,
+        humanText: String,
+        attachments: [AgentAttachment],
+        wireRequest: String
+    ) throws {
+        let messageID = AgentMessageID(runID.value)
+        let human = AgentChatTranscriptChrome.displayUserLine(
+            text: humanText,
+            attachments: attachments
+        )
+        if try context.messageRepo.get(id: messageID) == nil {
+            try context.messageRepo.append(AgentMessage(
+                id: messageID,
+                threadId: threadID,
+                role: .user,
+                content: human,
+                attachments: attachments
+            ))
+        }
+        guard RCWireProtocol.isWire(wireRequest) else { return }
+        try context.messageRepo.upsertRCW1RequestTranslation(
+            messageId: messageID,
+            wireRequestText: wireRequest
+        )
     }
 
     /// Dest first. First paint dest used to dest dest thread before
@@ -7408,10 +7512,16 @@ public final class BotsViewModel: ObservableObject {
             if selectedBotID == bot.id, screen == .desk {
                 startDeskLiveTurnWatch(botID: bot.id, threadID: prepared.thread.id)
             }
+            let compressedUser = await context.tokenSaverCompress(
+                prompt: userText,
+                provider: routing.provider,
+                threadId: prepared.thread.id,
+                runId: prepared.runID
+            )
             var receipt = BotBrainCompiler.assemble(
                 bot: bot,
                 revision: revision,
-                userText: userText,
+                userText: compressedUser,
                 memoryFiles: memoryFiles,
                 skills: skills,
                 ownedSkills: ownedSkillTexts(for: bot),
@@ -7435,6 +7545,13 @@ public final class BotsViewModel: ObservableObject {
             if !providers.isEmpty {
                 router.rememberProviderSnapshotsForSend(providers)
             }
+            try persistDeskTokenSaverUserTranslation(
+                threadID: prepared.thread.id,
+                runID: prepared.runID,
+                humanText: userText,
+                attachments: attachments,
+                wireRequest: compressedUser
+            )
             beforeBotRunDispatchForTesting?(prepared.runID)
             guard !Task.isCancelled, (deskStopEpoch[bot.id] ?? 0) == expectedEpoch else {
                 cancelExactRunWait(prepared.runID)
