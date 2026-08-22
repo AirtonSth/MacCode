@@ -166,12 +166,21 @@ public enum DiagnosticsExportAllowlist {
         }
     }
 
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     public static func correlationID(sessionSalt: Data, eventSeed: String) -> String {
         var hasher = SHA256()
         hasher.update(data: sessionSalt)
         hasher.update(data: Data(eventSeed.utf8))
         let digest = hasher.finalize()
-        return digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        // PERF: nibble table avoids String(format:) per byte; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(16)
+        for b in digest.prefix(8) {
+            out.append(Self.hexAlphabet[Int(b >> 4)])
+            out.append(Self.hexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     // PERF: ISO8601DateFormatter init is expensive. Share one for export.

@@ -363,12 +363,22 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
         return try Self.prettyEncoder.encode(self)
     }
 
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     /// Stable content digest for artifact binding (not just id equality).
     public func contentDigest() throws -> String {
         let data = try encodePretty()
         var hasher = SHA256()
         hasher.update(data: data)
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let digest = hasher.finalize()
+        // PERF: nibble table avoids 32 String(format:) calls per hash; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(Self.hexAlphabet[Int(b >> 4)])
+            out.append(Self.hexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 }
 
