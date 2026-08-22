@@ -633,8 +633,18 @@ public enum TokenSaverBestOfThreeSelector {
         Format.allCases.firstIndex(of: format) ?? Format.allCases.count
     }
 
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
     fileprivate static func sha256Hex(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hash(data: Data(text.utf8))
+        // PERF: nibble table avoids 32 String(format:) calls; same lowercase hex.
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in digest {
+            out.append(Self.hexAlphabet[Int(b >> 4)])
+            out.append(Self.hexAlphabet[Int(b & 0x0F)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
     }
 
     private enum MeasurementFailure: Error {
