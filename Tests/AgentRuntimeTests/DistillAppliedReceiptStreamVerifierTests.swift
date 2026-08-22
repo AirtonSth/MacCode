@@ -31,7 +31,18 @@ final class DistillAppliedReceiptStreamVerifierTests: XCTestCase {
         verifier.startItem(id: "tool", body: "", output: String(wire[..<split]))
         verifier.append(itemID: "tool", body: nil, output: String(wire[split...]))
 
-        XCTAssertTrue(verifier.complete(itemID: "tool", scope: scope))
+        let verified = try XCTUnwrap(
+            verifier.completeWithFingerprint(itemID: "tool", scope: scope)
+        )
+        let wireBytes = Data(wire.utf8)
+        XCTAssertEqual(verified.output, AssistantContentFingerprint(
+            byteCount: wireBytes.count,
+            sha256: Data(SHA256.hash(data: wireBytes))
+        ), "durable replay proof must cover every provider-visible byte")
+        XCTAssertEqual(verified.body, AssistantContentFingerprint(
+            byteCount: 0,
+            sha256: Data(SHA256.hash(data: Data()))
+        ))
     }
 
     func test_bytesAfterMarkerWrongRootAndWrongPayloadDoNotAttest() throws {

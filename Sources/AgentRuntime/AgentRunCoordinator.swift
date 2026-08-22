@@ -5879,7 +5879,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 }
                 var verifier = distillReceiptVerifiers[runId]
                     ?? DistillAppliedReceiptStreamVerifier()
-                verifier.startItem(id: item.id, body: item.body, output: item.output)
+                verifier.startItem(
+                    id: item.id,
+                    itemType: item.type,
+                    body: item.body,
+                    output: item.output
+                )
                 distillReceiptVerifiers[runId] = verifier
                 distillReceiptItemTurnIDs[runId, default: [:]][item.id] = item.turnId
                 return true
@@ -5890,12 +5895,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 hostMetadataTrusted: false
             )]
             if item.state != .streaming,
-               let turnId = completeDistillReceipt(itemID: item.id, runId: runId) {
+               let completion = completeDistillReceipt(itemID: item.id, runId: runId) {
                 prepared.append(PreparedAssistantEvent(
                     event: .itemHostMetadata(
-                        turnId: turnId,
+                        turnId: completion.turnId,
                         itemId: item.id,
-                        distillApplied: true
+                        distillApplied: true,
+                        attestation: completion.attestation
                     ),
                     hostMetadataTrusted: true
                 ))
@@ -5928,12 +5934,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         case .itemCompleted(let itemId, let finalState):
             var prepared: [PreparedAssistantEvent] = []
-            if let turnId = completeDistillReceipt(itemID: itemId, runId: runId) {
+            if let completion = completeDistillReceipt(itemID: itemId, runId: runId) {
                 prepared.append(PreparedAssistantEvent(
                     event: .itemHostMetadata(
-                        turnId: turnId,
+                        turnId: completion.turnId,
                         itemId: itemId,
-                        distillApplied: true
+                        distillApplied: true,
+                        attestation: completion.attestation
                     ),
                     hostMetadataTrusted: true
                 ))
@@ -5981,25 +5988,35 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func completeDistillReceipt(
         itemID: String,
         runId: AgentRunID
-    ) -> String? {
+    ) -> (turnId: String, attestation: AssistantItemHostAttestation)? {
         guard let receiptScope = lock.withLock({ distillReceiptRunScopes[runId] }),
               receiptScope.isCurrentlyActive else {
             return nil
         }
         return lock.withLock {
             guard var verifier = distillReceiptVerifiers[runId] else { return nil }
-            let applied = verifier.complete(
+            let verified = verifier.completeWithFingerprint(
                 itemID: itemID,
                 scope: receiptScope.verifierScope
             )
             distillReceiptVerifiers[runId] = verifier
-            guard applied, let turnId = distillReceiptItemTurnIDs[runId]?[itemID] else {
+            guard let verified,
+                  let turnId = distillReceiptItemTurnIDs[runId]?[itemID] else {
                 return nil
             }
             let identity = DistillReceiptItemIdentity(turnId: turnId, itemId: itemID)
-            return authenticatedDistillReceiptItems[runId, default: []].insert(identity).inserted
-                ? turnId
-                : nil
+            guard authenticatedDistillReceiptItems[runId, default: []]
+                .insert(identity).inserted else {
+                return nil
+            }
+            return (
+                turnId,
+                AssistantItemHostAttestation(
+                    itemType: verified.itemType,
+                    body: verified.body,
+                    output: verified.output
+                )
+            )
         }
     }
 
@@ -6035,7 +6052,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                  .itemState(let itemId, _),
                  .itemProgress(let itemId, _),
                  .itemCompleted(let itemId, _),
-                 .itemHostMetadata(_, let itemId, _):
+                 .itemHostMetadata(_, let itemId, _, _):
                 if lock.withLock({ replyOnlyAssistantItemIDs[runId]?.contains(itemId) == true }) {
                     return nil
                 }

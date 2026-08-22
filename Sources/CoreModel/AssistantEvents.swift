@@ -58,6 +58,44 @@ public struct AssistantItem: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+/// Exact terminal UTF-8 identity for one provider item content channel.
+/// The digest is persisted instead of another copy of potentially huge output.
+public struct AssistantContentFingerprint: Codable, Sendable, Equatable {
+    public let byteCount: Int
+    public let sha256: Data
+
+    public init(byteCount: Int, sha256: Data) {
+        self.byteCount = byteCount
+        self.sha256 = sha256
+    }
+
+    public var isWellFormed: Bool {
+        byteCount >= 0 && sha256.count == 32
+    }
+}
+
+/// Host-only proof binding a Token Saver badge to the complete provider bytes.
+/// Optional on the wire so historical persisted metadata remains decodable.
+public struct AssistantItemHostAttestation: Codable, Sendable, Equatable {
+    public let itemType: AssistantItemType
+    public let body: AssistantContentFingerprint
+    public let output: AssistantContentFingerprint?
+
+    public init(
+        itemType: AssistantItemType,
+        body: AssistantContentFingerprint,
+        output: AssistantContentFingerprint?
+    ) {
+        self.itemType = itemType
+        self.body = body
+        self.output = output
+    }
+
+    public var isWellFormed: Bool {
+        body.isWellFormed && (output?.isWellFormed ?? true)
+    }
+}
+
 public struct AssistantSR1Translation: Codable, Sendable, Equatable {
     public var itemId: String?
     public var messageId: String?
@@ -788,7 +826,12 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
     case itemCompleted(itemId: String, finalState: AssistantItemState)
     /// Host-only metadata channel. Keeping trust out of parser-owned
     /// `itemStarted`/`itemDelta` payloads prevents provider text from minting UI truth.
-    case itemHostMetadata(turnId: String, itemId: String, distillApplied: Bool?)
+    case itemHostMetadata(
+        turnId: String,
+        itemId: String,
+        distillApplied: Bool?,
+        attestation: AssistantItemHostAttestation? = nil
+    )
     case turnCompleted(turnId: String, finalMessage: String?)
     case proposedPlan(AssistantProposedPlan)
     case activePlanUpdated(AssistantActivePlan)
@@ -813,7 +856,7 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
         case .itemState(let i, let s): return "itemState(\(i) -> \(s.rawValue))"
         case .itemProgress(let i, let p): return "itemProgress(\(i) -> \(p ?? -1))"
         case .itemCompleted(let i, let s): return "itemCompleted(\(i) -> \(s.rawValue))"
-        case .itemHostMetadata(let t, let i, let applied): return "itemHostMetadata(\(t)/\(i) distill=\(applied == true))"
+        case .itemHostMetadata(let t, let i, let applied, _): return "itemHostMetadata(\(t)/\(i) distill=\(applied == true))"
         case .turnCompleted(let t, _): return "turnCompleted(\(t))"
         case .proposedPlan(let p): return "proposedPlan(\(p.id))"
         case .activePlanUpdated(let p): return "activePlanUpdated(\(p.steps.count))"
@@ -859,8 +902,9 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
             return envelope + id.utf8.count
         case .itemCompleted(let id, _):
             return envelope + id.utf8.count
-        case .itemHostMetadata(let turnId, let itemId, _):
-            return envelope + turnId.utf8.count + itemId.utf8.count + 8
+        case .itemHostMetadata(let turnId, let itemId, _, let attestation):
+            return envelope + turnId.utf8.count + itemId.utf8.count
+                + (attestation == nil ? 8 : 128)
         case .turnCompleted(let t, let final):
             return envelope + t.utf8.count + s(final)
         case .proposedPlan(let plan):
@@ -1478,7 +1522,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             if let item = item(withId: iid) {
                 recordActivity(for: item, state: state)
             }
-        case .itemHostMetadata(let turnId, let itemId, let distillApplied):
+        case .itemHostMetadata(let turnId, let itemId, let distillApplied, _):
             // OR semantics are deliberate: absent/false metadata is never an
             // instruction to erase a durable host attestation.
             guard distillApplied == true else { break }
@@ -1492,6 +1536,11 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 pending.distillApplied = true
                 pendingItemDeltas[key] = pending
                 trimPendingItemDeltas()
+            } else if let item = item(turnId: turnId, itemId: itemId) {
+                // A terminal itemStarted may have already populated Work log
+                // before its receipt authenticated. Refresh the same activity
+                // so protocol metadata disappears only after host truth lands.
+                recordActivity(for: item, state: item.state)
             }
         case .turnCompleted(let tid, let final):
             if let idx = turns.firstIndex(where: { $0.turnId == tid }) {
@@ -1807,13 +1856,21 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         return nil
     }
 
+    private func item(turnId: String, itemId: String) -> AssistantItem? {
+        guard let turn = turns.last(where: { $0.turnId == turnId }) else { return nil }
+        return turn.items.last(where: { $0.id == itemId })
+    }
+
     private mutating func recordActivity(for item: AssistantItem, state: AssistantItemState) {
         guard item.type != .assistantMessage, item.type != .reasoning, item.type != .plan else { return }
+        let rawDetail = item.output ?? item.body
         recordActivity(AssistantWorkActivity(
             id: "item:\(item.id)",
             kind: .tool,
             title: "\(state == .streaming ? "Running" : state.rawValue.capitalized): \(Self.activityLabel(for: item))",
-            detail: item.output ?? item.body,
+            detail: item.distillApplied == true
+                ? DistillAppliedReceipt.strip(rawDetail)
+                : rawDetail,
             state: state.rawValue,
             createdAtMs: item.finishedAtMs ?? item.startedAtMs
         ))

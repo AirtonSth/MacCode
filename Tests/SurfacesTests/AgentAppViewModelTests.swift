@@ -2,6 +2,7 @@ import XCTest
 import AppKit
 import MachO
 import Combine
+import CryptoKit
 import SwiftUI
 @testable import Surfaces
 import CoreModel
@@ -13,6 +14,25 @@ import CoreModel
 /// the selected thread never strands the UI on a dead selection.
 @MainActor
 final class AgentAppViewModelTests: XCTestCase {
+
+    private func distillAttestation(
+        type: AssistantItemType = .tool,
+        body: String,
+        output: String?
+    ) -> AssistantItemHostAttestation {
+        func fingerprint(_ text: String) -> AssistantContentFingerprint {
+            let bytes = Data(text.utf8)
+            return AssistantContentFingerprint(
+                byteCount: bytes.count,
+                sha256: Data(SHA256.hash(data: bytes))
+            )
+        }
+        return AssistantItemHostAttestation(
+            itemType: type,
+            body: fingerprint(body),
+            output: output.map(fingerprint)
+        )
+    }
 
     override func setUp() {
         super.setUp()
@@ -5062,6 +5082,182 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(chosen, persisted,
                        "byte-different provider history must not inherit persisted host truth")
         XCTAssertEqual(timeline.turns[0].items[0].output, "trusted output")
+        XCTAssertEqual(timeline.turns[0].items[0].distillApplied, true)
+    }
+
+    func test_chooseReplayCountsRawDuplicateStartsBeforeTransferringHostTruth() {
+        // WHY: the paint reducer merges duplicate IDs within one turn. Replay
+        // correlation must count the raw occurrences first, or an inserted same
+        // (id,type) start can be overwritten by trusted-looking bytes and badged.
+        let persisted: [AssistantEvent] = [
+            .turnStarted(turnId: "persisted"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "persisted", type: .tool,
+                state: .completed, body: "trusted body", output: "trusted output",
+                startedAtMs: 1, finishedAtMs: 2
+            )),
+            .itemHostMetadata(turnId: "persisted", itemId: "tool", distillApplied: true)
+        ]
+        let snapshot: [AssistantEvent] = [
+            .turnStarted(turnId: "snapshot"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "snapshot", type: .tool,
+                state: .completed, body: "inserted body", output: "inserted output",
+                startedAtMs: 10, finishedAtMs: 11
+            )),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "snapshot", type: .tool,
+                state: .completed, body: "trusted body", output: "trusted output",
+                startedAtMs: 12, finishedAtMs: 13
+            ))
+        ]
+
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: snapshot)
+
+        XCTAssertEqual(chosen, persisted,
+                       "an earlier same-tuple occurrence must shift correlation and fail closed")
+    }
+
+    func test_chooseReplayHashesBytesBeforeUICapsWhenPrefixChanges() {
+        // WHY: both paint timelines retain only a long output's suffix. Replay
+        // trust must hash the full delta stream or a changed evicted prefix can
+        // inherit a badge from byte-different provider history.
+        let trusted = String(repeating: "a", count: AssistantTimelineState.liveOutputLimit + 1)
+        let changed = "b" + trusted.dropFirst()
+        let attestation = distillAttestation(body: "", output: trusted)
+        let persisted: [AssistantEvent] = [
+            .turnStarted(turnId: "persisted"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "persisted", type: .tool,
+                body: "", output: nil, startedAtMs: 1
+            )),
+            .itemDelta(itemId: "tool", bodyAppend: nil, outputAppend: trusted, summary: nil),
+            .itemHostMetadata(
+                turnId: "persisted", itemId: "tool", distillApplied: true,
+                attestation: attestation
+            )
+        ]
+        let snapshot: [AssistantEvent] = [
+            .turnStarted(turnId: "snapshot"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "snapshot", type: .tool,
+                body: "", output: nil, startedAtMs: 2
+            )),
+            .itemDelta(itemId: "tool", bodyAppend: nil, outputAppend: String(changed), summary: nil),
+            .itemStarted(item: AssistantItem(
+                id: "richer", turnId: "snapshot", type: .tool, startedAtMs: 3
+            ))
+        ]
+
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: snapshot)
+
+        XCTAssertEqual(chosen, persisted,
+                       "a prefix mutation outside the UI suffix must fail closed")
+    }
+
+    func test_chooseReplayUsesTerminalAttestationAfterStartRowPruning() throws {
+        // WHY: production keeps only 100 stream rows per thread. A long tool can
+        // evict its own itemStarted before reopen, so the terminal host event must
+        // carry enough bounded proof to recover the badge from provider history.
+        let chunks = (0..<101).map { "chunk-\($0);" }
+        let output = chunks.joined()
+        let attestation = distillAttestation(body: "", output: output)
+        var fullPersisted: [AssistantEvent] = [
+            .turnStarted(turnId: "persisted"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "persisted", type: .tool,
+                body: "", output: nil, startedAtMs: 1
+            ))
+        ]
+        fullPersisted.append(contentsOf: chunks.map {
+            .itemDelta(itemId: "tool", bodyAppend: nil, outputAppend: $0, summary: nil)
+        })
+        fullPersisted.append(.itemHostMetadata(
+            turnId: "persisted", itemId: "tool", distillApplied: true,
+            attestation: attestation
+        ))
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let thread = AgentThread(title: "pruned receipt", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "m",
+            status: .completed
+        )
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+        let encoder = JSONEncoder()
+        for (offset, event) in fullPersisted.enumerated() {
+            try runs.appendStreamEvent(
+                runId: run.id,
+                seq: offset + 1,
+                kind: event.debugDescription,
+                payloadJSON: String(decoding: try encoder.encode(event), as: UTF8.self)
+            )
+        }
+        let retained = try runs.listLatestStreamEvents(
+            threadId: thread.id,
+            limit: 500,
+            strictDecoding: true
+        )
+        XCTAssertEqual(retained.count, 100, "production persistence must apply its real row cap")
+        XCTAssertFalse(retained.contains { if case .itemStarted = $0 { return true }; return false },
+                       "the regression requires itemStarted to be physically evicted")
+        let snapshot: [AssistantEvent] = [
+            .turnStarted(turnId: "snapshot"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "snapshot", type: .tool,
+                state: .completed, body: "", output: output,
+                startedAtMs: 2, finishedAtMs: 3
+            ))
+        ]
+
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: retained, snapshot: snapshot)
+        let timeline = AgentAppViewModel.timelineByReplaying(chosen)
+
+        XCTAssertEqual(timeline.turns[0].items[0].distillApplied, true,
+                       "a retained terminal proof must survive itemStarted eviction")
+    }
+
+    func test_chooseReplayCountsRepeatedTurnIDsAsSeparateOccurrences() {
+        // WHY: paint deduplicates provider turn IDs, but replay identity must not.
+        // A repeated ID cannot move second-turn trust onto the first occurrence.
+        let attestation = distillAttestation(body: "trusted", output: nil)
+        let persisted: [AssistantEvent] = [
+            .turnStarted(turnId: "same"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "same", type: .tool,
+                body: "first", startedAtMs: 1
+            )),
+            .turnStarted(turnId: "same"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "same", type: .tool,
+                body: "trusted", startedAtMs: 2
+            )),
+            .itemHostMetadata(
+                turnId: "same", itemId: "tool", distillApplied: true,
+                attestation: attestation
+            )
+        ]
+        let snapshot: [AssistantEvent] = [
+            .turnStarted(turnId: "same"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "same", type: .tool,
+                body: "first", startedAtMs: 10
+            )),
+            .turnStarted(turnId: "same"),
+            .itemStarted(item: AssistantItem(
+                id: "tool", turnId: "same", type: .tool,
+                body: "trusted", startedAtMs: 11
+            ))
+        ]
+
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: snapshot)
+        let timeline = AgentAppViewModel.timelineByReplaying(chosen)
+
+        XCTAssertEqual(timeline.turns[0].items[0].body, "trusted")
         XCTAssertEqual(timeline.turns[0].items[0].distillApplied, true)
     }
 

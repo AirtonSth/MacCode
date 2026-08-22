@@ -8,6 +8,12 @@ import Foundation
 /// one complete receipt line are retained, so a large tool result cannot become
 /// a second in-memory copy merely to attest its final marker.
 package struct DistillAppliedReceiptStreamVerifier: Sendable {
+    package struct VerifiedItem: Sendable, Equatable {
+        package let itemType: AssistantItemType
+        package let body: AssistantContentFingerprint
+        package let output: AssistantContentFingerprint?
+    }
+
     package struct Scope: Sendable, Equatable {
         package let rootRunID: String
         package let key: Data
@@ -62,12 +68,23 @@ package struct DistillAppliedReceiptStreamVerifier: Sendable {
             }
             return marker.nonce
         }
+
+        func fingerprint() -> AssistantContentFingerprint {
+            var finalHasher = hasher
+            finalHasher.update(data: tail)
+            return AssistantContentFingerprint(
+                byteCount: totalByteCount,
+                sha256: Data(finalHasher.finalize())
+            )
+        }
     }
 
     private struct Item: Sendable {
         var orderingIsValid: Bool
+        let itemType: AssistantItemType
         var body = Channel()
         var output = Channel()
+        var outputIsPresent = false
     }
 
     private static let itemLimit = 5_000
@@ -80,6 +97,7 @@ package struct DistillAppliedReceiptStreamVerifier: Sendable {
 
     package mutating func startItem(
         id: String,
+        itemType: AssistantItemType = .tool,
         body: String,
         output: String?
     ) {
@@ -89,9 +107,10 @@ package struct DistillAppliedReceiptStreamVerifier: Sendable {
             items[id]?.orderingIsValid = false
             return
         }
-        var item = Item(orderingIsValid: true)
+        var item = Item(orderingIsValid: true, itemType: itemType)
         item.body.append(body)
         item.output.append(output)
+        item.outputIsPresent = output != nil
         items[id] = item
         itemOrder.append(id)
         trimItems()
@@ -103,26 +122,41 @@ package struct DistillAppliedReceiptStreamVerifier: Sendable {
         output: String?
     ) {
         guard var item = items[itemID] else {
-            items[itemID] = Item(orderingIsValid: false)
+            items[itemID] = Item(orderingIsValid: false, itemType: .tool)
             itemOrder.append(itemID)
             trimItems()
             return
         }
         item.body.append(body)
         item.output.append(output)
+        if output != nil { item.outputIsPresent = true }
         items[itemID] = item
     }
 
     /// Finalizes one item and consumes a valid nonce exactly once per run.
     package mutating func complete(itemID: String, scope: Scope) -> Bool {
-        guard let item = items.removeValue(forKey: itemID) else { return false }
+        completeWithFingerprint(itemID: itemID, scope: scope) != nil
+    }
+
+    /// Finalizes one item and returns the exact full-channel identity used by
+    /// durable replay. The UI may cap text later; this digest never does.
+    package mutating func completeWithFingerprint(
+        itemID: String,
+        scope: Scope
+    ) -> VerifiedItem? {
+        guard let item = items.removeValue(forKey: itemID) else { return nil }
         itemOrder.removeAll { $0 == itemID }
-        guard item.orderingIsValid else { return false }
+        guard item.orderingIsValid else { return nil }
         for channel in [item.output, item.body] {
             guard let nonce = channel.verifiedNonce(scope: scope) else { continue }
-            return consume(nonce)
+            guard consume(nonce) else { return nil }
+            return VerifiedItem(
+                itemType: item.itemType,
+                body: item.body.fingerprint(),
+                output: item.outputIsPresent ? item.output.fingerprint() : nil
+            )
         }
-        return false
+        return nil
     }
 
     /// Authenticates a terminal prose payload without retaining it in the item map.

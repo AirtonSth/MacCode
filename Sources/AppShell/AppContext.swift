@@ -1190,7 +1190,7 @@ public final class AppContext {
                     runId: runId,
                     finalize: false
                 )
-            case .itemHostMetadata(let turnId, let itemId, let distillApplied):
+            case .itemHostMetadata(let turnId, let itemId, let distillApplied, _):
                 var p: [String: JSONValue] = [
                     "thread_id": .string(t),
                     "turn_id": .string(turnId),

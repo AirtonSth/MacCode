@@ -29,7 +29,7 @@ final class TokenSaverDistillReceiptCoordinatorTests: XCTestCase {
 
             let events = fixture.observer.recordedEvents
             let metadataIndex = events.firstIndex {
-                if case .itemHostMetadata(_, "tool-item", true) = $0 { return true }
+                if case .itemHostMetadata(_, "tool-item", true, _) = $0 { return true }
                 return false
             }
             let completionIndex = events.firstIndex {
@@ -38,6 +38,14 @@ final class TokenSaverDistillReceiptCoordinatorTests: XCTestCase {
             }
             XCTAssertNotNil(metadataIndex, "\(provider.rawValue) must publish authenticated host metadata")
             XCTAssertNotNil(completionIndex)
+            if let metadataIndex,
+               case .itemHostMetadata(_, _, true, let attestation) = events[metadataIndex] {
+                let proof = try XCTUnwrap(attestation)
+                XCTAssertEqual(proof.itemType, .commandExecution)
+                XCTAssertTrue(proof.isWellFormed,
+                              "durable host truth must include exact terminal fingerprints")
+                XCTAssertNotNil(proof.output)
+            }
             if let metadataIndex, let completionIndex {
                 XCTAssertLessThan(
                     metadataIndex,
@@ -109,7 +117,7 @@ final class TokenSaverDistillReceiptCoordinatorTests: XCTestCase {
         ))
 
         XCTAssertTrue(fixture.observer.recordedEvents.contains {
-            if case .itemHostMetadata(_, "tool-item", true) = $0 { return true }
+            if case .itemHostMetadata(_, "tool-item", true, _) = $0 { return true }
             return false
         })
         fixture.runner.finish()
@@ -233,7 +241,7 @@ final class TokenSaverDistillReceiptCoordinatorTests: XCTestCase {
 
         try fixture.runner.emitFreshAuthenticatedItemAfterTerminal()
         XCTAssertFalse(fixture.observer.recordedEvents.contains { event in
-            if case .itemHostMetadata(_, "late-tool-item", true) = event { return true }
+            if case .itemHostMetadata(_, "late-tool-item", true, _) = event { return true }
             return false
         }, "a late callback must not reuse receipt authority from the terminal run")
     }

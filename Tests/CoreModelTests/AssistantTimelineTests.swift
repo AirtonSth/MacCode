@@ -642,6 +642,34 @@ final class AssistantTimelineTests: XCTestCase {
                       "work log must include raw provider runtime events so unknown Codex/Claude progress remains visible")
     }
 
+    func test_workActivityStripsReceiptOnlyAfterHostAttestation() {
+        // WHY: Work log is a second presentation of tool output. It must hide
+        // authenticated protocol metadata without also hiding provider text that
+        // merely resembles a receipt.
+        let marker = DistillAppliedReceipt.makeMarker()
+        let wire = "compressed\n\(marker)"
+        var state = AssistantTimelineState()
+        state.apply(.itemStarted(item: AssistantItem(
+            id: "trusted", turnId: "turn", type: .tool,
+            state: .completed, output: wire, startedAtMs: 1
+        )))
+        XCTAssertEqual(state.workActivities.last?.detail, wire,
+                       "receipt-shaped provider text stays visible before host truth")
+
+        state.apply(.itemHostMetadata(
+            turnId: "turn", itemId: "trusted", distillApplied: true
+        ))
+        XCTAssertEqual(state.workActivities.last?.detail, "compressed",
+                       "host truth refreshes the Work log without the receipt")
+
+        state.apply(.itemStarted(item: AssistantItem(
+            id: "spoof", turnId: "turn", type: .tool,
+            state: .completed, output: wire, startedAtMs: 2
+        )))
+        XCTAssertEqual(state.workActivities.last?.detail, wire,
+                       "an unattested lookalike must remain byte-visible")
+    }
+
     /// Grok (and Claude) stream one NDJSON line per token. Surfacing every
     /// `thought`/`text` as a Work log row puts a flickering "runtime: thought"
     /// strip *above* the user message and rewrites it on every token.

@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import CryptoKit
 import SwiftUI
 import Combine
 import UniformTypeIdentifiers
@@ -2574,13 +2575,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return true
         }
         guard persisted.contains(where: { event in
-            if case .itemHostMetadata(_, _, let applied) = event { return applied == true }
+            if case .itemHostMetadata(_, _, let applied, _) = event { return applied == true }
             return false
         }) else { return providerSnapshot }
-        let persistedTimeline = timelineByReplaying(persisted)
-        let snapshotTimeline = timelineByReplaying(providerSnapshot)
+        let persistedOccurrences = replayItemOccurrences(persisted)
+        let snapshotOccurrences = replayItemOccurrences(providerSnapshot)
         var merged = providerSnapshot
-        for (turnOrdinal, persistedTurn) in persistedTimeline.turns.enumerated() {
+        let fallback = renderableItemCount(persisted) > 0 ? persisted : providerSnapshot
+
+        for (turnOrdinal, persistedTurn) in persistedOccurrences.turns.enumerated() {
             for (itemIndex, persistedItem) in persistedTurn.items.enumerated()
             where persistedItem.distillApplied == true {
                 let itemOrdinal = persistedTurn.items[..<itemIndex].reduce(into: 0) { count, item in
@@ -2588,44 +2591,247 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         count += 1
                     }
                 }
-                guard snapshotTimeline.turns.indices.contains(turnOrdinal) else {
-                    return persisted
+                guard snapshotOccurrences.turns.indices.contains(turnOrdinal) else {
+                    return fallback
                 }
-                let snapshotTurn = snapshotTimeline.turns[turnOrdinal]
-                let matches = snapshotTurn.items.filter {
+                let snapshotOccurrenceTurn = snapshotOccurrences.turns[turnOrdinal]
+                let occurrenceMatches = snapshotOccurrenceTurn.items.filter {
                     $0.id == persistedItem.id && $0.type == persistedItem.type
                 }
-                guard matches.indices.contains(itemOrdinal),
-                      replayItemAttestedContentMatches(persistedItem, matches[itemOrdinal]) else {
+                guard occurrenceMatches.indices.contains(itemOrdinal),
+                      replayOccurrenceMatches(
+                          persistedItem,
+                          occurrenceMatches[itemOrdinal]
+                      ),
+                      snapshotOccurrences.isTerminalPaintOccurrence(
+                          turnOrdinal: turnOrdinal,
+                          itemID: occurrenceMatches[itemOrdinal].id,
+                          occurrence: occurrenceMatches[itemOrdinal]
+                      ) else {
                     // A richer snapshot is not worth losing or moving durable host
                     // truth. Keep the exact persisted replay when occurrences no
                     // longer pair or provider history changed attested bytes.
-                    return persisted
+                    return fallback
                 }
-                let snapshotItem = matches[itemOrdinal]
+                let snapshotItem = occurrenceMatches[itemOrdinal]
                 merged.append(.itemHostMetadata(
-                    turnId: snapshotTurn.turnId,
+                    turnId: snapshotOccurrenceTurn.id,
                     itemId: snapshotItem.id,
-                    distillApplied: true
+                    distillApplied: true,
+                    attestation: persistedItem.attestation
                 ))
             }
+        }
+
+        for orphan in persistedOccurrences.orphanAttestations {
+            guard let attestation = orphan.attestation,
+                  attestation.isWellFormed else {
+                return fallback
+            }
+            let candidates = snapshotOccurrences.turns.enumerated().flatMap { turnOrdinal, turn in
+                turn.items.filter { item in
+                    item.id == orphan.itemID
+                        && item.type == attestation.itemType
+                        && item.matches(attestation)
+                        && snapshotOccurrences.isTerminalPaintOccurrence(
+                            turnOrdinal: turnOrdinal,
+                            itemID: item.id,
+                            occurrence: item
+                        )
+                }.map { (turn, $0) }
+            }
+            guard candidates.count == 1, let candidate = candidates.first else {
+                return fallback
+            }
+            merged.append(.itemHostMetadata(
+                turnId: candidate.0.id,
+                itemId: candidate.1.id,
+                distillApplied: true,
+                attestation: attestation
+            ))
         }
         return merged
     }
 
-    nonisolated private static func replayItemAttestedContentMatches(
-        _ persisted: AssistantItem,
-        _ snapshot: AssistantItem
+    nonisolated private static func replayOccurrenceMatches(
+        _ persisted: ReplayItemOccurrence,
+        _ snapshot: ReplayItemOccurrence
     ) -> Bool {
-        guard persisted.body.utf8.elementsEqual(snapshot.body.utf8) else { return false }
-        switch (persisted.output, snapshot.output) {
-        case (nil, nil):
-            return true
-        case (let persistedOutput?, let snapshotOutput?):
-            return persistedOutput.utf8.elementsEqual(snapshotOutput.utf8)
-        default:
-            return false
+        if let attestation = persisted.attestation {
+            return persisted.matches(attestation) && snapshot.matches(attestation)
         }
+        return persisted.body.fingerprint == snapshot.body.fingerprint
+            && persisted.output?.fingerprint == snapshot.output?.fingerprint
+    }
+
+    private struct ReplayItemOccurrence: Sendable {
+        let sequence: Int
+        let id: String
+        let type: AssistantItemType
+        var body: ReplayContentFingerprintBuilder
+        var output: ReplayContentFingerprintBuilder?
+        var distillApplied = false
+        var attestation: AssistantItemHostAttestation?
+
+        func matches(_ attestation: AssistantItemHostAttestation) -> Bool {
+            attestation.isWellFormed
+                && type == attestation.itemType
+                && body.fingerprint == attestation.body
+                && output?.fingerprint == attestation.output
+        }
+    }
+
+    private struct ReplayTurnOccurrence: Sendable {
+        let id: String
+        var items: [ReplayItemOccurrence] = []
+    }
+
+    private struct ReplayContentFingerprintBuilder: Sendable {
+        private var hasher = SHA256()
+        private(set) var byteCount = 0
+
+        init(_ text: String = "") {
+            append(text)
+        }
+
+        mutating func append(_ text: String) {
+            guard !text.isEmpty else { return }
+            let data = Data(text.utf8)
+            byteCount += data.count
+            hasher.update(data: data)
+        }
+
+        var fingerprint: AssistantContentFingerprint {
+            var finalHasher = hasher
+            return AssistantContentFingerprint(
+                byteCount: byteCount,
+                sha256: Data(finalHasher.finalize())
+            )
+        }
+    }
+
+    private struct ReplayHostMetadataKey: Hashable {
+        let turnID: String
+        let itemID: String
+    }
+
+    private struct ReplayOrphanAttestation: Sendable {
+        let key: ReplayHostMetadataKey
+        let attestation: AssistantItemHostAttestation?
+
+        var itemID: String { key.itemID }
+    }
+
+    private struct ReplayOccurrenceState: Sendable {
+        var turns: [ReplayTurnOccurrence] = []
+        var orphanAttestations: [ReplayOrphanAttestation] = []
+
+        func isTerminalPaintOccurrence(
+            turnOrdinal: Int,
+            itemID: String,
+            occurrence: ReplayItemOccurrence
+        ) -> Bool {
+            guard turns.indices.contains(turnOrdinal),
+                  let occurrenceIndex = turns[turnOrdinal].items.firstIndex(where: {
+                      $0.sequence == occurrence.sequence
+                  }) else {
+                return false
+            }
+            let turnID = turns[turnOrdinal].id
+            for laterTurnOrdinal in turnOrdinal..<turns.count
+            where turns[laterTurnOrdinal].id == turnID {
+                let startIndex = laterTurnOrdinal == turnOrdinal
+                    ? occurrenceIndex + 1
+                    : 0
+                guard startIndex < turns[laterTurnOrdinal].items.count else { continue }
+                if turns[laterTurnOrdinal].items[startIndex...].contains(where: { $0.id == itemID }) {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
+    /// Replays content while assigning a fresh internal identity to every raw
+    /// itemStarted event. The production timeline intentionally merges duplicate
+    /// provider IDs for paint; replay trust must observe those occurrences first.
+    nonisolated private static func replayItemOccurrences(
+        _ events: [AssistantEvent]
+    ) -> ReplayOccurrenceState {
+        var state = ReplayOccurrenceState()
+        var latestTurnIndexByID: [String: Int] = [:]
+        var latestItemLocationByID: [String: (turn: Int, item: Int)] = [:]
+        var nextItemSequence = 0
+
+        func appendTurn(_ turnID: String) -> Int {
+            state.turns.append(ReplayTurnOccurrence(id: turnID))
+            let index = state.turns.index(before: state.turns.endIndex)
+            latestTurnIndexByID[turnID] = index
+            return index
+        }
+
+        for event in events {
+            switch event {
+            case .turnStarted(let turnID):
+                _ = appendTurn(turnID)
+
+            case .itemStarted(let item):
+                let turnIndex = latestTurnIndexByID[item.turnId] ?? appendTurn(item.turnId)
+                var occurrence = ReplayItemOccurrence(
+                    sequence: nextItemSequence,
+                    id: item.id,
+                    type: item.type,
+                    body: ReplayContentFingerprintBuilder(item.body),
+                    output: item.output.map(ReplayContentFingerprintBuilder.init)
+                )
+                nextItemSequence += 1
+                let metadataKey = ReplayHostMetadataKey(
+                    turnID: item.turnId,
+                    itemID: item.id
+                )
+                if let pendingIndex = state.orphanAttestations.lastIndex(where: { $0.key == metadataKey }) {
+                    let pending = state.orphanAttestations.remove(at: pendingIndex)
+                    occurrence.distillApplied = true
+                    occurrence.attestation = pending.attestation
+                }
+                state.turns[turnIndex].items.append(occurrence)
+                latestItemLocationByID[item.id] = (
+                    turn: turnIndex,
+                    item: state.turns[turnIndex].items.index(before: state.turns[turnIndex].items.endIndex)
+                )
+
+            case .itemDelta(let itemID, let bodyAppend, let outputAppend, _):
+                if let location = latestItemLocationByID[itemID] {
+                    if let bodyAppend {
+                        state.turns[location.turn].items[location.item].body.append(bodyAppend)
+                    }
+                    if let outputAppend {
+                        if state.turns[location.turn].items[location.item].output == nil {
+                            state.turns[location.turn].items[location.item].output =
+                                ReplayContentFingerprintBuilder()
+                        }
+                        state.turns[location.turn].items[location.item].output?.append(outputAppend)
+                    }
+                }
+
+            case .itemHostMetadata(let turnID, let itemID, let distillApplied, let attestation):
+                guard distillApplied == true else { continue }
+                if let turnIndex = latestTurnIndexByID[turnID],
+                   let itemIndex = state.turns[turnIndex].items.lastIndex(where: { $0.id == itemID }) {
+                    state.turns[turnIndex].items[itemIndex].distillApplied = true
+                    state.turns[turnIndex].items[itemIndex].attestation = attestation
+                } else {
+                    state.orphanAttestations.append(ReplayOrphanAttestation(
+                        key: ReplayHostMetadataKey(turnID: turnID, itemID: itemID),
+                        attestation: attestation
+                    ))
+                }
+
+            default:
+                break
+            }
+        }
+        return state
     }
 
     nonisolated static func renderableItemCount(_ events: [AssistantEvent]) -> Int {
