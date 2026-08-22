@@ -570,47 +570,124 @@ public final class ChromeDevToolsHostClient: @unchecked Sendable {
     }
 }
 
-/// Foundation-only synchronous transport for one-command-per-WebSocket CDP
-/// calls. The host bridge is intentionally off-main, so the narrow semaphore
-/// wait preserves its synchronous integration contract without UI work.
-public final class URLSessionChromeDevToolsTransport: ChromeDevToolsTransport, @unchecked Sendable {
-    private let session: URLSession
-    private let timeout: TimeInterval
+/// Internal seam for deterministic tests of the Foundation WebSocket session.
+/// Production uses the URLSession adapter below; tests provide a queued socket
+/// without starting Chrome or a server process.
+protocol ChromeDevToolsWebSocketTasking: AnyObject {
+    func resume()
+    func cancel()
+    func send(
+        _ message: URLSessionWebSocketTask.Message,
+        completionHandler: @escaping (Error?) -> Void
+    )
+    func receive(
+        completionHandler: @escaping (Result<URLSessionWebSocketTask.Message, Error>) -> Void
+    )
+}
 
-    public init(session: URLSession = .shared, timeout: TimeInterval = 15) {
-        self.session = session
-        self.timeout = timeout
+private final class URLSessionChromeDevToolsWebSocketTask: ChromeDevToolsWebSocketTasking {
+    private let task: URLSessionWebSocketTask
+
+    init(task: URLSessionWebSocketTask) {
+        self.task = task
     }
 
-    public func send(
-        method: String,
-        parameters: [String: Any],
-        webSocketURL: URL
-    ) throws -> [String: Any] {
-        guard JSONSerialization.isValidJSONObject(parameters) else {
-            throw ChromeDevToolsHostClientError.protocolError("command parameters are not JSON")
+    func resume() { task.resume() }
+    func cancel() { task.cancel() }
+
+    func send(
+        _ message: URLSessionWebSocketTask.Message,
+        completionHandler: @escaping (Error?) -> Void
+    ) {
+        task.send(message, completionHandler: completionHandler)
+    }
+
+    func receive(
+        completionHandler: @escaping (Result<URLSessionWebSocketTask.Message, Error>) -> Void
+    ) {
+        task.receive(completionHandler: completionHandler)
+    }
+}
+
+/// One persistent CDP WebSocket session. Commands on one session are
+/// serialized, while different browser/target URLs retain independent lanes.
+/// CDP events have no `id` and are consumed until the command's exact id
+/// arrives; a different numeric id is a protocol violation, not a response to
+/// accept or a reason to retry against a visible target.
+private final class ChromeDevToolsPersistentWebSocket: @unchecked Sendable {
+    private let task: any ChromeDevToolsWebSocketTasking
+    private let timeout: TimeInterval
+    private let lock = NSLock()
+    private var nextCommandID = 1
+
+    init(task: any ChromeDevToolsWebSocketTasking, timeout: TimeInterval) {
+        self.task = task
+        self.timeout = timeout
+        task.resume()
+    }
+
+    func close() { task.cancel() }
+
+    deinit { close() }
+
+    func send(method: String, parameters: [String: Any]) throws -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let commandID = nextCommandID
+        nextCommandID += 1
+        let body: [String: Any] = [
+            "id": commandID,
+            "method": method,
+            "params": parameters
+        ]
+        guard JSONSerialization.isValidJSONObject(body) else {
+            throw ChromeDevToolsHostClientError.protocolError("command is not JSON")
         }
-        let body: [String: Any] = ["id": 1, "method": method, "params": parameters]
         let data = try JSONSerialization.data(withJSONObject: body, options: [])
         guard let message = String(data: data, encoding: .utf8) else {
             throw ChromeDevToolsHostClientError.protocolError("command could not be encoded")
         }
-        let task = session.webSocketTask(with: webSocketURL)
-        task.resume()
-        defer { task.cancel() }
+        try sendMessage(.string(message))
 
-        let sendSemaphore = DispatchSemaphore(value: 0)
-        var sendError: Error?
-        task.send(.string(message)) { error in
-            sendError = error
-            sendSemaphore.signal()
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let object = try receiveObject(until: deadline)
+            // CDP event frames (for example Page.loadEventFired) arrive before
+            // a command reply and intentionally have no id.
+            guard let rawID = object["id"] else { continue }
+            guard let responseID = Self.commandID(rawID) else {
+                throw ChromeDevToolsHostClientError.protocolError("CDP response id is malformed")
+            }
+            guard responseID == commandID else {
+                throw ChromeDevToolsHostClientError.protocolError(
+                    "CDP response id \(responseID) did not match command id \(commandID)"
+                )
+            }
+            return object
         }
-        guard sendSemaphore.wait(timeout: .now() + timeout) == .success else {
+    }
+
+    private func sendMessage(_ message: URLSessionWebSocketTask.Message) throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        var sendError: Error?
+        task.send(message) { error in
+            sendError = error
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + timeout) == .success else {
             throw ChromeDevToolsHostClientError.timeout
         }
-        if let sendError { throw ChromeDevToolsHostClientError.transport(String(describing: sendError)) }
+        if let sendError {
+            throw ChromeDevToolsHostClientError.transport(String(describing: sendError))
+        }
+    }
 
-        let receiveSemaphore = DispatchSemaphore(value: 0)
+    private func receiveObject(until deadline: Date) throws -> [String: Any] {
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { throw ChromeDevToolsHostClientError.timeout }
+
+        let semaphore = DispatchSemaphore(value: 0)
         var received: URLSessionWebSocketTask.Message?
         var receiveError: Error?
         task.receive { result in
@@ -618,12 +695,14 @@ public final class URLSessionChromeDevToolsTransport: ChromeDevToolsTransport, @
             case .success(let message): received = message
             case .failure(let error): receiveError = error
             }
-            receiveSemaphore.signal()
+            semaphore.signal()
         }
-        guard receiveSemaphore.wait(timeout: .now() + timeout) == .success else {
+        guard semaphore.wait(timeout: .now() + remaining) == .success else {
             throw ChromeDevToolsHostClientError.timeout
         }
-        if let receiveError { throw ChromeDevToolsHostClientError.transport(String(describing: receiveError)) }
+        if let receiveError {
+            throw ChromeDevToolsHostClientError.transport(String(describing: receiveError))
+        }
         guard let received else {
             throw ChromeDevToolsHostClientError.transport("empty WebSocket response")
         }
@@ -640,6 +719,85 @@ public final class URLSessionChromeDevToolsTransport: ChromeDevToolsTransport, @
             throw ChromeDevToolsHostClientError.protocolError("WebSocket response is not a JSON object")
         }
         return object
+    }
+
+    private static func commandID(_ value: Any) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        return nil
+    }
+}
+
+/// Foundation-only synchronous transport with persistent browser/target CDP
+/// sessions. The host bridge is intentionally off-main, so narrow semaphore
+/// waits preserve its synchronous integration contract without UI work.
+public final class URLSessionChromeDevToolsTransport: ChromeDevToolsTransport, @unchecked Sendable {
+    private let timeout: TimeInterval
+    private let webSocketFactory: (URL) -> any ChromeDevToolsWebSocketTasking
+    private let socketsLock = NSLock()
+    private var sockets: [URL: ChromeDevToolsPersistentWebSocket] = [:]
+
+    public init(session: URLSession = .shared, timeout: TimeInterval = 15) {
+        self.timeout = timeout
+        self.webSocketFactory = { url in
+            URLSessionChromeDevToolsWebSocketTask(task: session.webSocketTask(with: url))
+        }
+    }
+
+    /// Injectable socket construction keeps persistence, event draining, and
+    /// response-id correlation testable without a Chrome process.
+    init(
+        timeout: TimeInterval = 15,
+        webSocketFactory: @escaping (URL) -> any ChromeDevToolsWebSocketTasking
+    ) {
+        self.timeout = timeout
+        self.webSocketFactory = webSocketFactory
+    }
+
+    deinit {
+        socketsLock.lock()
+        let sessions = Array(sockets.values)
+        sockets.removeAll()
+        socketsLock.unlock()
+        // Deinitialization closes each persistent CDP session, including the
+        // browser session that owns hidden target lifetime.
+        sessions.forEach { $0.close() }
+    }
+
+    public func send(
+        method: String,
+        parameters: [String: Any],
+        webSocketURL: URL
+    ) throws -> [String: Any] {
+        guard JSONSerialization.isValidJSONObject(parameters) else {
+            throw ChromeDevToolsHostClientError.protocolError("command parameters are not JSON")
+        }
+        let socket = persistentSocket(for: webSocketURL)
+        do {
+            return try socket.send(method: method, parameters: parameters)
+        } catch {
+            remove(socket: socket, for: webSocketURL)
+            throw error
+        }
+    }
+
+    private func persistentSocket(for url: URL) -> ChromeDevToolsPersistentWebSocket {
+        socketsLock.lock()
+        defer { socketsLock.unlock() }
+        if let existing = sockets[url] { return existing }
+        let socket = ChromeDevToolsPersistentWebSocket(
+            task: webSocketFactory(url),
+            timeout: timeout
+        )
+        sockets[url] = socket
+        return socket
+    }
+
+    private func remove(socket: ChromeDevToolsPersistentWebSocket, for url: URL) {
+        socketsLock.lock()
+        defer { socketsLock.unlock() }
+        guard sockets[url] === socket else { return }
+        sockets.removeValue(forKey: url)
     }
 }
 

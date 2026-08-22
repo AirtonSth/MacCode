@@ -159,6 +159,39 @@ final class ChromeDevToolsHostClientTests: XCTestCase {
             XCTAssertEqual(error as? ChromeDevToolsHostClientError, .transport("offline"),
                            "An unavailable WebSocket must fail closed instead of creating a phantom target.")
         }
+
+        let factory = FakeWebSocketFactory()
+        let persistentTransport = URLSessionChromeDevToolsTransport(timeout: 1) { url in
+            let task = FakeWebSocketTask()
+            factory.created.append((url, task))
+            return task
+        }
+        let sessionURL = URL(string: "ws://127.0.0.1:9222/devtools/browser/session")!
+        _ = try persistentTransport.send(method: "Runtime.enable", parameters: [:], webSocketURL: sessionURL)
+        _ = try persistentTransport.send(method: "Runtime.evaluate", parameters: ["expression": "1"], webSocketURL: sessionURL)
+        XCTAssertEqual(factory.created.count, 1,
+                       "Repeated commands for one browser/target URL must reuse its persistent CDP session.")
+        XCTAssertEqual(factory.created[0].1.resumeCount, 1,
+                       "A persistent CDP session must be resumed once, not recreated per command.")
+        XCTAssertEqual(factory.created[0].1.cancelCount, 0,
+                       "The browser/target session must remain open after each command so hidden targets survive.")
+        XCTAssertEqual(factory.created[0].1.commandIDs, [1, 2],
+                       "Each persistent session must assign and correlate monotonically increasing command IDs.")
+
+        let mismatchFactory = FakeWebSocketFactory(mismatchedReplyID: true)
+        let mismatchTransport = URLSessionChromeDevToolsTransport(timeout: 1) { url in
+            let task = FakeWebSocketTask(mismatchedReplyID: mismatchFactory.mismatchedReplyID)
+            mismatchFactory.created.append((url, task))
+            return task
+        }
+        XCTAssertThrowsError(try mismatchTransport.send(method: "Runtime.enable", parameters: [:], webSocketURL: sessionURL)) { error in
+            guard let error = error as? ChromeDevToolsHostClientError,
+                  case .protocolError = error else {
+                return XCTFail("A mismatched CDP response id must fail as a protocol error.")
+            }
+        }
+        XCTAssertEqual(mismatchFactory.created.count, 1,
+                       "A mismatched reply must not trigger a second socket or visible-target retry.")
     }
 }
 
@@ -213,5 +246,63 @@ private final class FakeChromeDevToolsTransport: ChromeDevToolsTransport {
             return ["result": ["result": ["value": runtimeValue]]]
         }
         return ["result": ["result": ["value": ["ok": true]]]]
+    }
+}
+
+private final class FakeWebSocketFactory {
+    var created: [(URL, FakeWebSocketTask)] = []
+    let mismatchedReplyID: Bool
+
+    init(mismatchedReplyID: Bool = false) {
+        self.mismatchedReplyID = mismatchedReplyID
+    }
+}
+
+private final class FakeWebSocketTask: ChromeDevToolsWebSocketTasking {
+    private(set) var resumeCount = 0
+    private(set) var cancelCount = 0
+    private(set) var commandIDs: [Int] = []
+    private let mismatchedReplyID: Bool
+    private var queued: [Result<URLSessionWebSocketTask.Message, Error>] = []
+    private var waitingReceiver: ((Result<URLSessionWebSocketTask.Message, Error>) -> Void)?
+
+    init(mismatchedReplyID: Bool = false) {
+        self.mismatchedReplyID = mismatchedReplyID
+    }
+
+    func resume() { resumeCount += 1 }
+    func cancel() { cancelCount += 1 }
+
+    func send(
+        _ message: URLSessionWebSocketTask.Message,
+        completionHandler: @escaping (Error?) -> Void
+    ) {
+        guard case .string(let raw) = message,
+              let data = raw.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let commandID = object["id"] as? Int else {
+            return completionHandler(ChromeDevToolsHostClientError.protocolError("fake command malformed"))
+        }
+        commandIDs.append(commandID)
+        if commandID == 1 {
+            if !mismatchedReplyID {
+                queued.append(.success(.string("{\"method\":\"Page.loadEventFired\"}")))
+            }
+            let responseID = mismatchedReplyID ? 99 : commandID
+            queued.append(.success(.string("{\"id\":\(responseID),\"result\":{\"ok\":true}}")))
+        } else {
+            queued.append(.success(.string("{\"id\":\(commandID),\"result\":{\"ok\":true}}")))
+        }
+        completionHandler(nil)
+    }
+
+    func receive(
+        completionHandler: @escaping (Result<URLSessionWebSocketTask.Message, Error>) -> Void
+    ) {
+        if queued.isEmpty {
+            waitingReceiver = completionHandler
+        } else {
+            completionHandler(queued.removeFirst())
+        }
     }
 }

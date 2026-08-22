@@ -98,17 +98,17 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
     func test_browserRouteFollowsPublishedDesktopKind_becauseBotsNeverGetTheInAppBrowser() {
         // WHY: bot_browser_* must run Playwright locally for a bot-owned
         // browser and Playwright inside the guest for Docker. Owner's-Chrome
-        // desktops (and leftover VM kinds) must refuse with copy that points
-        // at native host browser bridge — never at a RemoteCode in-app browser tab.
+        // desktops use the native host bridge; leftover VM kinds must refuse
+        // rather than silently redirect to this Mac.
         XCTAssertEqual(BotBrowserRoute.forPublished(.botOwnedBrowser), .playwrightLocal)
         XCTAssertEqual(BotBrowserRoute.forPublished(.dockerDesktop), .playwrightGuest)
-        for kind: BotDesktopKind in [.logicalExecutionSpace, .dedicatedLocalVM, .managedRemoteMac] {
+        XCTAssertEqual(BotBrowserRoute.forPublished(.logicalExecutionSpace), .chromeHost)
+        for kind: BotDesktopKind in [.dedicatedLocalVM, .managedRemoteMac] {
             guard case let .refused(message) = BotBrowserRoute.forPublished(kind) else {
                 XCTFail("\(kind) must refuse bot_browser_*")
                 continue
             }
-            XCTAssertTrue(message.contains("Google Chrome"), "refusal must name the browser the bot really gets")
-            XCTAssertTrue(message.contains("never"), "refusal must forbid the in-app browser, not merely omit it")
+            XCTAssertTrue(message.contains("unavailable"), "refusal must fail loud for an unsupported runtime")
             XCTAssertTrue(message.contains("RemoteCode"), "refusal must name the banned in-app browser")
         }
     }
