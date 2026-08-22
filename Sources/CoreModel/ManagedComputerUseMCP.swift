@@ -79,8 +79,8 @@ public protocol ComputerUseToolBackend: Sendable {
     func invoke(name: String, arguments: [String: Any]) async -> ComputerUseToolResult
 }
 
-/// Default backend: records that the host queue admitted the call. Live HID is
-/// forwarded only when a wrapping backend is injected (npx @zavora-ai/computer-use-mcp).
+/// Test backend: records that the host queue admitted the call. Production uses
+/// the shipped native backend; callers can inject another backend for tests.
 public struct ComputerUseQueuedPassthroughBackend: ComputerUseToolBackend {
     public init() {}
 
@@ -93,9 +93,9 @@ public struct ComputerUseQueuedPassthroughBackend: ComputerUseToolBackend {
     }
 }
 
-/// MCP stdio handler based on zavora-ai/computer-use-mcp: screenshot plus HID
-/// (mouse/keyboard) with window/app targeting fields. Mutating and observation
-/// tools share `ComputerUseHostQueue` so two bots never interleave HID.
+/// MCP stdio handler for the shipped native host backend: screenshot plus
+/// targeted semantic/input operations. Mutating and observation tools share
+/// `ComputerUseHostQueue` so two bots never interleave HID.
 public struct ManagedComputerUseMCP: Sendable {
     public static let serverName = ComputerUseHostQueue.serverName
     public static let screenshotTool = "screenshot"
@@ -132,7 +132,7 @@ public struct ManagedComputerUseMCP: Sendable {
 
     public init(
         queue: ComputerUseHostQueue = .shared,
-        backend: any ComputerUseToolBackend = ComputerUseZavoraForwardBackend()
+        backend: any ComputerUseToolBackend = ComputerUseNativeHostBackend()
     ) {
         self.queue = queue
         self.backend = backend
@@ -168,8 +168,9 @@ public struct ManagedComputerUseMCP: Sendable {
                 return errorReply(id: id, code: -32602, message: "unknown tool: \(name)")
             }
             let kind: ComputerUseHostQueue.Kind = Self.mutationTools.contains(name) ? .mutation : .observation
+            let targetPID = Self.targetPID(from: arguments)
             do {
-                let result = try await queue.withExclusive(kind: kind) {
+                let result = try await queue.withExclusive(kind: kind, targetPID: targetPID) {
                     await backend.invoke(name: name, arguments: arguments)
                 }
                 return reply(id: id, result: [
@@ -199,7 +200,7 @@ public struct ManagedComputerUseMCP: Sendable {
     private static func description(for name: String) -> String {
         switch name {
         case screenshotTool:
-            return "Capture the screen or a targeted app/window (zavora-ai/computer-use-mcp)."
+            return "Capture the screen or a targeted app/window with native host capture."
         case "zoom":
             return "Inspect a screen region at full resolution."
         case leftClickTool:
@@ -234,8 +235,10 @@ public struct ManagedComputerUseMCP: Sendable {
     private static func inputSchema(for name: String) -> [String: Any] {
         let targeting: [String: Any] = [
             "target_app": ["type": "string"],
+            "target_pid": ["type": "integer"],
             "target_window_id": ["type": "number"],
             "focus_strategy": ["type": "string"],
+            "expected_state_token": ["type": "string"],
         ]
         switch name {
         case screenshotTool:
@@ -305,6 +308,19 @@ public struct ManagedComputerUseMCP: Sendable {
         default:
             return ["type": "object", "properties": [String: Any]()]
         }
+    }
+
+    private static func targetPID(from arguments: [String: Any]) -> Int32? {
+        if let value = arguments["target_pid"] as? Int {
+            return Int32(exactly: value)
+        }
+        if let value = arguments["target_pid"] as? NSNumber {
+            return value.int32Value
+        }
+        if let value = arguments["target_pid"] as? String {
+            return Int32(value)
+        }
+        return nil
     }
 
     private func reply(id: Any?, result: [String: Any]) -> String? {

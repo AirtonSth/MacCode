@@ -49,7 +49,11 @@ let package = Package(
             name: "CoreModel",
             path: "Sources/CoreModel",
             linkerSettings: [
-                .linkedFramework("Security")
+                .linkedFramework("Security"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("ScreenCaptureKit")
             ]
         ),
         .target(

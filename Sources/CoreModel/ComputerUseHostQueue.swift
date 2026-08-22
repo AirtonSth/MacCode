@@ -30,10 +30,14 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
         var continuation: CheckedContinuation<Void, Error>
     }
 
-    private let fd: Int32
+    private final class TargetState {
+        var busy = false
+        var waiters: [Waiter] = []
+        var fd: Int32 = -1
+    }
+
     private let state = NSLock()
-    private var busy = false
-    private var waiters: [Waiter] = []
+    private var targets: [String: TargetState] = [:]
     public let lockURL: URL
 
     public static var defaultLockURL: URL {
@@ -48,16 +52,18 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
 
     public init(lockURL: URL) {
         self.lockURL = lockURL
-        let directory = lockURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let opened = lockURL.path.withCString { pointer in
-            open(pointer, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
-        }
-        self.fd = opened
+        try? FileManager.default.createDirectory(
+            at: lockURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
     }
 
     deinit {
-        if fd >= 0 {
+        state.lock()
+        let fds = targets.values.map(\.fd)
+        targets.removeAll()
+        state.unlock()
+        for fd in fds where fd >= 0 {
             flock(fd, LOCK_UN)
             close(fd)
         }
@@ -67,27 +73,38 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
     /// cannot race a click. Throws if the waiter is cancelled before it acquires.
     public func withExclusive<T: Sendable>(
         kind: Kind,
+        targetPID: Int32? = nil,
         body: @Sendable () async throws -> T
     ) async throws -> T {
-        _ = kind
-        try await acquireToken()
+        try await acquireToken(targetPID: targetPID)
         do {
             let value = try await body()
-            releaseToken()
+            releaseToken(targetPID: targetPID)
             return value
         } catch {
-            releaseToken()
+            releaseToken(targetPID: targetPID)
             throw error
         }
+    }
+
+    /// Target-labelled convenience for call sites where the host PID is the
+    /// primary part of the operation's identity.
+    public func withExclusive<T: Sendable>(
+        targetPID: Int32,
+        kind: Kind,
+        body: @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withExclusive(kind: kind, targetPID: targetPID, body: body)
     }
 
     /// Same exclusive lease, but returns the recorded interval so overlap tests
     /// drive the shipped lock instead of a mock clock.
     public func withExclusiveLease<T: Sendable>(
         kind: Kind,
+        targetPID: Int32? = nil,
         body: @Sendable () async throws -> T
     ) async throws -> (T, Lease) {
-        try await acquireToken()
+        try await acquireToken(targetPID: targetPID)
         let acquiredAtNs = DispatchTime.now().uptimeNanoseconds
         do {
             let value = try await body()
@@ -96,17 +113,18 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
                 acquiredAtNs: acquiredAtNs,
                 releasedAtNs: DispatchTime.now().uptimeNanoseconds
             )
-            releaseToken()
+            releaseToken(targetPID: targetPID)
             return (value, lease)
         } catch {
-            releaseToken()
+            releaseToken(targetPID: targetPID)
             throw error
         }
     }
 
-    private func acquireToken() async throws {
+    private func acquireToken(targetPID: Int32?) async throws {
         try Task.checkCancellation()
         let id = UUID()
+        let key = key(for: targetPID)
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 state.lock()
@@ -115,54 +133,123 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
-                if !busy {
-                    busy = true
-                    lockFile()
+                let target: TargetState
+                if let existing = targets[key] {
+                    target = existing
+                } else {
+                    let created = TargetState()
+                    targets[key] = created
+                    target = created
+                }
+                if !target.busy {
+                    target.busy = true
                     state.unlock()
-                    continuation.resume()
+                    let fd = openLockFile(for: targetPID)
+                    state.lock()
+                    target.fd = fd
+                    state.unlock()
+                    if fd >= 0 {
+                        continuation.resume()
+                    } else {
+                        state.lock()
+                        target.busy = false
+                        target.fd = -1
+                        targets.removeValue(forKey: key)
+                        state.unlock()
+                        continuation.resume(throwing: ComputerUseHostQueueError.lockFileUnavailable(lockURL.path))
+                    }
                     return
                 }
-                waiters.append(Waiter(id: id, continuation: continuation))
+                target.waiters.append(Waiter(id: id, continuation: continuation))
                 state.unlock()
             }
         } onCancel: {
-            cancelWaiter(id: id)
+            cancelWaiter(id: id, targetPID: targetPID)
         }
     }
 
-    private func cancelWaiter(id: UUID) {
+    private func cancelWaiter(id: UUID, targetPID: Int32?) {
+        let key = key(for: targetPID)
         state.lock()
-        if let index = waiters.firstIndex(where: { $0.id == id }) {
-            let waiter = waiters.remove(at: index)
+        guard let target = targets[key] else {
             state.unlock()
-            waiter.continuation.resume(throwing: CancellationError())
             return
         }
+        guard let index = target.waiters.firstIndex(where: { $0.id == id }) else {
+            state.unlock()
+            return
+        }
+        let waiter = target.waiters.remove(at: index)
         state.unlock()
+        waiter.continuation.resume(throwing: CancellationError())
     }
 
-    private func releaseToken() {
+    private func releaseToken(targetPID: Int32?) {
+        let key = key(for: targetPID)
         state.lock()
-        unlockFile()
-        if waiters.isEmpty {
-            busy = false
+        guard let target = targets[key] else {
             state.unlock()
             return
         }
-        let next = waiters.removeFirst()
-        lockFile()
+        let releasedFD = target.fd
+        target.fd = -1
+        if releasedFD >= 0 {
+            flock(releasedFD, LOCK_UN)
+            close(releasedFD)
+        }
+        guard !target.waiters.isEmpty else {
+            target.busy = false
+            targets.removeValue(forKey: key)
+            state.unlock()
+            return
+        }
+        let next = target.waiters.removeFirst()
+        state.unlock()
+
+        // Keep the target busy while the next local waiter acquires the
+        // same PID's file lock. Different target PIDs use different files.
+        let fd = openLockFile(for: targetPID)
+        state.lock()
+        target.fd = fd
+        if fd < 0 {
+            target.busy = false
+            let remaining = target.waiters
+            target.waiters.removeAll()
+            targets.removeValue(forKey: key)
+            state.unlock()
+            next.continuation.resume(throwing: ComputerUseHostQueueError.lockFileUnavailable(lockURL.path))
+            for waiter in remaining {
+                waiter.continuation.resume(throwing: ComputerUseHostQueueError.lockFileUnavailable(lockURL.path))
+            }
+            return
+        }
         state.unlock()
         next.continuation.resume()
     }
 
-    private func lockFile() {
-        guard fd >= 0 else { return }
-        flock(fd, LOCK_EX)
+    private func key(for targetPID: Int32?) -> String {
+        targetPID.map { "pid:\($0)" } ?? "global"
     }
 
-    private func unlockFile() {
-        guard fd >= 0 else { return }
-        flock(fd, LOCK_UN)
+    private func openLockFile(for targetPID: Int32?) -> Int32 {
+        let url: URL
+        if let targetPID {
+            let base = lockURL.deletingPathExtension().lastPathComponent
+            url = lockURL.deletingLastPathComponent()
+                .appendingPathComponent("\(base).pid-\(targetPID).lock")
+        } else {
+            url = lockURL
+        }
+        let directory = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fd = url.path.withCString { pointer in
+            open(pointer, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        }
+        guard fd >= 0, flock(fd, LOCK_EX) == 0 else {
+            if fd >= 0 { close(fd) }
+            return -1
+        }
+        return fd
     }
 }
 

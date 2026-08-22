@@ -16,6 +16,74 @@ final class ComputerUseHostQueueTests: XCTestCase {
         try await assertExclusivePair(label: "pair-2")
     }
 
+    func test_differentTargetPIDsCanProgressConcurrently() async throws {
+        let queue = makeQueue()
+        let leases = LockBox<[ComputerUseHostQueue.Lease]>([])
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for pid in [Int32(101), Int32(202)] {
+                group.addTask {
+                    let (_, lease) = try await queue.withExclusiveLease(
+                        kind: .mutation,
+                        targetPID: pid
+                    ) {
+                        try await Task.sleep(nanoseconds: 40_000_000)
+                        return pid
+                    }
+                    leases.append(lease)
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let recorded = leases.value
+        XCTAssertEqual(recorded.count, 2)
+        XCTAssertTrue(
+            recorded[0].overlaps(recorded[1]),
+            "different host PIDs must not share one global FIFO"
+        )
+    }
+
+    func test_separateQueueInstancesShareTargetPIDFileLock() async throws {
+        let lockURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-cu-shared-lock-\(UUID().uuidString).lock")
+        let firstQueue = ComputerUseHostQueue(lockURL: lockURL)
+        let secondQueue = ComputerUseHostQueue(lockURL: lockURL)
+        let firstAcquired = expectation(description: "first queue acquired")
+        let leases = LockBox<[ComputerUseHostQueue.Lease]>([])
+        let targetPID: Int32 = 303
+
+        let first = Task.detached {
+            let (_, lease) = try await firstQueue.withExclusiveLease(
+                kind: .mutation,
+                targetPID: targetPID
+            ) {
+                firstAcquired.fulfill()
+                try await Task.sleep(nanoseconds: 80_000_000)
+            }
+            leases.append(lease)
+        }
+
+        await fulfillment(of: [firstAcquired], timeout: 1)
+        let second = Task.detached {
+            let (_, lease) = try await secondQueue.withExclusiveLease(
+                kind: .mutation,
+                targetPID: targetPID
+            ) {
+            }
+            leases.append(lease)
+        }
+
+        _ = try await first.value
+        _ = try await second.value
+        let recorded = leases.value
+        XCTAssertEqual(recorded.count, 2, "each queue must complete one body and record its lease")
+        XCTAssertFalse(
+            recorded[0].overlaps(recorded[1]),
+            "separate queue instances sharing one PID lock must remain exclusive"
+        )
+    }
+
     func test_cancelledWaiterNeverEntersCriticalSection() async throws {
         let queue = makeQueue()
         let firstStarted = expectation(description: "first acquired")
@@ -85,8 +153,15 @@ private final class LockBox<Value>: @unchecked Sendable {
     private var storage: Value
     init(_ value: Value) { storage = value }
     var value: Value {
-        lock.lock(); defer { lock.unlock() }
-        return storage
+        get {
+            lock.lock(); defer { lock.unlock() }
+            return storage
+        }
+        set {
+            lock.lock()
+            storage = newValue
+            lock.unlock()
+        }
     }
 }
 
