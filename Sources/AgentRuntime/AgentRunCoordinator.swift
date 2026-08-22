@@ -128,6 +128,7 @@ private final class PendingProviderStart: @unchecked Sendable {
     private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
     private var settledHandle: AgentRunHandle?
     private var startFailed = false
+    private var acceptanceInvalidated = false
 
     init(runId: AgentRunID, acceptancePermit: AgentRunAcceptancePermit) {
         self.runId = runId
@@ -157,7 +158,13 @@ private final class PendingProviderStart: @unchecked Sendable {
 
     @discardableResult
     func invalidateAcceptance() -> AgentRunAcceptanceAttempt? {
-        acceptancePermit.invalidate()
+        let attempt = acceptancePermit.invalidate()
+        lock.withLock { acceptanceInvalidated = true }
+        return attempt
+    }
+
+    func isAcceptanceInvalidated() -> Bool {
+        lock.withLock { acceptanceInvalidated }
     }
 
     func record(handle: AgentRunHandle) {
@@ -1319,6 +1326,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// start. Payload consumers must remain content-free or store only scoped,
     /// retention-governed data.
     public var onRunPrepared: (@Sendable (_ request: AgentRunRequest, _ originalPrompt: String) async -> Void)?
+    /// After a successful spawn claim and before `sendTurn`. Tests park here so
+    /// Stop can win the pending start's acceptance without racing durable prep.
+    var afterSpawnClaimForTesting: (@Sendable (_ request: AgentRunRequest) async -> Void)?
 
     /// Fired (on an arbitrary executor) when a final assistant message was wire-rendered
     /// and persisted. Callers can use the id to badge the message in the UI.
@@ -2083,6 +2093,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             threadId: effectiveRequest.threadId,
             runId: runId
         ) else {
+            markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
+            throw AgentRunAcceptanceError.cancelled
+        }
+        await afterSpawnClaimForTesting?(effectiveRequest)
+        guard confirmSpawnClaimStillLive(threadId: effectiveRequest.threadId) else {
             markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
             throw AgentRunAcceptanceError.cancelled
         }
@@ -2867,6 +2882,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// so a late claimSpawn/sendTurn cannot start the provider.
     /// Arms `pendingThreadStops` only when a pending start or surface reservation
     /// exists — pure Graphify-only cancel before claim must not poison resend.
+    /// Also invalidates the pending start's acceptance permit so a post-claim
+    /// `sendTurn` cannot write after this Stop.
     public func cancelPreparation(threadId: AgentThreadID) {
         lock.lock()
         _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
@@ -2877,11 +2894,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         for runId in reservedForThread.keys {
             cancelledProviderStartRuns[runId] = threadId
         }
-        if pendingProviderStarts[threadId] != nil {
+        let pendingStart = pendingProviderStarts[threadId]
+        if pendingStart != nil {
             pendingThreadStops.insert(threadId)
         }
         reservedProviderStarts = reservedProviderStarts.filter { $0.value != threadId }
         lock.unlock()
+        _ = pendingStart?.invalidateAcceptance()
     }
 
     /// Surface finished Graphify claim and is about to call startRun. Stop in the
@@ -2974,6 +2993,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         lock.unlock()
         return ok
+    }
+
+    /// Re-checks Stop after the spawn-claim lock is released. A Desk stop can
+    /// arrive in that gap; `sendTurn` must not start the provider.
+    private func confirmSpawnClaimStillLive(threadId: AgentThreadID) -> Bool {
+        lock.lock()
+        let stopArmed = pendingThreadStops.remove(threadId) != nil
+        let acceptanceRevoked = pendingProviderStarts[threadId]?.isAcceptanceInvalidated() == true
+        if stopArmed || acceptanceRevoked {
+            _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
+            lock.unlock()
+            return false
+        }
+        lock.unlock()
+        return true
     }
 
     private func providerSessionIsLive(

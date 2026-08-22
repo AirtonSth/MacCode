@@ -1,7 +1,7 @@
 import XCTest
 import SwiftUI
 import CoreModel
-import AgentRuntime
+@testable import AgentRuntime
 @testable import AppShell
 @testable import Persistence
 import Surfaces
@@ -4327,6 +4327,48 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertTrue(runner.requests.isEmpty)
         router.sendAgentMessageAfterPreflightProbeForTesting = nil
+    }
+
+    func test_stopAfterSpawnClaimDoesNotStartProvider() async throws {
+        // WHY: spawn claim unlocks before sendTurn. Desk stop must still
+        // revoke that pending start while its join is outstanding, or the
+        // provider write can begin after Stop.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        let park = SpawnClaimPark()
+        context.coordinator.afterSpawnClaimForTesting = { _ in await park.park() }
+        let routing = BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        _ = try vm.enqueueHostMessage(botID: bot.id, text: "go", conversationID: nil, routing: routing)
+        await park.waitUntilEntered()
+        let settled = expectation(description: "stop settled after spawn claim")
+        var settledOK: Bool?
+        vm.stopLiveRuns(for: bot.id, force: true) { ok in
+            settledOK = ok
+            settled.fulfill()
+        }
+        park.release()
+        await fulfillment(of: [settled], timeout: 5)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(runner.requests.isEmpty, "post-claim stop must not reach sendTurn")
+        XCTAssertFalse(vm.lastSendStartedProviderRun)
+        XCTAssertEqual(settledOK, true)
+        context.coordinator.afterSpawnClaimForTesting = nil
     }
 
     func test_openHomeFileRevealsOwnedSkillInStudioFiles() throws {
@@ -12221,6 +12263,54 @@ final class BotsWindowTests: XCTestCase {
 }
 
 /// Parks overlapping sendAgentMessage preflights until Task cancellation resumes them.
+private final class SpawnClaimPark: @unchecked Sendable {
+    private let lock = NSLock()
+    private var parked: [CheckedContinuation<Void, Never>] = []
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var entered = 0
+    private var released = false
+
+    func park() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            entered += 1
+            let waiters = entryWaiters
+            entryWaiters.removeAll()
+            if released {
+                lock.unlock()
+                waiters.forEach { $0.resume() }
+                cont.resume()
+                return
+            }
+            parked.append(cont)
+            lock.unlock()
+            waiters.forEach { $0.resume() }
+        }
+    }
+
+    func waitUntilEntered() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if entered > 0 {
+                lock.unlock()
+                cont.resume()
+                return
+            }
+            entryWaiters.append(cont)
+            lock.unlock()
+        }
+    }
+
+    func release() {
+        lock.lock()
+        released = true
+        let parked = self.parked
+        self.parked.removeAll()
+        lock.unlock()
+        parked.forEach { $0.resume() }
+    }
+}
+
 private final class OverlappingSendPreflightGate: @unchecked Sendable {
     private let lock = NSLock()
     private var entered = 0

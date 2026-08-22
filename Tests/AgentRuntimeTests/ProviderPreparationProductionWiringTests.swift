@@ -93,6 +93,88 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         )
     }
 
+    func test_cancelAfterSpawnClaim_blocksSendTurn() async throws {
+        // WHY: claimSpawn unlocks before sendTurn. Desk stop uses
+        // cancelPreparation, not stopRun, so a post-claim Stop must still
+        // revoke the pending start and never enter the provider write.
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-after-claim")
+        let thread = AgentThread(title: "prep-after-claim", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+        coordinator.afterSpawnClaimForTesting = { request in
+            coordinator.cancelPreparation(threadId: request.threadId)
+        }
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "should not spawn after claim"
+            ))
+            XCTFail("expected cancel after spawn claim")
+        } catch is AgentRunAcceptanceError {
+            // expected
+        } catch {
+            XCTAssertTrue(
+                "\(error)".localizedCaseInsensitiveContains("cancel")
+                    || error is AgentRunAcceptanceError,
+                "unexpected error: \(error)"
+            )
+        }
+
+        XCTAssertEqual(runner.startCount, 0, "sendTurn must not run after Stop won post-claim")
+        XCTAssertFalse(coordinator.isPreparingProviderStart(threadId: thread.id))
+    }
+
+    func test_stopRunAfterSpawnClaim_blocksSendTurn() async throws {
+        // WHY: RPC/iOS Stop is stopRun. It must also win the post-claim gap
+        // before sendTurn, not only the pre-claim preparation window.
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-stop-after-claim")
+        let thread = AgentThread(title: "prep-stop-after-claim", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = CountingRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+        coordinator.afterSpawnClaimForTesting = { request in
+            coordinator.stopRun(threadId: request.threadId)
+        }
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "should not spawn after stopRun"
+            ))
+            XCTFail("expected stopRun after spawn claim")
+        } catch is AgentRunAcceptanceError {
+            // expected
+        } catch {
+            XCTAssertTrue(
+                "\(error)".localizedCaseInsensitiveContains("cancel")
+                    || error is AgentRunAcceptanceError,
+                "unexpected error: \(error)"
+            )
+        }
+
+        XCTAssertEqual(runner.startCount, 0, "sendTurn must not run after stopRun won post-claim")
+    }
+
     func test_happyPath_claimSpawnAllowsProviderStart() async throws {
         let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-happy")
         let thread = AgentThread(title: "prep-ok", provider: .codex, model: "fake-model")
