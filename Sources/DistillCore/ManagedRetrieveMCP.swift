@@ -429,7 +429,7 @@ public struct ManagedRetrieveMCP: Sendable {
     private func reply(
         id: Any?,
         result: [String: Any],
-        sortedKeys: Bool = false
+        sortedKeys: Bool = true
     ) -> String? {
         encode(
             ["jsonrpc": "2.0", "id": id ?? NSNull(), "result": result],
@@ -438,7 +438,10 @@ public struct ManagedRetrieveMCP: Sendable {
     }
 
     private func errorReply(id: Any?, code: Int, message: String) -> String? {
-        encode(["jsonrpc": "2.0", "id": id ?? NSNull(), "error": ["code": code, "message": message]])
+        encode(
+            ["jsonrpc": "2.0", "id": id ?? NSNull(), "error": ["code": code, "message": message]],
+            sortedKeys: true
+        )
     }
 
     private func encode(_ object: [String: Any], sortedKeys: Bool = false) -> String? {

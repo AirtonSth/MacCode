@@ -122,6 +122,21 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         XCTAssertEqual(result["isError"] as? Bool, false)
     }
 
+    func test_toolCallReplyIsCanonicalSoShippingReplaysStayByteStable() async throws {
+        let srv = server(["rcv1.capability": "exact original"], scoped: true)
+        let request = #"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"rc_retrieve","arguments":{"handle":"rcv1.capability"}}}"#
+        let expected = #"{"id":21,"jsonrpc":"2.0","result":{"content":[{"text":"exact original","type":"text"}],"isError":false}}"#
+
+        for _ in 0..<20 {
+            let actual = await srv.handle(request)
+            XCTAssertEqual(
+                actual,
+                expected,
+                "provider-facing MCP bytes must not depend on dictionary iteration order"
+            )
+        }
+    }
+
     func test_toolsCallUnavailableIsErrorResult() async throws {
         let obj = try parse(await server().handle(
             #"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"rc_retrieve","arguments":{"handle":"nope"}}}"#))
