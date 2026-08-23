@@ -61,9 +61,6 @@ public struct EncoderFirstRuntime: DistillRuntime {
             if let routed = DistillContentRouter().route(routable, options: lossless) {
                 return DistillStageResult(output: routed.output, stage: .deterministic)
             }
-            if let deduped = ExactBlockDedupeTransform.commandOutput(for: request) {
-                return DistillStageResult(output: deduped, stage: .deterministic)
-            }
             // 2. BERT extractive selection for large, intent-less logs / code.
             if let bert = await encoderExtractedCommandOutput(request) {
                 return DistillStageResult(output: bert, stage: .encoderBERT)

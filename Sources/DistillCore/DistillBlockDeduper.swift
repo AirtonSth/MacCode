@@ -81,51 +81,6 @@ public enum DistillBlockDeduper {
             : Result(output: text, dedupedBlocks: 0, nearDedupedBlocks: 0)
     }
 
-    /// Production-safe exact-only lane. Unlike `dedupe`, this deliberately performs
-    /// no whitespace trimming, Unicode canonical matching, volatile-field
-    /// normalization, or near-duplicate nomination. A repeat is eligible only when
-    /// its complete UTF-8 byte sequence matches an earlier substantial block.
-    public static func dedupeExact(
-        _ text: String,
-        minBlockBytes: Int = 400
-    ) -> Result {
-        let blocks = text.components(separatedBy: "\n\n")
-        guard blocks.count > 1 else {
-            return Result(output: text, dedupedBlocks: 0, nearDedupedBlocks: 0)
-        }
-
-        let floor = max(0, minBlockBytes)
-        let originalBytes = text.utf8.count
-        var seenBlocks: Set<Data> = []
-        var outputBlocks: [String] = []
-        outputBlocks.reserveCapacity(blocks.count)
-        var deduped = 0
-
-        for block in blocks {
-            let bytes = Data(block.utf8)
-            guard bytes.count >= floor else {
-                outputBlocks.append(block)
-                continue
-            }
-            if seenBlocks.contains(bytes) {
-                outputBlocks.append("⟪identical to the first byte-identical block above⟫")
-                deduped += 1
-            } else {
-                seenBlocks.insert(bytes)
-                outputBlocks.append(block)
-            }
-        }
-
-        guard deduped > 0 else {
-            return Result(output: text, dedupedBlocks: 0, nearDedupedBlocks: 0)
-        }
-        let output = outputBlocks.joined(separator: "\n\n")
-        guard output.utf8.count < originalBytes else {
-            return Result(output: text, dedupedBlocks: 0, nearDedupedBlocks: 0)
-        }
-        return Result(output: output, dedupedBlocks: deduped, nearDedupedBlocks: 0)
-    }
-
     private static func firstNearDuplicate(
         of block: String,
         in seenBlocks: [(ordinal: Int, text: String)],
