@@ -137,6 +137,41 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         }
     }
 
+    func test_verifierHashesRawEmbeddedEnvelopeTextWithoutReserializing() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-envelope-hash-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let envelope = #"{"fallback":{"question":"Was it in Sources\/App.swift?"},"status":"ok"}"#
+        let body = try canonicalJSON([
+            "messages": [[
+                "content": [[
+                    "type": "tool_result",
+                    "content": [["type": "text", "text": envelope]],
+                ]],
+            ]],
+        ])
+        let bodyURL = root.appendingPathComponent("body.json")
+        try body.write(to: bodyURL)
+
+        let result = try runBenchmark([
+            "verify-envelope-hash", bodyURL.path, sha256(Data(envelope.utf8)),
+        ])
+        XCTAssertEqual(
+            result.status,
+            0,
+            "the verifier must hash the exact MCP text bytes; JSON reserialization changes escaped slashes: \(result.stderr)"
+        )
+
+        let normalized = try canonicalJSON(jsonObject(Data(envelope.utf8)))
+        XCTAssertNotEqual(sha256(normalized), sha256(Data(envelope.utf8)))
+        let normalizedResult = try runBenchmark([
+            "verify-envelope-hash", bodyURL.path, sha256(normalized),
+        ])
+        XCTAssertNotEqual(normalizedResult.status, 0, "a normalized envelope hash must be rejected")
+    }
+
     func test_candidateSourceBoundaryAllowsOnlyTheExactLineTransformation() {
         let removed = #"            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle, question: request.question)"#
         let added = #"            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle)"#

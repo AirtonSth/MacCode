@@ -20,6 +20,7 @@ Usage:
   scripts/token-saver-round2-benchmark.sh verify-pair <package-dir>
   scripts/token-saver-round2-benchmark.sh verify-suite <package-dir>
   scripts/token-saver-round2-benchmark.sh verify-source-materialization <exact-git-sha>
+  scripts/token-saver-round2-benchmark.sh verify-envelope-hash <provider-body> <expected-sha256>
 
 Required live environment (Authorization stays in process memory):
   RC_TOKEN_SAVER_ROUND2_BASE_URL=http://127.0.0.1:8000/v1
@@ -102,6 +103,27 @@ verify_fixture() {
       all($case.forbidden_literals[]; . as $forbidden | ($case.answer | contains($forbidden) | not))
     )
   ' "${repo_root}/${fixture_rel}" >/dev/null || die "fixture contract invalid"
+}
+
+shipping_envelope_text() {
+  jq -jr '[
+    .messages[].content[]?
+    | select(.type=="tool_result")
+    | .content[]?
+    | select(.type=="text")
+    | select((try (.text | fromjson | .status) catch null) == "ok")
+    | .text
+  ][0] // empty' "$1"
+}
+
+verify_envelope_hash() {
+  require_tools
+  local body="${1:-}" expected="${2:-}" actual
+  require_file "${body}"
+  [[ "${expected}" =~ ^[0-9a-f]{64}$ ]] || die "expected envelope SHA must be 64 lowercase hex"
+  actual="$(shipping_envelope_text "${body}" | shasum -a 256 | awk '{print $1}')"
+  [[ "${actual}" == "${expected}" ]] || die "raw shipping envelope hash mismatch"
+  echo "verify-envelope-hash ok sha256=${actual}"
 }
 
 capture_arm() {
@@ -382,7 +404,7 @@ verify_arm() {
     local expected_question question_state scenario_turn shipped_envelope
     expected_question="$(jq -r --arg id "${case_id}" '.cases[]|select(.id==$id)|.question' "${repo_root}/${fixture_rel}")"
     for scenario_turn in 'S0/turn-1' 'S2/turn-1' 'S6/turn-2'; do
-      shipped_envelope="$(jq -c '[.messages[].content[]? | select(.type=="tool_result") | .content[]? | select(.type=="text") | (try (.text|fromjson) catch {}) | select(.status=="ok")][0]' "${arm_dir}/envelopes/${case_id}/${scenario_turn}.json")"
+      shipped_envelope="$(shipping_envelope_text "${arm_dir}/envelopes/${case_id}/${scenario_turn}.json")"
       question_state="$(jq -r '.fallback | has("question")' <<<"${shipped_envelope}")"
       if [[ "${arm}" == baseline ]]; then
         [[ "${question_state}" == true && "$(jq -r '.fallback.question' <<<"${shipped_envelope}")" == "${expected_question}" ]] || die "baseline fallback.question mismatch: ${case_id}/${scenario_turn}"
@@ -582,5 +604,6 @@ case "${command}" in
   verify-pair) verify_pair "$@" ;;
   verify-suite) verify_suite "$@" ;;
   verify-source-materialization) verify_source_materialization "$@" ;;
+  verify-envelope-hash) verify_envelope_hash "$@" ;;
   *) usage ;;
 esac
