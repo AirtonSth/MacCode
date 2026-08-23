@@ -20,9 +20,21 @@ public struct DeadlineDistillRuntime: DistillRuntime {
 
     private struct DeadlineExceeded: Error {}
 
-    private final class OneShot: @unchecked Sendable {
+    final class OneShot: @unchecked Sendable {
         private let lock = NSLock()
         private var fired = false
+        private var registeredTasks: [Task<Void, Never>] = []
+
+        func register(_ task: Task<Void, Never>) {
+            lock.lock()
+            guard !fired else {
+                lock.unlock()
+                task.cancel()
+                return
+            }
+            registeredTasks.append(task)
+            lock.unlock()
+        }
 
         func fire(_ body: () -> Void) {
             lock.lock()
@@ -31,7 +43,10 @@ public struct DeadlineDistillRuntime: DistillRuntime {
                 return
             }
             fired = true
+            let tasks = registeredTasks
+            registeredTasks.removeAll(keepingCapacity: false)
             lock.unlock()
+            for task in tasks { task.cancel() }
             body()
         }
     }
@@ -66,14 +81,15 @@ public struct DeadlineDistillRuntime: DistillRuntime {
                         oneShot.fire { continuation.resume(throwing: error) }
                     }
                 }
-                Task {
+                oneShot.register(runtimeTask)
+                let deadlineTask = Task {
                     try? await Task.sleep(for: deadline)
                     guard !Task.isCancelled else { return }
                     oneShot.fire {
-                        runtimeTask.cancel()
                         continuation.resume(throwing: DeadlineExceeded())
                     }
                 }
+                oneShot.register(deadlineTask)
             }
         } catch {
             // Deadline exceeded or the runtime threw: fail open to the deterministic
@@ -95,14 +111,15 @@ public struct DeadlineDistillRuntime: DistillRuntime {
                     let out = await wrapped.rawGenerate(system: system, user: user, maxTokens: maxTokens)
                     oneShot.fire { continuation.resume(returning: out) }
                 }
-                Task {
+                oneShot.register(runtimeTask)
+                let deadlineTask = Task {
                     try? await Task.sleep(for: deadline)
                     guard !Task.isCancelled else { return }
                     oneShot.fire {
-                        runtimeTask.cancel()
                         continuation.resume(throwing: DeadlineExceeded())
                     }
                 }
+                oneShot.register(deadlineTask)
             }
         } catch {
             if let onFallback {

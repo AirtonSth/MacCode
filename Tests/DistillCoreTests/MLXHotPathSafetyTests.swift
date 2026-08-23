@@ -75,6 +75,42 @@ final class MLXHotPathSafetyTests: XCTestCase {
         XCTAssertEqual(output, "OK", "a fast generation returns its real result, not the fallback")
     }
 
+    func test_deadlineRaceCancelsWatchdogRegisteredAfterRuntimeAlreadyWon() async {
+        // WHY: a fast local generation can finish before its deadline Task is
+        // registered. That late watchdog must be cancelled immediately instead
+        // of sleeping until the 20 s production deadline on every successful call.
+        let oneShot = DeadlineDistillRuntime.OneShot()
+        oneShot.fire {}
+
+        let watchdog = Task<Void, Never> {
+            try? await Task.sleep(for: .seconds(5))
+        }
+        oneShot.register(watchdog)
+
+        await Task.yield()
+        XCTAssertTrue(
+            watchdog.isCancelled,
+            "a deadline registered after the runtime winner must not remain scheduled"
+        )
+        watchdog.cancel()
+    }
+
+    func test_fastRawGeneratePassesThroughBeforeDeadline() async {
+        struct FastRawRuntime: DistillRuntime {
+            func distill(_ request: DistillRequest) async throws -> String { "unused" }
+            func rawGenerate(system: String, user: String, maxTokens: Int) async -> String? { "RAW" }
+        }
+        let runtime = DeadlineDistillRuntime(
+            wrapping: FastRawRuntime(),
+            deadlineMilliseconds: 5_000,
+            fallback: { _ in "FALLBACK" }
+        )
+
+        let output = await runtime.rawGenerate(system: "system", user: "user", maxTokens: 32)
+
+        XCTAssertEqual(output, "RAW", "fast librarian generation must retain its real output")
+    }
+
     // MARK: - Single GPU lane serialization
 
     private actor ConcurrencyProbe {
