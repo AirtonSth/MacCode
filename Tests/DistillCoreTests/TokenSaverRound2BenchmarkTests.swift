@@ -185,6 +185,20 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         ))
     }
 
+    func test_captureBindsCompiledTestBundleInsteadOfXCTestLauncher() throws {
+        let captured = try captureExecutableURL()
+        let bundleExecutable = try XCTUnwrap(
+            Bundle(for: TokenSaverRound2BenchmarkTests.self).executableURL
+        ).standardizedFileURL
+
+        XCTAssertEqual(
+            captured,
+            bundleExecutable,
+            "source provenance must hash the built tests, not the stable Xcode xctest launcher"
+        )
+        XCTAssertEqual(captured.lastPathComponent, "RemoteCodePackageTests")
+    }
+
     func test_allTwentyFourS2RetrievesAreSuccessfulAndByteExact() async throws {
         let cases = try loadFixture().fixture.cases
         let recovery = try RecoveryContext.temporary(cases: cases)
@@ -597,7 +611,7 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         )
 
         try recovery.persistCapabilities()
-        let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        let executableURL = try captureExecutableURL()
         let executableData = try Data(contentsOf: executableURL, options: .mappedIfSafe)
         let finalSourceState = try sourceCaptureState(repository: repository)
         try requireStableSourceCapture(
@@ -1081,6 +1095,13 @@ private extension TokenSaverRound2BenchmarkTests {
 
     func repositoryURL() -> URL {
         URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    }
+
+    func captureExecutableURL() throws -> URL {
+        guard let executable = Bundle(for: TokenSaverRound2BenchmarkTests.self).executableURL else {
+            throw Round2Error.invalid("compiled XCTest bundle has no executable")
+        }
+        return executable.standardizedFileURL
     }
 
     func envelopeText(from result: [String: Any]) throws -> String {
