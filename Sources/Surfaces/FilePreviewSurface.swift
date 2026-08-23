@@ -4,20 +4,72 @@ import ImageIO
 import Quartz
 import CoreModel
 
+/// Immutable UTF-16 line-start index for the read-only preview ruler.
+/// Build once with the loaded text, then resolve the first visible line in O(log lines).
+struct FilePreviewLineIndex: Sendable, Equatable {
+    // Preview text is capped at 512 KiB, so UInt32 covers every UTF-16 offset
+    // while halving the index storage versus native-width Int on macOS.
+    private let lineStartOffsets: [UInt32]
+
+    init(text: String) {
+        var offsets: [UInt32] = [0]
+        var utf16Offset: UInt32 = 0
+        for codeUnit in text.utf16 {
+            utf16Offset += 1
+            if codeUnit == 0x0A { offsets.append(utf16Offset) }
+        }
+        lineStartOffsets = offsets
+    }
+
+    var lineCount: Int { lineStartOffsets.count }
+
+    /// Returns the 1-based line containing `charOffset`.
+    /// Exact line starts belong to the new line; a newline itself stays on the prior line.
+    func lineNumber(forCharacterOffset charOffset: Int) -> Int {
+        guard charOffset > 0, !lineStartOffsets.isEmpty else { return 1 }
+        let boundedOffset = UInt32(clamping: charOffset)
+        var low = 0
+        var high = lineStartOffsets.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            if lineStartOffsets[middle] <= boundedOffset {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        return max(1, low)
+    }
+}
+
 // Pure text-content cache -- no AppKit deps; safe to test without a display.
-// Caches the UTF-8 string result of previewText(path:) keyed by absolute file path
-// to avoid re-running up to 512KB FileHandle reads on every didBecomeVisible.
+// Caches the UTF-8 string and its UTF-16 line index together so visibility reloads
+// avoid both the 512KB FileHandle read and rebuilding the gutter index.
 public struct FilePreviewTextCache {
-    private var store: [String: String] = [:]
+    private struct Entry {
+        let text: String
+        let lineIndex: FilePreviewLineIndex
+    }
+
+    private var store: [String: Entry] = [:]
 
     public init() {}
 
     public mutating func store(path: String, text: String) {
-        store[path] = text
+        store(path: path, text: text, lineIndex: FilePreviewLineIndex(text: text))
+    }
+
+    mutating func store(path: String, text: String, lineIndex: FilePreviewLineIndex) {
+        store[path] = Entry(text: text, lineIndex: lineIndex)
     }
 
     public func text(for path: String) -> String? {
-        store[path]
+        store[path]?.text
+    }
+
+    func cachedEntry(for path: String) -> (text: String, lineIndex: FilePreviewLineIndex)? {
+        guard let entry = store[path] else { return nil }
+        return (entry.text, entry.lineIndex)
     }
 
     public mutating func evict(path: String) {
@@ -290,18 +342,21 @@ public final class FilePreviewSurface: NSObject, Surface {
         // Load text bytes off the main thread to avoid blocking the render path
         // (PERF: previewText reads up to 512KB synchronously via FileHandle).
         // Re-use cached result if this path was already loaded.
-        if let cached = textCache.text(for: path) {
+        if let cached = textCache.cachedEntry(for: path) {
             // Cache hit -- apply text immediately on main (no I/O).
-            tv.string = cached
+            ruler.replaceLineIndex(cached.lineIndex)
+            tv.string = cached.text
             Self.applyTextScrollRestore(scroll: scroll, saved: saved)
         } else {
-            Task { [weak self, weak tv, weak scroll] in
-                let text = await Task.detached(priority: .userInitiated) {
-                    Self.previewText(path: path)
+            Task { [weak self, weak tv, weak scroll, weak ruler] in
+                let loaded = await Task.detached(priority: .userInitiated) {
+                    let text = Self.previewText(path: path)
+                    return (text, FilePreviewLineIndex(text: text))
                 }.value
-                guard let self, self.filePath == path, let tv, let scroll else { return }
-                self.textCache.store(path: path, text: text)
-                tv.string = text
+                guard let self, self.filePath == path, let tv, let scroll, let ruler else { return }
+                self.textCache.store(path: path, text: loaded.0, lineIndex: loaded.1)
+                ruler.replaceLineIndex(loaded.1)
+                tv.string = loaded.0
                 Self.applyTextScrollRestore(scroll: scroll, saved: saved)
             }
         }
@@ -327,7 +382,8 @@ public final class FilePreviewSurface: NSObject, Surface {
     /// Pure helper: return the 1-based line number that contains `charOffset` (UTF-16 offset).
     /// Scans the UTF-16 code units up to `charOffset` and counts newlines.
     /// Returns 1 for any offset in an empty string or when offset <= 0.
-    /// Nonisolated -- no AppKit; callable from any isolation context or test.
+    /// Retained as the reference implementation for correctness and A/B performance proof;
+    /// the production ruler uses the precomputed `FilePreviewLineIndex` instead.
     public nonisolated static func lineNumber(forCharacterOffset charOffset: Int, in text: String) -> Int {
         guard charOffset > 0 else { return 1 }
         let ns = text as NSString
@@ -419,6 +475,7 @@ public final class FilePreviewSurface: NSObject, Surface {
 private final class PreviewLineNumberRulerView: NSRulerView {
     private weak var textView: NSTextView?
     private var lastVisibleGlyphRange = NSRange(location: NSNotFound, length: 0)
+    private var lineIndex = FilePreviewLineIndex(text: "")
 
     init(textView: NSTextView) {
         self.textView = textView
@@ -442,6 +499,12 @@ private final class PreviewLineNumberRulerView: NSRulerView {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+
+    func replaceLineIndex(_ index: FilePreviewLineIndex) {
+        lineIndex = index
+        lastVisibleGlyphRange = NSRange(location: NSNotFound, length: 0)
+        needsDisplay = true
     }
 
     // Redraw only when the set of visible lines actually changes (not on every
@@ -485,13 +548,9 @@ private final class PreviewLineNumberRulerView: NSRulerView {
         let glyphRange = lm.glyphRange(forBoundingRect: visibleRect, in: tc)
         guard glyphRange.location < lm.numberOfGlyphs else { return }
 
-        // Compute 1-based line number for the first visible glyph by counting
-        // newlines in the text before it (uses pure FilePreviewSurface.lineNumber helper).
+        // O(log lines): resolve the first visible line from the immutable UTF-16 index.
         let firstCharIndex = lm.characterIndexForGlyph(at: glyphRange.location)
-        var lineNumber = FilePreviewSurface.lineNumber(
-            forCharacterOffset: firstCharIndex,
-            in: textView.string
-        )
+        var lineNumber = lineIndex.lineNumber(forCharacterOffset: firstCharIndex)
 
         var glyphIndex = glyphRange.location
         while glyphIndex < NSMaxRange(glyphRange) {
