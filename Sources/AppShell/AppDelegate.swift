@@ -1721,6 +1721,36 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     // MARK: - Denied-notification in-app fallback (UX-MAC_APPSHELL-P2)
 
+    static let notificationsDeniedPetID = "pet.notifications.denied"
+
+    @discardableResult
+    static func projectPetNotificationsDenied(
+        content: RemoteCodeNotificationContent,
+        repository: NotificationRepository
+    ) throws -> String {
+        let workspaceID = content.userInfo["workspaceId"]
+            .flatMap(UUID.init(uuidString:))
+            .map(WorkspaceID.init)
+        let category = PetNotificationCategory.notificationsDenied
+        let id = notificationsDeniedPetID
+        try repository.resurface(AppNotification(
+            id: id,
+            workspaceId: workspaceID,
+            title: category.presentation.title,
+            body: category.presentation.detail,
+            category: category.rawValue
+        ))
+        var payload: [String: JSONValue] = [
+            "id": .string(id),
+            "category": .string(category.rawValue)
+        ]
+        if let workspaceID {
+            payload["workspace_id"] = .string(workspaceID.value.uuidString)
+        }
+        EventBus.shared.publish(kind: "notification.created", payload: .object(payload))
+        return id
+    }
+
     /// Invoked by `SystemNotifier.shared.onDeniedPost`. Posts
     /// `SystemNotifier.rc2NotificationsDeniedPost` on the default
     /// `NotificationCenter` the first time it is called; subsequent calls
@@ -1732,10 +1762,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     func handleDeniedPost(_ content: RemoteCodeNotificationContent) {
         guard Self.shouldFireDeniedNotice(alreadyFired: notificationsDeniedNoticeFired) else { return }
         notificationsDeniedNoticeFired = true
+        if let context {
+            do {
+                _ = try Self.projectPetNotificationsDenied(
+                    content: content,
+                    repository: NotificationRepository(db: context.db)
+                )
+            } catch {
+                appLifecycleLog.error("pet.notifications_denied_projection_failed error=\(error.localizedDescription, privacy: .public)")
+            }
+        }
         NotificationCenter.default.post(
             name: SystemNotifier.rc2NotificationsDeniedPost,
             object: self,
-            userInfo: ["threadId": content.userInfo["threadId"] ?? ""]
+            userInfo: [
+                "id": Self.notificationsDeniedPetID,
+                "threadId": content.userInfo["threadId"] ?? "",
+                "workspaceId": content.userInfo["workspaceId"] ?? ""
+            ]
         )
     }
 

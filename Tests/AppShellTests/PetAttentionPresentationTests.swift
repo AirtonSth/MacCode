@@ -138,6 +138,13 @@ final class PetAttentionPresentationTests: XCTestCase {
             PetAttentionPresentation(title: "Remote access needs attention", detail: nil)
         )
         XCTAssertEqual(
+            PetNotificationCategory.notificationsDenied.presentation,
+            PetAttentionPresentation(
+                title: "Notifications are turned off",
+                detail: "Open System Settings to re-enable them."
+            )
+        )
+        XCTAssertEqual(
             PetNotificationCategory.agentAttention.presentation,
             PetAttentionPresentation(title: "Agent input requested", detail: nil)
         )

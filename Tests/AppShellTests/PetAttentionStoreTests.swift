@@ -461,10 +461,33 @@ final class PetAttentionStoreTests: XCTestCase {
             category: PetNotificationCategory.serverListenerFailed.rawValue,
             createdAt: Date(timeIntervalSince1970: 20)
         ))
+        try fixture.notifications.insert(AppNotification(
+            id: "notifications-denied",
+            title: "unsafe notification title",
+            category: PetNotificationCategory.notificationsDenied.rawValue
+        ))
 
         let routes = Dictionary(uniqueKeysWithValues: try fixture.store.refresh().items.map { ($0.id, $0.route) })
         XCTAssertEqual(routes["notification:provider-update"], .settings(.providers))
         XCTAssertEqual(routes["notification:listener-failure"], .settings(.general))
+        XCTAssertEqual(routes["notification:notifications-denied"], .settings(.general))
+    }
+
+    func test_notificationsDeniedFallbackCanBeOpenedAndAcknowledged() throws {
+        let fixture = try fixture()
+        try fixture.notifications.insert(AppNotification(
+            id: "notifications-denied",
+            title: "unsafe notification title",
+            category: PetNotificationCategory.notificationsDenied.rawValue
+        ))
+
+        let result = try fixture.store.openAndMarkRead(itemID: "notification:notifications-denied") { route in
+            route == .settings(.general)
+        }
+
+        XCTAssertEqual(result, .marked,
+            "The denied-notification fallback must open General settings and clear its own notice.")
+        XCTAssertTrue(try fixture.notifications.list(unreadOnly: true).isEmpty)
     }
 
     func test_agentAttentionNotificationProjectsExactAgentSurfaceRoute() throws {
