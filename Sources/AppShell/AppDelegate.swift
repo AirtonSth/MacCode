@@ -663,10 +663,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                // Grok first: the full Claude/Codex probe can stay busy for the
-                // whole interval, and its busy-skip must not starve the purple ring.
-                self.context?.refreshGrokTokenSaverAccountUsage(reason: "periodic")
-                self.context?.refreshTokenSaverAccountUsage(reason: "periodic")
+                // Grok stays independent from slow Claude/Codex probes, but the
+                // combined operation issues only one Grok credits request.
+                self.context?.refreshPeriodicTokenSaverAccountUsage()
             }
         }
     }
