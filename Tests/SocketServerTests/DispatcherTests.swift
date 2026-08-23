@@ -963,7 +963,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func browserAction(surface: SurfaceID, kind: String, ref: String, value: String?) async throws -> String { "{\"ok\":true}" }
     func browserWait(surface: SurfaceID, selector: String, timeoutMs: Int) async throws -> String { "{\"ok\":true}" }
     var notifs: [String] = []
-    func notificationCreate(workspaceId: WorkspaceID?, title: String, body: String?, category: String?) throws -> String {
+    func notificationCreate(workspaceId: WorkspaceID?, surfaceId: SurfaceID?, title: String, body: String?, category: String?) throws -> String {
         let id = UUID().uuidString; notifs.append(id); return id
     }
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]] { [] }

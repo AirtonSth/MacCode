@@ -243,6 +243,14 @@ public final class PetAttentionStore {
             route = .settings(.providers)
         case .serverListenerFailed:
             route = .settings(.general)
+        case .agentAttention:
+            if let surfaceID = notification.surfaceId {
+                route = .surface(surfaceID: surfaceID, workspaceID: notification.workspaceId)
+            } else if let workspaceID = notification.workspaceId {
+                route = .workspace(workspaceID: workspaceID)
+            } else {
+                return nil
+            }
         case .gitCompleted, .gitFailed:
             if let surfaceID = notification.surfaceId {
                 route = .surface(surfaceID: surfaceID, workspaceID: notification.workspaceId)

@@ -137,6 +137,10 @@ final class PetAttentionPresentationTests: XCTestCase {
             PetNotificationCategory.serverListenerFailed.presentation,
             PetAttentionPresentation(title: "Remote access needs attention", detail: nil)
         )
+        XCTAssertEqual(
+            PetNotificationCategory.agentAttention.presentation,
+            PetAttentionPresentation(title: "Agent input requested", detail: nil)
+        )
     }
 
     func test_contextLabelsCollapseWhitespaceCapLengthAndRedactCredentials() {

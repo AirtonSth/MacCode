@@ -45,7 +45,7 @@ enum PetAttentionVisualStatus: Equatable {
             switch category {
             case .gitFailed, .projectScriptFailed, .sshTransferFailed, .providerUpdateFailed:
                 return .failed
-            case .sshUnexpectedDisconnect, .fileConflict, .serverListenerFailed:
+            case .sshUnexpectedDisconnect, .fileConflict, .serverListenerFailed, .agentAttention:
                 return .needsAttention
             case .gitCompleted, .projectScriptCompleted, .sshTransferCompleted:
                 return .completed

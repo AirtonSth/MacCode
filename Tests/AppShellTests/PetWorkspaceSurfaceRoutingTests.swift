@@ -74,6 +74,45 @@ final class PetWorkspaceSurfaceRoutingTests: XCTestCase {
         XCTAssertNil(pet.modelForTests.routeError)
     }
 
+    func test_agentAttentionRouteFocusesExactAgentAppSurfaceAndRetainsActionRequiredRow() throws {
+        let fixture = try makeFixture(prefix: "AgentAttention")
+        defer { fixture.cleanup() }
+        let workspace = try fixture.router.createWorkspace(
+            name: "AGENT-ATTENTION",
+            cwd: NSTemporaryDirectory()
+        )
+        let agentSurfaceID = try fixture.focusedSurfaceID(in: workspace.id)
+        try fixture.notifications.insert(AppNotification(
+            id: "agent-attention",
+            workspaceId: workspace.id,
+            surfaceId: agentSurfaceID,
+            title: "Agent input requested",
+            category: PetNotificationCategory.agentAttention.rawValue
+        ))
+
+        let pet = try fixture.startPet()
+        defer { pet.stop() }
+        fixture.open(itemID: "notification:agent-attention", with: pet)
+
+        XCTAssertEqual(
+            try fixture.focusedSurfaceID(in: workspace.id),
+            agentSurfaceID,
+            "Pet Agent attention must focus the exact Agent App surface that produced the notification."
+        )
+        XCTAssertTrue(fixture.windowController.window.isVisible)
+        XCTAssertTrue(
+            SurfaceRegistry.shared.surface(agentSurfaceID)?.view.window
+                === fixture.windowController.window,
+            "The Agent App surface must be mounted before Pet acknowledges its notification."
+        )
+        XCTAssertEqual(
+            try fixture.notifications.list(unreadOnly: true).map(\.id),
+            ["agent-attention"],
+            "Opening Agent attention must not acknowledge an action-required row before the Agent thread is resolved."
+        )
+        XCTAssertNil(pet.modelForTests.routeError)
+    }
+
     func test_mainSurfaceRouteFlushesWorkspaceSwitchBeforeClearing() throws {
         let fixture = try makeFixture(prefix: "MainSurfaceWorkspaceSwitch")
         defer { fixture.cleanup() }
