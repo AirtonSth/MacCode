@@ -21,6 +21,7 @@ Usage:
   scripts/token-saver-round2-benchmark.sh verify-suite <package-dir>
   scripts/token-saver-round2-benchmark.sh verify-source-materialization <exact-git-sha>
   scripts/token-saver-round2-benchmark.sh verify-envelope-hash <provider-body> <expected-sha256>
+  scripts/token-saver-round2-benchmark.sh verify-model-catalog-pair <baseline-response> <candidate-response>
 
 Required live environment (Authorization stays in process memory):
   RC_TOKEN_SAVER_ROUND2_BASE_URL=http://127.0.0.1:8000/v1
@@ -124,6 +125,46 @@ verify_envelope_hash() {
   actual="$(shipping_envelope_text "${body}" | shasum -a 256 | awk '{print $1}')"
   [[ "${actual}" == "${expected}" ]] || die "raw shipping envelope hash mismatch"
   echo "verify-envelope-hash ok sha256=${actual}"
+}
+
+validate_models_response() {
+  jq -se '
+    length == 1 and
+    (.[0] |
+      (keys | sort) == ["data","object"] and
+      .object == "list" and
+      (.data | type) == "array" and (.data | length) > 0 and
+      ([.data[].id] | length) == ([.data[].id] | unique | length) and
+      all(.data[];
+        (keys | sort) == ["created","id","max_model_len","object","owned_by"] and
+        (.created | type) == "number" and .created == (.created | floor) and
+        (.id | type) == "string" and (.id | length) > 0 and
+        .object == "model" and
+        (.owned_by | type) == "string" and (.owned_by | length) > 0 and
+        (
+          .max_model_len == null or
+          ((.max_model_len | type) == "number" and .max_model_len > 0 and
+           .max_model_len == (.max_model_len | floor))
+        )
+      )
+    )
+  ' "$1" >/dev/null
+}
+
+models_response_identity() {
+  validate_models_response "$1" || return 1
+  jq -cS '.data |= map(del(.created))' "$1"
+}
+
+verify_model_catalog_pair() {
+  require_tools
+  local baseline="${1:-}" candidate="${2:-}" baseline_identity candidate_identity
+  require_file "${baseline}"
+  require_file "${candidate}"
+  baseline_identity="$(models_response_identity "${baseline}")" || die "baseline /v1/models contract invalid"
+  candidate_identity="$(models_response_identity "${candidate}")" || die "candidate /v1/models contract invalid"
+  [[ "${baseline_identity}" == "${candidate_identity}" ]] || die "/v1/models stable identity changed between responses"
+  echo "verify-model-catalog-pair ok"
 }
 
 capture_arm() {
@@ -371,6 +412,7 @@ verify_arm() {
   require_file "${arm_dir}/models-status-after.json"
   require_file "${arm_dir}/server-openapi.json"
   [[ "$(sha256_file "${arm_dir}/models-response.json")" == "$(jq -r '.model.models_response_sha256' "${report}")" ]] || die "models response hash mismatch"
+  validate_models_response "${arm_dir}/models-response.json" || die "/v1/models response contract invalid"
   [[ "$(sha256_file "${arm_dir}/models-status-before.json")" == "$(jq -r '.model.models_status_before_sha256' "${report}")" ]] || die "models status-before hash mismatch"
   [[ "$(sha256_file "${arm_dir}/models-status-after.json")" == "$(jq -r '.model.models_status_after_sha256' "${report}")" ]] || die "models status-after hash mismatch"
   [[ "$(sha256_file "${arm_dir}/server-openapi.json")" == "$(jq -r '.model.openapi_response_sha256' "${report}")" ]] || die "openapi response hash mismatch"
@@ -476,7 +518,7 @@ pair_checks() {
   [[ "$(jq -r '.model.snapshot_path' "${baseline}/report.json")" == "$(jq -r '.model.snapshot_path' "${candidate}/report.json")" ]] || die "canonical model snapshot changed between arms"
   [[ "$(jq -r '.model.revision' "${baseline}/report.json")" == "$(jq -r '.model.revision' "${candidate}/report.json")" ]] || die "model revision changed between arms"
   [[ "$(jq -r '.model.server_version' "${baseline}/report.json")" == "$(jq -r '.model.server_version' "${candidate}/report.json")" ]] || die "oMLX server version changed between arms"
-  [[ "$(jq -r '.model.models_response_sha256' "${baseline}/report.json")" == "$(jq -r '.model.models_response_sha256' "${candidate}/report.json")" ]] || die "/v1/models response changed between arms"
+  verify_model_catalog_pair "${baseline}/models-response.json" "${candidate}/models-response.json" >/dev/null
   [[ "$(jq -r '.model.openapi_response_sha256' "${baseline}/report.json")" == "$(jq -r '.model.openapi_response_sha256' "${candidate}/report.json")" ]] || die "oMLX server response changed between arms"
   local bound_path baseline_blob candidate_blob
   while IFS= read -r bound_path; do
@@ -605,5 +647,6 @@ case "${command}" in
   verify-suite) verify_suite "$@" ;;
   verify-source-materialization) verify_source_materialization "$@" ;;
   verify-envelope-hash) verify_envelope_hash "$@" ;;
+  verify-model-catalog-pair) verify_model_catalog_pair "$@" ;;
   *) usage ;;
 esac

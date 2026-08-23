@@ -172,6 +172,87 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         XCTAssertNotEqual(normalizedResult.status, 0, "a normalized envelope hash must be rejected")
     }
 
+    func test_modelCatalogPairIgnoresOnlyPerRequestCreatedTimestamp() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-model-catalog-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let baselineURL = root.appendingPathComponent("baseline.json")
+        let candidateURL = root.appendingPathComponent("candidate.json")
+        let first: [String: Any] = [
+            "created": 100, "id": "selected", "max_model_len": 40960,
+            "object": "model", "owned_by": "omlx",
+        ]
+        let second: [String: Any] = [
+            "created": 100, "id": "other", "max_model_len": NSNull(),
+            "object": "model", "owned_by": "omlx",
+        ]
+        let baseline: [String: Any] = ["data": [first, second], "object": "list"]
+        try canonicalJSON(baseline).write(to: baselineURL)
+
+        var candidateFirst = first
+        candidateFirst["created"] = 200
+        var candidateSecond = second
+        candidateSecond["created"] = 200
+        let validCandidate: [String: Any] = ["data": [candidateFirst, candidateSecond], "object": "list"]
+        try canonicalJSON(validCandidate).write(to: candidateURL)
+        let valid = try runBenchmark([
+            "verify-model-catalog-pair", baselineURL.path, candidateURL.path,
+        ])
+        XCTAssertEqual(valid.status, 0, "created is generated per request and is not model identity: \(valid.stderr)")
+
+        var changedID = candidateFirst
+        changedID["id"] = "changed"
+        var changedOwner = candidateFirst
+        changedOwner["owned_by"] = "other"
+        var changedLength = candidateFirst
+        changedLength["max_model_len"] = 8192
+        var changedObject = candidateFirst
+        changedObject["object"] = "not-model"
+        var malformedCreated = candidateFirst
+        malformedCreated["created"] = "200"
+        var extraItemField = candidateFirst
+        extraItemField["extra"] = true
+        var missingCreated = candidateFirst
+        missingCreated.removeValue(forKey: "created")
+        var extraRoot = validCandidate
+        extraRoot["extra"] = true
+        var missingRoot = validCandidate
+        missingRoot.removeValue(forKey: "object")
+
+        let rejected: [[String: Any]] = [
+            ["data": [changedID, candidateSecond], "object": "list"],
+            ["data": [changedOwner, candidateSecond], "object": "list"],
+            ["data": [changedLength, candidateSecond], "object": "list"],
+            ["data": [changedObject, candidateSecond], "object": "list"],
+            ["data": [malformedCreated, candidateSecond], "object": "list"],
+            ["data": [extraItemField, candidateSecond], "object": "list"],
+            ["data": [missingCreated, candidateSecond], "object": "list"],
+            ["data": [candidateSecond, candidateFirst], "object": "list"],
+            ["data": [candidateFirst], "object": "list"],
+            ["data": [candidateFirst, candidateFirst], "object": "list"],
+            extraRoot,
+            missingRoot,
+        ]
+        for (index, mutation) in rejected.enumerated() {
+            try canonicalJSON(mutation).write(to: candidateURL, options: .atomic)
+            let result = try runBenchmark([
+                "verify-model-catalog-pair", baselineURL.path, candidateURL.path,
+            ])
+            XCTAssertNotEqual(result.status, 0, "mutation \(index) must not be hidden as timestamp drift")
+        }
+
+        var concatenated = try canonicalJSON(validCandidate)
+        concatenated.append(0x0A)
+        concatenated.append(try canonicalJSON(validCandidate))
+        try concatenated.write(to: candidateURL, options: .atomic)
+        let multipleDocuments = try runBenchmark([
+            "verify-model-catalog-pair", baselineURL.path, candidateURL.path,
+        ])
+        XCTAssertNotEqual(multipleDocuments.status, 0, "a response must contain exactly one JSON document")
+    }
+
     func test_candidateSourceBoundaryAllowsOnlyTheExactLineTransformation() {
         let removed = #"            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle, question: request.question)"#
         let added = #"            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle)"#
