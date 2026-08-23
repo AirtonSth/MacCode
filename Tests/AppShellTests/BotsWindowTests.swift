@@ -9985,6 +9985,9 @@ final class BotsWindowTests: XCTestCase {
         context.router = router
         let vm = BotsViewModel(context: context, router: router)
         router.botsViewModel = vm
+        let controller = MainWindowController(context: context, router: router)
+        router.windowController = controller
+        defer { controller.window.orderOut(nil) }
         let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
         vm.openDesk(piper)
@@ -9993,6 +9996,20 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.selectedBotID, piper.id)
         XCTAssertFalse(try router.openBotsDesk(botID: BotID()))
         XCTAssertEqual(vm.selectedBotID, piper.id)
+    }
+
+    func test_petOpenBotsDeskWithoutDestinationDoesNotClaimSuccess() throws {
+        // WHY: Pet acknowledgement follows this boolean. Returning true when
+        // no MainWindowController exists would clear durable Bot attention
+        // without proving that the Bot Desk is visible to the user.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+
+        XCTAssertFalse(try router.openBotsDesk(botID: piper.id))
     }
 
     func test_petProjectsDestAttention_andHidesDisabledBots() throws {

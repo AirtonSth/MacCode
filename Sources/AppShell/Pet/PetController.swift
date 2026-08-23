@@ -521,6 +521,10 @@ public final class PetController {
         // blue Active badge is non-zero. EventBus can insert ghost run ids when
         // finish is missed; host coordinator Active is the sole authority.
         if Self.shouldResyncActiveRuns(after: domainEvent) {
+            // A lifecycle event can arrive before the coordinator publishes its
+            // matching projection. An empty snapshot at that instant is not
+            // authoritative and must not erase the event's active work pose or
+            // a projected row that is still being republished for Live Activity.
             refreshActiveThreadsFromCoordinator()
         }
         if case .ignored = reduction.disposition {
@@ -985,12 +989,19 @@ public final class PetController {
     private func refreshActiveThreadsFromCoordinator() {
         // Primary threads only — delegated bot-peer runs show under Subagents.
         let threadIDs = Array(context.coordinator.primaryActiveThreadIdsSnapshot())
-        applyActiveThreadIDs(threadIDs)
-        // Reconcile animation active-run set to coordinator truth (not EventBus alone).
+        if !threadIDs.isEmpty {
+            applyActiveThreadIDs(threadIDs)
+        }
+        // Reconcile animation active-run set to coordinator truth when it has
+        // positive evidence. An empty snapshot during event delivery can be a
+        // projection race; explicit ActiveRunProjection callbacks remain the
+        // authoritative path for clearing work.
         let hostRunIDs = Set(threadIDs.compactMap {
             context.coordinator.activeRunId(threadId: $0)?.value.uuidString
         })
-        reconcilePetActiveRuns(hostRunIDs)
+        if !threadIDs.isEmpty {
+            reconcilePetActiveRuns(hostRunIDs)
+        }
     }
 
     private func applyActiveRunProjection(_ projection: ActiveRunProjection) {
@@ -1121,10 +1132,10 @@ public final class PetController {
             return openSettings(settingsRoute)
         case .botsDesk(let botID):
             guard try router.openBotsDesk(botID: botID) else { return false }
-            let destination = router.windowController?.window
-            return destination?.isVisible == true
-                && destination?.isMiniaturized == false
-                && destinationWindowIsKey(destination!)
+            guard let destination = router.windowController?.window,
+                  destination.isVisible,
+                  !destination.isMiniaturized else { return false }
+            return destinationWindowIsKey(destination)
         }
     }
 
