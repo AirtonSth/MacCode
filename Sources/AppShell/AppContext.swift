@@ -5754,11 +5754,7 @@ public final class AppContext {
     @discardableResult
     public func reapIdleProviderSessions(now: Date = Date(), idleAge: TimeInterval = 6 * 60 * 60) throws -> ProviderSessionReaperResult {
         let cutoff = now.addingTimeInterval(-idleAge)
-        let activeThreadIds = Set(
-            try threadRepo.list().filter { thread in
-                thread.status == .running
-            }.map(\.id)
-        )
+        let activeThreadIds = try threadRepo.runningThreadIds()
         let reaper = ProviderSessionReaper(
             sessionRepo: providerSessionRuntimeRepo,
             pendingCallbackRepo: providerPendingCallbackRepo

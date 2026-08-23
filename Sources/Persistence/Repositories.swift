@@ -791,6 +791,22 @@ public final class AgentThreadRepository {
         return out
     }
 
+    /// IDs of threads whose persisted run state is active. The provider-session
+    /// reaper polls this on MainActor every 30 seconds and needs no thread model,
+    /// routing join, JSON decode, or recency ordering.
+    public func runningThreadIds() throws -> Set<AgentThreadID> {
+        let statement = try db.prepare(
+            "SELECT id FROM agent_threads WHERE status = 'running';"
+        )
+        var ids = Set<AgentThreadID>()
+        while try statement.step() {
+            guard let rawID = statement.columnText(0),
+                  let uuid = UUID(uuidString: rawID) else { continue }
+            ids.insert(AgentThreadID(uuid))
+        }
+        return ids
+    }
+
     public func get(id: AgentThreadID) throws -> AgentThread? {
         let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
