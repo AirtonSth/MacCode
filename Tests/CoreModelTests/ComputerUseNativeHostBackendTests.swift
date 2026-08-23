@@ -512,6 +512,70 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertEqual(monitor.activity(for: target), .none, "the native quiet window is exactly two seconds")
     }
 
+    func testActivityMonitorBoundsRecentTargetsConservatively() {
+        var now: UInt64 = 10_000
+        let monitor = ComputerUseNativeActivityMonitor(
+            quietWindowNanoseconds: 2_000,
+            now: { now }
+        )
+
+        for index in 0...ComputerUseNativeActivityMonitor.maximumTrackedActivityEntries {
+            monitor.record(.init(
+                kind: .keyboard,
+                pid: Int32(1_000 + index),
+                timestampNanoseconds: now
+            ))
+        }
+
+        XCTAssertEqual(
+            monitor.activity(for: .init(pid: 17, windowID: 29)),
+            .human,
+            "activity overflow must fail closed instead of retaining an unbounded target map"
+        )
+        now += 2_001
+        XCTAssertEqual(monitor.activity(for: .init(pid: 17, windowID: 29)), .none)
+    }
+
+    func testOversizedCaptureFailsClosedWithoutEmittingImage() async throws {
+        let probe = Probe()
+        probe.captureData = String(
+            repeating: "A",
+            count: ComputerUseNativeHostBackend.maximumCaptureBase64Characters + 1
+        )
+        let backend = makeBackend(probe: probe)
+
+        let result = await backend.invoke(
+            name: "screenshot",
+            arguments: ["target_pid": 17, "target_window_id": 29]
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual(result.content.count, 1)
+        XCTAssertTrue(result.content.first?.text?.contains("capture_too_large") == true)
+        XCTAssertFalse(result.content.contains { $0.type == "image" })
+    }
+
+    func testCompressedCaptureWithExcessiveDimensionsFailsClosed() async throws {
+        // WHY: PNG compression can keep a huge pixel surface below the byte
+        // limit; dimensions must be bounded before image decoding/cropping.
+        let probe = Probe()
+        probe.captureData = try makePNGBase64(
+            width: ComputerUseNativeHostBackend.maximumCapturePixelDimension + 1,
+            height: 1,
+            rgba: Array(repeating: 255, count: (ComputerUseNativeHostBackend.maximumCapturePixelDimension + 1) * 4)
+        )
+        let backend = makeBackend(probe: probe)
+
+        let result = await backend.invoke(
+            name: "screenshot",
+            arguments: ["target_pid": 17, "target_window_id": 29]
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("capture_too_large") == true)
+        XCTAssertFalse(result.content.contains { $0.type == "image" })
+    }
+
     func testMissingPermissionExecutesNoMutation() async throws {
         let probe = Probe()
         probe.accessibilityPermission = false

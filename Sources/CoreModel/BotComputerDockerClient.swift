@@ -47,6 +47,7 @@ public enum BotComputerDockerError: Error, Equatable, LocalizedError, CustomStri
     case cliMissing
     case daemonUnavailable
     case probeTimedOut
+    case outputTooLarge
     case networkAddressPoolExhausted
     case networkSubnetUnavailable
     case provisioningFailed
@@ -56,6 +57,7 @@ public enum BotComputerDockerError: Error, Equatable, LocalizedError, CustomStri
         case .cliMissing: return .installCLI
         case .daemonUnavailable: return .startDaemon
         case .probeTimedOut: return .retryTimedOutProbe
+        case .outputTooLarge: return .retryProvisioning
         case .networkAddressPoolExhausted, .networkSubnetUnavailable, .provisioningFailed:
             return .retryProvisioning
         }
@@ -102,6 +104,8 @@ public struct BotComputerContainerInspect: Equatable, Sendable {
 
 /// App-process CLI wrapper. Agent children must never receive this client.
 public struct BotComputerDockerCLI: BotComputerDockerClienting {
+    static let stdoutRetentionLimit = 8 * 1_024 * 1_024
+    static let buildStdoutRetentionLimit = 64 * 1_024 * 1_024
     static let stderrRetentionLimit = 16 * 1_024
     public var run: @Sendable ([String]) throws -> Data
 
@@ -299,11 +303,20 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
     public static func defaultRun(_ args: [String]) throws -> Data {
         let executable = try BotComputerDockerResolver.shared.resolveHealthyExecutable()
         let timeout = timeoutForArguments(args)
-        let result = try runProcess(
-            executableURL: URL(fileURLWithPath: executable),
-            arguments: args,
-            timeout: timeout
-        )
+        let result: (data: Data, errorData: Data, terminationStatus: Int32, timedOut: Bool)
+        do {
+            result = try runProcess(
+                executableURL: URL(fileURLWithPath: executable),
+                arguments: args,
+                timeout: timeout,
+                stdoutLimit: stdoutLimit(for: args),
+                failOnStdoutLimit: args.first != "build"
+            )
+        } catch BotComputerDockerProcessError.stdoutLimitExceeded {
+            throw args.first == "info"
+                ? BotComputerDockerError.daemonUnavailable
+                : BotComputerDockerError.outputTooLarge
+        }
         if result.timedOut {
             throw timeoutError(for: args)
         }
@@ -339,10 +352,16 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         args.first == "info" ? .probeTimedOut : .provisioningFailed
     }
 
+    static func stdoutLimit(for args: [String]) -> Int {
+        args.first == "build" ? buildStdoutRetentionLimit : stdoutRetentionLimit
+    }
+
     static func runProcess(
         executableURL: URL,
         arguments: [String],
-        timeout: TimeInterval = 15
+        timeout: TimeInterval = 15,
+        stdoutLimit: Int = stdoutRetentionLimit,
+        failOnStdoutLimit: Bool = true
     ) throws -> (data: Data, errorData: Data, terminationStatus: Int32, timedOut: Bool) {
         let process = Process()
         process.executableURL = executableURL
@@ -363,12 +382,20 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             throw error
         }
         let pid = process.processIdentifier
-        let collected = LockedDataBox()
+        let collected = LockedBoundedExactDataBox(limit: stdoutLimit)
         let errorCollected = LockedDataSuffixBox(limit: stderrRetentionLimit)
         let drainDone = DispatchGroup()
         drainDone.enter()
         DispatchQueue.global(qos: .utility).async {
-            collected.append(stdout.fileHandleForReading.readDataToEndOfFile())
+            var terminatedForOverflow = false
+            while true {
+                let chunk = stdout.fileHandleForReading.readData(ofLength: 4_096)
+                guard !chunk.isEmpty else { break }
+                if !collected.append(chunk), failOnStdoutLimit, !terminatedForOverflow {
+                    terminatedForOverflow = true
+                    terminateOwnedTree(pid: pid)
+                }
+            }
             drainDone.leave()
         }
         drainDone.enter()
@@ -390,6 +417,9 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             process.waitUntilExit()
         }
         _ = drainDone.wait(timeout: .now() + 1)
+        if failOnStdoutLimit && collected.exceededLimit {
+            throw BotComputerDockerProcessError.stdoutLimitExceeded
+        }
         return (
             collected.data,
             errorCollected.data,
@@ -418,6 +448,10 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         }
         kill(pid, SIGKILL)
     }
+}
+
+enum BotComputerDockerProcessError: Error, Equatable {
+    case stdoutLimitExceeded
 }
 
 @_silgen_name("proc_listchildpids")
@@ -569,18 +603,38 @@ public enum BotComputerDockerProbeOutcome: Equatable, Sendable {
     }
 }
 
-private final class LockedDataBox: @unchecked Sendable {
+private final class LockedBoundedExactDataBox: @unchecked Sendable {
     private let lock = NSLock()
+    private let limit: Int
     private var storage = Data()
-    func append(_ data: Data) {
-        lock.lock()
-        storage.append(data)
-        lock.unlock()
+    private var exceeded = false
+
+    init(limit: Int) {
+        self.limit = max(1, limit)
     }
+
+    func append(_ data: Data) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !exceeded, data.count <= limit - storage.count else {
+            exceeded = true
+            storage.removeAll(keepingCapacity: false)
+            return false
+        }
+        storage.append(data)
+        return true
+    }
+
     var data: Data {
         lock.lock()
         defer { lock.unlock() }
         return storage
+    }
+
+    var exceededLimit: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return exceeded
     }
 }
 
