@@ -76,6 +76,7 @@ final class TokenSaverLocalLLMBenchmarkTests: XCTestCase {
 
         XCTAssertEqual(decoded.schemaVersion, 1)
         XCTAssertEqual(decoded.tokenCountSource, "omlx:/v1/messages/count_tokens")
+        XCTAssertEqual(decoded.source.gitHead, String(repeating: "a", count: 40))
         XCTAssertEqual(decoded.corpus.sha256, Self.expectedCorpusSHA256)
         XCTAssertEqual(decoded.cases.first?.finalEnvelope, "signal\n[[rc:rcv1.0123456789abcdef01234567]]")
         XCTAssertEqual(decoded.cases.first?.handleOverheadTokens, 7)
@@ -94,6 +95,7 @@ final class TokenSaverLocalLLMBenchmarkTests: XCTestCase {
         let baseURL = try requiredLocalBaseURL(environment["RC_TOKEN_SAVER_BENCHMARK_BASE_URL"])
         let model = try required(environment["RC_TOKEN_SAVER_BENCHMARK_MODEL"], name: "RC_TOKEN_SAVER_BENCHMARK_MODEL")
         let revision = try required(environment["RC_TOKEN_SAVER_BENCHMARK_MODEL_REVISION"], name: "RC_TOKEN_SAVER_BENCHMARK_MODEL_REVISION")
+        let sourceGitHead = try requiredGitHead(environment["RC_TOKEN_SAVER_BENCHMARK_SOURCE_GIT_HEAD"])
         let captureKind = try required(environment["RC_TOKEN_SAVER_BENCHMARK_CAPTURE_KIND"], name: "RC_TOKEN_SAVER_BENCHMARK_CAPTURE_KIND")
         guard ["baseline", "candidate", "final"].contains(captureKind) else {
             throw BenchmarkError.invalidConfiguration("RC_TOKEN_SAVER_BENCHMARK_CAPTURE_KIND must be baseline, candidate, or final")
@@ -196,6 +198,7 @@ final class TokenSaverLocalLLMBenchmarkTests: XCTestCase {
             captureKind: captureKind,
             capturedAt: ISO8601DateFormatter().string(from: Date()),
             tokenCountSource: "omlx:/v1/messages/count_tokens",
+            source: SourceIdentity(gitHead: sourceGitHead),
             model: ModelIdentity(id: model, revision: revision, server: "oMLX", serverVersion: serverVersion),
             corpus: CorpusIdentity(id: corpus.corpusID, sha256: corpusHash, caseCount: corpus.cases.count),
             protocolConfiguration: ProtocolConfiguration(
@@ -259,6 +262,7 @@ private struct BenchmarkReport: Codable {
     let captureKind: String
     let capturedAt: String
     let tokenCountSource: String
+    let source: SourceIdentity
     let model: ModelIdentity
     let corpus: CorpusIdentity
     let protocolConfiguration: ProtocolConfiguration
@@ -270,7 +274,7 @@ private struct BenchmarkReport: Codable {
         case captureKind = "capture_kind"
         case capturedAt = "captured_at"
         case tokenCountSource = "token_count_source"
-        case model, corpus, cases, aggregate
+        case source, model, corpus, cases, aggregate
         case protocolConfiguration = "protocol"
     }
 
@@ -280,6 +284,7 @@ private struct BenchmarkReport: Codable {
             captureKind: "baseline",
             capturedAt: "2026-08-23T00:00:00Z",
             tokenCountSource: "omlx:/v1/messages/count_tokens",
+            source: SourceIdentity(gitHead: String(repeating: "a", count: 40)),
             model: ModelIdentity(id: "model", revision: "revision", server: "oMLX", serverVersion: "test"),
             corpus: CorpusIdentity(id: "token-saver-local-llm-v1", sha256: corpusSHA256, caseCount: 1),
             protocolConfiguration: ProtocolConfiguration(
@@ -331,6 +336,14 @@ private struct BenchmarkReport: Codable {
                 routeCounts: ["llm_mlx": 1]
             )
         )
+    }
+}
+
+private struct SourceIdentity: Codable {
+    let gitHead: String
+
+    enum CodingKeys: String, CodingKey {
+        case gitHead = "git_head"
     }
 }
 
@@ -593,6 +606,14 @@ private extension TokenSaverLocalLLMBenchmarkTests {
     func required(_ rawValue: String?, name: String) throws -> String {
         guard let value = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
             throw BenchmarkError.invalidConfiguration("missing \(name)")
+        }
+        return value
+    }
+
+    func requiredGitHead(_ rawValue: String?) throws -> String {
+        let value = try required(rawValue, name: "RC_TOKEN_SAVER_BENCHMARK_SOURCE_GIT_HEAD")
+        guard value.range(of: #"^[0-9a-f]{40}$"#, options: .regularExpression) != nil else {
+            throw BenchmarkError.invalidConfiguration("RC_TOKEN_SAVER_BENCHMARK_SOURCE_GIT_HEAD must be a full lowercase Git SHA")
         }
         return value
     }

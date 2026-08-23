@@ -85,6 +85,7 @@ verify_integrity() {
     (.capture_kind == "baseline" or .capture_kind == "candidate" or .capture_kind == "final") and
     (.captured_at | type == "string" and length > 0) and
     .token_count_source == "omlx:/v1/messages/count_tokens" and
+    (.source.git_head | test("^[0-9a-f]{40}$")) and
     (.model.id | type == "string" and length > 0) and
     (.model.revision | type == "string" and length > 0) and
     .model.server == "oMLX" and
@@ -114,7 +115,7 @@ verify_integrity() {
       (.output_stable | type == "boolean") and
       (.recovery_readback_verified | type == "boolean") and
       (.measured_runs == $report.protocol.measured_runs_per_case) and
-      (.latency_ms | length == .measured_runs) and
+      (.latency_ms | length == $case.measured_runs) and
       (.input_tokens >= 0) and
       (.output_tokens_before_handle >= 0) and
       (.final_output_tokens >= 0) and
@@ -129,6 +130,10 @@ verify_integrity() {
        end)
     )
   ' "${report}" >/dev/null || die "report integrity failed: ${report}"
+  local source_head
+  source_head="$(jq -r '.source.git_head' "${report}")"
+  git -C "${repo_root}" cat-file -e "${source_head}^{commit}" 2>/dev/null \
+    || die "report source commit is unavailable: ${report}"
   echo "integrity ok report=${report}"
 }
 
@@ -224,6 +229,7 @@ capture() {
   : "${RC_TOKEN_SAVER_BENCHMARK_MODEL_REVISION:?set RC_TOKEN_SAVER_BENCHMARK_MODEL_REVISION}"
   verify_protocol
   RC_TOKEN_SAVER_LOCAL_LLM_BENCHMARK=1 \
+  RC_TOKEN_SAVER_BENCHMARK_SOURCE_GIT_HEAD="$(git -C "${repo_root}" rev-parse HEAD)" \
   RC_TOKEN_SAVER_BENCHMARK_CAPTURE_KIND="${kind}" \
   RC_TOKEN_SAVER_BENCHMARK_OUTPUT="${report}" \
     "${repo_root}/scripts/isolated-sandbox.sh" test \
