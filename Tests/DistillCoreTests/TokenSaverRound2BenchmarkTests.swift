@@ -1,0 +1,921 @@
+import CryptoKit
+import Foundation
+import Persistence
+import XCTest
+@testable import DistillCore
+
+final class TokenSaverRound2BenchmarkTests: XCTestCase {
+    private static let fixtureSHA256 = "2f7f815fa8efa3891809c1b66cbcc1b495c016d848401cf78d628cd836c00749"
+    private static let techniqueID = "librarian-success-fallback-question-elision-v1"
+
+    func test_fixtureFreezesTwentyFourAdversarialShippingCases() throws {
+        let (fixture, bytes) = try loadFixture()
+        XCTAssertEqual(fixture.schemaVersion, 1)
+        XCTAssertEqual(fixture.techniqueID, Self.techniqueID)
+        XCTAssertEqual(fixture.counter, "anthropic-v1-shipping-episode")
+        XCTAssertEqual(fixture.cases.count, 24)
+        XCTAssertEqual(Set(fixture.cases.map(\.id)).count, 24)
+        XCTAssertEqual(sha256(bytes), Self.fixtureSHA256)
+
+        for item in fixture.cases {
+            XCTAssertFalse(item.question.isEmpty, item.id)
+            XCTAssertTrue(item.source.contains(item.span), "\(item.id) span is not verbatim")
+            for literal in item.requiredLiterals {
+                XCTAssertTrue(
+                    item.answer.contains(literal) || item.span.contains(literal) || item.source.contains(literal),
+                    "\(item.id) lost required literal \(literal)"
+                )
+            }
+            for forbidden in item.forbiddenLiterals {
+                XCTAssertFalse(item.answer.contains(forbidden), "\(item.id) delivered forbidden claim \(forbidden)")
+            }
+        }
+    }
+
+    func test_successfulLibrarianEnvelopeShipsThroughActualMCPFraming() async throws {
+        let item = try loadFixture().fixture.cases[0]
+        let recovery = try RecoveryContext.temporary(cases: [item])
+        defer { recovery.removeTemporaryFiles() }
+        let episode = try await shippingEpisode(item, recovery: recovery)
+        XCTAssertEqual(episode.envelope.status, .ok)
+        XCTAssertEqual(episode.envelope.op, "ask_handle")
+        XCTAssertEqual(episode.envelope.answer, .object(["text": .string(item.answer)]))
+        XCTAssertEqual(episode.envelope.evidence.count, 1)
+        XCTAssertEqual(episode.envelope.evidence[0].span, item.span)
+        XCTAssertEqual(episode.envelope.fallback.recommended, "retrieve")
+        XCTAssertEqual(episode.envelope.evidence[0].handle, episode.envelope.fallback.handle)
+        XCTAssertTrue(episode.readbackExact)
+        XCTAssertEqual(episode.mcpResult["isError"] as? Bool, false)
+        XCTAssertEqual(try envelopeText(from: episode.mcpResult), episode.envelopeJSON)
+        XCTAssertEqual(try envelopeText(from: episode.retrieveResult), item.source)
+        XCTAssertTrue(episode.durableReadbackExact)
+    }
+
+    func test_adversarialVerifierAllowsOnlyQuestionElision() async throws {
+        let item = try loadFixture().fixture.cases[8]
+        let recovery = try RecoveryContext.temporary(cases: [item])
+        defer { recovery.removeTemporaryFiles() }
+        let episode = try await shippingEpisode(item, recovery: recovery)
+        let baseline = episode.envelopeJSON
+        var candidate = try jsonObject(Data(baseline.utf8))
+        var fallback = try requireDictionary(candidate["fallback"])
+        fallback.removeValue(forKey: "question")
+        candidate["fallback"] = fallback
+        let validCandidate = String(decoding: try canonicalJSON(candidate), as: UTF8.self)
+        XCTAssertTrue(try differsOnlyBySuccessfulFallbackQuestion(baseline: baseline, candidate: validCandidate))
+
+        let mutations: [(inout [String: Any]) -> Void] = [
+            { object in object["status"] = "low_confidence" },
+            { object in object["confidence"] = 0.2 },
+            { object in object["op"] = "other_op" },
+            { object in
+                var answer = object["answer"] as? [String: Any] ?? [:]
+                answer["text"] = "fabricated answer"
+                object["answer"] = answer
+            },
+            { object in
+                var evidence = object["evidence"] as? [[String: Any]] ?? []
+                evidence[0]["span"] = "fabricated span"
+                object["evidence"] = evidence
+            },
+            { object in
+                var changed = object["fallback"] as? [String: Any] ?? [:]
+                changed["handle"] = "rcv1.fabricated"
+                object["fallback"] = changed
+            },
+            { object in object["unexpected"] = true },
+        ]
+        for mutate in mutations {
+            var adulterated = candidate
+            mutate(&adulterated)
+            let text = String(decoding: try canonicalJSON(adulterated), as: UTF8.self)
+            XCTAssertFalse(try differsOnlyBySuccessfulFallbackQuestion(baseline: baseline, candidate: text))
+        }
+
+        var retained = candidate
+        var retainedFallback = try requireDictionary(retained["fallback"])
+        retainedFallback["question"] = "different question"
+        retained["fallback"] = retainedFallback
+        XCTAssertFalse(try differsOnlyBySuccessfulFallbackQuestion(
+            baseline: baseline,
+            candidate: String(decoding: try canonicalJSON(retained), as: UTF8.self)
+        ))
+    }
+
+    /// Manual and fail-closed. The shell coordinator sets this only after proving
+    /// the checkout is clean and HEAD equals the arm SHA.
+    func test_captureArmAgainstOMLX() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["RC_TOKEN_SAVER_ROUND2_CAPTURE"] == "1" else {
+            throw XCTSkip("Use scripts/token-saver-round2-benchmark.sh capture-arm.")
+        }
+        let configuration = try CaptureConfiguration(environment)
+        let (fixture, fixtureData) = try loadFixture()
+        guard sha256(fixtureData) == Self.fixtureSHA256 else {
+            throw Round2Error.invalid("fixture hash changed")
+        }
+
+        let repository = repositoryURL()
+        let head = try git(["rev-parse", "HEAD"], repository).trimmed
+        guard head == configuration.expectedGitSHA else {
+            throw Round2Error.invalid("compiled checkout HEAD does not equal expected arm SHA")
+        }
+        let tree = try git(["rev-parse", "HEAD^{tree}"], repository).trimmed
+        let sourceBindings = try sourceBindings(repository: repository, gitSHA: head)
+        let modelBinding = try modelBinding(configuration.modelSnapshot)
+
+        let output = configuration.outputDirectory
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        let recovery = try RecoveryContext(
+            outputDirectory: output,
+            seedDirectory: configuration.recoverySeedDirectory,
+            arm: configuration.arm,
+            cases: fixture.cases
+        )
+
+        let modelsResponse = try await request(
+            configuration.baseURL.appendingPathComponent("models"),
+            method: "GET",
+            body: nil,
+            token: configuration.authToken
+        )
+        let modelIDs = try modelIDs(in: modelsResponse)
+        guard modelIDs.filter({ $0 == configuration.model }).count == 1 else {
+            throw Round2Error.invalid("/v1/models must contain the selected model exactly once")
+        }
+        let openAPIURL = configuration.baseURL.deletingLastPathComponent().appendingPathComponent("openapi.json")
+        let openAPIResponse = try await request(openAPIURL, method: "GET", body: nil, token: configuration.authToken)
+        let serverVersion = try openAPIVersion(openAPIResponse)
+
+        try modelsResponse.write(to: output.appendingPathComponent("models-response.json"), options: .atomic)
+        try openAPIResponse.write(to: output.appendingPathComponent("server-openapi.json"), options: .atomic)
+
+        var caseReports: [[String: Any]] = []
+        for item in fixture.cases {
+            let warm = try await shippingEpisode(item, recovery: recovery)
+            try recovery.confirmDelivery(for: item)
+            var shippingSamples: [Double] = []
+            var episode = warm
+            for _ in 0..<5 {
+                let started = DispatchTime.now().uptimeNanoseconds
+                let measured = try await shippingEpisode(item, recovery: recovery)
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                guard measured.emitted == warm.emitted,
+                      measured.retrieveEmitted == warm.retrieveEmitted,
+                      measured.failOpenEmitted == warm.failOpenEmitted else {
+                    throw Round2Error.invalid("\(item.id) shipping output was not byte-stable")
+                }
+                shippingSamples.append(elapsed)
+                episode = measured
+            }
+
+            let emittedDirectory = output
+                .appendingPathComponent("emitted/\(item.id)", isDirectory: true)
+            try FileManager.default.createDirectory(at: emittedDirectory, withIntermediateDirectories: true)
+
+            let s0 = try providerBody(
+                model: configuration.model,
+                system: fixture.system,
+                item: item,
+                tools: episode.providerTools,
+                mcpResult: episode.mcpResult,
+                carryForward: false
+            )
+            let s6 = try providerBody(
+                model: configuration.model,
+                system: fixture.system,
+                item: item,
+                tools: episode.providerTools,
+                mcpResult: episode.mcpResult,
+                carryForward: true
+            )
+            let s2 = try forcedRetrieveBody(
+                model: configuration.model,
+                system: fixture.system,
+                item: item,
+                episode: episode
+            )
+            let s4 = try providerBody(
+                model: configuration.model,
+                system: fixture.system,
+                item: item,
+                tools: episode.providerTools,
+                mcpResult: episode.failOpenResult,
+                carryForward: false
+            )
+            let s2Emitted = episode.emitted + Data("\n".utf8) + episode.retrieveEmitted
+            let scenarios: [(id: String, turn: String, body: [String: Any], emitted: Data, expected: String)] = [
+                ("S0", "turn-1", s0, episode.emitted, "positive"),
+                ("S2", "turn-1", s2, s2Emitted, "positive"),
+                ("S4", "turn-1", s4, episode.failOpenEmitted, "zero"),
+                ("S6", "turn-2", s6, episode.emitted, "positive"),
+            ]
+            var scenarioReports: [[String: Any]] = []
+            for scenario in scenarios {
+                let envelopeDirectory = output
+                    .appendingPathComponent("envelopes/\(item.id)/\(scenario.id)", isDirectory: true)
+                let tokenizerDirectory = output
+                    .appendingPathComponent("tokenizer-responses/\(item.id)/\(scenario.id)", isDirectory: true)
+                try FileManager.default.createDirectory(at: envelopeDirectory, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: tokenizerDirectory, withIntermediateDirectories: true)
+                let bodyData = try canonicalJSON(scenario.body)
+                try bodyData.write(to: envelopeDirectory.appendingPathComponent("\(scenario.turn).json"), options: .atomic)
+                try scenario.emitted.write(to: emittedDirectory.appendingPathComponent("\(scenario.id).bin"), options: .atomic)
+                let count = try await countTwice(bodyData, configuration: configuration)
+                try count.first.write(to: tokenizerDirectory.appendingPathComponent("\(scenario.turn).json"), options: .atomic)
+                try count.replay.write(to: tokenizerDirectory.appendingPathComponent("\(scenario.turn)-replay.json"), options: .atomic)
+                scenarioReports.append([
+                    "id": scenario.id,
+                    "turn": scenario.turn,
+                    "body_sha256": sha256(bodyData),
+                    "emitted_sha256": sha256(scenario.emitted),
+                    "input_tokens": count.tokens,
+                    "expected_delta": scenario.expected,
+                    "count_replay_verified": true,
+                ])
+            }
+
+            let hasQuestion = episode.envelope.fallback.question != nil
+            guard (configuration.arm == "baseline" && episode.envelope.fallback.question == item.question)
+                    || (configuration.arm == "candidate" && !hasQuestion) else {
+                throw Round2Error.invalid("\(item.id) arm does not match fallback.question contract")
+            }
+            guard episode.readbackExact,
+                  episode.envelope.status == .ok,
+                  episode.envelope.op == "ask_handle",
+                  episode.envelope.answer == .object(["text": .string(item.answer)]),
+                  episode.envelope.evidence.first?.span == item.span,
+                  episode.envelope.evidence.first?.handle == episode.envelope.fallback.handle,
+                  episode.envelope.fallback.recommended == "retrieve",
+                  item.requiredLiterals.allSatisfy({ item.answer.contains($0) || item.source.contains($0) }),
+                  item.forbiddenLiterals.allSatisfy({ !item.answer.contains($0) && !episode.envelopeJSON.contains($0) }) else {
+                throw Round2Error.invalid("\(item.id) quality oracle failed")
+            }
+
+            caseReports.append([
+                "id": item.id,
+                "question_sha256": sha256(Data(item.question.utf8)),
+                "envelope_sha256": sha256(Data(episode.envelopeJSON.utf8)),
+                "emitted_sha256": sha256(episode.emitted),
+                "scenarios": scenarioReports,
+                "not_applicable": [
+                    ["id": "S1", "reason": "ask_handle is a hot declared tool; no catalog lookup is required"],
+                    ["id": "S3", "reason": "field elision does not change generation, parsing, or retry behavior"],
+                    ["id": "S5", "reason": "S1 and S3 are source-bound not applicable for this field-only technique"],
+                ],
+                "shipping_latency_ms": shippingSamples,
+                "quality_passed": true,
+                "fallback_question_present": hasQuestion,
+                "durable_readback_exact": true,
+                "delivery_confirmed": true,
+                "recovery_mode": "token_saver_scoped_persistence",
+            ])
+        }
+
+        try recovery.persistCapabilities()
+        let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        let executableData = try Data(contentsOf: executableURL, options: .mappedIfSafe)
+        let report: [String: Any] = [
+            "schema_version": 1,
+            "technique_id": Self.techniqueID,
+            "arm": configuration.arm,
+            "counter": fixture.counter,
+            "token_count_source": "omlx:/v1/messages/count_tokens",
+            "source": [
+                "git_sha": head,
+                "tree_sha": tree,
+                "dirty": false,
+                "bindings": sourceBindings,
+                "executable_sha256": sha256(executableData),
+            ],
+            "fixture": ["path": fixturePath(relativeTo: repository), "sha256": Self.fixtureSHA256, "case_count": 24],
+            "model": [
+                "id": configuration.model,
+                "server": "oMLX",
+                "server_version": serverVersion,
+                "snapshot_path": modelBinding.path,
+                "revision": modelBinding.revision,
+                "files": modelBinding.files,
+                "manifest_sha256": modelBinding.manifestSHA256,
+                "models_response_sha256": sha256(modelsResponse),
+                "openapi_response_sha256": sha256(openAPIResponse),
+            ],
+            "cases": caseReports,
+            "aggregate": [
+                "case_count": caseReports.count,
+                "quality_passed_cases": caseReports.filter { $0["quality_passed"] as? Bool == true }.count,
+                "measured_scenarios": ["S0", "S2", "S4", "S6"],
+                "not_applicable_scenarios": ["S1", "S3", "S5"],
+            ],
+            "auth_persisted": false,
+        ]
+        let reportData = try canonicalJSON(report, pretty: true)
+        if let token = configuration.authToken, token.count >= 8,
+           String(decoding: reportData, as: UTF8.self).contains(token) {
+            throw Round2Error.invalid("authorization material reached report")
+        }
+        try reportData.write(to: output.appendingPathComponent("report.json"), options: .atomic)
+        try writeManifest(in: output)
+    }
+}
+
+private extension TokenSaverRound2BenchmarkTests {
+    struct ScriptedGenerate: LibrarianGenerating {
+        let answer: String
+        let span: String
+
+        func generate(_ call: LibrarianGenerateCall) async -> String? {
+            guard call.user.contains(span) else { return nil }
+            let data = try? JSONSerialization.data(withJSONObject: ["answer": answer, "span": span], options: [.sortedKeys, .withoutEscapingSlashes])
+            return data.map { String(decoding: $0, as: UTF8.self) }
+        }
+    }
+
+    struct ShippingEpisode {
+        let emitted: Data
+        let mcpResult: [String: Any]
+        let retrieveEmitted: Data
+        let retrieveResult: [String: Any]
+        let failOpenEmitted: Data
+        let failOpenResult: [String: Any]
+        let envelope: LibrarianEnvelope
+        let envelopeJSON: String
+        let providerTools: [[String: Any]]
+        let durableReadbackExact: Bool
+
+        var providerTool: [String: Any] { providerTools[0] }
+        var readbackExact: Bool { durableReadbackExact }
+    }
+
+    func shippingEpisode(_ item: Round2Case, recovery: RecoveryContext) async throws -> ShippingEpisode {
+        let capability = try recovery.capability(for: item)
+        let persistentOriginal = try recovery.retrieve(capability: capability)
+        guard persistentOriginal == Data(item.source.utf8) else {
+            throw Round2Error.invalid("\(item.id) persistent recovery readback failed")
+        }
+        let dispatcher = LibrarianDispatcher(generate: ScriptedGenerate(answer: item.answer, span: item.span))
+        _ = dispatcher.store.put(item.source, handle: capability)
+        let server = ManagedRetrieveMCP(
+            retrieve: { handle in
+                guard let data = try? recovery.retrieve(capability: handle) else { return nil }
+                return String(data: data, encoding: .utf8)
+            },
+            ask: { op, input, question, handle in
+                let result = await dispatcher.dispatch(LibrarianRequest(
+                    id: op,
+                    input: input,
+                    question: question,
+                    handle: handle,
+                    provider: "round2-benchmark",
+                    threadID: item.id,
+                    admitted: true,
+                    retrieveAvailable: true,
+                    verifiedRecoveryHandle: handle
+                ))
+                return result.envelope?.jsonString() ?? result.text
+            },
+            scopedRecoveryAvailable: true,
+            distillAdmission: { true }
+        )
+        let optionalList = await server.handle(#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        let list = try XCTUnwrap(optionalList)
+        let listObject = try jsonObject(Data(list.utf8))
+        let listed = try requireDictionary(listObject["result"])["tools"] as? [[String: Any]]
+        let askTool = try XCTUnwrap(listed?.first { $0["name"] as? String == "rc_ask" })
+        let retrieveTool = try XCTUnwrap(listed?.first { $0["name"] as? String == "rc_retrieve" })
+        let providerTools: [[String: Any]] = [askTool, retrieveTool].map {
+            ["name": $0["name"] as Any, "description": $0["description"] as Any, "input_schema": $0["inputSchema"] as Any]
+        }
+        let call: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": [
+                "name": "rc_ask",
+                "arguments": ["op": "ask_handle", "question": item.question, "handle": capability],
+            ],
+        ]
+        let callLine = String(decoding: try canonicalJSON(call), as: UTF8.self)
+        let optionalResponseLine = await server.handle(callLine)
+        let responseLine = try XCTUnwrap(optionalResponseLine)
+        let emitted = Data(responseLine.utf8)
+        let response = try jsonObject(emitted)
+        let mcpResult = try requireDictionary(response["result"])
+        let envelopeJSON = try envelopeText(from: mcpResult)
+        let envelope = try JSONDecoder().decode(LibrarianEnvelope.self, from: Data(envelopeJSON.utf8))
+        let handle = try XCTUnwrap(envelope.fallback.handle)
+        guard handle == capability else { throw Round2Error.invalid("\(item.id) envelope changed persistent capability") }
+
+        let retrieveCall: [String: Any] = [
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": ["name": "rc_retrieve", "arguments": ["handle": capability]],
+        ]
+        let retrieveLine = String(decoding: try canonicalJSON(retrieveCall), as: UTF8.self)
+        let optionalRetrieveResponse = await server.handle(retrieveLine)
+        let retrieveResponse = try XCTUnwrap(optionalRetrieveResponse)
+        let retrieveEmitted = Data(retrieveResponse.utf8)
+        let retrieveResult = try requireDictionary(try jsonObject(retrieveEmitted)["result"])
+
+        let unavailable = LibrarianDispatcher(store: dispatcher.store)
+        let unavailableServer = ManagedRetrieveMCP(
+            retrieve: { handle in
+                guard let data = try? recovery.retrieve(capability: handle) else { return nil }
+                return String(data: data, encoding: .utf8)
+            },
+            ask: { op, input, question, handle in
+                let result = await unavailable.dispatch(LibrarianRequest(
+                    id: op, input: input, question: question, handle: handle,
+                    provider: "round2-benchmark", threadID: item.id,
+                    admitted: true, retrieveAvailable: true, verifiedRecoveryHandle: handle
+                ))
+                return result.envelope?.jsonString() ?? result.text
+            },
+            scopedRecoveryAvailable: true,
+            distillAdmission: { true }
+        )
+        let optionalFailOpenResponse = await unavailableServer.handle(callLine)
+        let failOpenResponse = try XCTUnwrap(optionalFailOpenResponse)
+        let failOpenEmitted = Data(failOpenResponse.utf8)
+        let failOpenResult = try requireDictionary(try jsonObject(failOpenEmitted)["result"])
+        return ShippingEpisode(
+            emitted: emitted,
+            mcpResult: mcpResult,
+            retrieveEmitted: retrieveEmitted,
+            retrieveResult: retrieveResult,
+            failOpenEmitted: failOpenEmitted,
+            failOpenResult: failOpenResult,
+            envelope: envelope,
+            envelopeJSON: envelopeJSON,
+            providerTools: providerTools,
+            durableReadbackExact: try recovery.reconstructAndRetrieve(capability: handle) == Data(item.source.utf8)
+        )
+    }
+
+    func providerBody(
+        model: String,
+        system: String,
+        item: Round2Case,
+        tools: [[String: Any]],
+        mcpResult: [String: Any],
+        carryForward: Bool
+    ) throws -> [String: Any] {
+        let shippedEnvelope = try jsonObject(Data(envelopeText(from: mcpResult).utf8))
+        let fallback = try requireDictionary(shippedEnvelope["fallback"])
+        guard let handle = fallback["handle"] as? String else {
+            throw Round2Error.invalid("provider body omitted recovery handle")
+        }
+        var messages: [[String: Any]] = [
+            ["role": "user", "content": item.question],
+            ["role": "assistant", "content": [[
+                "type": "tool_use", "id": "toolu_\(item.id)", "name": "rc_ask",
+                "input": ["op": "ask_handle", "handle": handle, "question": item.question],
+            ]]],
+            ["role": "user", "content": [[
+                "type": "tool_result", "tool_use_id": "toolu_\(item.id)",
+                "content": mcpResult["content"] as Any,
+                "is_error": mcpResult["isError"] as Any,
+            ]]],
+        ]
+        if carryForward {
+            messages.append(["role": "assistant", "content": item.answer])
+            messages.append(["role": "user", "content": item.nextUser])
+        }
+        return ["model": model, "system": system, "messages": messages, "tools": tools]
+    }
+
+    func forcedRetrieveBody(
+        model: String,
+        system: String,
+        item: Round2Case,
+        episode: ShippingEpisode
+    ) throws -> [String: Any] {
+        var body = try providerBody(
+            model: model,
+            system: system,
+            item: item,
+            tools: episode.providerTools,
+            mcpResult: episode.mcpResult,
+            carryForward: false
+        )
+        var messages = try XCTUnwrap(body["messages"] as? [[String: Any]])
+        let handle = try XCTUnwrap(episode.envelope.fallback.handle)
+        messages.append(["role": "assistant", "content": [[
+            "type": "tool_use", "id": "toolu_retrieve_\(item.id)", "name": "rc_retrieve",
+            "input": ["handle": handle],
+        ]]])
+        messages.append(["role": "user", "content": [[
+            "type": "tool_result", "tool_use_id": "toolu_retrieve_\(item.id)",
+            "content": episode.retrieveResult["content"] as Any,
+            "is_error": episode.retrieveResult["isError"] as Any,
+        ]]])
+        body["messages"] = messages
+        return body
+    }
+
+    func countTwice(_ body: Data, configuration: CaptureConfiguration) async throws -> (first: Data, replay: Data, tokens: Int) {
+        let url = configuration.baseURL.appendingPathComponent("messages/count_tokens")
+        let first = try await request(url, method: "POST", body: body, token: configuration.authToken)
+        let replay = try await request(url, method: "POST", body: body, token: configuration.authToken)
+        let firstTokens = try tokenCount(first)
+        guard firstTokens == (try tokenCount(replay)) else {
+            throw Round2Error.invalid("count_tokens replay changed input_tokens")
+        }
+        return (first, replay, firstTokens)
+    }
+
+    func request(_ url: URL, method: String, body: Data?, token: String?) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = 60
+        if let body {
+            request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        if let token, !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw Round2Error.invalid("HTTP request failed: \(url.path)")
+        }
+        return data
+    }
+
+    func tokenCount(_ data: Data) throws -> Int {
+        let object = try jsonObject(data)
+        guard let value = object["input_tokens"] as? Int else {
+            throw Round2Error.invalid("count_tokens response omitted input_tokens")
+        }
+        return value
+    }
+
+    func modelIDs(in data: Data) throws -> [String] {
+        let object = try jsonObject(data)
+        guard let models = object["data"] as? [[String: Any]] else {
+            throw Round2Error.invalid("invalid /v1/models response")
+        }
+        return models.compactMap { $0["id"] as? String }
+    }
+
+    func openAPIVersion(_ data: Data) throws -> String {
+        let object = try jsonObject(data)
+        guard let info = object["info"] as? [String: Any],
+              let version = info["version"] as? String, !version.isEmpty else {
+            throw Round2Error.invalid("oMLX version unavailable")
+        }
+        return version
+    }
+
+    func modelBinding(_ snapshotURL: URL) throws -> (path: String, revision: String, files: [[String: Any]], manifestSHA256: String) {
+        let canonical = snapshotURL.resolvingSymlinksInPath().standardizedFileURL
+        let revision = canonical.lastPathComponent
+        guard revision.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil else {
+            throw Round2Error.invalid("model snapshot must end in a 40-hex revision")
+        }
+        let required = ["config.json", "tokenizer.json", "tokenizer_config.json"]
+        for name in required where !FileManager.default.fileExists(atPath: canonical.appendingPathComponent(name).path) {
+            throw Round2Error.invalid("model snapshot omitted \(name)")
+        }
+        let enumerator = FileManager.default.enumerator(at: canonical, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
+        var files: [[String: Any]] = []
+        while let url = enumerator?.nextObject() as? URL {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey])
+            guard values.isRegularFile == true else { continue }
+            let name = url.lastPathComponent
+            let relevant = required.contains(name)
+                || name.contains("token") || name.contains("chat_template")
+                || name.hasSuffix(".safetensors") || name.hasSuffix(".index.json")
+            guard relevant else { continue }
+            let bytes = try Data(contentsOf: url, options: .mappedIfSafe)
+            let relative = String(url.path.dropFirst(canonical.path.count + 1))
+            files.append(["path": relative, "bytes": bytes.count, "sha256": sha256(bytes)])
+        }
+        files.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
+        guard files.contains(where: { ($0["path"] as? String)?.hasSuffix(".safetensors") == true }) else {
+            throw Round2Error.invalid("model snapshot omitted weight files")
+        }
+        return (canonical.path, revision, files, sha256(try canonicalJSON(files)))
+    }
+
+    func sourceBindings(repository: URL, gitSHA: String) throws -> [[String: Any]] {
+        let paths = [
+            "Sources/DistillCore/Librarian/LibrarianHandlers.swift",
+            "Sources/DistillCore/Librarian/LibrarianEnvelope.swift",
+            "Sources/DistillCore/ManagedRetrieveMCP.swift",
+            "Tests/DistillCoreTests/TokenSaverRound2BenchmarkTests.swift",
+            "Tests/Fixtures/TokenSaverLocalLLMRound2/envelope-question.json",
+            "scripts/token-saver-round2-benchmark.sh",
+            "docs/benchmarks/token-saver-local-llm/round-2/PROTOCOL.md",
+        ]
+        return try paths.map { path in
+            let blob = try git(["rev-parse", "\(gitSHA):\(path)"], repository).trimmed
+            let bytes = try gitData(["show", "\(gitSHA):\(path)"], repository)
+            return ["path": path, "blob_sha1": blob, "sha256": sha256(bytes), "bytes": bytes.count]
+        }
+    }
+
+    func writeManifest(in root: URL) throws {
+        let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
+        var files: [[String: Any]] = []
+        while let url = enumerator?.nextObject() as? URL {
+            guard url.lastPathComponent != "manifest.json",
+                  try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else { continue }
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            let relative = String(url.path.dropFirst(root.path.count + 1))
+            files.append(["path": relative, "bytes": data.count, "sha256": sha256(data)])
+        }
+        files.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
+        let manifest: [String: Any] = ["schema_version": 1, "manifest_excludes_self": true, "files": files]
+        try canonicalJSON(manifest, pretty: true).write(to: root.appendingPathComponent("manifest.json"), options: .atomic)
+    }
+
+    func loadFixture() throws -> (fixture: Round2Fixture, bytes: Data) {
+        let url = repositoryURL().appendingPathComponent("Tests/Fixtures/TokenSaverLocalLLMRound2/envelope-question.json")
+        let data = try Data(contentsOf: url)
+        return (try JSONDecoder().decode(Round2Fixture.self, from: data), data)
+    }
+
+    func fixturePath(relativeTo repository: URL) -> String {
+        "Tests/Fixtures/TokenSaverLocalLLMRound2/envelope-question.json"
+    }
+
+    func repositoryURL() -> URL {
+        URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    }
+
+    func envelopeText(from result: [String: Any]) throws -> String {
+        guard let content = result["content"] as? [[String: Any]],
+              let text = content.first?["text"] as? String else {
+            throw Round2Error.invalid("MCP result omitted text content")
+        }
+        return text
+    }
+
+    func jsonObject(_ data: Data) throws -> [String: Any] {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw Round2Error.invalid("expected JSON object")
+        }
+        return object
+    }
+
+    func differsOnlyBySuccessfulFallbackQuestion(baseline: String, candidate: String) throws -> Bool {
+        var baselineObject = try jsonObject(Data(baseline.utf8))
+        let candidateObject = try jsonObject(Data(candidate.utf8))
+        guard baselineObject["status"] as? String == "ok",
+              candidateObject["status"] as? String == "ok",
+              var baselineFallback = baselineObject["fallback"] as? [String: Any],
+              let candidateFallback = candidateObject["fallback"] as? [String: Any],
+              baselineFallback["question"] is String,
+              candidateFallback["question"] == nil else {
+            return false
+        }
+        baselineFallback.removeValue(forKey: "question")
+        baselineObject["fallback"] = baselineFallback
+        return try canonicalJSON(baselineObject) == canonicalJSON(candidateObject)
+    }
+
+    func requireDictionary(_ value: Any?) throws -> [String: Any] {
+        guard let dictionary = value as? [String: Any] else {
+            throw Round2Error.invalid("expected JSON dictionary")
+        }
+        return dictionary
+    }
+
+    func canonicalJSON(_ object: Any, pretty: Bool = false) throws -> Data {
+        var options: JSONSerialization.WritingOptions = [.sortedKeys, .withoutEscapingSlashes]
+        if pretty { options.insert(.prettyPrinted) }
+        return try JSONSerialization.data(withJSONObject: object, options: options)
+    }
+
+    func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func git(_ arguments: [String], _ repository: URL) throws -> String {
+        String(decoding: try gitData(arguments, repository), as: UTF8.self)
+    }
+
+    func gitData(_ arguments: [String], _ repository: URL) throws -> Data {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", repository.path] + arguments
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw Round2Error.invalid("git \(arguments.joined(separator: " ")) failed") }
+        return data
+    }
+}
+
+private struct CaptureConfiguration {
+    let arm: String
+    let expectedGitSHA: String
+    let outputDirectory: URL
+    let baseURL: URL
+    let model: String
+    let modelSnapshot: URL
+    let recoverySeedDirectory: URL?
+    let authToken: String?
+
+    init(_ environment: [String: String]) throws {
+        arm = try Self.required(environment["RC_TOKEN_SAVER_ROUND2_ARM"], "RC_TOKEN_SAVER_ROUND2_ARM")
+        guard arm == "baseline" || arm == "candidate" else { throw Round2Error.invalid("arm must be baseline or candidate") }
+        expectedGitSHA = try Self.required(environment["RC_TOKEN_SAVER_ROUND2_EXPECTED_GIT_SHA"], "RC_TOKEN_SAVER_ROUND2_EXPECTED_GIT_SHA")
+        guard expectedGitSHA.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil else { throw Round2Error.invalid("expected SHA must be 40 hex") }
+        outputDirectory = URL(fileURLWithPath: try Self.required(environment["RC_TOKEN_SAVER_ROUND2_OUTPUT_DIR"], "RC_TOKEN_SAVER_ROUND2_OUTPUT_DIR"), isDirectory: true)
+        let base = try Self.required(environment["RC_TOKEN_SAVER_ROUND2_BASE_URL"], "RC_TOKEN_SAVER_ROUND2_BASE_URL")
+        guard let parsed = URL(string: base), parsed.scheme == "http", ["127.0.0.1", "localhost", "::1"].contains(parsed.host), parsed.path.hasSuffix("/v1") else {
+            throw Round2Error.invalid("base URL must be loopback HTTP ending in /v1")
+        }
+        baseURL = parsed
+        model = try Self.required(environment["RC_TOKEN_SAVER_ROUND2_MODEL"], "RC_TOKEN_SAVER_ROUND2_MODEL")
+        modelSnapshot = URL(fileURLWithPath: try Self.required(environment["RC_TOKEN_SAVER_ROUND2_MODEL_SNAPSHOT"], "RC_TOKEN_SAVER_ROUND2_MODEL_SNAPSHOT"), isDirectory: true)
+        recoverySeedDirectory = environment["RC_TOKEN_SAVER_ROUND2_RECOVERY_SEED_DIR"].flatMap {
+            $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true)
+        }
+        if arm == "candidate", recoverySeedDirectory == nil {
+            throw Round2Error.invalid("candidate capture requires the baseline recovery seed directory")
+        }
+        authToken = environment["RC_TOKEN_SAVER_ROUND2_AUTH_TOKEN"].flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    private static func required(_ value: String?, _ name: String) throws -> String {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw Round2Error.invalid("missing \(name)") }
+        return value
+    }
+}
+
+private struct Round2Fixture: Decodable {
+    let schemaVersion: Int
+    let techniqueID: String
+    let counter: String
+    let system: String
+    let cases: [Round2Case]
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case techniqueID = "technique_id"
+        case counter, system, cases
+    }
+}
+
+private struct Round2Case: Decodable, Sendable {
+    let id: String
+    let cohort: String
+    let source: String
+    let question: String
+    let answer: String
+    let span: String
+    let nextUser: String
+    let requiredLiterals: [String]
+    let forbiddenLiterals: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case id, cohort, source, question, answer, span
+        case nextUser = "next_user"
+        case requiredLiterals = "required_literals"
+        case forbiddenLiterals = "forbidden_literals"
+    }
+}
+
+private enum Round2Error: Error {
+    case invalid(String)
+}
+
+private final class RecoveryContext: @unchecked Sendable {
+    private struct Entry: Codable {
+        let capability: String
+        let idempotencyKey: String
+    }
+
+    private let db: SQLiteDB
+    private let store: TokenSaverScopedRecoveryStore
+    private let worker: TokenSaverRuntimeRecoveryWorker
+    private let scope = TokenSaverPersistentScope(
+        workspaceID: "round2-workspace",
+        projectID: "round2-project",
+        threadID: "round2-thread",
+        provider: "canonical-anthropic-envelope",
+        attemptID: "round2-attempt"
+    )
+    private let arm: String
+    private let recoveryDirectory: URL
+    private let liveDirectory: URL
+    private var entries: [String: Entry]
+    private var temporaryRoot: URL?
+
+    init(outputDirectory: URL, seedDirectory: URL?, arm: String, cases: [Round2Case]) throws {
+        self.arm = arm
+        recoveryDirectory = outputDirectory.appendingPathComponent("recovery", isDirectory: true)
+        try FileManager.default.createDirectory(at: recoveryDirectory, withIntermediateDirectories: true)
+        liveDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("token-saver-round2-live-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: liveDirectory, withIntermediateDirectories: true)
+        let databaseURL = liveDirectory.appendingPathComponent("recovery.sqlite")
+        if let seedDirectory {
+            let seedDB = seedDirectory.appendingPathComponent("recovery/recovery.sqlite")
+            let seedEntries = seedDirectory.appendingPathComponent("recovery/capabilities.json")
+            guard FileManager.default.fileExists(atPath: seedDB.path), FileManager.default.fileExists(atPath: seedEntries.path) else {
+                throw Round2Error.invalid("baseline recovery seed is incomplete")
+            }
+            try FileManager.default.copyItem(at: seedDB, to: databaseURL)
+            entries = try JSONDecoder().decode([String: Entry].self, from: Data(contentsOf: seedEntries))
+        } else {
+            entries = [:]
+        }
+        db = try SQLiteDB(path: databaseURL.path)
+        try Schema.migrate(db)
+        try TokenSaverLaneStateRepository(db: db).ensureDefaults(projectID: scope.projectID)
+        store = TokenSaverScopedRecoveryStore(db: db)
+        worker = TokenSaverRuntimeRecoveryWorker(db: db)
+        if arm == "candidate", Set(entries.keys) != Set(cases.map(\.id)) {
+            throw Round2Error.invalid("candidate recovery seed does not bind all fixture cases")
+        }
+    }
+
+    static func temporary(cases: [Round2Case]) throws -> RecoveryContext {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("token-saver-round2-recovery-\(UUID().uuidString)", isDirectory: true)
+        let context = try RecoveryContext(outputDirectory: root, seedDirectory: nil, arm: "baseline", cases: cases)
+        context.temporaryRoot = root
+        return context
+    }
+
+    func capability(for item: Round2Case) throws -> String {
+        if let entry = entries[item.id] {
+            guard try store.retrieve(capability: entry.capability, scope: scope) == Data(item.source.utf8) else {
+                throw Round2Error.invalid("\(item.id) seeded capability readback failed")
+            }
+            return entry.capability
+        }
+        guard arm == "baseline" else { throw Round2Error.invalid("candidate attempted to mint a new capability") }
+        let prepared = try worker.prepareOriginal(
+            Data(item.source.utf8),
+            scope: scope,
+            operationID: "round2-\(item.id.lowercased())",
+            invocationID: "round2-\(item.id.lowercased())",
+            lane: "deterministic_wrapper",
+            expiresAt: Date(timeIntervalSince1970: 2_000_000_000),
+            disk: TokenSaverRecoveryDiskSnapshot(
+                freeBytes: 20 * 1_024 * 1_024 * 1_024,
+                totalBytes: 100 * 1_024 * 1_024 * 1_024
+            ),
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        guard prepared.readBackVerified else { throw Round2Error.invalid("\(item.id) persistence prepare was not verified") }
+        entries[item.id] = Entry(capability: prepared.capability, idempotencyKey: prepared.idempotencyKey)
+        return prepared.capability
+    }
+
+    func retrieve(capability: String) throws -> Data? {
+        try store.retrieve(capability: capability, scope: scope)
+    }
+
+    func reconstructAndRetrieve(capability: String) throws -> Data? {
+        try TokenSaverScopedRecoveryStore(db: db).retrieve(capability: capability, scope: scope)
+    }
+
+    func confirmDelivery(for item: Round2Case) throws {
+        guard let entry = entries[item.id] else { throw Round2Error.invalid("missing recovery entry") }
+        let transitioned = try store.markDelivered(
+            capability: entry.capability,
+            scope: scope,
+            idempotencyKey: entry.idempotencyKey,
+            outcome: .acked,
+            now: Date(timeIntervalSince1970: 1_800_000_001)
+        )
+        let stillRetrievable = try reconstructAndRetrieve(capability: entry.capability) == Data(item.source.utf8)
+        guard transitioned || stillRetrievable else {
+            throw Round2Error.invalid("\(item.id) delivery confirmation failed")
+        }
+    }
+
+    func persistCapabilities() throws {
+        let url = recoveryDirectory.appendingPathComponent("capabilities.json")
+        let data = try JSONEncoder().encode(entries)
+        try data.write(to: url, options: .atomic)
+        try db.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        let snapshot = recoveryDirectory.appendingPathComponent("recovery.sqlite")
+        if FileManager.default.fileExists(atPath: snapshot.path) {
+            try FileManager.default.removeItem(at: snapshot)
+        }
+        let escaped = snapshot.path.replacingOccurrences(of: "'", with: "''")
+        try db.execute("VACUUM INTO '\(escaped)';")
+    }
+
+    func removeTemporaryFiles() {
+        try? FileManager.default.removeItem(at: liveDirectory)
+        if let temporaryRoot { try? FileManager.default.removeItem(at: temporaryRoot) }
+    }
+
+    deinit {
+        try? FileManager.default.removeItem(at: liveDirectory)
+    }
+}
+
+private extension String {
+    var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
+}
