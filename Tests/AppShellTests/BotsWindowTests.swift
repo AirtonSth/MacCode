@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 import SwiftUI
 import CoreModel
@@ -5889,6 +5890,7 @@ final class BotsWindowTests: XCTestCase {
         vm.studioDraft.title = "Research lead"
         vm.studioDraft.soul = "Stand up for the brief."
         XCTAssertTrue(vm.studioHasUnpublishedChanges)
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
 
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.screen, .studio)
@@ -11035,6 +11037,7 @@ final class BotsWindowTests: XCTestCase {
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.openDesk(bot)
         vm.composerText = "keep after relaunch"
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.selectedBotID, bot.id)
         XCTAssertEqual(reopened.screen, .desk)
@@ -11104,6 +11107,7 @@ final class BotsWindowTests: XCTestCase {
         vm.routineName = "Morning scan"
         vm.routinePrompt = "Scan overnight"
         vm.routineScheduleNote = "Weekdays 9:00"
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.selectedBotID, bot.id)
         XCTAssertEqual(reopened.memoryDraft, "keep inspector after relaunch")
@@ -11112,6 +11116,547 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(reopened.routinePrompt, "Scan overnight")
         XCTAssertEqual(reopened.routineScheduleNote, "Weekdays 9:00")
         XCTAssertTrue(reopened.memoryItems.isEmpty, "relaunch must restore the draft, not save it")
+    }
+
+    func test_draftPersistenceCoalescesUntilFakeClockDeadline_becauseTypingMustNotWritePerCharacter() throws {
+        // WHY: a 25 Hz editor must update visible/in-memory state immediately
+        // without rebuilding and writing the full 50-row JSON envelope per key.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        vm.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        vm.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        vm.resetDraftPersistenceMetricsForTesting()
+
+        for _ in 0..<6 {
+            vm.composerText.append("x")
+            clock.advance(byNanoseconds: 40_000_000)
+        }
+        XCTAssertEqual(vm.composerText, "xxxxxx", "the in-memory draft must be immediate")
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 0)
+        XCTAssertEqual(clock.pendingCount, 1)
+
+        clock.advance(byNanoseconds: 10_000_000)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.encodeCount, 1)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 1)
+        let data = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        let stored = try JSONDecoder().decode([String: BotComposerDraft].self, from: data)
+        XCTAssertEqual(stored[bot.id.value.uuidString.lowercased()]?.text, "xxxxxx")
+    }
+
+    func test_pendingDraftsFlushBeforeBotSwitch_becauseOwnershipMustNotLeakOrLoseWork() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.")
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", soul: "Be exact.")
+        vm.openStudio(piper)
+        vm.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        vm.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        vm.resetDraftPersistenceMetricsForTesting()
+        vm.composerText = "Piper composer"
+        vm.memoryDraft = "Piper memory"
+        vm.studioDraft.title = "Piper draft title"
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 0)
+
+        vm.openDesk(quinn)
+
+        XCTAssertEqual(vm.composerText, "")
+        XCTAssertEqual(vm.memoryDraft, "")
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.encodeCount, 3)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 3)
+        let decoder = JSONDecoder()
+        let composer = try decoder.decode(
+            [String: BotComposerDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        )
+        let inspector = try decoder.decode(
+            [String: BotInspectorDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+        )
+        let studio = try decoder.decode(
+            [String: BotStudioDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+        )
+        let key = piper.id.value.uuidString.lowercased()
+        XCTAssertEqual(composer[key]?.text, "Piper composer")
+        XCTAssertEqual(inspector[key]?.memoryDraft, "Piper memory")
+        XCTAssertEqual(studio[key]?.title, "Piper draft title")
+    }
+
+    func test_sendAndSaveSynchronouslyFlushPendingDraftState_becauseCommittedTextMustNotReturn() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.")
+        vm.openDesk(bot)
+        vm.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        vm.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+
+        vm.composerText = "send then forget"
+        XCTAssertTrue(vm.send())
+        XCTAssertNil(
+            UserDefaults.standard.data(forKey: "bots.composerDrafts"),
+            "Send must synchronously remove the consumed draft"
+        )
+
+        vm.beginEdit(bot)
+        vm.studioDraft.title = "Published title"
+        _ = try vm.saveStudio()
+        let studioData = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+        let studio = try JSONDecoder().decode([String: BotStudioDraft].self, from: studioData)
+        XCTAssertEqual(studio[bot.id.value.uuidString.lowercased()]?.title, "Published title")
+
+        let writes = vm.draftPersistenceMetricsForTesting.setCount
+        clock.advance(byNanoseconds: 1_000_000_000)
+        XCTAssertEqual(
+            vm.draftPersistenceMetricsForTesting.setCount,
+            writes,
+            "a cancelled deadline must not write a second time after explicit flush"
+        )
+    }
+
+    func test_hideCloseAndQuitFlushPendingDrafts_becauseLifecycleMustPreserveLatestText() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.")
+        vm.beginEdit(bot)
+        vm.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        vm.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        vm.resetDraftPersistenceMetricsForTesting()
+
+        vm.studioDraft.title = "Before hide"
+        NotificationCenter.default.post(name: NSApplication.willHideNotification, object: nil)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 1)
+
+        vm.studioDraft.title = "Before close"
+        NotificationCenter.default.post(name: NSWindow.willCloseNotification, object: nil)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 2)
+
+        vm.studioDraft.title = "Before quit"
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 3)
+        let data = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+        let stored = try JSONDecoder().decode([String: BotStudioDraft].self, from: data)
+        XCTAssertEqual(stored[bot.id.value.uuidString.lowercased()]?.title, "Before quit")
+    }
+
+    func test_olderPendingDraftFromAnotherViewModelCannotReplaceNewerCommittedText() throws {
+        // WHY: Desk, sidebar, and guest windows share one AppContext. A delayed
+        // write from an older surface must not undo text already committed by a
+        // newer surface for the same bot.
+        let context = try makeContext()
+        let older = BotsViewModel(context: context)
+        let bot = try older.create(name: "Piper", title: "Scout")
+        older.beginEdit(bot)
+        let newer = BotsViewModel(context: context)
+        newer.beginEdit(bot)
+        older.flushDraftPersistenceForTesting()
+        newer.flushDraftPersistenceForTesting()
+
+        let olderClock = BotDraftManualClock()
+        older.draftPersistenceScheduleForTesting = { delay, action in
+            olderClock.schedule(afterNanoseconds: delay, action)
+        }
+        older.composerText = "older pending"
+        older.memoryDraft = "older memory"
+        older.studioDraft.title = "Older title"
+        newer.composerText = "newer committed"
+        newer.memoryDraft = "newer memory"
+        newer.studioDraft.title = "Newer title"
+        newer.flushDraftPersistenceForTesting()
+        older.flushDraftPersistenceForTesting()
+
+        let decoder = JSONDecoder()
+        let composer = try decoder.decode(
+            [String: BotComposerDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        )
+        let inspector = try decoder.decode(
+            [String: BotInspectorDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+        )
+        let studio = try decoder.decode(
+            [String: BotStudioDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+        )
+        let key = bot.id.value.uuidString.lowercased()
+        XCTAssertEqual(composer[key]?.text, "newer committed")
+        XCTAssertEqual(inspector[key]?.memoryDraft, "newer memory")
+        XCTAssertEqual(studio[key]?.title, "Newer title")
+    }
+
+    func test_differentBotDraftsFromDifferentViewModelsPersistAsOneUnion() throws {
+        // WHY: independent windows may edit different teammates concurrently;
+        // persisting either surface must preserve the other teammate's work.
+        let context = try makeContext()
+        let first = BotsViewModel(context: context)
+        let piper = try first.create(name: "Piper", title: "Scout")
+        let quinn = try first.create(name: "Quinn", title: "Reviewer")
+        let second = BotsViewModel(context: context)
+        first.beginEdit(piper)
+        second.beginEdit(quinn)
+        first.flushDraftPersistenceForTesting()
+        second.flushDraftPersistenceForTesting()
+
+        first.composerText = "Piper unfinished"
+        first.memoryDraft = "Piper memory"
+        first.studioDraft.title = "Piper title"
+        second.composerText = "Quinn unfinished"
+        second.memoryDraft = "Quinn memory"
+        second.studioDraft.title = "Quinn title"
+        first.flushDraftPersistenceForTesting()
+        second.flushDraftPersistenceForTesting()
+
+        let decoder = JSONDecoder()
+        let composer = try decoder.decode(
+            [String: BotComposerDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        )
+        let inspector = try decoder.decode(
+            [String: BotInspectorDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+        )
+        let studio = try decoder.decode(
+            [String: BotStudioDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+        )
+        let piperKey = piper.id.value.uuidString.lowercased()
+        let quinnKey = quinn.id.value.uuidString.lowercased()
+        XCTAssertEqual(composer[piperKey]?.text, "Piper unfinished")
+        XCTAssertEqual(composer[quinnKey]?.text, "Quinn unfinished")
+        XCTAssertEqual(inspector[piperKey]?.memoryDraft, "Piper memory")
+        XCTAssertEqual(inspector[quinnKey]?.memoryDraft, "Quinn memory")
+        XCTAssertEqual(studio[piperKey]?.title, "Piper title")
+        XCTAssertEqual(studio[quinnKey]?.title, "Quinn title")
+    }
+
+    func test_staleEmptyDraftFromAnotherViewModelCannotDeleteNewerText() throws {
+        // WHY: an empty local snapshot is a real tombstone only at the moment
+        // the user clears it; it must not erase a later edit from another window.
+        let context = try makeContext()
+        let stale = BotsViewModel(context: context)
+        let bot = try stale.create(name: "Piper", title: "Scout")
+        stale.openDesk(bot)
+        let newer = BotsViewModel(context: context)
+        newer.openDesk(bot)
+        stale.flushDraftPersistenceForTesting()
+        newer.flushDraftPersistenceForTesting()
+
+        stale.composerText = "temporary"
+        stale.composerText = ""
+        newer.composerText = "newer survives"
+        newer.flushDraftPersistenceForTesting()
+        stale.flushDraftPersistenceForTesting()
+
+        let stored = try JSONDecoder().decode(
+            [String: BotComposerDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        )
+        XCTAssertEqual(stored[bot.id.value.uuidString.lowercased()]?.text, "newer survives")
+    }
+
+    func test_staleViewModelNavigationCannotRecaptureOlderComposerOrInspectorDraft() throws {
+        // WHY: Desk, sidebar, and guest windows can keep local fields for the
+        // same bot. Navigation from a stale window must not turn those fields
+        // into a newer edit that replaces another window's immediate changes.
+        let context = try makeContext()
+        let stale = BotsViewModel(context: context)
+        let piper = try stale.create(name: "Piper", title: "Scout")
+        let quinn = try stale.create(name: "Quinn", title: "Reviewer")
+        stale.beginEdit(piper)
+        stale.composerText = "older composer"
+        stale.memoryDraft = "older inspector"
+        stale.flushDraftPersistenceForTesting()
+
+        let newer = BotsViewModel(context: context)
+        newer.beginEdit(piper)
+        let clock = BotDraftManualClock()
+        stale.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        newer.composerText = "newer composer"
+        newer.memoryDraft = "newer inspector"
+
+        stale.openDesk(quinn)
+
+        XCTAssertEqual(
+            context.botDraftPersistenceAuthority.composerDraftsByBot[piper.id]?.text,
+            "newer composer"
+        )
+        XCTAssertEqual(
+            context.botDraftPersistenceAuthority.inspectorDraftsByBot[piper.id]?.memoryDraft,
+            "newer inspector"
+        )
+        let decoder = JSONDecoder()
+        let composer = try decoder.decode(
+            [String: BotComposerDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        )
+        let inspector = try decoder.decode(
+            [String: BotInspectorDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+        )
+        let key = piper.id.value.uuidString.lowercased()
+        XCTAssertEqual(composer[key]?.text, "newer composer")
+        XCTAssertEqual(inspector[key]?.memoryDraft, "newer inspector")
+    }
+
+    func test_hideCloseAndQuitWithMultipleViewModelsWriteSharedFinalStateOnce() throws {
+        // WHY: every real surface sees app/window lifecycle notifications. One
+        // AppContext owner must persist the union exactly once, independent of
+        // NotificationCenter observer ordering.
+        let context = try makeContext()
+        let first = BotsViewModel(context: context)
+        let piper = try first.create(name: "Piper", title: "Scout")
+        let quinn = try first.create(name: "Quinn", title: "Reviewer")
+        let second = BotsViewModel(context: context)
+        first.beginEdit(piper)
+        second.beginEdit(quinn)
+        first.flushDraftPersistenceForTesting()
+        second.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        first.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        let events: [(Notification.Name, String)] = [
+            (NSApplication.willHideNotification, "hide"),
+            (NSWindow.willCloseNotification, "close"),
+            (NSApplication.willTerminateNotification, "quit"),
+        ]
+
+        for (name, label) in events {
+            first.composerText = "Piper before \(label)"
+            first.memoryDraft = "Piper memory before \(label)"
+            first.studioDraft.title = "Piper title before \(label)"
+            second.composerText = "Quinn before \(label)"
+            second.memoryDraft = "Quinn memory before \(label)"
+            second.studioDraft.title = "Quinn title before \(label)"
+            first.resetDraftPersistenceMetricsForTesting()
+            NotificationCenter.default.post(name: name, object: nil)
+
+            XCTAssertEqual(first.draftPersistenceMetricsForTesting.setCount, 3, label)
+            XCTAssertEqual(second.draftPersistenceMetricsForTesting.setCount, 3, label)
+            let decoder = JSONDecoder()
+            let composer = try decoder.decode(
+                [String: BotComposerDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+            )
+            let inspector = try decoder.decode(
+                [String: BotInspectorDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+            )
+            let studio = try decoder.decode(
+                [String: BotStudioDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+            )
+            let piperKey = piper.id.value.uuidString.lowercased()
+            let quinnKey = quinn.id.value.uuidString.lowercased()
+            XCTAssertEqual(
+                composer[piperKey]?.text,
+                "Piper before \(label)"
+            )
+            XCTAssertEqual(
+                composer[quinnKey]?.text,
+                "Quinn before \(label)"
+            )
+            XCTAssertEqual(inspector[piperKey]?.memoryDraft, "Piper memory before \(label)")
+            XCTAssertEqual(inspector[quinnKey]?.memoryDraft, "Quinn memory before \(label)")
+            XCTAssertEqual(studio[piperKey]?.title, "Piper title before \(label)")
+            XCTAssertEqual(studio[quinnKey]?.title, "Quinn title before \(label)")
+        }
+    }
+
+    /// Paired proof for the three per-keystroke UserDefaults paths. Fifty rows
+    /// is the production Bot cap; 500 mutations represent 20 seconds at 25 Hz.
+    func test_microbenchDraftPersistenceCoalescingReducesRealWrites() throws {
+        let context = try makeContext()
+        var bots: [BotDefinition] = []
+        for index in 0..<BotDefinition.liveAccountCap {
+            bots.append(try context.botStore.create(
+                name: "Draft Bot \(index)",
+                title: "Production operations teammate \(index)",
+                description: "Owns a realistic account workflow and keeps a concise handoff for the next shift.",
+                soul: String(repeating: "Operate carefully, cite evidence, and preserve unfinished user work. ", count: 8)
+            ))
+        }
+        let target = try XCTUnwrap(bots.last)
+        let encoder = JSONEncoder()
+        let composerPayload = Dictionary(uniqueKeysWithValues: bots.enumerated().map { index, bot in
+            (bot.id.value.uuidString.lowercased(), BotComposerDraft(
+                text: "Draft \(index): " + String(repeating: "check the deployment evidence before reporting completion. ", count: 6)
+            ))
+        })
+        let inspectorPayload = Dictionary(uniqueKeysWithValues: bots.enumerated().map { index, bot in
+            (bot.id.value.uuidString.lowercased(), BotInspectorDraft(
+                memoryDraft: "Customer \(index) prefers a written audit trail.",
+                skillDraft: "release-verification-\(index)",
+                routineName: "Morning account review \(index)",
+                routinePrompt: String(repeating: "Review alerts, reconcile ownership, and list blockers. ", count: 5),
+                routineScheduleNote: "Weekdays at 09:00",
+                routineSpec: BotScheduleSpec()
+            ))
+        })
+        let studioPayload = Dictionary(uniqueKeysWithValues: bots.enumerated().map { index, bot in
+            (bot.id.value.uuidString.lowercased(), BotStudioDraft(
+                botID: bot.id,
+                name: bot.name,
+                title: bot.title,
+                description: bot.description,
+                handle: bot.handle,
+                avatarSymbol: bot.avatarSymbol,
+                soul: String(repeating: "Keep the owner informed, verify final state, and fail loud on uncertainty. ", count: 10),
+                notificationsEnabled: bot.notificationsEnabled,
+                expectedRevisionID: bot.currentRevisionID
+            ))
+        })
+        let composerData = try encoder.encode(composerPayload)
+        let inspectorData = try encoder.encode(inspectorPayload)
+        let studioData = try encoder.encode(studioPayload)
+        let targetKey = target.id.value.uuidString.lowercased()
+        let expectedComposer = try XCTUnwrap(composerPayload[targetKey]).text
+            + String(repeating: "c", count: 200)
+        let expectedStudioSoul = try XCTUnwrap(studioPayload[targetKey]).soul
+            + String(repeating: "s", count: 150)
+        let expectedRoutinePrompt = try XCTUnwrap(inspectorPayload[targetKey]).routinePrompt
+            + String(repeating: "i", count: 150)
+
+        func measure(eager: Bool) throws -> (
+            wallMs: Double,
+            cpuMs: Double,
+            metrics: BotDraftPersistenceMetrics
+        ) {
+            UserDefaults.standard.set(composerData, forKey: "bots.composerDrafts")
+            UserDefaults.standard.set(inspectorData, forKey: "bots.inspectorDrafts")
+            UserDefaults.standard.set(studioData, forKey: "bots.studioDraft")
+            UserDefaults.standard.set(targetKey, forKey: "bots.selectedBotID")
+            UserDefaults.standard.set(BotsScreen.studio.rawValue, forKey: "bots.screen")
+            context.botDraftPersistenceAuthority.reloadFromUserDefaultsForTesting()
+            let vm = BotsViewModel(context: context)
+            vm.flushDraftPersistenceForTesting()
+            let clock = BotDraftManualClock()
+            if eager {
+                vm.draftPersistenceScheduleForTesting = { _, action in action() }
+            } else {
+                vm.draftPersistenceScheduleForTesting = { delay, action in
+                    clock.schedule(afterNanoseconds: delay, action)
+                }
+            }
+            vm.resetDraftPersistenceMetricsForTesting()
+            let cpuStart = Self.processCPUNanoseconds()
+            let wallStart = DispatchTime.now().uptimeNanoseconds
+            Self.performDraftTypingWorkload(vm) {
+                clock.advance(byNanoseconds: 40_000_000)
+            }
+            vm.flushDraftPersistenceForTesting()
+            let wallEnd = DispatchTime.now().uptimeNanoseconds
+            let cpuEnd = Self.processCPUNanoseconds()
+
+            let decoder = JSONDecoder()
+            let storedComposer = try decoder.decode(
+                [String: BotComposerDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+            )
+            let storedInspector = try decoder.decode(
+                [String: BotInspectorDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+            )
+            let storedStudio = try decoder.decode(
+                [String: BotStudioDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+            )
+            XCTAssertEqual(storedComposer.count, BotDefinition.liveAccountCap)
+            XCTAssertEqual(storedInspector.count, BotDefinition.liveAccountCap)
+            XCTAssertEqual(storedStudio.count, BotDefinition.liveAccountCap)
+            XCTAssertEqual(storedComposer[targetKey]?.text, expectedComposer)
+            XCTAssertEqual(storedInspector[targetKey]?.routinePrompt, expectedRoutinePrompt)
+            XCTAssertEqual(storedStudio[targetKey]?.soul, expectedStudioSoul)
+            return (
+                Double(wallEnd - wallStart) / 1_000_000,
+                Double(cpuEnd - cpuStart) / 1_000_000,
+                vm.draftPersistenceMetricsForTesting
+            )
+        }
+
+        for index in 0..<2 {
+            if index.isMultiple(of: 2) {
+                _ = try measure(eager: true)
+                _ = try measure(eager: false)
+            } else {
+                _ = try measure(eager: false)
+                _ = try measure(eager: true)
+            }
+        }
+        var eagerSamples: [(wallMs: Double, cpuMs: Double, metrics: BotDraftPersistenceMetrics)] = []
+        var coalescedSamples: [(wallMs: Double, cpuMs: Double, metrics: BotDraftPersistenceMetrics)] = []
+        for index in 0..<5 {
+            if index.isMultiple(of: 2) {
+                eagerSamples.append(try measure(eager: true))
+                coalescedSamples.append(try measure(eager: false))
+            } else {
+                coalescedSamples.append(try measure(eager: false))
+                eagerSamples.append(try measure(eager: true))
+            }
+        }
+        XCTAssertTrue(eagerSamples.allSatisfy { $0.metrics.encodeCount == 500 })
+        XCTAssertTrue(eagerSamples.allSatisfy { $0.metrics.setCount == 500 })
+        XCTAssertTrue(coalescedSamples.allSatisfy { $0.metrics.encodeCount > 0 && $0.metrics.encodeCount < 100 })
+        XCTAssertTrue(coalescedSamples.allSatisfy { $0.metrics.setCount == $0.metrics.encodeCount })
+
+        func median(_ values: [Double]) -> Double {
+            values.sorted()[values.count / 2]
+        }
+        func reduction(before: Double, after: Double) -> Double {
+            (before - after) / before * 100
+        }
+        let wallReduction = reduction(
+            before: median(eagerSamples.map(\.wallMs)),
+            after: median(coalescedSamples.map(\.wallMs))
+        )
+        let cpuReduction = reduction(
+            before: median(eagerSamples.map(\.cpuMs)),
+            after: median(coalescedSamples.map(\.cpuMs))
+        )
+        let setReduction = reduction(
+            before: median(eagerSamples.map { Double($0.metrics.setCount) }),
+            after: median(coalescedSamples.map { Double($0.metrics.setCount) })
+        )
+        let encodedBytesReduction = reduction(
+            before: median(eagerSamples.map { Double($0.metrics.encodedBytes) }),
+            after: median(coalescedSamples.map { Double($0.metrics.encodedBytes) })
+        )
+        XCTAssertGreaterThan(wallReduction, 5)
+        XCTAssertGreaterThan(cpuReduction, 5)
+        XCTAssertGreaterThan(setReduction, 5)
+        XCTAssertGreaterThan(encodedBytesReduction, 5)
+        NSLog(
+            "[perf-proof] botDraftPersistence paired=true drafts=50 chars=500 cadence_hz=25 warmup=2 n=5 eager_wall_ms=%@ coalesced_wall_ms=%@ eager_cpu_ms=%@ coalesced_cpu_ms=%@ eager_encode_count=%@ coalesced_encode_count=%@ eager_set_count=%@ coalesced_set_count=%@ eager_encoded_bytes_proxy=%@ coalesced_encoded_bytes_proxy=%@ wall_reduction_pct=%.2f cpu_reduction_pct=%.2f set_reduction_pct=%.2f encoded_bytes_reduction_pct=%.2f",
+            String(describing: eagerSamples.map(\.wallMs)),
+            String(describing: coalescedSamples.map(\.wallMs)),
+            String(describing: eagerSamples.map(\.cpuMs)),
+            String(describing: coalescedSamples.map(\.cpuMs)),
+            String(describing: eagerSamples.map(\.metrics.encodeCount)),
+            String(describing: coalescedSamples.map(\.metrics.encodeCount)),
+            String(describing: eagerSamples.map(\.metrics.setCount)),
+            String(describing: coalescedSamples.map(\.metrics.setCount)),
+            String(describing: eagerSamples.map(\.metrics.encodedBytes)),
+            String(describing: coalescedSamples.map(\.metrics.encodedBytes)),
+            wallReduction,
+            cpuReduction,
+            setReduction,
+            encodedBytesReduction
+        )
     }
 
     func test_studioScheduleSpecStaysOnOwningBot_becauseFrequencyMustNotLeak() throws {
@@ -11163,6 +11708,7 @@ final class BotsWindowTests: XCTestCase {
         vm.routineSpec.localTimeHour = 9
         vm.routineSpec.localTimeMinute = 0
         vm.routineSpec.provider = .grok
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.selectedBotID, bot.id)
         XCTAssertEqual(reopened.routineName, "QA morning scan")
@@ -13331,6 +13877,29 @@ final class BotsWindowTests: XCTestCase {
         return sorted[index]
     }
 
+    private static func performDraftTypingWorkload(
+        _ vm: BotsViewModel,
+        advanceCadence: () -> Void
+    ) {
+        for index in 0..<500 {
+            switch index {
+            case 0..<200:
+                vm.composerText.append("c")
+            case 200..<350:
+                vm.studioDraft.soul.append("s")
+            default:
+                vm.routinePrompt.append("i")
+            }
+            advanceCadence()
+        }
+    }
+
+    private static func processCPUNanoseconds() -> UInt64 {
+        var value = timespec()
+        precondition(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value) == 0)
+        return UInt64(value.tv_sec) * 1_000_000_000 + UInt64(value.tv_nsec)
+    }
+
     private func makeContext() throws -> AppContext {
         try AppContext(channel: .debug, appSupportOverride: directory)
     }
@@ -13439,6 +14008,36 @@ final class BotsWindowTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent(relative)
+    }
+}
+
+@MainActor
+private final class BotDraftManualClock {
+    private struct Scheduled {
+        let deadlineNanoseconds: UInt64
+        let action: () -> Void
+    }
+
+    private var nowNanoseconds: UInt64 = 0
+    private var scheduled: [Scheduled] = []
+
+    var pendingCount: Int { scheduled.count }
+
+    func schedule(afterNanoseconds delay: UInt64, _ action: @escaping () -> Void) {
+        scheduled.append(Scheduled(
+            deadlineNanoseconds: nowNanoseconds + delay,
+            action: action
+        ))
+    }
+
+    func advance(byNanoseconds delta: UInt64) {
+        nowNanoseconds += delta
+        while let index = scheduled.indices.first(where: {
+            scheduled[$0].deadlineNanoseconds <= nowNanoseconds
+        }) {
+            let action = scheduled.remove(at: index).action
+            action()
+        }
     }
 }
 

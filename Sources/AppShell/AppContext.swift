@@ -365,6 +365,7 @@ public final class AppContext {
         appSupportDirectory: appSupportDirectory,
         orchestrationRuntime: orchestrationRuntime
     )
+    lazy var botDraftPersistenceAuthority = BotDraftPersistenceAuthority()
     private var tokenSaverCodexAdapter: CodexAppServerAdapter
     public var router: AppCommandRouter! {
         didSet {
