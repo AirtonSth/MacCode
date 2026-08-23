@@ -202,9 +202,9 @@ public struct ManagedComputerUseMCP: Sendable {
         case screenshotTool:
             return "Capture the screen or a targeted app/window with native host capture."
         case "zoom":
-            return "Inspect a screen region at full resolution."
+            return "Inspect an exact integral pixel region in window-local screenshot coordinates."
         case leftClickTool:
-            return "Left-click at coordinates in the exact background target; requires a state token and never activates."
+            return "Left-click window-local coordinates in the exact background target; requires a state token and never activates."
         case "right_click":
             return "Right-click at coordinates for the exact target; requires a state token and fails closed without focus-safe support."
         case "mouse_move":
@@ -236,7 +236,7 @@ public struct ManagedComputerUseMCP: Sendable {
         let targeting: [String: Any] = [
             "target_app": ["type": "string"],
             "target_pid": ["type": "integer"],
-            "target_window_id": ["type": "number"],
+            "target_window_id": ["type": "integer"],
             "focus_strategy": ["type": "string"],
             "expected_state_token": ["type": "string"],
         ]
@@ -254,7 +254,7 @@ public struct ManagedComputerUseMCP: Sendable {
             return [
                 "type": "object",
                 "properties": targeting.merging([
-                    "region": ["type": "array", "items": ["type": "number"]],
+                    "region": ["type": "array", "items": ["type": "integer"]],
                 ]) { _, new in new },
                 "required": ["target_pid", "target_window_id", "region"],
             ]
@@ -324,16 +324,7 @@ public struct ManagedComputerUseMCP: Sendable {
     }
 
     private static func targetPID(from arguments: [String: Any]) -> Int32? {
-        if let value = arguments["target_pid"] as? Int {
-            return Int32(exactly: value)
-        }
-        if let value = arguments["target_pid"] as? NSNumber {
-            return value.int32Value
-        }
-        if let value = arguments["target_pid"] as? String {
-            return Int32(value)
-        }
-        return nil
+        ComputerUseNativeHostBackend.exactInt32(arguments["target_pid"])
     }
 
     private func reply(id: Any?, result: [String: Any]) -> String? {

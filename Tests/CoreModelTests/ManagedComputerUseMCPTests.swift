@@ -48,9 +48,15 @@ final class ManagedComputerUseMCPTests: XCTestCase {
         for name in ["zoom", "doctor", "get_ui_tree", "cursor_position"] {
             let schema = try XCTUnwrap(byName[name])
             let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
-            XCTAssertNotNil(properties["target_pid"], "\(name) must admit the PID used by the backend")
-            XCTAssertNotNil(properties["target_window_id"], "\(name) must admit the window used by the backend")
+            XCTAssertEqual((properties["target_pid"] as? [String: Any])?["type"] as? String, "integer")
+            XCTAssertEqual((properties["target_window_id"] as? [String: Any])?["type"] as? String, "integer")
             XCTAssertEqual(schema["required"] as? [String], ["target_pid", "target_window_id"] + (name == "zoom" ? ["region"] : []))
+            if name == "zoom" {
+                XCTAssertEqual(
+                    ((properties["region"] as? [String: Any])?["items"] as? [String: Any])?["type"] as? String,
+                    "integer"
+                )
+            }
         }
 
         for name in ["left_click", "right_click", "mouse_move", "scroll", "type", "key", "open_application", "click_element"] {

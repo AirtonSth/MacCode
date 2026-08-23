@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 import ScreenCaptureKit
 @testable import CoreModel
 
@@ -46,6 +47,33 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         let metadata = try XCTUnwrap(result.content.first?.text)
         XCTAssertTrue(metadata.contains("\"target_window_id\":30"))
         XCTAssertFalse(metadata.contains("\"target_window_id\":29"))
+    }
+
+    func testTargetIDsRejectLossyJSONNumbersAndInvalidRanges() async throws {
+        // WHY: NSNumber's intValue/int32Value silently truncates fractions and
+        // wraps large values, which could observe or mutate the wrong window.
+        let probe = Probe()
+        let backend = makeBackend(probe: probe)
+        let invalidArguments: [[String: Any]] = [
+            ["target_pid": NSNumber(value: 17.5), "target_window_id": 29],
+            ["target_pid": NSNumber(value: true), "target_window_id": 29],
+            ["target_pid": NSNumber(value: Double.nan), "target_window_id": 29],
+            ["target_pid": 0, "target_window_id": 29],
+            ["target_pid": -1, "target_window_id": 29],
+            ["target_pid": Int64(Int32.max) + 1, "target_window_id": 29],
+            ["target_pid": 17, "target_window_id": NSNumber(value: 29.5)],
+            ["target_pid": 17, "target_window_id": NSNumber(value: true)],
+            ["target_pid": 17, "target_window_id": NSNumber(value: Double.infinity)],
+            ["target_pid": 17, "target_window_id": 0],
+            ["target_pid": 17, "target_window_id": -1],
+            ["target_pid": 17, "target_window_id": UInt64(UInt32.max) + 1],
+        ]
+
+        for arguments in invalidArguments {
+            let result = await backend.invoke(name: "doctor", arguments: arguments)
+            XCTAssertTrue(result.isError, "invalid target must fail closed: \(arguments)")
+            XCTAssertTrue(result.content.first?.text?.contains("invalid_target") == true)
+        }
     }
 
     func testCaptureUsesInjectedAsyncExactWindowHook() async throws {
@@ -436,6 +464,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
 
     func testLeftClickUsesExactTargetAXHookWithoutActivation() async throws {
         let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 640, height: 480)
         let backend = makeBackend(probe: probe)
         let token = try await stateToken(from: backend, name: "screenshot")
 
@@ -449,6 +478,141 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertFalse(result.isError)
         XCTAssertEqual(probe.leftClickMutations, 1)
         XCTAssertEqual(probe.activations, 0)
+    }
+
+    func testLeftClickConvertsWindowLocalCoordinatesUsingCurrentOrigin() async throws {
+        // WHY: callers target the screenshot's window-local pixels; passing
+        // them as global coordinates can click an unrelated window.
+        let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 640, height: 480)
+        let backend = makeBackend(probe: probe)
+        let token = try await stateToken(from: backend, name: "screenshot")
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: token).merging(["coordinate": [12, 34]]) { _, value in value }
+        )
+
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(probe.lastLeftClickCoordinate, [112, 234])
+    }
+
+    func testLeftClickRejectsOutOfBoundsWindowLocalCoordinateWithoutMutation() async throws {
+        let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 640, height: 480)
+        let backend = makeBackend(probe: probe)
+        let token = try await stateToken(from: backend, name: "screenshot")
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: token).merging(["coordinate": [640, 0]]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("semantic_action_failed") == true)
+        XCTAssertEqual(probe.leftClickMutations, 0)
+    }
+
+    func testBooleanCoordinateAndRegionValuesFailClosed() async throws {
+        let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 640, height: 480)
+        let backend = makeBackend(probe: probe)
+        let token = try await stateToken(from: backend, name: "screenshot")
+
+        let click = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: token).merging([
+                "coordinate": [NSNumber(value: true), 0]
+            ]) { _, value in value }
+        )
+        XCTAssertTrue(click.isError)
+        XCTAssertTrue(click.content.first?.text?.contains("semantic_action_failed") == true)
+        XCTAssertEqual(probe.leftClickMutations, 0)
+
+        let zoom = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [NSNumber(value: true), 0, 1, 1],
+            ]
+        )
+        XCTAssertTrue(zoom.isError)
+        XCTAssertTrue(zoom.content.first?.text?.contains("invalid_region") == true)
+    }
+
+    func testLeftClickRevalidatesWindowOriginImmediatelyBeforeAction() async throws {
+        let probe = Probe()
+        let initial = CGRect(x: 100, y: 200, width: 640, height: 480)
+        probe.windowBoundsSequence = [initial, initial, CGRect(x: 101, y: 200, width: 640, height: 480)]
+        let backend = makeBackend(probe: probe)
+        let token = try await stateToken(from: backend, name: "screenshot")
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: token).merging(["coordinate": [12, 34]]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("stale_state_token") == true)
+        XCTAssertEqual(probe.leftClickMutations, 0)
+    }
+
+    func testZoomCropsExactCapturedPixelsAndBindsTokenToCrop() async throws {
+        // WHY: zoom must narrow observation to the requested pixel region;
+        // returning the full screenshot leaks unrelated pixels and permits a
+        // token to validate content outside the requested region.
+        let probe = Probe()
+        probe.captureData = try makePNGBase64(width: 4, height: 3)
+        let backend = makeBackend(probe: probe)
+
+        let screenshot = await backend.invoke(
+            name: "screenshot",
+            arguments: ["target_pid": 17, "target_window_id": 29]
+        )
+        let screenshotToken = try XCTUnwrap(stateToken(from: screenshot))
+        let zoom = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [1, 1, 2, 1],
+            ]
+        )
+
+        XCTAssertFalse(zoom.isError)
+        let zoomMetadata = try XCTUnwrap(zoom.content.first?.text)
+        let zoomToken = try XCTUnwrap(stateToken(from: zoom))
+        XCTAssertNotEqual(zoomToken, screenshotToken, "zoom token must bind to cropped pixels")
+        let croppedData = try XCTUnwrap(zoom.content.last?.data).flatMap { Data(base64Encoded: $0) }
+        let cropped = try XCTUnwrap(croppedData.flatMap(NSBitmapImageRep.init(data:)))
+        XCTAssertEqual(cropped.pixelsWide, 2)
+        XCTAssertEqual(cropped.pixelsHigh, 1)
+        XCTAssertTrue(zoomMetadata.contains("\"target_window_id\":29"))
+        XCTAssertNotEqual(croppedData, Data(base64Encoded: probe.captureData))
+    }
+
+    func testZoomRejectsFractionalNegativeAndOutOfBoundsRegions() async throws {
+        let probe = Probe()
+        probe.captureData = try makePNGBase64(width: 4, height: 3)
+        let backend = makeBackend(probe: probe)
+        let regions: [[Any]] = [
+            [1.5, 0, 1, 1],
+            [NSNumber(value: true), 0, 1, 1],
+            [-1, 0, 1, 1],
+            [0, 0, 0, 1],
+            [3, 2, 2, 1],
+        ]
+
+        for region in regions {
+            let result = await backend.invoke(
+                name: "zoom",
+                arguments: ["target_pid": 17, "target_window_id": 29, "region": region]
+            )
+            XCTAssertTrue(result.isError, "invalid region must fail closed: \(region)")
+            XCTAssertTrue(result.content.first?.text?.contains("invalid_region") == true)
+            XCTAssertNil(result.content.last?.data)
+        }
     }
 
     func testGetUITreeSerializesBoundedInjectedTargetTree() async throws {
@@ -521,9 +685,44 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         ]
     }
 
+    private func stateToken(from result: ComputerUseToolResult) -> String? {
+        for line in result.content.compactMap(\.text).joined(separator: "\n").split(separator: "\n").reversed() {
+            guard let data = String(line).data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let token = json["state_token"] as? String else { continue }
+            return token
+        }
+        return nil
+    }
+
+    private func makePNGBase64(width: Int, height: Int) throws -> String {
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        for index in 0..<(width * height) {
+            pixels[index * 4] = UInt8(index & 0xff)
+            pixels[index * 4 + 1] = UInt8((index * 3) & 0xff)
+            pixels[index * 4 + 2] = UInt8((index * 7) & 0xff)
+            pixels[index * 4 + 3] = 255
+        }
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let image = pixels.withUnsafeMutableBytes { bytes in
+            CGContext(
+                data: bytes.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )?.makeImage()
+        }
+        let representation = try XCTUnwrap(image.map(NSBitmapImageRep.init(cgImage:)))
+        let data = try XCTUnwrap(representation.representation(using: .png, properties: [:]))
+        return data.base64EncodedString()
+    }
+
     private func makeBackend(probe: Probe) -> ComputerUseNativeHostBackend {
         ComputerUseNativeHostBackend(hooks: .init(
-            listWindows: { _ in [probe.window] + probe.additionalWindows },
+            listWindows: { _ in [probe.nextWindow()] + probe.additionalWindows },
             userActivity: { _ in probe.nextActivity() },
             activityMonitorAvailable: { probe.activityMonitorAvailable },
             accessibilityPermission: { probe.accessibilityPermission },
@@ -550,8 +749,9 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
                 probe.semanticMutations += 1
                 return true
             },
-            leftClick: { _, _ in
+            leftClick: { _, coordinate in
                 probe.leftClickMutations += 1
+                probe.lastLeftClickCoordinate = coordinate
                 return true
             },
             typeText: { _, _ in
@@ -570,6 +770,9 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
 private final class Probe: @unchecked Sendable {
     private let lock = NSLock()
     var windowTitle = "RemoteCode"
+    var windowBounds = CGRect.zero
+    var windowBoundsSequence: [CGRect] = []
+    private var windowBoundsIndex = 0
     var activity: ComputerUseNativeUserActivity = .none
     var activitySequence: [ComputerUseNativeUserActivity] = []
     private var activityIndex = 0
@@ -583,6 +786,7 @@ private final class Probe: @unchecked Sendable {
     var typeTextMutations = 0
     var typeTextResult = false
     var pixelMutations = 0
+    var lastLeftClickCoordinate: [Double] = []
     var activations = 0
     var captureCalls = 0
     var uiTree: String? = "{\"role\":\"AXWindow\",\"title\":\"RemoteCode\"}"
@@ -590,6 +794,26 @@ private final class Probe: @unchecked Sendable {
     var captureData = "cGl4ZWxz"
     var captureFailure: String?
     var captureFallback = false
+
+    func nextWindow() -> ComputerUseNativeWindow {
+        lock.lock()
+        let bounds: CGRect
+        if windowBoundsSequence.indices.contains(windowBoundsIndex) {
+            bounds = windowBoundsSequence[windowBoundsIndex]
+            windowBoundsIndex += 1
+        } else {
+            bounds = windowBounds
+        }
+        lock.unlock()
+        return ComputerUseNativeWindow(
+            target: .init(pid: 17, windowID: 29),
+            title: windowTitle,
+            bundleIdentifier: "com.example.RemoteCode",
+            isOnScreen: !isMinimized,
+            isMinimized: isMinimized,
+            bounds: bounds
+        )
+    }
     var additionalWindows: [ComputerUseNativeWindow] = []
 
     var window: ComputerUseNativeWindow {
@@ -600,7 +824,7 @@ private final class Probe: @unchecked Sendable {
             bundleIdentifier: "com.example.RemoteCode",
             isOnScreen: !isMinimized,
             isMinimized: isMinimized,
-            bounds: .zero
+            bounds: windowBounds
         )
     }
 

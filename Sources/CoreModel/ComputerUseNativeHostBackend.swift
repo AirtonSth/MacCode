@@ -277,6 +277,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         case semantic_action_failed
         case capture_unavailable
         case ui_tree_unavailable
+        case invalid_region
     }
 
     private enum TokenKind: String {
@@ -308,7 +309,22 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
 
         switch name {
         case "screenshot", "zoom":
-            let capture: ComputerUseNativeCapture?
+            let requestedRegion: CGRect?
+            if name == "zoom" {
+                guard let region = Self.pixelRegion(arguments["region"]) else {
+                    let observation = await makeObservation(
+                        window: window,
+                        kind: .pixel,
+                        content: "<invalid-region>"
+                    )
+                    return failure(.invalid_region, encodeObservation(observation))
+                }
+                requestedRegion = region
+            } else {
+                requestedRegion = nil
+            }
+
+            var capture: ComputerUseNativeCapture?
             let captureFailure: String?
             if hooks.screenCapturePermission(), window.isOnScreen, !window.isMinimized {
                 switch await hooks.capture(target) {
@@ -322,6 +338,17 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             } else {
                 capture = nil
                 captureFailure = nil
+            }
+            if let requestedRegion, let captured = capture {
+                guard let cropped = Self.crop(capture: captured, region: requestedRegion) else {
+                    let observation = await makeObservation(
+                        window: window,
+                        kind: .pixel,
+                        content: "<invalid-region>"
+                    )
+                    return failure(.invalid_region, encodeObservation(observation))
+                }
+                capture = cropped
             }
             let observation = await makeObservation(
                 window: window,
@@ -480,14 +507,32 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
 
         switch name {
         case "left_click":
-            let coordinate = arguments["coordinate"] as? [Double]
-                ?? (arguments["coordinate"] as? [NSNumber])?.map(\.doubleValue)
-                ?? []
+            guard let localCoordinate = Self.localCoordinate(arguments["coordinate"]) else {
+                return failure(.semantic_action_failed, encodeObservation(freshObservation))
+            }
             guard freshObservation.screenCapturePermission,
                   freshObservation.isOnScreen,
                   !freshObservation.isMinimized else {
                 return failure(.pixel_target_not_renderable, encodeObservation(freshObservation))
             }
+            guard let currentWindow = resolve(target: target, arguments: arguments),
+                  currentWindow == window,
+                  currentWindow.bounds.width.isFinite,
+                  currentWindow.bounds.height.isFinite,
+                  currentWindow.bounds.width > 0,
+                  currentWindow.bounds.height > 0 else {
+                return failure(.stale_state_token, encodeObservation(freshObservation))
+            }
+            guard localCoordinate[0] >= 0,
+                  localCoordinate[1] >= 0,
+                  localCoordinate[0] < currentWindow.bounds.width,
+                  localCoordinate[1] < currentWindow.bounds.height else {
+                return failure(.semantic_action_failed, encodeObservation(freshObservation))
+            }
+            let coordinate = [
+                currentWindow.bounds.origin.x + localCoordinate[0],
+                currentWindow.bounds.origin.y + localCoordinate[1],
+            ]
             guard hooks.leftClick(target, coordinate) else {
                 return failure(.semantic_action_failed, encodeObservation(freshObservation))
             }
@@ -606,8 +651,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     }
 
     private static func target(from arguments: [String: Any]) -> ComputerUseNativeHostTarget? {
-        guard let pid = int32(arguments["target_pid"]),
-              let windowID = uint32(arguments["target_window_id"]),
+        guard let pid = exactInt32(arguments["target_pid"]),
+              let windowID = exactUInt32(arguments["target_window_id"]),
               pid > 0,
               windowID > 0 else {
             return nil
@@ -615,21 +660,111 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         return ComputerUseNativeHostTarget(pid: pid, windowID: windowID)
     }
 
-    private static func int32(_ value: Any?) -> Int32? {
-        if let value = value as? Int { return Int32(exactly: value) }
+    static func exactInt32(_ value: Any?) -> Int32? {
+        guard !isBooleanNumber(value) else { return nil }
         if let value = value as? Int32 { return value }
-        if let value = value as? NSNumber { return value.int32Value }
-        if let value = value as? String { return Int32(value) }
+        if let value = value as? Int { return Int32(exactly: value) }
+        if let value = value as? NSNumber {
+            guard let integer = Int(exactly: value.doubleValue) else { return nil }
+            return Int32(exactly: integer)
+        }
         return nil
     }
 
-    private static func uint32(_ value: Any?) -> UInt32? {
+    static func exactUInt32(_ value: Any?) -> UInt32? {
+        guard !isBooleanNumber(value) else { return nil }
         if let value = value as? UInt32 { return value }
         if let value = value as? UInt { return UInt32(exactly: value) }
         if let value = value as? Int { return UInt32(exactly: value) }
-        if let value = value as? NSNumber { return UInt32(exactly: value.intValue) }
-        if let value = value as? String { return UInt32(value) }
+        if let value = value as? NSNumber {
+            guard let integer = Int(exactly: value.doubleValue) else { return nil }
+            return UInt32(exactly: integer)
+        }
         return nil
+    }
+
+    private static func exactPixelInteger(_ value: Any?) -> Int? {
+        guard !isBooleanNumber(value) else { return nil }
+        if let value = value as? Int { return value }
+        if let value = value as? Int32 { return Int(value) }
+        if let value = value as? UInt32 { return Int(value) }
+        if let value = value as? NSNumber {
+            return Int(exactly: value.doubleValue)
+        }
+        return nil
+    }
+
+    private static func localCoordinate(_ value: Any?) -> [Double]? {
+        let values: [Any]
+        if let value = value as? [Any] {
+            values = value
+        } else if let value = value as? [Double] {
+            values = value
+        } else if let value = value as? [NSNumber] {
+            values = value
+        } else {
+            return nil
+        }
+        guard values.count == 2 else { return nil }
+        let result = values.compactMap { value -> Double? in
+            guard !isBooleanNumber(value) else { return nil }
+            if let value = value as? Double { return value.isFinite ? value : nil }
+            if let value = value as? Int { return Double(value) }
+            if let value = value as? NSNumber {
+                let number = value.doubleValue
+                return number.isFinite ? number : nil
+            }
+            return nil
+        }
+        return result.count == 2 ? result : nil
+    }
+
+    private static func isBooleanNumber(_ value: Any?) -> Bool {
+        if value is Bool { return true }
+        guard let number = value as? NSNumber else { return false }
+        return CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID()
+    }
+
+    private static func pixelRegion(_ value: Any?) -> CGRect? {
+        let values: [Any]
+        if let value = value as? [Any] {
+            values = value
+        } else if let value = value as? [Double] {
+            values = value
+        } else if let value = value as? [NSNumber] {
+            values = value
+        } else {
+            return nil
+        }
+        guard values.count == 4,
+              let x = exactPixelInteger(values[0]),
+              let y = exactPixelInteger(values[1]),
+              let width = exactPixelInteger(values[2]),
+              let height = exactPixelInteger(values[3]),
+              x >= 0, y >= 0, width > 0, height > 0 else {
+            return nil
+        }
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    private static func crop(
+        capture: ComputerUseNativeCapture,
+        region: CGRect
+    ) -> ComputerUseNativeCapture? {
+        guard let data = Data(base64Encoded: capture.data),
+              let representation = NSBitmapImageRep(data: data),
+              let image = representation.cgImage,
+              region.maxX <= CGFloat(image.width),
+              region.maxY <= CGFloat(image.height),
+              let cropped = image.cropping(to: region),
+              let croppedData = NSBitmapImageRep(cgImage: cropped)
+                .representation(using: .png, properties: [:]) else {
+            return nil
+        }
+        return ComputerUseNativeCapture(
+            data: croppedData.base64EncodedString(),
+            mimeType: "image/png"
+        )
     }
 
     private static func cursorPosition() -> String {
