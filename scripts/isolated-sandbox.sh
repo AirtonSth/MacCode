@@ -32,6 +32,7 @@ Environment:
   RC2_SANDBOX_CHANNEL     default debug
   RC2_SANDBOX_HTTP_PORT   default 18218
   RC2_SANDBOX_REF         git ref for ensure (default HEAD)
+  RC2_SANDBOX_HOME        debug process home (default <worktree>/.sandbox-state/home)
   RC2_SANDBOX_ALLOW_PRIMARY=1  allow test/build/run in the primary checkout
   RC2_SANDBOX_FETCH=1     fetch origin production before ensure
 EOF
@@ -85,6 +86,10 @@ app_support_dir() {
   echo "${RC2_SANDBOX_APP_SUPPORT:-$(repo_root)/.sandbox-state/Application Support/RemoteCodeDebug}"
 }
 
+sandbox_home_dir() {
+  echo "${RC2_SANDBOX_HOME:-$(repo_root)/.sandbox-state/home}"
+}
+
 app_executable() {
   echo "$(app_path)/Contents/MacOS/RemoteCode"
 }
@@ -134,6 +139,7 @@ primary_worktree=$(primary_worktree)
 linked_worktree=$(is_linked_worktree && echo yes || echo no)
 app_path=$(app_path)
 app_support=$(app_support_dir)
+sandbox_home=$(sandbox_home_dir)
 stable_bundle_id=$STABLE_BUNDLE_ID
 EOF
 }
@@ -206,13 +212,18 @@ cmd_stop() {
 
 cmd_run() {
   cmd_build
-  local executable support log pid
+  local executable support home log pid
   executable="$(app_executable)"
   [ -x "$executable" ] || die "missing executable $executable"
   support="$(app_support_dir)"
-  mkdir -p "$support" "$(repo_root)/.sandbox-state"
+  home="$(sandbox_home_dir)"
+  mkdir -p "$support" "$home/.codex" "$home/.claude" "$home/.grok" "$(repo_root)/.sandbox-state"
   log="$(repo_root)/.sandbox-state/RemoteCodeDebug.log"
   cmd_stop >/dev/null
+  HOME="$home" \
+    CFFIXED_USER_HOME="$home" \
+    CODEX_HOME="$home/.codex" \
+    RC2_DISABLE_MANAGED_DISTILL_RECONCILE=1 \
   RC2_CHANNEL="$CHANNEL" \
     RC2_HTTP_PORT="$HTTP_PORT" \
     RC2_APP_SUPPORT="$support" \
@@ -226,6 +237,7 @@ cmd_run() {
   echo "[sandbox] running pid $pid"
   echo "[sandbox] executable $executable"
   echo "[sandbox] app-support $support"
+  echo "[sandbox] home $home"
   echo "[sandbox] http-port $HTTP_PORT"
   echo "[sandbox] log $log"
 }
