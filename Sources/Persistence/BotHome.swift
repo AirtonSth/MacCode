@@ -110,9 +110,40 @@ public struct BotHome: Sendable {
     /// One-time lift of leftover `memory.md` or store bullets into `MEMORY.md`.
     /// Never overwrites an existing `MEMORY.md`.
     public func migrateLegacyMemoryIfNeeded(legacyFacts: [String] = []) throws {
-        if FileManager.default.fileExists(atPath: memoryURL.path) { return }
         let legacyURL = root.appendingPathComponent(Self.legacyMemoryName)
-        if FileManager.default.fileExists(atPath: legacyURL.path) {
+        let legacyExists = FileManager.default.fileExists(atPath: legacyURL.path)
+        let memoryExists = FileManager.default.fileExists(atPath: memoryURL.path)
+        let directoryEntries = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        // On case-insensitive APFS `memory.md` and `MEMORY.md` resolve to the same inode.
+        // fileExists on the second then shadows the legacy file. Detect the collision
+        // and migrate in place instead of early-returning with the projection header.
+        let isSameFileCaseInsensitive = Self.legacyAndMemoryShareDirectoryEntry(
+            legacyExists: legacyExists,
+            memoryExists: memoryExists,
+            directoryEntries: directoryEntries
+        )
+        if isSameFileCaseInsensitive, legacyExists {
+            let raw = try mappedString(at: legacyURL)
+            let body = Self.stripProjectionHeader(raw)
+            let alreadyMigrated = !raw.contains("# Memory projection") && !raw.contains("Forget and Correct still go through Memory")
+            if alreadyMigrated && !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // Already a proper MEMORY.md on a case-insensitive volume; ensure the
+                // directory entry case is MEMORY.md (case-preserving rename via temp).
+                try normalizeMemoryFilenameCaseIfNeeded(legacyURL: legacyURL)
+                return
+            }
+            try writeAtomic(
+                body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? Self.memoryStarter + "\n"
+                    : body,
+                to: memoryURL
+            )
+            // Ensure the stored case becomes MEMORY.md on case-insensitive volumes.
+            try normalizeMemoryFilenameCaseIfNeeded(legacyURL: legacyURL)
+            return
+        }
+        if memoryExists { return }
+        if legacyExists {
             let raw = try mappedString(at: legacyURL)
             let body = Self.stripProjectionHeader(raw)
             try writeAtomic(
@@ -131,6 +162,32 @@ public struct BotHome: Sendable {
         var lines = ["# Memory", ""]
         lines.append(contentsOf: facts.map { "- \($0)" })
         try writeAtomic(lines.joined(separator: "\n") + "\n", to: memoryURL)
+    }
+
+    static func legacyAndMemoryShareDirectoryEntry(
+        legacyExists: Bool,
+        memoryExists: Bool,
+        directoryEntries: [String]
+    ) -> Bool {
+        guard legacyExists, memoryExists else { return false }
+        return !(directoryEntries.contains(Self.legacyMemoryName)
+            && directoryEntries.contains(Self.memoryName))
+    }
+
+    private func normalizeMemoryFilenameCaseIfNeeded(legacyURL: URL) throws {
+        let entries = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        guard entries.contains(Self.legacyMemoryName), !entries.contains(Self.memoryName) else { return }
+
+        let temporaryURL = root.appendingPathComponent(".tmp-memory-case-\(UUID().uuidString)")
+        try FileManager.default.moveItem(at: legacyURL, to: temporaryURL)
+        do {
+            try FileManager.default.moveItem(at: temporaryURL, to: memoryURL)
+        } catch {
+            if FileManager.default.fileExists(atPath: temporaryURL.path) {
+                try? FileManager.default.moveItem(at: temporaryURL, to: legacyURL)
+            }
+            throw error
+        }
     }
 
     // PERF: DateFormatter ICU init is expensive. Share one for bootstrap yyyy-MM-dd
