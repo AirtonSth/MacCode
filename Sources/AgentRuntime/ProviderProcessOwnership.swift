@@ -305,9 +305,14 @@ public extension ProviderProcessSweeper {
             let rootIsAlive = processIsAlive(tag.pgid)
             let hasVerifiedGroupIdentity = tag.isolatedProcessGroup == tag.pgid
                 && tag.startIdentity != nil
-            let groupMembers = hasVerifiedGroupIdentity
-                ? processGroupMembers(tag.pgid).filter { $0 > 0 && $0 != currentPID }
-                : []
+            var cachedGroupMembers: [pid_t]?
+            func verifiedGroupMembers() -> [pid_t] {
+                guard hasVerifiedGroupIdentity else { return [] }
+                if let cachedGroupMembers { return cachedGroupMembers }
+                let members = processGroupMembers(tag.pgid).filter { $0 > 0 && $0 != currentPID }
+                cachedGroupMembers = members
+                return members
+            }
 
             if tag.ownerPID == currentPID,
                let expectedOwnerIdentity = tag.ownerStartIdentity,
@@ -319,7 +324,7 @@ public extension ProviderProcessSweeper {
                         || processStartIdentity(tag.pgid) == tag.startIdentity {
                         retained.append(tag)
                     }
-                } else if !groupMembers.isEmpty {
+                } else if !verifiedGroupMembers().isEmpty {
                     // The root exited, but its certified group still has late
                     // descendants. Retain ownership until the group drains.
                     retained.append(tag)
@@ -370,7 +375,7 @@ public extension ProviderProcessSweeper {
                     retained.append(tag)
                     continue
                 }
-            } else if groupMembers.isEmpty {
+            } else if verifiedGroupMembers().isEmpty {
                 // The exact root lifetime and its verified group are both gone.
                 // The ownership row is now exhausted and may be removed.
                 continue
@@ -385,7 +390,7 @@ public extension ProviderProcessSweeper {
             let rootTargets = rootIsAlive ? [tag.pgid] : []
             let targets = (
                 Array(descendantPIDs(tag.pgid).reversed())
-                    + Array(groupMembers.reversed())
+                    + Array(verifiedGroupMembers().reversed())
                     + rootTargets
             ).filter {
                 seen.insert($0).inserted
