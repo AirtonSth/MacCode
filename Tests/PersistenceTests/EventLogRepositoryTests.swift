@@ -138,6 +138,14 @@ final class EventLogRepositoryTests: XCTestCase {
         XCTAssertTrue(try insertedSt.step())
         XCTAssertEqual(Int(insertedSt.columnInt64(0)), 0,
             "failed retention must roll back the new event with the prune")
+
+        try db.execute("DROP TRIGGER reject_event_retention_delete;")
+        try repo.append(seq: 5001, kind: "test", payloadJSON: "{}")
+        let recovered = try repo.read(since: -1, limit: 6000)
+        XCTAssertEqual(recovered.count, 5000)
+        XCTAssertEqual(recovered.first?.seq, 1,
+            "a rolled-back prune must restore the cached occupancy before retry")
+        XCTAssertEqual(recovered.last?.seq, 5001)
     }
 
     // MARK: - T010: ordering — read(since:) returns rows seq ASC
@@ -280,5 +288,165 @@ final class EventLogRepositoryTests: XCTestCase {
         let countSt = try db.prepare("SELECT COUNT(*) FROM events;")
         XCTAssertTrue(try countSt.step())
         XCTAssertEqual(countSt.columnInt64(0), 10)
+    }
+
+    func test_append_skipsEventCountSelectAfterCap() throws {
+        // WHY: lifecycle traffic continues after the 5,000-row replay cap. The
+        // connection already knows occupancy, so recounting the full table twice
+        // per event turns a fixed bound into permanent O(cap) append work.
+        let db = try makeDB()
+        let repo = EventLogRepository(db: db)
+        for seq in 0..<5_010 {
+            try repo.append(seq: Int64(seq), kind: "agent.run.started", payloadJSON: "{}")
+        }
+
+        XCTAssertEqual(
+            db.eventRowCountSelectCountForTesting,
+            1,
+            "the initial occupancy seed is the only COUNT(*) required across capped appends"
+        )
+        let retained = try repo.read(since: -1, limit: 6_000)
+        XCTAssertEqual(retained.count, 5_000)
+        XCTAssertEqual(retained.first?.seq, 10)
+        XCTAssertEqual(retained.last?.seq, 5_009)
+    }
+
+    /// Same-process A/B of the previous post-cap retention SQL and the cached
+    /// exact-excess path. Primary metric: wall time for 1,000 durable appends after
+    /// a 5,000-row seed (warmup=2, n=5).
+    func test_microbench_postCapRetention_avoidsFullRecountsAndOrphanScan() throws {
+        let warmup = 2
+        let samples = 5
+        let appendsPerSample = 1_000
+
+        func median(_ values: [Double]) -> Double {
+            values.sorted()[values.count / 2]
+        }
+
+        func elapsedMilliseconds(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            return Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        }
+
+        var before: [Double] = []
+        var after: [Double] = []
+        for iteration in 0..<(warmup + samples) {
+            let legacyDB = try makeDB()
+            let optimizedDB = try makeDB()
+            try seedEventLogAtCap(legacyDB)
+            try seedEventLogAtCap(optimizedDB)
+
+            let runLegacy = {
+                try self.measureLegacyPostCapAppends(
+                    db: legacyDB,
+                    startSequence: 5_000,
+                    count: appendsPerSample
+                )
+            }
+            let runOptimized = {
+                let repo = EventLogRepository(db: optimizedDB)
+                for offset in 0..<appendsPerSample {
+                    try repo.append(
+                        seq: Int64(5_000 + offset),
+                        kind: "agent.run.started",
+                        payloadJSON: "{}"
+                    )
+                }
+            }
+
+            let legacyMS: Double
+            let optimizedMS: Double
+            if iteration.isMultiple(of: 2) {
+                legacyMS = try elapsedMilliseconds(runLegacy)
+                optimizedMS = try elapsedMilliseconds(runOptimized)
+            } else {
+                optimizedMS = try elapsedMilliseconds(runOptimized)
+                legacyMS = try elapsedMilliseconds(runLegacy)
+            }
+
+            let legacyRows = try EventLogRepository(db: legacyDB).read(since: -1, limit: 6_000)
+            let optimizedRows = try EventLogRepository(db: optimizedDB).read(since: -1, limit: 6_000)
+            XCTAssertEqual(optimizedRows.map(\.seq), legacyRows.map(\.seq))
+            XCTAssertEqual(optimizedRows.count, 5_000)
+
+            if iteration >= warmup {
+                before.append(legacyMS)
+                after.append(optimizedMS)
+            }
+        }
+
+        let beforeMedian = median(before)
+        let afterMedian = median(after)
+        let improvement = (beforeMedian - afterMedian) / beforeMedian * 100
+        NSLog(
+            "[perf-proof] eventLogPostCap legacy_ms=%@ optimized_ms=%@ improvement_pct=%.2f before=%@ after=%@ appends=%d cap=5000",
+            String(beforeMedian), String(afterMedian), improvement,
+            String(describing: before), String(describing: after), appendsPerSample
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5,
+            "exact cached retention must outperform two full recounts and an orphan scan by at least 5%"
+        )
+    }
+
+    private func seedEventLogAtCap(_ db: SQLiteDB) throws {
+        try db.performSync { database in
+            try database.transaction {
+                for sequence in 0..<5_000 {
+                    let statement = try database.prepare("""
+                        INSERT INTO events(seq, kind, request_id, origin_client_id, payload_json, created_at)
+                        VALUES(?, 'agent.run.started', NULL, NULL, '{}', '2026-08-23T00:00:00Z');
+                    """)
+                    try statement.bind(1, Int64(sequence))
+                    _ = try statement.step()
+                }
+            }
+        }
+        db.rememberEventRowCount(5_000)
+    }
+
+    private func measureLegacyPostCapAppends(
+        db: SQLiteDB,
+        startSequence: Int,
+        count: Int
+    ) throws {
+        for offset in 0..<count {
+            try db.performSync { database in
+                try database.transaction {
+                    let statement = try database.prepare("""
+                        INSERT INTO events(seq, kind, request_id, origin_client_id, payload_json, created_at)
+                        VALUES(?, 'agent.run.started', NULL, NULL, '{}', ?);
+                    """)
+                    try statement.bind(1, Int64(startSequence + offset))
+                    try statement.bind(2, iso.string(from: Date()))
+                    _ = try statement.step()
+                    database.noteEventRowsInserted(1)
+
+                    database.noteEventRowCountSelectForTesting()
+                    let countStatement = try database.prepare("SELECT COUNT(*) FROM events;")
+                    _ = try countStatement.step()
+                    let rows = countStatement.columnInt64(0)
+                    database.rememberEventRowCount(rows)
+                    if rows > 5_000 {
+                        try database.execute("""
+                            DELETE FROM events
+                            WHERE id <= (SELECT MAX(id) FROM events) - 5000;
+                        """)
+                        try database.execute("""
+                            DELETE FROM command_receipt_events
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM events WHERE events.seq = command_receipt_events.seq
+                            );
+                        """)
+                        database.noteEventRowCountSelectForTesting()
+                        let after = try database.prepare("SELECT COUNT(*) FROM events;")
+                        _ = try after.step()
+                        database.rememberEventRowCount(after.columnInt64(0))
+                    }
+                }
+            }
+        }
     }
 }

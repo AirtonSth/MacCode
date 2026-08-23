@@ -433,6 +433,7 @@ public final class SQLiteDB {
             try withTransientLockRetry(onRetry: { [self] in
                 releaseReadSnapshotForRetry()
             }) {
+                let eventRowCountBeforeTransaction = cachedEventRowCount
                 transactionDepth += 1
                 defer { transactionDepth -= 1 }
                 try execute("BEGIN IMMEDIATE;")
@@ -442,6 +443,7 @@ public final class SQLiteDB {
                     return r
                 } catch {
                     try? execute("ROLLBACK;")
+                    cachedEventRowCount = eventRowCountBeforeTransaction
                     throw error
                 }
             }
