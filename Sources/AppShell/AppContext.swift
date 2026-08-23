@@ -1859,7 +1859,7 @@ public final class AppContext {
     func prepareForApplicationTermination() -> [Task<Void, Never>] {
         isTerminating = true
         flushPendingTokenSaverUsage()
-        flushWriterQueue()
+        flushEventPersistence()
         return cancelAllQueueDrainWaiters()
     }
 
@@ -5553,29 +5553,17 @@ public final class AppContext {
         return appendCount > 0 && appendCount % n == 0
     }
 
-    /// Wire EventBus.shared.persister to append to the event log off-main,
-    /// pruning on a counter cadence rather than on every append.
-    /// In production AppDelegate overrides this after init; in tests (no
-    /// AppDelegate) this persister is the active one and exercises the queue.
-    ///
-    /// The append counter is a local closure variable guarded by the serial
-    /// backgroundWriterQueue, so no lock or @MainActor access is needed.
-    public func wireBackgroundPersister() {
+    /// Wire an EventBus persister to encode and append on the serial writer
+    /// queue. Serial submission preserves event sequence while keeping payload
+    /// encoding and SQLite transactions off the producer/delivery path.
+    public func wireBackgroundPersister(eventBus: EventBus = .shared) {
         let log = eventLog
         let queue = backgroundWriterQueue
-        // Counter is local to the closure; only ever mutated on `queue` (serial).
-        var appendCount = 0
-        EventBus.shared.persister = { ev in
+        eventBus.persister = { ev in
             guard AppDelegate.shouldPersistEvent(ev) else { return }
-            let json = EventBus.encodePayloadForPersistence(ev.payload)
             queue.async {
+                let json = EventBus.encodePayloadForPersistence(ev.payload)
                 _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
-                appendCount += 1
-                // shouldPrune gate: in future, move the bounded-log DELETE out of
-                // EventLogRepository.append and call it here when shouldPrune returns
-                // true. The counter is live now so the cadence logic is in place.
-                _ = AppContext.shouldPrune(appendCount: appendCount,
-                                           interval: AppContext.eventLogPruneInterval)
             }
         }
     }
@@ -5638,6 +5626,14 @@ public final class AppContext {
     /// before the assertion.
     public func flushWriterQueue() {
         backgroundWriterQueue.sync {}
+    }
+
+    /// Drain EventBus delivery first, then its serial persistence queue. The
+    /// ordering closes the graceful-exit race where an accepted publish had not
+    /// submitted its writer work when a plain writer barrier was inserted.
+    public func flushEventPersistence(eventBus: EventBus = .shared) {
+        eventBus.flushPersistenceSubmissions()
+        flushWriterQueue()
     }
 
     @discardableResult

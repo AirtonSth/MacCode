@@ -227,17 +227,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         context.router = router
 
         // Wire EventBus to the persisted event log so events survive restart.
-        let log = context.eventLog
-        EventBus.shared.shouldRetainRecentEvent = { ev in
-            Self.shouldRetainRecentEvent(ev)
-        }
-        EventBus.shared.persister = { ev in
-            guard Self.shouldPersistEvent(ev) else { return }
-            let json = EventBus.encodePayloadForPersistence(ev.payload)
-            _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
-        }
+        // Encoding + SQLite run on AppContext's serial writer queue; publish
+        // remains ordered without blocking the producer on durable storage.
+        Self.wireEventPersistence(context: context)
         do {
-            EventBus.shared.reloadFromPersistence(lastSeq: try log.lastSeq(), recent: [])
+            EventBus.shared.reloadFromPersistence(lastSeq: try context.eventLog.lastSeq(), recent: [])
         } catch {
             appLifecycleLog.error("event_log.sequence_init_failed error=\(error.localizedDescription, privacy: .public)")
         }
@@ -553,6 +547,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         persistRestorableStateBeforeUpdate()
         stopPetController()
         stopLiveRuntimesForAppTermination()
+        // Runtime shutdown publishes final lifecycle events after the snapshot
+        // barrier above. Drain them before the process exits.
+        context?.flushEventPersistence()
         socketServer?.stop()
         directAccessSupervisor?.shutdown()
         directAccessSupervisor = nil
@@ -591,6 +588,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     private func persistRestorableStateBeforeUpdate() {
         context?.saveSnapshot()
+        // Sparkle may relaunch immediately after this hook returns. Make every
+        // previously published event durable before handing control back.
+        context?.flushEventPersistence()
+    }
+
+    static func wireEventPersistence(
+        context: AppContext,
+        eventBus: EventBus = .shared
+    ) {
+        eventBus.shouldRetainRecentEvent = { event in
+            Self.shouldRetainRecentEvent(event)
+        }
+        context.wireBackgroundPersister(eventBus: eventBus)
     }
 
     private func stopLiveRuntimesForAppTermination() {
