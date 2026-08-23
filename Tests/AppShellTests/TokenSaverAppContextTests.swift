@@ -1098,12 +1098,12 @@ final class TokenSaverAppContextTests: XCTestCase {
         )
         savePrivateSession(in: context)
         let digestEvents = LockedEventCount()
-        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
             if event.kind == TokenSaverWidgetDigest.eventKind {
                 digestEvents.increment()
             }
         }
-        defer { EventBus.shared.unsubscribe(token) }
+        defer { EventBus.shared.unsubscribe(subscription) }
 
         context.refreshPeriodicTokenSaverAccountUsage()
         let didFinish = await waitUntil {
