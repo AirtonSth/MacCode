@@ -30,6 +30,7 @@ public struct ManagedRetrieveMCP: Sendable {
     public static let toolName = "rc_retrieve"
     public static let searchToolName = "rc_search"
     public static let statsToolName = "rc_stats"
+    public static let catalogToolName = "rc_catalog"
     public static let compressToolName = "rc_compress"
     public static let askToolName = "rc_ask"
     private let retrieve: RetrieveFn
@@ -128,14 +129,36 @@ public struct ManagedRetrieveMCP: Sendable {
                 ],
             ])
             tools.append([
+                "name": Self.catalogToolName,
+                "description": "Discover enabled Token Saver catalog operations by id or summary. Results are deterministic, local, and paginated.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "query": [
+                            "type": "string",
+                            "description": "Optional case-insensitive id or summary search.",
+                        ],
+                        "cursor": [
+                            "type": "string",
+                            "description": "Opaque continuation returned by the preceding page for the same query.",
+                        ],
+                        "limit": [
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20,
+                        ],
+                    ],
+                ],
+            ])
+            tools.append([
                 "name": Self.askToolName,
-                "description": "Run a Token Saver catalog function from 01-catalogo.html on the user's selected Distill model (Settings 1.7B / E4B / OpenAI-compat). op is a catalog id. Host-only ops return unavailable; forbidden ops are refused.",
+                "description": "Run an enabled Token Saver catalog operation. Discover cold operations with rc_catalog; host-only operations return unavailable.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
                         "op": [
                             "type": "string",
-                            "enum": LibrarianCatalog.implementedIDs,
+                            "description": "Catalog id. Common: \(LibrarianCatalog.hotHintIDs.joined(separator: ", ")). Use rc_catalog for the complete enabled list.",
                         ],
                         "input": ["type": "string"],
                         "question": ["type": "string"],
@@ -168,13 +191,14 @@ public struct ManagedRetrieveMCP: Sendable {
             }
             return reply(id: id, result: [
                 "tools": tools,
-            ])
+            ], sortedKeys: true)
         case "tools/call":
             let params = msg["params"] as? [String: Any]
             let args = params?["arguments"] as? [String: Any]
             let name = params?["name"] as? String
             guard name == Self.statsToolName
                     || name == Self.searchToolName
+                    || name == Self.catalogToolName
                     || name == Self.askToolName
                     || name == Self.compressToolName
                     || (scopedRecoveryAvailable && name == Self.toolName) else {
@@ -207,9 +231,53 @@ public struct ManagedRetrieveMCP: Sendable {
                     "isError": false,
                 ])
             }
+            if name == Self.catalogToolName {
+                let query: String?
+                if let rawQuery = args?["query"] {
+                    guard let value = rawQuery as? String else {
+                        return errorReply(id: id, code: -32602, message: "invalid catalog query")
+                    }
+                    query = value
+                } else {
+                    query = nil
+                }
+                let cursor: String?
+                if let rawCursor = args?["cursor"] {
+                    guard let value = rawCursor as? String else {
+                        return errorReply(id: id, code: -32602, message: "invalid catalog cursor")
+                    }
+                    cursor = value
+                } else {
+                    cursor = nil
+                }
+                let limit: Int
+                if let rawLimit = args?["limit"] {
+                    guard let value = rawLimit as? Int, (1...20).contains(value) else {
+                        return errorReply(id: id, code: -32602, message: "catalog limit must be 1...20")
+                    }
+                    limit = value
+                } else {
+                    limit = 10
+                }
+                do {
+                    let page = try LibrarianCatalog.page(query: query, cursor: cursor, limit: limit)
+                    return reply(id: id, result: [
+                        "content": [["type": "text", "text": encodeJSON(page) ?? "{}"]],
+                        "isError": false,
+                    ])
+                } catch {
+                    return errorReply(id: id, code: -32602, message: "invalid catalog cursor")
+                }
+            }
             if name == Self.askToolName {
                 guard let op = args?["op"] as? String, !op.isEmpty else {
                     return errorReply(id: id, code: -32602, message: "missing op")
+                }
+                guard LibrarianCatalog.implementedIDs.contains(op) else {
+                    return reply(id: id, result: [
+                        "content": [["type": "text", "text": "catalog op unavailable"]],
+                        "isError": true,
+                    ])
                 }
                 let input = args?["input"] as? String ?? ""
                 let question = args?["question"] as? String ?? op
@@ -358,16 +426,24 @@ public struct ManagedRetrieveMCP: Sendable {
         )
     }
 
-    private func reply(id: Any?, result: [String: Any]) -> String? {
-        encode(["jsonrpc": "2.0", "id": id ?? NSNull(), "result": result])
+    private func reply(
+        id: Any?,
+        result: [String: Any],
+        sortedKeys: Bool = false
+    ) -> String? {
+        encode(
+            ["jsonrpc": "2.0", "id": id ?? NSNull(), "result": result],
+            sortedKeys: sortedKeys
+        )
     }
 
     private func errorReply(id: Any?, code: Int, message: String) -> String? {
         encode(["jsonrpc": "2.0", "id": id ?? NSNull(), "error": ["code": code, "message": message]])
     }
 
-    private func encode(_ object: [String: Any]) -> String? {
-        guard let data = try? JSONSerialization.data(withJSONObject: object, options: []),
+    private func encode(_ object: [String: Any], sortedKeys: Bool = false) -> String? {
+        let options: JSONSerialization.WritingOptions = sortedKeys ? [.sortedKeys] : []
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: options),
               let text = String(data: data, encoding: .utf8) else {
             return nil
         }

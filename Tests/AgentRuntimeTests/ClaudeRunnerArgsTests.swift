@@ -106,7 +106,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
 
     func test_liveClaudeRoutesAdmitDistillLibrarianMCPOnlyWithTokenSaver() throws {
         // WHY: the distill skill instructs every provider to use the librarian
-        // MCP tools (rc_stats/rc_search/rc_ask/rc_retrieve/rc_compress — the
+        // MCP tools (rc_stats/rc_search/rc_catalog/rc_ask/rc_retrieve/rc_compress — the
         // 01-catalogo.html surface), but Claude never saw the server: it was
         // installed into ~/.claude/settings.json, which Claude Code does not read
         // for mcpServers (proven live: the entry never spawned and `claude mcp
@@ -190,6 +190,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             Set([
                 ManagedRetrieveMCP.statsToolName,
                 ManagedRetrieveMCP.searchToolName,
+                ManagedRetrieveMCP.catalogToolName,
                 ManagedRetrieveMCP.askToolName,
                 ManagedRetrieveMCP.toolName,
                 ManagedRetrieveMCP.compressToolName,

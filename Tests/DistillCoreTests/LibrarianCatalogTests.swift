@@ -9,6 +9,36 @@ final class LibrarianCatalogTests: XCTestCase {
         XCTAssertEqual(LibrarianCatalog.forbiddenIDs.count, 19)
     }
 
+    func test_exposedCatalogHasOnlyEnabledNonForbiddenFunctionsInStableOrder() {
+        // WHY: rc_ask no longer pays to advertise every id in tools/list. The
+        // on-demand catalog must still make every callable operation reachable,
+        // while forbidden and runtime-disabled operations remain undiscoverable.
+        XCTAssertEqual(LibrarianCatalog.implementedIDs.count, 168)
+        XCTAssertEqual(Set(LibrarianCatalog.implementedIDs).count, 168)
+        XCTAssertEqual(
+            LibrarianCatalog.implementedIDs,
+            LibrarianCatalog.all.filter {
+                $0.safety != .forbidden && !LibrarianCatalog.disabledOnNineB.contains($0.id)
+            }.map(\.id)
+        )
+        XCTAssertTrue(Set(LibrarianCatalog.implementedIDs).isDisjoint(with: LibrarianCatalog.forbiddenIDs))
+        XCTAssertTrue(Set(LibrarianCatalog.implementedIDs).isDisjoint(with: LibrarianCatalog.disabledOnNineB))
+    }
+
+    func test_catalogPageSupportsExactAndSummarySearchWithOpaqueBoundCursor() throws {
+        let exact = try LibrarianCatalog.page(query: "test_verdict", cursor: nil, limit: 20)
+        XCTAssertEqual(exact.items.first?.id, "test_verdict")
+
+        let summary = try LibrarianCatalog.page(query: "Ledger stats", cursor: nil, limit: 20)
+        XCTAssertTrue(summary.items.contains { $0.id == "stats" })
+
+        let first = try LibrarianCatalog.page(query: nil, cursor: nil, limit: 7)
+        let cursor = try XCTUnwrap(first.nextCursor)
+        XCTAssertNil(Int(cursor), "cursor is an opaque continuation, not a public offset")
+        XCTAssertThrowsError(try LibrarianCatalog.page(query: "different", cursor: cursor, limit: 7))
+        XCTAssertThrowsError(try LibrarianCatalog.page(query: nil, cursor: "not-a-cursor", limit: 7))
+    }
+
     func test_persistCallback_emitsLibrarianModeRow() async {
         var persisted: [DistillSavingsRecord] = []
         let dispatcher = LibrarianDispatcher(persist: { persisted.append($0) })

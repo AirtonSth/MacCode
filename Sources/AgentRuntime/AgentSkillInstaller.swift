@@ -177,7 +177,7 @@ public struct RemoteCodeSubagentTelemetryScope: Sendable, Equatable {
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "remote-code://token-saver/distill-tool-output"
-    public static let distillLocalVersion = "9"
+    public static let distillLocalVersion = "10"
     public static let distillInstructionsBeginMarker = "<!-- distill skill: begin -->"
     public static let distillInstructionsEndMarker = "<!-- distill skill: end -->"
     public static let distillCLIBeginMarker = "# RemoteCode managed distill CLI: begin"
@@ -247,8 +247,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - Wait for `distill` before continuing when you did pipe it.
 
     Local librarian catalog (01-catalogo.html, Token Saver Distill MCP `remotecode-distill` / `remotecode-distill-retrieve`) — MANDATORY when these tools are listed:
-    - Use the FULL tool surface, not just one tool: `rc_search` (find stored handles/blobs BEFORE re-deriving or re-reading), `rc_ask` (run any implemented catalog op over a handle), `rc_compress` (shrink a large blob before quoting it), `rc_retrieve` (byte-exact original behind `[[rc:handle]]` — whole-blob retrieval is the exception, justify it), `rc_stats` (ledger/handle stats).
-    - `rc_ask.op` is the catalog function id and the schema enum IS the implemented catalog. Before you extract, digest, classify, rank, diff, grep-inside-a-handle, or draft from bulky content in paid context, check the enum for the matching op and call it (examples: test_verdict, ci_job_failures, handle_grep, retrieve_range, extract_schema, pick_candidates, cite_spans, multi_handle_ask, delta_handles, commit_message_draft). Doing one of these manually on handle-backed content is a policy violation, same as skipping `| distill`.
+    - Use the FULL tool surface, not just one tool: `rc_search` (find stored handles/blobs BEFORE re-deriving or re-reading), `rc_catalog` (discover enabled catalog operations by id/summary), `rc_ask` (run a discovered op over a handle), `rc_compress` (shrink a large blob before quoting it), `rc_retrieve` (byte-exact original behind `[[rc:handle]]` — whole-blob retrieval is the exception, justify it), `rc_stats` (ledger/handle stats).
+    - `rc_ask.op` is a catalog function id. Use the eight schema hints for common work; query `rc_catalog` just in time for other extract/digest/classify/rank/diff/grep-in-handle/draft operations, then call the returned id (examples: test_verdict, ci_job_failures, handle_grep, retrieve_range, extract_schema, pick_candidates, cite_spans, multi_handle_ask). Doing one manually on handle-backed content is a policy violation, same as skipping `| distill`.
     - Generate ops run on the Distill model selected in Settings (1.7B / E4B / OpenAI-compatible API).
     - Host-only catalog ops (screenshot_ocr, doc_text_extract, lsp_query, graphify_query, path_wrappers, …) stay on the Mac; if MCP returns unavailable, do not fake success — read the original natively.
     - Forbidden catalog ids (apply_patch, extract_secret_values, …) are refused. Never ask Distill to ship code or leak secrets.
@@ -276,7 +276,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     NEVER Distill skill content: Skill tool output and requested/returned SKILL bodies must stay complete/verbatim (no summary, `[[rc:]]` handle, truncation, or savings accounting).
     Never invoke Node/tsx/npm/bun or a source-checkout `distill`.
     Host/runtime carries the ordinary-output Distill policy; do not require every worker prompt to restate it.
-    Distill MCP catalog tools (01-catalogo.html) are MANDATORY when listed — use the FULL surface: `rc_search` stored handles before re-deriving; `rc_ask` for ANY extract/digest/classify/rank/diff/grep-in-handle/draft over handle content (`rc_ask.op` schema enum = the implemented catalog; pick the matching op — doing it manually on handle-backed content is a policy violation); `rc_compress` big blobs before quoting; `rc_retrieve` only for byte-exact needs; `rc_stats` for ledger stats. Generate ops use the Settings Distill model. Host-only ops may be unavailable — never fake success; forbidden ops are refused. Recover `[[rc:handle]]` with `rc_retrieve` or `distill retrieve <handle>`. Wait for `distill` before continuing when used.
+    Distill MCP catalog tools are MANDATORY when listed: `rc_search` stored handles; `rc_catalog` cold ops by id/summary; `rc_ask` extract/digest/classify/rank/diff/grep/draft with a hot hint or returned id; `rc_compress` big blobs; `rc_retrieve` exact bytes; `rc_stats` ledger. Doing this manually on handle content is a policy violation. Generate uses the Settings Distill model. Host-only may be unavailable — never fake success; forbidden ops are refused. Recover `[[rc:<handle>]]` with `rc_retrieve` or `distill retrieve <handle>`. Wait when used.
     Details and examples live in the managed `distill` SKILL.md.
     <!-- distill skill: end -->
     """
