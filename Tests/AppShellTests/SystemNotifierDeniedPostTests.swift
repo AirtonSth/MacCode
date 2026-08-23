@@ -2,6 +2,7 @@ import XCTest
 import UserNotifications
 @testable import AppShell
 import CoreModel
+import Persistence
 
 /// Tests for the `SystemNotifier.onDeniedPost` seam.
 ///
@@ -181,5 +182,33 @@ final class SystemNotifierDeniedPostTests: XCTestCase {
         XCTAssertEqual(userInfoThreadId, threadId,
             "rc2NotificationsDeniedPost userInfo[threadId] must match the denied content " +
             "so an observer can deep-link to the finished thread from the in-app notice")
+    }
+
+    func test_projectPetNotificationsDeniedPersistsSafeSettingsFallback() throws {
+        // WHY: a denied OS banner must still leave a visible, actionable Pet row
+        // so the run result is not lost when macOS refuses notification access.
+        let directory = NSTemporaryDirectory() + "RC2DeniedPet-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let workspaceID = WorkspaceID(UUID())
+        let content = RemoteCodeNotificationContent.userActionNeeded(
+            threadId: UUID().uuidString,
+            workspaceId: workspaceID.value.uuidString,
+            threadTitle: "unsafe title",
+            actionTitle: "unsafe action",
+            requestId: UUID().uuidString
+        )!
+
+        let id = try AppDelegate.projectPetNotificationsDenied(
+            content: content,
+            repository: NotificationRepository(db: context.db)
+        )
+        let row = try XCTUnwrap(NotificationRepository(db: context.db).list().first)
+
+        XCTAssertEqual(id, AppDelegate.notificationsDeniedPetID)
+        XCTAssertEqual(row.id, AppDelegate.notificationsDeniedPetID)
+        XCTAssertEqual(row.workspaceId, workspaceID)
+        XCTAssertEqual(row.category, PetNotificationCategory.notificationsDenied.rawValue)
+        XCTAssertEqual(row.title, "Notifications are turned off")
+        XCTAssertEqual(row.body, "Open System Settings to re-enable them.")
     }
 }

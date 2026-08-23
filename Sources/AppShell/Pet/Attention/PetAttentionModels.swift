@@ -28,11 +28,12 @@ public enum PetNotificationCategory: String, CaseIterable, Sendable, Equatable {
     case providerUpdateFailed = "pet.provider-update.failed"
     case fileConflict = "pet.file.conflict"
     case serverListenerFailed = "pet.server-listener.failed"
+    case notificationsDenied = "pet.notifications.denied"
     case agentAttention = "agent_attention"
 
     var classification: PetAttentionClassification {
         switch self {
-        case .sshUnexpectedDisconnect, .fileConflict, .serverListenerFailed, .agentAttention: return .needsYou
+        case .sshUnexpectedDisconnect, .fileConflict, .serverListenerFailed, .notificationsDenied, .agentAttention: return .needsYou
         default: return .completed
         }
     }
@@ -59,6 +60,11 @@ public enum PetNotificationCategory: String, CaseIterable, Sendable, Equatable {
             return .safe(kind: .fileConflict)
         case .serverListenerFailed:
             return PetAttentionPresentation(title: "Remote access needs attention", detail: nil)
+        case .notificationsDenied:
+            return PetAttentionPresentation(
+                title: "Notifications are turned off",
+                detail: "Open System Settings to re-enable them."
+            )
         case .agentAttention:
             return PetAttentionPresentation(title: "Agent input requested", detail: nil)
         }

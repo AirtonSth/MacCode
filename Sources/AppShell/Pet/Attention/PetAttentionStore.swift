@@ -111,6 +111,10 @@ public final class PetAttentionStore {
             try markAgentThreadReadMutation(threadID)
             return .marked
         case .notification(let id):
+            if case .notification(.notificationsDenied) = item.kind {
+                try markNotificationReadMutation(id)
+                return .marked
+            }
             guard !item.kind.needsUserAction else { return .retainedBlocker }
             try markNotificationReadMutation(id)
             return .marked
@@ -241,7 +245,7 @@ public final class PetAttentionStore {
         switch category {
         case .providerUpdateFailed:
             route = .settings(.providers)
-        case .serverListenerFailed:
+        case .serverListenerFailed, .notificationsDenied:
             route = .settings(.general)
         case .agentAttention:
             if let surfaceID = notification.surfaceId {
