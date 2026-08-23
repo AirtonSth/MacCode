@@ -1,5 +1,6 @@
-import Foundation
+import AppKit
 import CoreGraphics
+import Foundation
 import ImageIO
 
 enum PetAtlasError: Error, Equatable {
@@ -157,7 +158,19 @@ struct PetAtlasFrame {
     let index: Int
     let image: CGImage
     let displayImage: CGImage
+    let appKitImage: NSImage
     let interpolationQuality: CGInterpolationQuality = .none
+
+    init(state: PetAnimationState, index: Int, image: CGImage, displayImage: CGImage) {
+        self.state = state
+        self.index = index
+        self.image = image
+        self.displayImage = displayImage
+        self.appKitImage = NSImage(
+            cgImage: displayImage,
+            size: NSSize(width: displayImage.width, height: displayImage.height)
+        )
+    }
 
     /// Rendering entry point for AppKit/SwiftUI bridges. Pixel art must never be
     /// filtered when scaled to the configured pet size.
@@ -179,9 +192,11 @@ final class PetAtlas {
 
     private let rowURLs: [PetAnimationState: URL]
     private var rowImages: [PetAnimationState: CGImage] = [:]
+    private var rowFrames: [PetAnimationState: [Int: PetAtlasFrame]] = [:]
     private let idleMicroManifest: PetIdleMicroManifest
     private let idleMicroRowURLs: [PetIdleMicroAction: URL]
     private var idleMicroRowImage: (action: PetIdleMicroAction, image: CGImage)?
+    private var idleMicroFrames: [Int: PetAtlasFrame] = [:]
 
     var decodedRowStates: Set<PetAnimationState> { Set(rowImages.keys) }
 
@@ -286,7 +301,9 @@ final class PetAtlas {
         }
         if idleMicroRowImage?.action != action {
             idleMicroRowImage = (action, try decodeIdleMicroRow(action))
+            idleMicroFrames.removeAll(keepingCapacity: true)
         }
+        if let cached = idleMicroFrames[index] { return cached }
         guard let rowImage = idleMicroRowImage?.image else {
             throw PetAtlasError.invalidImage("idle-\(action.rawValue) row did not decode")
         }
@@ -301,7 +318,9 @@ final class PetAtlas {
               let displayImage = image.cropping(to: visualBounds) else {
             throw PetAtlasError.invalidFrame(state: .idle, index: index)
         }
-        return PetAtlasFrame(state: .idle, index: index, image: image, displayImage: displayImage)
+        let frame = PetAtlasFrame(state: .idle, index: index, image: image, displayImage: displayImage)
+        idleMicroFrames[index] = frame
+        return frame
     }
 
     func canonicalIdleMicroActionFrame() throws -> PetAtlasFrame {
@@ -309,13 +328,17 @@ final class PetAtlas {
     }
 
     func activate(_ state: PetAnimationState, adjacent: [PetAnimationState] = []) throws {
-        if state != .idle { idleMicroRowImage = nil }
+        if state != .idle {
+            idleMicroRowImage = nil
+            idleMicroFrames.removeAll(keepingCapacity: true)
+        }
         var desired: [PetAnimationState] = [state]
         for candidate in adjacent where !desired.contains(candidate) && desired.count < 3 {
             desired.append(candidate)
         }
         let desiredSet = Set(desired)
         rowImages = rowImages.filter { desiredSet.contains($0.key) }
+        rowFrames = rowFrames.filter { desiredSet.contains($0.key) }
         for candidate in desired where rowImages[candidate] == nil {
             rowImages[candidate] = try decodeRow(candidate)
         }
@@ -328,6 +351,7 @@ final class PetAtlas {
         if rowImages[state] == nil {
             try activate(state)
         }
+        if let cached = rowFrames[state]?[index] { return cached }
         guard let rowImage = rowImages[state] else {
             throw PetAtlasError.invalidImage("row did not decode for \(state.rawValue)")
         }
@@ -348,12 +372,14 @@ final class PetAtlas {
               displayImage.height == Int(visualBounds.height) else {
             throw PetAtlasError.invalidFrame(state: state, index: index)
         }
-        return PetAtlasFrame(
+        let frame = PetAtlasFrame(
             state: state,
             index: index,
             image: image,
             displayImage: displayImage
         )
+        rowFrames[state, default: [:]][index] = frame
+        return frame
     }
 
     func canonicalFrame(for state: PetAnimationState) throws -> PetAtlasFrame {

@@ -2,6 +2,7 @@ import XCTest
 import CoreGraphics
 import CryptoKit
 import ImageIO
+import Persistence
 @testable import AppShell
 
 @MainActor
@@ -113,6 +114,61 @@ final class PetAssetRuntimeTests: XCTestCase {
         XCTAssertEqual(atlas.decodedRowStates, Set([.search, .idle]))
         XCTAssertLessThanOrEqual(atlas.decodedRowStates.count, 3,
             "runtime memory must retain only the active row and bounded adjacent rows")
+    }
+
+    func test_repeatedAnimationFrameLookup_reusesImageObjectsWithinTheBoundedRowCache() throws {
+        // WHY: looped Pet states revisit the same eight frames up to 24 times per second.
+        // Rebuilding identical CoreGraphics crops and AppKit bridges on every loop would
+        // turn an already-bounded row cache into continuous allocation churn.
+        let atlas = try PetAtlas.bundled()
+        let first = try atlas.frame(state: .coding, index: 3)
+        let repeated = try atlas.frame(state: .coding, index: 3)
+
+        XCTAssertTrue(first.image === repeated.image)
+        XCTAssertTrue(first.displayImage === repeated.displayImage)
+
+        let model = PetViewModel(settings: AppSettings(petEnabled: true))
+        model.setFrame(first)
+        let firstAppKitImage = try XCTUnwrap(model.currentImage)
+        model.setFrame(repeated)
+        XCTAssertTrue(firstAppKitImage === model.currentImage)
+
+        try atlas.activate(.search)
+        let reloaded = try atlas.frame(state: .coding, index: 3)
+        XCTAssertFalse(first.image === reloaded.image,
+            "evicting the decoded row must also evict its cached frame objects")
+
+        let blink = try atlas.idleMicroActionFrame(action: .blink, index: 2)
+        let repeatedBlink = try atlas.idleMicroActionFrame(action: .blink, index: 2)
+        XCTAssertTrue(blink.image === repeatedBlink.image)
+        XCTAssertTrue(blink.displayImage === repeatedBlink.displayImage)
+        _ = try atlas.idleMicroActionFrame(action: .tail, index: 2)
+        let reloadedBlink = try atlas.idleMicroActionFrame(action: .blink, index: 2)
+        XCTAssertFalse(blink.image === reloadedBlink.image,
+            "switching idle micro-action rows must release the prior action's frame cache")
+    }
+
+    func test_perfProof_repeatedAnimationFrameBridge() throws {
+        let atlas = try PetAtlas.bundled()
+        try atlas.activate(.coding)
+        let model = PetViewModel(settings: AppSettings(petEnabled: true))
+        let iterations = 50_000
+
+        func measureMilliseconds() throws -> Double {
+            let started = DispatchTime.now().uptimeNanoseconds
+            try autoreleasepool {
+                for iteration in 0..<iterations {
+                    model.setFrame(try atlas.frame(state: .coding, index: iteration % 8))
+                }
+            }
+            return Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+        }
+
+        for _ in 0..<5 { _ = try measureMilliseconds() }
+        let samples = try (0..<5).map { _ in try measureMilliseconds() }
+
+        XCTAssertEqual(model.currentFrame?.state, .coding)
+        print("[perf-proof] pet_frame_bridge iterations=\(iterations) warmup=5 n=5 wall_ms=\(samples)")
     }
 
     func test_all272AuthoredFramesDecodeAndCropAcrossEveryStateRow() throws {

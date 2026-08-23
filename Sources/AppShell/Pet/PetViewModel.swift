@@ -57,10 +57,7 @@ public final class PetViewModel: ObservableObject {
 
     func setFrame(_ frame: PetAtlasFrame) {
         currentFrame = frame
-        currentImage = NSImage(
-            cgImage: frame.displayImage,
-            size: NSSize(width: frame.displayImage.width, height: frame.displayImage.height)
-        )
+        currentImage = frame.appKitImage
     }
 
     public func apply(snapshot: PetAttentionSnapshot) {
