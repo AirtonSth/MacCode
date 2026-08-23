@@ -213,6 +213,55 @@ final class ProviderProcessSweeperTests: XCTestCase {
         XCTAssertEqual(try store.load(), [tag], "the concurrent lifetime must retain its ownership for the next scan")
     }
 
+    func test_emptySweepDoesNotMaterializeOwnershipLedger() throws {
+        // WHY: an empty sweep has no decision to commit. Creating/replacing and
+        // fsyncing `[]` every heartbeat burns idle CPU and disk while preserving
+        // the same observable empty ownership state.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("heartbeat-empty-no-write-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("ownership.json")
+        let store = ProviderProcessOwnershipStore(fileURL: file)
+        let staleTemp = directory.appendingPathComponent(".ownership.json.tmp-987654-stale")
+        let freshTemp = directory.appendingPathComponent(".ownership.json.tmp-987654-fresh")
+        let sameProcessTemp = directory.appendingPathComponent(
+            ".ownership.json.tmp-\(ProcessInfo.processInfo.processIdentifier)-interrupted"
+        )
+        for temp in [staleTemp, freshTemp, sameProcessTemp] {
+            try Data("interrupted".utf8).write(to: temp)
+        }
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -61)],
+            ofItemAtPath: staleTemp.path
+        )
+
+        let result = try ProviderProcessSweeper.sweepPersistedOrphans(
+            store: store,
+            currentPID: ProcessInfo.processInfo.processIdentifier,
+            minAge: 0,
+            ownerIsAlive: { _ in XCTFail("empty ownership must evaluate no owner"); return false },
+            processCommand: { _ in XCTFail("empty ownership must evaluate no command"); return nil },
+            processStartIdentity: { _ in XCTFail("empty ownership must evaluate no identity"); return nil },
+            descendantPIDs: { _ in XCTFail("empty ownership must enumerate no descendants"); return [] },
+            processGroupMembers: { _ in XCTFail("empty ownership must enumerate no group"); return [] },
+            processIsAlive: { _ in XCTFail("empty ownership must probe no process"); return false },
+            graceInterval: 0,
+            wait: { _ in XCTFail("empty ownership must never wait") },
+            sendSignal: { _, _ in XCTFail("empty ownership must never signal"); return false }
+        )
+
+        XCTAssertEqual(result, ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: []))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path),
+                       "a no-op sweep must preserve missing-file == empty-ledger without physical writes")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staleTemp.path),
+                       "the fast path must preserve recovery of abandoned temps from prior processes")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: freshTemp.path),
+                      "a concurrent writer's fresh temp must not be removed")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sameProcessTemp.path),
+                       "an interrupted temp from this process is safe to remove immediately")
+    }
+
     func test_sharedSnapshotPreservesTelemetrySweepAndLedgerWhileHalvingLoads() throws {
         // WHY: sharing is valid only if it removes enumeration work without
         // changing either heartbeat accounting or ownership retention.

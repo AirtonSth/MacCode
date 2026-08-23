@@ -439,6 +439,102 @@ final class ProviderProcessSweepPerformanceTests: XCTestCase {
         }
     }
 
+    /// Real APFS A/B of the residual empty-sweep commit. The legacy arm executes
+    /// the exact load -> commitSweep -> atomic write/fsync/rename/directory-fsync
+    /// sequence; the optimized arm executes the production empty sweep.
+    func test_microbench_emptyOwnershipSweep_skipsNoOpLedgerRewrite() throws {
+        let warmup = 2
+        let samples = 7
+        let ticksPerSample = 32
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("heartbeat-empty-write-perf-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProviderProcessOwnershipStore(fileURL: directory.appendingPathComponent("ownership.json"))
+        try store.replace([])
+
+        func optimizedSweep() throws {
+            _ = try ProviderProcessSweeper.sweepPersistedOrphans(
+                store: store,
+                currentPID: ProcessInfo.processInfo.processIdentifier,
+                minAge: 0,
+                ownerIsAlive: { _ in false },
+                processCommand: { _ in nil },
+                processStartIdentity: { _ in nil },
+                descendantPIDs: { _ in [] },
+                processGroupMembers: { _ in [] },
+                processIsAlive: { _ in false },
+                graceInterval: 0,
+                wait: { _ in },
+                sendSignal: { _, _ in false }
+            )
+        }
+
+        func measure(legacyRewrite: Bool) throws -> Sample {
+            let cpuStart = processCPUSeconds()
+            let wallStart = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<ticksPerSample {
+                if legacyRewrite {
+                    // Exact empty branch removed from sweepPersistedOrphans:
+                    // load `tags`, then commit the unchanged empty snapshot.
+                    let tags = try store.load()
+                    try store.commitSweep(snapshot: tags, retainedFromSnapshot: [])
+                } else {
+                    try optimizedSweep()
+                }
+            }
+            let wallEnd = DispatchTime.now().uptimeNanoseconds
+            let cpuEnd = processCPUSeconds()
+            return Sample(
+                wallMilliseconds: Double(wallEnd - wallStart) / 1_000_000,
+                cpuMilliseconds: (cpuEnd - cpuStart) * 1_000,
+                groupEnumerations: legacyRewrite ? ticksPerSample : 0,
+                result: ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+            )
+        }
+
+        for _ in 0..<warmup {
+            _ = try measure(legacyRewrite: true)
+            _ = try measure(legacyRewrite: false)
+        }
+        var before: [Sample] = []
+        var after: [Sample] = []
+        for sampleIndex in 0..<samples {
+            if sampleIndex.isMultiple(of: 2) {
+                before.append(try measure(legacyRewrite: true))
+                after.append(try measure(legacyRewrite: false))
+            } else {
+                after.append(try measure(legacyRewrite: false))
+                before.append(try measure(legacyRewrite: true))
+            }
+        }
+
+        let beforeWall = median(before.map(\.wallMilliseconds))
+        let afterWall = median(after.map(\.wallMilliseconds))
+        let beforeCPU = median(before.map(\.cpuMilliseconds))
+        let afterCPU = median(after.map(\.cpuMilliseconds))
+        let wallImprovement = (beforeWall - afterWall) / beforeWall * 100
+        let cpuImprovement = beforeCPU > 0 ? (beforeCPU - afterCPU) / beforeCPU * 100 : 0
+
+        XCTAssertTrue(before.allSatisfy { $0.groupEnumerations == ticksPerSample })
+        XCTAssertTrue(after.allSatisfy { $0.groupEnumerations == 0 })
+        XCTAssertEqual(try store.load(), [])
+        NSLog(
+            "[perf-proof] emptyOwnershipSweep ticks=%d baseline_ledger_rewrites=%d optimized_ledger_rewrites=0 baseline_wall_ms=%@ optimized_wall_ms=%@ wall_improvement_pct=%.2f baseline_cpu_ms=%@ optimized_cpu_ms=%@ cpu_improvement_pct=%.2f before_wall=%@ after_wall=%@ before_cpu=%@ after_cpu=%@",
+            ticksPerSample, ticksPerSample,
+            String(beforeWall), String(afterWall), wallImprovement,
+            String(beforeCPU), String(afterCPU), cpuImprovement,
+            String(describing: before.map(\.wallMilliseconds)),
+            String(describing: after.map(\.wallMilliseconds)),
+            String(describing: before.map(\.cpuMilliseconds)),
+            String(describing: after.map(\.cpuMilliseconds))
+        )
+        XCTAssertGreaterThan(wallImprovement, 5,
+                             "skipping empty atomic rewrites must improve wall time by >5%")
+        XCTAssertGreaterThan(cpuImprovement, 5,
+                             "skipping empty atomic rewrites must improve CPU by >5%")
+    }
+
     /// Same-process A/B of the pre-checkpoint eager enumeration and production's
     /// lazy sweep. Primary metric: wall time for live exact current-owner rows;
     /// process CPU is reported as a corroborating metric (warmup=2, n=7).
