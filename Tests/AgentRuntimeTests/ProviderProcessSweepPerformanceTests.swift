@@ -216,6 +216,229 @@ final class ProviderProcessSweepPerformanceTests: XCTestCase {
                              "one shared ps per heartbeat must improve process+child CPU by >5%")
     }
 
+    /// Same-machine A/B of the exact shared-snapshot heartbeat with an empty
+    /// durable ownership ledger. The legacy arm executes real `/bin/ps`; the
+    /// candidate arm first consults the authoritative ledger (warmup=2, n=7).
+    func test_microbench_idleHeartbeatEmptyLedger_skipsProcessTable() throws {
+        let warmup = 2
+        let samples = 7
+        let ticksPerSample = 12
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("heartbeat-empty-ps-perf-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProviderProcessOwnershipStore(fileURL: directory.appendingPathComponent("ownership.json"))
+        try store.replace([])
+
+        func measure(skipEmptyOwnership: Bool) throws -> HeartbeatSample {
+            let executions = LockedCounter()
+            let realPS: ProviderProcessList = {
+                executions.increment()
+                return try ProviderProcessSweeper.psRowsThrowing()
+            }
+            let cpuStart = processAndChildrenCPUSeconds()
+            let wallStart = DispatchTime.now().uptimeNanoseconds
+            let results = HeartbeatResults()
+            for _ in 0..<ticksPerSample {
+                let loader: ProviderProcessList
+                if skipEmptyOwnership {
+                    loader = {
+                        try ProviderProcessSweeper.persistedOwnershipRows(
+                            store: store,
+                            processList: realPS
+                        )
+                    }
+                } else {
+                    loader = realPS
+                }
+                let snapshot = ProviderProcessListSnapshot(loader: loader)
+                let group = DispatchGroup()
+                group.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    results.record(Result {
+                        try ProviderProcessSweeper.managedProcessScan(
+                            store: store,
+                            processList: { try snapshot.rowsAfterSweepLoad() }
+                        )
+                    })
+                    group.leave()
+                }
+                group.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    results.record(Result {
+                        try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(
+                            minAge: 0,
+                            store: store,
+                            processList: { try snapshot.rows() }
+                        )
+                    })
+                    group.leave()
+                }
+                XCTAssertEqual(group.wait(timeout: .now() + 10), .success)
+            }
+            let wallEnd = DispatchTime.now().uptimeNanoseconds
+            let cpuEnd = processAndChildrenCPUSeconds()
+            let (scans, sweeps) = try results.values()
+            return HeartbeatSample(
+                wallMilliseconds: Double(wallEnd - wallStart) / 1_000_000,
+                cpuMilliseconds: (cpuEnd - cpuStart) * 1_000,
+                psExecutions: executions.read(),
+                scans: scans,
+                sweeps: sweeps,
+                ledger: try store.load()
+            )
+        }
+
+        for _ in 0..<warmup {
+            _ = try measure(skipEmptyOwnership: false)
+            _ = try measure(skipEmptyOwnership: true)
+        }
+        var before: [HeartbeatSample] = []
+        var after: [HeartbeatSample] = []
+        for sampleIndex in 0..<samples {
+            if sampleIndex.isMultiple(of: 2) {
+                before.append(try measure(skipEmptyOwnership: false))
+                after.append(try measure(skipEmptyOwnership: true))
+            } else {
+                after.append(try measure(skipEmptyOwnership: true))
+                before.append(try measure(skipEmptyOwnership: false))
+            }
+        }
+
+        let beforeWall = median(before.map(\.wallMilliseconds))
+        let afterWall = median(after.map(\.wallMilliseconds))
+        let beforeCPU = median(before.map(\.cpuMilliseconds))
+        let afterCPU = median(after.map(\.cpuMilliseconds))
+        let wallImprovement = (beforeWall - afterWall) / beforeWall * 100
+        let cpuImprovement = beforeCPU > 0 ? (beforeCPU - afterCPU) / beforeCPU * 100 : 0
+        let emptyScan = ManagedProcessScan(
+            providerProcesses: [], sidecarProcesses: [],
+            providerRootCount: 0, sidecarRootCount: 0,
+            isComplete: true, incompleteRootPIDs: []
+        )
+        let emptySweep = ProviderProcessSweepResult(
+            orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: []
+        )
+
+        XCTAssertTrue(before.allSatisfy { $0.psExecutions == ticksPerSample })
+        XCTAssertTrue(after.allSatisfy { $0.psExecutions == 0 })
+        XCTAssertTrue((before + after).allSatisfy {
+            $0.scans == Array(repeating: emptyScan, count: ticksPerSample)
+                && $0.sweeps == Array(repeating: emptySweep, count: ticksPerSample)
+                && $0.ledger.isEmpty
+        }, "skipping ps must preserve complete zero telemetry, empty sweep output and ledger")
+        NSLog(
+            "[perf-proof] idleHeartbeatEmptyLedger ticks=%d baseline_ps=%d optimized_ps=0 baseline_wall_ms=%@ optimized_wall_ms=%@ wall_improvement_pct=%.2f baseline_cpu_ms=%@ optimized_cpu_ms=%@ cpu_improvement_pct=%.2f before_wall=%@ after_wall=%@ before_cpu=%@ after_cpu=%@",
+            ticksPerSample, ticksPerSample,
+            String(beforeWall), String(afterWall), wallImprovement,
+            String(beforeCPU), String(afterCPU), cpuImprovement,
+            String(describing: before.map(\.wallMilliseconds)),
+            String(describing: after.map(\.wallMilliseconds)),
+            String(describing: before.map(\.cpuMilliseconds)),
+            String(describing: after.map(\.cpuMilliseconds))
+        )
+        XCTAssertGreaterThan(wallImprovement, 5,
+                             "empty-ledger heartbeat must improve wall time by >5%")
+        XCTAssertGreaterThan(cpuImprovement, 5,
+                             "removing real ps child work must improve CPU by >5%")
+    }
+
+    /// Regression bound for the non-empty path: the ownership preflight adds one
+    /// JSON decode before the unchanged real `/bin/ps`. It must stay below the 5%
+    /// qualification threshold at both one row and the 256-row downgrade ceiling.
+    func test_microbench_nonEmptyOwnershipPreflight_staysBelowNoiseThreshold() throws {
+        let warmup = 2
+        let samples = 7
+        let ticksPerSample = 4
+
+        for tagCount in [1, ProviderProcessOwnershipStore.downgradeSafeRecordCeiling] {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("heartbeat-owned-preflight-\(tagCount)-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let store = ProviderProcessOwnershipStore(fileURL: directory.appendingPathComponent("ownership.json"))
+            let tags = (0..<tagCount).map { offset in
+                SpawnedProcessTag(
+                    pgid: pid_t(1_500_000_000 + offset),
+                    spawnedAt: Date(timeIntervalSince1970: Double(1_000 + offset)),
+                    provider: .codex
+                )
+            }
+            try store.replace(tags)
+
+            func measure(preflight: Bool) throws -> HeartbeatSample {
+                let executions = LockedCounter()
+                let realPS: ProviderProcessList = {
+                    executions.increment()
+                    return try ProviderProcessSweeper.psRowsThrowing()
+                }
+                let cpuStart = processAndChildrenCPUSeconds()
+                let wallStart = DispatchTime.now().uptimeNanoseconds
+                for _ in 0..<ticksPerSample {
+                    if preflight {
+                        _ = try ProviderProcessSweeper.persistedOwnershipRows(
+                            store: store,
+                            processList: realPS
+                        )
+                    } else {
+                        _ = try realPS()
+                    }
+                }
+                let wallEnd = DispatchTime.now().uptimeNanoseconds
+                let cpuEnd = processAndChildrenCPUSeconds()
+                return HeartbeatSample(
+                    wallMilliseconds: Double(wallEnd - wallStart) / 1_000_000,
+                    cpuMilliseconds: (cpuEnd - cpuStart) * 1_000,
+                    psExecutions: executions.read(),
+                    scans: [],
+                    sweeps: [],
+                    ledger: try store.load()
+                )
+            }
+
+            for _ in 0..<warmup {
+                _ = try measure(preflight: false)
+                _ = try measure(preflight: true)
+            }
+            var before: [HeartbeatSample] = []
+            var after: [HeartbeatSample] = []
+            for sampleIndex in 0..<samples {
+                if sampleIndex.isMultiple(of: 2) {
+                    before.append(try measure(preflight: false))
+                    after.append(try measure(preflight: true))
+                } else {
+                    after.append(try measure(preflight: true))
+                    before.append(try measure(preflight: false))
+                }
+            }
+
+            let beforeWall = median(before.map(\.wallMilliseconds))
+            let afterWall = median(after.map(\.wallMilliseconds))
+            let beforeCPU = median(before.map(\.cpuMilliseconds))
+            let afterCPU = median(after.map(\.cpuMilliseconds))
+            let wallRegression = (afterWall - beforeWall) / beforeWall * 100
+            let cpuRegression = beforeCPU > 0 ? (afterCPU - beforeCPU) / beforeCPU * 100 : 0
+
+            XCTAssertTrue((before + after).allSatisfy {
+                $0.psExecutions == ticksPerSample && $0.ledger == tags
+            }, "non-empty A/B must preserve one real ps per tick and the exact ledger")
+            NSLog(
+                "[perf-proof] nonEmptyOwnershipPreflight tags=%d ticks=%d baseline_ps=%d optimized_ps=%d baseline_wall_ms=%@ optimized_wall_ms=%@ wall_regression_pct=%.2f baseline_cpu_ms=%@ optimized_cpu_ms=%@ cpu_regression_pct=%.2f before_wall=%@ after_wall=%@ before_cpu=%@ after_cpu=%@",
+                tagCount, ticksPerSample, ticksPerSample, ticksPerSample,
+                String(beforeWall), String(afterWall), wallRegression,
+                String(beforeCPU), String(afterCPU), cpuRegression,
+                String(describing: before.map(\.wallMilliseconds)),
+                String(describing: after.map(\.wallMilliseconds)),
+                String(describing: before.map(\.cpuMilliseconds)),
+                String(describing: after.map(\.cpuMilliseconds))
+            )
+            XCTAssertLessThan(wallRegression, 5,
+                              "non-empty ownership preflight must stay below 5% wall regression")
+            XCTAssertLessThan(cpuRegression, 5,
+                              "non-empty ownership preflight must stay below 5% CPU regression")
+        }
+    }
+
     /// Same-process A/B of the pre-checkpoint eager enumeration and production's
     /// lazy sweep. Primary metric: wall time for live exact current-owner rows;
     /// process CPU is reported as a corroborating metric (warmup=2, n=7).

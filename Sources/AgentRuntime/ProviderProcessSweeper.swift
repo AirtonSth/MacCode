@@ -284,6 +284,17 @@ public enum ProviderProcessSweeper {
         )
     }
 
+    /// Loads the process table only when durable ownership can make its rows
+    /// observable to managed telemetry or orphan cleanup. Command text alone
+    /// never grants ownership, so an empty ledger has an exact empty result.
+    public static func persistedOwnershipRows(
+        store: ProviderProcessOwnershipStore,
+        processList: ProviderProcessList = { try ProviderProcessSweeper.psRowsThrowing() }
+    ) throws -> [ProviderRuntimeProcess] {
+        guard !(try store.load()).isEmpty else { return [] }
+        return try processList()
+    }
+
     public static func psRowsThrowing() throws -> [ProviderRuntimeProcess] {
         let process = Process()
         let output = Pipe()

@@ -670,6 +670,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
+    /// Periodic telemetry can only observe processes backed by durable ownership.
+    /// Termination is intentionally different: it samples the post-sweep table
+    /// directly so shutdown diagnostics retain their established ordering.
+    nonisolated static func providerProcessListForDiagnostics(
+        reason: String,
+        store: ProviderProcessOwnershipStore?,
+        processList: @escaping ProviderProcessList
+    ) -> ProviderProcessList {
+        guard reason != "will_terminate" else { return processList }
+        guard let store else { return { [] } }
+        return {
+            try ProviderProcessSweeper.persistedOwnershipRows(
+                store: store,
+                processList: processList
+            )
+        }
+    }
+
     private func logDiagnosticsHeartbeat(reason: String) {
         // Periodic heartbeats must never block MainActor on process scans or
         // SIGTERM grace sleeps — that freezes the whole UI every 60s once orphans
@@ -678,10 +696,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         if reason == "will_terminate" {
             // Termination telemetry runs after the blocking reaper and must read
             // the post-sweep table rather than reuse its pre-signal snapshot.
-            processList = { try ProviderProcessSweeper.psRowsThrowing() }
+            processList = Self.providerProcessListForDiagnostics(
+                reason: reason,
+                store: ProviderProcessOwnership.shared.store(),
+                processList: { try ProviderProcessSweeper.psRowsThrowing() }
+            )
             reconcilePersistedProcessOwnership(reason: reason)
         } else {
-            let snapshot = ProviderProcessListSnapshot()
+            let persistedOwnershipProcessList = Self.providerProcessListForDiagnostics(
+                reason: reason,
+                store: ProviderProcessOwnership.shared.store(),
+                processList: { try ProviderProcessSweeper.psRowsThrowing() }
+            )
+            let snapshot = ProviderProcessListSnapshot(loader: persistedOwnershipProcessList)
             let sweepDecision = scheduleOrphanRuntimeSweep(
                 reason: reason,
                 processSnapshot: snapshot
@@ -691,7 +718,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 // delayed sweep from acting on rows captured earlier by telemetry.
                 processList = { try snapshot.rowsAfterSweepLoad() }
             } else {
-                processList = { try ProviderProcessSweeper.psRowsThrowing() }
+                processList = persistedOwnershipProcessList
             }
         }
         AppDiagnostics.heartbeat(

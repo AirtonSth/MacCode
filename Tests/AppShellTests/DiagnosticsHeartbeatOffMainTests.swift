@@ -22,6 +22,23 @@ import CoreModel
 ///        and completion must clear the latch so a later heartbeat can scan.
 final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
 
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        func increment() {
+            lock.lock()
+            value += 1
+            lock.unlock()
+        }
+
+        func read() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     private let eightGiB = UInt64(8) * 1_024 * 1_024 * 1_024
 
     // MARK: - R1: pure helper is callable without actor context
@@ -108,6 +125,45 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
 
         XCTAssertEqual(AppDiagnostics.beginProviderScanForTests(), .start,
             "after the detached scan completes, a later heartbeat must be allowed to scan again")
+    }
+
+    func test_processListPolicySkipsOnlyPeriodicEmptyOwnership() throws {
+        // WHY: idle periodic heartbeats may skip an unobservable process table,
+        // but non-empty ownership needs RSS/orphan rows and termination telemetry
+        // intentionally reads the post-sweep table even when the ledger drained.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("heartbeat-process-policy-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProviderProcessOwnershipStore(fileURL: directory.appendingPathComponent("ownership.json"))
+        try store.replace([])
+        let loads = LockedCounter()
+        let expected = [ProviderRuntimeProcess(pid: 901, ppid: 1, rssKB: 64, command: "/opt/codex")]
+        let realList: ProviderProcessList = {
+            loads.increment()
+            return expected
+        }
+
+        let periodic = AppDelegate.providerProcessListForDiagnostics(
+            reason: "periodic",
+            store: store,
+            processList: realList
+        )
+        XCTAssertEqual(try periodic(), [])
+        XCTAssertEqual(loads.read(), 0, "empty periodic ownership must avoid process enumeration")
+
+        try store.replace([SpawnedProcessTag(pgid: 901, spawnedAt: Date(), provider: .codex)])
+        XCTAssertEqual(try periodic(), expected)
+        XCTAssertEqual(loads.read(), 1, "the same periodic path must enumerate once after ownership appears")
+
+        try store.replace([])
+        let terminating = AppDelegate.providerProcessListForDiagnostics(
+            reason: "will_terminate",
+            store: store,
+            processList: realList
+        )
+        XCTAssertEqual(try terminating(), expected)
+        XCTAssertEqual(loads.read(), 2, "will_terminate must preserve the direct post-sweep process scan")
     }
 
     func test_lowMemoryProfileBoundsProvidersSidecarQueueAndIdleRelease() {

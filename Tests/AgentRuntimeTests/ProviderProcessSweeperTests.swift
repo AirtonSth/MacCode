@@ -79,6 +79,140 @@ final class ProviderProcessSweeperTests: XCTestCase {
                        "telemetry must retain its independent retry after a transient sweep ps failure")
     }
 
+    func test_persistedOwnershipRowsSkipsProcessListWhenLedgerIsEmpty() throws {
+        // WHY: an empty ownership ledger is authoritative: command text never
+        // grants ownership. Launching /bin/ps in this state can only produce rows
+        // that the managed scan will discard, adding idle CPU once per heartbeat.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("heartbeat-empty-ledger-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProviderProcessOwnershipStore(fileURL: directory.appendingPathComponent("ownership.json"))
+        try store.replace([])
+        let loads = LockedCounter()
+
+        let rows = try ProviderProcessSweeper.persistedOwnershipRows(store: store) {
+            loads.increment()
+            return [ProviderRuntimeProcess(pid: 901, ppid: 1, rssKB: 64, command: "/opt/codex")]
+        }
+
+        XCTAssertEqual(rows, [], "zero durable ownership must yield the same complete empty telemetry input")
+        XCTAssertEqual(loads.read(), 0, "an empty ledger must not execute the process-list provider")
+    }
+
+    func test_persistedOwnershipRowsListsProcessesWhenLedgerIsNonEmpty() throws {
+        // WHY: the fast path must not suppress live provider memory telemetry or
+        // orphan cleanup once any durable ownership row exists.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("heartbeat-owned-ledger-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProviderProcessOwnershipStore(fileURL: directory.appendingPathComponent("ownership.json"))
+        try store.replace([SpawnedProcessTag(pgid: 901, spawnedAt: Date(), provider: .codex)])
+        let loads = LockedCounter()
+        let expected = [ProviderRuntimeProcess(pid: 901, ppid: 1, rssKB: 64, command: "/opt/codex")]
+
+        let rows = try ProviderProcessSweeper.persistedOwnershipRows(store: store) {
+            loads.increment()
+            return expected
+        }
+
+        XCTAssertEqual(rows, expected)
+        XCTAssertEqual(loads.read(), 1, "non-empty ownership must preserve exactly one process-table load")
+    }
+
+    func test_persistedOwnershipRowsFailsClosedOnCorruptLedgerWithoutScanning() throws {
+        // WHY: corrupt ownership is evidence, not an empty all-clear. Preserve the
+        // decode failure and bytes; a speculative process scan cannot restore the
+        // missing lifetime identities and must not change the failure outcome.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("heartbeat-corrupt-ledger-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("ownership.json")
+        let corrupt = Data("{not-json".utf8)
+        try corrupt.write(to: file)
+        let store = ProviderProcessOwnershipStore(fileURL: file)
+        let loads = LockedCounter()
+
+        XCTAssertThrowsError(
+            try ProviderProcessSweeper.persistedOwnershipRows(store: store) {
+                loads.increment()
+                return []
+            }
+        )
+        XCTAssertEqual(loads.read(), 0, "corrupt ownership must fail before an irrelevant process scan")
+        XCTAssertEqual(try Data(contentsOf: file), corrupt, "the fast path must retain corrupt evidence byte-for-byte")
+    }
+
+    func test_persistedOwnershipRowsPreservesSnapshotRetryForNonEmptyLedger() throws {
+        // WHY: the empty-ledger preflight must not consume the telemetry retry
+        // promised after a transient process-list failure for owned runtimes.
+        enum ListFailure: Error { case transient }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("heartbeat-owned-retry-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProviderProcessOwnershipStore(fileURL: directory.appendingPathComponent("ownership.json"))
+        try store.replace([SpawnedProcessTag(pgid: 902, spawnedAt: Date(), provider: .claude)])
+        let loads = LockedCounter()
+        let expected = [ProviderRuntimeProcess(pid: 902, ppid: 1, rssKB: 32, command: "/opt/claude")]
+        let snapshot = ProviderProcessListSnapshot {
+            try ProviderProcessSweeper.persistedOwnershipRows(store: store) {
+                loads.increment()
+                if loads.read() == 1 { throw ListFailure.transient }
+                return expected
+            }
+        }
+
+        XCTAssertThrowsError(try snapshot.rows())
+        XCTAssertEqual(try snapshot.rowsAfterSweepLoad(), expected)
+        XCTAssertEqual(loads.read(), 2, "non-empty ownership must retain the independent telemetry retry")
+    }
+
+    func test_emptyPreflightThenConcurrentAppendRetainsExactCurrentOwner() throws {
+        // WHY: a provider can be tagged after the empty-ledger preflight but
+        // before the sweep reloads ownership. The empty process snapshot must
+        // fail safe: retain that exact current-owner lifetime and never signal it.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("heartbeat-empty-append-race-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProviderProcessOwnershipStore(fileURL: directory.appendingPathComponent("ownership.json"))
+        try store.replace([])
+        let loads = LockedCounter()
+        let preflightRows = try ProviderProcessSweeper.persistedOwnershipRows(store: store) {
+            loads.increment()
+            return try ProviderProcessSweeper.psRowsThrowing()
+        }
+        XCTAssertEqual(loads.read(), 0)
+
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let identity = try XCTUnwrap(ProviderProcessStartIdentity.read(pid: currentPID))
+        let tag = SpawnedProcessTag(
+            pgid: currentPID,
+            spawnedAt: Date(),
+            ownerPID: currentPID,
+            ownerStartIdentity: identity,
+            provider: .codex,
+            managedKind: .provider,
+            executablePath: "/current-process",
+            startIdentity: identity,
+            isolatedProcessGroup: currentPID
+        )
+        try store.append(tag)
+
+        let result = try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(
+            currentPID: currentPID,
+            minAge: 0,
+            store: store,
+            processList: { preflightRows }
+        )
+
+        XCTAssertEqual(result, ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: []))
+        XCTAssertEqual(try store.load(), [tag], "the concurrent lifetime must retain its ownership for the next scan")
+    }
+
     func test_sharedSnapshotPreservesTelemetrySweepAndLedgerWhileHalvingLoads() throws {
         // WHY: sharing is valid only if it removes enumeration work without
         // changing either heartbeat accounting or ownership retention.
