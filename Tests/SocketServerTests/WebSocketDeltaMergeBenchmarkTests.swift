@@ -135,6 +135,128 @@ final class WebSocketDeltaMergeBenchmarkTests: XCTestCase {
         }
     }
 
+    func test_pressureCoalescerCountsLinearWorkPerDeltaKey() throws {
+        // WHY: degrade runs only after the outbound queue is already under
+        // pressure; repeated parse/encode of a growing delta frame amplifies
+        // that pressure and must remain bounded to linear work.
+        let workload = Workload(name: "pressure-contract", frameCount: 8, tokenBytes: 24, burstsPerSample: 1)
+        let frames = try makeFrames(workload)
+        let legacyWork = WorkCounter()
+        let legacy = legacyPressureCoalesce(frames, work: legacyWork)
+        let linearWork = WorkCounter()
+        let linear = WebSocketOutboundQueue.coalesceApplicationFrames(
+            frames,
+            onParse: { linearWork.parses += 1 },
+            onEncode: { linearWork.encodes += 1 }
+        )
+
+        XCTAssertEqual(linear.count, 1)
+        XCTAssertEqual(legacy.count, 1)
+        XCTAssertEqual(try canonicalJSON(XCTUnwrap(linear.first)), try canonicalJSON(XCTUnwrap(legacy.first)))
+        XCTAssertEqual(legacyWork.parses, 3 * workload.frameCount - 2)
+        XCTAssertEqual(legacyWork.encodes, workload.frameCount - 1)
+        XCTAssertEqual(linearWork.parses, 2 * workload.frameCount)
+        XCTAssertEqual(linearWork.encodes, 1)
+    }
+
+    func test_pressureCoalescerBenchmark() throws {
+        guard ProcessInfo.processInfo.environment["SWIFT_DETERMINISTIC_HASHING"] == "1" else {
+            throw XCTSkip("raw wire-byte comparison requires SWIFT_DETERMINISTIC_HASHING=1")
+        }
+        let workload = Workload(name: "pressure-realistic", frameCount: 64, tokenBytes: 24, burstsPerSample: 30)
+        let frames = try makeFrames(workload)
+        let legacyWork = WorkCounter()
+        let legacyOutput = legacyPressureCoalesce(frames, work: legacyWork)
+        let linearWork = WorkCounter()
+        let linearOutput = WebSocketOutboundQueue.coalesceApplicationFrames(
+            frames,
+            onParse: { linearWork.parses += 1 },
+            onEncode: { linearWork.encodes += 1 }
+        )
+        let legacyFrame = try XCTUnwrap(legacyOutput.first)
+        let linearFrame = try XCTUnwrap(linearOutput.first)
+
+        XCTAssertEqual(linearOutput, legacyOutput, "optimized pressure-coalesced wire bytes must match the legacy fold")
+        XCTAssertEqual(linearOutput.count, 1)
+        XCTAssertEqual(legacyWork.parses, 3 * workload.frameCount - 2)
+        XCTAssertEqual(legacyWork.encodes, workload.frameCount - 1)
+        XCTAssertEqual(linearWork.parses, 2 * workload.frameCount)
+        XCTAssertEqual(linearWork.encodes, 1)
+
+        for _ in 0..<2 {
+            _ = runLegacyPressureBursts(frames: frames, count: workload.burstsPerSample)
+            _ = runLinearPressureBursts(frames: frames, count: workload.burstsPerSample)
+        }
+
+        var legacyWallSamples: [Double] = []
+        var legacyCPUSamples: [Double] = []
+        var linearWallSamples: [Double] = []
+        var linearCPUSamples: [Double] = []
+        for sample in 1...7 {
+            let legacyMeasurement: (wallMilliseconds: Double, cpuMilliseconds: Double, checksum: UInt64)
+            let linearMeasurement: (wallMilliseconds: Double, cpuMilliseconds: Double, checksum: UInt64)
+            if sample.isMultiple(of: 2) {
+                linearMeasurement = measure {
+                    runLinearPressureBursts(frames: frames, count: workload.burstsPerSample)
+                }
+                legacyMeasurement = measure {
+                    runLegacyPressureBursts(frames: frames, count: workload.burstsPerSample)
+                }
+            } else {
+                legacyMeasurement = measure {
+                    runLegacyPressureBursts(frames: frames, count: workload.burstsPerSample)
+                }
+                linearMeasurement = measure {
+                    runLinearPressureBursts(frames: frames, count: workload.burstsPerSample)
+                }
+            }
+            legacyWallSamples.append(legacyMeasurement.wallMilliseconds)
+            legacyCPUSamples.append(legacyMeasurement.cpuMilliseconds)
+            linearWallSamples.append(linearMeasurement.wallMilliseconds)
+            linearCPUSamples.append(linearMeasurement.cpuMilliseconds)
+            printSample(
+                phase: "legacy-pressure",
+                workload: workload,
+                sample: sample,
+                measurement: legacyMeasurement,
+                frames: frames,
+                output: legacyFrame,
+                work: legacyWork
+            )
+            printSample(
+                phase: "optimized-pressure",
+                workload: workload,
+                sample: sample,
+                measurement: linearMeasurement,
+                frames: frames,
+                output: linearFrame,
+                work: linearWork
+            )
+        }
+
+        let legacyWall = median(legacyWallSamples)
+        let linearWall = median(linearWallSamples)
+        let legacyCPU = median(legacyCPUSamples)
+        let linearCPU = median(linearCPUSamples)
+        let wallImprovement = (legacyWall - linearWall) / legacyWall * 100
+        let cpuImprovement = (legacyCPU - linearCPU) / legacyCPU * 100
+        print(
+            "WS_PRESSURE_COALESCE_BENCH_SUMMARY workload=\(workload.name) "
+                + "legacy_wall_samples_ms=\(formatted(legacyWallSamples)) "
+                + "optimized_wall_samples_ms=\(formatted(linearWallSamples)) "
+                + "legacy_wall_median_ms=\(format(legacyWall)) "
+                + "optimized_wall_median_ms=\(format(linearWall)) "
+                + "wall_improvement_pct=\(format(wallImprovement)) "
+                + "legacy_cpu_samples_ms=\(formatted(legacyCPUSamples)) "
+                + "optimized_cpu_samples_ms=\(formatted(linearCPUSamples)) "
+                + "legacy_cpu_median_ms=\(format(legacyCPU)) "
+                + "optimized_cpu_median_ms=\(format(linearCPU)) "
+                + "cpu_improvement_pct=\(format(cpuImprovement))"
+        )
+        XCTAssertGreaterThan(wallImprovement, 5, "wall-time gain must clear the qualification gate")
+        XCTAssertGreaterThan(cpuImprovement, 5, "CPU gain must clear the qualification gate")
+    }
+
     private func instrumentedLinearMerge(
         _ frames: [Data],
         work: WorkCounter
@@ -162,6 +284,26 @@ final class WebSocketDeltaMergeBenchmarkTests: XCTestCase {
             let merged = legacyMergeInOrder(frames)
             checksum &+= UInt64(merged.first?.count ?? 0)
             checksum &+= UInt64(max(0, frames.count - merged.count))
+        }
+        return checksum
+    }
+
+    private func runLinearPressureBursts(frames: [Data], count: Int) -> UInt64 {
+        var checksum: UInt64 = 0
+        for _ in 0..<count {
+            let coalesced = WebSocketOutboundQueue.coalesceApplicationFrames(frames)
+            checksum &+= UInt64(coalesced.first?.count ?? 0)
+            checksum &+= UInt64(max(0, frames.count - coalesced.count))
+        }
+        return checksum
+    }
+
+    private func runLegacyPressureBursts(frames: [Data], count: Int) -> UInt64 {
+        var checksum: UInt64 = 0
+        for _ in 0..<count {
+            let coalesced = legacyPressureCoalesce(frames)
+            checksum &+= UInt64(coalesced.first?.count ?? 0)
+            checksum &+= UInt64(max(0, frames.count - coalesced.count))
         }
         return checksum
     }
@@ -238,6 +380,49 @@ final class WebSocketDeltaMergeBenchmarkTests: XCTestCase {
         return result
     }
 
+    private func legacyPressureCoalesce(
+        _ frames: [Data],
+        work: WorkCounter? = nil
+    ) -> [Data] {
+        guard !frames.isEmpty else { return [] }
+        var result: [Data] = []
+        var keySlots: [String: Int] = [:]
+
+        for frame in frames {
+            work?.parses += 1
+            guard let key = WebSocketOutboundQueue.coalescingKey(for: frame) else {
+                result.append(frame)
+                continue
+            }
+            if let index = keySlots[key] {
+                if key.hasPrefix("agent.item.delta:") {
+                    let merged: Data?
+                    if let work {
+                        merged = WebSocketEventBatcher.mergeAgentItemDeltaFrames(
+                            result[index],
+                            frame,
+                            onParse: { work.parses += 1 },
+                            onEncode: { work.encodes += 1 }
+                        )
+                    } else {
+                        merged = WebSocketEventBatcher.mergeAgentItemDeltaFrames(result[index], frame)
+                    }
+                    if let merged {
+                        result[index] = merged
+                    } else {
+                        result[index] = frame
+                    }
+                } else {
+                    result[index] = frame
+                }
+            } else {
+                keySlots[key] = result.count
+                result.append(frame)
+            }
+        }
+        return result
+    }
+
     private func canonicalJSON(_ data: Data) throws -> Data {
         let object = try JSONSerialization.jsonObject(with: data)
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
@@ -289,6 +474,10 @@ final class WebSocketDeltaMergeBenchmarkTests: XCTestCase {
 
     private func format(_ value: Double) -> String {
         String(format: "%.3f", value)
+    }
+
+    private func formatted(_ values: [Double]) -> String {
+        "[" + values.map(format).joined(separator: ",") + "]"
     }
 
     private func fnv1a64(_ data: Data) -> UInt64 {
