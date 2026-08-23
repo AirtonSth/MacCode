@@ -184,6 +184,11 @@ public enum ManagedProviderAdmissionError: Error, LocalizedError, Sendable, Equa
 }
 
 public enum ManagedProviderAdmissionPolicy {
+    /// Starts are unconditionally user-controlled, so sampling the complete
+    /// process table before every provider launch cannot affect the decision.
+    /// Periodic diagnostics continue to collect the same telemetry off-path.
+    public static let requiresProviderStartPreflight = false
+
     /// Provider starts are user-controlled. Resource ceilings, session counts,
     /// incomplete process scans, and unknown memory samples must never refuse a
     /// start — they remain available only as telemetry enums for diagnostics.

@@ -602,6 +602,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func configureManagedProviderAdmission() {
+        guard ManagedProviderAdmissionPolicy.requiresProviderStartPreflight else {
+            return
+        }
         let profile = managedProcessMemoryProfile
         let gate = ManagedProviderAdmissionGate()
         // Best-effort accounting only: never refuse a user-started provider for

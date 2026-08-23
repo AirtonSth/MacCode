@@ -181,6 +181,11 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
     func test_providerAdmissionNeverBlocksUserStarts() {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
 
+        XCTAssertFalse(
+            ManagedProviderAdmissionPolicy.requiresProviderStartPreflight,
+            "an always-admit policy must not put ledger decode, /bin/ps, and footprint sampling on every provider start"
+        )
+
         XCTAssertEqual(
             ManagedProviderAdmissionPolicy.decide(
                 profile: profile,
@@ -216,6 +221,81 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
             ),
             .admit,
             "session/memory knobs are telemetry only — user controls concurrency"
+        )
+    }
+
+    /// Same-process A/B of the previous production preflight and the no-op
+    /// provider-start check. Primary metric: wall time for 10 sequential starts
+    /// (warmup=2, n=5); the legacy arm performs a real ledger load, /bin/ps and
+    /// Mach footprint sample on every iteration.
+    func test_microbench_alwaysAdmit_skipsProviderStartProcessScan() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc2-admission-perf-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProviderProcessOwnershipStore(fileURL: directory.appendingPathComponent("ownership.json"))
+        try store.replace([])
+
+        let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
+        let startsPerSample = 10
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            values.sorted()[values.count / 2]
+        }
+
+        func timeLegacyPreflight() async throws -> Double {
+            let gate = ManagedProviderAdmissionGate()
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<startsPerSample {
+                let (scan, footprintKB) = try await Task.detached(priority: .userInitiated) {
+                    let scan = try ProviderProcessSweeper.managedProcessScan(store: store)
+                    let footprint = AppDiagnostics.currentProcessFootprintKB()
+                    return (scan, footprint >= 0 ? footprint : nil)
+                }.value
+                let decision = await gate.decide(
+                    profile: profile,
+                    scan: scan,
+                    appFootprintKB: footprintKB,
+                    key: ManagedProviderAdmissionKey(provider: .claude, threadId: AgentThreadID())
+                )
+                XCTAssertEqual(decision, .admit)
+            }
+            return Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        }
+
+        func timeNoOpCheck() async throws -> Double {
+            let check: @Sendable (AgentProvider, AgentThreadID) async throws -> Void = { _, _ in }
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<startsPerSample {
+                try await check(.claude, AgentThreadID())
+            }
+            return Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        }
+
+        for _ in 0..<warmup {
+            _ = try await timeLegacyPreflight()
+            _ = try await timeNoOpCheck()
+        }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(try await timeLegacyPreflight())
+            after.append(try await timeNoOpCheck())
+        }
+        let beforeMedian = median(before)
+        let afterMedian = median(after)
+        let improvement = (beforeMedian - afterMedian) / beforeMedian * 100
+        NSLog(
+            "[perf-proof] providerAdmission process_scan_ms=%@ noop_ms=%@ improvement_pct=%.2f before=%@ after=%@ starts=%d ps_per_start_before=1 ps_per_start_after=0",
+            String(beforeMedian), String(afterMedian), improvement,
+            String(describing: before), String(describing: after), startsPerSample
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5,
+            "always-admit startup must avoid the real process scan by at least 5%"
         )
     }
 
