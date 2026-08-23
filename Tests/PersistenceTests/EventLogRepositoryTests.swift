@@ -60,6 +60,59 @@ final class EventLogRepositoryTests: XCTestCase {
         XCTAssertEqual(all.last?.seq, 5000, "cap must retain the newest row")
     }
 
+    /// WHY: migrations and rolled-back inserts can leave gaps in the AUTOINCREMENT
+    /// key. Retention must delete the exact excess, not infer occupancy from
+    /// `MAX(id)`, or the replay window shrinks below its documented capacity.
+    func test_T009_append_capRetainsExactNewestRowsAcrossIDGaps() throws {
+        let db = try makeDB()
+        let repo = EventLogRepository(db: db)
+        for id in 1...5 {
+            let insert = try db.prepare("""
+                INSERT INTO events(id, seq, kind, request_id, origin_client_id, payload_json, created_at)
+                VALUES(?, ?, 'test', NULL, NULL, '{}', '2026-08-23T00:00:00Z');
+            """)
+            try insert.bind(1, Int64(id))
+            try insert.bind(2, Int64(id))
+            _ = try insert.step()
+        }
+        try db.execute("DELETE FROM events WHERE id = 4;")
+        db.rememberEventRowCount(4)
+
+        try db.performSync { database in
+            try database.transaction {
+                let insert = try database.prepare("""
+                    INSERT INTO events(seq, kind, request_id, origin_client_id, payload_json, created_at)
+                    VALUES(6, 'test', NULL, NULL, '{}', '2026-08-23T00:00:00Z');
+                """)
+                _ = try insert.step()
+                database.noteEventRowsInserted(1)
+                try EventRetentionPolicy.prune(db: database, cap: 4)
+            }
+        }
+        XCTAssertEqual(
+            try repo.read(since: -1, limit: 10).map(\.seq),
+            [2, 3, 5, 6],
+            "a gapped primary key must still retain exactly the newest four events"
+        )
+
+        try db.performSync { database in
+            try database.transaction {
+                let insert = try database.prepare("""
+                    INSERT INTO events(seq, kind, request_id, origin_client_id, payload_json, created_at)
+                    VALUES(7, 'test', NULL, NULL, '{}', '2026-08-23T00:00:00Z');
+                """)
+                _ = try insert.step()
+                database.noteEventRowsInserted(1)
+                try EventRetentionPolicy.prune(db: database, cap: 4)
+            }
+        }
+        XCTAssertEqual(
+            try repo.read(since: -1, limit: 10).map(\.seq),
+            [3, 5, 6, 7],
+            "the occupancy cache must remain exact after pruning a gapped table"
+        )
+    }
+
     // MARK: - T009b: hard cap — no transient overflow
 
     /// WHY: no append may leave a transient state above the documented cap.

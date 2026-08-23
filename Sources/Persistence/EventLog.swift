@@ -28,11 +28,24 @@ enum EventRetentionPolicy {
             db.rememberEventRowCount(rows)
         }
         guard rows > Int64(boundedCap) else { return }
-        let deleteEvents = try db.prepare("""
-            DELETE FROM events
-            WHERE id <= (SELECT MAX(id) FROM events) - ?;
-        """)
-        try deleteEvents.bind(1, Int64(boundedCap))
+        let excess = rows - Int64(boundedCap)
+        let deleteEvents: SQLiteStatement
+        if excess == 1 {
+            // The steady-state capped path appends one row at a time. MIN(id)
+            // lets SQLite seek and delete that row directly without building a
+            // temporary IN result, while remaining correct across id gaps.
+            deleteEvents = try db.prepare("""
+                DELETE FROM events WHERE id = (SELECT MIN(id) FROM events);
+            """)
+        } else {
+            deleteEvents = try db.prepare("""
+                DELETE FROM events
+                WHERE id IN (
+                    SELECT id FROM events ORDER BY id ASC LIMIT ?
+                );
+            """)
+            try deleteEvents.bind(1, excess)
+        }
         _ = try deleteEvents.step()
         let deleteOrphanedReceiptLinks = try db.prepare("""
             DELETE FROM command_receipt_events
