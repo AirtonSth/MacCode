@@ -5675,6 +5675,9 @@ public final class AppContext {
     public func wireBackgroundPersister(eventBus: EventBus = .shared) {
         let log = eventLog
         let queue = backgroundWriterQueue
+        eventBus.persistenceCommitFence = {
+            queue.sync {}
+        }
         eventBus.persister = { ev in
             guard AppDelegate.shouldPersistEvent(ev) else { return }
             queue.async {

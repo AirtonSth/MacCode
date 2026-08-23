@@ -120,6 +120,10 @@ public final class EventBus: @unchecked Sendable {
     private var clock: @Sendable () -> Date
 
     public var persister: ((Event) -> Void)?
+    /// Optional durability fence for persisters that submit work asynchronously.
+    /// `commitPersistedEvents` invokes it from the serialized delivery lane so a
+    /// receipt cannot physically overtake an earlier normal event.
+    public var persistenceCommitFence: (() -> Void)?
     public var shouldRetainRecentEvent: ((Event) -> Bool)?
 
     // PERF: EventLog persisters encode payload on every retained publish.
@@ -230,6 +234,11 @@ public final class EventBus: @unchecked Sendable {
     ) throws -> [Event] {
         precondition(DispatchQueue.getSpecific(key: deliveryQueueKey) == nil)
         return try deliveryQueue.sync {
+            let fence: (() -> Void)?
+            lock.lock()
+            fence = persistenceCommitFence
+            lock.unlock()
+            fence?()
             snapshotBarrierLock.lock()
             let floor: Int64
             lock.lock()

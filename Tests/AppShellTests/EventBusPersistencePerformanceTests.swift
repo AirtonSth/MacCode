@@ -4,6 +4,23 @@ import CoreModel
 import SocketServer
 
 final class EventBusPersistencePerformanceTests: XCTestCase {
+    private final class ErrorBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Error?
+
+        func store(_ error: Error) {
+            lock.lock()
+            value = error
+            lock.unlock()
+        }
+
+        func load() -> Error? {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     private struct TimedSample {
         let producerWallNanoseconds: UInt64
         let durableWallNanoseconds: UInt64
@@ -70,6 +87,80 @@ final class EventBusPersistencePerformanceTests: XCTestCase {
         XCTAssertEqual(rows.map(\.kind), Array(repeating: "agent.run.started", count: payloads.count))
         XCTAssertEqual(rows.map(\.payloadJSON), payloads.map(EventBus.encodePayloadForPersistence),
             "the lifecycle flush must make every queued payload durable without reordering")
+    }
+
+    @MainActor
+    func test_persistedReceiptWaitsForEarlierBackgroundEventWrite() throws {
+        // WHY: command receipts write their events synchronously. If they can
+        // pass an earlier normal event queued by the background persister, the
+        // physical retention order diverges from EventBus sequence order.
+        let context = try makeContext(label: "receipt-fence")
+        let eventBus = EventBus(recentLimit: 0, recentByteLimit: 0)
+        let writerEntered = expectation(description: "serial writer blocked before normal event")
+        let commitReturned = DispatchSemaphore(value: 0)
+        let releaseWriter = DispatchSemaphore(value: 0)
+        let commitError = ErrorBox()
+        let eventLog = context.eventLog
+        let database = context.db
+
+        context.backgroundWriterQueue.async {
+            writerEntered.fulfill()
+            releaseWriter.wait()
+        }
+        wait(for: [writerEntered], timeout: 2)
+        defer { releaseWriter.signal() }
+
+        AppDelegate.wireEventPersistence(context: context, eventBus: eventBus)
+        eventBus.publish(kind: "agent.run.started", payload: .string("normal"))
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                _ = try eventBus.commitPersistedEvents { floor in
+                    let durableBeforeReceipt = try eventLog.read(since: -1, limit: 10)
+                    guard durableBeforeReceipt.map(\.seq) == [floor] else {
+                        throw NSError(
+                            domain: "EventBusPersistencePerformanceTests",
+                            code: 1,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "receipt commit overtook the earlier normal event"]
+                        )
+                    }
+                    let receipt = EventBus.Event(
+                        seq: floor + 1,
+                        kind: "command.receipt",
+                        payload: .string("receipt"),
+                        ts: 0
+                    )
+                    try eventLog.append(
+                        seq: receipt.seq,
+                        kind: receipt.kind,
+                        payloadJSON: EventBus.encodePayloadForPersistence(receipt.payload)
+                    )
+                    return [receipt]
+                }
+            } catch {
+                commitError.store(error)
+            }
+            commitReturned.signal()
+        }
+
+        XCTAssertEqual(
+            commitReturned.wait(timeout: .now() + 0.05),
+            .timedOut,
+            "the receipt must not pass an earlier event whose writer is blocked"
+        )
+        releaseWriter.signal()
+        XCTAssertEqual(commitReturned.wait(timeout: .now() + 2), .success)
+        XCTAssertNil(commitError.load())
+
+        let physicalOrder = try database.performSync { sqlite -> [Int64] in
+            let statement = try sqlite.prepare("SELECT seq FROM events ORDER BY id ASC;")
+            var sequences: [Int64] = []
+            while try statement.step() { sequences.append(statement.columnInt64(0)) }
+            return sequences
+        }
+        XCTAssertEqual(physicalOrder, [1, 2],
+            "physical retention order must match EventBus sequence order")
     }
 
     @MainActor
