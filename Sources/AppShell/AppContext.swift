@@ -1999,13 +1999,6 @@ public final class AppContext {
                 )
             }
             do {
-                try installer.installMacOSHarness()
-            } catch {
-                NSLog(
-                    "RemoteCode: installMacOSHarness before agent turn failed: \(error.localizedDescription)"
-                )
-            }
-            do {
                 try installer.installBotSelfConfigMCP()
             } catch {
                 NSLog(
@@ -2107,6 +2100,7 @@ public final class AppContext {
     ) -> [String: String] {
         let thread = try? threadRepo.get(id: threadId)
         var environment = baseEnvironment
+        environment.removeValue(forKey: AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey)
         environment.merge([
             "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": appSupportDirectory.path,
             "RC_REMOTE_CODE_SUBAGENT_THREAD_ID": threadId.value.uuidString,
@@ -2119,6 +2113,15 @@ public final class AppContext {
         if let conversation = try? botStore.conversationLinked(to: threadId) {
             environment[BotSelfConfigCatalog.callerEnvironmentKey] =
                 conversation.botID.value.uuidString.lowercased()
+            if let bot = try? botStore.get(id: conversation.botID),
+               let revisionID = bot.currentRevisionID,
+               let revision = try? botStore.getRevision(id: revisionID) {
+                if revision.desktopKind == .logicalExecutionSpace {
+                    // This is a per-run admission signal. Provider-global MCP
+                    // config must never make Docker/VM/remote runs host-capable.
+                    environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] = "1"
+                }
+            }
         }
         let installer = makeAgentSkillInstaller()
         // Nested launches inherit managed bin; keep distill healthy whenever Token
@@ -2131,13 +2134,6 @@ public final class AppContext {
                     "RemoteCode: ensureDistillCLI before subagent env failed: \(error.localizedDescription)"
                 )
             }
-        }
-        do {
-            try installer.installMacOSHarness()
-        } catch {
-            NSLog(
-                "RemoteCode: installMacOSHarness before subagent env failed: \(error.localizedDescription)"
-            )
         }
         do {
             try installer.installBotSelfConfigMCP()
@@ -2714,9 +2710,16 @@ public final class AppContext {
     func reconcileComputerUseMCP() {
         let installer = makeAgentSkillInstaller()
         do {
-            try installer.installMacOSHarness()
+            try installer.uninstallLegacyExternalHostArtifacts()
         } catch {
-            NSLog("RemoteCode: installMacOSHarness failed: \(error.localizedDescription)")
+            NSLog("RemoteCode: legacy external host artifact cleanup failed: \(error.localizedDescription)")
+        }
+        // Remove any pre-native managed host entry once. Runtime admission is
+        // process-local; never re-add this global Claude/Codex configuration.
+        do {
+            try installer.uninstallComputerUseMCP()
+        } catch {
+            NSLog("RemoteCode: legacy computer-use MCP cleanup failed: \(error.localizedDescription)")
         }
         do {
             try installer.installBotSelfConfigMCP()

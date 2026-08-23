@@ -229,8 +229,8 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(browserTools.contains(BotStandingInstructions.getBrowserTool))
         XCTAssertTrue(browserTools.contains(BotStandingInstructions.waitLoginTool))
         XCTAssertTrue(browserTools.contains("teammate's"))
-        XCTAssertTrue(tools.contains(BotStandingInstructions.macosHarnessTool))
-        XCTAssertTrue(tools.contains(BotStandingInstructions.generatedMacOSHarnessLine))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.computerUseObservationTool))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.generatedNativeHostComputerLine))
         XCTAssertFalse(tools.contains("desktop"), "leftover desktop is not a live write")
         XCTAssertTrue(starter.contains(BotStandingInstructions.generatedSignature))
         XCTAssertTrue(BotStandingInstructions.looksGenerated(""))
@@ -291,23 +291,46 @@ final class BotTypesTests: XCTestCase {
         )
         XCTAssertFalse(tools.contains("handle,"), "handle is create-only")
         XCTAssertFalse(tools.contains("or handle"), "handle is create-only")
-        XCTAssertFalse(tools.contains("permission"), "leftover permission is not a live write")
+        XCTAssertFalse(tools.contains("permission_mode"), "retired permission_mode setting is not a live write")
         XCTAssertFalse(tools.contains("desktop"), "leftover desktop is not a live write")
     }
 
-    func test_admittedToolsNameMacOSHarness() {
-        // WHY: bots must drive the Mac through macos-harness on every
-        // provider. Naming remotecode-computer-use would send them back
-        // to the retired MCP.
+    func test_admittedToolsNameNativeHostComputerUse() {
+        // WHY: logical Desktop bots must observe the native host before
+        // mutating it with the capability-specific token, while the starter
+        // soul must not claim these tools.
         let tools = BotStandingInstructions.admittedToolsText
-        XCTAssertTrue(tools.contains(BotStandingInstructions.macosHarnessTool))
-        XCTAssertTrue(tools.contains("mac.see"))
-        XCTAssertTrue(tools.contains("Do not call remotecode-computer-use"))
+        XCTAssertTrue(tools.contains(BotStandingInstructions.generatedNativeHostComputerLine))
+        XCTAssertTrue(tools.contains("first call list_windows to discover the exact target_pid and target_window_id"))
+        XCTAssertTrue(tools.contains("screenshot or zoom for that target"))
+        XCTAssertTrue(tools.contains("pixel state token as expected_state_token"))
+        XCTAssertTrue(tools.contains("doctor or get_ui_tree"))
+        XCTAssertTrue(tools.contains("semantic state token as expected_state_token"))
+        XCTAssertTrue(tools.contains("Before a pixel or coordinate mutation, if its pixel token is stale or the target is minimized/off-screen"))
+        XCTAssertTrue(tools.contains("A semantic AX mutation may proceed in a background or minimized window"))
+        XCTAssertTrue(tools.contains("accessibility permission/capabilities and a fresh semantic token allow it"))
+        XCTAssertTrue(tools.contains("If a token is stale, permissions/capabilities are insufficient"))
+        XCTAssertTrue(tools.contains("must never activate an app"))
+        XCTAssertTrue(tools.contains("focus, raise, maximize, or unminimize"))
+        XCTAssertTrue(tools.contains("move the physical cursor"))
         XCTAssertFalse(
             BotStandingInstructions.fallback(name: "Piper", title: "Scout")
-                .contains(BotStandingInstructions.macosHarnessTool),
-            "tools layer owns macos-harness"
+                .contains(BotStandingInstructions.generatedNativeHostComputerLine),
+            "tools layer owns native host computer-use"
         )
+    }
+
+    func test_guestInstructionsKeepTheirOwnBrowserAndComputerPaths() {
+        // WHY: typed native-host guidance belongs only to logical Desktop.
+        // Docker must retain guest computer-use and Playwright instructions,
+        // so a host token can never steer a guest mutation.
+        let guest = BotStandingInstructions.admittedToolsText(for: .dockerDesktop)
+        XCTAssertTrue(guest.contains(BotStandingInstructions.generatedGuestComputerLine))
+        XCTAssertTrue(guest.contains(BotStandingInstructions.computerObserveTool))
+        XCTAssertTrue(guest.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertFalse(guest.contains(BotStandingInstructions.generatedNativeHostComputerLine))
+        XCTAssertFalse(guest.contains("pixel state token as expected_state_token"))
+        XCTAssertFalse(guest.contains("semantic state token as expected_state_token"))
     }
 
     func test_admittedToolsNameAddSkill_becauseSetSkillAlreadyBindsTheCatalogId() {

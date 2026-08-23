@@ -1,5 +1,6 @@
 import XCTest
 import CoreModel
+@testable import Persistence
 @testable import AgentRuntime
 
 final class ComputerUseMCPInstallTests: XCTestCase {
@@ -42,14 +43,84 @@ final class ComputerUseMCPInstallTests: XCTestCase {
 
     func test_grokSessionAdmitUsesTheSameServerAndKeepsLeftovers() {
         let leftover: [Any] = [["name": "user-slack", "command": "npx"]]
-        let servers = GrokACPClient.sessionMCPServers(existing: leftover, command: "/tmp/RemoteCodeDistillService")
-        XCTAssertFalse(
-            ComputerUseMCPAdmit.containsAdmittedGrokACP(servers),
-            "Grok sessions must use macos-harness, not remotecode-computer-use"
+        let servers = GrokACPClient.sessionMCPServers(
+            existing: leftover,
+            command: "/tmp/RemoteCodeDistillService",
+            environment: [AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey: "1"]
         )
+        XCTAssertTrue(ComputerUseMCPAdmit.containsAdmittedGrokACP(servers))
         let names = servers.compactMap { ($0 as? [String: Any])?["name"] as? String }
         XCTAssertTrue(names.contains("user-slack"))
-        XCTAssertEqual(names.filter { $0 == ComputerUseMCPAdmit.serverName }.count, 0)
+        XCTAssertEqual(names.filter { $0 == ComputerUseMCPAdmit.serverName }.count, 1)
+    }
+
+    func test_dockerProviderSurfaceExcludesHostMCPButRetainsGuestComputer() {
+        // WHY: a global provider config must not turn Docker into physical-host
+        // control. Docker keeps its bot_computer MCP and guest browser lanes.
+        let dockerEnvironment = ["RC_REMOTE_CODE_BOT_ID": UUID().uuidString]
+        let servers = GrokACPClient.sessionMCPServers(
+            existing: [],
+            command: "/tmp/RemoteCodeDistillService",
+            environment: dockerEnvironment
+        )
+        XCTAssertFalse(ComputerUseMCPAdmit.containsAdmittedGrokACP(servers))
+        XCTAssertTrue(BotComputerMCPAdmit.containsAdmittedGrokACP(servers))
+        XCTAssertTrue(BotBrowserMCPAdmit.containsAdmittedGrokACP(servers))
+    }
+
+    func test_codexHostOverrideIsPerProcessAndAbsentForDocker() {
+        let host = CodexRunner.computerUseMCPOverrides(
+            environment: [AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey: "1"],
+            command: "/tmp/RemoteCodeDistillService"
+        )
+        XCTAssertEqual(host, [
+            "-c", "mcp_servers.\(ComputerUseMCPAdmit.serverName).command=\"/tmp/RemoteCodeDistillService\"",
+            "-c", "mcp_servers.\(ComputerUseMCPAdmit.serverName).args=[\"\(ComputerUseMCPAdmit.cliArgument)\"]",
+        ])
+        XCTAssertEqual(
+            CodexRunner.computerUseMCPOverrides(environment: ["RC_REMOTE_CODE_BOT_ID": UUID().uuidString]),
+            []
+        )
+    }
+
+    func test_claudeHostMCPIsExplicitlyLogicalOnly() throws {
+        let hostJSON = ClaudeRunner.botPeerMCPConfigJSON(
+            environment: [AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey: "1"],
+            command: "/tmp/RemoteCodeDistillService"
+        )
+        let host = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(hostJSON.utf8)) as? [String: Any])
+        let hostServers = try XCTUnwrap(host["mcpServers"] as? [String: Any])
+        XCTAssertNotNil(hostServers[ComputerUseMCPAdmit.serverName])
+
+        let dockerJSON = ClaudeRunner.botPeerMCPConfigJSON(environment: [:], command: "/tmp/RemoteCodeDistillService")
+        let docker = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(dockerJSON.utf8)) as? [String: Any])
+        let dockerServers = try XCTUnwrap(docker["mcpServers"] as? [String: Any])
+        XCTAssertNil(dockerServers[ComputerUseMCPAdmit.serverName])
+    }
+
+    func test_claudeSDKParityScopesNativeHostMCPAndAutoAllowToLogicalRuns() {
+        // WHY: Claude's SDK and CLI seams must make the same per-run decision;
+        // a persisted global MCP entry must never expose host control to Docker.
+        let hostEnvironment = [AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey: "1"]
+        let hostServers = ClaudeAgentSDKBridgeAdapter.botPeerMCPServers(
+            environment: hostEnvironment,
+            command: "/tmp/RemoteCodeDistillService"
+        )
+        XCTAssertNotNil(hostServers[ComputerUseMCPAdmit.serverName])
+
+        let dockerServers = ClaudeAgentSDKBridgeAdapter.botPeerMCPServers(
+            environment: [:],
+            command: "/tmp/RemoteCodeDistillService"
+        )
+        XCTAssertNil(dockerServers[ComputerUseMCPAdmit.serverName])
+
+        let nativeNames = Set(ManagedComputerUseMCP.advertisedToolNames.map {
+            "mcp__\(ComputerUseMCPAdmit.serverName)__\($0)"
+        })
+        let hostAllowed = Set(ClaudeRunner.automaticallyAllowedTools(environment: hostEnvironment))
+        let dockerAllowed = Set(ClaudeRunner.automaticallyAllowedTools(environment: [:]))
+        XCTAssertEqual(hostAllowed.intersection(nativeNames), nativeNames)
+        XCTAssertTrue(dockerAllowed.isDisjoint(with: nativeNames))
     }
 
     func test_defaultAdmitPathCoversClaudeCodexAndGrok() {
