@@ -22,6 +22,7 @@ struct FilePreviewLineIndex: Sendable, Equatable {
     }
 
     var lineCount: Int { lineStartOffsets.count }
+    var storageBytesForTesting: Int { lineStartOffsets.count * MemoryLayout<UInt32>.stride }
 
     /// Returns the 1-based line containing `charOffset`.
     /// Exact line starts belong to the new line; a newline itself stays on the prior line.
@@ -76,6 +77,17 @@ public struct FilePreviewTextCache {
         store.removeValue(forKey: path)
     }
 
+    public mutating func removeAll() {
+        store.removeAll(keepingCapacity: false)
+    }
+
+    var entryCountForTesting: Int { store.count }
+    var retainedPayloadBytesForTesting: Int {
+        store.values.reduce(into: 0) {
+            $0 += $1.text.utf8.count + $1.lineIndex.storageBytesForTesting
+        }
+    }
+
     /// Pure helper: returns true when cachedPath differs from newPath (reload required).
     /// Nonisolated -- touches no AppKit state; callable from any context.
     public nonisolated static func shouldReload(cachedPath: String?, newPath: String) -> Bool {
@@ -102,6 +114,12 @@ public final class FilePreviewPDFCache {
     public func evict(path: String) {
         store.removeValue(forKey: path)
     }
+
+    public func removeAll() {
+        store.removeAll(keepingCapacity: false)
+    }
+
+    var entryCountForTesting: Int { store.count }
 }
 
 // Pure scroll/page cache -- no AppKit deps; safe to test without a display.
@@ -162,9 +180,12 @@ public final class FilePreviewSurface: NSObject, Surface {
     public private(set) var filePath: String?
     private let containerStack: NSView
     private var isVisible = true
+    private var renderGeneration: UInt64 = 0
     var scrollCache = FilePreviewScrollCache()
     var textCache = FilePreviewTextCache()
     let pdfCache = FilePreviewPDFCache()
+    var previewTextLoaderForTesting: (@Sendable (String) -> String)?
+    var previewTextPublicationProbeForTesting: (@MainActor @Sendable (String, Bool) -> Void)?
 
     public init(workspaceID: WorkspaceID, filePath: String?, title: String = "preview") {
         self.descriptor = SurfaceDescriptor(
@@ -183,6 +204,10 @@ public final class FilePreviewSurface: NSObject, Surface {
     }
 
     public func load(filePath: String) {
+        if self.filePath != filePath {
+            releaseHeavyContent()
+        }
+        renderGeneration &+= 1
         self.filePath = filePath
         descriptor.metadata["path"] = filePath
         renderForFile(filePath)
@@ -222,6 +247,7 @@ public final class FilePreviewSurface: NSObject, Surface {
     }
 
     private func renderImage(path: String) {
+        let generation = renderGeneration
         let iv = NSImageView()
         iv.imageScaling = .scaleProportionallyDown
         iv.translatesAutoresizingMaskIntoConstraints = false
@@ -235,7 +261,10 @@ public final class FilePreviewSurface: NSObject, Surface {
             let image = await Task.detached(priority: .userInitiated) {
                 Self.decodeDownsampled(url: url)
             }.value
-            guard let self, self.filePath == path else { return }
+            guard let self,
+                  self.isVisible,
+                  self.filePath == path,
+                  self.renderGeneration == generation else { return }
             iv?.image = image
         }
     }
@@ -253,6 +282,7 @@ public final class FilePreviewSurface: NSObject, Surface {
     }
 
     private func renderPDF(path: String) {
+        let generation = renderGeneration
         let pdf = PDFView()
         pdf.autoScales = true
         pdf.translatesAutoresizingMaskIntoConstraints = false
@@ -274,7 +304,11 @@ public final class FilePreviewSurface: NSObject, Surface {
                 let doc = await Task.detached(priority: .userInitiated) {
                     PDFDocument(url: url)
                 }.value
-                guard let self, self.filePath == path, let pdf else { return }
+                guard let self,
+                      self.isVisible,
+                      self.filePath == path,
+                      self.renderGeneration == generation,
+                      let pdf else { return }
                 if let doc {
                     self.pdfCache.store(path: path, document: doc)
                     pdf.document = doc
@@ -312,6 +346,10 @@ public final class FilePreviewSurface: NSObject, Surface {
     }
 
     private func renderText(path: String) {
+        let generation = renderGeneration
+        let previewTextLoader = previewTextLoaderForTesting ?? { path in
+            Self.previewText(path: path)
+        }
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
         scroll.borderType = .noBorder
@@ -350,10 +388,18 @@ public final class FilePreviewSurface: NSObject, Surface {
         } else {
             Task { [weak self, weak tv, weak scroll, weak ruler] in
                 let loaded = await Task.detached(priority: .userInitiated) {
-                    let text = Self.previewText(path: path)
+                    let text = previewTextLoader(path)
                     return (text, FilePreviewLineIndex(text: text))
                 }.value
-                guard let self, self.filePath == path, let tv, let scroll, let ruler else { return }
+                guard let self else { return }
+                let shouldPublish = self.isVisible
+                    && self.filePath == path
+                    && self.renderGeneration == generation
+                    && tv != nil
+                    && scroll != nil
+                    && ruler != nil
+                self.previewTextPublicationProbeForTesting?(loaded.0, shouldPublish)
+                guard shouldPublish, let tv, let scroll, let ruler else { return }
                 self.textCache.store(path: path, text: loaded.0, lineIndex: loaded.1)
                 ruler.replaceLineIndex(loaded.1)
                 tv.string = loaded.0
@@ -445,6 +491,7 @@ public final class FilePreviewSurface: NSObject, Surface {
     public func didBecomeHidden() {
         guard isVisible else { return }
         isVisible = false
+        renderGeneration &+= 1
         if let path = filePath {
             var entry = FilePreviewScrollCache.Entry()
             for sub in containerStack.subviews {
@@ -457,8 +504,17 @@ public final class FilePreviewSurface: NSObject, Surface {
             scrollCache.store(path: path, entry: entry)
         }
         for sub in containerStack.subviews { sub.removeFromSuperview() }
+        releaseHeavyContent()
     }
-    public func close() {}
+    public func close() {
+        didBecomeHidden()
+        releaseHeavyContent()
+    }
+
+    private func releaseHeavyContent() {
+        textCache.removeAll()
+        pdfCache.removeAll()
+    }
     public func sendText(_ text: String) {}
     public func readText() -> String { filePath ?? "" }
     public func snapshot() -> [String: String] { ["path": filePath ?? ""] }

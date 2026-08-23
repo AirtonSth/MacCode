@@ -150,17 +150,25 @@ final class PaneActionTests: XCTestCase {
         }
         let file = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-preview-memory-\(UUID().uuidString).txt")
-        try String(repeating: "preview\n", count: 200).write(to: file, atomically: true, encoding: .utf8)
+        try String(repeating: "123456789\n", count: 50_000).write(to: file, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: file) }
 
         let previewDesc = try router.createSurface(workspace: ws.id, type: .filePreview, paneID: nil, title: file.path)
         let preview = try XCTUnwrap(SurfaceRegistry.shared.surface(previewDesc.id) as? FilePreviewSurface)
         XCTAssertFalse(preview.view.subviews.isEmpty, "selected preview tab should render the file while visible")
+        waitUntil("visible preview must finish its off-main text load before lifecycle accounting") {
+            preview.textCache.retainedPayloadBytesForTesting > 0
+        }
 
         try router.focusSurface(workspace: ws.id, surface: defaultSurfaceID)
 
         XCTAssertTrue(preview.view.subviews.isEmpty,
                       "switching away must unload heavyweight preview views so hidden tabs do not retain image/PDF/text content")
+        XCTAssertEqual(preview.textCache.retainedPayloadBytesForTesting, 0,
+                       "router-driven hide must release the loaded text and UTF-16 line index")
+        XCTAssertEqual(preview.pdfCache.entryCountForTesting, 0)
+        XCTAssertEqual(preview.filePath, file.path,
+                       "heavy-content purge must preserve lightweight reopen metadata")
     }
 
     func test_addAgent_then_splitRight_buildsSplitTree() throws {
