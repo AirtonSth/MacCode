@@ -18,6 +18,7 @@ Usage:
   scripts/token-saver-local-llm-benchmark.sh verify-protocol
   scripts/token-saver-local-llm-benchmark.sh capture <baseline|candidate|final> <report.json>
   scripts/token-saver-local-llm-benchmark.sh verify-baseline <baseline.json>
+  scripts/token-saver-local-llm-benchmark.sh verify-regression <baseline.json> <final.json>
   scripts/token-saver-local-llm-benchmark.sh verify-improvement <baseline.json> <candidate-or-final.json>
   scripts/token-saver-local-llm-benchmark.sh verify-integrity <report.json>
   scripts/token-saver-local-llm-benchmark.sh verify-quality <report.json>
@@ -197,6 +198,46 @@ verify_improvement() {
   echo "improvement ok additional_exact_tokens=${delta}"
 }
 
+verify_regression() {
+  require_tools
+  local baseline="${1:-}"
+  local final_report="${2:-}"
+  [[ -n "${baseline}" && -n "${final_report}" ]] || usage
+  verify_baseline "${baseline}"
+  verify_integrity "${final_report}"
+  verify_quality "${final_report}"
+  jq -n -e --slurpfile baseline "${baseline}" --slurpfile final "${final_report}" '
+    ($baseline[0]) as $b |
+    ($final[0]) as $f |
+    $f.capture_kind == "final" and
+    $b.source.git_head != $f.source.git_head and
+    $b.token_count_source == $f.token_count_source and
+    $b.model == $f.model and
+    $b.corpus == $f.corpus and
+    $b.protocol == $f.protocol and
+    ($b.cases | map(.id)) == ($f.cases | map(.id)) and
+    ($b.cases | map(.input_tokens)) == ($f.cases | map(.input_tokens)) and
+    all($f.cases[]; .route_stable and .output_stable and .quality_passed) and
+    ([
+      $b.cases[] as $before |
+      $f.cases[] | select(.id == $before.id) |
+      {
+        before_ready: $before.next_action_ready,
+        final_ready: .next_action_ready,
+        input_tokens: $before.input_tokens,
+        final_tokens: .final_output_tokens
+      }
+    ] | all(.[];
+      (if .before_ready then .final_ready else true end) and
+      .final_tokens <= .input_tokens
+    )) and
+    $f.aggregate.next_action_ready_cases >= $b.aggregate.next_action_ready_cases and
+    $f.aggregate.quality_passed_cases == $b.aggregate.quality_passed_cases and
+    $f.aggregate.final_output_tokens <= $b.aggregate.final_output_tokens
+  ' >/dev/null || die "final report regresses exact tokens, stability, or per-case action quality"
+  echo "regression ok final_tokens=$(jq -r '.aggregate.final_output_tokens' "${final_report}") direct=$(jq -r '.aggregate.next_action_ready_cases' "${final_report}")/$(jq -r '.aggregate.case_count' "${final_report}")"
+}
+
 verify_iterations() {
   require_tools
   local iterations="${1:-}"
@@ -248,7 +289,7 @@ verify_all() {
   local iterations="${3:-}"
   [[ -n "${baseline}" && -n "${final_report}" && -n "${iterations}" ]] || usage
   verify_protocol
-  verify_improvement "${baseline}" "${final_report}"
+  verify_regression "${baseline}" "${final_report}"
   verify_iterations "${iterations}"
   echo "all benchmark gates passed"
 }
@@ -259,6 +300,7 @@ case "${command_name}" in
   verify-protocol) verify_protocol "$@" ;;
   capture) capture "$@" ;;
   verify-baseline) verify_baseline "$@" ;;
+  verify-regression) verify_regression "$@" ;;
   verify-improvement) verify_improvement "$@" ;;
   verify-integrity) verify_integrity "$@" ;;
   verify-quality) verify_quality "$@" ;;
