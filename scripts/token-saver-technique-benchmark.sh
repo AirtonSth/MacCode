@@ -18,6 +18,8 @@ Usage:
   scripts/token-saver-technique-benchmark.sh verify-protocol
   scripts/token-saver-technique-benchmark.sh capture <A|B|C> <baseline-git-sha> <candidate-git-sha> <artifact.json>
   scripts/token-saver-technique-benchmark.sh verify <artifact.json>
+  scripts/token-saver-technique-benchmark.sh verify-d <technique-D.json>
+  scripts/token-saver-technique-benchmark.sh verify-terminal-candidates <terminal-candidates.json>
   scripts/token-saver-technique-benchmark.sh verify-iterations <iterations.json>
   scripts/token-saver-technique-benchmark.sh assemble <A.json> <B.json> <C.json> <iterations.json> <suite.json>
   scripts/token-saver-technique-benchmark.sh verify-suite <suite.json>
@@ -250,25 +252,218 @@ verify_artifact() {
   echo "artifact ok technique=$(jq -r '.technique' "${artifact}") decision=$(jq -r '.decision' "${artifact}") net=$(jq -r '.aggregate.net_tokens_saved' "${artifact}") exact_tokens"
 }
 
+verify_d() {
+  require_tools
+  local artifact="${1:-}"
+  [[ -n "${artifact}" ]] || usage
+  require_file "${artifact}"
+  jq -e '
+    . as $report |
+    .schema_version == 1 and
+    .suite_id == "token-saver-exact-dedupe-v1" and
+    .technique == "D" and
+    .token_count_source == "omlx:/v1/messages/count_tokens" and
+    (.claim_scope | type == "string" and contains("not provider billing")) and
+    (.captured_at | type == "string" and length > 0) and
+    (.source.git_head | test("^[0-9a-f]{40}$")) and
+    (.source.tree_sha | test("^[0-9a-f]{40}$")) and
+    .source.dirty == false and
+    (.comparison.baseline_git_sha | test("^[0-9a-f]{40}$")) and
+    (.comparison.candidate_git_sha | test("^[0-9a-f]{40}$")) and
+    .source.git_head == .comparison.candidate_git_sha and
+    (.comparison.baseline_variant | type == "string" and length > 0) and
+    (.comparison.candidate_variant | type == "string" and length > 0) and
+    .model.server == "oMLX" and
+    (.model.id | type == "string" and length > 0) and
+    (.model.revision | test("^[0-9a-f]{40}$")) and
+    (.model.server_version | type == "string" and length > 0 and . != "unreported") and
+    .fixture.id == "token-saver-exact-dedupe-v1" and
+    (.fixture.sha256 | test("^[0-9a-f]{64}$")) and
+    (.fixture.input_bytes | type == "number" and . > 0) and
+    (.fixture.exact_block_bytes | type == "number" and . > 0 and . < $report.fixture.input_bytes) and
+    (.fixture.non_empty_lines | type == "number" and . > 0) and
+    all([.gross_transform_diagnostic.raw, .gross_transform_diagnostic.pointer,
+         .incremental_provider_facing.baseline, .incremental_provider_facing.candidate][];
+      (.canonical_body_bytes | type == "number" and . > 0) and
+      (.canonical_body_sha256 | test("^[0-9a-f]{64}$")) and
+      (.count_latency_ms | type == "number" and . >= 0) and
+      (.input_tokens | type == "number" and . >= 0)
+    ) and
+    .gross_transform_diagnostic.tokens_saved ==
+      (.gross_transform_diagnostic.raw.input_tokens - .gross_transform_diagnostic.pointer.input_tokens) and
+    .gross_transform_diagnostic.tokens_saved > 0 and
+    .incremental_provider_facing.baseline_tokens == .incremental_provider_facing.baseline.input_tokens and
+    .incremental_provider_facing.candidate_tokens == .incremental_provider_facing.candidate.input_tokens and
+    .incremental_provider_facing.net_tokens_saved ==
+      (.incremental_provider_facing.baseline_tokens - .incremental_provider_facing.candidate_tokens) and
+    .incremental_provider_facing.net_tokens_saved <= 0 and
+    .decision == "rejected" and
+    (.decision_reason | type == "string" and length > 0) and
+    .quality.quality_passed == true and
+    .quality.baseline_success_regression == false and
+    .quality.exact_reconstruction == true and
+    .quality.first_block_inline == true and
+    .quality.pass_fail_near_blocks_untouched == true and
+    .quality.pointer_order_preserved == true and
+    .quality.baseline_reached_real_local_llm == true and
+    .quality.candidate_resolved_deterministically == true and
+    .recovery.capability_format == "rcv1.<22-base64url>" and
+    (.recovery.capability_sha256 | test("^[0-9a-f]{64}$")) and
+    .recovery.same_capability_both_arms == true and
+    .recovery.scoped_readback_verified == true and
+    .delivery.baseline_cli_byte_gate_admitted == true and
+    .delivery.candidate_cli_byte_gate_admitted == true and
+    .delivery.baseline_receipt_verified == true and
+    .delivery.candidate_receipt_verified == true and
+    (.runtime.baseline_output_sha256 | test("^[0-9a-f]{64}$")) and
+    (.runtime.candidate_output_sha256 | test("^[0-9a-f]{64}$")) and
+    .runtime.baseline_route_stage == "llm_mlx" and
+    .runtime.candidate_route_stage == "deterministic" and
+    (.runtime.baseline_latency_ms | type == "number" and . >= 0) and
+    (.runtime.candidate_latency_ms | type == "number" and . >= 0)
+  ' "${artifact}" >/dev/null || die "technique D schema, accounting, recovery, or rejected decision failed: ${artifact}"
+
+  local baseline_sha candidate_sha capture_sha expected_tree
+  baseline_sha="$(jq -r '.comparison.baseline_git_sha' "${artifact}")"
+  candidate_sha="$(jq -r '.comparison.candidate_git_sha' "${artifact}")"
+  capture_sha="$(jq -r '.source.git_head' "${artifact}")"
+  git -C "${repo_root}" cat-file -e "${baseline_sha}^{commit}" 2>/dev/null || die "D baseline commit is unavailable: ${baseline_sha}"
+  git -C "${repo_root}" cat-file -e "${candidate_sha}^{commit}" 2>/dev/null || die "D candidate commit is unavailable: ${candidate_sha}"
+  git -C "${repo_root}" cat-file -e "${capture_sha}^{commit}" 2>/dev/null || die "D capture commit is unavailable: ${capture_sha}"
+  expected_tree="$(git -C "${repo_root}" rev-parse "${capture_sha}^{tree}")"
+  [[ "$(jq -r '.source.tree_sha' "${artifact}")" == "${expected_tree}" ]] || die "D capture source tree mismatch"
+  echo "artifact ok technique=D decision=rejected net=$(jq -r '.incremental_provider_facing.net_tokens_saved' "${artifact}") exact_tokens"
+}
+
+verify_terminal_candidates() {
+  require_tools
+  local artifact="${1:-}"
+  [[ -n "${artifact}" ]] || usage
+  require_file "${artifact}"
+  jq -e '
+    . as $report |
+    .schema_version == 1 and
+    .suite_id == "token-saver-terminal-candidates-v1" and
+    .token_count_source == "omlx:/v1/messages/count_tokens" and
+    (.claim_scope | type == "string" and contains("not provider delivery or billing claims")) and
+    (.source.git_head | test("^[0-9a-f]{40}$")) and
+    .source.dirty == false and
+    .model.server == "oMLX" and
+    (.model.id | type == "string" and length > 0) and
+    (.model.revision | test("^[0-9a-f]{40}$")) and
+    (.model.server_version | type == "string" and length > 0 and . != "unreported") and
+    .measurement_protocol.endpoint == "http://127.0.0.1:8000/v1/messages/count_tokens" and
+    (.measurements | type == "array" and length > 0) and
+    ([.measurements[].id] | length == (unique | length)) and
+    all(.measurements[];
+      (.id | type == "string" and length > 0) and
+      (.input_bytes | type == "number" and . > 0) and
+      (.input_sha256 | test("^[0-9a-f]{64}$")) and
+      (.request_body_bytes | type == "number" and . > 0) and
+      (.request_body_sha256 | test("^[0-9a-f]{64}$")) and
+      (.response_sha256 | test("^[0-9a-f]{64}$")) and
+      (.input_tokens | type == "number" and . >= 0)
+    ) and
+    (.candidates | type == "array" and length > 0) and
+    ([.candidates[].id] | length == (unique | length)) and
+    all(.candidates[];
+      . as $candidate |
+      (.id | type == "string" and length > 0) and
+      (.measurement_status == "exact_local_tokenizer" or
+       .measurement_status == "not_run_no_safe_delivery_surface") and
+      .quality_passed == false and
+      .decision == "rejected" and
+      (.reason | type == "string" and length > 0) and
+      (if .measurement_status == "exact_local_tokenizer" then
+         (.measured_tokens_saved | type == "number") and
+         (.baseline_measurement | type == "string" and length > 0) and
+         (.candidate_measurement | type == "string" and length > 0) and
+         ([$report.measurements[] | select(.id == $candidate.baseline_measurement)] | length) == 1 and
+         ([$report.measurements[] | select(.id == $candidate.candidate_measurement)] | length) == 1 and
+         .measured_tokens_saved ==
+           (([$report.measurements[] | select(.id == $candidate.baseline_measurement) | .input_tokens][0]) -
+            ([$report.measurements[] | select(.id == $candidate.candidate_measurement) | .input_tokens][0]))
+       else
+         .measured_tokens_saved == null and
+         (has("baseline_measurement") | not) and
+         (has("candidate_measurement") | not)
+       end)
+    ) and
+    (.source_evidence | type == "array" and length > 0) and
+    all(.source_evidence[];
+      (.path | type == "string" and length > 0 and startswith("Sources/") and (contains("..") | not)) and
+      (.git_blob | test("^[0-9a-f]{40}$")) and
+      (.sha256 | test("^[0-9a-f]{64}$")) and
+      (.supports | type == "array" and length > 0) and
+      all(.supports[]; . as $id | any($report.candidates[]; .id == $id))
+    ) and
+    ([$report.candidates[].id] - ([$report.source_evidence[].supports[]] | unique) | length) == 0 and
+    .terminal.status == "no_improvement" and
+    .terminal.remaining_safe_candidates == 0 and
+    (.terminal.reason | type == "string" and length > 0)
+  ' "${artifact}" >/dev/null || die "terminal candidate schema, measurements, or rejected decisions failed: ${artifact}"
+
+  local source_sha evidence_row evidence_path expected_blob expected_sha actual_blob actual_sha
+  source_sha="$(jq -r '.source.git_head' "${artifact}")"
+  git -C "${repo_root}" cat-file -e "${source_sha}^{commit}" 2>/dev/null || die "terminal candidate source commit is unavailable: ${source_sha}"
+  while IFS= read -r evidence_row; do
+    evidence_path="$(jq -r '.path' <<<"${evidence_row}")"
+    expected_blob="$(jq -r '.git_blob' <<<"${evidence_row}")"
+    expected_sha="$(jq -r '.sha256' <<<"${evidence_row}")"
+    [[ "${evidence_path}" == Sources/* && "${evidence_path}" != *..* ]] || die "unsafe terminal evidence path: ${evidence_path}"
+    git -C "${repo_root}" cat-file -e "${expected_blob}^{blob}" 2>/dev/null \
+      || die "terminal evidence Git blob is unavailable: ${evidence_path}"
+    git -C "${repo_root}" cat-file -e "${source_sha}:${evidence_path}" 2>/dev/null \
+      || die "terminal evidence path is unavailable at source commit: ${evidence_path}"
+    actual_blob="$(git -C "${repo_root}" rev-parse "${source_sha}:${evidence_path}")"
+    [[ "${actual_blob}" == "${expected_blob}" ]] || die "terminal evidence source-path blob mismatch: ${evidence_path}"
+    actual_sha="$(git -C "${repo_root}" cat-file blob "${expected_blob}" | shasum -a 256 | awk '{print $1}')"
+    [[ "${actual_sha}" == "${expected_sha}" ]] || die "terminal evidence SHA-256 mismatch: ${evidence_path}"
+  done < <(jq -c '.source_evidence[]' "${artifact}")
+  echo "terminal candidates ok rejected=$(jq '.candidates | length' "${artifact}") terminal=no_improvement"
+}
+
 verify_iterations() {
   require_tools
   local iterations="${1:-}"
   [[ -n "${iterations}" ]] || usage
   require_file "${iterations}"
   jq -e '
+    . as $report |
     .schema_version == 1 and
     .suite_id == "token-saver-techniques-v1" and
     (.iterations | type == "array" and length >= 3) and
     ([.iterations[].id] | length == (unique | length)) and
-    (["A", "B", "C"] - ([.iterations[].technique] | unique) | length) == 0 and
+    all(["A", "B", "C", "D"][];
+      . as $technique |
+      ([$report.iterations[] | select(.technique == $technique)] | length) == 1
+    ) and
+    ([$report.iterations[] |
+       select((.technique == "A" or .technique == "B" or .technique == "C" or .technique == "D") | not) |
+       .artifact_path] | unique) == ["docs/benchmarks/token-saver-local-llm/terminal-candidates.json"] and
     all(.iterations[];
       (.id | type == "string" and length > 0) and
       (.technique | type == "string" and length > 0) and
       (.baseline_git_sha | test("^[0-9a-f]{40}$")) and
       (.candidate_git_sha | test("^[0-9a-f]{40}$")) and
+      (.artifact_path | type == "string" and
+        startswith("docs/benchmarks/token-saver-local-llm/") and
+        endswith(".json") and
+        (contains("..") | not)) and
       (.artifact_sha256 | test("^[0-9a-f]{64}$")) and
       (.decision == "accepted" or .decision == "rejected") and
-      (.net_tokens_saved | type == "number") and
+      .status == .decision and
+      (.measurement_status == "exact_local_tokenizer" or
+       .measurement_status == "not_run_no_safe_delivery_surface") and
+      (if .measurement_status == "exact_local_tokenizer" then
+         (.net_tokens_saved | type == "number") and
+         (.measured_additional_tokens | type == "number") and
+         .measured_additional_tokens == .net_tokens_saved
+       else
+         .decision == "rejected" and
+         .net_tokens_saved == null and
+         .measured_additional_tokens == null
+       end) and
       (.quality_regressions | type == "number" and . >= 0) and
       (.reason | type == "string" and length > 0)
     ) and
@@ -276,6 +471,84 @@ verify_iterations() {
     .terminal.remaining_safe_candidates == 0 and
     (.terminal.reason | type == "string" and length > 0)
   ' "${iterations}" >/dev/null || die "iterations ledger is incomplete or lacks terminal no_improvement evidence"
+
+  local row technique measurement_status artifact_relative artifact_path artifact_hash baseline_sha candidate_sha decision net regressions
+  local last_verified_path=""
+  while IFS= read -r row; do
+    technique="$(jq -r '.technique' <<<"${row}")"
+    measurement_status="$(jq -r '.measurement_status' <<<"${row}")"
+    artifact_relative="$(jq -r '.artifact_path' <<<"${row}")"
+    artifact_hash="$(jq -r '.artifact_sha256' <<<"${row}")"
+    baseline_sha="$(jq -r '.baseline_git_sha' <<<"${row}")"
+    candidate_sha="$(jq -r '.candidate_git_sha' <<<"${row}")"
+    decision="$(jq -r '.decision' <<<"${row}")"
+    net="$(jq -r '.net_tokens_saved' <<<"${row}")"
+    regressions="$(jq -r '.quality_regressions' <<<"${row}")"
+    [[ "${artifact_relative}" == docs/benchmarks/token-saver-local-llm/*.json && "${artifact_relative}" != *..* ]] \
+      || die "unsafe iteration artifact path: ${artifact_relative}"
+    artifact_path="${repo_root}/${artifact_relative}"
+    require_file "${artifact_path}"
+    [[ "$(file_sha256 "${artifact_path}")" == "${artifact_hash}" ]] \
+      || die "iteration artifact hash mismatch: ${artifact_relative}"
+
+    if [[ "${artifact_path}" != "${last_verified_path}" ]]; then
+      case "${technique}" in
+        A|B|C) verify_artifact "${artifact_path}" >/dev/null ;;
+        D) verify_d "${artifact_path}" >/dev/null ;;
+        *) verify_terminal_candidates "${artifact_path}" >/dev/null ;;
+      esac
+      last_verified_path="${artifact_path}"
+    fi
+
+    case "${technique}" in
+      A|B|C)
+        jq -e --arg technique "${technique}" --arg baseline "${baseline_sha}" \
+          --arg candidate "${candidate_sha}" --arg decision "${decision}" --argjson net "${net}" '
+            .technique == $technique and
+            .comparison.baseline_git_sha == $baseline and
+            .comparison.candidate_git_sha == $candidate and
+            .decision == $decision and
+            .aggregate.net_tokens_saved == $net
+          ' "${artifact_path}" >/dev/null || die "iteration does not reconcile technique ${technique} artifact"
+        ;;
+      D)
+        jq -e --arg baseline "${baseline_sha}" --arg candidate "${candidate_sha}" \
+          --arg decision "${decision}" --argjson net "${net}" '
+            .technique == "D" and
+            .comparison.baseline_git_sha == $baseline and
+            .comparison.candidate_git_sha == $candidate and
+            .decision == $decision and
+            .incremental_provider_facing.net_tokens_saved == $net
+          ' "${artifact_path}" >/dev/null || die "iteration does not reconcile technique D artifact"
+        ;;
+      *)
+        jq -e --arg technique "${technique}" --arg measurement_status "${measurement_status}" \
+          --arg baseline "${baseline_sha}" \
+          --arg candidate "${candidate_sha}" --arg decision "${decision}" \
+          --argjson net "${net}" --argjson regressions "${regressions}" '
+            .source.git_head == $baseline and
+            .source.git_head == $candidate and
+            any(.candidates[];
+              .id == $technique and
+              .measurement_status == $measurement_status and
+              .decision == $decision and
+              .measured_tokens_saved == $net and
+              (if .quality_passed then $regressions == 0 else $regressions > 0 end)
+            )
+          ' "${artifact_path}" >/dev/null || die "iteration does not reconcile terminal candidate ${technique}"
+        ;;
+    esac
+  done < <(jq -c '.iterations[]' "${iterations}")
+
+  local terminal_relative terminal_path
+  while IFS= read -r terminal_relative; do
+    terminal_path="${repo_root}/${terminal_relative}"
+    jq -n -e --arg artifact_path "${terminal_relative}" \
+      --slurpfile iterations "${iterations}" --slurpfile artifact "${terminal_path}" '
+        ([$iterations[0].iterations[] | select(.artifact_path == $artifact_path) | .technique] | sort) ==
+        ([$artifact[0].candidates[].id] | sort)
+      ' >/dev/null || die "terminal artifact candidates are not fully reconciled: ${terminal_relative}"
+  done < <(jq -r '.iterations[] | select(.technique != "A" and .technique != "B" and .technique != "C" and .technique != "D") | .artifact_path' "${iterations}" | sort -u)
   echo "iterations ok attempts=$(jq '.iterations | length' "${iterations}") terminal=no_improvement"
 }
 
@@ -421,15 +694,25 @@ verify_suite() {
     .iterations.terminal.remaining_safe_candidates == 0 and
     (.iterations.terminal.reason | type == "string" and length > 0)
   ' "${suite}" >/dev/null || die "suite manifest failed"
-  local row path
+  local row path technique decision net
   while IFS= read -r row; do
     path="$(jq -r '.path' <<<"${row}")"
+    technique="$(jq -r '.technique' <<<"${row}")"
+    decision="$(jq -r '.decision' <<<"${row}")"
+    net="$(jq -r '.net_tokens_saved' <<<"${row}")"
     require_file "${path}"
     [[ "$(file_sha256 "${path}")" == "$(jq -r '.sha256' <<<"${row}")" ]] || die "suite artifact hash mismatch: ${path}"
+    verify_artifact "${path}" >/dev/null || die "suite artifact verification failed: ${path}"
+    jq -e --arg technique "${technique}" --arg decision "${decision}" --argjson net "${net}" '
+      .technique == $technique and
+      .decision == $decision and
+      .aggregate.net_tokens_saved == $net
+    ' "${path}" >/dev/null || die "suite manifest does not reconcile artifact: ${path}"
   done < <(jq -c '.artifacts[]' "${suite}")
   require_file "$(jq -r '.iterations.path' "${suite}")"
   [[ "$(file_sha256 "$(jq -r '.iterations.path' "${suite}")")" == "$(jq -r '.iterations.sha256' "${suite}")" ]] \
     || die "suite iterations hash mismatch"
+  verify_iterations "$(jq -r '.iterations.path' "${suite}")" >/dev/null
   echo "suite ok net=$(jq -r '.aggregate_net_tokens_saved' "${suite}") exact_tokens terminal=no_improvement"
 }
 
@@ -439,6 +722,8 @@ case "${command_name}" in
   verify-protocol) verify_protocol "$@" ;;
   capture) capture "$@" ;;
   verify) verify_artifact "$@" ;;
+  verify-d) verify_d "$@" ;;
+  verify-terminal-candidates) verify_terminal_candidates "$@" ;;
   verify-iterations) verify_iterations "$@" ;;
   assemble) assemble "$@" ;;
   verify-suite) verify_suite "$@" ;;

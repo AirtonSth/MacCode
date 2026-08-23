@@ -251,12 +251,24 @@ verify_iterations() {
       (.technique | type == "string" and length > 0) and
       (.status == "accepted" or .status == "rejected") and
       (.reason | type == "string" and length > 0) and
-      (.measured_additional_tokens | type == "number") and
+      (.measurement_status == "exact_local_tokenizer" or
+       .measurement_status == "not_run_no_safe_delivery_surface") and
+      (if .measurement_status == "exact_local_tokenizer" then
+         (.measured_additional_tokens | type == "number") and
+         (.net_tokens_saved | type == "number") and
+         .measured_additional_tokens == .net_tokens_saved
+       else
+         .status == "rejected" and
+         .measured_additional_tokens == null and
+         .net_tokens_saved == null
+       end) and
       (.quality_regressions | type == "number" and . >= 0)
     ) and
     .terminal.status == "no_improvement" and
     (.terminal.reason | type == "string" and length > 0)
   ' "${iterations}" >/dev/null || die "iteration ledger lacks measured decisions or a terminal no_improvement pass"
+  "${script_dir}/token-saver-technique-benchmark.sh" verify-iterations "${iterations}" >/dev/null \
+    || die "iteration ledger failed artifact reconciliation"
   echo "iterations ok attempts=$(jq '.iterations | length' "${iterations}") terminal=no_improvement"
 }
 

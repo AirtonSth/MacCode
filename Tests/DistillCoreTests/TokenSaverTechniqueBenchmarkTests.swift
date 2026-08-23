@@ -131,6 +131,190 @@ final class TokenSaverTechniqueBenchmarkTests: XCTestCase {
         XCTAssertNotEqual(try verifierExitCode(fabricatedURL, repository: repository), 0)
     }
 
+    func test_extendedVerifierReconcilesDAndEveryTerminalCandidateArtifact() throws {
+        let repository = repositoryURL()
+        let benchmarkDirectory = repository.appendingPathComponent("docs/benchmarks/token-saver-local-llm")
+        let techniqueDURL = benchmarkDirectory.appendingPathComponent("technique-D.json")
+        let terminalURL = benchmarkDirectory.appendingPathComponent("terminal-candidates.json")
+        let iterationsURL = benchmarkDirectory.appendingPathComponent("iterations.json")
+
+        XCTAssertEqual(try verifierExitCode(techniqueDURL, repository: repository, command: "verify-d"), 0)
+        XCTAssertEqual(try verifierExitCode(terminalURL, repository: repository, command: "verify-terminal-candidates"), 0)
+        XCTAssertEqual(try verifierExitCode(iterationsURL, repository: repository, command: "verify-iterations"), 0)
+        XCTAssertEqual(
+            try verifierExitCode(
+                iterationsURL,
+                repository: repository,
+                command: "verify-iterations",
+                scriptName: "token-saver-local-llm-benchmark.sh"
+            ),
+            0
+        )
+
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("token-saver-extended-verifier-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+
+        var dirtyD = try loadJSONObject(techniqueDURL)
+        var dirtySource = dirtyD["source"] as! [String: Any]
+        dirtySource["dirty"] = true
+        dirtyD["source"] = dirtySource
+        let dirtyDURL = temporary.appendingPathComponent("dirty-D.json")
+        try writeJSONObject(dirtyD, to: dirtyDURL)
+        XCTAssertNotEqual(try verifierExitCode(dirtyDURL, repository: repository, command: "verify-d"), 0)
+
+        var inconsistentTerminal = try loadJSONObject(terminalURL)
+        var measurements = inconsistentTerminal["measurements"] as! [[String: Any]]
+        measurements[0]["input_tokens"] = (measurements[0]["input_tokens"] as! Int) + 1
+        inconsistentTerminal["measurements"] = measurements
+        let inconsistentTerminalURL = temporary.appendingPathComponent("inconsistent-terminal.json")
+        try writeJSONObject(inconsistentTerminal, to: inconsistentTerminalURL)
+        XCTAssertNotEqual(
+            try verifierExitCode(inconsistentTerminalURL, repository: repository, command: "verify-terminal-candidates"),
+            0
+        )
+
+        var missingEvidencePath = try loadJSONObject(terminalURL)
+        var sourceEvidence = missingEvidencePath["source_evidence"] as! [[String: Any]]
+        sourceEvidence[0]["path"] = "Sources/DistillCore/does-not-exist.swift"
+        missingEvidencePath["source_evidence"] = sourceEvidence
+        let missingEvidencePathURL = temporary.appendingPathComponent("missing-evidence-path.json")
+        try writeJSONObject(missingEvidencePath, to: missingEvidencePathURL)
+        XCTAssertNotEqual(
+            try verifierExitCode(missingEvidencePathURL, repository: repository, command: "verify-terminal-candidates"),
+            0
+        )
+
+        var fabricatedZeroTerminal = try loadJSONObject(terminalURL)
+        var terminalCandidates = fabricatedZeroTerminal["candidates"] as! [[String: Any]]
+        let unmeasuredCandidateIndex = try XCTUnwrap(
+            terminalCandidates.firstIndex { $0["id"] as? String == "compact_all_text_notices" }
+        )
+        terminalCandidates[unmeasuredCandidateIndex]["measured_tokens_saved"] = 0
+        fabricatedZeroTerminal["candidates"] = terminalCandidates
+        let fabricatedZeroTerminalURL = temporary.appendingPathComponent("fabricated-zero-terminal.json")
+        try writeJSONObject(fabricatedZeroTerminal, to: fabricatedZeroTerminalURL)
+        XCTAssertNotEqual(
+            try verifierExitCode(fabricatedZeroTerminalURL, repository: repository, command: "verify-terminal-candidates"),
+            0
+        )
+
+        var badHashIterations = try loadJSONObject(iterationsURL)
+        var badHashRows = badHashIterations["iterations"] as! [[String: Any]]
+        badHashRows[0]["artifact_sha256"] = String(repeating: "0", count: 64)
+        badHashIterations["iterations"] = badHashRows
+        let badHashURL = temporary.appendingPathComponent("bad-hash-iterations.json")
+        try writeJSONObject(badHashIterations, to: badHashURL)
+        XCTAssertNotEqual(try verifierExitCode(badHashURL, repository: repository, command: "verify-iterations"), 0)
+        XCTAssertNotEqual(
+            try verifierExitCode(
+                badHashURL,
+                repository: repository,
+                command: "verify-iterations",
+                scriptName: "token-saver-local-llm-benchmark.sh"
+            ),
+            0
+        )
+
+        var badDecisionIterations = try loadJSONObject(iterationsURL)
+        var badDecisionRows = badDecisionIterations["iterations"] as! [[String: Any]]
+        let dIndex = try XCTUnwrap(badDecisionRows.firstIndex { $0["technique"] as? String == "D" })
+        badDecisionRows[dIndex]["decision"] = "accepted"
+        badDecisionRows[dIndex]["status"] = "accepted"
+        badDecisionIterations["iterations"] = badDecisionRows
+        let badDecisionURL = temporary.appendingPathComponent("bad-decision-iterations.json")
+        try writeJSONObject(badDecisionIterations, to: badDecisionURL)
+        XCTAssertNotEqual(try verifierExitCode(badDecisionURL, repository: repository, command: "verify-iterations"), 0)
+
+        var fabricatedZeroIterations = try loadJSONObject(iterationsURL)
+        var fabricatedZeroRows = fabricatedZeroIterations["iterations"] as! [[String: Any]]
+        let fIndex = try XCTUnwrap(fabricatedZeroRows.firstIndex { $0["id"] as? String == "F-global-text-notices" })
+        fabricatedZeroRows[fIndex]["measured_additional_tokens"] = 0
+        fabricatedZeroRows[fIndex]["net_tokens_saved"] = 0
+        fabricatedZeroIterations["iterations"] = fabricatedZeroRows
+        let fabricatedZeroIterationsURL = temporary.appendingPathComponent("fabricated-zero-iterations.json")
+        try writeJSONObject(fabricatedZeroIterations, to: fabricatedZeroIterationsURL)
+        XCTAssertNotEqual(
+            try verifierExitCode(fabricatedZeroIterationsURL, repository: repository, command: "verify-iterations"),
+            0
+        )
+        XCTAssertNotEqual(
+            try verifierExitCode(
+                fabricatedZeroIterationsURL,
+                repository: repository,
+                command: "verify-iterations",
+                scriptName: "token-saver-local-llm-benchmark.sh"
+            ),
+            0
+        )
+
+        var missingTerminalCandidate = try loadJSONObject(iterationsURL)
+        var incompleteRows = missingTerminalCandidate["iterations"] as! [[String: Any]]
+        let kIndex = try XCTUnwrap(
+            incompleteRows.firstIndex { $0["id"] as? String == "K-reversible-payload-compactor" }
+        )
+        incompleteRows.remove(at: kIndex)
+        missingTerminalCandidate["iterations"] = incompleteRows
+        let missingTerminalCandidateURL = temporary.appendingPathComponent("missing-terminal-candidate.json")
+        try writeJSONObject(missingTerminalCandidate, to: missingTerminalCandidateURL)
+        XCTAssertNotEqual(
+            try verifierExitCode(missingTerminalCandidateURL, repository: repository, command: "verify-iterations"),
+            0
+        )
+
+        var missingEveryTerminalCandidate = try loadJSONObject(iterationsURL)
+        var onlyTechniqueRows = missingEveryTerminalCandidate["iterations"] as! [[String: Any]]
+        onlyTechniqueRows.removeAll {
+            guard let technique = $0["technique"] as? String else { return false }
+            return !["A", "B", "C", "D"].contains(technique)
+        }
+        missingEveryTerminalCandidate["iterations"] = onlyTechniqueRows
+        let missingEveryTerminalCandidateURL = temporary.appendingPathComponent("missing-every-terminal-candidate.json")
+        try writeJSONObject(missingEveryTerminalCandidate, to: missingEveryTerminalCandidateURL)
+        XCTAssertNotEqual(
+            try verifierExitCode(
+                missingEveryTerminalCandidateURL,
+                repository: repository,
+                command: "verify-iterations"
+            ),
+            0
+        )
+
+        var duplicateTechniqueA = try loadJSONObject(iterationsURL)
+        var duplicateTechniqueRows = duplicateTechniqueA["iterations"] as! [[String: Any]]
+        var duplicateA = try XCTUnwrap(duplicateTechniqueRows.first { $0["technique"] as? String == "A" })
+        duplicateA["id"] = "A-duplicate"
+        duplicateTechniqueRows.append(duplicateA)
+        duplicateTechniqueA["iterations"] = duplicateTechniqueRows
+        let duplicateTechniqueAURL = temporary.appendingPathComponent("duplicate-technique-A.json")
+        try writeJSONObject(duplicateTechniqueA, to: duplicateTechniqueAURL)
+        XCTAssertNotEqual(
+            try verifierExitCode(duplicateTechniqueAURL, repository: repository, command: "verify-iterations"),
+            0
+        )
+    }
+
+    func test_suiteVerifierRejectsManifestNumbersThatDisagreeWithHashedArtifacts() throws {
+        let repository = repositoryURL()
+        let suiteURL = repository.appendingPathComponent("docs/benchmarks/token-saver-local-llm/suite.json")
+        XCTAssertEqual(try verifierExitCode(suiteURL, repository: repository, command: "verify-suite"), 0)
+
+        var adulteratedSuite = try loadJSONObject(suiteURL)
+        var artifacts = adulteratedSuite["artifacts"] as! [[String: Any]]
+        let techniqueAIndex = try XCTUnwrap(artifacts.firstIndex { $0["technique"] as? String == "A" })
+        artifacts[techniqueAIndex]["net_tokens_saved"] = 1_935
+        adulteratedSuite["artifacts"] = artifacts
+        adulteratedSuite["aggregate_net_tokens_saved"] = 26_968
+
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("adulterated-token-saver-suite-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        try writeJSONObject(adulteratedSuite, to: temporaryURL)
+
+        XCTAssertNotEqual(try verifierExitCode(temporaryURL, repository: repository, command: "verify-suite"), 0)
+    }
+
     /// Manual, env-gated A/B/C capture. Counts the exact canonical Anthropic request
     /// bodies against oMLX and records hashes, never auth or invented measurements.
     func test_liveCaptureAgainstOMLX() async throws {
@@ -883,16 +1067,25 @@ private extension TokenSaverTechniqueBenchmarkTests {
         URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
     }
 
-    func verifierExitCode(_ artifact: URL, repository: URL) throws -> Int32 {
+    func verifierExitCode(
+        _ artifact: URL,
+        repository: URL,
+        command: String = "verify",
+        scriptName: String = "token-saver-technique-benchmark.sh"
+    ) throws -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [repository.appendingPathComponent("scripts/token-saver-technique-benchmark.sh").path, "verify", artifact.path]
+        process.arguments = [repository.appendingPathComponent("scripts/\(scriptName)").path, command, artifact.path]
         process.currentDirectoryURL = repository
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()
         process.waitUntilExit()
         return process.terminationStatus
+    }
+
+    func loadJSONObject(_ url: URL) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
     }
 
     func git(_ arguments: [String], repository: URL) throws -> String {
