@@ -133,13 +133,26 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     public func post(title: String, body: String?, category: String?) {
-        guard authorized, Self.canUseNotificationCenter else { return }
-        let content = UNMutableNotificationContent()
-        content.title = title
-        if let b = body { content.body = b }
-        if let c = category { content.categoryIdentifier = c }
-        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        notificationCenterClient.add(req, withCompletionHandler: nil)
+        post(Self.legacyContent(title: title, body: body, category: category))
+    }
+
+    static func legacyContent(
+        title: String,
+        body: String?,
+        category: String?
+    ) -> RemoteCodeNotificationContent {
+        var userInfo: [String: String] = [:]
+        if let category, !category.isEmpty {
+            userInfo["category"] = category
+        }
+        return RemoteCodeNotificationContent(
+            identifier: UUID().uuidString,
+            title: title,
+            body: body ?? "",
+            categoryIdentifier: category ?? "",
+            threadIdentifier: "",
+            userInfo: userInfo
+        )
     }
 
     public func post(_ content: RemoteCodeNotificationContent) {

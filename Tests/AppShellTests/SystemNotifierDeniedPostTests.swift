@@ -83,6 +83,23 @@ final class SystemNotifierDeniedPostTests: XCTestCase {
             "so the in-app fallback can deep-link to the thread via the denied-post callback")
     }
 
+    func test_legacyTitleBodyNotification_buildsFallbackContent() {
+        // WHY: scheduled tasks and older command routes still call the
+        // title/body overload. They must carry the same content contract as
+        // the structured path so a denied OS permission can surface an
+        // in-app fallback instead of silently losing the result.
+        let content = SystemNotifier.legacyContent(
+            title: "Scheduled task failed",
+            body: "Deploy production",
+            category: "scheduled"
+        )
+
+        XCTAssertEqual(content.title, "Scheduled task failed")
+        XCTAssertEqual(content.body, "Deploy production")
+        XCTAssertEqual(content.categoryIdentifier, "scheduled")
+        XCTAssertEqual(content.userInfo["category"], "scheduled")
+    }
+
     func test_cancelledContent_carriesDistinctIdentifierSuffix() {
         // Verify that cancelled content passed to onDeniedPost is
         // distinguishable from failed content.
