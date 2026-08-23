@@ -20,6 +20,46 @@ final class BotComputerDockerClientTests: XCTestCase {
         XCTAssertEqual(result.data, expected)
     }
 
+    func test_runProcessFailsClosedWhenStdoutExceedsTheExactOutputLimit() throws {
+        // WHY: docker exec can emit a guest screenshot far larger than expected.
+        // Exact PNG bytes must never be truncated, but the app also must not
+        // retain unbounded stdout while waiting for the subprocess to exit.
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-code-docker-oversized-output-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: UInt64(BotComputerDockerCLI.stdoutRetentionLimit + 1))
+        try handle.close()
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        XCTAssertThrowsError(
+            try BotComputerDockerCLI.runProcess(
+                executableURL: URL(fileURLWithPath: "/bin/cat"),
+                arguments: [file.path]
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? BotComputerDockerProcessError,
+                .stdoutLimitExceeded
+            )
+        }
+    }
+
+    func test_runProcessDrainsOversizedNonExactBuildOutputWithoutRetainingIt() throws {
+        // WHY: docker build logs are not consumed as an exact payload. They
+        // must be drained without turning a verbose build into a provisioning
+        // failure or an unbounded stdout allocation.
+        let result = try BotComputerDockerCLI.runProcess(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "head -c \(BotComputerDockerCLI.stdoutRetentionLimit + 1) /dev/zero"],
+            stdoutLimit: BotComputerDockerCLI.stdoutRetentionLimit,
+            failOnStdoutLimit: false
+        )
+
+        XCTAssertEqual(result.terminationStatus, 0)
+        XCTAssertTrue(result.data.isEmpty)
+    }
+
     func test_defaultRunDrainsStdoutBeforeWaitingForExit() throws {
         // WHY: guest screenshots can exceed a pipe buffer. Waiting for Docker
         // before reading stdout deadlocks the child writer and freezes its caller.
@@ -31,7 +71,7 @@ final class BotComputerDockerClientTests: XCTestCase {
             contentsOf: repoRoot.appendingPathComponent("Sources/CoreModel/BotComputerDockerClient.swift"),
             encoding: .utf8
         )
-        let read = try XCTUnwrap(source.range(of: "readDataToEndOfFile()"))
+        let read = try XCTUnwrap(source.range(of: "stdout.fileHandleForReading.readData(ofLength:"))
         let wait = try XCTUnwrap(source.range(of: "process.waitUntilExit()"))
 
         XCTAssertLessThan(read.lowerBound, wait.lowerBound)

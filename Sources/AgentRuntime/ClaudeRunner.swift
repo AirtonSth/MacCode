@@ -362,6 +362,11 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     /// (matching the servers actually admitted for the run).
     static func automaticallyAllowedTools(environment: [String: String]) -> [String] {
         var tools = BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
+        if environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" {
+            tools += ManagedComputerUseMCP.advertisedToolNames.map {
+                "mcp__\(ComputerUseMCPAdmit.serverName)__\($0)"
+            }
+        }
         if DistillMCPAdmit.isEnabled(environment: environment) {
             tools += DistillMCPAdmit.claudeAutomaticallyAllowedTools
         }
@@ -381,6 +386,9 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
                 environment: environment
             )
         ]
+        if environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" {
+            servers[ComputerUseMCPAdmit.serverName] = ComputerUseMCPAdmit.stdioConfig(command: resolved)
+        }
         if DistillMCPAdmit.isEnabled(environment: environment) {
             servers[DistillMCPAdmit.serverName] = DistillMCPAdmit.claudeServer(
                 command: resolved,

@@ -300,11 +300,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
     public weak var botsViewModel: BotsViewModel?
-    /// Executes bot_browser_* against the app-owned Playwright MCP children.
-    /// Seam so tests inject a recorder instead of spawning npx/docker.
-    lazy var botBrowserBridge: any BotBrowserBridging = BotBrowserPlaywrightHost()
+    private let botComputerReconciliationQueue = DispatchQueue(
+        label: "io.remotecode.bot-computer-reconciliation",
+        qos: .utility
+    )
+    private var botComputerReconciliationScheduled = false
+    /// Routes logical Desktop browser actions through app-managed headless
+    /// Chrome CDP and preserves the existing Playwright local/guest lanes.
+    /// Seam so tests inject a recorder instead of spawning a browser.
+    lazy var botBrowserBridge: any BotBrowserBridging = ManagedChromeHostBrowserBridge()
     /// Replaces the real docker guest provision in tests (no docker in CI).
     var botBrowserGuestEnsureForTesting: (@Sendable (BotID) throws -> Void)?
+    /// Replaces the real pending-action worker in tests without starting Docker.
+    var botComputerReconciliationWorkerForTesting: (@Sendable () -> Void)?
     public private(set) var lastAgentAppHopTextForTesting: String?
     var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
     var providerSignInTerminalInputSenderForTests: ((SurfaceID, String) -> TerminalInputStatus)?
@@ -6764,9 +6772,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    /// Open or retarget this bot's own Playwright browser. Last URL/title
-    /// persist by bot id. Bots never get a RemoteCode in-app browser tab:
-    /// logical-space bots are refused toward the owner's Google Chrome.
+    /// Open or retarget this bot's browser. Last URL/title persist by bot id.
+    /// Bots never get a RemoteCode in-app browser tab: logical-space bots use
+    /// the native headless Chrome bridge.
     @discardableResult
     public func openBotBrowser(botID: BotID, url: String, title: String? = nil) throws -> BotBrowserTarget {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
@@ -6942,25 +6950,52 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Drain MCP pending guest observe/act through the app-process Docker CLI.
     public func reconcileBotComputerActions() {
         guard let ctx = context else { return }
-        let store = BotComputerStore(appSupportDirectory: ctx.appSupportDirectory)
+        guard !botComputerReconciliationScheduled else { return }
+        botComputerReconciliationScheduled = true
+        let appSupport = ctx.appSupportDirectory
+        let botStore = ctx.botStore
+        let worker = botComputerReconciliationWorkerForTesting ?? {
+            Self.reconcileBotComputerActions(appSupport: appSupport, botStore: botStore)
+        }
+        botComputerReconciliationQueue.async { [weak self] in
+            worker()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.botComputerReconciliationScheduled = false
+                if Self.hasPendingBotComputerActions(appSupport: appSupport) {
+                    self.reconcileBotComputerActions()
+                }
+            }
+        }
+    }
+
+    nonisolated private static func reconcileBotComputerActions(appSupport: URL, botStore: BotStore) {
+        let store = BotComputerStore(appSupportDirectory: appSupport)
         let service = BotComputerGuestService(
-            appSupport: ctx.appSupportDirectory,
+            appSupport: appSupport,
             docker: BotComputerDockerCLI(),
             recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
         )
-        try? BotComputerHost.applyPending(store: store) { action in
-            guard let uuid = UUID(uuidString: action.botID) else {
-                throw BotComputerError.invalid("Invalid bot id.")
-            }
-            let botID = BotID(uuid)
-            guard let bot = try ctx.botStore.get(id: botID),
-                  let revisionID = bot.currentRevisionID,
-                  let revision = try ctx.botStore.getRevision(id: revisionID),
-                  BotDesktopAdmission.forPublished(revision.desktopKind).allowsGuestComputer else {
-                throw BotComputerError.notDockerDesktop
-            }
-            return try service.apply(action)
+        while true {
+            let count = (try? BotComputerHost.applyPending(store: store) { action in
+                guard let uuid = UUID(uuidString: action.botID) else {
+                    throw BotComputerError.invalid("Invalid bot id.")
+                }
+                let botID = BotID(uuid)
+                guard let bot = try botStore.get(id: botID),
+                      let revisionID = bot.currentRevisionID,
+                      let revision = try botStore.getRevision(id: revisionID),
+                      BotDesktopAdmission.forPublished(revision.desktopKind).allowsGuestComputer else {
+                    throw BotComputerError.notDockerDesktop
+                }
+                return try service.apply(action)
+            }) ?? 0
+            guard count > 0 else { return }
         }
+    }
+
+    nonisolated private static func hasPendingBotComputerActions(appSupport: URL) -> Bool {
+        (try? BotComputerStore(appSupportDirectory: appSupport).hasPendingActions()) == true
     }
 
     /// Drain legacy MCP pending opens through the same `openBotBrowser`

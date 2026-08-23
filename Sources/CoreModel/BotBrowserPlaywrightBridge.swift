@@ -527,6 +527,8 @@ public final class BotBrowserPlaywrightHost: BotBrowserBridging, @unchecked Send
         let argv: [String]
         let environment = Self.childEnvironment()
         switch route {
+        case .chromeHost:
+            throw BotBrowserPlaywrightBridgeError.invalid("Native Chrome routes must use the composite browser bridge.")
         case .playwrightLocal:
             let npx = try resolveNPX()
             let profile = Self.localProfileDirectory(appSupport: appSupport, botID: botID)

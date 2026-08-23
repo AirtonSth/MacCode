@@ -35,6 +35,39 @@ final class ManagedComputerUseMCPTests: XCTestCase {
         XCTAssertEqual(names, Set(ManagedComputerUseMCP.advertisedToolNames))
     }
 
+    func test_backendTargetedToolsAdvertiseThePIDAndWindowRequiredByRealCalls() async throws {
+        let server = makeServer()
+        let listed = try parse(await server.handle(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
+        let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+        let byName = Dictionary(uniqueKeysWithValues: tools.compactMap { tool -> (String, [String: Any])? in
+            guard let name = tool["name"] as? String,
+                  let schema = tool["inputSchema"] as? [String: Any] else { return nil }
+            return (name, schema)
+        })
+
+        for name in ["zoom", "doctor", "get_ui_tree", "cursor_position"] {
+            let schema = try XCTUnwrap(byName[name])
+            let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+            XCTAssertEqual((properties["target_pid"] as? [String: Any])?["type"] as? String, "integer")
+            XCTAssertEqual((properties["target_window_id"] as? [String: Any])?["type"] as? String, "integer")
+            XCTAssertEqual(schema["required"] as? [String], ["target_pid", "target_window_id"] + (name == "zoom" ? ["region"] : []))
+            if name == "zoom" {
+                XCTAssertEqual(
+                    ((properties["region"] as? [String: Any])?["items"] as? [String: Any])?["type"] as? String,
+                    "integer"
+                )
+            }
+        }
+
+        for name in ["left_click", "right_click", "mouse_move", "scroll", "type", "key", "open_application", "click_element"] {
+            let schema = try XCTUnwrap(byName[name])
+            let required = try XCTUnwrap(schema["required"] as? [String])
+            XCTAssertTrue(required.contains("target_pid"), "\(name) must require the exact target PID")
+            XCTAssertTrue(required.contains("target_window_id"), "\(name) must require the exact target window")
+            XCTAssertTrue(required.contains("expected_state_token"), "\(name) must require the nonempty mutation state token")
+        }
+    }
+
     func test_twoConcurrentMutatingCallsShareTheShippedQueue() async throws {
         let backend = CountingBackend()
         let server = makeServer(backend: backend)

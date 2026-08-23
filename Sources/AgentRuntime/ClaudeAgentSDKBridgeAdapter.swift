@@ -1741,6 +1741,9 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                 environment: environment
             )
         ]
+        if environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" {
+            servers[ComputerUseMCPAdmit.serverName] = ComputerUseMCPAdmit.stdioConfig(command: resolved)
+        }
         if DistillMCPAdmit.isEnabled(environment: environment) {
             servers[DistillMCPAdmit.serverName] = DistillMCPAdmit.claudeServer(
                 command: resolved,

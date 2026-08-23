@@ -5,30 +5,64 @@ import CoreModel
 final class MacOSHarnessInstallTests: XCTestCase {
     private func tempHome() -> URL {
         URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("rc-macos-harness-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("rc-native-host-install-\(UUID().uuidString)", isDirectory: true)
     }
 
-    func test_installMacOSHarnessWritesSkillForEveryProvider() throws {
-        // WHY: Claude, Codex, and Grok must all see macos-harness. A
-        // Claude-only skill would leave Codex/Grok bots on the old MCP.
+    func test_runtimeNoLongerInstallsExternalHostHarness() throws {
+        // WHY: native host control must be shipped by RemoteCode; a provider
+        // run must remove only the old managed harness artifacts.
         let home = tempHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let installer = AgentSkillInstaller(homeDirectory: home)
-        try installer.installMacOSHarness()
-        try installer.installMacOSHarness()
-
+        let managedSource = "https://github.com/browser-use/" + AgentSkillInstaller.legacyExternalHostSkillID
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
         for provider in AgentProvider.allCases {
-            let skill = installer.skillDirectory(provider: provider, skillID: AgentSkillInstaller.macosHarnessSkillID)
-                .appendingPathComponent("SKILL.md")
-            let text = try String(contentsOf: skill, encoding: .utf8)
-            XCTAssertTrue(text.contains("macos-harness"), "\(provider) skill must name the CLI")
-            XCTAssertTrue(text.contains("mac.see"), "\(provider) skill must teach the six primitives")
-            XCTAssertTrue(text.contains("Do not call remotecode-computer-use"))
+            let directory = installer.skillDirectory(
+                provider: provider,
+                skillID: AgentSkillInstaller.legacyExternalHostSkillID
+            )
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data("legacy".utf8).write(to: directory.appendingPathComponent("SKILL.md"))
+            let manifest = AgentSkillManifest(
+                provider: provider,
+                skillID: AgentSkillInstaller.legacyExternalHostSkillID,
+                sourceURL: managedSource,
+                sourceRevision: "0.1.2",
+                localVersion: "1",
+                sha256: AgentSkillInstaller.sha256Hex(Data("legacy".utf8)),
+                installPath: directory.appendingPathComponent("SKILL.md").path,
+                installedAt: Date()
+            )
+            try encoder.encode(manifest).write(to: directory.appendingPathComponent("manifest.json"))
         }
+        let userSkill = installer.skillDirectory(
+            provider: .claude,
+            skillID: AgentSkillInstaller.legacyExternalHostSkillID
+        ).appendingPathComponent("user.txt")
+        // Replace the managed Claude directory with a user-owned copy; cleanup
+        // must not delete a same-named skill without RemoteCode metadata.
+        try FileManager.default.removeItem(at: userSkill.deletingLastPathComponent())
+        try FileManager.default.createDirectory(at: userSkill.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("user".utf8).write(to: userSkill)
+
+        let external = home.appendingPathComponent("external/macos-harness")
+        try FileManager.default.createDirectory(at: external.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("binary".utf8).write(to: external)
+        try FileManager.default.createDirectory(at: installer.managedCLIBinURL, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: installer.managedCLIBinURL.appendingPathComponent(AgentSkillInstaller.legacyExternalHostSkillID),
+            withDestinationURL: external
+        )
+        try installer.uninstallLegacyExternalHostArtifacts()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installer.skillDirectory(provider: .codex, skillID: AgentSkillInstaller.legacyExternalHostSkillID).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: userSkill.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installer.managedCLIBinURL.appendingPathComponent(AgentSkillInstaller.legacyExternalHostSkillID).path))
     }
 
-    func test_installMacOSHarnessStripsManagedComputerUseMCP() throws {
-        // WHY: leftover remotecode-computer-use would compete with macos-harness.
+    func test_installComputerUseMCPIsIdempotentAndPreservesUserServers() throws {
+        // WHY: provider-global config remains a compatibility utility, but it
+        // must only ever contain RemoteCode's bundled MCP and user entries.
         let home = tempHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let binary = home.appendingPathComponent("bin/RemoteCodeDistillService")
@@ -41,23 +75,14 @@ final class MacOSHarnessInstallTests: XCTestCase {
         try Data(#"{"mcpServers":{"other":{"command":"x"}}}"#.utf8).write(to: claudeSettings)
         let installer = AgentSkillInstaller(homeDirectory: home)
         try installer.installComputerUseMCP(serviceBinaryURL: binary)
-        try installer.installMacOSHarness()
+        try installer.installComputerUseMCP(serviceBinaryURL: binary)
 
         let settings = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: claudeSettings)) as? [String: Any])
         let servers = try XCTUnwrap(settings["mcpServers"] as? [String: Any])
-        XCTAssertNotNil(servers["other"], "user MCP must survive the swap")
-        XCTAssertNil(servers[ComputerUseMCPAdmit.serverName], "managed computer-use MCP must be removed")
-    }
-
-    func test_grokSessionDoesNotAdmitComputerUseMCP() {
-        let leftover: [Any] = [["name": "user-slack", "command": "npx"]]
-        let servers = GrokACPClient.sessionMCPServers(
-            existing: leftover,
-            command: "/tmp/RemoteCodeDistillService"
+        XCTAssertNotNil(servers["other"])
+        XCTAssertEqual(
+            (servers[ComputerUseMCPAdmit.serverName] as? [String: Any])?["command"] as? String,
+            binary.path
         )
-        XCTAssertFalse(ComputerUseMCPAdmit.containsAdmittedGrokACP(servers))
-        let names = servers.compactMap { ($0 as? [String: Any])?["name"] as? String }
-        XCTAssertTrue(names.contains("user-slack"))
-        XCTAssertFalse(names.contains(ComputerUseMCPAdmit.serverName))
     }
 }

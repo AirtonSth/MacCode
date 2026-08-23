@@ -4,9 +4,8 @@ import Persistence
 @testable import AppShell
 
 /// Bots never get a RemoteCode in-app browser tab: bot_browser_* routes to an
-/// app-owned Playwright MCP child (local Chrome or docker guest) or is
-/// refused toward the owner's Google Chrome. Tests inject a fake bridge — no
-/// npx, docker, or WKWebView work happens here.
+/// app-owned native Chrome target, Playwright MCP child, or an explicit refusal.
+/// Tests inject a fake bridge — no npx, docker, or WKWebView work happens here.
 final class BotBrowserRouterTests: XCTestCase {
     private final class FakeBotBrowserBridge: BotBrowserBridging, @unchecked Sendable {
         struct Call: Equatable {
@@ -92,16 +91,16 @@ final class BotBrowserRouterTests: XCTestCase {
     }
 
     @MainActor
-    func test_logicalBotIsRefusedTowardGoogleChrome_andNeverGetsASurface() async throws {
-        // WHY: a logical-execution-space bot browses with the owner's Google
-        // Chrome via macos-harness. The old path opened an in-app tab whose
-        // snapshot/act calls then errored (the Trello login incident); both
-        // lanes must now fail loud with the redirect and create nothing.
+    func test_logicalBotRoutesNativeChrome_andNeverGetsASurface() async throws {
+        // WHY: a logical-execution-space bot uses the app-owned headless
+        // Chrome bridge; it must never fall back to an in-app surface.
         let appSupport = NSTemporaryDirectory() + "RC2BotBrowserLogical-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
         let router = AppCommandRouter(context: ctx)
         let fake = FakeBotBrowserBridge()
+        let navigated = expectation(description: "native bridge navigate")
+        fake.performExpectation = navigated
         router.botBrowserBridge = fake
         let workspace = try router.createWorkspace(name: "desk", cwd: NSTemporaryDirectory())
         let bot = try ctx.botStore.create(
@@ -111,14 +110,15 @@ final class BotBrowserRouterTests: XCTestCase {
             workspaceID: workspace.id
         )
 
-        XCTAssertThrowsError(
-            try router.openBotBrowser(botID: bot.id, url: "https://login.example.test/in", title: "Sign in")
-        ) { error in
-            XCTAssertTrue(
-                String(describing: error).contains("Google Chrome"),
-                "refusal must redirect to the owner's Google Chrome, got \(error)"
-            )
-        }
+        let target = try router.openBotBrowser(
+            botID: bot.id,
+            url: "https://login.example.test/in",
+            title: "Sign in"
+        )
+        XCTAssertEqual(target.url, "https://login.example.test/in")
+        wait(for: [navigated], timeout: 5)
+        XCTAssertEqual(fake.recorded().first?.route, .chromeHost)
+        fake.performExpectation = nil
 
         let store = BotBrowserStore(appSupportDirectory: URL(fileURLWithPath: appSupport, isDirectory: true))
         try BotBrowserHost.requestAction(
@@ -135,10 +135,10 @@ final class BotBrowserRouterTests: XCTestCase {
         )
         await router.reconcileBotBrowserActions()
         let result = try XCTUnwrap(try store.takeActionResult(id: "act-1"))
-        XCTAssertTrue(result.error.contains("Google Chrome"), "act must drain to the redirect, got \(result.error)")
-        XCTAssertEqual(result.payload, "")
+        XCTAssertEqual(result.error, "")
+        XCTAssertFalse(result.payload.isEmpty)
 
-        XCTAssertTrue(fake.recorded().isEmpty, "a refused route must never reach the Playwright bridge")
+        XCTAssertTrue(fake.recorded().allSatisfy { $0.route == .chromeHost })
         XCTAssertTrue(botSurfaceIDs(ctx: ctx).isEmpty, "no in-app tab for a bot, ever")
     }
 
@@ -242,18 +242,19 @@ final class BotBrowserRouterTests: XCTestCase {
     }
 
     @MainActor
-    func test_legacyPendingOpenDrainsThroughBridge_refusedOnesSkipQuietly() throws {
+    func test_legacyPendingOpenDrainsThroughBridge_forNativeAndPlaywrightRoutes() throws {
         // WHY: bot_browser_open queued by an older DistillService (or the
         // legacy service.open API) must drain through the same Playwright
-        // path — and a logical bot's queued open is skipped, not a tab.
+        // path — including the native Chrome route — and never a tab.
         let appSupport = NSTemporaryDirectory() + "RC2BotBrowserLegacy-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
         let router = AppCommandRouter(context: ctx)
         let fake = FakeBotBrowserBridge()
-        fake.setPayload(url: "https://login.example.test/in", title: "Sign in")
-        let navigated = expectation(description: "bridge navigate")
+        let navigated = expectation(description: "bridge navigates both routes")
+        navigated.expectedFulfillmentCount = 2
         fake.performExpectation = navigated
+        fake.setPayload(url: "https://login.example.test/in", title: "Sign in")
         router.botBrowserBridge = fake
         let workspace = try router.createWorkspace(name: "desk", cwd: NSTemporaryDirectory())
         let owned = try ctx.botStore.create(
@@ -287,11 +288,14 @@ final class BotBrowserRouterTests: XCTestCase {
         )
 
         let applied = try router.reconcileBotBrowserOpens()
-        XCTAssertEqual(applied.map(\.url), ["https://login.example.test/in"], "only the Playwright-routed bot applies")
-        XCTAssertTrue(try store.loadPendingOpens().isEmpty, "queue drains even when an open is refused")
+        XCTAssertEqual(applied.map(\.url), ["https://login.example.test/in", "https://login.example.test/in"])
+        XCTAssertTrue(try store.loadPendingOpens().isEmpty, "queue drains across native and Playwright routes")
         wait(for: [navigated], timeout: 5)
-        XCTAssertEqual(fake.recorded().map(\.kind), [BotBrowserCatalog.open])
-        XCTAssertEqual(fake.recorded().first?.botID, owned.id)
+        XCTAssertEqual(fake.recorded().map(\.kind), [BotBrowserCatalog.open, BotBrowserCatalog.open])
+        let calls = fake.recorded()
+        XCTAssertEqual(Set(calls.map(\.botID)), Set([owned.id, logical.id]))
+        XCTAssertTrue(calls.contains { $0.route == .playwrightLocal })
+        XCTAssertTrue(calls.contains { $0.route == .chromeHost })
         XCTAssertTrue(botSurfaceIDs(ctx: ctx).isEmpty)
     }
 

@@ -611,7 +611,6 @@ public final class GrokACPClient: @unchecked Sendable {
         let resolved = command
             ?? AgentSkillInstaller.resolveServiceBinary()?.path
             ?? ComputerUseMCPAdmit.fallbackCommand
-        // Bots drive the Mac through macos-harness (skill + CLI), not remotecode-computer-use.
         let withSelfConfig = BotSelfConfigMCPAdmit.admitGrokACP(
             existing: existing,
             command: resolved,
@@ -637,11 +636,15 @@ public final class GrokACPClient: @unchecked Sendable {
                 environment: environment
             )
             : withWeb
-        return BotComputerMCPAdmit.admitGrokACP(
+        let withComputer = BotComputerMCPAdmit.admitGrokACP(
             existing: withDistill,
             command: resolved,
             environment: environment
         )
+        guard environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" else {
+            return withComputer
+        }
+        return ComputerUseMCPAdmit.admitGrokACP(existing: withComputer, command: resolved)
     }
 
     /// ACP `session/new` cwd must be an existing absolute path. Empty or
