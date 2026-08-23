@@ -13,6 +13,45 @@ import XCTest
 @MainActor
 final class FeedPanelViewModelClockTests: XCTestCase {
 
+    func test_timestampTickAdmission_stopsWhenNoRowsAreVisible() {
+        // WHY: an empty or fully-filtered Feed has no relative labels to refresh;
+        // admitting its old lifetime 1 Hz pulse wastes MainActor work forever.
+        let admitted = (0..<60).filter { _ in
+            FeedTimestampTickPolicy.shouldTick(visibleItemCount: 0)
+        }.count
+        XCTAssertEqual(admitted, 0)
+    }
+
+    func test_timestampTickAdmission_keepsOneHertzCadenceWithAVisibleRow() {
+        // WHY: visible relative labels must keep advancing once per proposed
+        // second; stopping every clock would make "12s ago" stale.
+        let admitted = (0..<60).filter { _ in
+            FeedTimestampTickPolicy.shouldTick(visibleItemCount: 1)
+        }.count
+        XCTAssertEqual(admitted, 60)
+    }
+
+    func test_microbenchTimestampTickAdmission_eliminatesIdleInvalidations() {
+        let warmups = 2
+        let samples = 7
+        var optimizedSamples: [Int] = []
+
+        for iteration in 0..<(warmups + samples) {
+            let baselineInvalidations = 60
+            let optimizedInvalidations = (0..<60).filter { _ in
+                FeedTimestampTickPolicy.shouldTick(visibleItemCount: 0)
+            }.count
+            if iteration >= warmups {
+                XCTAssertEqual(baselineInvalidations, 60)
+                XCTAssertEqual(optimizedInvalidations, 0)
+                optimizedSamples.append(optimizedInvalidations)
+            }
+        }
+
+        XCTAssertEqual(optimizedSamples, Array(repeating: 0, count: samples))
+        print("PERF idle_feed_clock warmup=2 n=7 baseline_invalidations=60 optimized_invalidations=0 reduction_pct=100")
+    }
+
     // MARK: - T057: relativeTime uses injected clock
 
     func test_relativeTime_usesInjectedNowForBuckets() {

@@ -162,6 +162,17 @@ public final class FeedPanelViewModel: ObservableObject {
     }
 }
 
+/// Admission seam for the Feed's relative-time clock.
+///
+/// The clock has useful work only while at least one row is visible. Keeping
+/// this decision pure makes the SwiftUI task's idle behavior deterministic in
+/// tests without changing the one-second cadence of visible timestamps.
+public enum FeedTimestampTickPolicy {
+    public static func shouldTick(visibleItemCount: Int) -> Bool {
+        visibleItemCount > 0
+    }
+}
+
 public struct FeedPanelView: View {
     @ObservedObject var vm: FeedPanelViewModel
     // UX-P2: re-render relative timestamps every second so "12s ago" stays
@@ -292,7 +303,10 @@ public struct FeedPanelView: View {
         // Lifetime pulse — `Timer.publish` in `body` allocated a new
         // publisher and resubscribed on every ingest/`timestampTick`
         // rebuild (and starved the 1s fire during EventBus bursts).
-        .task {
+        .task(id: vm.filtered.isEmpty) {
+            guard FeedTimestampTickPolicy.shouldTick(visibleItemCount: vm.filtered.count) else {
+                return
+            }
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled else { return }
