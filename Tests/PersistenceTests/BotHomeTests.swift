@@ -162,11 +162,21 @@ final class BotHomeTests: XCTestCase {
         XCTAssertTrue(migrated.contains("Prefers dark mode"))
         XCTAssertFalse(migrated.contains("Memory projection"))
         XCTAssertFalse(migrated.contains("Store leftover"))
-        XCTAssertFalse(
-            FileManager.default.fileExists(
-                atPath: home.root.appendingPathComponent(BotHome.legacyMemoryName).path
+        // On case-insensitive APFS `memory.md` and `MEMORY.md` are the same inode;
+        // `fileExists` is case-insensitive and returns true when MEMORY.md exists.
+        // Use a case-sensitive directory listing to verify the legacy entry is gone.
+        let entriesAfter = try? FileManager.default.contentsOfDirectory(atPath: home.root.path)
+        let legacyGoneCaseSensitive = entriesAfter?.contains(BotHome.legacyMemoryName) == false
+        let isSameFileCaseInsensitive = BotHome.legacyMemoryName.lowercased() == BotHome.memoryName.lowercased()
+        if isSameFileCaseInsensitive {
+            XCTAssertTrue(legacyGoneCaseSensitive, "legacy memory.md entry must be gone case-sensitively (now MEMORY.md)")
+        } else {
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: home.root.appendingPathComponent(BotHome.legacyMemoryName).path
+                )
             )
-        )
+        }
         try home.migrateLegacyMemoryIfNeeded(legacyFacts: ["Must not clobber"])
         XCTAssertEqual(try String(contentsOf: home.memoryURL, encoding: .utf8), migrated)
     }

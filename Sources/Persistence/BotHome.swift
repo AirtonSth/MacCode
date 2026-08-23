@@ -110,9 +110,50 @@ public struct BotHome: Sendable {
     /// One-time lift of leftover `memory.md` or store bullets into `MEMORY.md`.
     /// Never overwrites an existing `MEMORY.md`.
     public func migrateLegacyMemoryIfNeeded(legacyFacts: [String] = []) throws {
-        if FileManager.default.fileExists(atPath: memoryURL.path) { return }
         let legacyURL = root.appendingPathComponent(Self.legacyMemoryName)
-        if FileManager.default.fileExists(atPath: legacyURL.path) {
+        let legacyExists = FileManager.default.fileExists(atPath: legacyURL.path)
+        let memoryExists = FileManager.default.fileExists(atPath: memoryURL.path)
+        // On case-insensitive APFS `memory.md` and `MEMORY.md` resolve to the same inode.
+        // fileExists on the second then shadows the legacy file. Detect the collision
+        // and migrate in place instead of early-returning with the projection header.
+        let isSameFileCaseInsensitive = legacyURL.path.lowercased() == memoryURL.path.lowercased()
+        if isSameFileCaseInsensitive, legacyExists {
+            let raw = try mappedString(at: legacyURL)
+            let body = Self.stripProjectionHeader(raw)
+            let alreadyMigrated = !raw.contains("# Memory projection") && !raw.contains("Forget and Correct still go through Memory")
+            if alreadyMigrated && !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // Already a proper MEMORY.md on a case-insensitive volume; ensure the
+                // directory entry case is MEMORY.md (case-preserving rename via temp).
+                if let entries = try? FileManager.default.contentsOfDirectory(atPath: root.path),
+                   entries.contains(Self.legacyMemoryName), !entries.contains(Self.memoryName) {
+                    let tmp = root.appendingPathComponent(".tmp-memory-case")
+                    try? FileManager.default.removeItem(at: tmp)
+                    try? FileManager.default.moveItem(at: legacyURL, to: tmp)
+                    try? FileManager.default.moveItem(at: tmp, to: memoryURL)
+                }
+                return
+            }
+            try writeAtomic(
+                body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? Self.memoryStarter + "\n"
+                    : body,
+                to: memoryURL
+            )
+            // Ensure the stored case becomes MEMORY.md on case-insensitive volumes.
+            if let entries = try? FileManager.default.contentsOfDirectory(atPath: root.path),
+               entries.contains(Self.legacyMemoryName), !entries.contains(Self.memoryName) {
+                let tmp = root.appendingPathComponent(".tmp-memory-case")
+                try? FileManager.default.removeItem(at: tmp)
+                if (try? FileManager.default.moveItem(at: legacyURL, to: tmp)) != nil {
+                    try? FileManager.default.moveItem(at: tmp, to: memoryURL)
+                } else if (try? FileManager.default.moveItem(at: memoryURL, to: tmp)) != nil {
+                    try? FileManager.default.moveItem(at: tmp, to: memoryURL)
+                }
+            }
+            return
+        }
+        if memoryExists { return }
+        if legacyExists {
             let raw = try mappedString(at: legacyURL)
             let body = Self.stripProjectionHeader(raw)
             try writeAtomic(
