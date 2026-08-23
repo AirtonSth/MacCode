@@ -514,11 +514,25 @@ enum LibrarianHandlers {
         guard let generate else {
             return unavailableHost(resolved, reason: "generate_runtime_unavailable")
         }
+        let baselineSource = String(resolved.text.prefix(6_000))
+        let evidencePack: LibrarianEvidencePack.Result?
+        if request.retrieveAvailable,
+           request.verifiedRecoveryHandle == resolved.handle {
+            evidencePack = LibrarianEvidencePack(
+                budgetBytes: baselineSource.utf8.count
+            ).pack(
+                source: resolved.text,
+                question: request.question ?? function.summary
+            )
+        } else {
+            evidencePack = nil
+        }
+        let displayedSource = evidencePack?.text ?? baselineSource
         let prompt = """
         Op: \(function.id)
         Question: \(request.question ?? "")
         Source (cite exact substrings only):
-        \(resolved.text.prefix(6000))
+        \(displayedSource)
         Reply with one JSON object only. Keys: answer, span. span MUST be an exact substring of Source. No analysis.
         """
         guard let raw = await generate.generate(LibrarianGenerateCall(
@@ -526,7 +540,7 @@ enum LibrarianHandlers {
             user: String(prompt),
             maxTokens: 512
         )), let clean = LibrarianThinkStrip.strip(raw),
-              let parsed = parseAnswerSpan(clean, source: resolved.text) else {
+              let parsed = parseAnswerSpan(clean, source: displayedSource) else {
             return LibrarianHandlerOutput(
                 status: .unavailable,
                 text: resolved.original,
@@ -548,7 +562,11 @@ enum LibrarianHandlers {
                 originalForSavings: resolved.original
             )
         }
-        if span.isEmpty || !resolved.text.contains(span) {
+        let spanWasShownVerbatim = evidencePack?.containsExactSpan(
+            span,
+            in: resolved.text
+        ) ?? displayedSource.contains(span)
+        if span.isEmpty || !spanWasShownVerbatim || !resolved.text.contains(span) {
             return LibrarianHandlerOutput(
                 status: .lowConfidence,
                 text: resolved.original,
