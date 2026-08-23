@@ -335,6 +335,38 @@ final class LibrarianCatalogTests: XCTestCase {
         XCTAssertFalse(result.text.contains("reasoning_content"))
     }
 
+    func test_askHandle_successEnvelopeDoesNotRepeatToolQuestion() async throws {
+        let dispatcher = LibrarianDispatcher(generate: LibrarianScriptedGenerate())
+        let original = "ERROR payment failed at Sources/Billing.swift:12\nretry ignored\n"
+        let handle = dispatcher.store.put(original)
+        let result = await dispatcher.dispatch(LibrarianRequest(
+            id: "ask_handle",
+            question: "what failed?",
+            handle: handle,
+            provider: "grok"
+        ))
+
+        let envelope = try XCTUnwrap(result.envelope)
+        XCTAssertEqual(envelope.status, .ok)
+        XCTAssertEqual(envelope.op, "ask_handle")
+        XCTAssertEqual(envelope.fallback.recommended, "retrieve")
+        XCTAssertEqual(envelope.fallback.handle, handle)
+        XCTAssertNil(
+            envelope.fallback.question,
+            "the tool input already carries the question; repeating it in the paid tool result wastes context"
+        )
+        XCTAssertTrue(original.contains(try XCTUnwrap(envelope.evidence.first?.span)))
+
+        let encoded = envelope.jsonString()
+        let decoded = try JSONDecoder().decode(LibrarianEnvelope.self, from: Data(encoded.utf8))
+        XCTAssertEqual(decoded, envelope)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(encoded.utf8)) as? [String: Any]
+        )
+        let fallback = try XCTUnwrap(object["fallback"] as? [String: Any])
+        XCTAssertNil(fallback["question"], "the optional duplicate must be absent from the shipping JSON")
+    }
+
     func test_notebookCrusher_stripsOutputs() async {
         let dispatcher = LibrarianDispatcher()
         let notebook = #"{"cells":[{"cell_type":"code","source":["print(1)"],"outputs":[{"data":{"image/png":"aaaa"}}],"execution_count":3}]}"#

@@ -588,7 +588,7 @@ enum LibrarianHandlers {
             op: function.id,
             answer: .object(["text": .string(answer)]),
             evidence: [LibrarianEvidence(handle: resolved.handle, span: span)],
-            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle, question: request.question)
+            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle)
         )
         let paid = function.safety == .candidate
             ? "NON-AUTHORITATIVE DRAFT\n\(answer)\n[[rc:\(resolved.handle)]]"
