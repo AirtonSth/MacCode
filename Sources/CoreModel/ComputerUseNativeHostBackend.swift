@@ -471,6 +471,9 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         let activity = hooks.userActivity(window.target)
         let observedContent: String
         var effectivePixelScope = pixelScope
+        if kind == .pixel, !renderable {
+            effectivePixelScope = nil
+        }
         switch kind {
         case .semantic:
             observedContent = content ?? hooks.uiTree(window.target) ?? "<ui-tree-unavailable>"
@@ -512,6 +515,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                     }
                 case .unavailable:
                     observedContent = "<pixels-unavailable>"
+                    effectivePixelScope = nil
                 }
             } else {
                 observedContent = "<pixels-unavailable>"
@@ -940,7 +944,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
               region.maxY <= CGFloat(image.height),
               let cropped = image.cropping(to: CGRect(
                   x: region.origin.x,
-                  y: CGFloat(image.height) - region.maxY,
+                  y: region.origin.y,
                   width: region.width,
                   height: region.height
               )),

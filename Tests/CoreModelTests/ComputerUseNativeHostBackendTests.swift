@@ -321,6 +321,39 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         }
     }
 
+    func testScopedPixelTokenCannotResumeAfterCaptureBecomesUnavailable() async throws {
+        // WHY: once a scoped observation can no longer be re-captured, the
+        // backend must not mint a placeholder pixel token that a retry could
+        // accept or use to mutate the target.
+        let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 100, height: 100)
+        probe.captureData = try makePNGBase64(width: 200, height: 200)
+        let backend = makeBackend(probe: probe)
+        let zoom = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [40, 30, 80, 60],
+            ]
+        )
+        let token = try XCTUnwrap(stateToken(from: zoom))
+        XCTAssertTrue(token.hasPrefix("native-pixel-v1:"))
+        probe.captureFailure = "capture_unavailable_after_issue"
+
+        for _ in 0..<3 {
+            let result = await backend.invoke(
+                name: "left_click",
+                arguments: baseArguments(token: token).merging(["coordinate": [10, 20]]) { _, value in value }
+            )
+            let text = try XCTUnwrap(result.content.first?.text)
+            XCTAssertTrue(result.isError)
+            XCTAssertTrue(text.contains("stale_state_token"))
+            XCTAssertFalse(text.contains("native-pixel-v1:"), "unavailable recapture must not return a placeholder pixel token")
+        }
+        XCTAssertEqual(probe.leftClickMutations, 0)
+    }
+
     func testExtremePixelRegionEnvelopeFailsClosedWithoutOverflow() async throws {
         let probe = Probe()
         probe.windowBounds = CGRect(x: 100, y: 200, width: 100, height: 100)
@@ -796,6 +829,36 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertNotEqual(croppedData, Data(base64Encoded: probe.captureData))
     }
 
+    func testZoomCropUsesTopLeftRowsWithoutYFlip() async throws {
+        // WHY: screenshot regions are top-left-origin pixels. CGImage.cropping
+        // receives that same origin, so y=0 must select the red top row and
+        // y=1 must select the blue bottom row in this asymmetric image.
+        let probe = Probe()
+        probe.captureData = try makePNGBase64(width: 2, height: 2, rgba: [
+            255, 0, 0, 255, 0, 0, 0, 255,
+            0, 0, 255, 255, 0, 0, 0, 255,
+        ])
+        let backend = makeBackend(probe: probe)
+
+        for (y, expected) in [(0, [UInt8](arrayLiteral: 255, 0, 0, 255)), (1, [UInt8](arrayLiteral: 0, 0, 255, 255))] {
+            let zoom = await backend.invoke(
+                name: "zoom",
+                arguments: [
+                    "target_pid": 17,
+                    "target_window_id": 29,
+                    "region": [0, y, 1, 1],
+                ]
+            )
+            XCTAssertFalse(zoom.isError)
+            let encoded = try XCTUnwrap(zoom.content.last?.data)
+            let data = try XCTUnwrap(Data(base64Encoded: encoded))
+            let image = try XCTUnwrap(NSBitmapImageRep(data: data)?.cgImage)
+            let providerData = try XCTUnwrap(image.dataProvider?.data)
+            let bytes = try XCTUnwrap(CFDataGetBytePtr(providerData))
+            XCTAssertEqual(Array(UnsafeBufferPointer(start: bytes, count: 4)), expected)
+        }
+    }
+
     func testZoomRejectsFractionalNegativeAndOutOfBoundsRegions() async throws {
         let probe = Probe()
         probe.captureData = try makePNGBase64(width: 4, height: 3)
@@ -911,6 +974,25 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         let image = pixels.withUnsafeMutableBytes { bytes in
             CGContext(
                 data: bytes.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )?.makeImage()
+        }
+        let representation = try XCTUnwrap(image.map(NSBitmapImageRep.init(cgImage:)))
+        let data = try XCTUnwrap(representation.representation(using: .png, properties: [:]))
+        return data.base64EncodedString()
+    }
+
+    private func makePNGBase64(width: Int, height: Int, rgba: [UInt8]) throws -> String {
+        XCTAssertEqual(rgba.count, width * height * 4)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let image = rgba.withUnsafeBytes { bytes in
+            CGContext(
+                data: UnsafeMutableRawPointer(mutating: bytes.baseAddress),
                 width: width,
                 height: height,
                 bitsPerComponent: 8,
