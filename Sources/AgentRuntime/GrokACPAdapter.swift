@@ -29,6 +29,76 @@ public struct GrokACPDiscoveryResult: Sendable, Equatable {
     }
 }
 
+/// Bounded pull-history for Grok ACP sessions. The public read window matches
+/// AgentRunCoordinator while a small high-water slack amortizes storage compaction.
+struct GrokACPHistoryRetention: Sendable {
+    static let eventPruneSlack = 1_024
+    static let bytePruneSlack: Int64 = 1_024 * 1_024
+
+    private var storage: [AssistantEvent] = []
+    private var storageBytes: [Int64] = []
+    private var startIndex = 0
+    private var discardedBytes: Int64 = 0
+    private var estimatedBytes: Int64 = 0
+    private let eventLimit: Int
+    private let byteLimit: Int64
+    private let eventSlack: Int
+    private let byteSlack: Int64
+
+    init(
+        eventLimit: Int = AgentRunCoordinator.hotReplayEventCount,
+        byteLimit: Int64 = AgentRunCoordinator.hotReplayEventBytes,
+        eventSlack: Int = eventPruneSlack,
+        byteSlack: Int64 = bytePruneSlack
+    ) {
+        self.eventLimit = max(1, eventLimit)
+        self.byteLimit = max(1, byteLimit)
+        self.eventSlack = max(0, eventSlack)
+        self.byteSlack = max(0, byteSlack)
+        storage.reserveCapacity(self.eventLimit + self.eventSlack + 1)
+        storageBytes.reserveCapacity(self.eventLimit + self.eventSlack + 1)
+    }
+
+    var readableEvents: [AssistantEvent] {
+        Array(storage[startIndex...])
+    }
+
+    var retainedEventCount: Int { storage.count - startIndex }
+    var bufferedEventCount: Int { storage.count }
+    var bufferedEstimatedBytes: Int64 { estimatedBytes + discardedBytes }
+
+    mutating func append(_ event: AssistantEvent) {
+        let eventBytes = Int64(max(1, event.estimatedHotQueueBytes))
+        // Match boundedHotReplay: a frame larger than the whole window cannot
+        // fit alone and must not evict a valid recent tail.
+        guard eventBytes <= byteLimit else { return }
+        storage.append(event)
+        storageBytes.append(eventBytes)
+        estimatedBytes += eventBytes
+        evictIfNeeded()
+    }
+
+    mutating func append(contentsOf newEvents: [AssistantEvent]) {
+        for event in newEvents { append(event) }
+    }
+
+    private mutating func evictIfNeeded() {
+        while retainedEventCount > eventLimit || estimatedBytes > byteLimit {
+            let evictedBytes = storageBytes[startIndex]
+            estimatedBytes -= evictedBytes
+            discardedBytes += evictedBytes
+            startIndex += 1
+        }
+        let crossedEventSlack = eventSlack == 0 ? startIndex > 0 : startIndex > eventSlack
+        let crossedByteSlack = byteSlack == 0 ? discardedBytes > 0 : discardedBytes > byteSlack
+        guard crossedEventSlack || crossedByteSlack else { return }
+        storage.removeFirst(startIndex)
+        storageBytes.removeFirst(startIndex)
+        startIndex = 0
+        discardedBytes = 0
+    }
+}
+
 public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     /// Discovery is still a provider runtime. It must enter the same durable
     /// ownership ledger as interactive Grok sessions so a host crash cannot
@@ -94,7 +164,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         var turnWatchdogSynthesisInProgress = false
         var promptWritePermit = AgentRunAcceptancePermit()
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
-        var history: [AssistantEvent] = []
+        var history: GrokACPHistoryRetention
         var pendingPermissions: [String: PendingPermission] = [:]
 
         init(
@@ -108,6 +178,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             availableModeIDs: Set<String>,
             planModeID: String?,
             mode: String?,
+            maxReadableEvents: Int,
+            maxReadableBytes: Int64,
             onEvent: @escaping @Sendable (AgentRunEvent) -> Void
         ) {
             self.threadId = threadId
@@ -120,6 +192,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             self.availableModeIDs = availableModeIDs
             self.planModeID = planModeID
             self.mode = mode
+            self.history = GrokACPHistoryRetention(
+                eventLimit: maxReadableEvents,
+                byteLimit: maxReadableBytes
+            )
             self.onEvent = onEvent
         }
     }
@@ -143,6 +219,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     private let discoveryCwd: String
     private let discoveryEnvironment: [String: String]
     private let modelCacheTTL: TimeInterval
+    private let maxReadableEvents: Int
+    private let maxReadableBytes: Int64
     private let lock = NSLock()
     private static let discoveryCacheLock = NSLock()
     private static var sharedDiscoveryCache: [String: (result: GrokACPDiscoveryResult, fetchedAt: Date)] = [:]
@@ -172,7 +250,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         turnInactivityTimeout: TimeInterval = 900,
         discoveryCwd: String = FileManager.default.temporaryDirectory.path,
         discoveryEnvironment: [String: String] = [:],
-        modelCacheTTL: TimeInterval = 300
+        modelCacheTTL: TimeInterval = 300,
+        maxReadableEvents: Int = AgentRunCoordinator.hotReplayEventCount,
+        maxReadableBytes: Int64 = AgentRunCoordinator.hotReplayEventBytes
     ) {
         self.binaryNameOverride = binaryNameOverride
         self.cancellationGracePeriod = max(0.01, cancellationGracePeriod)
@@ -180,6 +260,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         self.discoveryCwd = discoveryCwd
         self.discoveryEnvironment = discoveryEnvironment
         self.modelCacheTTL = max(0, modelCacheTTL)
+        self.maxReadableEvents = max(1, maxReadableEvents)
+        self.maxReadableBytes = max(1, maxReadableBytes)
     }
 
     static func tokenSaverCensusAllowed(
@@ -572,7 +654,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
         try synchronized {
             guard let session = sessions[threadId] else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
-            return session.history
+            return session.history.readableEvents
         }
     }
 
@@ -687,6 +769,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 availableModeIDs: availableModeIDs,
                 planModeID: planModeID,
                 mode: opened.currentModeId,
+                maxReadableEvents: maxReadableEvents,
+                maxReadableBytes: maxReadableBytes,
                 onEvent: onEvent
             )
             client.notificationHandler = { [weak self, weak session] method, params in
@@ -989,7 +1073,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             let key = id.stringValue
             let turnId = synchronized { () -> String? in
                 session.pendingPermissions[key] = PendingPermission(request: request, continuation: continuation)
-                return session.history.compactMap { if case .turnStarted(let id) = $0 { return id }; return nil }.last
+                return session.mapper.activeTurnId
             }
             emit(.requestOpened(AssistantPendingRequest(
                 id: key,

@@ -1107,6 +1107,49 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(text, "once")
     }
 
+    func test_eventIDDedupeEvictsOnlyBeyondRecentWindowAndResetsOnReopen() {
+        let mapper = GrokACPEventMapper(
+            sessionId: "s",
+            eventIDDedupeLimit: 3,
+            eventIDDedupePruneSlack: 2
+        )
+        func update(_ id: Int) -> [String: Any] {
+            [
+                "sessionUpdate": "config_option_update",
+                "value": id,
+                "_meta": ["eventId": "event-\(id)"]
+            ]
+        }
+
+        for id in 0..<3 {
+            XCTAssertFalse(mapper.consumeSessionUpdate(update(id)).isEmpty)
+        }
+        XCTAssertEqual(mapper.retainedEventIDCountForTesting, 3)
+        XCTAssertTrue(mapper.consumeSessionUpdate(update(0)).isEmpty,
+                      "an ID inside the exact recent window must dedupe")
+
+        XCTAssertFalse(mapper.consumeSessionUpdate(update(3)).isEmpty)
+        XCTAssertEqual(mapper.retainedEventIDCountForTesting, 3,
+                       "inserting a new ID must evict the oldest logical member")
+        XCTAssertTrue(mapper.consumeSessionUpdate(update(2)).isEmpty,
+                      "a recent retained ID must still dedupe after pruning")
+        XCTAssertFalse(mapper.consumeSessionUpdate(update(0)).isEmpty,
+                       "an evicted old ID may be accepted without unbounded retention")
+        XCTAssertEqual(mapper.bufferedEventIDCountForTesting, 5,
+                       "physical ID storage may use bounded slack before compaction")
+        XCTAssertFalse(mapper.consumeSessionUpdate(update(4)).isEmpty)
+        XCTAssertEqual(mapper.bufferedEventIDCountForTesting, 3,
+                       "crossing slack must compact the discarded FIFO prefix")
+
+        let reopened = GrokACPEventMapper(
+            sessionId: "s",
+            eventIDDedupeLimit: 3,
+            eventIDDedupePruneSlack: 2
+        )
+        XCTAssertFalse(reopened.consumeSessionUpdate(update(2)).isEmpty,
+                       "a new ACP mapper/reopen must not inherit stale in-memory dedupe state")
+    }
+
     func test_sealHydrationClearsReplayTurnSoBeginTurnMintsFreshUserTurn() {
         // WHY: session/load replay used to leave turnId set; beginTurn no-oped
         // and follow-up prompts inherited prior tool_call steps.

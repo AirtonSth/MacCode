@@ -43,6 +43,34 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
                       "completed-class stop reasons must not emit .error events")
     }
 
+    func test_readThreadAppliesExactCapAndKeepsNewestTerminal() async throws {
+        let peer = try FakeGrokACPPeer(mode: .maxTokens)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(
+            binaryNameOverride: peer.path,
+            cancellationGracePeriod: 0.05,
+            maxReadableEvents: 5,
+            maxReadableBytes: 1_000_000
+        )
+        let request = makeRequest()
+        let box = GrokACPEventBox()
+        _ = try await adapter.startSession(request) { box.append($0) }
+        _ = try await box.waitFinished(timeout: 3)
+
+        let history = try await adapter.readThread(threadId: request.threadId)
+        XCTAssertEqual(history.count, 5,
+                       "internal hysteresis must not expand the public readThread cap")
+        XCTAssertFalse(history.contains {
+            if case .threadStarted = $0 { return true }
+            return false
+        }, "the oldest event must leave the exact public suffix")
+        XCTAssertTrue(history.contains {
+            if case .turnCompleted(_, let final) = $0 { return final == "token cap reached" }
+            return false
+        }, "the newest terminal must survive the capped suffix")
+        adapter.stopAll()
+    }
+
     /// WHY: field 2026-08-05 — Grok streamed a full **COMPLETE** final then
     /// never resolved session/prompt (timeout: nil). Working latched 70m+ with
     /// Stop while durable agent_runs stayed running. The inactivity watchdog

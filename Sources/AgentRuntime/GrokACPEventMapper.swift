@@ -1,6 +1,44 @@
 import Foundation
 import CoreModel
 
+/// Recent ACP event-id membership with FIFO eviction. IDs older than the
+/// readable replay window may be accepted again after reopen/replay.
+struct GrokACPRecentEventIDs: Sendable {
+    static let defaultLimit = AgentRunCoordinator.hotReplayEventCount
+    static let pruneSlack = 1_024
+
+    private var values = Set<String>()
+    private var order: [String] = []
+    private var startIndex = 0
+    private let limit: Int
+    private let slack: Int
+
+    init(limit: Int = defaultLimit, slack: Int = pruneSlack) {
+        self.limit = max(1, limit)
+        self.slack = max(0, slack)
+        values.reserveCapacity(self.limit + 1)
+        order.reserveCapacity(self.limit + self.slack + 1)
+    }
+
+    var count: Int { values.count }
+    var bufferedCount: Int { order.count }
+
+    mutating func insert(_ eventId: String) -> Bool {
+        guard values.insert(eventId).inserted else { return false }
+        order.append(eventId)
+        if values.count > limit {
+            values.remove(order[startIndex])
+            startIndex += 1
+        }
+        let crossedSlack = slack == 0 ? startIndex > 0 : startIndex > slack
+        if crossedSlack {
+            order.removeFirst(startIndex)
+            startIndex = 0
+        }
+        return true
+    }
+}
+
 public final class GrokACPEventMapper: @unchecked Sendable {
     public let sessionId: String
     public private(set) var availableCommands: [GrokACPAvailableCommand] = []
@@ -20,7 +58,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
     /// so finishTurn does not yield a nil final after a turn that already spoke.
     private var lastNonEmptyAssistantPhase = ""
     private var finished = false
-    private var seenEventIds = Set<String>()
+    private var seenEventIds: GrokACPRecentEventIDs
     /// Shell-detached work Grok does NOT track: a tool_call whose rawInput
     /// command backgrounds children with `&` / `nohup` / `setsid` / `disown`.
     /// When set at a completed turn end, we prefix `[[RC_AWAITING]]` onto
@@ -35,7 +73,33 @@ public final class GrokACPEventMapper: @unchecked Sendable {
     private var openToolCallIds = Set<String>()
     private let lock = NSLock()
 
-    public init(sessionId: String) { self.sessionId = sessionId }
+    public init(sessionId: String) {
+        self.sessionId = sessionId
+        self.seenEventIds = GrokACPRecentEventIDs()
+    }
+
+    init(sessionId: String, eventIDDedupeLimit: Int, eventIDDedupePruneSlack: Int) {
+        self.sessionId = sessionId
+        self.seenEventIds = GrokACPRecentEventIDs(
+            limit: eventIDDedupeLimit,
+            slack: eventIDDedupePruneSlack
+        )
+    }
+
+    var activeTurnId: String? {
+        lock.lock(); defer { lock.unlock() }
+        return turnId
+    }
+
+    var retainedEventIDCountForTesting: Int {
+        lock.lock(); defer { lock.unlock() }
+        return seenEventIds.count
+    }
+
+    var bufferedEventIDCountForTesting: Int {
+        lock.lock(); defer { lock.unlock() }
+        return seenEventIds.bufferedCount
+    }
 
     /// Seed or refresh the ACP mode so plan session updates can distinguish
     /// live progress (default/full-access) from Plan-mode review artifacts.
@@ -116,7 +180,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         var events: [AssistantEvent] = []
         if let metadata = update["_meta"] as? [String: Any],
            let eventId = metadata["eventId"] as? String,
-           !seenEventIds.insert(eventId).inserted {
+           !seenEventIds.insert(eventId) {
             return []
         }
         ensureThread(&events)
