@@ -56,8 +56,12 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         let recovery = try RecoveryContext.temporary(cases: [item])
         defer { recovery.removeTemporaryFiles() }
         let episode = try await shippingEpisode(item, recovery: recovery)
-        let baseline = episode.envelopeJSON
-        var candidate = try jsonObject(Data(baseline.utf8))
+        var baselineObject = try jsonObject(Data(episode.envelopeJSON.utf8))
+        var baselineFallback = try requireDictionary(baselineObject["fallback"])
+        baselineFallback["question"] = item.question
+        baselineObject["fallback"] = baselineFallback
+        let baseline = String(decoding: try canonicalJSON(baselineObject), as: UTF8.self)
+        var candidate = baselineObject
         var fallback = try requireDictionary(candidate["fallback"])
         fallback.removeValue(forKey: "question")
         candidate["fallback"] = fallback
