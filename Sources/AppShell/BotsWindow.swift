@@ -9461,6 +9461,22 @@ private struct BotsDeleteConfirmation: ViewModifier {
 
 // MARK: - Root view
 
+/// Keeps the Desk composer's elapsed label live only while a run can change it.
+/// An idle schedule yields the initial render and then ends, while a live run
+/// preserves the prior one-second cadence.
+struct BotsComposerTimelineSchedule: TimelineSchedule {
+    let runIsLive: Bool
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        var next: Date? = startDate
+        return AnyIterator {
+            guard let current = next else { return nil }
+            next = runIsLive ? current.addingTimeInterval(1) : nil
+            return current
+        }
+    }
+}
+
 public struct BotsRootView: View {
     @ObservedObject private var vm: BotsViewModel
     /// Standalone Bots window keeps its own rail. The main shell hosts the
@@ -11019,7 +11035,7 @@ public struct BotsRootView: View {
     }
 
     private func composerBar(_ bot: BotDefinition) -> some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
+        TimelineView(BotsComposerTimelineSchedule(runIsLive: vm.deskRunIsLive)) { context in
             AgentChatComposerBar(
                 text: $vm.composerText,
                 attachments: vm.attachments,

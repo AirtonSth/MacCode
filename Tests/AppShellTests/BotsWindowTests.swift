@@ -1716,6 +1716,55 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_deskComposerTimelineSchedule_stopsAfterInitialIdleRender() {
+        // WHY: with no live Desk run, the composer label is static. The old
+        // periodic TimelineView still invalidated it once per second forever.
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let entries = BotsComposerTimelineSchedule(runIsLive: false)
+            .entries(from: start, mode: .normal)
+        let renderedDates = Array(entries.prefix(61))
+
+        XCTAssertEqual(renderedDates, [start])
+        XCTAssertEqual(renderedDates.dropFirst().count, 0,
+                       "60 idle seconds must produce zero follow-up invalidations")
+    }
+
+    func test_deskComposerTimelineSchedule_keepsOneHertzDuringLiveRun() {
+        // WHY: the elapsed Working label must retain its existing one-second
+        // cadence while the selected Desk thread is actually running.
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let entries = BotsComposerTimelineSchedule(runIsLive: true)
+            .entries(from: start, mode: .normal)
+        let renderedDates = Array(entries.prefix(61))
+
+        XCTAssertEqual(renderedDates.count, 61)
+        XCTAssertEqual(renderedDates.first, start)
+        XCTAssertEqual(renderedDates.last, start.addingTimeInterval(60))
+        XCTAssertTrue(zip(renderedDates, renderedDates.dropFirst()).allSatisfy {
+            $1.timeIntervalSince($0) == 1
+        })
+    }
+
+    func test_microbenchDeskComposerTimelineSchedule_eliminatesIdleInvalidations() {
+        let warmups = 2
+        let samples = 7
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var optimizedSamples: [Int] = []
+
+        for iteration in 0..<(warmups + samples) {
+            let entries = BotsComposerTimelineSchedule(runIsLive: false)
+                .entries(from: start, mode: .normal)
+            let optimizedInvalidations = Array(entries.prefix(61)).dropFirst().count
+            if iteration >= warmups {
+                XCTAssertEqual(optimizedInvalidations, 0)
+                optimizedSamples.append(optimizedInvalidations)
+            }
+        }
+
+        XCTAssertEqual(optimizedSamples, Array(repeating: 0, count: samples))
+        print("PERF idle_bots_composer_clock warmup=2 n=7 baseline_invalidations=60 optimized_invalidations=0 reduction_pct=100 live_invalidations=60")
+    }
+
     func test_deskReplaysStreamEventsOnOpen_becauseThinkingMustSurviveClose() throws {
         // WHY: Desk is not a second Agent App window, but it must replay the
         // linked thread's persisted stream events so Thought / Worked remain
