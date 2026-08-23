@@ -7,6 +7,7 @@ import XCTest
 final class TokenSaverRound2BenchmarkTests: XCTestCase {
     private static let fixtureSHA256 = "2f7f815fa8efa3891809c1b66cbcc1b495c016d848401cf78d628cd836c00749"
     private static let techniqueID = "librarian-success-fallback-question-elision-v1"
+    private static let catalogTestDiffSHA256 = "adcd7491dc68ec0cf3654b3321e3964f1dcb0e4289b3aa195fc9b6ed51ad14f3"
 
     func test_fixtureFreezesTwentyFourAdversarialShippingCases() throws {
         let (fixture, bytes) = try loadFixture()
@@ -106,6 +107,197 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         ))
     }
 
+    func test_rawShippingComparisonRejectsAnyOtherByteChange() throws {
+        let question = "why / why?"
+        let baselineEnvelope = try canonicalJSON([
+            "fallback": ["handle": "rcv1.example", "question": question, "recommended": "retrieve"],
+            "status": "ok",
+        ])
+        let candidateEnvelope = try canonicalJSON([
+            "fallback": ["handle": "rcv1.example", "recommended": "retrieve"],
+            "status": "ok",
+        ])
+        let baseline = try canonicalJSON(["other": "a/b", "text": String(decoding: baselineEnvelope, as: UTF8.self)])
+        let candidate = try canonicalJSON(["other": "a/b", "text": String(decoding: candidateEnvelope, as: UTF8.self)])
+        XCTAssertTrue(try differsOnlyByLiteralQuestionBytes(baseline: baseline, candidate: candidate, question: question))
+
+        let candidateText = String(decoding: candidate, as: UTF8.self)
+        let orderedPrefix = #"{"other":"a/b","text":"#
+        let reordered = candidateText.hasPrefix(orderedPrefix)
+            ? #"{"text":"# + String(candidateText.dropFirst(orderedPrefix.count).dropLast()) + #", "other":"a/b"}"#
+            : candidateText
+        let mutations = [
+            Data((candidateText + "\n").utf8),
+            Data(candidateText.replacingOccurrences(of: #""other":"a/b""#, with: #""other": "a/b""#).utf8),
+            Data(candidateText.replacingOccurrences(of: "a/b", with: #"a\/b"#).utf8),
+            Data(reordered.utf8),
+        ]
+        for mutation in mutations {
+            XCTAssertFalse(try differsOnlyByLiteralQuestionBytes(baseline: baseline, candidate: mutation, question: question))
+        }
+    }
+
+    func test_candidateSourceBoundaryAllowsOnlyTheExactLineTransformation() {
+        let removed = #"            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle, question: request.question)"#
+        let added = #"            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle)"#
+        XCTAssertTrue(isExactTechniqueSourceChange(removed: [removed], added: [added]))
+        XCTAssertFalse(isExactTechniqueSourceChange(removed: [removed, "extra"], added: [added]))
+        XCTAssertFalse(isExactTechniqueSourceChange(removed: [removed], added: [" " + added]))
+        XCTAssertFalse(isExactTechniqueSourceChange(
+            removed: [removed],
+            added: [#"            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle, question: nil)"#]
+        ))
+
+        let catalogTest = "    func test_askHandle_successEnvelopeDoesNotRepeatToolQuestion() async throws {"
+        XCTAssertTrue(hasRequiredCatalogRegression(
+            removed: [],
+            added: [catalogTest],
+            diffSHA256: Self.catalogTestDiffSHA256
+        ))
+        XCTAssertFalse(hasRequiredCatalogRegression(
+            removed: ["old assertion"],
+            added: [catalogTest],
+            diffSHA256: Self.catalogTestDiffSHA256
+        ))
+        XCTAssertFalse(hasRequiredCatalogRegression(
+            removed: [],
+            added: [catalogTest],
+            diffSHA256: String(repeating: "0", count: 64)
+        ))
+    }
+
+    func test_sourceCaptureStateRejectsDirtyOrChangedCheckout() throws {
+        let clean = SourceCaptureState(
+            gitSHA: String(repeating: "a", count: 40),
+            treeSHA: String(repeating: "b", count: 40),
+            statusPorcelain: ""
+        )
+        XCTAssertNoThrow(try requireStableSourceCapture(initial: clean, final: clean, expectedGitSHA: clean.gitSHA))
+        XCTAssertThrowsError(try requireStableSourceCapture(
+            initial: clean,
+            final: SourceCaptureState(gitSHA: clean.gitSHA, treeSHA: clean.treeSHA, statusPorcelain: " M file"),
+            expectedGitSHA: clean.gitSHA
+        ))
+        XCTAssertThrowsError(try requireStableSourceCapture(
+            initial: clean,
+            final: SourceCaptureState(gitSHA: String(repeating: "c", count: 40), treeSHA: clean.treeSHA, statusPorcelain: ""),
+            expectedGitSHA: clean.gitSHA
+        ))
+    }
+
+    func test_allTwentyFourS2RetrievesAreSuccessfulAndByteExact() async throws {
+        let cases = try loadFixture().fixture.cases
+        let recovery = try RecoveryContext.temporary(cases: cases)
+        defer { recovery.removeTemporaryFiles() }
+        for item in cases {
+            let episode = try await shippingEpisode(item, recovery: recovery)
+            XCTAssertEqual(episode.retrieveResult["isError"] as? Bool, false, item.id)
+            XCTAssertEqual((episode.retrieveResult["content"] as? [[String: Any]])?.count, 1, item.id)
+            XCTAssertEqual(Data(try envelopeText(from: episode.retrieveResult).utf8), Data(item.source.utf8), item.id)
+        }
+    }
+
+    func test_modelBindingEnumeratesRegularAndSafeHFSymlinkLeaves() throws {
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-model-\(UUID().uuidString)", isDirectory: true)
+        let modelsRoot = temporary.appendingPathComponent("models--org--repo", isDirectory: true)
+        let root = modelsRoot
+            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(String(repeating: "a", count: 40), isDirectory: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("weights"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: modelsRoot.appendingPathComponent("blobs"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        for (path, text) in [
+            ("config.json", "{}"), ("tokenizer.json", "{}"),
+            ("tokenizer_config.json", "{}"), ("vocab.json", "{}"),
+            ("merges.txt", "a b"), ("README.md", "bound too"),
+        ] {
+            let url = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: url)
+        }
+        try Data("weights".utf8).write(to: modelsRoot.appendingPathComponent("blobs/model-weight"))
+        try FileManager.default.createSymbolicLink(
+            atPath: root.appendingPathComponent("weights/model.safetensors").path,
+            withDestinationPath: "../../../blobs/model-weight"
+        )
+        let bound = try modelBinding(root)
+        XCTAssertEqual(Set(bound.files.compactMap { $0["path"] as? String }), [
+            "README.md", "config.json", "merges.txt", "tokenizer.json",
+            "tokenizer_config.json", "vocab.json", "weights/model.safetensors",
+        ])
+        let weight = try XCTUnwrap(bound.files.first { $0["path"] as? String == "weights/model.safetensors" })
+        XCTAssertEqual(weight["kind"] as? String, "symlink")
+        XCTAssertEqual(weight["link_target"] as? String, "../../../blobs/model-weight")
+        XCTAssertEqual(weight["sha256"] as? String, sha256(Data("weights".utf8)))
+
+        let outside = temporary.appendingPathComponent("outside.safetensors")
+        try Data("outside".utf8).write(to: outside)
+        let link = root.appendingPathComponent("weights/outside.safetensors")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "../../../../outside.safetensors")
+        XCTAssertThrowsError(try modelBinding(root))
+        try FileManager.default.removeItem(at: link)
+
+        let directoryLink = root.appendingPathComponent("linked-directory")
+        try FileManager.default.createSymbolicLink(atPath: directoryLink.path, withDestinationPath: "../../blobs")
+        XCTAssertThrowsError(try modelBinding(root))
+        try FileManager.default.removeItem(at: directoryLink)
+
+        let rootLink = temporary.appendingPathComponent("snapshot-link")
+        try FileManager.default.createSymbolicLink(at: rootLink, withDestinationURL: root)
+        XCTAssertThrowsError(try modelBinding(rootLink))
+    }
+
+    func test_modelStatusRequiresOneLoadedSelectedModelAtServedPath() throws {
+        let modelPath = "/tmp/models--org--repo/snapshots/\(String(repeating: "a", count: 40))"
+        let valid = try canonicalJSON(["models": [
+            ["id": "selected", "loaded": true, "model_path": modelPath],
+            ["id": "other", "loaded": false, "model_path": "/tmp/other"],
+        ]])
+        let selected = try selectedModelStatus(in: valid, selectedID: "selected")
+        XCTAssertEqual(selected.modelPath, modelPath)
+
+        let duplicate = try canonicalJSON(["models": [
+            ["id": "selected", "loaded": true, "model_path": modelPath],
+            ["id": "selected", "loaded": true, "model_path": modelPath],
+        ]])
+        XCTAssertThrowsError(try selectedModelStatus(in: duplicate, selectedID: "selected"))
+        let unloaded = try canonicalJSON(["models": [["id": "selected", "loaded": false, "model_path": modelPath]]])
+        XCTAssertThrowsError(try selectedModelStatus(in: unloaded, selectedID: "selected"))
+    }
+
+    func test_manifestIncludesNestedManifestAndRejectsAnySymlink() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-manifest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("nested"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("payload".utf8).write(to: root.appendingPathComponent("payload.bin"))
+        try Data("nested".utf8).write(to: root.appendingPathComponent("nested/manifest.json"))
+        try writeManifest(in: root)
+        let manifest = try jsonObject(Data(contentsOf: root.appendingPathComponent("manifest.json")))
+        let paths = Set((manifest["files"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String })
+        XCTAssertEqual(paths, ["nested/manifest.json", "payload.bin"])
+
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("payload-link"),
+            withDestinationURL: root.appendingPathComponent("payload.bin")
+        )
+        XCTAssertThrowsError(try writeManifest(in: root))
+    }
+
+    func test_captureConfigurationRejectsNonemptyShortAuthorization() {
+        let environment = [
+            "RC_TOKEN_SAVER_ROUND2_ARM": "baseline",
+            "RC_TOKEN_SAVER_ROUND2_EXPECTED_GIT_SHA": String(repeating: "a", count: 40),
+            "RC_TOKEN_SAVER_ROUND2_OUTPUT_DIR": "/tmp/round2-output",
+            "RC_TOKEN_SAVER_ROUND2_BASE_URL": "http://127.0.0.1:8000/v1",
+            "RC_TOKEN_SAVER_ROUND2_MODEL": "model",
+            "RC_TOKEN_SAVER_ROUND2_MODEL_SNAPSHOT": "/tmp/Models/repo/\(String(repeating: "b", count: 40))",
+            "RC_TOKEN_SAVER_ROUND2_AUTH_TOKEN": "short",
+        ]
+        XCTAssertThrowsError(try CaptureConfiguration(environment))
+    }
+
     /// Manual and fail-closed. The shell coordinator sets this only after proving
     /// the checkout is clean and HEAD equals the arm SHA.
     func test_captureArmAgainstOMLX() async throws {
@@ -120,13 +312,15 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         }
 
         let repository = repositoryURL()
-        let head = try git(["rev-parse", "HEAD"], repository).trimmed
-        guard head == configuration.expectedGitSHA else {
-            throw Round2Error.invalid("compiled checkout HEAD does not equal expected arm SHA")
-        }
-        let tree = try git(["rev-parse", "HEAD^{tree}"], repository).trimmed
+        let initialSourceState = try sourceCaptureState(repository: repository)
+        try requireStableSourceCapture(
+            initial: initialSourceState,
+            final: initialSourceState,
+            expectedGitSHA: configuration.expectedGitSHA
+        )
+        let head = initialSourceState.gitSHA
+        let tree = initialSourceState.treeSHA
         let sourceBindings = try sourceBindings(repository: repository, gitSHA: head)
-        let modelBinding = try modelBinding(configuration.modelSnapshot)
 
         let output = configuration.outputDirectory
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
@@ -147,11 +341,39 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         guard modelIDs.filter({ $0 == configuration.model }).count == 1 else {
             throw Round2Error.invalid("/v1/models must contain the selected model exactly once")
         }
+        let modelsStatusURL = configuration.baseURL
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent("status")
+        let modelsStatusBeforeResponse = try await request(
+            modelsStatusURL,
+            method: "GET",
+            body: nil,
+            token: configuration.authToken
+        )
+        let selectedStatusBefore = try selectedModelStatus(
+            in: modelsStatusBeforeResponse,
+            selectedID: configuration.model
+        )
+        let configuredSnapshotValues = try configuration.modelSnapshot.resourceValues(forKeys: [.isSymbolicLinkKey])
+        guard configuredSnapshotValues.isSymbolicLink != true else {
+            throw Round2Error.invalid("configured snapshot root must not be a symlink")
+        }
+        let configuredSnapshotPath = try canonicalDirectoryPath(configuration.modelSnapshot)
+        let servedSnapshotURL = URL(fileURLWithPath: selectedStatusBefore.modelPath, isDirectory: true)
+        let servedSnapshotPath = try canonicalDirectoryPath(servedSnapshotURL)
+        guard configuredSnapshotPath == servedSnapshotPath else {
+            throw Round2Error.invalid("configured snapshot is not the selected model_path served by oMLX")
+        }
+        let modelBinding = try modelBinding(servedSnapshotURL)
         let openAPIURL = configuration.baseURL.deletingLastPathComponent().appendingPathComponent("openapi.json")
         let openAPIResponse = try await request(openAPIURL, method: "GET", body: nil, token: configuration.authToken)
         let serverVersion = try openAPIVersion(openAPIResponse)
 
         try modelsResponse.write(to: output.appendingPathComponent("models-response.json"), options: .atomic)
+        try modelsStatusBeforeResponse.write(
+            to: output.appendingPathComponent("models-status-before.json"),
+            options: .atomic
+        )
         try openAPIResponse.write(to: output.appendingPathComponent("server-openapi.json"), options: .atomic)
 
         var caseReports: [[String: Any]] = []
@@ -245,6 +467,8 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
                 throw Round2Error.invalid("\(item.id) arm does not match fallback.question contract")
             }
             guard episode.readbackExact,
+                  episode.retrieveResult["isError"] as? Bool == false,
+                  (try envelopeText(from: episode.retrieveResult)) == item.source,
                   episode.envelope.status == .ok,
                   episode.envelope.op == "ask_handle",
                   episode.envelope.answer == .object(["text": .string(item.answer)]),
@@ -276,9 +500,41 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
             ])
         }
 
+        let modelsStatusAfterResponse = try await request(
+            modelsStatusURL,
+            method: "GET",
+            body: nil,
+            token: configuration.authToken
+        )
+        let selectedStatusAfter = try selectedModelStatus(
+            in: modelsStatusAfterResponse,
+            selectedID: configuration.model
+        )
+        guard selectedStatusAfter.modelPath == selectedStatusBefore.modelPath,
+              try canonicalDirectoryPath(URL(fileURLWithPath: selectedStatusAfter.modelPath, isDirectory: true)) == servedSnapshotPath else {
+            throw Round2Error.invalid("selected oMLX model binding changed during counting")
+        }
+        let modelBindingAfter = try self.modelBinding(servedSnapshotURL)
+        guard modelBindingAfter.path == modelBinding.path,
+              modelBindingAfter.revision == modelBinding.revision,
+              modelBindingAfter.manifestSHA256 == modelBinding.manifestSHA256,
+              try canonicalJSON(modelBindingAfter.files) == canonicalJSON(modelBinding.files) else {
+            throw Round2Error.invalid("served model snapshot contents changed during counting")
+        }
+        try modelsStatusAfterResponse.write(
+            to: output.appendingPathComponent("models-status-after.json"),
+            options: .atomic
+        )
+
         try recovery.persistCapabilities()
         let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
         let executableData = try Data(contentsOf: executableURL, options: .mappedIfSafe)
+        let finalSourceState = try sourceCaptureState(repository: repository)
+        try requireStableSourceCapture(
+            initial: initialSourceState,
+            final: finalSourceState,
+            expectedGitSHA: configuration.expectedGitSHA
+        )
         let report: [String: Any] = [
             "schema_version": 1,
             "technique_id": Self.techniqueID,
@@ -289,6 +545,10 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
                 "git_sha": head,
                 "tree_sha": tree,
                 "dirty": false,
+                "capture_checks": [
+                    "initial": initialSourceState.reportObject,
+                    "pre_report": finalSourceState.reportObject,
+                ],
                 "bindings": sourceBindings,
                 "executable_sha256": sha256(executableData),
             ],
@@ -297,11 +557,14 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
                 "id": configuration.model,
                 "server": "oMLX",
                 "server_version": serverVersion,
+                "served_model_path": selectedStatusBefore.modelPath,
                 "snapshot_path": modelBinding.path,
                 "revision": modelBinding.revision,
                 "files": modelBinding.files,
                 "manifest_sha256": modelBinding.manifestSHA256,
                 "models_response_sha256": sha256(modelsResponse),
+                "models_status_before_sha256": sha256(modelsStatusBeforeResponse),
+                "models_status_after_sha256": sha256(modelsStatusAfterResponse),
                 "openapi_response_sha256": sha256(openAPIResponse),
             ],
             "cases": caseReports,
@@ -561,6 +824,33 @@ private extension TokenSaverRound2BenchmarkTests {
         return models.compactMap { $0["id"] as? String }
     }
 
+    func selectedModelStatus(in data: Data, selectedID: String) throws -> ServedModelStatus {
+        let object = try jsonObject(data)
+        guard let models = object["models"] as? [[String: Any]] else {
+            throw Round2Error.invalid("invalid /v1/models/status response")
+        }
+        let selected = models.filter { $0["id"] as? String == selectedID }
+        guard selected.count == 1,
+              selected[0]["loaded"] as? Bool == true,
+              let modelPath = selected[0]["model_path"] as? String,
+              !modelPath.isEmpty else {
+            throw Round2Error.invalid("/v1/models/status must contain one loaded selected model with model_path")
+        }
+        return ServedModelStatus(id: selectedID, modelPath: modelPath)
+    }
+
+    func canonicalDirectoryPath(_ url: URL) throws -> String {
+        guard let canonicalPath = try url.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath,
+              FileManager.default.fileExists(atPath: canonicalPath) else {
+            throw Round2Error.invalid("model path does not resolve to an existing directory")
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: canonicalPath, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw Round2Error.invalid("model path does not resolve to a directory")
+        }
+        return canonicalPath
+    }
+
     func openAPIVersion(_ data: Data) throws -> String {
         let object = try jsonObject(data)
         guard let info = object["info"] as? [String: Any],
@@ -571,34 +861,75 @@ private extension TokenSaverRound2BenchmarkTests {
     }
 
     func modelBinding(_ snapshotURL: URL) throws -> (path: String, revision: String, files: [[String: Any]], manifestSHA256: String) {
-        let canonical = snapshotURL.resolvingSymlinksInPath().standardizedFileURL
-        let revision = canonical.lastPathComponent
+        let originalValues = try snapshotURL.resourceValues(forKeys: [.isSymbolicLinkKey])
+        guard originalValues.isSymbolicLink != true else {
+            throw Round2Error.invalid("model snapshot path must not be a symlink")
+        }
+        guard let canonicalPath = try snapshotURL.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath else {
+            throw Round2Error.invalid("model snapshot has no canonical path")
+        }
+        let canonical = URL(fileURLWithPath: canonicalPath, isDirectory: true)
+        let revision = (canonicalPath as NSString).lastPathComponent
         guard revision.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil else {
             throw Round2Error.invalid("model snapshot must end in a 40-hex revision")
+        }
+        let snapshotsPath = (canonicalPath as NSString).deletingLastPathComponent
+        let modelsRootPath = (snapshotsPath as NSString).deletingLastPathComponent
+        guard (snapshotsPath as NSString).lastPathComponent == "snapshots",
+              (modelsRootPath as NSString).lastPathComponent.hasPrefix("models--") else {
+            throw Round2Error.invalid("model snapshot must be inside a Hugging Face models--repo/snapshots root")
         }
         let required = ["config.json", "tokenizer.json", "tokenizer_config.json"]
         for name in required where !FileManager.default.fileExists(atPath: canonical.appendingPathComponent(name).path) {
             throw Round2Error.invalid("model snapshot omitted \(name)")
         }
-        let enumerator = FileManager.default.enumerator(at: canonical, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
+        let enumerator = FileManager.default.enumerator(
+            at: canonical,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: []
+        )
         var files: [[String: Any]] = []
         while let url = enumerator?.nextObject() as? URL {
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey])
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            let relative = String(url.path.dropFirst(canonicalPath.count + 1))
+            if values.isSymbolicLink == true {
+                let linkTarget = try FileManager.default.destinationOfSymbolicLink(atPath: url.path)
+                let resolvedTargetURL = url.resolvingSymlinksInPath()
+                guard let targetCanonicalPath = try resolvedTargetURL.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath else {
+                    throw Round2Error.invalid("model snapshot contains a broken symlink: \(relative)")
+                }
+                let targetURL = URL(fileURLWithPath: targetCanonicalPath)
+                let targetValues = try targetURL.resourceValues(forKeys: [.isRegularFileKey])
+                guard targetValues.isRegularFile == true,
+                      targetCanonicalPath.hasPrefix(modelsRootPath + "/") else {
+                    enumerator?.skipDescendants()
+                    throw Round2Error.invalid("model symlink must resolve to a file inside its models--repo root: \(relative)")
+                }
+                let bytes = try Data(contentsOf: url, options: .mappedIfSafe)
+                files.append([
+                    "path": relative,
+                    "kind": "symlink",
+                    "link_target": linkTarget,
+                    "bytes": bytes.count,
+                    "sha256": sha256(bytes),
+                ])
+                continue
+            }
             guard values.isRegularFile == true else { continue }
-            let name = url.lastPathComponent
-            let relevant = required.contains(name)
-                || name.contains("token") || name.contains("chat_template")
-                || name.hasSuffix(".safetensors") || name.hasSuffix(".index.json")
-            guard relevant else { continue }
             let bytes = try Data(contentsOf: url, options: .mappedIfSafe)
-            let relative = String(url.path.dropFirst(canonical.path.count + 1))
-            files.append(["path": relative, "bytes": bytes.count, "sha256": sha256(bytes)])
+            files.append([
+                "path": relative,
+                "kind": "regular",
+                "link_target": NSNull(),
+                "bytes": bytes.count,
+                "sha256": sha256(bytes),
+            ])
         }
         files.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
         guard files.contains(where: { ($0["path"] as? String)?.hasSuffix(".safetensors") == true }) else {
             throw Round2Error.invalid("model snapshot omitted weight files")
         }
-        return (canonical.path, revision, files, sha256(try canonicalJSON(files)))
+        return (canonicalPath, revision, files, sha256(try canonicalJSON(files)))
     }
 
     func sourceBindings(repository: URL, gitSHA: String) throws -> [[String: Any]] {
@@ -618,14 +949,49 @@ private extension TokenSaverRound2BenchmarkTests {
         }
     }
 
+    func sourceCaptureState(repository: URL) throws -> SourceCaptureState {
+        SourceCaptureState(
+            gitSHA: try git(["rev-parse", "HEAD"], repository).trimmed,
+            treeSHA: try git(["rev-parse", "HEAD^{tree}"], repository).trimmed,
+            statusPorcelain: try git(["status", "--porcelain=v1", "--untracked-files=all"], repository)
+                .trimmingCharacters(in: .newlines)
+        )
+    }
+
+    func requireStableSourceCapture(
+        initial: SourceCaptureState,
+        final: SourceCaptureState,
+        expectedGitSHA: String
+    ) throws {
+        guard initial.gitSHA == expectedGitSHA,
+              initial.statusPorcelain.isEmpty,
+              final.statusPorcelain.isEmpty,
+              final == initial else {
+            throw Round2Error.invalid("capture source HEAD/tree/status changed or was dirty")
+        }
+    }
+
     func writeManifest(in root: URL) throws {
-        let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
+        guard let canonicalPath = try root.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath else {
+            throw Round2Error.invalid("artifact root has no canonical path")
+        }
+        let canonicalRoot = URL(fileURLWithPath: canonicalPath, isDirectory: true)
+        let enumerator = FileManager.default.enumerator(
+            at: canonicalRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: []
+        )
         var files: [[String: Any]] = []
         while let url = enumerator?.nextObject() as? URL {
-            guard url.lastPathComponent != "manifest.json",
-                  try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else { continue }
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isSymbolicLink != true else {
+                enumerator?.skipDescendants()
+                throw Round2Error.invalid("artifact contains symlink: \(url.path)")
+            }
+            guard values.isRegularFile == true else { continue }
             let data = try Data(contentsOf: url, options: .mappedIfSafe)
-            let relative = String(url.path.dropFirst(root.path.count + 1))
+            let relative = String(url.path.dropFirst(canonicalPath.count + 1))
+            guard relative != "manifest.json" else { continue }
             files.append(["path": relative, "bytes": data.count, "sha256": sha256(data)])
         }
         files.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
@@ -678,6 +1044,29 @@ private extension TokenSaverRound2BenchmarkTests {
         return try canonicalJSON(baselineObject) == canonicalJSON(candidateObject)
     }
 
+    func differsOnlyByLiteralQuestionBytes(baseline: Data, candidate: Data, question: String) throws -> Bool {
+        let questionArray = String(decoding: try canonicalJSON([question]), as: UTF8.self)
+        let questionJSON = String(questionArray.dropFirst().dropLast())
+        let innerFragment = ",\"question\":\(questionJSON)"
+        let fragmentArray = String(decoding: try canonicalJSON([innerFragment]), as: UTF8.self)
+        let escapedFragment = String(fragmentArray.dropFirst(2).dropLast(2))
+        let baselineText = String(decoding: baseline, as: UTF8.self)
+        let pieces = baselineText.components(separatedBy: escapedFragment)
+        guard pieces.count == 2 else { return false }
+        return Data(pieces.joined().utf8) == candidate
+    }
+
+    func isExactTechniqueSourceChange(removed: [String], added: [String]) -> Bool {
+        removed == [#"            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle, question: request.question)"#]
+            && added == [#"            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle)"#]
+    }
+
+    func hasRequiredCatalogRegression(removed: [String], added: [String], diffSHA256: String) -> Bool {
+        removed.isEmpty && added.filter {
+            $0 == "    func test_askHandle_successEnvelopeDoesNotRepeatToolQuestion() async throws {"
+        }.count == 1 && diffSHA256 == Self.catalogTestDiffSHA256
+    }
+
     func requireDictionary(_ value: Any?) throws -> [String: Any] {
         guard let dictionary = value as? [String: Any] else {
             throw Round2Error.invalid("expected JSON dictionary")
@@ -714,6 +1103,21 @@ private extension TokenSaverRound2BenchmarkTests {
     }
 }
 
+private struct ServedModelStatus: Equatable {
+    let id: String
+    let modelPath: String
+}
+
+private struct SourceCaptureState: Equatable {
+    let gitSHA: String
+    let treeSHA: String
+    let statusPorcelain: String
+
+    var reportObject: [String: Any] {
+        ["git_sha": gitSHA, "tree_sha": treeSHA, "status_porcelain": statusPorcelain]
+    }
+}
+
 private struct CaptureConfiguration {
     let arm: String
     let expectedGitSHA: String
@@ -744,6 +1148,9 @@ private struct CaptureConfiguration {
             throw Round2Error.invalid("candidate capture requires the baseline recovery seed directory")
         }
         authToken = environment["RC_TOKEN_SAVER_ROUND2_AUTH_TOKEN"].flatMap { $0.isEmpty ? nil : $0 }
+        if let authToken, authToken.count < 8 {
+            throw Round2Error.invalid("nonempty auth token must contain at least 8 characters for exact artifact scanning")
+        }
     }
 
     private static func required(_ value: String?, _ name: String) throws -> String {
