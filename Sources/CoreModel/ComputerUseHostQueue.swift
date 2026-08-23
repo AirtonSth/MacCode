@@ -9,6 +9,8 @@ import Foundation
 public final class ComputerUseHostQueue: @unchecked Sendable {
     public static let cliArgument = "computer-use-mcp"
     public static let serverName = "remotecode-computer-use"
+    static let maximumWaitersPerTarget = 128
+    private static let maximumTicketsPerTarget = maximumWaitersPerTarget + 1
 
     public enum Kind: String, Sendable, Equatable {
         case observation
@@ -143,6 +145,8 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
         let ticket: Ticket
         do {
             ticket = try createTicket(for: targetPID)
+        } catch let error as ComputerUseHostQueueError {
+            throw error
         } catch {
             throw ComputerUseHostQueueError.lockFileUnavailable(lockURL.path)
         }
@@ -162,6 +166,12 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
                     let created = TargetState()
                     targets[key] = created
                     target = created
+                }
+                if target.busy, target.waiters.count >= Self.maximumWaitersPerTarget {
+                    state.unlock()
+                    removeTicket(ticket)
+                    continuation.resume(throwing: ComputerUseHostQueueError.queueFull(targetPID))
+                    return
                 }
                 if !target.busy {
                     target.busy = true
@@ -391,6 +401,15 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
             close(counterFD)
         }
 
+        cleanupStaleTickets(in: directory)
+        let ticketCount = (try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasPrefix("ticket-") }.count) ?? 0
+        guard ticketCount < Self.maximumTicketsPerTarget else {
+            throw ComputerUseHostQueueError.queueFull(targetPID)
+        }
+
         var counterBytes = [UInt8](repeating: 0, count: 32)
         lseek(counterFD, 0, SEEK_SET)
         let readCount = read(counterFD, &counterBytes, counterBytes.count)
@@ -463,11 +482,15 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
 
 public enum ComputerUseHostQueueError: Error, Equatable, CustomStringConvertible {
     case lockFileUnavailable(String)
+    case queueFull(Int32?)
 
     public var description: String {
         switch self {
         case .lockFileUnavailable(let path):
             return "Computer-use lock file unavailable: \(path)"
+        case .queueFull(let targetPID):
+            let target = targetPID.map(String.init) ?? "global"
+            return "Computer-use host queue is full for \(target)."
         }
     }
 }

@@ -17,6 +17,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var builds: [URL] = []
     var execCalls = 0
     var execFailuresRemaining = 0
+    var execError: Error?
     var lastExec: (name: String, command: [String], user: String?, detach: Bool)?
     var networks: [String] = []
     var removedNetworks: [String] = []
@@ -69,6 +70,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
             execFailuresRemaining -= 1
             throw BotComputerGuestError.observeFailed
         }
+        if let execError { throw execError }
         return png
     }
     func rename(from: String, to: String) throws {
@@ -266,6 +268,26 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertTrue(fake.created.isEmpty)
     }
 
+    func test_oversizedDockerOutputFailsWithoutRepeatingTheCapture() throws {
+        // WHY: a bounded exact-output reader already proved this frame cannot
+        // fit; retrying it repeatedly only recreates the memory pressure.
+        let support = makeSupport("rc-guest-output-limit")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.execError = BotComputerDockerError.outputTooLarge
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 3,
+            observeDelay: 0
+        )
+
+        XCTAssertThrowsError(try service.provision(botID: BotID())) { error in
+            XCTAssertEqual(error as? BotComputerDockerError, .outputTooLarge)
+        }
+        XCTAssertEqual(fake.execCalls, 1)
+    }
+
     func test_proveReadyBuildsBundledRecipeWhenImageMissing() throws {
         // WHY: Studio must build remotecode/computer:local from the bundled
         // ComputerGuest recipe instead of staying disabled forever.
@@ -448,6 +470,84 @@ final class BotComputerGuestServiceTests: XCTestCase {
         ])
         XCTAssertTrue(fake.execCalls >= 3)
         service.teardown(botID: botID)
+    }
+
+    func test_applyObserveReturnsTheFullBoundedPNGResult() throws {
+        // WHY: a valid guest screenshot must keep the public MCP result shape
+        // and bytes; the bound must prevent an unbounded base64 result without
+        // silently truncating a valid image.
+        let support = makeSupport("rc-guest-result-bound")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+        let result = try service.apply(BotComputerPendingAction(
+            id: "observe-result",
+            botID: botID.value.uuidString,
+            kind: BotComputerCatalog.observe
+        ))
+        let base64 = try XCTUnwrap(result["png_base64"] as? String)
+
+        XCTAssertEqual(Set(result.keys), Set(["png_magic", "png_hash", "png_base64", "host", "image"]))
+        XCTAssertEqual(Data(base64Encoded: base64), fake.png)
+        XCTAssertLessThanOrEqual(base64.utf8.count, BotComputerGuestService.maxScreenshotBase64Bytes)
+        service.teardown(botID: botID)
+    }
+
+    func test_applyObserveFailsClosedForAnOversizedPNG() throws {
+        // WHY: oversized PNG output must produce an explicit failure rather
+        // than silently truncating a valid tool result into a corrupt image.
+        let support = makeSupport("rc-guest-result-overflow")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.png = BotComputerGuestObserve.pngSignature + Data(
+            repeating: 0,
+            count: BotComputerGuestService.maxScreenshotBytes - BotComputerGuestObserve.pngSignature.count + 1
+        )
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+
+        XCTAssertThrowsError(try service.apply(BotComputerPendingAction(
+            id: "observe-overflow",
+            botID: botID.value.uuidString,
+            kind: BotComputerCatalog.observe
+        ))) { error in
+            XCTAssertEqual(
+                error as? BotComputerGuestServiceError,
+                .screenshotTooLarge(
+                    actualBytes: BotComputerGuestService.maxScreenshotBytes + 1,
+                    maximumBytes: BotComputerGuestService.maxScreenshotBytes
+                )
+            )
+        }
+    }
+
+    func test_reconcileBotComputerActionsRunsWorkerOffMainActor() throws {
+        // WHY: distributed notifications are delivered on the main queue, but
+        // Docker provisioning and PNG polling must never block MainActor.
+        let support = makeSupport("rc-guest-reconcile-off-main")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let context = try AppContext(channel: .debug, appSupportOverride: support.path)
+        let router = AppCommandRouter(context: context)
+        let probe = ReconciliationWorkerProbe()
+        router.botComputerReconciliationWorkerForTesting = {
+            probe.record(ranOnMainThread: Thread.isMainThread)
+        }
+
+        router.reconcileBotComputerActions()
+
+        XCTAssertTrue(probe.wait(timeout: 1), "reconciliation worker did not run")
+        XCTAssertFalse(probe.ranOnMainThread)
     }
 
     func test_provisionRetriesUntilPNG() throws {
@@ -684,6 +784,29 @@ final class BotComputerGuestServiceTests: XCTestCase {
 
     private final class SleepCounter: @unchecked Sendable {
         var count = 0
+    }
+
+    private final class ReconciliationWorkerProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private let completed = DispatchSemaphore(value: 0)
+        private var mainThread = false
+
+        func record(ranOnMainThread: Bool) {
+            lock.lock()
+            mainThread = ranOnMainThread
+            lock.unlock()
+            completed.signal()
+        }
+
+        func wait(timeout: TimeInterval) -> Bool {
+            completed.wait(timeout: .now() + timeout) == .success
+        }
+
+        var ranOnMainThread: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return mainThread
+        }
     }
 
     private func makeSupport(_ prefix: String) -> URL {

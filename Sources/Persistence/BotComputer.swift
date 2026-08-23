@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import CoreModel
 
@@ -165,6 +166,10 @@ public struct BotComputerActionResult: Codable, Equatable, Sendable {
 public struct BotComputerStore: Sendable {
     public let rootDirectory: URL
 
+    // A timed-out caller can leave a large screenshot result behind. Keep the
+    // durable result channel bounded while retaining the newest responses.
+    private static let maxRetainedResults = 32
+
     public init(appSupportDirectory: URL) {
         self.rootDirectory = appSupportDirectory.appendingPathComponent("BotComputers", isDirectory: true)
     }
@@ -179,34 +184,70 @@ public struct BotComputerStore: Sendable {
     }
 
     public func enqueue(_ action: BotComputerPendingAction) throws {
-        var pending = try loadPending()
-        pending.append(action)
-        try writeJSON(pending, to: pendingURL)
+        try withStoreLock {
+            var pending = try loadPending()
+            pending.append(action)
+            try writeJSON(pending, to: pendingURL)
+        }
     }
 
     public func takePending() throws -> [BotComputerPendingAction] {
-        let pending = try loadPending()
-        try writeJSON([BotComputerPendingAction](), to: pendingURL)
-        return pending
+        try withStoreLock {
+            let pending = try loadPending()
+            guard !pending.isEmpty else { return pending }
+            try writeJSON([BotComputerPendingAction](), to: pendingURL)
+            return pending
+        }
+    }
+
+    public func hasPendingActions() throws -> Bool {
+        try withStoreLock { !(try loadPending()).isEmpty }
     }
 
     public func writeResult(_ result: BotComputerActionResult) throws {
-        var results = try loadResults()
-        results.removeAll { $0.id == result.id }
-        results.append(result)
-        try writeJSON(results, to: resultsURL)
+        try withStoreLock {
+            var results = try loadResults()
+            results.removeAll { $0.id == result.id }
+            results.append(result)
+            if results.count > Self.maxRetainedResults {
+                results = Array(results.suffix(Self.maxRetainedResults))
+            }
+            try writeJSON(results, to: resultsURL)
+        }
     }
 
     public func takeResult(id: String) throws -> BotComputerActionResult? {
-        var results = try loadResults()
-        guard let index = results.firstIndex(where: { $0.id == id }) else { return nil }
-        let value = results.remove(at: index)
-        try writeJSON(results, to: resultsURL)
-        return value
+        try withStoreLock {
+            var results = try loadResults()
+            guard let index = results.firstIndex(where: { $0.id == id }) else { return nil }
+            let value = results.remove(at: index)
+            try writeJSON(results, to: resultsURL)
+            return value
+        }
     }
 
     private var pendingURL: URL { rootDirectory.appendingPathComponent("pending.json") }
     private var resultsURL: URL { rootDirectory.appendingPathComponent("results.json") }
+    private var lockURL: URL { rootDirectory.appendingPathComponent(".lock") }
+
+    private func withStoreLock<T>(_ body: () throws -> T) throws -> T {
+        try FileManager.default.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        let descriptor = lockURL.path.withCString { path in
+            Darwin.open(path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        }
+        guard descriptor >= 0 else {
+            throw BotComputerError.invalid("Bot computer store lock is unavailable.")
+        }
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            close(descriptor)
+            throw BotComputerError.invalid("Bot computer store lock is unavailable.")
+        }
+        defer {
+            _ = flock(descriptor, LOCK_UN)
+            close(descriptor)
+        }
+        return try body()
+    }
 
     private func loadPending() throws -> [BotComputerPendingAction] {
         try readJSON([BotComputerPendingAction].self, from: pendingURL) ?? []
@@ -264,8 +305,10 @@ public enum BotComputerHost: Sendable {
     public static func applyPending(
         store: BotComputerStore,
         apply: (BotComputerPendingAction) throws -> [String: Any]
-    ) throws {
+    ) throws -> Int {
+        var applied = 0
         for item in try store.takePending() {
+            applied += 1
             do {
                 let object = try apply(item)
                 let payload = (try? JSONSerialization.data(withJSONObject: object)).flatMap {
@@ -285,6 +328,7 @@ public enum BotComputerHost: Sendable {
                 )
             }
         }
+        return applied
     }
 }
 
@@ -292,6 +336,8 @@ public struct BotComputerService: Sendable {
     public let callerBotID: BotID
     public let store: BotComputerStore
     public var timeoutMS: Double = 20_000
+
+    private static let resultPollInterval: TimeInterval = 0.1
 
     public init(callerBotID: BotID, store: BotComputerStore) {
         self.callerBotID = callerBotID
@@ -376,7 +422,7 @@ public struct BotComputerService: Sendable {
                 }
                 return ["payload": result.payload]
             }
-            Thread.sleep(forTimeInterval: 0.03)
+            Thread.sleep(forTimeInterval: Self.resultPollInterval)
         }
         throw BotComputerError.invalid("Docker desktop is not available. Keep RemoteCode open.")
     }
