@@ -1111,20 +1111,27 @@ public final class DistillHTTPServer: @unchecked Sendable {
             let body = try decoder.decode(LibrarianHTTPBody.self, from: request.body)
             let store = LibrarianHandleStore()
             var text = body.input ?? ""
-            if let handle = body.handle, !handle.isEmpty, text.isEmpty {
-                if let context = recoveryContext(headers: request.headers, requiresOperationID: false),
-                   let data = try? scopedRecoveryStore?.retrieveOriginal(capability: handle, context: context),
-                   let original = String(data: data, encoding: .utf8) {
-                    text = original
-                } else if let data = try? reversibleStore?.retrieveOriginal(handle),
-                          let original = String(data: data, encoding: .utf8) {
-                    text = original
+            var verifiedRecoveryHandle: String?
+            if let handle = body.handle, !handle.isEmpty,
+               let context = recoveryContext(headers: request.headers, requiresOperationID: false),
+               let scopedRecoveryStore,
+               let recoveredData = try? scopedRecoveryStore.retrieveOriginal(
+                   capability: handle,
+                   context: context
+               ),
+               let recovered = String(data: recoveredData, encoding: .utf8) {
+                if let supplied = body.input, !supplied.isEmpty {
+                    if Data(supplied.utf8) == recoveredData {
+                        text = supplied
+                        verifiedRecoveryHandle = handle
+                    }
+                } else {
+                    text = recovered
+                    verifiedRecoveryHandle = handle
                 }
             }
-            if let handle = body.handle, !handle.isEmpty, !text.isEmpty {
+            if let handle = verifiedRecoveryHandle {
                 _ = store.put(text, handle: handle)
-            } else if !text.isEmpty {
-                _ = store.put(text)
             }
             let dispatcher = LibrarianDispatcher(
                 store: store,
@@ -1139,7 +1146,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 provider: body.provider ?? "unknown",
                 threadID: body.threadID ?? "",
                 admitted: true,
-                retrieveAvailable: reversibleStore != nil || scopedRecoveryStore != nil,
+                retrieveAvailable: verifiedRecoveryHandle != nil,
+                verifiedRecoveryHandle: verifiedRecoveryHandle,
                 graphifyEnabled: ProcessInfo.processInfo.environment["RC_GRAPHIFY_ENABLED"] == "1"
             )
             req.command = body.command

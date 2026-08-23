@@ -31,6 +31,9 @@ public struct LibrarianRequest: Sendable {
     public var threadID: String
     public var admitted: Bool
     public var retrieveAvailable: Bool
+    /// Capability proven by the host through a scoped, byte-exact recovery
+    /// readback. Caller-supplied HTTP fields never populate this directly.
+    public var verifiedRecoveryHandle: String?
     public var graphifyEnabled: Bool
     public var command: String?
     public var schema: String?
@@ -52,6 +55,7 @@ public struct LibrarianRequest: Sendable {
         threadID: String = "",
         admitted: Bool = true,
         retrieveAvailable: Bool = true,
+        verifiedRecoveryHandle: String? = nil,
         graphifyEnabled: Bool = false,
         command: String? = nil,
         schema: String? = nil,
@@ -72,6 +76,7 @@ public struct LibrarianRequest: Sendable {
         self.threadID = threadID
         self.admitted = admitted
         self.retrieveAvailable = retrieveAvailable
+        self.verifiedRecoveryHandle = verifiedRecoveryHandle
         self.graphifyEnabled = graphifyEnabled
         self.command = command
         self.schema = schema

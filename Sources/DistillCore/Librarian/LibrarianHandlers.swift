@@ -8,7 +8,11 @@ enum LibrarianHandlers {
         store: LibrarianHandleStore,
         generate: (any LibrarianGenerating)?
     ) async -> LibrarianHandlerOutput {
-        let resolved = resolve(request, store: store)
+        let resolved = resolve(
+            request,
+            store: store,
+            storeMissing: function.id != "duplicate_handle_notice"
+        )
         switch function.id {
         case "retrieve":
             return retrieve(request, store: store)
@@ -118,10 +122,7 @@ enum LibrarianHandlers {
             let handle = store.put(resolved.text, kind: "exemplar")
             return textNotice(resolved, text: "stored exemplar \(handle); never binds paid")
         case "duplicate_handle_notice":
-            if let dup = store.findDuplicate(of: resolved.text) {
-                return textNotice(resolved, text: "duplicate of \(dup)")
-            }
-            return textNotice(resolved, text: "no duplicate handle")
+            return duplicateHandleNotice(request, resolved: resolved, store: store)
         case "secret_presence_flag":
             return flag(resolved, on: LibrarianSecretGate.looksSecret(resolved.text), label: "secret")
         case "pii_presence_flag":
@@ -149,14 +150,66 @@ enum LibrarianHandlers {
         let original: String
     }
 
-    private static func resolve(_ request: LibrarianRequest, store: LibrarianHandleStore) -> Resolved {
+    private static func resolve(
+        _ request: LibrarianRequest,
+        store: LibrarianHandleStore,
+        storeMissing: Bool = true
+    ) -> Resolved {
         if let handle = request.handle, let blob = store.get(handle) {
             return Resolved(text: blob, handle: handle, original: blob)
         }
         let text = request.input
-        let handle = request.handle ?? store.put(text)
-        if store.get(handle) == nil { _ = store.put(text, handle: handle) }
+        // duplicate_handle_notice must inspect the pre-existing store. Inserting
+        // first makes every first-seen blob a false self-duplicate. Preserve the
+        // established resolve behavior for every other operation.
+        let handle = storeMissing ? (request.handle ?? store.put(text)) : LibrarianHandleStore.makeHandle(text)
+        if storeMissing, store.get(handle) == nil { _ = store.put(text, handle: handle) }
         return Resolved(text: text, handle: handle, original: text)
+    }
+
+    private static func duplicateHandleNotice(
+        _ request: LibrarianRequest,
+        resolved: Resolved,
+        store: LibrarianHandleStore
+    ) -> LibrarianHandlerOutput {
+        let original = request.input.isEmpty ? resolved.original : request.input
+        guard request.retrieveAvailable,
+              let handle = request.handle,
+              request.verifiedRecoveryHandle == handle,
+              resolved.handle == handle,
+              let stored = store.get(handle),
+              sameUTF8Bytes(stored, original) else {
+            return LibrarianHandlerOutput(
+                status: .ok,
+                text: original,
+                handle: request.handle,
+                stage: .verbatim,
+                originalForSavings: original
+            )
+        }
+
+        let notice = "duplicate [[rc:\(handle)]]"
+        guard notice.utf8.count < original.utf8.count,
+              TokenEstimator.estimate(notice) < TokenEstimator.estimate(original) else {
+            return LibrarianHandlerOutput(
+                status: .ok,
+                text: original,
+                handle: handle,
+                stage: .verbatim,
+                originalForSavings: original
+            )
+        }
+        return LibrarianHandlerOutput(
+            status: .ok,
+            text: notice,
+            handle: handle,
+            stage: .deterministic,
+            originalForSavings: original
+        )
+    }
+
+    private static func sameUTF8Bytes(_ lhs: String, _ rhs: String) -> Bool {
+        Data(lhs.utf8) == Data(rhs.utf8)
     }
 
     private static func retrieve(_ request: LibrarianRequest, store: LibrarianHandleStore) -> LibrarianHandlerOutput {

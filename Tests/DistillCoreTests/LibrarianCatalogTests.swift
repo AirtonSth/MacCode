@@ -385,4 +385,126 @@ final class LibrarianCatalogTests: XCTestCase {
         XCTAssertEqual(result.status, LibrarianStatus.unavailable)
         XCTAssertEqual(result.analytics.savedTokens, 0)
     }
+
+    // WHY: a duplicate notice replaces paid-facing bytes, so it is safe only when
+    // the host has already recovered the same scoped capability byte-for-byte.
+    func test_duplicateHandleNotice_compactsOnlyVerifiedExactRecoverableHandle() async {
+        let dispatcher = LibrarianDispatcher()
+        let original = String(repeating: "build step completed with identical output\n", count: 40)
+        let handle = "scope-owned-capability"
+        _ = dispatcher.store.put(original, handle: handle)
+        let request = LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: original,
+            handle: handle,
+            provider: "codex",
+            retrieveAvailable: true,
+            verifiedRecoveryHandle: handle
+        )
+
+        let result = await dispatcher.dispatch(request)
+
+        XCTAssertEqual(result.status, .ok)
+        XCTAssertEqual(result.text, "duplicate [[rc:\(handle)]]")
+        XCTAssertLessThan(result.text.utf8.count, original.utf8.count)
+        XCTAssertGreaterThan(result.analytics.savedTokens, 0)
+
+        let retrieved = await dispatcher.dispatch(LibrarianRequest(
+            id: "retrieve",
+            handle: handle,
+            provider: "codex"
+        ))
+        XCTAssertEqual(retrieved.status, .ok)
+        XCTAssertEqual(retrieved.text, original)
+    }
+
+    // WHY: resolve used to insert raw input before duplicate lookup, making every
+    // first-seen blob a false self-duplicate. Raw input must remain byte-identical.
+    func test_duplicateHandleNotice_rawInputDoesNotSelfDuplicate() async {
+        let dispatcher = LibrarianDispatcher()
+        let original = String(repeating: "first seen output\n", count: 20)
+
+        let result = await dispatcher.dispatch(LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: original,
+            provider: "claude"
+        ))
+
+        XCTAssertEqual(result.text, original)
+        XCTAssertEqual(result.analytics.savedTokens, 0)
+    }
+
+    // WHY: caller-provided handles, mismatched stores, unavailable recovery, and
+    // notices that are not actually smaller must all fail open without savings.
+    func test_duplicateHandleNotice_untrustedMismatchUnavailableAndShortFailOpen() async {
+        let original = String(repeating: "trusted original payload\n", count: 20)
+
+        let fabricated = LibrarianDispatcher()
+        let fabricatedResult = await fabricated.dispatch(LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: original,
+            handle: "fabricated",
+            provider: "grok",
+            retrieveAvailable: true,
+            verifiedRecoveryHandle: "fabricated"
+        ))
+        XCTAssertEqual(fabricatedResult.text, original)
+        XCTAssertEqual(fabricatedResult.analytics.savedTokens, 0)
+
+        let mismatched = LibrarianDispatcher()
+        _ = mismatched.store.put("different bytes", handle: "mismatch")
+        let mismatchResult = await mismatched.dispatch(LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: original,
+            handle: "mismatch",
+            provider: "grok",
+            retrieveAvailable: true,
+            verifiedRecoveryHandle: "mismatch"
+        ))
+        XCTAssertEqual(mismatchResult.text, original)
+        XCTAssertEqual(mismatchResult.analytics.savedTokens, 0)
+
+        let unavailable = LibrarianDispatcher()
+        _ = unavailable.store.put(original, handle: "unavailable")
+        let unavailableResult = await unavailable.dispatch(LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: original,
+            handle: "unavailable",
+            provider: "grok",
+            retrieveAvailable: false,
+            verifiedRecoveryHandle: "unavailable"
+        ))
+        XCTAssertEqual(unavailableResult.text, original)
+        XCTAssertEqual(unavailableResult.analytics.savedTokens, 0)
+
+        let short = LibrarianDispatcher()
+        _ = short.store.put("tiny", handle: "short-capability")
+        let shortResult = await short.dispatch(LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: "tiny",
+            handle: "short-capability",
+            provider: "grok",
+            retrieveAvailable: true,
+            verifiedRecoveryHandle: "short-capability"
+        ))
+        XCTAssertEqual(shortResult.text, "tiny")
+        XCTAssertEqual(shortResult.analytics.savedTokens, 0)
+    }
+
+    // WHY: an unknown op must stop at catalog admission and never reach the local
+    // model, even when a generate runtime is installed.
+    func test_unknownLibrarianOperationNeverCallsGenerate() async {
+        let generate = LibrarianInstrumentedGenerate(LibrarianScriptedGenerate())
+        let dispatcher = LibrarianDispatcher(generate: generate)
+
+        let result = await dispatcher.dispatch(LibrarianRequest(
+            id: "not-a-real-operation",
+            input: "do not send this to the model",
+            provider: "codex"
+        ))
+
+        XCTAssertEqual(result.status, .unavailable)
+        XCTAssertEqual(generate.callCount, 0)
+        XCTAssertEqual(result.analytics.savedTokens, 0)
+    }
 }
