@@ -106,16 +106,20 @@ verify_fixture() {
 capture_arm() {
   require_tools
   verify_fixture
-  local arm="${1:-}" expected_sha="${2:-}" output="${3:-}" initial_tree seed_dir=""
+  local arm="${1:-}" expected_sha="${2:-}" output="${3:-}" initial_tree seed_dir="" output_parent output_name
   [[ "${arm}" == baseline || "${arm}" == candidate ]] || usage
   [[ "${expected_sha}" =~ ^[0-9a-f]{40}$ ]] || die "expected SHA must be 40 lowercase hex"
   [[ -n "${output}" ]] || usage
+  [[ ! -e "${output}" ]] || die "arm output already exists"
+  output_parent="$(dirname -- "${output}")"
+  [[ -d "${output_parent}" ]] || die "arm output parent does not exist: ${output_parent}"
+  output_parent="$(cd "${output_parent}" && pwd -P)" || die "arm output parent cannot be resolved: ${output_parent}"
+  output_name="$(basename -- "${output}")" || die "arm output name cannot be resolved"
+  output="${output_parent}/${output_name}"
   [[ -z "$(git -C "${repo_root}" symbolic-ref -q HEAD || true)" ]] || die "capture requires a detached temporary worktree"
   [[ "$(git -C "${repo_root}" rev-parse HEAD)" == "${expected_sha}" ]] || die "HEAD is not the requested arm SHA"
   initial_tree="$(git -C "${repo_root}" rev-parse 'HEAD^{tree}')"
   [[ -z "$(git -C "${repo_root}" status --porcelain --untracked-files=all)" ]] || die "capture arm checkout is dirty"
-  [[ ! -e "${output}" ]] || die "arm output already exists"
-  output="$(cd "$(dirname "${output}")" && pwd -P)/$(basename "${output}")"
   case "${output}" in
     "${repo_root}"|"${repo_root}"/*) die "arm output must be outside its source checkout" ;;
   esac
@@ -152,7 +156,7 @@ capture_arm() {
 
   local scratch
   scratch="$(mktemp -d "${TMPDIR:-/tmp}/token-saver-r2-build.XXXXXX")"
-  trap 'cleanup_scratch "${scratch}"' RETURN
+  trap 'cleanup_scratch "${scratch}"' EXIT
   RC_TOKEN_SAVER_ROUND2_CAPTURE=1 \
   RC_TOKEN_SAVER_ROUND2_ARM="${arm}" \
   RC_TOKEN_SAVER_ROUND2_EXPECTED_GIT_SHA="${expected_sha}" \
@@ -169,6 +173,8 @@ capture_arm() {
   [[ "$(git -C "${repo_root}" rev-parse 'HEAD^{tree}')" == "${initial_tree}" ]] || die "capture checkout tree changed during build/test"
   [[ -z "$(git -C "${repo_root}" status --porcelain=v1 --untracked-files=all)" ]] || die "capture checkout became dirty during build/test"
   "$0" verify-arm "${output}"
+  cleanup_scratch "${scratch}"
+  trap - EXIT
   echo "capture-arm ok arm=${arm} git_sha=${expected_sha} output=${output}"
 }
 

@@ -298,6 +298,29 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         XCTAssertThrowsError(try CaptureConfiguration(environment))
     }
 
+    func test_captureArmRejectsMissingOutputParentBeforeMaterializingSource() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-output-preflight-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appendingPathComponent("missing", isDirectory: true)
+            .appendingPathComponent("baseline", isDirectory: true)
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = repositoryURL().appendingPathComponent("scripts/token-saver-round2-benchmark.sh")
+        process.arguments = ["capture-arm", "baseline", String(repeating: "a", count: 40), output.path]
+        process.currentDirectoryURL = repositoryURL()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = stderr
+        try process.run()
+        let error = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+
+        XCTAssertNotEqual(process.terminationStatus, 0)
+        XCTAssertTrue(error.contains("arm output parent does not exist"), error)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.deletingLastPathComponent().path))
+    }
+
     /// Manual and fail-closed. The shell coordinator sets this only after proving
     /// the checkout is clean and HEAD equals the arm SHA.
     func test_captureArmAgainstOMLX() async throws {
