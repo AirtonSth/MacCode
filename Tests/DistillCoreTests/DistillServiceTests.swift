@@ -161,6 +161,37 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(acceptedE4B.modelID, e4b.id)
     }
 
+    func test_configurationSelectsOpenAICompatibleGenerateTarget() throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code",
+            generateBaseURL: "http://127.0.0.1:8000/v1",
+            generateModel: "samuelfaj--distill-1.7B-4bit-MLX",
+            generateToken: "local-api-token"
+        )
+
+        XCTAssertEqual(
+            configuration.generateTarget,
+            .openAICompatible(
+                baseURL: URL(string: "http://127.0.0.1:8000/v1")!,
+                model: "samuelfaj--distill-1.7B-4bit-MLX",
+                token: "local-api-token"
+            ),
+            "the parsed override must select the configured runtime instead of loading local MLX"
+        )
+    }
+
+    func test_configurationRejectsInvalidOpenAICompatibleGenerateURL() {
+        XCTAssertThrowsError(try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code",
+            generateBaseURL: "not-a-url",
+            generateModel: "model"
+        )) { error in
+            XCTAssertEqual(error as? DistillServiceError, .invalidGenerateBaseURL("not-a-url"))
+        }
+    }
+
     func test_httpServerRequiresBearerTokenAndServesDistillRequests() async throws {
         let configuration = try DistillServiceConfiguration(
             authToken: "secret-token",

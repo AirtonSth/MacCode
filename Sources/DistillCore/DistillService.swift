@@ -215,6 +215,7 @@ public enum DistillServiceError: Error, Sendable, Equatable, CustomStringConvert
     case unsupportedRuntime(String)
     case unsupportedModel(modelID: String, modelURL: String)
     case unsupportedHost(String)
+    case invalidGenerateBaseURL(String)
     case modelValidationFailed(String?)
     case mlxRuntimeUnavailable(String)
 
@@ -230,12 +231,19 @@ public enum DistillServiceError: Error, Sendable, Equatable, CustomStringConvert
             return "unsupported model \(modelID) \(modelURL)"
         case .unsupportedHost(let host):
             return "unsupported host \(host)"
+        case .invalidGenerateBaseURL(let raw):
+            return "invalid OpenAI-compatible generate base URL \(raw)"
         case .modelValidationFailed(let reason):
             return "approved MLX model validation failed: \(reason ?? "unknown reason")"
         case .mlxRuntimeUnavailable(let reason):
             return "MLX runtime unavailable: \(reason)"
         }
     }
+}
+
+public enum DistillServiceGenerateTarget: Sendable, Equatable {
+    case localMLX
+    case openAICompatible(baseURL: URL, model: String, token: String)
 }
 
 /// Dispatch gate for the sidecar Mach-O. HTTP mode is only valid when this
@@ -340,6 +348,16 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
             throw DistillServiceError.unsupportedModel(modelID: modelID, modelURL: modelURL)
         }
 
+        let trimmedGenerateBaseURL = generateBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedGenerateBaseURL.isEmpty {
+            guard let url = URL(string: trimmedGenerateBaseURL),
+                  let scheme = url.scheme?.lowercased(),
+                  (scheme == "http" || scheme == "https"),
+                  url.host != nil else {
+                throw DistillServiceError.invalidGenerateBaseURL(trimmedGenerateBaseURL)
+            }
+        }
+
         self.host = host
         self.port = port
         self.authToken = authToken
@@ -352,10 +370,18 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         self.maxQueueWaitMilliseconds = max(0, maxQueueWaitMilliseconds)
         self.idleTimeoutMS = max(1_000, idleTimeoutMS)
         self.mlxCallDeadlineMS = max(1_000, mlxCallDeadlineMS)
-        self.generateBaseURL = generateBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.generateBaseURL = trimmedGenerateBaseURL
         self.generateModel = generateModel.trimmingCharacters(in: .whitespacesAndNewlines)
         self.generateToken = generateToken.trimmingCharacters(in: .whitespacesAndNewlines)
         self.saveTrainingPrompts = saveTrainingPrompts
+    }
+
+    public var generateTarget: DistillServiceGenerateTarget {
+        guard !generateBaseURL.isEmpty, let url = URL(string: generateBaseURL) else {
+            return .localMLX
+        }
+        let selectedModel = generateModel.isEmpty ? modelID : generateModel
+        return .openAICompatible(baseURL: url, model: selectedModel, token: generateToken)
     }
 
     public static func parse(arguments: [String]) throws -> DistillServiceConfiguration {
