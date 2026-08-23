@@ -8176,6 +8176,24 @@ public final class TerminalOutputRepository {
         try failureLedger?.pendingDeleteURL(surfaceID: surfaceID, id: id)
     }
 
+    /// A nil estimate deliberately forces a real global check. The connection
+    /// owns this value so multiple repository instances cannot undercount.
+    public func terminalGlobalRetentionRequired(maxBytes: Int) -> Bool {
+        db.terminalOutputRetentionRequired(maxBytes: maxBytes)
+    }
+
+    public func invalidateTerminalGlobalRetentionEstimate() {
+        db.invalidateTerminalOutputBytes()
+    }
+
+    private func recordTerminalBytesAppended(_ byteCount: Int) {
+        db.noteTerminalOutputBytesInserted(byteCount)
+    }
+
+    private func recordTerminalGlobalRetentionBytes(_ byteCount: Int) {
+        db.rememberTerminalOutputBytes(byteCount)
+    }
+
     public func append(surfaceID: String, workspaceID: String?, chunkIndex: Int64, data: Data) throws {
         guard !data.isEmpty else { return }
         try db.performSync { database in
@@ -8192,6 +8210,7 @@ public final class TerminalOutputRepository {
             // A successful INSERT step already admitted one row. SELECT
             // changes() was a second statement on every PTY persist.
             _ = try st.step()
+            recordTerminalBytesAppended(data.count)
         }
     }
 
@@ -8397,6 +8416,7 @@ public final class TerminalOutputRepository {
                     key: Self.dirtyHistoryKey(surfaceID: surfaceID),
                     database: database
                 )
+                recordTerminalBytesAppended(data.count)
             }
         }
     }
@@ -8530,13 +8550,26 @@ public final class TerminalOutputRepository {
         maxDeleteBytes: Int = 8 * 1_024 * 1_024
     ) throws -> TerminalHistoryGlobalPruneResult {
         guard maxBytes > 0 else {
-            return TerminalHistoryGlobalPruneResult(deletedRows: 0, deletedBytes: 0, truncatedSurfaceIDs: [], remainsOverBudget: false)
+            invalidateTerminalGlobalRetentionEstimate()
+            return TerminalHistoryGlobalPruneResult(
+                deletedRows: 0,
+                deletedBytes: 0,
+                truncatedSurfaceIDs: [],
+                remainsOverBudget: false
+            )
         }
         return try db.performSync { database in
-            try database.transaction {
+            var remainingBytes = 0
+            let result = try database.transaction {
                 let total = try Self.totalBytesAllSurfaces(database: database)
+                remainingBytes = total
                 guard total > maxBytes else {
-                    return TerminalHistoryGlobalPruneResult(deletedRows: 0, deletedBytes: 0, truncatedSurfaceIDs: [], remainsOverBudget: false)
+                    return TerminalHistoryGlobalPruneResult(
+                        deletedRows: 0,
+                        deletedBytes: 0,
+                        truncatedSurfaceIDs: [],
+                        remainsOverBudget: false
+                    )
                 }
                 let needed = min(total - maxBytes, max(1, maxDeleteBytes))
                 let candidates = try database.prepare("""
@@ -8558,7 +8591,12 @@ public final class TerminalOutputRepository {
                     if deletedBytes >= needed { break }
                 }
                 guard !ids.isEmpty else {
-                    return TerminalHistoryGlobalPruneResult(deletedRows: 0, deletedBytes: 0, truncatedSurfaceIDs: [], remainsOverBudget: true)
+                    return TerminalHistoryGlobalPruneResult(
+                        deletedRows: 0,
+                        deletedBytes: 0,
+                        truncatedSurfaceIDs: [],
+                        remainsOverBudget: true
+                    )
                 }
                 var nextIndexes: [String: Int64] = [:]
                 for surface in surfaces {
@@ -8581,6 +8619,7 @@ public final class TerminalOutputRepository {
                     )
                 }
                 let remaining = max(0, total - deletedBytes)
+                remainingBytes = remaining
                 return TerminalHistoryGlobalPruneResult(
                     deletedRows: ids.count,
                     deletedBytes: deletedBytes,
@@ -8588,6 +8627,8 @@ public final class TerminalOutputRepository {
                     remainsOverBudget: remaining > maxBytes
                 )
             }
+            recordTerminalGlobalRetentionBytes(remainingBytes)
+            return result
         }
     }
 
@@ -8807,33 +8848,36 @@ public final class TerminalOutputRepository {
     ) throws -> Bool {
         let total = try totalBytes(surfaceID: surfaceID, database: database)
         guard total > maxBytes else { return false }
-        let overflow = total - maxBytes
-        let candidates = try database.prepare("""
-            SELECT id, byte_count
-            FROM terminal_output_chunks
-            WHERE surface_id = ?
-            ORDER BY id ASC
-            LIMIT 512;
-        """)
-        try candidates.bind(1, surfaceID)
-        var ids: [Int64] = []
-        var bytes = 0
-        while try candidates.step() {
-            ids.append(candidates.columnInt64(0))
-            bytes += max(0, Int(candidates.columnInt64(1)))
-            if bytes >= overflow { break }
+        var remainingOverflow = total - maxBytes
+        while remainingOverflow > 0 {
+            let candidates = try database.prepare("""
+                SELECT id, byte_count
+                FROM terminal_output_chunks
+                WHERE surface_id = ?
+                ORDER BY id ASC
+                LIMIT 512;
+            """)
+            try candidates.bind(1, surfaceID)
+            var ids: [Int64] = []
+            var bytes = 0
+            while try candidates.step() {
+                ids.append(candidates.columnInt64(0))
+                bytes += max(0, Int(candidates.columnInt64(1)))
+                if bytes >= remainingOverflow { break }
+            }
+            guard !ids.isEmpty else { break }
+            let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+            let deletion = try database.prepare(
+                "DELETE FROM terminal_output_chunks WHERE surface_id = ? AND id IN (\(placeholders));"
+            )
+            try deletion.bind(1, surfaceID)
+            for (index, id) in ids.enumerated() {
+                try deletion.bind(Int32(index + 2), id)
+            }
+            _ = try deletion.step()
+            remainingOverflow = max(0, remainingOverflow - bytes)
         }
-        guard !ids.isEmpty else { return false }
-        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
-        let deletion = try database.prepare(
-            "DELETE FROM terminal_output_chunks WHERE surface_id = ? AND id IN (\(placeholders));"
-        )
-        try deletion.bind(1, surfaceID)
-        for (index, id) in ids.enumerated() {
-            try deletion.bind(Int32(index + 2), id)
-        }
-        _ = try deletion.step()
-        return true
+        return remainingOverflow == 0
     }
 
     private static func deleteHistoryState(
@@ -8845,6 +8889,7 @@ public final class TerminalOutputRepository {
         )
         try chunks.bind(1, surfaceID)
         _ = try chunks.step()
+        database.invalidateTerminalOutputBytes()
         try deleteSetting(
             key: partialHistoryKey(surfaceID: surfaceID),
             database: database

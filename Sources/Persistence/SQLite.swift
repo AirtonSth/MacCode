@@ -75,6 +75,9 @@ public final class SQLiteDB {
     /// Connection-local events-table occupancy. EventLog + command receipts
     /// share this so under-cap appends skip COUNT(*).
     private var cachedEventRowCount: Int64?
+    /// Connection-scoped terminal occupancy estimate shared by every repository
+    /// using this SQLite authority. Nil fails closed to a real global scan.
+    private var cachedTerminalOutputBytes: Int?
 
     func cachedEventRowCountIfKnown() -> Int64? { cachedEventRowCount }
 
@@ -85,6 +88,34 @@ public final class SQLiteDB {
     func noteEventRowsInserted(_ n: Int64) {
         guard n > 0, let current = cachedEventRowCount else { return }
         cachedEventRowCount = current + n
+    }
+
+    func terminalOutputRetentionRequired(maxBytes: Int) -> Bool {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard let cachedTerminalOutputBytes else { return true }
+        return cachedTerminalOutputBytes > maxBytes
+    }
+
+    func rememberTerminalOutputBytes(_ byteCount: Int) {
+        operationLock.lock()
+        cachedTerminalOutputBytes = max(0, byteCount)
+        operationLock.unlock()
+    }
+
+    func noteTerminalOutputBytesInserted(_ byteCount: Int) {
+        operationLock.lock()
+        if let current = cachedTerminalOutputBytes {
+            let (updated, overflow) = current.addingReportingOverflow(max(0, byteCount))
+            cachedTerminalOutputBytes = overflow ? Int.max : updated
+        }
+        operationLock.unlock()
+    }
+
+    func invalidateTerminalOutputBytes() {
+        operationLock.lock()
+        cachedTerminalOutputBytes = nil
+        operationLock.unlock()
     }
 
 #if DEBUG
