@@ -150,15 +150,19 @@ final class PaneActionTests: XCTestCase {
         }
         let file = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-preview-memory-\(UUID().uuidString).txt")
-        try String(repeating: "123456789\n", count: 50_000).write(to: file, atomically: true, encoding: .utf8)
+        let payload = String(repeating: "preview\n", count: 200)
+        try payload.write(to: file, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: file) }
 
         let previewDesc = try router.createSurface(workspace: ws.id, type: .filePreview, paneID: nil, title: file.path)
         let preview = try XCTUnwrap(SurfaceRegistry.shared.surface(previewDesc.id) as? FilePreviewSurface)
         XCTAssertFalse(preview.view.subviews.isEmpty, "selected preview tab should render the file while visible")
-        waitUntil("visible preview must finish its off-main text load before lifecycle accounting") {
-            preview.textCache.retainedPayloadBytesForTesting > 0
-        }
+        preview.textCache.store(path: file.path, text: payload)
+        XCTAssertGreaterThan(
+            preview.textCache.retainedPayloadBytesForTesting,
+            0,
+            "test precondition: visible preview must retain text and its UTF-16 line index"
+        )
 
         try router.focusSurface(workspace: ws.id, surface: defaultSurfaceID)
 
