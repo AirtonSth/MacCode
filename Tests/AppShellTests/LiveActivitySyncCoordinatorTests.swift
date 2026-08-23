@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import Darwin
 @testable import AppShell
 import AgentRuntime
 import CoreModel
@@ -87,6 +88,254 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(recorder.deliveries.map(\.event), [.start, .update])
         XCTAssertEqual(recorder.deliveries.map(\.projection.revision), [1, 2])
         XCTAssertEqual(recorder.deliveries.last?.projection.updatedAt, 260)
+    }
+
+    func testIdleCoordinatorDoesNotWakeOrEnqueueHeartbeats() async {
+        let ticks = DeliveryAttemptCounter()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-idle",
+            bootEpoch: 1,
+            deliver: { _ in },
+            heartbeatIntervalNanoseconds: 2_000_000,
+            onHeartbeatTick: { ticks.increment() }
+        )
+
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        await sync.flush()
+
+        XCTAssertEqual(ticks.count, 0,
+                       "without an active or remotely-open activity, the coordinator must own no periodic wake")
+    }
+
+    func testHeartbeatTimerTracksActiveLifecycleAndRearmsForNextRun() async {
+        let recorder = DeliveryRecorder()
+        let ticks = DeliveryAttemptCounter()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-lifecycle",
+            bootEpoch: 1,
+            deliver: { delivery in await recorder.append(delivery) },
+            heartbeatIntervalNanoseconds: 5_000_000,
+            onHeartbeatTick: { ticks.increment() }
+        )
+        let first = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+        let second = ("10000000-0000-0000-0000-000000000002", "20000000-0000-0000-0000-000000000002")
+
+        sync.submit(active([first]), cause: .started)
+        await sync.flush()
+        let reachedActiveCadence = await Self.waitUntil(timeout: 0.25) { ticks.count >= 2 }
+        XCTAssertTrue(reachedActiveCadence)
+        await sync.flush()
+        XCTAssertEqual(recorder.deliveries.first?.event, .start)
+        XCTAssertGreaterThanOrEqual(recorder.deliveries.filter { $0.event == .update }.count, 2,
+                                    "an active run must keep the existing heartbeat cadence")
+
+        sync.submit(active([]), cause: .finished(.completed))
+        await sync.flush()
+        let stoppedTickCount = ticks.count
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        await sync.flush()
+        XCTAssertEqual(ticks.count, stoppedTickCount,
+                       "a confirmed end must cancel the periodic task, not merely make its deliveries no-op")
+        XCTAssertEqual(recorder.deliveries.last?.event, .end)
+        let deliveryCountAfterEnd = recorder.deliveries.count
+
+        sync.submit(active([second]), cause: .started)
+        await sync.flush()
+        let rearmed = await Self.waitUntil(timeout: 0.25) { ticks.count > stoppedTickCount }
+        XCTAssertTrue(rearmed)
+        await sync.flush()
+        let replacementEvents = recorder.deliveries.dropFirst(deliveryCountAfterEnd).map(\.event)
+        XCTAssertEqual(replacementEvents.first, .start)
+        XCTAssertTrue(replacementEvents.dropFirst().contains(.update),
+                      "a new run after a confirmed end must create a fresh timer and retain start-before-update order")
+    }
+
+    func testFailedEndKeepsTimerUntilAutomaticRetrySucceeds() async {
+        let recorder = DeliveryRecorder()
+        let endAttempts = DeliveryAttemptCounter()
+        let ticks = DeliveryAttemptCounter()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-end-retry",
+            bootEpoch: 1,
+            deliver: { delivery in
+                if delivery.event == .end, endAttempts.increment() <= 3 {
+                    throw OutboxTestError.persistence
+                }
+                await recorder.append(delivery)
+            },
+            heartbeatIntervalNanoseconds: 5_000_000,
+            onHeartbeatTick: { ticks.increment() },
+            deliveryMaxAttempts: 3,
+            deliveryRetryDelayNanoseconds: { _ in 0 }
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+
+        sync.submit(active([run]), cause: .started)
+        await sync.flush()
+        sync.submit(active([]), cause: .finished(.completed))
+        await sync.flush()
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start])
+
+        let recoveredEnd = await Self.waitUntil(timeout: 0.25) {
+            recorder.deliveries.last?.event == .end
+        }
+        XCTAssertTrue(recoveredEnd,
+                      "the owned timer must retry a stranded end without an unrelated app event")
+        await sync.flush()
+        XCTAssertEqual(endAttempts.count, 4)
+        let stoppedTickCount = ticks.count
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        await sync.flush()
+        XCTAssertEqual(ticks.count, stoppedTickCount,
+                       "the timer must cancel immediately after the retry confirms the end")
+    }
+
+    func testRunEndingAfterFailedStartCancelsRetryTimer() async {
+        let attempts = DeliveryAttemptCounter()
+        let ticks = DeliveryAttemptCounter()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-start-abandoned",
+            bootEpoch: 1,
+            deliver: { _ in
+                attempts.increment()
+                throw OutboxTestError.persistence
+            },
+            heartbeatIntervalNanoseconds: 5_000_000,
+            onHeartbeatTick: { ticks.increment() },
+            deliveryMaxAttempts: 3,
+            deliveryRetryDelayNanoseconds: { _ in 0 }
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+
+        sync.submit(active([run]), cause: .started)
+        await sync.flush()
+        XCTAssertEqual(attempts.count, 3)
+
+        sync.submit(active([]), cause: .finished(.failed))
+        await sync.flush()
+        let stoppedTickCount = ticks.count
+        let stoppedAttemptCount = attempts.count
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        await sync.flush()
+
+        XCTAssertEqual(ticks.count, stoppedTickCount,
+                       "a locally-ended run whose start never opened remotely must release its retry timer")
+        XCTAssertEqual(attempts.count, stoppedAttemptCount,
+                       "ending after a failed start must not invent an end delivery or retry an abandoned start")
+    }
+
+    func testFailedStartRetriesAutomaticallyWhileRunRemainsActive() async {
+        let recorder = DeliveryRecorder()
+        let attempts = DeliveryAttemptCounter()
+        let ticks = DeliveryAttemptCounter()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-start-retry",
+            bootEpoch: 1,
+            deliver: { delivery in
+                if attempts.increment() <= 3 { throw OutboxTestError.persistence }
+                await recorder.append(delivery)
+            },
+            heartbeatIntervalNanoseconds: 5_000_000,
+            onHeartbeatTick: { ticks.increment() },
+            deliveryMaxAttempts: 3,
+            deliveryRetryDelayNanoseconds: { _ in 0 }
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+
+        sync.submit(active([run]), cause: .started)
+        await sync.flush()
+        XCTAssertTrue(recorder.deliveries.isEmpty)
+
+        let recoveredStart = await Self.waitUntil(timeout: 0.25) {
+            recorder.deliveries.first?.event == .start
+        }
+        XCTAssertTrue(recoveredStart,
+                      "an active run must own a timer that retries its failed start without a manual heartbeat")
+        await sync.flush()
+        XCTAssertEqual(recorder.deliveries.first?.event, .start)
+        XCTAssertEqual(recorder.deliveries.first?.activityGeneration, 2)
+        XCTAssertGreaterThanOrEqual(attempts.count, 4)
+        XCTAssertGreaterThanOrEqual(ticks.count, 1)
+
+        sync.submit(active([]), cause: .finished(.completed))
+        await sync.flush()
+        XCTAssertEqual(recorder.deliveries.last?.event, .end)
+    }
+
+    func testBackToBackEndAndNewRunPreserveLifecycleAndHeartbeat() async {
+        let recorder = DeliveryRecorder()
+        let ticks = DeliveryAttemptCounter()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-race",
+            bootEpoch: 1,
+            deliver: { delivery in await recorder.append(delivery) },
+            heartbeatIntervalNanoseconds: 5_000_000,
+            onHeartbeatTick: { ticks.increment() }
+        )
+        let first = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+        let second = ("10000000-0000-0000-0000-000000000002", "20000000-0000-0000-0000-000000000002")
+
+        sync.submit(active([first]), cause: .started)
+        sync.submit(active([]), cause: .finished(.completed))
+        sync.submit(active([second]), cause: .started)
+        await sync.flush()
+
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start, .end, .start])
+        let replacementHeartbeat = await Self.waitUntil(timeout: 0.25) { ticks.count >= 1 }
+        XCTAssertTrue(replacementHeartbeat)
+        await sync.flush()
+        XCTAssertEqual(recorder.deliveries.last?.event, .update,
+                       "an end/new-run mailbox race must leave the replacement run's timer armed")
+    }
+
+    func testDeinitCancelsActiveHeartbeatTimer() async {
+        let ticks = DeliveryAttemptCounter()
+        var sync: LiveActivitySyncCoordinator? = LiveActivitySyncCoordinator(
+            serverId: "server-deinit",
+            bootEpoch: 1,
+            deliver: { _ in },
+            heartbeatIntervalNanoseconds: 5_000_000,
+            onHeartbeatTick: { ticks.increment() }
+        )
+        weak var releasedSync = sync
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+
+        sync?.submit(active([run]), cause: .started)
+        await sync?.flush()
+        let firstHeartbeat = await Self.waitUntil(timeout: 0.25) { ticks.count >= 1 }
+        XCTAssertTrue(firstHeartbeat)
+        sync = nil
+        XCTAssertNil(releasedSync,
+                     "the scheduler task must not retain the coordinator after its owner releases it")
+        let stoppedTickCount = ticks.count
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(ticks.count, stoppedTickCount)
+    }
+
+    func testMicrobenchmarkIdleHeartbeatOwnershipAndActiveCadence() async {
+        for _ in 0..<2 {
+            _ = await heartbeatSample(active: false)
+            _ = await heartbeatSample(active: true)
+        }
+
+        var idle: [HeartbeatPerfSample] = []
+        var activeSamples: [HeartbeatPerfSample] = []
+        for _ in 0..<7 {
+            idle.append(await heartbeatSample(active: false))
+            activeSamples.append(await heartbeatSample(active: true))
+        }
+
+        NSLog(
+            "[perf-proof] liveActivityHeartbeat idle_ticks=%@ idle_cpu_ms=%@ active_ticks=%@ active_cpu_ms=%@ production_idle_5m_wakes_before=10 production_idle_5m_wakes_after=0",
+            String(describing: idle.map(\.ticks)),
+            String(describing: idle.map(\.cpuMilliseconds)),
+            String(describing: activeSamples.map(\.ticks)),
+            String(describing: activeSamples.map(\.cpuMilliseconds))
+        )
+        XCTAssertEqual(idle.map(\.ticks), Array(repeating: 0, count: 7),
+                       "128 idle coordinators must retain zero timer tasks and enqueue zero heartbeats")
+        XCTAssertGreaterThan(activeSamples.map(\.ticks).min() ?? 0, 0,
+                             "event-driven ownership must preserve the active heartbeat cadence")
     }
 
     func testLaunchReconciliationEmitsEmptyCorrection() async {
@@ -1803,6 +2052,56 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
         return predicate()
+    }
+
+    private struct HeartbeatPerfSample {
+        let ticks: Int
+        let cpuMilliseconds: Double
+    }
+
+    private func heartbeatSample(active hasActiveRun: Bool) async -> HeartbeatPerfSample {
+        let coordinatorCount = hasActiveRun ? 16 : 128
+        let ticks = DeliveryAttemptCounter()
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+        var coordinators: [LiveActivitySyncCoordinator] = []
+        coordinators.reserveCapacity(coordinatorCount)
+        for index in 0..<coordinatorCount {
+            let coordinator = LiveActivitySyncCoordinator(
+                serverId: "server-benchmark-\(index)",
+                bootEpoch: 1,
+                deliver: { _ in },
+                heartbeatIntervalNanoseconds: 2_000_000,
+                onHeartbeatTick: { ticks.increment() }
+            )
+            coordinators.append(coordinator)
+            if hasActiveRun {
+                coordinator.submit(active([run]), cause: .started)
+            }
+        }
+        if hasActiveRun {
+            for coordinator in coordinators { await coordinator.flush() }
+        }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+
+        let ticksBefore = ticks.count
+        let cpuBefore = Self.processCPUNanoseconds()
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        let cpuAfter = Self.processCPUNanoseconds()
+        let measuredTicks = ticks.count - ticksBefore
+
+        withExtendedLifetime(coordinators) {}
+        coordinators.removeAll()
+        try? await Task.sleep(nanoseconds: 5_000_000)
+        return HeartbeatPerfSample(
+            ticks: measuredTicks,
+            cpuMilliseconds: Double(cpuAfter - cpuBefore) / 1_000_000
+        )
+    }
+
+    private static func processCPUNanoseconds() -> UInt64 {
+        var value = timespec()
+        precondition(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value) == 0)
+        return UInt64(value.tv_sec) * 1_000_000_000 + UInt64(value.tv_nsec)
     }
 
     private func makeDelivery(

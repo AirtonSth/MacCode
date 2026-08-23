@@ -238,6 +238,62 @@ private final class LiveActivityTokenScopeBinder: @unchecked Sendable {
     }
 }
 
+/// Owns the periodic wake only while the serialized lifecycle says a remote
+/// activity is open or still needs a start/end retry.
+private final class LiveActivityHeartbeatScheduler: @unchecked Sendable {
+    private let lock = NSLock()
+    private let intervalNanoseconds: UInt64
+    private let fire: @Sendable () -> Void
+    private var task: Task<Void, Never>?
+    private var generation: UInt64 = 0
+
+    init(intervalNanoseconds: UInt64, fire: @escaping @Sendable () -> Void) {
+        self.intervalNanoseconds = intervalNanoseconds
+        self.fire = fire
+    }
+
+    func setActive(_ active: Bool) {
+        lock.withLock {
+            if active {
+                guard task == nil else { return }
+                generation &+= 1
+                let expectedGeneration = generation
+                let intervalNanoseconds = intervalNanoseconds
+                task = Task { [weak self] in
+                    while !Task.isCancelled {
+                        do {
+                            try await Task.sleep(nanoseconds: intervalNanoseconds)
+                        } catch {
+                            return
+                        }
+                        guard self?.fireIfCurrent(expectedGeneration) == true else { return }
+                    }
+                }
+            } else {
+                generation &+= 1
+                task?.cancel()
+                task = nil
+            }
+        }
+    }
+
+    func cancel() {
+        setActive(false)
+    }
+
+    private func fireIfCurrent(_ expectedGeneration: UInt64) -> Bool {
+        lock.withLock {
+            guard task != nil, generation == expectedGeneration else { return false }
+            fire()
+            return true
+        }
+    }
+
+    deinit {
+        task?.cancel()
+    }
+}
+
 /// One long-lived mailbox serializes lifecycle transitions and network delivery.
 /// Callers submit synchronously from coordinator callbacks; no per-event
 /// unstructured Task can reorder start/update/end.
@@ -259,8 +315,8 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
 
     private let continuation: AsyncStream<Command>.Continuation
     private let tokenScopeBinder: LiveActivityTokenScopeBinder
+    private let heartbeatScheduler: LiveActivityHeartbeatScheduler
     private var worker: Task<Void, Never>?
-    private var heartbeatTask: Task<Void, Never>?
 
     /// Keep remote Live Activities under ActivityKit stale budget while runs are
     /// active — even when no turn.completed event arrives for a long stretch.
@@ -289,6 +345,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         onDeliveryError: @escaping DeliveryError = { _, _ in },
         deliver: @escaping Delivery,
         heartbeatIntervalNanoseconds: UInt64 = LiveActivitySyncCoordinator.heartbeatIntervalNanoseconds,
+        onHeartbeatTick: @escaping @Sendable () -> Void = {},
         deliveryMaxAttempts: Int = LiveActivitySyncCoordinator.deliveryMaxAttempts,
         deliveryRetryDelayNanoseconds: @escaping @Sendable (Int) -> UInt64 =
             LiveActivitySyncCoordinator.defaultDeliveryRetryDelayNanoseconds
@@ -303,7 +360,15 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         let maxAttempts = max(1, deliveryMaxAttempts)
         var capturedContinuation: AsyncStream<Command>.Continuation?
         let stream = AsyncStream<Command> { capturedContinuation = $0 }
-        self.continuation = capturedContinuation!
+        let commandContinuation = capturedContinuation!
+        self.continuation = commandContinuation
+        let heartbeatScheduler = LiveActivityHeartbeatScheduler(
+            intervalNanoseconds: heartbeatIntervalNanoseconds
+        ) {
+            commandContinuation.yield(.heartbeat(Date()))
+            onHeartbeatTick()
+        }
+        self.heartbeatScheduler = heartbeatScheduler
         self.worker = Task {
             var latest = ActiveRunProjection(runs: [])
             var surface: PetLiveActivityCopy.Output?
@@ -375,11 +440,13 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                 } else if nowPresent {
                     event = .update
                 } else {
+                    heartbeatScheduler.setActive(false)
                     return
                 }
                 if await emit(event: event, cause: cause, now: now) {
                     wasPresent = nowPresent
                 }
+                heartbeatScheduler.setActive(nowPresent || wasPresent)
             }
 
             for await command in stream {
@@ -401,6 +468,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                         // whether the corrective end reaches the backend.
                         _ = await emit(event: .end, cause: cause, now: now)
                         wasPresent = false
+                        heartbeatScheduler.setActive(false)
                         continue
                     }
                     await publishLifecycle(cause: cause, now: now)
@@ -414,23 +482,12 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                 }
             }
         }
-        // Always-on keep-alive while any run is active (idle heartbeats are no-ops).
-        self.heartbeatTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    try await Task.sleep(nanoseconds: heartbeatIntervalNanoseconds)
-                } catch {
-                    break
-                }
-                self?.submitHeartbeat()
-            }
-        }
     }
 
     deinit {
         continuation.finish()
         worker?.cancel()
-        heartbeatTask?.cancel()
+        heartbeatScheduler.cancel()
     }
 
     public func submit(_ projection: ActiveRunProjection, cause: LiveActivitySyncCause, now: Date = Date()) {
