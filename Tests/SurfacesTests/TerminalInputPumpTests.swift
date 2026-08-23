@@ -481,6 +481,104 @@ final class TerminalInputPumpTests: XCTestCase {
             "intermittent backpressure with forward progress must NOT trip the stall")
     }
 
+    func test_writeReadinessWaiterRetriesOnlyAfterKernelSignalsWritable() {
+        // WHY: a full nonblocking PTY must sleep in the kernel instead of waking
+        // every 2 ms and issuing thousands of doomed write syscalls. Readiness
+        // must still retry the exact accepted suffix without changing FIFO bytes.
+        let attempts = Counters()
+        let readinessWaits = Counters()
+        let written = WrittenLog()
+        let payload = Data("readiness-preserves-fifo\n".utf8)
+        let pump = TerminalInputPump(
+            retryDelay: 2_000,
+            maxWouldBlockWaitMicros: 5_000_000,
+            waitForWriteReadiness: { _ in
+                readinessWaits.recordWrite(1)
+                return .writable
+            },
+            writer: { data, offset in
+                attempts.recordWrite(1)
+                if attempts.written == 1 { return .wouldBlock }
+                written.record(data, offset: offset)
+                return .wrote(data.count - offset)
+            }
+        )
+
+        XCTAssertEqual(pump.enqueue(payload), .accepted)
+        pump.drain()
+
+        XCTAssertEqual(attempts.written, 2,
+            "one EAGAIN plus one readiness-triggered retry is sufficient")
+        XCTAssertEqual(readinessWaits.written, 1,
+            "the blocked write must park on one kernel readiness wait")
+        XCTAssertEqual(written.text, String(decoding: payload, as: UTF8.self),
+            "readiness waiting must preserve the exact accepted payload")
+        XCTAssertTrue(pump.inputAccepting)
+    }
+
+    func test_writeReadinessTimeoutStillPublishesRecoverableStallAtBudget() {
+        // WHY: kernel waiting removes polling, but it must not remove the bounded
+        // stall contract that closes later input while accepted bytes stay queued.
+        let writes = Counters()
+        let waits = Counters()
+        let stalled = Flag()
+        let payload = Data("blocked\n".utf8)
+        let pump = TerminalInputPump(
+            retryDelay: 100_000,
+            maxWouldBlockWaitMicros: 1_000,
+            waitForWriteReadiness: { _ in
+                waits.recordWrite(1)
+                return .timedOut
+            },
+            writer: { _, _ in
+                writes.recordWouldBlock()
+                return .wouldBlock
+            }
+        )
+        pump.onInputStalled = { stalled.set($0) }
+
+        XCTAssertEqual(pump.enqueue(payload), .accepted)
+        pump.drain()
+
+        XCTAssertTrue(stalled.isSet)
+        XCTAssertEqual(stalled.payload, payload.count)
+        XCTAssertFalse(pump.inputAccepting)
+        XCTAssertEqual(pump.queuedByteCount, payload.count)
+        XCTAssertEqual(waits.written, 1,
+            "one timeout replaces the 2 ms wake loop for the whole wait budget")
+        XCTAssertEqual(writes.wouldBlockCalls, 2,
+            "the timeout gets one final write probe before declaring the stall")
+        pump.stop()
+    }
+
+    func test_closingDescriptorInterruptsKernelWriteWaitPromptly() throws {
+        // WHY: a tab can close while its input queue is parked in poll(POLLOUT).
+        // The readiness optimization must not retain the pump or delay teardown
+        // for the full five-second stall budget.
+        var pipeFDs: [Int32] = [0, 0]
+        XCTAssertEqual(pipe(&pipeFDs), 0)
+        let readFD = pipeFDs[0]
+        let writeFD = pipeFDs[1]
+        defer { Darwin.close(readFD) }
+        XCTAssertTrue(TerminalFileDescriptorFlags.enableNonBlocking(writeFD))
+        try fillPipeUntilWouldBlock(writeFD: writeFD)
+
+        let lease = TerminalFileDescriptorLease(fd: writeFD)
+        let entered = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            entered.signal()
+            _ = lease.waitForWritable(timeoutMicros: 5_000_000)
+            finished.signal()
+        }
+
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        usleep(10_000)
+        lease.close()
+        XCTAssertEqual(finished.wait(timeout: .now() + 0.25), .success,
+            "closing the owned descriptor must wake or cancel the parked writer promptly")
+    }
+
     func test_closedDescriptorLeaseCannotWriteAfterFileDescriptorReuse() throws {
         var pipeFDs: [Int32] = [0, 0]
         XCTAssertEqual(pipe(&pipeFDs), 0)

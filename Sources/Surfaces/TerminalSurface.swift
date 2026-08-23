@@ -2621,9 +2621,14 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     private func configureInputPump(lease: TerminalFileDescriptorLease) {
-        let pump = TerminalInputPump(writer: { data, offset in
-            lease.write(data, offset: offset)
-        })
+        let pump = TerminalInputPump(
+            waitForWriteReadiness: { timeoutMicros in
+                lease.waitForWritable(timeoutMicros: timeoutMicros)
+            },
+            writer: { data, offset in
+                lease.write(data, offset: offset)
+            }
+        )
         attachInputPumpCallbacks(pump)
         inputPump = pump
     }

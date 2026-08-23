@@ -1410,6 +1410,12 @@ enum TerminalWriteResult: Equatable {
     case failed(Int32)
 }
 
+enum TerminalWriteReadinessResult: Equatable {
+    case writable
+    case timedOut
+    case unavailable
+}
+
 final class TerminalFileDescriptorLease: @unchecked Sendable {
     private let lock = NSLock()
     private var fd: Int32
@@ -1439,6 +1445,48 @@ final class TerminalFileDescriptorLease: @unchecked Sendable {
             if count < 0, errno == EINTR { return .interrupted }
             if count < 0, errno == EAGAIN || errno == EWOULDBLOCK { return .wouldBlock }
             return .failed(errno)
+        }
+    }
+
+    func waitForWritable(
+        timeoutMicros: UInt64,
+        onPoll: (@Sendable () -> Void)? = nil
+    ) -> TerminalWriteReadinessResult {
+        guard timeoutMicros > 0 else { return .timedOut }
+        lock.lock()
+        let descriptor = fd
+        lock.unlock()
+        // A concurrent close is surfaced by poll as POLLNVAL/HUP, then the
+        // lease-guarded write below resolves the authoritative EBADF state.
+        guard descriptor >= 0 else { return .writable }
+
+        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutMicros * 1_000
+        while true {
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard now < deadline else { return .timedOut }
+            let remainingMicros = (deadline - now + 999) / 1_000
+            // Darwin does not guarantee that close() on another thread wakes a
+            // descriptor already inside poll. Slice the kernel wait so teardown
+            // observes lease closure within 100 ms while still replacing up to
+            // 2,500 user-space sleep/write wakeups with at most 50 timeouts.
+            let pollMicros = min(remainingMicros, 100_000)
+            let timeoutMillis = Int32(min(
+                UInt64(Int32.max),
+                max(1, (pollMicros + 999) / 1_000)
+            ))
+            var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+            onPoll?()
+            let result = Darwin.poll(&pollDescriptor, 1, timeoutMillis)
+            if result > 0 { return .writable }
+            if result == 0 {
+                lock.lock()
+                let stillOwned = fd == descriptor
+                lock.unlock()
+                if !stillOwned { return .writable }
+                continue
+            }
+            if errno == EINTR { continue }
+            return .unavailable
         }
     }
 
@@ -1738,6 +1786,7 @@ enum TerminalFileDescriptorFlags {
 
 final class TerminalInputPump: @unchecked Sendable {
     typealias Writer = @Sendable (_ data: Data, _ offset: Int) -> TerminalWriteResult
+    typealias WriteReadinessWaiter = @Sendable (_ timeoutMicros: UInt64) -> TerminalWriteReadinessResult
     private struct WaitingDrain: Sendable {
         let data: Data
         let chunkID: UInt64
@@ -1758,6 +1807,7 @@ final class TerminalInputPump: @unchecked Sendable {
     private let maxQueuedItems: Int
     private let retryDelay: useconds_t
     private let maxWouldBlockWaitMicros: UInt64
+    private let waitForWriteReadiness: WriteReadinessWaiter?
     private let writer: Writer
     private let lock = NSLock()
     private var queuedBytes = 0
@@ -1785,6 +1835,7 @@ final class TerminalInputPump: @unchecked Sendable {
         maxQueuedItems: Int = 1024,
         retryDelay: useconds_t = 2_000,
         maxWouldBlockWaitMicros: UInt64 = 5_000_000,
+        waitForWriteReadiness: WriteReadinessWaiter? = nil,
         writer: @escaping Writer
     ) {
         self.queue = DispatchQueue(label: label, qos: .userInitiated)
@@ -1792,6 +1843,7 @@ final class TerminalInputPump: @unchecked Sendable {
         self.maxQueuedItems = max(1, maxQueuedItems)
         self.retryDelay = retryDelay
         self.maxWouldBlockWaitMicros = maxWouldBlockWaitMicros
+        self.waitForWriteReadiness = waitForWriteReadiness
         self.writer = writer
     }
 
@@ -1948,8 +2000,25 @@ final class TerminalInputPump: @unchecked Sendable {
                     )
                     return
                 }
-                usleep(retryDelay)
-                wouldBlockWaitMicros &+= UInt64(retryDelay)
+                if let waitForWriteReadiness {
+                    let remainingMicros = maxWouldBlockWaitMicros > wouldBlockWaitMicros
+                        ? maxWouldBlockWaitMicros - wouldBlockWaitMicros
+                        : UInt64(max(1, retryDelay))
+                    let waitStarted = DispatchTime.now().uptimeNanoseconds
+                    switch waitForWriteReadiness(remainingMicros) {
+                    case .writable:
+                        let elapsed = (DispatchTime.now().uptimeNanoseconds - waitStarted + 999) / 1_000
+                        wouldBlockWaitMicros &+= max(1, elapsed)
+                    case .timedOut:
+                        wouldBlockWaitMicros &+= remainingMicros
+                    case .unavailable:
+                        usleep(retryDelay)
+                        wouldBlockWaitMicros &+= UInt64(retryDelay)
+                    }
+                } else {
+                    usleep(retryDelay)
+                    wouldBlockWaitMicros &+= UInt64(retryDelay)
+                }
                 continue
             case .failed:
                 finishQueuedBytes(countedBytes, chunkID: chunkID)
