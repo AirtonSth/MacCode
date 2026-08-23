@@ -467,6 +467,35 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertEqual(routes["notification:listener-failure"], .settings(.general))
     }
 
+    func test_agentAttentionNotificationProjectsExactAgentSurfaceRoute() throws {
+        let fixture = try fixture()
+        let workspaceID = WorkspaceID(UUID())
+        let surfaceID = SurfaceID(UUID())
+        try fixture.notifications.insert(AppNotification(
+            id: "agent-attention",
+            workspaceId: workspaceID,
+            surfaceId: surfaceID,
+            title: "untrusted title must not reach Pet",
+            body: "secret-token",
+            category: PetNotificationCategory.agentAttention.rawValue
+        ))
+
+        let item = try XCTUnwrap(fixture.store.refresh().items.first)
+        XCTAssertEqual(item.id, "notification:agent-attention")
+        XCTAssertEqual(item.kind, .notification(.agentAttention))
+        XCTAssertEqual(item.title, "Agent input requested")
+        XCTAssertNil(item.detail)
+        XCTAssertEqual(item.classification, .needsYou)
+        XCTAssertEqual(item.route, .surface(surfaceID: surfaceID, workspaceID: workspaceID))
+        XCTAssertEqual(
+            try fixture.store.openAndMarkRead(itemID: item.id) { route in
+                route == .surface(surfaceID: surfaceID, workspaceID: workspaceID)
+            },
+            .retainedBlocker,
+            "Agent input remains actionable until the Agent surface resolves it."
+        )
+    }
+
     func test_operationNotificationsWithoutVerifiableDestinationAreNotProjectedOrBulkCleared() throws {
         let fixture = try fixture()
         for (id, category) in [

@@ -326,6 +326,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
 
     override func notificationCreate(
         workspaceId: WorkspaceID?,
+        surfaceId: SurfaceID?,
         title: String,
         body: String?,
         category: String?

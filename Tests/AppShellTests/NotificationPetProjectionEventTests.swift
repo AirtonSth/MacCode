@@ -83,6 +83,37 @@ final class NotificationPetProjectionEventTests: XCTestCase {
         XCTAssertTrue(encoded.contains(id))
     }
 
+    func test_agentAttentionNotificationKeepsAgentSurfaceInPersistenceAndEvent() async throws {
+        let directory = NSTemporaryDirectory() + "RC2AgentAttentionRPC-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "Agent", cwd: NSTemporaryDirectory())
+        let surfaceID = SurfaceID(UUID())
+        var events: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind == "notification.created" { events.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        let id = try router.notificationCreate(
+            workspaceId: workspace.id,
+            surfaceId: surfaceID,
+            title: "Agent input requested",
+            body: "Review the active Agent thread",
+            category: PetNotificationCategory.agentAttention.rawValue
+        )
+
+        let notification = try XCTUnwrap(
+            NotificationRepository(db: context.db).list().first { $0.id == id }
+        )
+        XCTAssertEqual(notification.surfaceId, surfaceID)
+        let payload = try XCTUnwrap(events.first?.payload.objectValue)
+        XCTAssertEqual(payload["id"]?.stringValue, id)
+        XCTAssertEqual(payload["surface_id"]?.stringValue, surfaceID.value.uuidString)
+        XCTAssertEqual(payload["category"]?.stringValue, PetNotificationCategory.agentAttention.rawValue)
+    }
+
     func test_serverFailureProjectionReopensStableRowAndPublishesSafeRefreshEvents() throws {
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrate(db)

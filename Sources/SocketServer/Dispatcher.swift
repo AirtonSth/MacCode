@@ -275,7 +275,7 @@ public protocol CommandRouting: AnyObject {
     func surfaceMove(workspace: WorkspaceID, surface: SurfaceID, targetPane: PaneID) throws
     func surfaceReorder(workspace: WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int) throws
     // notifications
-    func notificationCreate(workspaceId: WorkspaceID?, title: String, body: String?, category: String?) throws -> String
+    func notificationCreate(workspaceId: WorkspaceID?, surfaceId: SurfaceID?, title: String, body: String?, category: String?) throws -> String
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]]
     func notificationMarkRead(id: String) throws
     func notificationDismiss(id: String) throws
@@ -3658,16 +3658,26 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .string(json))
             case "notification.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
+                let surfaceID: SurfaceID? = (params["surface_id"]?.stringValue ?? params["surfaceId"]?.stringValue)
+                    .flatMap(UUID.init).map(SurfaceID.init)
                 let title = params["title"]?.stringValue ?? "Notification"
                 let body = params["body"]?.stringValue
                 let category = params["category"]?.stringValue
-                let nid = try router.notificationCreate(workspaceId: wid, title: title, body: body, category: category)
+                let nid = try router.notificationCreate(
+                    workspaceId: wid,
+                    surfaceId: surfaceID,
+                    title: title,
+                    body: body,
+                    category: category
+                )
                 if !(router is NotificationEventPublishingRouting) {
-                    EventBus.shared.publish(kind: "notification.created", payload: .object([
+                    var payload: [String: JSONValue] = [
                         "id": .string(nid),
                         "workspace_id": wid.map { .string($0.value.uuidString) } ?? .null,
                         "title": .string(title)
-                    ]))
+                    ]
+                    if let surfaceID { payload["surface_id"] = .string(surfaceID.value.uuidString) }
+                    EventBus.shared.publish(kind: "notification.created", payload: .object(payload))
                 }
                 return .init(id: id, result: .object([
                     "id": .string(nid),
