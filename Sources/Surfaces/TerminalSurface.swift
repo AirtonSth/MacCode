@@ -870,7 +870,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     /// force-completes, so a continuous stream can't latch canRender false (#5).
     private var hiddenBacklogDrainDeadline: Date?
     private var focusRepairGeneration = 0
-    private var busyStatePollActive = false
+    private var busyStatePollDeadline: Date?
+    private var busyStatePollGeneration: UInt64 = 0
+    private var busyStatePollWorkItem: DispatchWorkItem?
+#if DEBUG
+    private var busyStatePollCallbackEntryCountForTestingValue = 0
+#endif
     private var busyStateProbeUntil = Date.distantPast
     private var lastPublishedBusyState = false
     private var didBeepForDeadInput = false
@@ -1138,7 +1143,8 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     /// force-completes, even under a never-quiet stream (#5). Bounds the frozen frame.
     private static let hiddenBacklogMaxDrainWindow: TimeInterval = 1.0
     private static let busyStateProbeDuration: TimeInterval = 2.0
-    private static let busyStatePollInterval: TimeInterval = 0.25
+    private static let activeBusyStatePollInterval: TimeInterval = 0.25
+    private static let hiddenBusyStatePollInterval: TimeInterval = 1.0
     private static let outputTelemetryByteInterval = 8 * 1024 * 1024
     private static let outputTelemetryTimeInterval: TimeInterval = 60
     private nonisolated static let maxPTYReadEventBytes = 256 * 1024
@@ -1169,6 +1175,20 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     var ownsTerminalFocusForTesting: Bool {
         view.window?.firstResponder === ghosttyView
     }
+
+    var lastPublishedBusyStateForTesting: Bool {
+        lastPublishedBusyState
+    }
+
+#if DEBUG
+    var busyStatePollPendingCountForTesting: Int {
+        busyStatePollWorkItem == nil ? 0 : 1
+    }
+
+    var busyStatePollCallbackEntryCountForTesting: Int {
+        busyStatePollCallbackEntryCountForTestingValue
+    }
+#endif
 
     private var historyOutstandingBytes: Int {
         historyCoordinator.outstandingBytes
@@ -2700,6 +2720,16 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         isBusy || now < probeUntil
     }
 
+    static func busyStatePollDelay(isVisible: Bool, activityTriggered: Bool) -> TimeInterval {
+        if isVisible || activityTriggered { return activeBusyStatePollInterval }
+        return hiddenBusyStatePollInterval
+    }
+
+    static func shouldReplaceBusyStatePoll(scheduledAt: Date?, requestedAt: Date) -> Bool {
+        guard let scheduledAt else { return true }
+        return requestedAt < scheduledAt
+    }
+
     private func foregroundProcessGroup() -> Int32? {
         guard masterFD >= 0 else { return nil }
         let group = tcgetpgrp(masterFD)
@@ -2984,15 +3014,37 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     private func scheduleBusyStateRefresh() {
-        busyStateProbeUntil = max(busyStateProbeUntil, Date().addingTimeInterval(Self.busyStateProbeDuration))
-        guard !busyStatePollActive else { return }
-        busyStatePollActive = true
-        pollBusyState()
+        let now = Date()
+        busyStateProbeUntil = max(busyStateProbeUntil, now.addingTimeInterval(Self.busyStateProbeDuration))
+        scheduleBusyStatePoll(activityTriggered: true, now: now)
     }
 
-    private func pollBusyState() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.busyStatePollInterval) { [weak self] in
-            guard let self, !self.isClosing else { return }
+    private func scheduleBusyStatePoll(activityTriggered: Bool, now: Date) {
+        let delay = Self.busyStatePollDelay(
+            isVisible: isVisible,
+            activityTriggered: activityTriggered
+        )
+        let requestedDeadline = now.addingTimeInterval(delay)
+        guard Self.shouldReplaceBusyStatePoll(
+            scheduledAt: busyStatePollDeadline,
+            requestedAt: requestedDeadline
+        ) else { return }
+
+        busyStatePollWorkItem?.cancel()
+        busyStatePollDeadline = requestedDeadline
+        busyStatePollGeneration &+= 1
+        let generation = busyStatePollGeneration
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+#if DEBUG
+            self.busyStatePollCallbackEntryCountForTestingValue += 1
+#endif
+            guard self.busyStatePollGeneration == generation else { return }
+            self.busyStatePollWorkItem = nil
+            self.busyStatePollDeadline = nil
+            guard !self.isClosing else {
+                return
+            }
             let busy = self.isBusy
             if busy != self.lastPublishedBusyState {
                 self.lastPublishedBusyState = busy
@@ -3004,11 +3056,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                 now: now,
                 probeUntil: self.busyStateProbeUntil
             ) else {
-                self.busyStatePollActive = false
                 return
             }
-            self.pollBusyState()
+            self.scheduleBusyStatePoll(activityTriggered: false, now: now)
         }
+        busyStatePollWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     private func recordOutputTelemetry(bytes: Int) {
@@ -3267,6 +3320,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // Workspace switch rebuild races focus repair ahead of reattach. Re-drive
         // firstResponder after reveal so keyDown reaches Ghostty again.
         repairTerminalFocus(reason: "became_visible", force: true)
+        scheduleBusyStatePoll(activityTriggered: true, now: Date())
         touchTerminalMemoryBudget()
     }
 
@@ -3647,7 +3701,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         isDrainingHiddenBacklog = false
         hiddenBacklogDrainDeadline = nil
         stuckHiddenHealScheduled = false
-        busyStatePollActive = false
+        busyStatePollWorkItem?.cancel()
+        busyStatePollWorkItem = nil
+        busyStatePollDeadline = nil
+        busyStatePollGeneration &+= 1
 
         inputPump?.stop(reason: .processExited)
         inputPump?.onTerminalFailure = nil
