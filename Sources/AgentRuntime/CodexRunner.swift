@@ -156,6 +156,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         if request.serviceTier == .fast {
             args += ["-c", "model_service_tier=\"fast\""]
         }
+        args += computerUseMCPOverrides(environment: request.environment)
         if !resuming {
             let model = request.model.trimmingCharacters(in: .whitespaces)
             if !model.isEmpty, model.lowercased() != "default" {
@@ -177,6 +178,29 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         if resuming, let ptid { args.append(ptid) }   // SESSION_ID before PROMPT
         args.append(request.providerPrompt)
         return args
+    }
+
+    /// Codex has no per-turn MCP JSON input. `-c` overrides are scoped to this
+    /// process, so the host MCP can be admitted for logical Desktop without
+    /// persisting it in the user's global config or leaking it to Docker/VM.
+    public static func computerUseMCPOverrides(
+        environment: [String: String],
+        command: String? = nil
+    ) -> [String] {
+        guard environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" else {
+            return []
+        }
+        let resolved = command
+            ?? AgentSkillInstaller.resolveServiceBinary()?.path
+            ?? ComputerUseMCPAdmit.fallbackCommand
+        let escaped = resolved
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let prefix = "mcp_servers.\(ComputerUseMCPAdmit.serverName)"
+        return [
+            "-c", "\(prefix).command=\"\(escaped)\"",
+            "-c", "\(prefix).args=[\"\(ComputerUseMCPAdmit.cliArgument)\"]",
+        ]
     }
 
     public func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
