@@ -103,6 +103,105 @@ final class BotsDeskLiveReplayPerformanceTests: XCTestCase {
             "the candidate must decode fewer persisted payload bytes than full replay")
     }
 
+    func test_benchmarkCachedClaudeSlashDiscoveryBeatsPerKeystrokeScanByMoreThanFivePercent() throws {
+        guard ProcessInfo.processInfo.environment["RC2_BOTS_CLAUDE_SLASH_BENCHMARK"] == "1" else {
+            throw XCTSkip("Set RC2_BOTS_CLAUDE_SLASH_BENCHMARK=1 to run the Claude slash discovery A/B benchmark.")
+        }
+
+        let warmupCount = 2
+        let measuredCount = 5
+        let fixtureSkillCount = 64
+        let fixtureCommandCount = 32
+        let fallback = FileManager.default.temporaryDirectory
+        let appSupport = ProcessInfo.processInfo.environment["RC2_SANDBOX_APP_SUPPORT"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? fallback
+        let root = appSupport
+            .appendingPathComponent("BotsClaudeSlashPerformanceTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let skills = home.appendingPathComponent(".claude/skills", isDirectory: true)
+        let commands = home.appendingPathComponent(".claude/commands", isDirectory: true)
+        let contextRoot = root.appendingPathComponent("app-support", isDirectory: true)
+        try FileManager.default.createDirectory(at: skills, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for index in 0..<fixtureSkillCount {
+            let directory = skills.appendingPathComponent("skill-\(index)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data("# Skill \(index)".utf8).write(to: directory.appendingPathComponent("SKILL.md"))
+        }
+        for index in 0..<fixtureCommandCount {
+            try Data("# Command \(index)".utf8).write(
+                to: commands.appendingPathComponent("command-\(index).md")
+            )
+        }
+
+        let context = try AppContext(channel: .debug, appSupportOverride: contextRoot.path)
+        let viewModel = BotsViewModel(context: context)
+        let bot = try viewModel.create(name: "Piper", title: "Claude slash benchmark")
+        viewModel.openDesk(bot)
+        viewModel.setDeskProvider(.claude)
+        viewModel.composerText = "/"
+        viewModel.claudeSlashDiscoveryForTesting = { _ in
+            ClaudeSlashCommandDiscovery.discover(cwd: nil, home: home.path)
+        }
+
+        func legacySuggestions() -> [AgentComposerSuggestion] {
+            AgentComposerSuggestions.suggestions(
+                for: viewModel.composerText,
+                cursorOffset: viewModel.composerCursorOffset,
+                snapshot: viewModel.selectedDeskSnapshot,
+                localSlashCommands: [],
+                extraCommands: ClaudeSlashCommandDiscovery.builtInClaudeCommands,
+                extraSkillNames: ClaudeSlashCommandDiscovery.discover(cwd: nil, home: home.path),
+                mentionableBots: viewModel.bots.filter { $0.id != viewModel.selectedBotID }
+            )
+        }
+
+        func measure(_ operation: () -> [AgentComposerSuggestion]) -> (UInt64, [AgentComposerSuggestion]) {
+            let started = DispatchTime.now().uptimeNanoseconds
+            let suggestions = operation()
+            let elapsed = DispatchTime.now().uptimeNanoseconds - started
+            return (elapsed, suggestions)
+        }
+
+        let expected = legacySuggestions()
+        XCTAssertEqual(viewModel.composerSuggestions, expected,
+            "caching must preserve the exact command and skill projection")
+        XCTAssertFalse(expected.isEmpty)
+        for _ in 0..<warmupCount {
+            _ = measure(legacySuggestions)
+            _ = measure { viewModel.composerSuggestions }
+        }
+
+        var legacyWall: [UInt64] = []
+        var candidateWall: [UInt64] = []
+        for sample in 0..<measuredCount {
+            if sample.isMultiple(of: 2) {
+                legacyWall.append(measure(legacySuggestions).0)
+                candidateWall.append(measure { viewModel.composerSuggestions }.0)
+            } else {
+                candidateWall.append(measure { viewModel.composerSuggestions }.0)
+                legacyWall.append(measure(legacySuggestions).0)
+            }
+        }
+
+        let legacyMedian = median(legacyWall)
+        let candidateMedian = median(candidateWall)
+        let improvementPercent = 100 * (Double(legacyMedian) - Double(candidateMedian))
+            / Double(legacyMedian)
+        print("BOTS_CLAUDE_SLASH_BENCHMARK skills=\(fixtureSkillCount) commands=\(fixtureCommandCount) warmups=\(warmupCount) n=\(measuredCount)")
+        print("BOTS_CLAUDE_SLASH_BENCHMARK legacy_wall_ns=\(legacyWall)")
+        print("BOTS_CLAUDE_SLASH_BENCHMARK candidate_wall_ns=\(candidateWall)")
+        print("BOTS_CLAUDE_SLASH_BENCHMARK legacy_median_ns=\(legacyMedian) candidate_median_ns=\(candidateMedian) improvement_percent=\(improvementPercent)")
+
+        XCTAssertGreaterThan(improvementPercent, 5,
+            "cached Claude discovery must improve median composer suggestion time by more than 5%")
+        XCTAssertEqual(viewModel.composerSuggestions, legacySuggestions(),
+            "measured candidate must remain semantically equivalent to the former scan")
+    }
+
     private func makeHarness(label: String, fixtureEventCount: Int) throws -> Harness {
         let fallback = FileManager.default.temporaryDirectory
         let appSupport = ProcessInfo.processInfo.environment["RC2_SANDBOX_APP_SUPPORT"]

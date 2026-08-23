@@ -2911,6 +2911,10 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var attentionListCountForTesting = 0
     private var cachedPreviewBrain: ContextAssemblyReceipt?
     private var cachedPreviewBrainKey: String?
+    private var cachedClaudeSlashEntries: (home: String, entries: [String])?
+    var claudeSlashDiscoveryForTesting: ((String) -> [String])? {
+        didSet { cachedClaudeSlashEntries = nil }
+    }
     private var studioSupportByBot: [BotID: BotStudioSupportSnapshot] = [:]
     private var revisionByID: [BotRevisionID: BotRevision] = [:]
     @Published public private(set) var conversations: [BotConversation] = []
@@ -6513,6 +6517,20 @@ public final class BotsViewModel: ObservableObject {
         providers = snapshots
     }
 
+    /// Bots have no project cwd, so Claude discovery is user-scoped. Cache it
+    /// by home for this Desk's lifetime, matching Agent App's cwd-keyed cache.
+    private func claudeSlashEntries() -> [String] {
+        let home = ProcessInfo.processInfo.environment["HOME"]
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        if let cached = cachedClaudeSlashEntries, cached.home == home {
+            return cached.entries
+        }
+        let entries = claudeSlashDiscoveryForTesting?(home)
+            ?? ClaudeSlashCommandDiscovery.discover(cwd: nil, home: home)
+        cachedClaudeSlashEntries = (home, entries)
+        return entries
+    }
+
     public var composerSuggestions: [AgentComposerSuggestion] {
         let snapshot = selectedDeskSnapshot
         let isClaude = snapshot?.provider == .claude || deskRouting.provider == .claude
@@ -6522,11 +6540,7 @@ public final class BotsViewModel: ObservableObject {
             snapshot: snapshot,
             localSlashCommands: [],
             extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
-            extraSkillNames: isClaude ? ClaudeSlashCommandDiscovery.discover(
-                cwd: nil,
-                home: ProcessInfo.processInfo.environment["HOME"]
-                    ?? FileManager.default.homeDirectoryForCurrentUser.path
-            ) : [],
+            extraSkillNames: isClaude ? claudeSlashEntries() : [],
             mentionableBots: bots.filter { $0.id != selectedBotID }
         )
     }

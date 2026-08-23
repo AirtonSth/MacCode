@@ -6903,6 +6903,34 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.composerSuggestions.contains { $0.kind == .skill })
     }
 
+    func test_claudeComposerCachesSlashDiscovery_becauseTypingMustNotRescanTheFilesystem() throws {
+        // WHY: SwiftUI reevaluates composer suggestions while the user types.
+        // Claude's on-disk skill catalog is stable for the life of this Desk,
+        // so each keystroke must reuse the first discovery like Agent App.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller")
+        vm.openDesk(piper)
+        vm.setDeskProvider(.claude)
+        var discoveryCount = 0
+        vm.claudeSlashDiscoveryForTesting = { _ in
+            discoveryCount += 1
+            return ["sam-work"]
+        }
+
+        vm.composerText = "/sam"
+        let first = vm.composerSuggestions
+        vm.composerText = "/sam-w"
+        let second = vm.composerSuggestions
+
+        XCTAssertEqual(discoveryCount, 1)
+        XCTAssertTrue(first.contains { $0.insertText == "/sam-work " })
+        XCTAssertTrue(second.contains { $0.insertText == "/sam-work " })
+        vm.setDeskProvider(.grok)
+        _ = vm.composerSuggestions
+        XCTAssertEqual(discoveryCount, 1, "non-Claude providers must not touch the Claude filesystem")
+    }
+
     func test_deskApplyComposerSuggestionUsesCursorOffset() throws {
         // WHY: Desk used to apply at endIndex. Mid-prompt `/sam` must
         // replace that token, not the word after the caret.
