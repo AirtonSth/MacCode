@@ -5213,6 +5213,150 @@ public final class AgentRunRepository: @unchecked Sendable {
         return 0
     }
 
+    /// Payload-free identity of the newest replay row plus the replay-view count
+    /// and thread-wide insertion watermark. Unlike COUNT(*) or the presentation
+    /// tail alone, this advances when retention replaces a historical-run row
+    /// while a newer run remains the visible tail.
+    public struct StreamEventCursor: Sendable, Equatable {
+        public let count: Int
+        public let rowId: Int64?
+        public let runId: AgentRunID?
+        public let sequence: Int
+        /// Highest raw stream id represented anywhere in the replay view.
+        public let mutationId: Int64?
+
+        public init(
+            count: Int,
+            rowId: Int64?,
+            runId: AgentRunID?,
+            sequence: Int,
+            mutationId: Int64?
+        ) {
+            self.count = count
+            self.rowId = rowId
+            self.runId = runId
+            self.sequence = sequence
+            self.mutationId = mutationId
+        }
+    }
+
+    public func streamEventCursor(threadId: AgentThreadID) throws -> StreamEventCursor {
+        let st = try db.prepare("""
+            WITH scoped AS (
+                SELECT id, run_id, seq, started_at, ordering_id
+                FROM agent_replay_stream_events
+                WHERE thread_id = ?
+            ), newest AS (
+                SELECT id, run_id, seq
+                FROM scoped
+                ORDER BY started_at DESC, seq DESC, ordering_id DESC
+                LIMIT 1
+            )
+            SELECT
+                (SELECT COUNT(*) FROM scoped),
+                (SELECT id FROM newest),
+                (SELECT run_id FROM newest),
+                (SELECT seq FROM newest),
+                (SELECT MAX(ordering_id) FROM scoped);
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        guard try st.step() else {
+            return StreamEventCursor(
+                count: 0,
+                rowId: nil,
+                runId: nil,
+                sequence: 0,
+                mutationId: nil
+            )
+        }
+        let runId = st.columnText(2)
+            .flatMap(UUID.init(uuidString:))
+            .map(AgentRunID.init)
+        return StreamEventCursor(
+            count: Int(st.columnInt64(0)),
+            rowId: runId == nil ? nil : st.columnInt64(1),
+            runId: runId,
+            sequence: runId == nil ? 0 : Int(st.columnInt64(3)),
+            mutationId: runId == nil ? nil : st.columnInt64(4)
+        )
+    }
+
+    /// Payload-free identity for one replay row admitted after a cursor's
+    /// thread-wide insertion watermark.
+    public struct StreamEventMutationRow: Sendable, Equatable {
+        public let id: Int64
+        public let runId: AgentRunID
+        public let sequence: Int
+        public let mutationId: Int64
+        public let payloadBytes: Int64
+
+        public init(
+            id: Int64,
+            runId: AgentRunID,
+            sequence: Int,
+            mutationId: Int64,
+            payloadBytes: Int64
+        ) {
+            self.id = id
+            self.runId = runId
+            self.sequence = sequence
+            self.mutationId = mutationId
+            self.payloadBytes = payloadBytes
+        }
+    }
+
+    /// All replay-view insertions covered by `(afterMutationId, throughMutationId]`,
+    /// ordered by durable insertion identity. The caller uses `limit = expected + 1`
+    /// so one unexpected in-process or external row fails closed without decoding.
+    public func listStreamEventMutations(
+        threadId: AgentThreadID,
+        afterMutationId: Int64,
+        throughMutationId: Int64,
+        limit: Int
+    ) throws -> [StreamEventMutationRow] {
+        let safeLimit = max(0, limit)
+        guard safeLimit > 0, throughMutationId > afterMutationId else { return [] }
+        let st = try db.prepare("""
+            SELECT id, run_id, seq, ordering_id,
+                   LENGTH(CAST(payload_json AS BLOB)) AS presentation_bytes,
+                   substr(payload_json, -240) AS trailer_suffix
+            FROM agent_replay_stream_events
+            WHERE thread_id = ?
+              AND ordering_id > ?
+              AND ordering_id <= ?
+            ORDER BY ordering_id ASC
+            LIMIT ?;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        try st.bind(2, afterMutationId)
+        try st.bind(3, throughMutationId)
+        try st.bind(4, Int64(safeLimit))
+        var rows: [StreamEventMutationRow] = []
+        while try st.step() {
+            let id = st.columnInt64(0)
+            guard let rawRunId = st.columnText(1),
+                  let runUUID = UUID(uuidString: rawRunId) else {
+                throw PersistenceDataError.corruptStreamEvent("row \(id) has invalid run id")
+            }
+            let presentation = st.columnInt64(4)
+            let trailer = st.columnText(5) ?? ""
+            let authoritative = Int64(
+                AuthoritativePayloadRecovery.authoritativeByteCount(
+                    forStoredPayload: trailer,
+                    presentationFallback: Int(presentation)
+                )
+            )
+            rows.append(StreamEventMutationRow(
+                id: id,
+                runId: AgentRunID(runUUID),
+                sequence: Int(st.columnInt64(2)),
+                mutationId: st.columnInt64(3),
+                payloadBytes: authoritative
+            ))
+        }
+        return rows
+    }
+
     public func listLatestStreamEvents(
         threadId: AgentThreadID,
         limit: Int = 500,

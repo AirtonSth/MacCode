@@ -1950,6 +1950,470 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_deskLiveObserverWatermarkDoesNotReplayTheDurableCopy_becauseTheEventAlreadyPainted() throws {
+        // WHY: coordinator observers paint stream events immediately. Once the same
+        // ordered prefix reaches SQLite, the 250 ms watcher must advance its durable
+        // watermark instead of decoding and replaying the whole hot window again.
+        let fixture = try makeDeskReplayFixture()
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        let delta = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: " observed-once",
+            outputAppend: nil,
+            summary: nil
+        )
+
+        fixture.viewModel.applyDeskLiveEventForTesting(delta, threadId: fixture.thread.id)
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [delta],
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveReplayFetchCountForTesting,
+            replayCount,
+            "the durable copy of an already-observed event must not trigger a full hot-window replay"
+        )
+        XCTAssertEqual(fixture.viewModel.deskLiveIncrementalDecodeEventCountForTesting, 1)
+        let reasoning = try XCTUnwrap(
+            fixture.viewModel.deskLiveTimeline.turns.first?.items.first { $0.id == "r-watermark" }
+        )
+        XCTAssertEqual(reasoning.body, "seed observed-once", "a skipped replay must not duplicate the delta")
+    }
+
+    func test_deskLiveObserverWatermarkFallsBackWhenTheObserverMissedAnExternalEvent() throws {
+        // WHY: another process can commit to the shared database while this view
+        // has no matching observer callback. A watermark advance without a local
+        // event must retain the full-replay recovery path.
+        let fixture = try makeDeskReplayFixture()
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        let external = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: " external",
+            outputAppend: nil,
+            summary: nil
+        )
+
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [external],
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveReplayFetchCountForTesting,
+            replayCount + 1,
+            "a durable advance with no observer receipt must fall back to full replay"
+        )
+        let reasoning = try XCTUnwrap(
+            fixture.viewModel.deskLiveTimeline.turns.first?.items.first { $0.id == "r-watermark" }
+        )
+        XCTAssertEqual(reasoning.body, "seed external")
+    }
+
+    func test_deskLiveObserverWatermarkFallsBackWhenExternalAppendKeepsRetainedCountStable() throws {
+        // WHY: production retention can insert one row while pruning one old row,
+        // leaving COUNT(*) unchanged. Out-of-process recovery therefore needs the
+        // durable tail identity, not count alone, to notice the missed event.
+        let fixture = try makeDeskReplayFixture()
+        let fill: [AssistantEvent] = (0..<98).map {
+            .contextCompaction(summary: "retained-\($0)")
+        }
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: fill,
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+
+        let external = AssistantEvent.contextCompaction(summary: "external-at-stable-count")
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [external],
+            startSeq: 101
+        )
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+        fixture.viewModel.refreshDeskLiveTurn()
+
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, replayCount + 1)
+        XCTAssertEqual(fixture.viewModel.deskLiveTimeline.contextCompactionSummary, "external-at-stable-count")
+    }
+
+    func test_deskLiveObserverWatermarkDetectsHistoricalRunMutationAtStableCount() throws {
+        // WHY: presentation order follows run start time. A historical run can
+        // append and prune at the 100-row cap while a newer run remains the same
+        // visible tail, so the cursor also needs a thread-wide mutation watermark.
+        let fixture = try makeDeskReplayFixture()
+        let historicalFill: [AssistantEvent] = (0..<96).map {
+            .contextCompaction(summary: "historical-\($0)")
+        }
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: historicalFill,
+            startSeq: 3
+        )
+        let newerRun = AgentRun(
+            threadId: fixture.thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: fixture.run.startedAt.addingTimeInterval(60),
+            finishedAt: fixture.run.startedAt.addingTimeInterval(61)
+        )
+        try fixture.context.runRepo.upsert(newerRun)
+        try persistStreamEvents(
+            context: fixture.context,
+            run: newerRun,
+            events: [
+                .turnStarted(turnId: "t-newer"),
+                .turnCompleted(turnId: "t-newer", finalMessage: "newer-tail"),
+            ]
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+        let before = fixture.context.coordinator.streamEventCursor(threadId: fixture.thread.id)
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [.contextCompaction(summary: "historical-external-at-stable-count")],
+            startSeq: 99
+        )
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+        let after = fixture.context.coordinator.streamEventCursor(threadId: fixture.thread.id)
+        XCTAssertEqual(after.rowId, before.rowId, "the newer presentation tail intentionally stays unchanged")
+        XCTAssertEqual(after.runId, before.runId)
+        XCTAssertEqual(after.sequence, before.sequence)
+        XCTAssertNotEqual(after.mutationId, before.mutationId)
+
+        fixture.viewModel.refreshDeskLiveTurn()
+
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, replayCount + 1)
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveTimeline.contextCompactionSummary,
+            "historical-external-at-stable-count"
+        )
+    }
+
+    func test_deskLiveObserverWatermarkDoesNotMaskHistoricalMutationBehindObservedNewestAdvance() throws {
+        // WHY: one poll may cover both an observed event on the presentation-tail
+        // run and an unobserved append on a historical run. Confirming only the
+        // newest suffix would consume the thread-wide watermark and lose the
+        // external historical event permanently.
+        let fixture = try makeDeskReplayFixture()
+        let historicalRun = AgentRun(
+            threadId: fixture.thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: fixture.run.startedAt.addingTimeInterval(-60),
+            finishedAt: fixture.run.startedAt.addingTimeInterval(-59)
+        )
+        try fixture.context.runRepo.upsert(historicalRun)
+        let historicalFill: [AssistantEvent] = (0..<98).map {
+            .contextCompaction(summary: "historical-combined-\($0)")
+        }
+        try persistStreamEvents(
+            context: fixture.context,
+            run: historicalRun,
+            events: historicalFill
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+
+        try persistStreamEvents(
+            context: fixture.context,
+            run: historicalRun,
+            events: [.contextCompaction(summary: "historical-external-combined")],
+            startSeq: 99
+        )
+        let observedNewest = AssistantEvent.itemStarted(item: AssistantItem(
+            id: "newest-observed-combined",
+            turnId: "t-watermark",
+            type: .reasoning,
+            state: .streaming,
+            body: "newest local event",
+            startedAtMs: 20
+        ))
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [observedNewest],
+            startSeq: 3
+        )
+        fixture.viewModel.applyDeskLiveEventForTesting(
+            observedNewest,
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+
+        fixture.viewModel.refreshDeskLiveTurn()
+
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveReplayFetchCountForTesting,
+            replayCount + 1,
+            "an observed newest-run suffix must not attest an unobserved historical mutation"
+        )
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveTimeline.contextCompactionSummary,
+            "historical-external-combined"
+        )
+        XCTAssertNotNil(
+            fixture.viewModel.deskLiveTimeline.turns
+                .flatMap(\.items)
+                .first { $0.id == "newest-observed-combined" }
+        )
+    }
+
+    func test_deskLiveObserverWatermarkBoundsObservedBytesAndFallsBackAfterSwitch() throws {
+        // WHY: observer confirmation is only an optimization. A large pending
+        // event must fail closed without being retained beyond the byte budget,
+        // and leaving the Desk must release a smaller pending prefix while a
+        // later durable append still rehydrates through the full fallback.
+        let fixture = try makeDeskReplayFixture()
+        fixture.viewModel.deskLiveObservedEventByteLimitForTesting = 512
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        let large = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: String(repeating: "x", count: 1_024),
+            outputAppend: nil,
+            summary: nil
+        )
+        fixture.viewModel.applyDeskLiveEventForTesting(large, threadId: fixture.thread.id)
+        var buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertEqual(buffer.bytes, 0)
+        XCTAssertEqual(buffer.totalBytes, 0)
+        XCTAssertTrue(buffer.overflowed)
+
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [large],
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, replayCount + 1)
+        XCTAssertFalse(
+            fixture.viewModel.deskLiveObservedEventBufferForTesting(threadId: fixture.thread.id).overflowed
+        )
+
+        let pending = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: " pending-after-switch",
+            outputAppend: nil,
+            summary: nil
+        )
+        fixture.viewModel.applyDeskLiveEventForTesting(pending, threadId: fixture.thread.id)
+        buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(threadId: fixture.thread.id)
+        XCTAssertEqual(buffer.count, 1)
+        XCTAssertGreaterThan(buffer.bytes, 0)
+        XCTAssertEqual(buffer.totalBytes, buffer.bytes)
+
+        _ = try fixture.viewModel.create(name: "Quinn", title: "Switch target", provider: .claude)
+        buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(threadId: fixture.thread.id)
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertEqual(buffer.bytes, 0)
+        XCTAssertEqual(buffer.totalBytes, 0)
+        XCTAssertFalse(buffer.overflowed)
+
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [pending],
+            startSeq: 4
+        )
+        let fallbackCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        fixture.viewModel.openDesk(fixture.bot)
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, fallbackCount + 1)
+        let reasoning = try XCTUnwrap(
+            fixture.viewModel.deskLiveTimeline.turns.first?.items.first { $0.id == "r-watermark" }
+        )
+        XCTAssertTrue(reasoning.body.hasSuffix("pending-after-switch"))
+    }
+
+    func test_deskLiveObserverWatermarkPreservesOrderedTerminalTailWithoutReplay() throws {
+        // WHY: eliminating redundant replay is safe only when ordered deltas and
+        // the terminal event survive exactly once after the durability barrier.
+        let fixture = try makeDeskReplayFixture()
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        let tail: [AssistantEvent] = [
+            .itemDelta(itemId: "r-watermark", bodyAppend: " A", outputAppend: nil, summary: nil),
+            .itemDelta(itemId: "r-watermark", bodyAppend: " B", outputAppend: nil, summary: nil),
+            .itemCompleted(itemId: "r-watermark", finalState: .completed),
+            .turnCompleted(turnId: "t-watermark", finalMessage: "done"),
+        ]
+        for event in tail {
+            fixture.viewModel.applyDeskLiveEventForTesting(event, threadId: fixture.thread.id)
+        }
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: tail,
+            startSeq: 3
+        )
+        var terminal = fixture.run
+        terminal.status = .completed
+        terminal.finishedAt = Date()
+        try fixture.context.runRepo.upsert(terminal)
+
+        fixture.viewModel.adoptLinkedRunTerminalForTests(
+            runId: terminal.id,
+            threadId: fixture.thread.id
+        )
+
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, replayCount)
+        let turn = try XCTUnwrap(fixture.viewModel.deskLiveTimeline.turns.first)
+        XCTAssertTrue(turn.finished)
+        XCTAssertEqual(turn.finalAssistantMessage, "done")
+        XCTAssertEqual(try XCTUnwrap(turn.items.first { $0.id == "r-watermark" }).body, "seed A B")
+    }
+
+    func test_deskLiveObserverWatermarkReconcilesPersistPollObserverRaceAtTerminal() throws {
+        // WHY: persistence can finish before its observer Task reaches MainActor.
+        // If the poll replays first, the late callback paints the same delta a
+        // second time while the cursor is already current. Terminal settlement
+        // must authoritatively reconcile once and release that pending receipt.
+        let fixture = try makeDeskReplayFixture()
+        let delta = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: " once",
+            outputAppend: nil,
+            summary: nil
+        )
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [delta],
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        let afterPoll = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        XCTAssertEqual(
+            try XCTUnwrap(
+                fixture.viewModel.deskLiveTimeline.turns.first?.items
+                    .first { $0.id == "r-watermark" }
+            ).body,
+            "seed once"
+        )
+
+        fixture.viewModel.applyDeskLiveEventForTesting(delta, threadId: fixture.thread.id)
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveObservedEventBufferForTesting(
+                threadId: fixture.thread.id
+            ).count,
+            1
+        )
+
+        fixture.viewModel.adoptLinkedRunTerminalForTests(
+            runId: fixture.run.id,
+            threadId: fixture.thread.id
+        )
+
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, afterPoll + 1)
+        XCTAssertEqual(
+            try XCTUnwrap(
+                fixture.viewModel.deskLiveTimeline.turns.first?.items
+                    .first { $0.id == "r-watermark" }
+            ).body,
+            "seed once"
+        )
+        var buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertEqual(buffer.bytes, 0)
+        XCTAssertFalse(buffer.overflowed)
+
+        fixture.viewModel.adoptLinkedRunTerminalForTests(
+            runId: fixture.run.id,
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveReplayFetchCountForTesting,
+            afterPoll + 1,
+            "an identical terminal read after cleanup must be a no-op"
+        )
+        buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertFalse(buffer.overflowed)
+    }
+
+    func test_deskLiveObserverWatermarkReconcilesObserverArrivingAfterTerminal() throws {
+        // WHY: didReceive and didFinish reach MainActor through independent
+        // Tasks. Terminal settlement may finish and stop the watcher before a
+        // delayed didReceive runs, so that callback itself must close the race.
+        let fixture = try makeDeskReplayFixture()
+        let delta = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: " once",
+            outputAppend: nil,
+            summary: nil
+        )
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [delta],
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        let afterPoll = fixture.viewModel.deskLiveReplayFetchCountForTesting
+
+        fixture.viewModel.adoptLinkedRunTerminalForTests(
+            runId: fixture.run.id,
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, afterPoll)
+
+        fixture.viewModel.applyDeskLiveEventForTesting(
+            delta,
+            runId: fixture.run.id,
+            threadId: fixture.thread.id
+        )
+
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, afterPoll + 1)
+        XCTAssertEqual(
+            try XCTUnwrap(
+                fixture.viewModel.deskLiveTimeline.turns.first?.items
+                    .first { $0.id == "r-watermark" }
+            ).body,
+            "seed once"
+        )
+        let buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertEqual(buffer.bytes, 0)
+        XCTAssertFalse(buffer.overflowed)
+
+        fixture.viewModel.refreshDeskLiveTurn()
+        fixture.viewModel.adoptLinkedRunTerminalForTests(
+            runId: fixture.run.id,
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveReplayFetchCountForTesting,
+            afterPoll + 1,
+            "subsequent identical reads must remain no-ops after late-event cleanup"
+        )
+    }
+
     func test_currentGoalAndActivityDriveHomeFromRealConversations() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -12580,6 +13044,57 @@ final class BotsWindowTests: XCTestCase {
     private struct SeededDeskTurn {
         let run: AgentRun
         let eventCount: Int
+    }
+
+    private struct DeskReplayFixture {
+        let context: AppContext
+        let viewModel: BotsViewModel
+        let bot: BotDefinition
+        let thread: AgentThread
+        let run: AgentRun
+    }
+
+    private func makeDeskReplayFixture() throws -> DeskReplayFixture {
+        let context = try makeContext()
+        let viewModel = BotsViewModel(context: context)
+        let bot = try viewModel.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Watermark", provider: .claude, model: "opus")
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: Date(),
+            finishedAt: Date()
+        )
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(run)
+        try persistStreamEvents(
+            context: context,
+            run: run,
+            events: [
+                .turnStarted(turnId: "t-watermark"),
+                .itemStarted(item: AssistantItem(
+                    id: "r-watermark",
+                    turnId: "t-watermark",
+                    type: .reasoning,
+                    state: .streaming,
+                    body: "seed",
+                    startedAtMs: 10
+                )),
+            ]
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Watermark", linkedAgentThreadID: thread.id)
+        )
+        viewModel.openDesk(bot)
+        return DeskReplayFixture(
+            context: context,
+            viewModel: viewModel,
+            bot: bot,
+            thread: thread,
+            run: run
+        )
     }
 
     @discardableResult

@@ -2612,6 +2612,10 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var deskStopRunIssuedCountForTesting = 0
     /// Test seam: how many times Desk actually decoded stream events.
     public private(set) var deskLiveReplayFetchCountForTesting = 0
+    /// Test seams: persisted suffix work used to confirm an observer watermark.
+    public private(set) var deskLiveIncrementalDecodeEventCountForTesting = 0
+    public private(set) var deskLiveIncrementalDecodeBytesForTesting: Int64 = 0
+    var deskLiveObservedEventByteLimitForTesting: Int?
     /// Test seam: dest at the moment send first acknowledged the click.
     public private(set) var lastSendAcknowledgedOnScreenForTesting: BotsScreen?
     /// Test seam: dest at the moment Attention acknowledge ran. Dest-first
@@ -2664,7 +2668,15 @@ public final class BotsViewModel: ObservableObject {
     private var studioSupportByBot: [BotID: BotStudioSupportSnapshot] = [:]
     private var revisionByID: [BotRevisionID: BotRevision] = [:]
     @Published public private(set) var conversations: [BotConversation] = []
-    @Published public private(set) var selectedConversation: BotConversation?
+    @Published public private(set) var selectedConversation: BotConversation? {
+        didSet {
+            let previousThreadID = oldValue?.linkedAgentThreadID
+            if let previousThreadID,
+               previousThreadID != selectedConversation?.linkedAgentThreadID {
+                clearDeskObservedEvents(threadID: previousThreadID)
+            }
+        }
+    }
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
     @Published public private(set) var memoryItems: [BotMemoryItem] = []
     @Published public private(set) var skillBindings: [BotSkillBinding] = []
@@ -2742,6 +2754,12 @@ public final class BotsViewModel: ObservableObject {
     private var lastStartedConversationByBot: [BotID: BotConversation] = [:]
     private var liveTimelineByThread: [AgentThreadID: AssistantTimelineState] = [:]
     private var liveStreamCountByThread: [AgentThreadID: Int] = [:]
+    private var liveStreamCursorByThread: [AgentThreadID: AgentRunRepository.StreamEventCursor] = [:]
+    private var liveObservedEventsByThread: [AgentThreadID: [AssistantEvent]] = [:]
+    private var liveObservedEventBytesByThread: [AgentThreadID: Int] = [:]
+    private var liveObservedEventBytesTotal = 0
+    private var liveObservedEventOverflowThreads: Set<AgentThreadID> = []
+    private var settledTerminalRunIDByThread: [AgentThreadID: AgentRunID] = [:]
     private var queuedFollowUpsByBot: [BotID: [BotQueuedFollowUp]] = [:]
     private var composerDraftsByBot: [BotID: BotComposerDraft] = [:]
     private var composerHydrated = false
@@ -3765,6 +3783,10 @@ public final class BotsViewModel: ObservableObject {
 
     public func clearAllDeskThreads() {
         guard let bot = selectedBot else { return }
+        for threadID in conversations.compactMap(\.linkedAgentThreadID) {
+            clearDeskObservedEvents(threadID: threadID)
+            settledTerminalRunIDByThread[threadID] = nil
+        }
         let handoffDeletion = context.botPeerHandoffAuthority.beginDeletion(originBotID: bot.id)
         if deskRunIsLive {
             stopDeskRun()
@@ -4315,6 +4337,25 @@ public final class BotsViewModel: ObservableObject {
 
     func applyDeskLiveEventForTesting(_ event: AssistantEvent, threadId: AgentThreadID) {
         applyIncomingDeskEvent(event, threadId: threadId)
+    }
+
+    func applyDeskLiveEventForTesting(
+        _ event: AssistantEvent,
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        applyIncomingDeskEvent(event, runId: runId, threadId: threadId)
+    }
+
+    func deskLiveObservedEventBufferForTesting(
+        threadId: AgentThreadID
+    ) -> (count: Int, bytes: Int, totalBytes: Int, overflowed: Bool) {
+        (
+            liveObservedEventsByThread[threadId]?.count ?? 0,
+            liveObservedEventBytesByThread[threadId] ?? 0,
+            liveObservedEventBytesTotal,
+            liveObservedEventOverflowThreads.contains(threadId)
+        )
     }
 
     public func addAttachments(_ paths: [String]) {
@@ -5421,6 +5462,19 @@ public final class BotsViewModel: ObservableObject {
     private func leaveDeskLiveWatch() {
         deskLiveTurnWatch?.cancel()
         deskLiveTurnWatch = nil
+        if let threadID = selectedConversation?.linkedAgentThreadID {
+            clearDeskObservedEvents(threadID: threadID)
+        }
+    }
+
+    private func clearDeskObservedEvents(threadID: AgentThreadID) {
+        liveObservedEventBytesTotal = max(
+            0,
+            liveObservedEventBytesTotal - (liveObservedEventBytesByThread[threadID] ?? 0)
+        )
+        liveObservedEventsByThread[threadID] = nil
+        liveObservedEventBytesByThread[threadID] = nil
+        liveObservedEventOverflowThreads.remove(threadID)
     }
 
     /// Studio dest needs revision, memory, skills, routines, and the last
@@ -6124,6 +6178,9 @@ public final class BotsViewModel: ObservableObject {
         }
         if deskRoutingHydrated {
             captureDeskRouting()
+        }
+        if let threadID = selectedConversation?.linkedAgentThreadID {
+            clearDeskObservedEvents(threadID: threadID)
         }
         selectedBotID = id
         applyComposerDraft(for: id)
@@ -7210,7 +7267,10 @@ public final class BotsViewModel: ObservableObject {
         messagesByBot[botID] = dest
     }
 
-    private func restoreDeskLiveTurn(botID: BotID) {
+    private func restoreDeskLiveTurn(
+        botID: BotID,
+        reconcileObservedAtTerminal: Bool = false
+    ) {
         let conversation = conversationForBot(botID)
         guard let threadID = conversation?.linkedAgentThreadID else {
             if selectedBotID == botID {
@@ -7221,20 +7281,79 @@ public final class BotsViewModel: ObservableObject {
             }
             return
         }
-        applyDeskLiveReplay(botID: botID, threadID: threadID, force: false)
+        applyDeskLiveReplay(
+            botID: botID,
+            threadID: threadID,
+            reconcileObservedAtTerminal: reconcileObservedAtTerminal
+        )
         if selectedBotID == botID, screen == .desk, deskRunIsLive {
             startDeskLiveTurnWatch(botID: botID, threadID: threadID)
         }
     }
 
-    private func applyDeskLiveReplay(botID: BotID, threadID: AgentThreadID, force: Bool = false) {
-        let count = context.coordinator.countStreamEvents(threadId: threadID)
-        if !force, liveStreamCountByThread[threadID] == count {
+    @discardableResult
+    private func applyDeskLiveReplay(
+        botID: BotID,
+        threadID: AgentThreadID,
+        reconcileObservedAtTerminal: Bool = false
+    ) -> Bool {
+        let cursor = context.coordinator.streamEventCursor(threadId: threadID)
+        let hasUnconfirmedObservedEvents = liveObservedEventsByThread[threadID]?.isEmpty == false
+            || liveObservedEventOverflowThreads.contains(threadID)
+        let requiresTerminalReconciliation = reconcileObservedAtTerminal
+            && hasUnconfirmedObservedEvents
+        if let previous = liveStreamCursorByThread[threadID],
+           previous == cursor,
+           !requiresTerminalReconciliation {
             if selectedBotID == botID {
                 deskLiveTimeline = liveTimelineByThread[threadID] ?? deskLiveTimeline
-                deskStreamEventCount = liveStreamCountByThread[threadID] ?? count
+                deskStreamEventCount = liveStreamCountByThread[threadID] ?? cursor.count
             }
-            return
+            return false
+        }
+        if let previous = liveStreamCursorByThread[threadID],
+           let runId = cursor.runId,
+           previous.runId == runId,
+           cursor.sequence > previous.sequence,
+           let previousMutationId = previous.mutationId,
+           let mutationId = cursor.mutationId,
+           !liveObservedEventOverflowThreads.contains(threadID) {
+            let advance = cursor.sequence - previous.sequence
+            let observed = liveObservedEventsByThread[threadID] ?? []
+            if advance <= observed.count,
+               let suffix = context.coordinator.attestedStreamEventSuffix(
+                   threadId: threadID,
+                   afterMutationId: previousMutationId,
+                   throughMutationId: mutationId,
+                   runId: runId,
+                   startingSequence: previous.sequence + 1,
+                   count: advance
+               ) {
+                deskLiveIncrementalDecodeEventCountForTesting += suffix.events.count
+                deskLiveIncrementalDecodeBytesForTesting += suffix.decodedPayloadBytes
+                if suffix.events == Array(observed.prefix(advance)) {
+                    let remaining = Array(observed.dropFirst(advance))
+                    let previousBytes = liveObservedEventBytesByThread[threadID] ?? 0
+                    let remainingBytes = remaining.reduce(0) {
+                        $0 + max(1, $1.estimatedHotQueueBytes)
+                    }
+                    liveObservedEventBytesTotal = max(
+                        0,
+                        liveObservedEventBytesTotal - previousBytes + remainingBytes
+                    )
+                    liveObservedEventsByThread[threadID] = remaining.isEmpty ? nil : remaining
+                    liveObservedEventBytesByThread[threadID] = remaining.isEmpty
+                        ? nil
+                        : remainingBytes
+                    liveStreamCursorByThread[threadID] = cursor
+                    liveStreamCountByThread[threadID] = cursor.count
+                    if selectedBotID == botID {
+                        deskLiveTimeline = liveTimelineByThread[threadID] ?? deskLiveTimeline
+                        deskStreamEventCount = cursor.count
+                    }
+                    return true
+                }
+            }
         }
         deskLiveReplayFetchCountForTesting += 1
         let events = context.coordinator.latestStreamEvents(threadId: threadID)
@@ -7242,23 +7361,38 @@ public final class BotsViewModel: ObservableObject {
         // Compare against THIS thread. A per-bot cache kept a richer
         // hop's Worked rows after the user opened another conversation.
         let current = liveTimelineByThread[threadID] ?? AssistantTimelineState()
-        if AgentChatLiveTurnChrome.isRicher(current, than: state) {
-            liveStreamCountByThread[threadID] = max(count, liveStreamCountByThread[threadID] ?? 0)
+        liveStreamCursorByThread[threadID] = cursor
+        if !requiresTerminalReconciliation,
+           AgentChatLiveTurnChrome.isRicher(current, than: state) {
+            liveStreamCountByThread[threadID] = max(
+                cursor.count,
+                liveStreamCountByThread[threadID] ?? 0
+            )
+            clearDeskObservedEvents(threadID: threadID)
+            if hasUnconfirmedObservedEvents {
+                liveObservedEventOverflowThreads.insert(threadID)
+            }
             if selectedBotID == botID {
                 deskLiveTimeline = current
-                deskStreamEventCount = liveStreamCountByThread[threadID] ?? count
+                deskStreamEventCount = liveStreamCountByThread[threadID] ?? cursor.count
             }
-            return
+            return true
         }
         liveTimelineByThread[threadID] = state
-        liveStreamCountByThread[threadID] = count
+        liveStreamCountByThread[threadID] = cursor.count
+        clearDeskObservedEvents(threadID: threadID)
         if selectedBotID == botID {
             deskLiveTimeline = state
-            deskStreamEventCount = count
+            deskStreamEventCount = cursor.count
         }
+        return true
     }
 
-    private func applyIncomingDeskEvent(_ event: AssistantEvent, threadId: AgentThreadID) {
+    private func applyIncomingDeskEvent(
+        _ event: AssistantEvent,
+        runId: AgentRunID? = nil,
+        threadId: AgentThreadID
+    ) {
         guard screen == .desk,
               selectedConversation?.linkedAgentThreadID == threadId
         else { return }
@@ -7267,29 +7401,61 @@ public final class BotsViewModel: ObservableObject {
         next.enforceAggregateHotTextBudget()
         deskLiveTimeline = next
         liveTimelineByThread[threadId] = next
+        if !liveObservedEventOverflowThreads.contains(threadId) {
+            var observed = liveObservedEventsByThread[threadId] ?? []
+            let eventBytes = max(1, event.estimatedHotQueueBytes)
+            let threadBytes = liveObservedEventBytesByThread[threadId] ?? 0
+            let byteLimit = max(
+                1,
+                deskLiveObservedEventByteLimitForTesting
+                    ?? Int(AgentRunCoordinator.hotReplayEventBytes)
+            )
+            if observed.count < AgentRunCoordinator.hotReplayEventCount,
+               eventBytes <= byteLimit,
+               threadBytes <= byteLimit - eventBytes,
+               liveObservedEventBytesTotal <= byteLimit - eventBytes {
+                observed.append(event)
+                liveObservedEventsByThread[threadId] = observed
+                liveObservedEventBytesByThread[threadId] = threadBytes + eventBytes
+                liveObservedEventBytesTotal += eventBytes
+            } else {
+                clearDeskObservedEvents(threadID: threadId)
+                liveObservedEventOverflowThreads.insert(threadId)
+            }
+        }
+        if let runId,
+           settledTerminalRunIDByThread[threadId] == runId,
+           let botID = selectedBotID {
+            _ = applyDeskLiveReplay(
+                botID: botID,
+                threadID: threadId,
+                reconcileObservedAtTerminal: true
+            )
+        }
     }
 
     private func refreshDeskLiveTurnIfCountChanged(botID: BotID, threadID: AgentThreadID) {
-        applyDeskLiveReplay(botID: botID, threadID: threadID, force: false)
+        applyDeskLiveReplay(botID: botID, threadID: threadID)
     }
 
     private func startDeskLiveTurnWatch(botID: BotID, threadID: AgentThreadID) {
         deskLiveTurnWatch?.cancel()
         deskLiveTurnWatch = Task { [weak self] in
-            var lastCount = -1
             while !Task.isCancelled {
                 guard let self else { return }
                 guard self.selectedBotID == botID, self.screen == .desk else { return }
-                let count = self.context.coordinator.countStreamEvents(threadId: threadID)
-                if count != lastCount {
-                    lastCount = count
-                    self.applyDeskLiveReplay(botID: botID, threadID: threadID, force: true)
+                if self.applyDeskLiveReplay(botID: botID, threadID: threadID) {
                     self.refreshPublishedIdentity(for: botID)
                 }
                 let run = self.linkedRun(for: threadID, botID: botID)
                 if let run, BotsDeskFollowThrough.isTerminal(run.status) {
-                    self.applyDeskLiveReplay(botID: botID, threadID: threadID, force: true)
-                    self.refreshPublishedIdentity(for: botID)
+                    if self.applyDeskLiveReplay(
+                        botID: botID,
+                        threadID: threadID,
+                        reconcileObservedAtTerminal: true
+                    ) {
+                        self.refreshPublishedIdentity(for: botID)
+                    }
                     return
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
@@ -8105,11 +8271,14 @@ public final class BotsViewModel: ObservableObject {
         if let run {
             lastLinkedRunIDByBot[bot.id] = run.id
         }
-        restoreDeskWorkLog(botID: bot.id, preferredRun: run)
-        restoreDeskLiveTurn(botID: bot.id)
-        refreshPublishedIdentity(for: bot.id)
         let status = run?.status ?? .interrupted
         let reason = run?.terminalReason
+        restoreDeskWorkLog(botID: bot.id, preferredRun: run)
+        restoreDeskLiveTurn(
+            botID: bot.id,
+            reconcileObservedAtTerminal: BotsDeskFollowThrough.isTerminal(status)
+        )
+        refreshPublishedIdentity(for: bot.id)
         let viewingDesk = isViewing(bot.id)
         next.attentionState = BotsDeskFollowThrough.conversationState(
             for: status,
@@ -8402,6 +8571,7 @@ public final class BotsViewModel: ObservableObject {
     /// Finish events and relaunch must settle that row, not just refresh
     /// Active Bots from the stale attention flag.
     private func adoptLinkedRunTerminal(runId: AgentRunID, threadId: AgentThreadID) {
+        settledTerminalRunIDByThread[threadId] = runId
         guard let conversation = try? botStore.conversationLinked(to: threadId) else {
             if screen == .desk,
                let botID = selectedBotID,
@@ -8620,7 +8790,7 @@ extension BotsViewModel: AgentRunObserver {
         threadId: AgentThreadID
     ) {
         Task { @MainActor [weak self] in
-            self?.applyIncomingDeskEvent(event, threadId: threadId)
+            self?.applyIncomingDeskEvent(event, runId: run, threadId: threadId)
         }
     }
 
