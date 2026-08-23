@@ -152,6 +152,61 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         )
     }
 
+    func test_relaunchRestoresPetPlacementFromThePersistedStore() throws {
+        // WHY: the Pet process can be relaunched independently of the host
+        // session. Its last resolved physical placement must survive the
+        // controller teardown so the next launch does not jump to a default
+        // corner or overlap the Dock.
+        let db = try database()
+        let placementStore = PetPlacementStore(repository: SettingsRepository(db: db))
+        let firstModel = PetViewModel(settings: AppSettings(
+            petEnabled: true,
+            petPosition: "free"
+        ))
+        let firstController = PetWindowController(model: firstModel, placementStore: placementStore)
+        Self.useCenteredDockFixture(on: firstController)
+        firstController.show()
+        let firstPanel = try XCTUnwrap(firstController.petPanelForTests)
+        let firstScreen = try XCTUnwrap(firstPanel.screen ?? NSScreen.main)
+        let firstPlacement = PetScreenGeometry.petPlacementFrame(
+            screenFrame: firstScreen.frame,
+            visibleFrame: firstScreen.visibleFrame
+        )
+        let requestedFrame = CGRect(
+            x: firstPlacement.minX + firstPlacement.width * 0.37,
+            y: firstPlacement.minY + firstPlacement.height * 0.41,
+            width: firstPanel.frame.width,
+            height: firstPanel.frame.height
+        )
+        firstController.finishDragForTests(frame: requestedFrame)
+        let persisted = try XCTUnwrap(placementStore.load())
+        firstController.stop()
+
+        let secondModel = PetViewModel(settings: AppSettings(
+            petEnabled: true,
+            petPosition: "free"
+        ))
+        let secondController = PetWindowController(model: secondModel, placementStore: placementStore)
+        Self.useCenteredDockFixture(on: secondController)
+        defer { secondController.stop() }
+        secondController.show()
+        let secondPanel = try XCTUnwrap(secondController.petPanelForTests)
+        let secondScreen = try XCTUnwrap(secondPanel.screen ?? NSScreen.main)
+        let secondPlacement = PetScreenGeometry.petPlacementFrame(
+            screenFrame: secondScreen.frame,
+            visibleFrame: secondScreen.visibleFrame
+        )
+
+        XCTAssertEqual(
+            try XCTUnwrap(placementStore.load()).position,
+            persisted.position,
+            "relaunch must read the same normalized Pet position from SQLite"
+        )
+        let restored = PetPlacement.normalizedPosition(for: secondPanel.frame, in: secondPlacement)
+        XCTAssertEqual(restored.x, persisted.position.x, accuracy: 0.001)
+        XCTAssertEqual(restored.y, persisted.position.y, accuracy: 0.001)
+    }
+
     func test_animationStateResizeKeepsVisualPanelOnChosenScreenEdges() throws {
         let db = try database()
         let atlas = try PetAtlas.bundled()
