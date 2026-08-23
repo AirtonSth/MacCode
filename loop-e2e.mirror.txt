@@ -1,0 +1,257 @@
+# =============================================================================
+# REMOTECODE LOOP — ISOLADO + ANTI-RETRABALHO + PERF (faster/less mem/less CPU/fluido)
+# Arquivo canônico: /Users/samuelfajreldines/dev/remote-code/loop-e2e.txt
+# Este arquivo guarda TUDO: snapshot do prompt + ledger append-only
+# O loop lê este arquivo como LEDGER: linhas com '|' são ledger, linhas com '# ' são comentários
+# Snapshot do prompt está entre as marcadoras abaixo — extraia com:
+#   sed -n '/^# ====== PROMPT_SNAPSHOT_START/,/^# ====== PROMPT_SNAPSHOT_END/p' loop-e2e.txt | sed '1d;$d' | sed 's/^# //' | sed 's/^#$//' 
+# Para iniciar o loop use loop.txt direto (mirror idêntico)
+# Não apague linhas de ledger; cada fire faz APPEND de 1 linha por slice validado
+# =============================================================================
+# ====== PROMPT_SNAPSHOT_START ======
+# /loop 60s
+#
+# You are the ONLY scheduled RemoteCode hunt-fix loop. New session. Do not resume a prior fire. No parent chat. No extra /loop. No scheduler_create except the single rechain at the end. No spawn_subagent. No parallel builds. No second worktree. One fire = one serial iteration, then exit.
+#
+# STATE=/Users/samuelfajreldines/dev/remote-code/.rc-autoloops/macos-ios-hunt
+# MACOS=/Users/samuelfajreldines/dev/remote-code/macos-app
+# IOS=/Users/samuelfajreldines/dev/remote-code/ios-app
+# MACOS_WT=$MACOS/.rc-autoloops/wt/bug-fix
+# IOS_WT=$IOS/.rc-autoloops/wt/bug-fix
+# PROMPT_FILE=$STATE/PROMPT.txt
+# LOCK=$STATE/lock
+# CURSOR=$STATE/cursor
+# STREAK=$STATE/empty-streak
+# LOG=$STATE/last-status.txt
+# FPS=$STATE/fingerprints.txt
+# MACOS_MR_FILE=$STATE/macos-mr
+# IOS_MR_FILE=$STATE/ios-mr
+# BRANCH=bug-fix
+# MACOS_BASE=production
+# IOS_BASE=main
+# # AUTH padrão para login E2E (usar quando a UI pedir email/senha — não inventar outro usuário)
+# AUTH_EMAIL=samuelfaj@icloud.com
+# AUTH_PASS=12345678
+# export AUTH_EMAIL="samuelfaj@icloud.com"
+# export AUTH_PASS="12345678"
+# export TEST_USER_EMAIL="samuelfaj@icloud.com"
+# export TEST_USER_PASS="12345678"
+# export E2E_USER="samuelfaj@icloud.com"
+# export E2E_PASS="12345678"
+# SAM_GOAL=~/.grok/skills/sam-goal/SKILL.md
+# SAM_TASK=~/.grok/skills/sam-task/SKILL.md
+# mkdir -p "$STATE"
+# if [ ! -f "$PROMPT_FILE" ]; then write THIS exact user prompt to "$PROMPT_FILE"; fi
+#
+# SERIAL / NO CONCURRENCY
+# 1. scheduler_list. If any other scheduled task exists besides the one that launched this fire, scheduler_delete it.
+# 2. If "$LOCK" exists and names a live worker (PID alive, or grok task still running, or heartbeat newer than 20m): print exactly `SKIP busy` and STOP. Do not rechain. Do not hunt. Do not edit. Do not commit.
+# 3. Else take "$LOCK" (pid, time, fire-id). Heartbeat it.
+# 4. scheduler_delete EVERY scheduled task including yours. This fire owns the machine until it exits.
+# 5. Never start a second Grok loop, monitor, background build, or sandbox GUI while another is already running.
+# 6. sam-goal split-gate OPEN still means YOU walk units serially in this fire. Do not spawn workers. Do not fan out.
+#
+# EVERY FIRE READS AND RUNS BOTH SKILLS (before any product edit)
+# Immediately after the lock:
+#   - Read and obey $SAM_GOAL (references/method.md, gates.md, ladder.md, output-contract.md). Intensity=full. Action=execute.
+#   - Read and obey $SAM_TASK (plan → refine → work → closure → learn; never skip, never emulate children).
+#   - Also read macos-app/.grok/skills/isolated-sandbox/SKILL.md and ~/.grok/skills/macos-harness/SKILL.md.
+# Order on a candidate: sam-goal FIRST (GATES.md on disk, smallest change), THEN sam-task using those gates as the frozen goal. User instruction to use both skills overrides sam-goal “do not invoke another skill”.
+# EMPTY fire: still scaffold a per-fire GOAL_DIR, write GATES that encode the empty E2E sweep, run check_gates.py. Do NOT start sam-task work/plan delivery on empty qualification (sam-task has no NO_CHANGE terminal). Still read the sam-task skill this fire.
+# RAN fire: sam-goal must reach validator VALID on $GOAL_DIR/goal-report.json AND sam-task must reach validator VALID on task-report.json. Missing either → BLOCKED, not RAN.
+# GOAL_DIR=$MACOS_WT/goal/macos-ios-hunt/<UTC-fire-id> when the defect is macos/integ-host; $IOS_WT/goal/macos-ios-hunt/<UTC-fire-id> when the defect is ios. Commit the goal ledgers as checkpoints on bug-fix.
+# sam-task/sam-work MUST use existing branch bug-fix and the existing series MR. They must NOT invent a new branch or a second MR. web_surface=false with evidence: native SwiftUI macOS + iOS apps, no browser product surface. Playwright phase NOT_APPLICABLE. Demo-video phase still required on RAN (sam-create-task-demo-video, publish on the series MR). Native E2E proof below is additional and mandatory on EVERY fire, including EMPTY.
+#
+# GIT / BRANCH / MR  (non-negotiable)
+# Two remotes, one series, one branch name, one MR per repo for the WHOLE series.
+#
+# macOS repo: $MACOS
+#   origin = gitlab.com/desenvolvimento-ninja/remodecode/remotecode.git
+#   base = origin/production
+#   working branch = bug-fix   (ALWAYS this name, never sandbox/isolated-*, never auto/*, never a new name per fire)
+#   MR target = production
+#   MR iid file = $MACOS_MR_FILE
+#   worktree = $MACOS_WT
+#
+# iOS repo: $IOS
+#   origin = gitlab.com/desenvolvimento-ninja/remotecode2-ios.git
+#   base = origin/main
+#   working branch = bug-fix   (ALWAYS this name)
+#   MR target = main
+#   MR iid file = $IOS_MR_FILE
+#   worktree = $IOS_WT
+#
+# Ensure branch + worktree BEFORE any product edit (each repo you will touch):
+#   git -C "$REPO" fetch origin
+#   if worktree $WT does not exist:
+#     if origin/bug-fix exists:  git -C "$REPO" worktree add "$WT" bug-fix
+#     else:                      git -C "$REPO" worktree add -b bug-fix "$WT" origin/$BASE
+#   else:
+#     git -C "$WT" checkout bug-fix
+#     git -C "$WT" pull --ff-only origin bug-fix || true
+#   NEVER reset bug-fix. NEVER rebase. NEVER force-push. NEVER delete bug-fix.
+#   If compile needs newer base: merge origin/$BASE into bug-fix with a merge commit (checkpoint), then push.
+#   Primary checkouts must remain untouched: macos stays on production, ios stays on main. No checkout/commit/reset/push from $MACOS or $IOS roots — only from $MACOS_WT / $IOS_WT.
+#   Forbidden branch names: sandbox/isolated-*, auto/*, any name other than bug-fix.
+#
+# SAME MR FOREVER
+#   If $MR_FILE has an iid: that is THE MR. Verify `glab mr view $IID` source=bug-fix and target=$BASE. If source/target mismatch → BLOCKED, do not open another.
+#   If $MR_FILE is empty: `glab mr list --source-branch bug-fix --target-branch $BASE`. If one exists, write its iid to $MR_FILE and use it. If none exists, create ONCE:
+#     macos: glab mr create --source-branch bug-fix --target-branch production --title "bug-fix: macOS hunt-fix series" --description "..." --no-editor
+#     ios:   glab mr create --source-branch bug-fix --target-branch main --title "bug-fix: iOS hunt-fix series" --description "..." --no-editor
+#     write iid to $MR_FILE.
+#   NEVER create a second MR for that repo. NEVER merge. NEVER mark draft. NEVER retarget.
+#
+# COMMIT EVERY CHECKPOINT then PUSH then UPDATE THE MR
+# A checkpoint is any of: merge-base into bug-fix; GATES.md/DELEGATION.md written; added failing/regression test; applied fix; rebuild+E2E proof went green; sam-goal/sam-task report files; MR description/body change; recovered from a partial edit.
+# After EACH checkpoint, in the worktree you edited:
+#   git add -A   (only product/goal files; never lock/state/DerivedData/xcuserstate/videos)
+#   git commit -m "bug-fix: <slice> <what this checkpoint did>"
+#   git push -u origin bug-fix
+#   glab mr update $IID --description with: Hunt-fix series (do not merge from a loop); last fire UTC/status/fp; commits `git log --oneline origin/$BASE..HEAD`; E2E proof paths; sam-goal GOAL_DIR; sam-task report path; uploaded demo player markup if RAN.
+#   Confirm remote HEAD of bug-fix equals local HEAD. Confirm glab mr view source=bug-fix target=$BASE.
+# If a checkpoint has no diff, do not empty-commit; still push if unpushed commits exist, then update the MR.
+# EMPTY/BLOCKED with no code change: do not commit; still update the MR description with the fire log (commits list unchanged).
+# Never leave uncommitted product edits at fire end. If the fix is half-done, commit the partial as a checkpoint titled wip, then BLOCKED — do not discard, do not stash and forget.
+# Never git-add recordings/mp4/screenshots; upload media to GitLab and embed on the MR.
+#
+# ALWAYS REBUILD (every fire, before every E2E, and again after every code change)
+# macOS from $MACOS_WT only:
+#   scripts/isolated-sandbox.sh identity   # must show linked_worktree=yes, bundle_id=io.remotecode.desktop.debug, http_port=18218
+#   scripts/isolated-sandbox.sh build      # packages dist/RemoteCodeDebug.app
+#   scripts/isolated-sandbox.sh run        # launches ONLY the debug app
+#   Confirm executable is dist/RemoteCodeDebug.app/Contents/MacOS/RemoteCode listening on 18218.
+#   FORBIDDEN: pkill RemoteCode, osascript quit io.remotecode.desktop, script/build_and_run.sh, scripts/run-app.sh, open dist/RemoteCode.app, Token Saver install from sandbox, pointing anything at 127.0.0.1:18217.
+# iOS from $IOS_WT only:
+#   rebuild via ios-app/scripts (test-unit / test-ui / bootstrap as needed) into the booted simulator. Do not uninstall a physical device. Do not use FakeDirectServer as the only proof.
+# A hunt or a “fix” without a successful rebuild this fire is BLOCKED.
+#
+# ALWAYS E2E WITH macos-harness OR computer-use (every fire, hunt AND proof)
+# Prefer macos-harness through the repo lease:
+#   cd "$MACOS_WT" && scripts/macos-ui-lease.sh --allow-input -- macos-harness <<'PY'
+#   # target ONLY io.remotecode.desktop.debug / RemoteCodeDebug
+#   PY
+# Fallback: computer-use MCP (get_tool_guide first; target_app = debug RemoteCode or Simulator). Never remotecode-computer-use. Never drive io.remotecode.desktop (the user’s live host). Never move the user’s physical cursor if harness can PID-target.
+# This fire is invalid without at least one real GUI E2E session (see + type/click + observed result). Unit tests alone are not enough. Screenshots of source are not E2E. FakeDirectServer-only is not E2E.
+#
+# REAL DATA AND REAL PROMPTS (no toys)
+# - Drive the rebuilt debug/sim app as a user would: pair/connect to the SANDBOX host (18218), open a real workspace on disk, send a REAL agent/user prompt, wait for a real model/provider turn, observe the transcript/UI.
+# - Rotate real prompts (not “hello”, not lorem, not “test test”). Examples of the class required: ask the agent to list files in the open workspace and explain a concrete Swift type; ask it to run a real command in the integrated terminal; ask it to show git status of the workspace; ask it to open a real file and summarize a function that exists. Pick prompts that can expose the current hunt slice.
+# - Use sandbox Application Support / simulator data, never production customer data, never the live host’s workspaces.
+# - AUTH PARA E2E LOGIN (obrigatório): sempre que a UI pedir email/senha/login/signup/auth/pairing, use EXCLUSIVAMENTE email=samuelfaj@icloud.com senha=12345678 (vars AUTH_EMAIL/AUTH_PASS/TEST_USER_EMAIL/TEST_USER_PASS/E2E_USER/E2E_PASS já exportadas no topo). Não invente outro usuário, não use samuel@empathmsp.com nem fake. Se o fluxo criar conta, use esse mesmo; se pedir token, use o desse usuário.
+# - Record the exact prompt text, workspace path, bundle id, port, and visible outcome in $LOG and in sam-goal GATES (CHECK/EXPECT).
+# - Integration slices: the iOS sim must talk to the rebuilt sandbox macOS host on 18218, then exercise the same real prompt/flow from iOS. ios-app/scripts/test-contract.sh HOST=127.0.0.1 PORT=18218 is extra evidence, not a substitute for GUI E2E.
+# - If the GUI cannot boot after rebuild, BLOCKED with the build/run log — do not “fix from grep” and claim RAN.
+#
+# GOAL
+# Find exactly ONE real, reproducible defect and fix it. Choose the first candidate in hunt-cursor order from:
+# - a macOS-app bug, XOR
+# - an iOS-app bug, XOR
+# - a macOS↔iOS integration/contract bug.
+# Never fix two. Never “while I am here”. Never refactor, never add features, never weaken tests, never delete tests, never fake a host API on iOS.
+# If the fix needs both repos (true integration), still one logical defect: commit checkpoints on macos bug-fix AND ios bug-fix as needed, update BOTH existing MRs. Do not open extras.
+# Qualify the candidate from the E2E session (red GUI behavior or contract failure), then freeze it into sam-goal GATES, then deliver through sam-task.
+#
+# STOP ONLY WHEN THE PRODUCT IS ACTUALLY CLEAN
+# Do not declare done because this fire found nothing. Do not declare done because one slice is empty. SERIES_DONE is allowed only when ALL of these are true in the same fire:
+# - you rebuilt both surfaces
+# - you completed a full extra sweep of every hunt slice below (0–27) against current HEAD of both bug-fix worktrees
+# - each visited slice this sweep had a real-prompt macos-harness or computer-use E2E (or iOS sim E2E) that passed
+# - zero failing tests in the scoped macOS and iOS commands you actually ran
+# - zero remaining reproducible items in ios-app/docs/DESKTOP-CONTRACT-GAPS.md that are still true in code
+# - empty-streak would be ≥ 28 after this fire (28 consecutive EMPTY fires, one full rotation)
+# - you wrote proof of the empty sweep into $LOG
+# Then: do not rechain, scheduler_delete everything, drop lock, print `SERIES_DONE`, exit. Leave bug-fix + both MRs open (never merge).
+# Any other result: rechain. The loop must not die on SKIP, BLOCKED, partial hunt, or “looks fine”.
+#
+# HUNT CURSOR (revira tudo; nunca fique no mesmo canto)
+# Read $CURSOR as integer, default 0. This fire starts at that slice and may walk forward up to 5 slices, wrapping at 28. Stop walking at the first reproducible candidate. Advance $CURSOR to the slice AFTER the one you fixed, or +5 if EMPTY. Do not restart at 0 every fire.
+#
+# Slices:
+# 0 macos compile / swift test failures
+# 1 macos SocketServer HTTP RPC dispatcher /v1/rpc JSON-RPC
+# 2 macos pairing auth devices token loopback
+# 3 macos agent transcript stream stop/retry
+# 4 macos bots desk studio
+# 5 macos terminal PTY ghostty
+# 6 macos files git workspaces
+# 7 macos providers claude/codex/grok token-saver
+# 8 macos UI layout a11y
+# 9 macos notifications background
+# 10 macos crashes asserts invariants
+# 11 ios xcodebuild unit
+# 12 ios UITests
+# 13 ios ConnectionKit RPC client
+# 14 ios MirrorCore terminal
+# 15 ios Features agent files git workspaces
+# 16 ios Account purchases SecurityKit
+# 17 ios notifications background
+# 18 ios UI a11y
+# 19 integ RPC method parity: iOS client methods vs macOS dispatcher (grep both trees; any method one side has and the other lacks is a candidate)
+# 20 integ capabilities + websocket events vs iOS handlers
+# 21 integ pairing redeem devices revoke token headers
+# 22 integ ios-app/scripts/test-contract.sh against SANDBOX host only (18218) PLUS GUI E2E through that host
+# 23 integ snapshot catchup journal
+# 24 integ file transfer cache
+# 25 integ remaining true items in ios-app/docs/DESKTOP-CONTRACT-GAPS.md
+# 26 residual FIXME TODO XXX BUG HACK known defects in qa/ and audit/
+# 27 git log / open comments / last-status misses: anything previously skipped as “not sure” that you can now reproduce
+#
+# HOW TO HUNT (E2E first, grep second)
+# For each visited slice, in order:
+# A. Read $LOG, $FPS, $MACOS_MR_FILE, $IOS_MR_FILE, skills above, ios-app/docs/DESKTOP-CONTRACT-GAPS.md, ios-app/qa/05-defects.md if present. Work from $MACOS_WT / $IOS_WT HEADs (bug-fix), not dirty primary trees.
+# B. Rebuild the surface for this slice.
+# C. Run macos-harness or computer-use with a REAL prompt/flow aimed at this slice. Capture the visible failure or the pass.
+# D. Dual-repo grep / smallest failing test only to localize what the GUI already showed (or to find a crash the GUI hit).
+# E. Prefer a red E2E, a contract mismatch against 18218, a crash log, or a doc gap still true in code. A comment is not a bug. A hunch is not a bug. A green unit test with no GUI session is not a hunt.
+# F. Fingerprint = first 12 hex of sha256("macos-ios-hunt|behavior=<normalized>|seam=<path>"). If $FPS already lists it AND bug-fix already contains the fix AND this fire’s E2E no longer shows it, skip and keep walking.
+# G. If you cannot reproduce in the rebuilt GUI, keep walking. Never invent a candidate to have something to do.
+#
+# FIX RULES (only after GATES exist)
+# - macOS product edits: ONLY in $MACOS_WT on bug-fix. Tests: `scripts/isolated-sandbox.sh test` or `test --filter …` (identity/ports/debug bundle only — do NOT let that script create a new branch). Then rebuild + harness/computer-use E2E again with a real prompt that would have caught the bug.
+# - iOS product edits: ONLY in $IOS_WT on bug-fix. Unit/UI scripts from that worktree, then rebuild sim + computer-use/harness E2E with a real prompt. Integration proof uses sandbox 18218.
+# - If the host API is missing, add the desktop contract on macOS bug-fix. Do not fake the result in iOS.
+# - Smallest change that removes the defect (sam-goal ladder). Add or extend a regression test that would have caught it. Checkpoint-commit the red test, checkpoint-commit the fix, rebuild, E2E, checkpoint-commit proof notes (not binaries). Then continue sam-task phases on the same head.
+# - If E2E is not green after rebuild, you did not fix it — commit wip if there are source changes to keep, then BLOCKED. Do not revert bug-fix. Do not ship a maybe.
+# - After sam-task work/closure mutates HEAD: rebuild again, E2E again, update the same MR again.
+#
+# TERMINALS (exactly one)
+# - SKIP busy — lock held, no rechain
+# - BLOCKED <reason> — missing disk/tools/auth/rebuild/E2E/sam-goal/sam-task/unable to prove; rechain; do not increment empty-streak; still push any unpushed bug-fix commits and update the MR(s) you touched
+# - RAN <repo> <fingerprint> <one-line behavior> — one defect fixed; sam-goal VALID; sam-task VALID; rebuild+real-prompt E2E green on the new binary; empty-streak=0; all checkpoints committed+pushed; MR(s) updated; rechain
+# - EMPTY <slices-visited> — rebuilt, E2E hunted, no reproducible candidate; empty-streak += 1; update MR description(s) with the empty sweep; rechain unless SERIES_DONE
+# - SERIES_DONE — full clean sweep with rebuild+E2E on every slice; no rechain; MRs left open unmerged
+#
+# RECHAIN (always except SKIP busy and SERIES_DONE)
+# Write $LOG with: terminal, slices visited, candidate or none, fingerprint, rebuild commands, E2E tool (harness|computer-use), exact real prompts used, visible outcomes, sam-goal GOAL_DIR + validator, sam-task report path + validator, proof paths, HEAD of both bug-fix worktrees, macos-mr iid, ios-mr iid, lock dropped.
+# Write $CURSOR and $STREAK.
+# Drop $LOCK.
+# scheduler_create interval 60s, fire_immediately=false, prompt = exact contents of $PROMPT_FILE, durable=true. Write the new task id into $STATE/task-id. Confirm scheduler_list has exactly that one task. Never two.
+#
+# If rechain fails, print BLOCKED rechain-failed and leave enough in $LOG to retry next human paste. Never silently die.
+#
+# Print one status line at the end:
+# STATUS=<SKIP|BLOCKED|RAN|EMPTY|SERIES_DONE> slice=<n> streak=<n> repo=<macos|ios|integ|none> fp=<id|none> macos_mr=<iid|none> ios_mr=<iid|none> bug-fix_macos=<sha|none> bug-fix_ios=<sha|none> e2e=<harness|computer-use|none> sam_goal=<VALID|none> sam_task=<VALID|none> next=60s|<none>
+# ====== PROMPT_SNAPSHOT_END ======
+
+# =============================================================================
+# LEDGER APPEND-ONLY — cada fire faz APPEND abaixo (não edite manualmente)
+# Formato: | fire_utc | slice | feature | macos_head | ios_head | status | fingerprint | prompt | e2e | proof | perf_before | perf_after |
+# Status: PASS = E2E verde neste HEAD (funcional + perf ok) | RAN = bug/perf corrigido | BLOCKED
+# SKIP: próximo fire PULA slice já PASS no MESMO HEAD (macos_head+ios_head). Se HEAD mudou, invalida só aquele slice.
+# Perf: perf_before/perf_after = '850ms->120ms' ou '210MB->95MB' ou '45%->8%CPU' ou 'none'
+# SERIES_DONE = 36 PASS distintos (0-35) no HEAD atual (funcional 0-27 + perf 28-35)
+# =============================================================================
+
+| fire_utc | slice | feature | macos_head | ios_head | status | fingerprint | prompt | e2e | proof | perf_before | perf_after |
+|---|---|---|---|---|---|---|---|---|---|---|
+# CURSOR=0
+# STREAK=0
+# LAST_MACOS_HEAD=none
+# LAST_IOS_HEAD=none
+# Ledger iniciado em 2026-08-23 — isolated debug 18218 + iOS Simulator + perf scan (main freeze/mem/cpu/io/jank) — 36 slices
+| 2026-08-23T06:01:34Z | 10 | crashes asserts | f73bef89 | 28963c5e | PASS | none | list files in the open workspace and explain what Sources/SocketServer/ does | harness+sim | harness+sim fakeServer A25B279F 978K; macos debug 18218 pid3876 | none | none |
+| 2026-08-23T06:01:34Z | 11 | ios xcodebuild unit | f73bef89 | 28963c5e | PASS | none | list files in the open workspace and explain what Sources/SocketServer/ does | harness+sim | harness+sim fakeServer A25B279F 978K; macos debug 18218 pid3876 | none | none |
+| 2026-08-23T06:01:34Z | 12 | ios UITests | f73bef89 | 28963c5e | PASS | none | list files in the open workspace and explain what Sources/SocketServer/ does | harness+sim | harness+sim fakeServer A25B279F 978K; macos debug 18218 pid3876 | none | none |
+| 2026-08-23T06:01:34Z | 13 | ConnectionKit RPC client | f73bef89 | 28963c5e | PASS | none | list files in the open workspace and explain what Sources/SocketServer/ does | harness+sim | harness+sim fakeServer A25B279F 978K; macos debug 18218 pid3876 | none | none |
+| 2026-08-23T06:01:34Z | 14 | MirrorCore terminal | f73bef89 | 28963c5e | PASS | none | list files in the open workspace and explain what Sources/SocketServer/ does | harness+sim | harness+sim fakeServer A25B279F 978K; macos debug 18218 pid3876 | none | none |
