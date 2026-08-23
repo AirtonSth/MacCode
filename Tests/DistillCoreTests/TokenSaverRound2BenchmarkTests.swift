@@ -305,20 +305,67 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let output = root.appendingPathComponent("missing", isDirectory: true)
             .appendingPathComponent("baseline", isDirectory: true)
-        let process = Process()
-        let stderr = Pipe()
-        process.executableURL = repositoryURL().appendingPathComponent("scripts/token-saver-round2-benchmark.sh")
-        process.arguments = ["capture-arm", "baseline", String(repeating: "a", count: 40), output.path]
-        process.currentDirectoryURL = repositoryURL()
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = stderr
-        try process.run()
-        let error = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        process.waitUntilExit()
+        let result = try runBenchmark([
+            "capture-arm", "baseline", String(repeating: "a", count: 40), output.path,
+        ])
 
-        XCTAssertNotEqual(process.terminationStatus, 0)
-        XCTAssertTrue(error.contains("arm output parent does not exist"), error)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.stderr.contains("arm output parent does not exist"), result.stderr)
+        XCTAssertFalse(result.stderr.contains("missing RC_TOKEN_SAVER_ROUND2_BASE_URL"), result.stderr)
         XCTAssertFalse(FileManager.default.fileExists(atPath: output.deletingLastPathComponent().path))
+    }
+
+    func test_captureArmAcceptsExistingOutputParentBeforeTheNextGate() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-output-positive-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appendingPathComponent("baseline", isDirectory: true)
+        let head = try git(["rev-parse", "HEAD"], repositoryURL()).trimmed
+        let result = try runBenchmark(["capture-arm", "baseline", head, output.path])
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertFalse(result.stderr.contains("arm output parent"), result.stderr)
+        XCTAssertTrue(
+            result.stderr.contains("capture requires a detached temporary worktree")
+                || result.stderr.contains("missing RC_TOKEN_SAVER_ROUND2_BASE_URL"),
+            result.stderr
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func test_captureArmRejectsFailedGitStatusInspection() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-status-probe-\(UUID().uuidString)", isDirectory: true)
+        let fakeBin = root.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeBin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let expectedSHA = String(repeating: "a", count: 40)
+        let fakeGit = fakeBin.appendingPathComponent("git")
+        let script = """
+        #!/bin/sh
+        case "$*" in
+          *" symbolic-ref -q HEAD") exit 1 ;;
+          *" rev-parse HEAD^{tree}") printf '%s\\n' '\(String(repeating: "b", count: 40))'; exit 0 ;;
+          *" rev-parse HEAD") printf '%s\\n' '\(expectedSHA)'; exit 0 ;;
+          *" status --porcelain"*) exit 42 ;;
+        esac
+        exec /usr/bin/git "$@"
+        """
+        try Data(script.utf8).write(to: fakeGit)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeGit.path)
+        let output = root.appendingPathComponent("baseline", isDirectory: true)
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = fakeBin.path + ":" + (environment["PATH"] ?? "/usr/bin:/bin")
+        let result = try runBenchmark(
+            ["capture-arm", "baseline", expectedSHA, output.path],
+            environment: environment
+        )
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.stderr.contains("failed to inspect capture arm status"), result.stderr)
+        XCTAssertFalse(result.stderr.contains("missing RC_TOKEN_SAVER_ROUND2_BASE_URL"), result.stderr)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
     }
 
     /// Manual and fail-closed. The shell coordinator sets this only after proving
@@ -1109,6 +1156,24 @@ private extension TokenSaverRound2BenchmarkTests {
 
     func git(_ arguments: [String], _ repository: URL) throws -> String {
         String(decoding: try gitData(arguments, repository), as: UTF8.self)
+    }
+
+    func runBenchmark(
+        _ arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> (status: Int32, stderr: String) {
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = repositoryURL().appendingPathComponent("scripts/token-saver-round2-benchmark.sh")
+        process.arguments = arguments
+        process.currentDirectoryURL = repositoryURL()
+        process.environment = environment
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = stderr
+        try process.run()
+        let error = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        return (process.terminationStatus, error)
     }
 
     func gitData(_ arguments: [String], _ repository: URL) throws -> Data {

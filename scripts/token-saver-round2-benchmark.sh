@@ -62,7 +62,7 @@ cleanup_scratch() {
 }
 
 materialize_source() {
-  local expected_sha="$1" expected_tree
+  local expected_sha="$1" expected_tree source_status
   expected_tree="$(git -C "${repo_root}" rev-parse "${expected_sha}^{tree}")"
   materialized_parent="$(mktemp -d "${TMPDIR:-/tmp}/token-saver-r2-source.XXXXXX")"
   materialized_parent="$(cd "${materialized_parent}" && pwd -P)"
@@ -71,7 +71,8 @@ materialize_source() {
   materialized_worktree="$(cd "${materialized_worktree}" && pwd -P)"
   [[ "$(git -C "${materialized_worktree}" rev-parse HEAD)" == "${expected_sha}" ]] || die "materialized worktree HEAD mismatch"
   [[ "$(git -C "${materialized_worktree}" rev-parse 'HEAD^{tree}')" == "${expected_tree}" ]] || die "materialized worktree tree mismatch"
-  [[ -z "$(git -C "${materialized_worktree}" status --porcelain=v1 --untracked-files=all)" ]] || die "materialized worktree is dirty"
+  source_status="$(git -C "${materialized_worktree}" status --porcelain=v1 --untracked-files=all)" || die "failed to inspect materialized worktree status"
+  [[ -z "${source_status}" ]] || die "materialized worktree is dirty"
   find "${materialized_worktree}" ! -type l -exec chmod a-w {} +
   [[ ! -w "${materialized_worktree}" && ! -w "${materialized_worktree}/Package.swift" ]] || die "materialized source is still writable"
 }
@@ -106,7 +107,7 @@ verify_fixture() {
 capture_arm() {
   require_tools
   verify_fixture
-  local arm="${1:-}" expected_sha="${2:-}" output="${3:-}" initial_tree seed_dir="" output_parent output_name
+  local arm="${1:-}" expected_sha="${2:-}" output="${3:-}" initial_tree seed_dir="" output_parent output_name source_status
   [[ "${arm}" == baseline || "${arm}" == candidate ]] || usage
   [[ "${expected_sha}" =~ ^[0-9a-f]{40}$ ]] || die "expected SHA must be 40 lowercase hex"
   [[ -n "${output}" ]] || usage
@@ -119,7 +120,8 @@ capture_arm() {
   [[ -z "$(git -C "${repo_root}" symbolic-ref -q HEAD || true)" ]] || die "capture requires a detached temporary worktree"
   [[ "$(git -C "${repo_root}" rev-parse HEAD)" == "${expected_sha}" ]] || die "HEAD is not the requested arm SHA"
   initial_tree="$(git -C "${repo_root}" rev-parse 'HEAD^{tree}')"
-  [[ -z "$(git -C "${repo_root}" status --porcelain --untracked-files=all)" ]] || die "capture arm checkout is dirty"
+  source_status="$(git -C "${repo_root}" status --porcelain --untracked-files=all)" || die "failed to inspect capture arm status"
+  [[ -z "${source_status}" ]] || die "capture arm checkout is dirty"
   case "${output}" in
     "${repo_root}"|"${repo_root}"/*) die "arm output must be outside its source checkout" ;;
   esac
@@ -171,7 +173,8 @@ capture_arm() {
   [[ "$(sha256_file "${executable}")" == "$(jq -r '.source.executable_sha256' "${output}/report.json")" ]] || die "captured executable hash mismatch"
   [[ "$(git -C "${repo_root}" rev-parse HEAD)" == "${expected_sha}" ]] || die "capture checkout HEAD changed during build/test"
   [[ "$(git -C "${repo_root}" rev-parse 'HEAD^{tree}')" == "${initial_tree}" ]] || die "capture checkout tree changed during build/test"
-  [[ -z "$(git -C "${repo_root}" status --porcelain=v1 --untracked-files=all)" ]] || die "capture checkout became dirty during build/test"
+  source_status="$(git -C "${repo_root}" status --porcelain=v1 --untracked-files=all)" || die "failed to re-inspect capture checkout status"
+  [[ -z "${source_status}" ]] || die "capture checkout became dirty during build/test"
   "$0" verify-arm "${output}"
   cleanup_scratch "${scratch}"
   trap - EXIT
@@ -180,7 +183,7 @@ capture_arm() {
 
 verify_source_materialization() {
   require_tools
-  local expected_sha="${1:-}" expected_tree scratch
+  local expected_sha="${1:-}" expected_tree scratch source_status
   [[ "${expected_sha}" =~ ^[0-9a-f]{40}$ ]] || die "expected SHA must be 40 lowercase hex"
   expected_tree="$(git -C "${repo_root}" rev-parse "${expected_sha}^{tree}")"
   scratch="$(mktemp -d "${TMPDIR:-/tmp}/token-saver-r2-dry-build.XXXXXX")"
@@ -195,7 +198,8 @@ verify_source_materialization() {
   )
   [[ "$(git -C "${materialized_worktree}" rev-parse HEAD)" == "${expected_sha}" ]] || die "dry materialized HEAD changed"
   [[ "$(git -C "${materialized_worktree}" rev-parse 'HEAD^{tree}')" == "${expected_tree}" ]] || die "dry materialized tree changed"
-  [[ -z "$(git -C "${materialized_worktree}" status --porcelain=v1 --untracked-files=all)" ]] || die "dry materialized source became dirty"
+  source_status="$(git -C "${materialized_worktree}" status --porcelain=v1 --untracked-files=all)" || die "failed to re-inspect dry materialized source status"
+  [[ -z "${source_status}" ]] || die "dry materialized source became dirty"
   cleanup_materialized_source || die "failed to remove dry materialized worktree"
   cleanup_scratch "${scratch}"
   trap - EXIT
