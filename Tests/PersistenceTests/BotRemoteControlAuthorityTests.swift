@@ -785,4 +785,34 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         ])
         XCTAssertEqual(status["status"] as? String, "completed")
     }
+
+    func test_conversationList_exposesLinkedAgentThreadID_soRemoteClientsCanReadTranscripts() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "conv-list-1",
+            "name": "Piper",
+        ])
+        let botIDRaw = try XCTUnwrap(created["bot_id"] as? String)
+        let botID = BotID(try XCTUnwrap(UUID(uuidString: botIDRaw)))
+        let threadID = AgentThreadID()
+        let linked = BotConversation(botID: botID, title: "Linked", linkedAgentThreadID: threadID)
+        let unlinked = BotConversation(botID: botID, title: "Unlinked")
+        try store.upsertConversation(linked)
+        try store.upsertConversation(unlinked)
+
+        let result = try authority.dispatch(method: "bot.conversation.list", params: ["bot_id": botIDRaw])
+        let rows = try XCTUnwrap(result["conversations"] as? [[String: Any]])
+        let linkedRow = try XCTUnwrap(rows.first { $0["id"] as? String == linked.id.value.uuidString.lowercased() })
+        let unlinkedRow = try XCTUnwrap(rows.first { $0["id"] as? String == unlinked.id.value.uuidString.lowercased() })
+
+        XCTAssertEqual(
+            linkedRow["linked_agent_thread_id"] as? String,
+            threadID.value.uuidString.lowercased(),
+            "Remote clients need the linked agent thread id to read the transcript via agent.message.list"
+        )
+        XCTAssertNil(
+            unlinkedRow["linked_agent_thread_id"],
+            "Conversations without a first run have no thread yet; the key must be absent, not fabricated"
+        )
+        XCTAssertNotNil(linkedRow["updated_at"] as? Double)
+    }
 }

@@ -198,11 +198,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func conversationList(params: [String: Any]) throws -> [String: Any] {
         let bot = try requireBot(params)
         let rows = try store.listConversations(botID: bot.id).map { conversation in
-            [
+            var row: [String: Any] = [
                 "id": conversation.id.value.uuidString.lowercased(),
                 "title": conversation.title,
                 "bot_id": bot.id.value.uuidString.lowercased(),
-            ] as [String: Any]
+                "updated_at": conversation.updatedAt.timeIntervalSince1970,
+            ]
+            if let threadID = conversation.linkedAgentThreadID {
+                row["linked_agent_thread_id"] = threadID.value.uuidString.lowercased()
+            }
+            return row
         }
         return [
             "conversations": rows,
