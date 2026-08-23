@@ -3199,6 +3199,346 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.filteredActiveBotItems().isEmpty)
     }
 
+    func test_activeAndFinishedBots_batchLinkedConversations_withoutChangingOrderOrStatus() throws {
+        // WHY: opening Active Bots must not issue one SQLite lookup per active
+        // or recent run, while the projected links and finished-run ordering
+        // remain identical to the durable run roster.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .grok)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .grok)
+        let active = AgentThread(title: "Active", provider: .grok, model: "test")
+        let finishedNewer = AgentThread(title: "Newer", provider: .grok, model: "test")
+        let finishedOlder = AgentThread(title: "Older", provider: .grok, model: "test")
+        let finishedOldest = AgentThread(title: "Oldest", provider: .grok, model: "test")
+        let unlinked = AgentThread(title: "Unlinked", provider: .grok, model: "test")
+        for thread in [active, finishedNewer, finishedOlder, finishedOldest, unlinked] {
+            try context.threadRepo.upsert(thread)
+        }
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Active", linkedAgentThreadID: active.id)
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Newer", linkedAgentThreadID: finishedNewer.id)
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: quinn.id, title: "Older", linkedAgentThreadID: finishedOlder.id)
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: quinn.id, title: "Oldest", linkedAgentThreadID: finishedOldest.id)
+        )
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        try context.runRepo.upsert(AgentRun(
+            threadId: active.id,
+            provider: .grok,
+            model: "test",
+            status: .running,
+            startedAt: now
+        ))
+        try context.runRepo.upsert(AgentRun(
+            threadId: finishedOlder.id,
+            provider: .grok,
+            model: "test",
+            status: .completed,
+            startedAt: now.addingTimeInterval(-30),
+            finishedAt: now.addingTimeInterval(-20)
+        ))
+        try context.runRepo.upsert(AgentRun(
+            threadId: finishedOldest.id,
+            provider: .grok,
+            model: "test",
+            status: .completed,
+            startedAt: now.addingTimeInterval(-40),
+            finishedAt: now.addingTimeInterval(-30)
+        ))
+        try context.runRepo.upsert(AgentRun(
+            threadId: finishedNewer.id,
+            provider: .grok,
+            model: "test",
+            status: .failed,
+            startedAt: now.addingTimeInterval(-20),
+            finishedAt: now.addingTimeInterval(-10)
+        ))
+        try context.runRepo.upsert(AgentRun(
+            threadId: unlinked.id,
+            provider: .grok,
+            model: "test",
+            status: .completed,
+            startedAt: now.addingTimeInterval(-10),
+            finishedAt: now
+        ))
+        vm.activeThreadIDsOverrideForTesting = [active.id]
+        vm.setHidden(id: quinn.id, hidden: true)
+
+        var singleLookupSteps = 0
+        var singleBotLookupSteps = 0
+        var batchSQL = Set<String>()
+        var botBatchSQL = Set<String>()
+        context.db.beforeStatementStepForTesting = { sql in
+            if sql.contains("WHERE linked_agent_thread_id = ? LIMIT 1") {
+                singleLookupSteps += 1
+            }
+            if sql.contains("FROM bots"), sql.contains("WHERE id = ? LIMIT 1") {
+                singleBotLookupSteps += 1
+            }
+            if sql.contains("WHERE linked_agent_thread_id IN (") {
+                batchSQL.insert(sql)
+            }
+            if sql.contains("FROM bots"), sql.contains("WHERE id IN (") {
+                botBatchSQL.insert(sql)
+            }
+        }
+        vm.openActiveBots()
+        context.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(singleLookupSteps, 0)
+        XCTAssertEqual(singleBotLookupSteps, 0, "repeated hidden finished bots must not issue per-run gets")
+        XCTAssertEqual(batchSQL.count, 2, "active and finished projections each use one batched SQL shape")
+        XCTAssertEqual(botBatchSQL.count, 1, "the missing hidden roster entry is prefetched once")
+        XCTAssertEqual(vm.activeBotItems.map(\.botID), [piper.id])
+        XCTAssertEqual(vm.finishedBotItems.map(\.botID), [piper.id, quinn.id, quinn.id])
+        XCTAssertEqual(vm.finishedBotItems.map(\.status), [.failed, .completed, .completed])
+        XCTAssertEqual(vm.finishedBotItems.map(\.title), ["Piper", "Quinn", "Quinn"])
+    }
+
+    func test_activeBots_batchColdStartedAt_withoutChangingLatestConversationTimestamp() throws {
+        // WHY: a cold Active Bots screen has no lastUpdated cache. Computing
+        // startedAt must not list every conversation once per active Bot, and
+        // must still choose the exact newest conversation timestamp per Bot.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        var activeThreadIDs = Set<AgentThreadID>()
+        var expectedStartedAt: [BotID: Date] = [:]
+        for index in 0..<10 {
+            let bot = try vm.create(name: "Bot \(index)", title: "Worker")
+            let thread = AgentThread(title: "Active \(index)", provider: .grok, model: "test")
+            try context.threadRepo.upsert(thread)
+            activeThreadIDs.insert(thread.id)
+            let latest = base.addingTimeInterval(Double(index * 10))
+            try context.botStore.upsertConversation(BotConversation(
+                botID: bot.id,
+                title: "Older \(index)",
+                createdAt: latest.addingTimeInterval(-1_000),
+                updatedAt: latest.addingTimeInterval(-1_000)
+            ))
+            try context.botStore.upsertConversation(BotConversation(
+                botID: bot.id,
+                title: "Active \(index)",
+                linkedAgentThreadID: thread.id,
+                createdAt: latest,
+                updatedAt: latest
+            ))
+            expectedStartedAt[bot.id] = try XCTUnwrap(
+                context.botStore.listConversations(botID: bot.id).first?.updatedAt
+            )
+        }
+        vm.activeThreadIDsOverrideForTesting = activeThreadIDs
+
+        var singleConversationListSteps = 0
+        var latestBatchSQL = Set<String>()
+        context.db.beforeStatementStepForTesting = { sql in
+            if sql.contains("WHERE bot_id = ? ORDER BY updated_at DESC") {
+                singleConversationListSteps += 1
+            }
+            if sql.contains("SELECT bot_id, MAX(updated_at)"), sql.contains("WHERE bot_id IN (") {
+                latestBatchSQL.insert(sql)
+            }
+        }
+        vm.openActiveBots()
+        context.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(singleConversationListSteps, 0)
+        XCTAssertEqual(latestBatchSQL.count, 1)
+        XCTAssertEqual(vm.activeBotItems.count, 10)
+        XCTAssertEqual(
+            Dictionary(uniqueKeysWithValues: vm.activeBotItems.compactMap { item in
+                item.startedAt.map { (item.botID, $0) }
+            }),
+            expectedStartedAt
+        )
+    }
+
+    func test_activeBots_batchOnlyActiveHandoffOrigins_withoutScanningHistoricalRows() throws {
+        // WHY: the durable handoff snapshot retains terminal history. Opening
+        // Active Bots must discard that history before SQLite, batch only live
+        // origin existence checks, and preserve phase/orphan membership.
+        let context = try makeContext()
+        _ = context.botPeerHandoffAuthority
+        let origin = try context.botStore.create(
+            name: "Origin", title: "Controller", description: "", provider: .grok
+        )
+        let peer = try context.botStore.create(
+            name: "Peer", title: "Worker", description: "", provider: .grok
+        )
+        let hostOnlyOrigin = try context.botStore.create(
+            name: "Host", title: "Synthesizer", description: "", provider: .grok
+        )
+        let hostOnlyPeer = try context.botStore.create(
+            name: "Finished Peer", title: "Worker", description: "", provider: .grok
+        )
+        let legacyOrigin = try context.botStore.create(
+            name: "Legacy Origin", title: "Controller", description: "", provider: .grok
+        )
+        let legacyPeer = try context.botStore.create(
+            name: "Legacy Peer", title: "Worker", description: "", provider: .grok
+        )
+        let orphanOrigin = try context.botStore.create(
+            name: "Orphan Origin", title: "Controller", description: "", provider: .grok
+        )
+        let orphanPeer = try context.botStore.create(
+            name: "Orphan Peer", title: "Worker", description: "", provider: .grok
+        )
+        let historicalOrigin = try context.botStore.create(
+            name: "Historical Origin", title: "Controller", description: "", provider: .grok
+        )
+        let historicalPeer = try context.botStore.create(
+            name: "Historical Peer", title: "Worker", description: "", provider: .grok
+        )
+        let route = T005PeerHandoffRouteFixture(
+            provider: .grok,
+            providerInstanceID: nil,
+            model: "test",
+            permissionMode: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
+            runAsUser: AgentRunAsUser(
+                generatedUID: "active-handoff-batch",
+                shortName: "fixture",
+                uid: 0,
+                gid: 0,
+                homePath: "/tmp/active-handoff-batch"
+            ),
+            routingConfiguration: nil
+        )
+        func record(
+            originBotID: BotID?,
+            originConversationID: BotConversationID?,
+            peerBotID: BotID,
+            phase: BotPeerHandoffPhase,
+            index: Int
+        ) -> T005PeerHandoffRecordFixture {
+            let activityID = UUID()
+            return T005PeerHandoffRecordFixture(
+                version: 2,
+                activityID: activityID,
+                originBotID: originBotID,
+                originConversationID: originConversationID,
+                originAgentThreadID: nil,
+                peerBotID: peerBotID,
+                peerConversationID: BotConversationID(),
+                peerThreadID: nil,
+                peerRunID: nil,
+                inboundMessageID: activityID,
+                peerName: "Peer \(index)",
+                peerTitle: "Worker",
+                peerHandle: "peer-\(index)",
+                outboundText: "handoff \(index)",
+                createdAt: Date(timeIntervalSinceReferenceDate: Double(index)),
+                peerRoute: route,
+                hostThreadID: nil,
+                hostRunID: nil,
+                hostRoute: nil,
+                replyText: nil,
+                replyCreatedAt: nil,
+                phase: phase
+            )
+        }
+
+        var rows: [UUID: T005PeerHandoffRecordFixture] = [:]
+        for index in 0..<200 {
+            let conversation = BotConversation(
+                botID: origin.id,
+                title: "Active peer \(index)"
+            )
+            try context.botStore.upsertConversation(conversation)
+            let handoff = record(
+                originBotID: origin.id,
+                originConversationID: conversation.id,
+                peerBotID: peer.id,
+                phase: .peerRunning,
+                index: index
+            )
+            rows[handoff.activityID] = handoff
+        }
+        let hostConversation = BotConversation(botID: hostOnlyOrigin.id, title: "Active host")
+        try context.botStore.upsertConversation(hostConversation)
+        let hostHandoff = record(
+            originBotID: hostOnlyOrigin.id,
+            originConversationID: hostConversation.id,
+            peerBotID: hostOnlyPeer.id,
+            phase: .hostRunning,
+            index: 200
+        )
+        rows[hostHandoff.activityID] = hostHandoff
+        let legacyHandoff = record(
+            originBotID: legacyOrigin.id,
+            originConversationID: nil,
+            peerBotID: legacyPeer.id,
+            phase: .peerPrepared,
+            index: 201
+        )
+        rows[legacyHandoff.activityID] = legacyHandoff
+        let orphanHandoff = record(
+            originBotID: orphanOrigin.id,
+            originConversationID: BotConversationID(),
+            peerBotID: orphanPeer.id,
+            phase: .peerRunning,
+            index: 202
+        )
+        rows[orphanHandoff.activityID] = orphanHandoff
+        for index in 0..<500 {
+            let handoff = record(
+                originBotID: historicalOrigin.id,
+                originConversationID: BotConversationID(),
+                peerBotID: historicalPeer.id,
+                phase: index.isMultiple(of: 2) ? .completed : .needsAttention,
+                index: 1_000 + index
+            )
+            rows[handoff.activityID] = handoff
+        }
+        let payload = try JSONEncoder().encode(rows)
+        UserDefaults.standard.set(payload, forKey: "bots.peerTurns.v2")
+        try context.settingsRepo.set(
+            "bots.peerTurns.v2",
+            "base64:\(payload.base64EncodedString())"
+        )
+        _ = context.botPeerHandoffAuthority.delegatedBotID(forHostRunID: AgentRunID())
+        let vm = BotsViewModel(context: context)
+        let restoredHandoffs = vm.peerHandoffSnapshotsForTesting()
+        XCTAssertEqual(restoredHandoffs.count, rows.count)
+        XCTAssertEqual(restoredHandoffs.filter { $0.phase == .peerRunning }.count, 201)
+        XCTAssertEqual(restoredHandoffs.filter { $0.phase == .hostRunning }.count, 1)
+        XCTAssertEqual(restoredHandoffs.filter { $0.phase == .completed }.count, 250)
+        XCTAssertEqual(restoredHandoffs.filter { $0.phase == .needsAttention }.count, 250)
+
+        var singleConversationSteps = 0
+        var originBatchSQL = Set<String>()
+        context.db.beforeStatementStepForTesting = { sql in
+            if sql.contains("FROM bot_conversations"), sql.contains("WHERE id = ? LIMIT 1") {
+                singleConversationSteps += 1
+            }
+            if sql.contains("FROM bot_conversations"), sql.contains("WHERE id IN (") {
+                originBatchSQL.insert(sql)
+            }
+        }
+        vm.openActiveBots()
+        context.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(singleConversationSteps, 0, "historical and active handoffs must not point-query")
+        XCTAssertEqual(originBatchSQL.count, 2, "202 live origin IDs must use bounded chunks")
+        XCTAssertEqual(originBatchSQL.map { $0.filter { $0 == "?" }.count }.max(), 200)
+        XCTAssertEqual(
+            Set(vm.activeBotItems.map(\.botID)),
+            [origin.id, peer.id, hostOnlyOrigin.id, legacyOrigin.id, legacyPeer.id]
+        )
+        XCTAssertFalse(vm.activeBotItems.map(\.botID).contains(hostOnlyPeer.id))
+        XCTAssertFalse(vm.activeBotItems.map(\.botID).contains(orphanOrigin.id))
+        XCTAssertFalse(vm.activeBotItems.map(\.botID).contains(orphanPeer.id))
+        XCTAssertFalse(vm.activeBotItems.map(\.botID).contains(historicalOrigin.id))
+        XCTAssertFalse(vm.activeBotItems.map(\.botID).contains(historicalPeer.id))
+    }
+
     func test_activeBotItemsClearWhenRunFinishes_becauseChipMustMatchFooter() throws {
         // WHY: Computer Use saw Active chip "1" while the footer said
         // "0 active" after a mention hop finished. The chip reads cached

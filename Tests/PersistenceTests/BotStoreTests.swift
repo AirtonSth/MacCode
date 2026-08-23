@@ -264,6 +264,139 @@ final class BotStoreTests: XCTestCase {
         XCTAssertEqual(try store.conversation(id: conversation.id)?.attentionState, .needsAttention)
     }
 
+    func test_conversationsLinked_matchesSingleLookups_becauseActiveBotsMustKeepExactLinksAndStatus() throws {
+        // WHY: Active/Finished Bots may collapse many thread lookups into one
+        // SQLite query only if every requested thread resolves to the exact row
+        // and derived status that the existing single-thread lookup returns.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .grok)
+        let liveThread = AgentThread(title: "Live", provider: .grok, model: "test")
+        let staleThread = AgentThreadID()
+        let missingThread = AgentThreadID()
+        let corruptThread = AgentThreadID()
+        try AgentThreadRepository(db: db).upsert(liveThread)
+        try AgentRunRepository(db: db).upsert(
+            AgentRun(threadId: liveThread.id, provider: .grok, model: "test", status: .running)
+        )
+
+        let liveConversation = BotConversation(
+            botID: bot.id,
+            title: "Live conversation",
+            unread: true,
+            attentionState: .needsAttention,
+            linkedAgentThreadID: liveThread.id
+        )
+        let staleConversation = BotConversation(
+            botID: bot.id,
+            title: "Stale conversation",
+            unread: true,
+            attentionState: .needsAttention,
+            linkedAgentThreadID: staleThread
+        )
+        try store.upsertConversation(liveConversation)
+        try store.upsertConversation(staleConversation)
+        try store.upsertConversation(BotConversation(
+            botID: bot.id,
+            title: "Later duplicate link",
+            linkedAgentThreadID: staleThread
+        ))
+        let corruptConversation = BotConversation(
+            botID: bot.id,
+            title: "Corrupt conversation",
+            linkedAgentThreadID: corruptThread
+        )
+        try store.upsertConversation(corruptConversation)
+        let corrupt = try db.prepare("UPDATE bot_conversations SET id = 'not-a-uuid' WHERE id = ?;")
+        defer { corrupt.reset() }
+        try corrupt.bind(1, corruptConversation.id.value.uuidString.lowercased())
+        _ = try corrupt.step()
+
+        let requested: Set<AgentThreadID> = [liveThread.id, staleThread, missingThread, corruptThread]
+        let expected = Dictionary(uniqueKeysWithValues: requested.compactMap { threadID in
+            try? store.conversationLinked(to: threadID).map { (threadID, $0) }
+        })
+        let actual = try store.conversationsLinked(to: requested)
+
+        XCTAssertEqual(actual, expected)
+        XCTAssertEqual(actual[liveThread.id]?.attentionState, .needsAttention)
+        XCTAssertEqual(actual[liveThread.id]?.unread, true)
+        XCTAssertEqual(actual[staleThread]?.attentionState, BotAttentionState.none)
+        XCTAssertEqual(actual[staleThread]?.unread, false)
+        XCTAssertEqual(actual[staleThread]?.id, staleConversation.id)
+        XCTAssertNil(actual[missingThread])
+        XCTAssertNil(actual[corruptThread])
+        XCTAssertEqual(try store.conversationsLinked(to: []), [:])
+    }
+
+    func test_conversationsLinked_chunksAboveSafeSQLiteVariableBound_becauseActiveRunsAreUnbounded() throws {
+        // WHY: Active thread snapshots have no cardinality cap. A batch wider
+        // than SQLite's safe bind-variable budget must split without losing a
+        // linked conversation from either side of the chunk boundary.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .grok)
+        let threadIDs = (0...200).map { _ in AgentThreadID() }
+        try db.transaction {
+            for (index, threadID) in threadIDs.enumerated() {
+                try store.upsertConversation(BotConversation(
+                    botID: bot.id,
+                    title: "Conversation \(index)",
+                    linkedAgentThreadID: threadID
+                ))
+            }
+        }
+
+        var batchSQL = Set<String>()
+        db.beforeStatementStepForTesting = { sql in
+            if sql.contains("WHERE linked_agent_thread_id IN (") {
+                batchSQL.insert(sql)
+            }
+        }
+        let actual = try store.conversationsLinked(to: Set(threadIDs))
+        db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(actual.count, threadIDs.count)
+        XCTAssertEqual(Set(actual.keys), Set(threadIDs))
+        XCTAssertEqual(batchSQL.count, 2, "201 IDs must execute as bounded 200 + 1 chunks")
+        XCTAssertEqual(batchSQL.map { $0.filter { $0 == "?" }.count }.max(), 200)
+    }
+
+    func test_conversationsByID_matchesFailSoftPointLookups_becauseOneCorruptHandoffMustNotHidePeers() throws {
+        // WHY: live handoff origin checks are batched. One corrupt durable row
+        // must still look missing without discarding healthy requested origins.
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .grok)
+        let first = BotConversation(botID: bot.id, title: "First")
+        let second = BotConversation(botID: bot.id, title: "Second")
+        let corrupt = BotConversation(botID: bot.id, title: "Corrupt")
+        try store.upsertConversation(first)
+        try store.upsertConversation(second)
+        try store.upsertConversation(corrupt)
+        let damage = try db.prepare(
+            "UPDATE bot_conversations SET attention_state = 'invalid' WHERE id = ?;"
+        )
+        defer { damage.reset() }
+        try damage.bind(1, corrupt.id.value.uuidString.lowercased())
+        _ = try damage.step()
+        let missing = BotConversationID()
+        let requested: Set<BotConversationID> = [first.id, second.id, corrupt.id, missing]
+        let expected = Dictionary(uniqueKeysWithValues: requested.compactMap { id in
+            try? store.conversation(id: id).map { (id, $0) }
+        })
+
+        var batchSQL = Set<String>()
+        db.beforeStatementStepForTesting = { sql in
+            if sql.contains("FROM bot_conversations"), sql.contains("WHERE id IN (") {
+                batchSQL.insert(sql)
+            }
+        }
+        let actual = try store.conversations(ids: requested)
+        db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(actual, expected)
+        XCTAssertEqual(Set(actual.keys), [first.id, second.id])
+        XCTAssertNil(actual[corrupt.id])
+        XCTAssertNil(actual[missing])
+        XCTAssertEqual(batchSQL.count, 1)
+        XCTAssertEqual(try store.conversations(ids: []), [:])
+    }
+
     func test_duplicate_copiesProfileAndRoutinesButNotMemoryOrConversations() throws {
         let bot = try store.create(
             name: "Piper", title: "Scout", description: "Looks around",

@@ -3362,14 +3362,22 @@ public final class BotsViewModel: ObservableObject {
 
     public func reloadActiveBotsScreen() {
         settleTerminalWorkingConversations()
-        activeBotItems = liveWorkingBots().map { bot in
+        let liveBots = liveWorkingBots()
+        let inMemoryStartedAt = Dictionary(uniqueKeysWithValues: liveBots.compactMap { bot in
+            inMemoryStartedAtForLiveBot(bot).map { (bot.id, $0) }
+        })
+        let fallbackBotIDs = Set(liveBots.map(\.id)).subtracting(Set(inMemoryStartedAt.keys))
+        let persistedStartedAt = (
+            try? botStore.latestConversationUpdatedAt(botIDs: fallbackBotIDs)
+        ) ?? [:]
+        activeBotItems = liveBots.map { bot in
             ActiveBotScreenItem(
                 bot: bot,
                 preview: rosterPreview(for: bot),
                 providerName: PetActiveThreadProjector.providerLabel(
                     resolvedProvider(for: bot) ?? deskRouting.provider
                 ),
-                startedAt: startedAtForLiveBot(bot)
+                startedAt: inMemoryStartedAt[bot.id] ?? persistedStartedAt[bot.id]
             )
         }
         reloadFinishedBots()
@@ -3378,9 +3386,13 @@ public final class BotsViewModel: ObservableObject {
     public func liveWorkingBots() -> [BotDefinition] {
         var seen = Set<BotID>()
         var result: [BotDefinition] = []
-        for botID in activeHandoffBotIDs() {
+        let handoffBotIDs = activeHandoffBotIDs()
+        let rosterBotIDs = Set(bots.map(\.id))
+        let missingHandoffBotIDs = handoffBotIDs.subtracting(rosterBotIDs)
+        let missingHandoffBots = (try? botStore.bots(ids: missingHandoffBotIDs)) ?? [:]
+        for botID in handoffBotIDs {
             guard let bot = bots.first(where: { $0.id == botID })
-                    ?? (try? botStore.get(id: botID)) else { continue }
+                    ?? missingHandoffBots[botID] else { continue }
             seen.insert(botID)
             result.append(bot)
         }
@@ -3393,8 +3405,9 @@ public final class BotsViewModel: ObservableObject {
         }
         let activeThreadIDs = activeThreadIDsOverrideForTesting
             ?? context.coordinator.activeThreadIdsSnapshot()
+        let linkedConversations = (try? botStore.conversationsLinked(to: activeThreadIDs)) ?? [:]
         for threadID in activeThreadIDs {
-            guard let conversation = try? botStore.conversationLinked(to: threadID) else { continue }
+            guard let conversation = linkedConversations[threadID] else { continue }
             guard !seen.contains(conversation.botID) else { continue }
             guard let bot = bots.first(where: { $0.id == conversation.botID }) else { continue }
             seen.insert(bot.id)
@@ -3403,26 +3416,31 @@ public final class BotsViewModel: ObservableObject {
         return result
     }
 
-    private func startedAtForLiveBot(_ bot: BotDefinition) -> Date? {
+    private func inMemoryStartedAtForLiveBot(_ bot: BotDefinition) -> Date? {
         if let handoff = peerHandoffs.values
             .filter({ activeBotIDs(for: $0).contains(bot.id) })
             .min(by: { $0.createdAt < $1.createdAt }) {
             return handoff.createdAt
         }
-        if let stamped = lastUpdatedByBot[bot.id] { return stamped }
-        return (try? botStore.listConversations(botID: bot.id))?.first?.updatedAt
+        return lastUpdatedByBot[bot.id]
     }
 
     private func reloadFinishedBots() {
         let runs = (try? context.runRepo.listRecentFinished(limit: 200)) ?? []
+        let linkedConversations = (
+            try? botStore.conversationsLinked(to: Set(runs.map(\.threadId)))
+        ) ?? [:]
+        let rosterBotIDs = Set(bots.map(\.id))
+        let missingBotIDs = Set(linkedConversations.values.map(\.botID)).subtracting(rosterBotIDs)
+        let missingBots = (try? botStore.bots(ids: missingBotIDs)) ?? [:]
         var items: [FinishedBotScreenItem] = []
         var seen = Set<AgentRunID>()
         for run in runs {
             guard items.count < 50 else { break }
             guard !seen.contains(run.id) else { continue }
-            guard let conversation = try? botStore.conversationLinked(to: run.threadId) else { continue }
+            guard let conversation = linkedConversations[run.threadId] else { continue }
             let bot = bots.first(where: { $0.id == conversation.botID })
-                ?? (try? botStore.get(id: conversation.botID))
+                ?? missingBots[conversation.botID]
             guard let bot else { continue }
             seen.insert(run.id)
             items.append(
@@ -6848,12 +6866,18 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func activeHandoffBotIDs() -> Set<BotID> {
-        peerHandoffs.values.reduce(into: Set<BotID>()) { result, handoff in
-            if let conversationID = handoff.originConversationID,
-               (try? botStore.conversation(id: conversationID)) == nil {
+        let activeHandoffs = peerHandoffs.values.compactMap { handoff -> (PersistedBotPeerHandoff, Set<BotID>)? in
+            let botIDs = activeBotIDs(for: handoff)
+            return botIDs.isEmpty ? nil : (handoff, botIDs)
+        }
+        let originConversationIDs = Set(activeHandoffs.compactMap { $0.0.originConversationID })
+        let existingOrigins = (try? botStore.conversations(ids: originConversationIDs)) ?? [:]
+        return activeHandoffs.reduce(into: Set<BotID>()) { result, item in
+            if let conversationID = item.0.originConversationID,
+               existingOrigins[conversationID] == nil {
                 return
             }
-            result.formUnion(activeBotIDs(for: handoff))
+            result.formUnion(item.1)
         }
     }
 
