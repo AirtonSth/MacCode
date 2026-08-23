@@ -162,13 +162,34 @@ final class BotHomeTests: XCTestCase {
         XCTAssertTrue(migrated.contains("Prefers dark mode"))
         XCTAssertFalse(migrated.contains("Memory projection"))
         XCTAssertFalse(migrated.contains("Store leftover"))
-        XCTAssertFalse(
-            FileManager.default.fileExists(
-                atPath: home.root.appendingPathComponent(BotHome.legacyMemoryName).path
-            )
-        )
+        let entriesAfter = try FileManager.default.contentsOfDirectory(atPath: home.root.path)
+        XCTAssertTrue(entriesAfter.contains(BotHome.memoryName))
+        XCTAssertFalse(entriesAfter.contains(BotHome.legacyMemoryName))
+        let editedMemory = migrated + "\nUser-edited canonical memory\n"
+        try editedMemory.write(to: home.memoryURL, atomically: true, encoding: .utf8)
         try home.migrateLegacyMemoryIfNeeded(legacyFacts: ["Must not clobber"])
-        XCTAssertEqual(try String(contentsOf: home.memoryURL, encoding: .utf8), migrated)
+        XCTAssertEqual(try String(contentsOf: home.memoryURL, encoding: .utf8), editedMemory)
+    }
+
+    func test_legacyAndMemoryAliasOnlyWhenDirectoryHasOneCaseVariant() {
+        // WHY: Lowercasing the two paths always compares equal, even on a
+        // case-sensitive volume where both files can coexist. Treating those
+        // distinct entries as aliases would overwrite the bot-edited MEMORY.md.
+        XCTAssertTrue(BotHome.legacyAndMemoryShareDirectoryEntry(
+            legacyExists: true,
+            memoryExists: true,
+            directoryEntries: [BotHome.legacyMemoryName]
+        ))
+        XCTAssertTrue(BotHome.legacyAndMemoryShareDirectoryEntry(
+            legacyExists: true,
+            memoryExists: true,
+            directoryEntries: [BotHome.memoryName]
+        ))
+        XCTAssertFalse(BotHome.legacyAndMemoryShareDirectoryEntry(
+            legacyExists: true,
+            memoryExists: true,
+            directoryEntries: [BotHome.legacyMemoryName, BotHome.memoryName]
+        ))
     }
 
     func test_removeOwnedSkillDeletesSkillDirectory() throws {
