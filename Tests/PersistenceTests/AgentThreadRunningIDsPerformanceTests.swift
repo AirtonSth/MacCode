@@ -36,10 +36,90 @@ final class AgentThreadRunningIDsPerformanceTests: XCTestCase {
         try assertProjectedIDsMatchLegacy(repository, expected: expected)
     }
 
+    /// WHY: a malformed persisted ID cannot be represented in the active-ID
+    /// protection set. Silently skipping it would let the reaper continue from
+    /// an incomplete view, so the repository must fail closed instead.
+    func test_runningThreadIdsFailsClosedForMalformedRunningID() throws {
+        let (repository, database) = try makeRepository(label: "malformed-id")
+        try insertRawThread(database: database, id: "not-a-uuid", status: "running")
+
+        XCTAssertThrowsError(try repository.runningThreadIds()) { error in
+            XCTAssertEqual(
+                error as? AgentThreadPersistenceError,
+                .invalidThreadID("not-a-uuid"),
+                "the reaper must abort rather than treat an unrepresentable running row as inactive"
+            )
+        }
+    }
+
+    /// WHY: running routing state is part of the persisted thread record that
+    /// the legacy list path validated. If it is corrupt, active-session cleanup
+    /// must stop before making any termination decision.
+    func test_runningThreadIdsFailsClosedForCorruptRunningRoutingSchema() throws {
+        let (repository, database) = try makeRepository(label: "corrupt-routing")
+        let routing = AgentRoutingConfiguration(
+            mode: .auto,
+            manualSelection: AgentModelSelection(provider: .codex, modelId: "gpt-5.5"),
+            eligibleProviders: [.codex],
+            revision: 3
+        )
+        var running = AgentThread(
+            title: "corrupt running routing",
+            provider: .codex,
+            model: "gpt-5.5",
+            routingConfiguration: routing
+        )
+        running.status = .running
+        try repository.upsert(running)
+        try database.execute(
+            "UPDATE agent_thread_routing SET configuration_json = '{}' "
+                + "WHERE thread_id = '\(running.id.value.uuidString)';"
+        )
+
+        XCTAssertThrowsError(try repository.runningThreadIds()) { error in
+            XCTAssertEqual(
+                error as? AgentRoutingPersistenceError,
+                .invalidConfigurationJSON,
+                "running routing schema corruption must retain the legacy typed failure"
+            )
+        }
+    }
+
+    /// WHY: routing is not an activity signal. Corrupt routing attached to a
+    /// non-running row must not force the 30-second reaper back to decoding all
+    /// retained history; only corrupt running persistence is safety-critical.
+    func test_runningThreadIdsDoesNotDecodeCorruptRoutingForNonrunningThread() throws {
+        let (repository, database) = try makeRepository(label: "terminal-corrupt-routing")
+        let routing = AgentRoutingConfiguration(
+            mode: .manual,
+            manualSelection: AgentModelSelection(provider: .codex, modelId: "gpt-5.5"),
+            eligibleProviders: [.codex],
+            revision: 1
+        )
+        let completed = AgentThread(
+            title: "completed corrupt routing",
+            provider: .codex,
+            model: "gpt-5.5",
+            routingConfiguration: routing
+        )
+        try repository.upsert(completed)
+        try database.execute(
+            "UPDATE agent_thread_routing SET configuration_json = '{}' "
+                + "WHERE thread_id = '\(completed.id.value.uuidString)';"
+        )
+
+        XCTAssertEqual(
+            try repository.runningThreadIds(),
+            [],
+            "terminal routing corruption cannot make a persisted thread active"
+        )
+    }
+
     /// Same-process, warmed A/B for the 30-second provider-session reaper tick.
     /// The legacy side executes the exact full list/filter path removed from
-    /// AppContext; the candidate decodes only matching IDs from the same SQLite
-    /// connection and page cache. Process CPU corroborates the primary wall gate.
+    /// AppContext; the candidate decodes only matching IDs and their routing
+    /// invariants from the same SQLite connection/page cache. Process CPU
+    /// corroborates the primary wall gate.
     func test_benchmarkRunningThreadIDProjectionImprovesTenThousandRowReaperTick() throws {
         guard ProcessInfo.processInfo.environment["RC2_PROVIDER_REAPER_BENCHMARK"] == "1" else {
             throw XCTSkip("Set RC2_PROVIDER_REAPER_BENCHMARK=1 to run the provider reaper A/B benchmark.")
@@ -170,12 +250,28 @@ final class AgentThreadRunningIDsPerformanceTests: XCTestCase {
         historyCount: Int,
         runningCount: Int
     ) throws -> Set<AgentThreadID> {
+        let routing = AgentRoutingConfiguration(
+            mode: .auto,
+            manualSelection: AgentModelSelection(provider: .codex, modelId: "gpt-5.5"),
+            eligibleProviders: [.codex, .claude],
+            policyDigest: String(repeating: "b", count: 64),
+            revision: 4,
+            updatedAt: Date(timeIntervalSince1970: 1_767_225_600)
+        )
+        let routingData = try JSONEncoder().encode(routing)
+        guard let routingJSON = String(data: routingData, encoding: .utf8) else {
+            throw AgentRoutingPersistenceError.invalidConfigurationJSON
+        }
         var running: Set<AgentThreadID> = []
         try database.performSync { database in
             try database.transaction {
                 let statement = try database.prepare("""
                     INSERT INTO agent_threads(id, title, provider, model, provider_thread_id, status, created_at, updated_at)
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?);
+                """)
+                let routingStatement = try database.prepare("""
+                    INSERT INTO agent_thread_routing(thread_id, mode, configuration_json, revision, updated_at)
+                    VALUES(?, ?, ?, ?, ?);
                 """)
                 for index in 0..<historyCount {
                     let rawID = String(format: "00000000-0000-0000-0000-%012d", index + 1)
@@ -192,10 +288,34 @@ final class AgentThreadRunningIDsPerformanceTests: XCTestCase {
                     try statement.bind(7, "2026-01-01T00:00:00.000Z")
                     try statement.bind(8, "2026-01-01T00:00:00.000Z")
                     _ = try statement.step()
+                    if isRunning {
+                        routingStatement.reset()
+                        try routingStatement.bind(1, rawID)
+                        try routingStatement.bind(2, routing.mode.rawValue)
+                        try routingStatement.bind(3, routingJSON)
+                        try routingStatement.bind(4, routing.revision)
+                        try routingStatement.bind(5, "2026-01-01T00:00:00.000Z")
+                        _ = try routingStatement.step()
+                    }
                 }
             }
         }
         return running
+    }
+
+    private func insertRawThread(database: SQLiteDB, id: String, status: String) throws {
+        let statement = try database.prepare("""
+            INSERT INTO agent_threads(id, title, provider, model, status, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?);
+        """)
+        try statement.bind(1, id)
+        try statement.bind(2, "raw persistence fixture")
+        try statement.bind(3, "codex")
+        try statement.bind(4, "gpt-5.5")
+        try statement.bind(5, status)
+        try statement.bind(6, "2026-01-01T00:00:00.000Z")
+        try statement.bind(7, "2026-01-01T00:00:00.000Z")
+        _ = try statement.step()
     }
 
     private func makeRepository(label: String) throws -> (AgentThreadRepository, SQLiteDB) {

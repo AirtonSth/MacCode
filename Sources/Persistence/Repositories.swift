@@ -63,6 +63,10 @@ public enum AgentRoutingPersistenceError: Error, Equatable {
     case revisionConflict(column: Int, configuration: Int)
 }
 
+public enum AgentThreadPersistenceError: Error, Equatable {
+    case invalidThreadID(String)
+}
+
 private func parseDate(_ s: String?) -> Date {
     guard let s else { return Date() }
     if let d = isoFractional.date(from: s) { return d }
@@ -792,16 +796,30 @@ public final class AgentThreadRepository {
     }
 
     /// IDs of threads whose persisted run state is active. The provider-session
-    /// reaper polls this on MainActor every 30 seconds and needs no thread model,
-    /// routing join, JSON decode, or recency ordering.
+    /// reaper polls this on MainActor every 30 seconds and needs no thread model
+    /// or recency ordering. Validate routing only for running rows so corrupt
+    /// active persistence aborts cleanup before it can terminate any session;
+    /// routing attached to a non-running row cannot make that row active.
     public func runningThreadIds() throws -> Set<AgentThreadID> {
-        let statement = try db.prepare(
-            "SELECT id FROM agent_threads WHERE status = 'running';"
-        )
+        let statement = try db.prepare("""
+            SELECT t.id, r.mode, r.configuration_json, r.revision
+            FROM agent_threads t
+            LEFT JOIN agent_thread_routing r ON r.thread_id = t.id
+            WHERE t.status = 'running';
+        """)
         var ids = Set<AgentThreadID>()
         while try statement.step() {
-            guard let rawID = statement.columnText(0),
-                  let uuid = UUID(uuidString: rawID) else { continue }
+            let rawID = statement.columnText(0) ?? ""
+            guard let uuid = UUID(uuidString: rawID) else {
+                throw AgentThreadPersistenceError.invalidThreadID(rawID)
+            }
+            if let routingJSON = statement.columnText(2) {
+                _ = try decodeRoutingConfiguration(
+                    json: routingJSON,
+                    storedMode: statement.columnText(1),
+                    storedRevision: statement.columnIsNull(3) ? nil : Int(statement.columnInt64(3))
+                )
+            }
             ids.insert(AgentThreadID(uuid))
         }
         return ids
