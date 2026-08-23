@@ -7244,10 +7244,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         windowController?.openBotGuestDesktopInNewWindow(bot)
     }
 
-    public func notificationCreate(workspaceId: WorkspaceID?, title: String, body: String?, category: String?) throws -> String {
+    public func notificationCreate(
+        workspaceId: WorkspaceID?,
+        surfaceId: SurfaceID? = nil,
+        title: String,
+        body: String?,
+        category: String?
+    ) throws -> String {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let repo = NotificationRepository(db: ctx.db)
-        let n = AppNotification(workspaceId: workspaceId, title: title, body: body, category: category)
+        let n = AppNotification(
+            workspaceId: workspaceId,
+            surfaceId: surfaceId,
+            title: title,
+            body: body,
+            category: category
+        )
         try repo.insert(n)
         // bump workspace unread + flash
         if let wid = workspaceId, var ws = ctx.state.workspaces[wid] {
@@ -7259,6 +7271,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         SystemNotifier.shared.post(title: title, body: body, category: category)
         var eventPayload: [String: JSONValue] = ["id": .string(n.id)]
         if let workspaceId { eventPayload["workspace_id"] = .string(workspaceId.value.uuidString) }
+        if let surfaceId { eventPayload["surface_id"] = .string(surfaceId.value.uuidString) }
         if let category { eventPayload["category"] = .string(category) }
         EventBus.shared.publish(kind: "notification.created", payload: .object(eventPayload))
         return n.id
