@@ -186,54 +186,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static let mcpEndMarker = "# RemoteCode managed MCP: end"
     public static let retrieveMCPName = "remotecode-distill-retrieve"
     public static let computerUseMCPName = ComputerUseMCPAdmit.serverName
-    public static let macosHarnessSkillID = "macos-harness"
-    public static let macosHarnessSourceURL = "https://github.com/browser-use/macos-harness"
-    public static let macosHarnessSourceRevision = "0.1.2"
-    public static let macosHarnessLocalVersion = "1"
-    public static let macosHarnessSkillTemplate = """
-    ---
-    name: macos-harness
-    description: Control a whole Mac from one persistent Python session with screenshots, PID-targeted input, an animated virtual pointer, targeted Apple Accessibility, Apple Events, Browser Harness CDP, and filesystem access. Use for native, Electron, browser, dialog, file, or cross-app tasks without moving the physical cursor or forcing apps into the foreground.
-    ---
-
-    # macOS Harness
-
-    Use one CLI call per decision point, not per primitive:
-
-    ```bash
-    macos-harness <<'PY'
-    app = "Spotify"
-    mac.see(app)
-    mac.key("cmd+k", app=app)
-    mac.type("Alessia Cara", app=app)
-    print(mac.see(app))
-    PY
-    ```
-
-    The CLI preloads `mac`, `browser`, `Path`, and `subprocess`. Prefer bounded stdin
-    programs; reserve `macos-harness repl` for manual exploration and always exit it.
-
-    In a RemoteCode checkout, invoke it through `scripts/macos-ui-lease.sh -- ...`.
-    The lease is cooperative and read-only by default; use `--allow-input` only for one
-    bounded E2E, and never run input-capable Computer Use while the user is using the Mac.
-
-    Think in six verbs: `see`, `key`, `type`, `click`, `ax`, `script`.
-
-    ```python
-    frame = mac.see("Spotify")
-    mac.key("cmd+k", app="Spotify")
-    mac.type("Alessia Cara", app="Spotify")
-    mac.click(640, 420, app="Spotify")
-    item = mac.ax.at(640, 420, app="Spotify")
-    mac.script('tell application "Spotify" to play')
-    ```
-
-    If `macos-harness` is missing, install with:
-
-    `uv tool install --python 3.12 --upgrade macos-harness`
-
-    from https://github.com/browser-use/macos-harness. Do not call remotecode-computer-use.
-    """
+    public static let legacyExternalHostSkillID = "macos-harness"
+    /// Environment signal set only for a logical Desktop (This Mac) run. It is
+    /// deliberately explicit so Docker, VM, and remote leftovers cannot inherit
+    /// the host MCP from a provider's global configuration.
+    public static let computerUseHostAdmissionEnvironmentKey = "RC_REMOTE_CODE_COMPUTER_USE_HOST"
     public static let botSelfConfigMCPName = BotSelfConfigMCPAdmit.serverName
     public static let agentAppMiddlewareCommand = "remote-code"
     public static let remoteCodeOrchestrateManifestName = ".remote-code-install.json"
@@ -1047,6 +1004,31 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         }
     }
 
+    /// Remove only artifacts that the pre-native RemoteCode installer owned.
+    /// A manifest source check protects a user-authored skill with the same id;
+    /// the managed-bin entry is always app-owned and may be removed when it is
+    /// a symlink to that legacy executable.
+    public func uninstallLegacyExternalHostArtifacts() throws {
+        let legacySourceURL = "https://github.com/browser-use/" + Self.legacyExternalHostSkillID
+        for provider in AgentProvider.allCases {
+            let directory = skillDirectory(provider: provider, skillID: Self.legacyExternalHostSkillID)
+            let manifestURL = directory.appendingPathComponent("manifest.json")
+            guard let data = try? Data(contentsOf: manifestURL, options: .mappedIfSafe),
+                  let manifest = try? decoder.decode(AgentSkillManifest.self, from: data),
+                  manifest.sourceURL == legacySourceURL else {
+                continue
+            }
+            try? fileManager.removeItem(at: directory)
+        }
+        let managedLink = cliBinDirectory.appendingPathComponent(Self.legacyExternalHostSkillID)
+        guard isSymbolicLink(managedLink),
+              let destination = try? fileManager.destinationOfSymbolicLink(atPath: managedLink.path),
+              destination.contains(Self.legacyExternalHostSkillID) else {
+            return
+        }
+        try? fileManager.removeItem(at: managedLink)
+    }
+
     private let claudeSkillsRoot: URL
     private let codexSkillsRoot: URL
     private let claudeInstructionsURL: URL
@@ -1748,47 +1730,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             throw AgentSkillCLIError.serviceBinaryUnavailable
         }
         try installCodexRetrieveMCP(binary: binary)
-    }
-
-    /// Bots (and every provider) use browser-use/macos-harness instead of the
-    /// remotecode-computer-use MCP. Writes the skill into Claude, Codex, and Grok
-    /// homes and strips the managed computer-use MCP if a prior admit left it.
-    public func installMacOSHarness() throws {
-        try uninstallComputerUseMCP()
-        for provider in AgentProvider.allCases {
-            _ = try installSkill(
-                provider: provider,
-                skillID: Self.macosHarnessSkillID,
-                skillText: Self.macosHarnessSkillTemplate,
-                sourceURL: Self.macosHarnessSourceURL,
-                sourceRevision: Self.macosHarnessSourceRevision,
-                localVersion: Self.macosHarnessLocalVersion
-            )
-        }
-        linkMacOSHarnessOntoManagedBinIfPresent()
-    }
-
-    /// If `macos-harness` is already on PATH, bridge it into the managed bin so
-    /// Claude / Codex / Grok shells see the same binary.
-    private func linkMacOSHarnessOntoManagedBinIfPresent() {
-        let name = Self.macosHarnessSkillID
-        let managed = cliBinDirectory.appendingPathComponent(name)
-        if fileManager.isExecutableFile(atPath: managed.path) { return }
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        for directory in path.split(separator: ":") {
-            let candidate = URL(fileURLWithPath: String(directory), isDirectory: true)
-                .appendingPathComponent(name)
-            guard candidate.path != managed.path,
-                  fileManager.isExecutableFile(atPath: candidate.path) else { continue }
-            do {
-                try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
-                try? fileManager.removeItem(at: managed)
-                try fileManager.createSymbolicLink(at: managed, withDestinationURL: candidate)
-            } catch {
-                NSLog("RemoteCode: macos-harness PATH bridge failed: \(error)")
-            }
-            return
-        }
     }
 
     /// Admit the host-queued computer-use MCP into Claude and Codex configs.

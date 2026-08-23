@@ -307,8 +307,8 @@ final class BotBrowserPlaywrightBridgeTests: XCTestCase {
     }
 
     func test_hostRefusedRouteThrowsTheRefusalMessage_andSpawnsNothing() {
-        // WHY: a logical-space bot must read the Google-Chrome redirect
-        // verbatim; the host must not even build a child for it.
+        // WHY: an explicitly refused runtime must fail loud; the Playwright
+        // host must not even build a child for it.
         let spawnCounter = SpawnCounter()
         let host = makeHost(children: { _, _ in
             spawnCounter.increment()
@@ -322,7 +322,7 @@ final class BotBrowserPlaywrightBridgeTests: XCTestCase {
             )
         ) { error in
             XCTAssertEqual(String(describing: error), BotBrowserRoute.refusedMessage)
-            XCTAssertTrue(String(describing: error).contains("Google Chrome"))
+            XCTAssertTrue(String(describing: error).contains("unavailable"))
         }
         XCTAssertEqual(spawnCounter.count, 0)
     }
