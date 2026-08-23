@@ -2424,7 +2424,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         vm.openDesk(bot)
         windowController?.flushPendingRefresh()
         guard vm.selectedBotID == botID, vm.screen == .desk else { return false }
-        guard let destination = windowController?.window else { return true }
+        guard let destination = windowController?.window else { return false }
         return destination.isVisible && destination.isMiniaturized == false
     }
 

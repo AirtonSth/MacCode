@@ -886,7 +886,8 @@ final class PetAttentionStoreTests: XCTestCase {
             BotConversation(
                 botID: bot.id,
                 title: "Live",
-                attentionState: .working,
+                unread: true,
+                attentionState: .unreadActivity,
                 linkedAgentThreadID: threadID
             )
         )
@@ -902,6 +903,13 @@ final class PetAttentionStoreTests: XCTestCase {
                 hasUnread: true
             )
         )
+        try AgentRunRepository(db: db).upsert(AgentRun(
+            threadId: threadID,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            finishedAt: Date(timeIntervalSince1970: 100)
+        ))
         let store = PetAttentionStore(
             threadRepository: threads,
             callbackRepository: ProviderPendingCallbackRepository(db: db),
@@ -916,6 +924,9 @@ final class PetAttentionStoreTests: XCTestCase {
             }
         )
         let items = try store.refresh().items
+        XCTAssertEqual(items.count, 1, "a linked Agent run must have one Bot attention row, not two destinations")
+        XCTAssertEqual(items.first?.route, .botsDesk(botID: bot.id))
+        XCTAssertEqual(items.first?.classification, .completed)
         XCTAssertFalse(items.contains { $0.id == "thread:\(threadID.value.uuidString)" })
         XCTAssertFalse(items.contains { if case .agentThread = $0.route { return true }; return false })
     }

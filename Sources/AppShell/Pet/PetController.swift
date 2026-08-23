@@ -1121,10 +1121,10 @@ public final class PetController {
             return openSettings(settingsRoute)
         case .botsDesk(let botID):
             guard try router.openBotsDesk(botID: botID) else { return false }
-            let destination = router.windowController?.window
-            return destination?.isVisible == true
-                && destination?.isMiniaturized == false
-                && destinationWindowIsKey(destination!)
+            guard let destination = router.windowController?.window,
+                  destination.isVisible,
+                  !destination.isMiniaturized else { return false }
+            return destinationWindowIsKey(destination)
         }
     }
 
