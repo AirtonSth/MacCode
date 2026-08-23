@@ -23,6 +23,31 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertEqual(probe.activations, 0, "observing a target must not activate or raise its window")
     }
 
+    func testObservationSelectsRequestedWindowWhenProcessOwnsMultipleWindows() async throws {
+        // WHY: PID-only resolution can silently observe the first sibling
+        // window while claiming the requested window ID in the tool call.
+        let probe = Probe()
+        probe.additionalWindows = [ComputerUseNativeWindow(
+            target: .init(pid: 17, windowID: 30),
+            title: "Second window",
+            bundleIdentifier: "com.example.RemoteCode",
+            isOnScreen: true,
+            isMinimized: false,
+            bounds: .zero
+        )]
+        let backend = makeBackend(probe: probe)
+
+        let result = await backend.invoke(
+            name: "screenshot",
+            arguments: ["target_pid": 17, "target_window_id": 30]
+        )
+
+        XCTAssertFalse(result.isError)
+        let metadata = try XCTUnwrap(result.content.first?.text)
+        XCTAssertTrue(metadata.contains("\"target_window_id\":30"))
+        XCTAssertFalse(metadata.contains("\"target_window_id\":29"))
+    }
+
     func testCaptureUsesInjectedAsyncExactWindowHook() async throws {
         let probe = Probe()
         let backend = makeBackend(probe: probe)
@@ -498,7 +523,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
 
     private func makeBackend(probe: Probe) -> ComputerUseNativeHostBackend {
         ComputerUseNativeHostBackend(hooks: .init(
-            listWindows: { _ in [probe.window] },
+            listWindows: { _ in [probe.window] + probe.additionalWindows },
             userActivity: { _ in probe.nextActivity() },
             activityMonitorAvailable: { probe.activityMonitorAvailable },
             accessibilityPermission: { probe.accessibilityPermission },
@@ -565,6 +590,7 @@ private final class Probe: @unchecked Sendable {
     var captureData = "cGl4ZWxz"
     var captureFailure: String?
     var captureFallback = false
+    var additionalWindows: [ComputerUseNativeWindow] = []
 
     var window: ComputerUseNativeWindow {
         lock.lock(); defer { lock.unlock() }
