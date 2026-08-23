@@ -337,10 +337,12 @@ actor AgentAttachmentThumbnailLoader {
     static let defaultCountLimit = 128
     static let defaultMaxPixel = 64
     static let defaultMaxConcurrentDecodes = 2
+    static let defaultMaxWaitingDecodes = 8
 
     private var cache: AgentAttachmentThumbnailMemoryCache
     private let maxPixel: Int
     private let maxConcurrentDecodes: Int
+    private let maxWaitingDecodes: Int
     private let decoder: Decoder
     private var activeDecodeCount = 0
     private var decodeWaiters: [DecodeWaiter] = []
@@ -350,6 +352,7 @@ actor AgentAttachmentThumbnailLoader {
         countLimit: Int = AgentAttachmentThumbnailLoader.defaultCountLimit,
         maxPixel: Int = AgentAttachmentThumbnailLoader.defaultMaxPixel,
         maxConcurrentDecodes: Int = AgentAttachmentThumbnailLoader.defaultMaxConcurrentDecodes,
+        maxWaitingDecodes: Int = AgentAttachmentThumbnailLoader.defaultMaxWaitingDecodes,
         decoder: Decoder? = nil
     ) {
         cache = AgentAttachmentThumbnailMemoryCache(
@@ -358,12 +361,19 @@ actor AgentAttachmentThumbnailLoader {
         )
         self.maxPixel = max(1, maxPixel)
         self.maxConcurrentDecodes = max(1, maxConcurrentDecodes)
+        self.maxWaitingDecodes = max(0, maxWaitingDecodes)
         self.decoder = decoder ?? { path, maxPixel in
             AgentAttachmentThumbnailLoader.decodeImage(path: path, maxPixel: maxPixel)
         }
     }
 
     func thumbnail(forPath path: String) async -> AgentAttachmentThumbnailResult? {
+        // Admission covers stat + decode, not just the expensive decoder. This
+        // keeps detached metadata reads and actor continuations bounded when a
+        // caller presents a large attachment batch. A saturated decorative
+        // thumbnail remains the existing photo placeholder.
+        guard await acquireDecodePermit() else { return nil }
+        defer { releaseDecodePermit() }
         // A replacement racing a detached decode gets one retry with its new signature.
         for _ in 0..<2 {
             guard !Task.isCancelled, let key = await readFileKey(forPath: path) else { return nil }
@@ -486,8 +496,6 @@ actor AgentAttachmentThumbnailLoader {
     private func decodedThumbnail(
         for key: AgentAttachmentThumbnailKey
     ) async -> AgentAttachmentDecodedThumbnail? {
-        guard await acquireDecodePermit() else { return nil }
-        defer { releaseDecodePermit() }
         guard !Task.isCancelled else { return nil }
         if let cached = cache.value(for: key) { return cached }
 
@@ -511,6 +519,7 @@ actor AgentAttachmentThumbnailLoader {
             activeDecodeCount += 1
             return true
         }
+        guard decodeWaiters.count < maxWaitingDecodes else { return false }
 
         let id = UUID()
         return await withTaskCancellationHandler {
@@ -590,7 +599,7 @@ public struct AgentChatAttachmentChips: View {
 
     public var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: DS.Space.sm) {
+            LazyHStack(spacing: DS.Space.sm) {
                 ForEach(attachments, id: \.self) { attachment in
                     HStack(spacing: DS.Space.xs) {
                         if AgentChatTranscriptChrome.isImagePath(attachment.path) {

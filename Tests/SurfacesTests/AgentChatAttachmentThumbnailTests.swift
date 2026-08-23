@@ -147,8 +147,8 @@ final class AgentChatAttachmentThumbnailTests: XCTestCase {
     }
 
     func test_loader_boundsDecodeFanoutAndDropsCancelledQueuedWork() async throws {
-        // WHY: the chip row is eager and attachment count is not capped. A large draft
-        // must not start an unbounded decode storm, and removed chips must leave the queue.
+        // WHY: attachment count is not capped. A large draft must not start an
+        // unbounded stat/decode storm, and removed chips must leave the queue.
         let fixtures = try (0..<6).map { _ in try ThumbnailFixture() }
         defer { fixtures.forEach { $0.remove() } }
         for (index, fixture) in fixtures.enumerated() {
@@ -208,6 +208,69 @@ final class AgentChatAttachmentThumbnailTests: XCTestCase {
         XCTAssertEqual(decodeProbe.count, 5, "the cancelled queued attachment must never enter the decoder")
         XCTAssertLessThanOrEqual(decodeProbe.maximumConcurrentCount, 2)
         XCTAssertEqual(decodeProbe.mainThreadCount, 0)
+        snapshot = await loader.cacheSnapshot()
+        XCTAssertEqual(snapshot.activeDecodeCount, 0)
+        XCTAssertEqual(snapshot.waitingDecodeCount, 0)
+    }
+
+    func test_loader_rejectsDecorativeThumbnailWorkBeyondItsHardAdmissionBound() async throws {
+        // WHY: LazyHStack bounds the current composer caller, but the loader is a
+        // shared authority and must remain bounded even if another caller submits
+        // an arbitrary batch. Saturation may keep the harmless photo placeholder;
+        // it must not retain N file stats, decodes, or continuations.
+        let fixtures = try (0..<20).map { _ in try ThumbnailFixture() }
+        defer { fixtures.forEach { $0.remove() } }
+        for (index, fixture) in fixtures.enumerated() {
+            try fixture.install(
+                Data(repeating: UInt8(index + 1), count: 64 + index),
+                modificationOffset: 200 + index
+            )
+        }
+        let decodeProbe = BlockingThumbnailDecodeProbe()
+        let loader = AgentAttachmentThumbnailLoader(
+            costLimitBytes: 256 * 1_024,
+            countLimit: 8,
+            maxConcurrentDecodes: 2,
+            maxWaitingDecodes: 2,
+            decoder: { path, maxPixel in decodeProbe.decode(path: path, maxPixel: maxPixel) }
+        )
+        let activeLoads = fixtures.prefix(2).map { fixture in
+            Task { await loader.thumbnail(forPath: fixture.imageURL.path) }
+        }
+
+        for _ in 0..<500 {
+            let snapshot = await loader.cacheSnapshot()
+            if snapshot.activeDecodeCount == 2, decodeProbe.count == 2 { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let queuedLoads = fixtures.dropFirst(2).prefix(2).map { fixture in
+            Task { await loader.thumbnail(forPath: fixture.imageURL.path) }
+        }
+        for _ in 0..<500 {
+            let snapshot = await loader.cacheSnapshot()
+            if snapshot.waitingDecodeCount == 2 { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let overflowLoads = fixtures.dropFirst(4).map { fixture in
+            Task { await loader.thumbnail(forPath: fixture.imageURL.path) }
+        }
+        var overflowResults: [AgentAttachmentThumbnailResult?] = []
+        for load in overflowLoads { overflowResults.append(await load.value) }
+
+        var snapshot = await loader.cacheSnapshot()
+        XCTAssertEqual(snapshot.activeDecodeCount, 2)
+        XCTAssertEqual(snapshot.waitingDecodeCount, 2)
+        XCTAssertEqual(decodeProbe.count, 2,
+            "only admitted requests may reach decode while the gate is saturated")
+        XCTAssertTrue(overflowResults.allSatisfy { $0 == nil },
+            "overflow requests must fail to the decorative placeholder without being retained")
+
+        decodeProbe.release(count: 4)
+        var results: [AgentAttachmentThumbnailResult?] = []
+        for load in activeLoads + queuedLoads { results.append(await load.value) }
+        XCTAssertTrue(results.allSatisfy { $0 != nil })
+        XCTAssertEqual(decodeProbe.count, 4)
+        XCTAssertLessThanOrEqual(decodeProbe.maximumConcurrentCount, 2)
         snapshot = await loader.cacheSnapshot()
         XCTAssertEqual(snapshot.activeDecodeCount, 0)
         XCTAssertEqual(snapshot.waitingDecodeCount, 0)
