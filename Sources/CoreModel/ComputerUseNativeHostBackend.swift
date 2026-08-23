@@ -286,6 +286,35 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         case geometry
     }
 
+    private struct PixelScope: Equatable {
+        let fullImageSize: [Int]
+        let region: [Int]?
+
+        var outputImageSize: [Int] {
+            guard let region, region.count == 4 else { return fullImageSize }
+            return [region[2], region[3]]
+        }
+    }
+
+    private struct PixelTokenEnvelope: Codable, Equatable {
+        let version: Int
+        let targetPID: Int32
+        let targetWindowID: UInt32
+        let windowBounds: [Double]
+        let accessibilityPermission: Bool
+        let screenCapturePermission: Bool
+        let fullImageSize: [Int]
+        let region: [Int]?
+        let pixelsDigest: String
+
+        var scope: PixelScope {
+            PixelScope(
+                fullImageSize: fullImageSize,
+                region: region
+            )
+        }
+    }
+
     private let hooks: Hooks
 
     public init(hooks: Hooks = Hooks()) {
@@ -339,21 +368,48 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 capture = nil
                 captureFailure = nil
             }
-            if let requestedRegion, let captured = capture {
-                guard let cropped = Self.crop(capture: captured, region: requestedRegion) else {
-                    let observation = await makeObservation(
-                        window: window,
-                        kind: .pixel,
-                        content: "<invalid-region>"
+            var pixelScope: PixelScope?
+            if let captured = capture,
+               let fullImageSize = Self.imageSize(capture: captured) {
+                if let requestedRegion {
+                    guard let cropped = Self.crop(capture: captured, region: requestedRegion) else {
+                        let observation = await makeObservation(
+                            window: window,
+                            kind: .pixel,
+                            content: "<invalid-region>"
+                        )
+                        return failure(.invalid_region, encodeObservation(observation))
+                    }
+                    capture = cropped
+                    pixelScope = PixelScope(
+                        fullImageSize: fullImageSize,
+                        region: [
+                            Int(requestedRegion.origin.x), Int(requestedRegion.origin.y),
+                            Int(requestedRegion.width), Int(requestedRegion.height),
+                        ]
                     )
-                    return failure(.invalid_region, encodeObservation(observation))
+                } else {
+                    pixelScope = PixelScope(
+                        fullImageSize: fullImageSize,
+                        region: nil
+                    )
                 }
-                capture = cropped
+            } else if capture != nil {
+                let observation = await makeObservation(
+                    window: window,
+                    kind: .pixel,
+                    content: requestedRegion == nil ? "<pixels-unavailable>" : "<invalid-region>"
+                )
+                return failure(
+                    requestedRegion == nil ? .capture_unavailable : .invalid_region,
+                    encodeObservation(observation)
+                )
             }
             let observation = await makeObservation(
                 window: window,
                 kind: .pixel,
-                content: capture?.data ?? "<pixels-unavailable>"
+                content: capture?.data ?? "<pixels-unavailable>",
+                pixelScope: pixelScope
             )
             return captureResult(
                 observation: observation,
@@ -402,7 +458,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     private func makeObservation(
         window: ComputerUseNativeWindow,
         kind: TokenKind,
-        content: String? = nil
+        content: String? = nil,
+        pixelScope: PixelScope? = nil
     ) async -> ComputerUseNativeHostObservation {
         let accessibility = hooks.accessibilityPermission()
         let screenCapture = hooks.screenCapturePermission()
@@ -413,6 +470,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         if semanticAXAvailable { capabilities.append("semantic_ax") }
         let activity = hooks.userActivity(window.target)
         let observedContent: String
+        var effectivePixelScope = pixelScope
         switch kind {
         case .semantic:
             observedContent = content ?? hooks.uiTree(window.target) ?? "<ui-tree-unavailable>"
@@ -422,7 +480,36 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             } else if renderable {
                 switch await hooks.capture(window.target) {
                 case .success(let capture), .quartzFallback(let capture):
-                    observedContent = capture.data
+                    if let fullImageSize = Self.imageSize(capture: capture),
+                       let pixelScope {
+                        if let region = pixelScope.region,
+                           region.count == 4,
+                           let cropped = Self.crop(
+                               capture: capture,
+                               region: CGRect(
+                                   x: region[0], y: region[1],
+                                   width: region[2], height: region[3]
+                               )
+                           ) {
+                            observedContent = cropped.data
+                            effectivePixelScope = PixelScope(
+                                fullImageSize: fullImageSize,
+                                region: pixelScope.region
+                            )
+                        } else if pixelScope.region == nil {
+                            observedContent = capture.data
+                            effectivePixelScope = PixelScope(
+                                fullImageSize: fullImageSize,
+                                region: nil
+                            )
+                        } else {
+                            observedContent = capture.data
+                            effectivePixelScope = nil
+                        }
+                    } else {
+                        observedContent = capture.data
+                        effectivePixelScope = nil
+                    }
                 case .unavailable:
                     observedContent = "<pixels-unavailable>"
                 }
@@ -437,7 +524,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             accessibilityPermission: accessibility,
             screenCapturePermission: screenCapture,
             kind: kind,
-            content: observedContent
+            content: observedContent,
+            pixelScope: effectivePixelScope
         )
         return ComputerUseNativeHostObservation(
             target: window.target,
@@ -488,14 +576,29 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         if hooks.userActivity(target) == .human {
             return failure(.human_activity, encodeObservation(observation))
         }
+        guard let expected = arguments["expected_state_token"] as? String,
+              !expected.isEmpty else {
+            return failure(.missing_state_token, encodeObservation(observation))
+        }
+        let expectedPixelScope: PixelScope?
+        if tokenKind == .pixel {
+            guard let envelope = Self.decodePixelToken(expected),
+                  envelope.targetPID == target.pid,
+                  envelope.targetWindowID == target.windowID else {
+                return failure(.stale_state_token, encodeObservation(observation))
+            }
+            expectedPixelScope = envelope.scope
+        } else {
+            expectedPixelScope = nil
+        }
         // Re-read the capability-specific content immediately before the
         // mutation. The observation token is never a substitute for this
         // final race check.
-        let freshObservation = await makeObservation(window: window, kind: tokenKind)
-        guard let expected = arguments["expected_state_token"] as? String,
-              !expected.isEmpty else {
-            return failure(.missing_state_token, encodeObservation(freshObservation))
-        }
+        let freshObservation = await makeObservation(
+            window: window,
+            kind: tokenKind,
+            pixelScope: expectedPixelScope
+        )
         guard expected == freshObservation.stateToken else {
             return failure(.stale_state_token, encodeObservation(freshObservation))
         }
@@ -523,15 +626,41 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                   currentWindow.bounds.height > 0 else {
                 return failure(.stale_state_token, encodeObservation(freshObservation))
             }
-            guard localCoordinate[0] >= 0,
+            guard let expectedPixelScope,
+                  let freshEnvelope = Self.decodePixelToken(freshObservation.stateToken),
+                  expectedPixelScope == freshEnvelope.scope,
+                  expectedPixelScope.fullImageSize.count == 2,
+                  expectedPixelScope.outputImageSize.count == 2,
+                  expectedPixelScope.fullImageSize.allSatisfy({ $0 > 0 }),
+                  expectedPixelScope.outputImageSize.allSatisfy({ $0 > 0 }),
+                  localCoordinate[0] >= 0,
                   localCoordinate[1] >= 0,
-                  localCoordinate[0] < currentWindow.bounds.width,
-                  localCoordinate[1] < currentWindow.bounds.height else {
+                  localCoordinate[0] < Double(expectedPixelScope.outputImageSize[0]),
+                  localCoordinate[1] < Double(expectedPixelScope.outputImageSize[1]) else {
+                return failure(.semantic_action_failed, encodeObservation(freshObservation))
+            }
+            let fullPixelCoordinate: [Double]
+            if let region = expectedPixelScope.region,
+               region.count == 4 {
+                fullPixelCoordinate = [
+                    Double(region[0]) + localCoordinate[0],
+                    Double(region[1]) + localCoordinate[1],
+                ]
+            } else {
+                fullPixelCoordinate = localCoordinate
+            }
+            let scaleX = Double(expectedPixelScope.fullImageSize[0]) / currentWindow.bounds.width
+            let scaleY = Double(expectedPixelScope.fullImageSize[1]) / currentWindow.bounds.height
+            guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0,
+                  fullPixelCoordinate[0] >= 0,
+                  fullPixelCoordinate[1] >= 0,
+                  fullPixelCoordinate[0] < Double(expectedPixelScope.fullImageSize[0]),
+                  fullPixelCoordinate[1] < Double(expectedPixelScope.fullImageSize[1]) else {
                 return failure(.semantic_action_failed, encodeObservation(freshObservation))
             }
             let coordinate = [
-                currentWindow.bounds.origin.x + localCoordinate[0],
-                currentWindow.bounds.origin.y + localCoordinate[1],
+                currentWindow.bounds.origin.x + fullPixelCoordinate[0] / scaleX,
+                currentWindow.bounds.origin.y + fullPixelCoordinate[1] / scaleY,
             ]
             guard hooks.leftClick(target, coordinate) else {
                 return failure(.semantic_action_failed, encodeObservation(freshObservation))
@@ -623,7 +752,8 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         accessibilityPermission: Bool,
         screenCapturePermission: Bool,
         kind: TokenKind,
-        content: String
+        content: String,
+        pixelScope: PixelScope? = nil
     ) -> String {
         let pid = String(window.target.pid)
         let windowID = String(window.target.windowID)
@@ -640,6 +770,30 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         let contentDigest = SHA256.hash(data: Data(content.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
+        if kind == .pixel {
+            guard let pixelScope else { return "" }
+            let bounds: [Double] = [
+                Double(window.bounds.origin.x), Double(window.bounds.origin.y),
+                Double(window.bounds.width), Double(window.bounds.height),
+            ]
+            let envelope = PixelTokenEnvelope(
+                version: 1,
+                targetPID: window.target.pid,
+                targetWindowID: window.target.windowID,
+                windowBounds: bounds,
+                accessibilityPermission: accessibilityPermission,
+                screenCapturePermission: screenCapturePermission,
+                fullImageSize: pixelScope.fullImageSize,
+                region: pixelScope.region,
+                pixelsDigest: contentDigest
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            guard let data = try? encoder.encode(envelope) else {
+                return ""
+            }
+            return "native-pixel-v1:" + data.base64EncodedString()
+        }
         let material = [
             pid, windowID, title, bundleID, onScreen, minimized,
             originX, originY, width, height, accessibility, screenCapture,
@@ -648,6 +802,34 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         return SHA256.hash(data: Data(material.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+
+    private static func decodePixelToken(_ token: String) -> PixelTokenEnvelope? {
+        let prefix = "native-pixel-v1:"
+        guard token.hasPrefix(prefix),
+              let data = Data(base64Encoded: String(token.dropFirst(prefix.count))),
+              let envelope = try? JSONDecoder().decode(PixelTokenEnvelope.self, from: data),
+              envelope.version == 1,
+              envelope.targetPID > 0,
+              envelope.targetWindowID > 0,
+              envelope.windowBounds.count == 4,
+              envelope.windowBounds.allSatisfy({ $0.isFinite }),
+              envelope.fullImageSize.count == 2,
+              envelope.fullImageSize.allSatisfy({ $0 > 0 }),
+              !envelope.pixelsDigest.isEmpty else {
+            return nil
+        }
+        if let region = envelope.region {
+            guard
+                  region.count == 4,
+                  region[0] >= 0, region[1] >= 0,
+                  region[2] > 0, region[3] > 0,
+                  region[2] <= envelope.fullImageSize[0],
+                  region[3] <= envelope.fullImageSize[1],
+                  region[0] <= envelope.fullImageSize[0] - region[2],
+                  region[1] <= envelope.fullImageSize[1] - region[3] else { return nil }
+        }
+        return envelope
     }
 
     private static func target(from arguments: [String: Any]) -> ComputerUseNativeHostTarget? {
@@ -756,7 +938,12 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
               let image = representation.cgImage,
               region.maxX <= CGFloat(image.width),
               region.maxY <= CGFloat(image.height),
-              let cropped = image.cropping(to: region),
+              let cropped = image.cropping(to: CGRect(
+                  x: region.origin.x,
+                  y: CGFloat(image.height) - region.maxY,
+                  width: region.width,
+                  height: region.height
+              )),
               let croppedData = NSBitmapImageRep(cgImage: cropped)
                 .representation(using: .png, properties: [:]) else {
             return nil
@@ -765,6 +952,16 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             data: croppedData.base64EncodedString(),
             mimeType: "image/png"
         )
+    }
+
+    private static func imageSize(capture: ComputerUseNativeCapture) -> [Int]? {
+        guard let data = Data(base64Encoded: capture.data),
+              let representation = NSBitmapImageRep(data: data),
+              representation.pixelsWide > 0,
+              representation.pixelsHigh > 0 else {
+            return nil
+        }
+        return [representation.pixelsWide, representation.pixelsHigh]
     }
 
     private static func cursorPosition() -> String {

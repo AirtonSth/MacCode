@@ -277,7 +277,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         // only state change below is captured content; PID, title and bounds
         // remain unchanged, so kind mismatch cannot explain the rejection.
         let token = try await stateToken(from: backend, name: "screenshot")
-        probe.captureData = "changed-pixels"
+        probe.captureData = try makePNGBase64(width: 1, height: 1, red: 240)
 
         let result = await backend.invoke(
             name: "left_click",
@@ -289,6 +289,94 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertTrue(result.isError)
         XCTAssertTrue(result.content.first?.text?.contains("stale_state_token") == true)
         XCTAssertEqual(probe.leftClickMutations, 0, "pixel changes must invalidate pixel tokens even when geometry is unchanged")
+    }
+
+    func testUnavailableOrUndecodableCaptureCannotMintActionablePixelToken() async throws {
+        for mode in ["unavailable", "undecodable"] {
+            let probe = Probe()
+            probe.windowBounds = CGRect(x: 100, y: 200, width: 100, height: 100)
+            if mode == "unavailable" {
+                probe.captureFailure = "capture_unavailable_test"
+            } else {
+                probe.captureData = "not-a-png"
+            }
+            let backend = makeBackend(probe: probe)
+            let screenshot = await backend.invoke(
+                name: "screenshot",
+                arguments: ["target_pid": 17, "target_window_id": 29]
+            )
+            if mode == "undecodable" {
+                XCTAssertTrue(screenshot.isError)
+            }
+            let token = try XCTUnwrap(stateToken(from: screenshot))
+            if mode == "undecodable" {
+                XCTAssertTrue(token.isEmpty, "undecodable capture must not return an actionable token")
+            }
+            let click = await backend.invoke(
+                name: "left_click",
+                arguments: baseArguments(token: token).merging(["coordinate": [1, 1]]) { _, value in value }
+            )
+            XCTAssertTrue(click.isError, "\(mode) capture must not mint an actionable token")
+            XCTAssertEqual(probe.leftClickMutations, 0)
+        }
+    }
+
+    func testExtremePixelRegionEnvelopeFailsClosedWithoutOverflow() async throws {
+        let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 100, height: 100)
+        probe.captureData = try makePNGBase64(width: 200, height: 200)
+        let backend = makeBackend(probe: probe)
+        let zoom = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [40, 30, 80, 60],
+            ]
+        )
+        let token = try XCTUnwrap(stateToken(from: zoom))
+        let prefix = "native-pixel-v1:"
+        let encoded = String(token.dropFirst(prefix.count))
+        var envelope = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(base64Encoded: encoded)!) as? [String: Any]
+        )
+        envelope["region"] = [Int.max, Int.max, 2, 2]
+        let extremeJSON = try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
+        let extremeToken = prefix + extremeJSON.base64EncodedString()
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: extremeToken).merging(["coordinate": [1, 1]]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual(probe.leftClickMutations, 0)
+    }
+
+    func testFreshZoomCaptureThatCannotReproduceScopeRejectsWithoutMutation() async throws {
+        let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 100, height: 100)
+        probe.captureData = try makePNGBase64(width: 200, height: 200)
+        let backend = makeBackend(probe: probe)
+        let zoom = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [40, 30, 80, 60],
+            ]
+        )
+        let token = try XCTUnwrap(stateToken(from: zoom))
+        probe.captureData = try makePNGBase64(width: 20, height: 20)
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: token).merging(["coordinate": [10, 20]]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("stale_state_token") == true)
+        XCTAssertEqual(probe.leftClickMutations, 0)
     }
 
     func testHumanActivityWinsAndExecutesNoMutation() async throws {
@@ -412,6 +500,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
     func testMinimizedPixelTargetExecutesNoMutation() async throws {
         let probe = Probe()
         probe.isMinimized = true
+        probe.captureData = try makePNGBase64(width: 640, height: 480)
         let backend = makeBackend(probe: probe)
         let token = try await stateToken(from: backend, name: "screenshot")
 
@@ -423,7 +512,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         )
 
         XCTAssertTrue(result.isError)
-        XCTAssertTrue(result.content.first?.text?.contains("pixel_target_not_renderable") == true)
+        XCTAssertTrue(result.content.first?.text?.contains("missing_state_token") == true)
         XCTAssertEqual(probe.pixelMutations, 0, "minimized pixels cannot be targeted without restoring the window")
     }
 
@@ -465,6 +554,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
     func testLeftClickUsesExactTargetAXHookWithoutActivation() async throws {
         let probe = Probe()
         probe.windowBounds = CGRect(x: 100, y: 200, width: 640, height: 480)
+        probe.captureData = try makePNGBase64(width: 640, height: 480)
         let backend = makeBackend(probe: probe)
         let token = try await stateToken(from: backend, name: "screenshot")
 
@@ -485,6 +575,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         // them as global coordinates can click an unrelated window.
         let probe = Probe()
         probe.windowBounds = CGRect(x: 100, y: 200, width: 640, height: 480)
+        probe.captureData = try makePNGBase64(width: 640, height: 480)
         let backend = makeBackend(probe: probe)
         let token = try await stateToken(from: backend, name: "screenshot")
 
@@ -495,6 +586,119 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
 
         XCTAssertFalse(result.isError)
         XCTAssertEqual(probe.lastLeftClickCoordinate, [112, 234])
+    }
+
+    func testRetinaScreenshotCoordinatesMapPixelsToGlobalPoints() async throws {
+        // WHY: screenshot coordinates are pixels in the returned image. A
+        // Retina image can therefore be twice the window's point dimensions.
+        let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 100, height: 100)
+        probe.captureData = try makePNGBase64(width: 200, height: 200)
+        let backend = makeBackend(probe: probe)
+        let token = try await stateToken(from: backend, name: "screenshot")
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: token).merging(["coordinate": [150, 50]]) { _, value in value }
+        )
+
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(probe.lastLeftClickCoordinate, [175, 225])
+    }
+
+    func testZoomPixelTokenUsesCropLocalPixelsAndTopLeftOrigin() async throws {
+        // WHY: zoom returns a top-left-origin crop, so a click must add the
+        // crop origin before converting Retina pixels into target points.
+        let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 100, height: 100)
+        probe.captureData = try makePNGBase64(width: 200, height: 200)
+        let backend = makeBackend(probe: probe)
+        let zoom = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [40, 30, 80, 60],
+            ]
+        )
+        let token = try XCTUnwrap(stateToken(from: zoom))
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: token).merging(["coordinate": [10, 20]]) { _, value in value }
+        )
+
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(probe.lastLeftClickCoordinate, [125, 225])
+    }
+
+    func testScopedPixelTokenRejectsTargetGeometryDrift() async throws {
+        let probe = Probe()
+        let initial = CGRect(x: 100, y: 200, width: 100, height: 100)
+        probe.windowBounds = initial
+        probe.captureData = try makePNGBase64(width: 200, height: 200)
+        let backend = makeBackend(probe: probe)
+        let zoom = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [40, 30, 80, 60],
+            ]
+        )
+        let token = try XCTUnwrap(stateToken(from: zoom))
+        probe.windowBounds = CGRect(x: 101, y: 200, width: 100, height: 100)
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: token).merging(["coordinate": [10, 20]]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("stale_state_token") == true)
+        XCTAssertEqual(probe.leftClickMutations, 0)
+    }
+
+    func testMalformedPixelTokenScopeFailsClosedWithoutMutation() async throws {
+        let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 100, height: 100)
+        probe.captureData = try makePNGBase64(width: 200, height: 200)
+        let backend = makeBackend(probe: probe)
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: "native-pixel-v1:not-a-valid-scope")
+                .merging(["coordinate": [10, 20]]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("stale_state_token") == true)
+        XCTAssertEqual(probe.leftClickMutations, 0)
+    }
+
+    func testPixelCoordinateOutsideReturnedZoomImageFailsClosed() async throws {
+        let probe = Probe()
+        probe.windowBounds = CGRect(x: 100, y: 200, width: 100, height: 100)
+        probe.captureData = try makePNGBase64(width: 200, height: 200)
+        let backend = makeBackend(probe: probe)
+        let zoom = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [40, 30, 80, 60],
+            ]
+        )
+        let token = try XCTUnwrap(stateToken(from: zoom))
+
+        let result = await backend.invoke(
+            name: "left_click",
+            arguments: baseArguments(token: token).merging(["coordinate": [80, 0]]) { _, value in value }
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("semantic_action_failed") == true)
+        XCTAssertEqual(probe.leftClickMutations, 0)
     }
 
     func testLeftClickRejectsOutOfBoundsWindowLocalCoordinateWithoutMutation() async throws {
@@ -695,10 +899,10 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         return nil
     }
 
-    private func makePNGBase64(width: Int, height: Int) throws -> String {
+    private func makePNGBase64(width: Int, height: Int, red: UInt8 = 0) throws -> String {
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
         for index in 0..<(width * height) {
-            pixels[index * 4] = UInt8(index & 0xff)
+            pixels[index * 4] = red == 0 ? UInt8(index & 0xff) : red
             pixels[index * 4 + 1] = UInt8((index * 3) & 0xff)
             pixels[index * 4 + 2] = UInt8((index * 7) & 0xff)
             pixels[index * 4 + 3] = 255
@@ -791,7 +995,7 @@ private final class Probe: @unchecked Sendable {
     var captureCalls = 0
     var uiTree: String? = "{\"role\":\"AXWindow\",\"title\":\"RemoteCode\"}"
     var uiTreeCalls = 0
-    var captureData = "cGl4ZWxz"
+    var captureData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1s="
     var captureFailure: String?
     var captureFallback = false
 

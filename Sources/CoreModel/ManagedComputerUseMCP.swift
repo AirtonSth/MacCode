@@ -55,7 +55,7 @@ public struct ComputerUseToolResult: Sendable, Equatable {
         self.isError = isError
     }
 
-    /// Decode a zavora-style tools/call result so screenshot/zoom images survive.
+    /// Decode an injected/backend tools/call result so screenshot/zoom images survive.
     public static func parseUpstream(_ object: [String: Any]) -> ComputerUseToolResult {
         if let error = object["error"] as? [String: Any] {
             let message = (error["message"] as? String) ?? String(describing: error)
@@ -200,11 +200,11 @@ public struct ManagedComputerUseMCP: Sendable {
     private static func description(for name: String) -> String {
         switch name {
         case screenshotTool:
-            return "Capture the screen or a targeted app/window with native host capture."
+            return "Capture the exact target window; returned image coordinates are pixels with a top-left origin."
         case "zoom":
-            return "Inspect an exact integral pixel region in window-local screenshot coordinates."
+            return "Return an exact integral pixel crop from the target window; crop coordinates and returned image coordinates use a top-left origin."
         case leftClickTool:
-            return "Left-click window-local coordinates in the exact background target; requires a state token and never activates."
+            return "Left-click pixel coordinates relative to the returned screenshot or zoom image in the exact background target; requires its state token and never activates."
         case "right_click":
             return "Right-click at coordinates for the exact target; requires a state token and fails closed without focus-safe support."
         case "mouse_move":
@@ -254,7 +254,7 @@ public struct ManagedComputerUseMCP: Sendable {
             return [
                 "type": "object",
                 "properties": targeting.merging([
-                    "region": ["type": "array", "items": ["type": "integer"]],
+                    "region": ["type": "array", "description": "Integral [x,y,width,height] pixels in the full window image, top-left origin.", "items": ["type": "integer"]],
                 ]) { _, new in new },
                 "required": ["target_pid", "target_window_id", "region"],
             ]
@@ -262,7 +262,7 @@ public struct ManagedComputerUseMCP: Sendable {
             return [
                 "type": "object",
                 "properties": targeting.merging([
-                    "coordinate": ["type": "array", "items": ["type": "number"]],
+                    "coordinate": ["type": "array", "description": "Pixel coordinates relative to the returned screenshot or zoom image, top-left origin.", "items": ["type": "number"]],
                 ]) { _, new in new },
                 "required": ["target_pid", "target_window_id", "expected_state_token", "coordinate"],
             ]
