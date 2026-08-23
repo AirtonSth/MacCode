@@ -50,7 +50,38 @@ public final class AgentWorkspaceRailReloadCoordinator {
     /// Shared subagent badge poll interval (was 2s per open surface).
     public var subagentPollNanoseconds: UInt64 = 2_000_000_000
 
+    #if DEBUG
+    private var subagentPollHasMembersForTesting: (() -> Bool)?
+    private var subagentPollSleepForTesting: ((UInt64) async throws -> Void)?
+    private var subagentPollRoundForTesting: (() async -> Void)?
+    var subagentPollIsRunningForTesting: Bool { subagentPollTask != nil }
+    #endif
+
     private init() {}
+
+    #if DEBUG
+    init(
+        subagentPollNanoseconds: UInt64,
+        hasMembers: @escaping () -> Bool,
+        sleep: @escaping (UInt64) async throws -> Void,
+        pollRound: @escaping () async -> Void
+    ) {
+        self.subagentPollNanoseconds = subagentPollNanoseconds
+        subagentPollHasMembersForTesting = hasMembers
+        subagentPollSleepForTesting = sleep
+        subagentPollRoundForTesting = pollRound
+    }
+
+    func reconcileSubagentPollForTesting() {
+        guard hasSubagentPollMembers else { return }
+        ensureSubagentPoll()
+    }
+
+    func cancelSubagentPollForTesting() {
+        let task = subagentPollTask
+        task?.cancel()
+    }
+    #endif
 
     public func register(_ viewModel: AgentAppViewModel) {
         let key = ObjectIdentifier(viewModel)
@@ -74,9 +105,9 @@ public final class AgentWorkspaceRailReloadCoordinator {
         } else {
             members[workspaceID] = bucket
         }
-        // Keep the singleton's lightweight poll loop alive for the app lifetime.
-        // Cancelling it here can overlap an uncancellable detached receipt read
-        // with a newly registered workspace's replacement loop.
+        // The shared loop observes empty membership before its next round and
+        // exits itself. Do not cancel here: a detached receipt read cannot be
+        // cancelled safely, and a replacement loop could overlap it.
     }
 
     /// EventBus / external path: coalesce N surface notifications into one rail load.
@@ -108,15 +139,45 @@ public final class AgentWorkspaceRailReloadCoordinator {
         // store and its cross-process mutex. Starting one repeating task per
         // workspace caused concurrent full scans every two seconds.
         subagentPollTask = Task { @MainActor [weak self] in
+            defer { self?.subagentPollTask = nil }
             while !Task.isCancelled {
                 let interval = self?.subagentPollNanoseconds ?? 2_000_000_000
+                #if DEBUG
+                if let sleep = self?.subagentPollSleepForTesting {
+                    try? await sleep(interval)
+                } else {
+                    try? await Task.sleep(nanoseconds: interval)
+                }
+                #else
                 try? await Task.sleep(nanoseconds: interval)
+                #endif
                 guard !Task.isCancelled else { return }
                 guard let self else { return }
-                let workspaceIDs = Array(self.members.keys)
-                await self.flushSubagents(workspaceIDs)
+                guard self.hasSubagentPollMembers else { return }
+                await self.runSubagentPollRound()
+                guard self.hasSubagentPollMembers else { return }
             }
         }
+    }
+
+    private var hasSubagentPollMembers: Bool {
+        #if DEBUG
+        if let hasMembers = subagentPollHasMembersForTesting {
+            return hasMembers()
+        }
+        #endif
+        return !members.isEmpty
+    }
+
+    private func runSubagentPollRound() async {
+        #if DEBUG
+        if let pollRound = subagentPollRoundForTesting {
+            await pollRound()
+            return
+        }
+        #endif
+        let workspaceIDs = Array(members.keys)
+        await flushSubagents(workspaceIDs)
     }
 
     private func flushRail(_ workspaceID: WorkspaceID) async {
