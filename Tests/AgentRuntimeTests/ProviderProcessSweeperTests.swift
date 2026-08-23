@@ -2,6 +2,159 @@ import XCTest
 @testable import AgentRuntime
 
 final class ProviderProcessSweeperTests: XCTestCase {
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        func increment() {
+            lock.lock()
+            value += 1
+            lock.unlock()
+        }
+
+        func read() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    func test_processListSnapshotIsLoadedBySweepBeforeTelemetryConsumesIt() throws {
+        // WHY: the periodic diagnostics heartbeat and ownership sweep consume the
+        // same point-in-time process table. Launching /bin/ps once per consumer
+        // doubles idle process churn without making either decision safer.
+        let loads = LockedCounter()
+        let expected = [
+            ProviderRuntimeProcess(pid: 101, ppid: 1, pgid: 101, rssKB: 64, command: "/opt/codex")
+        ]
+        let snapshot = ProviderProcessListSnapshot {
+            loads.increment()
+            Thread.sleep(forTimeInterval: 0.02)
+            return expected
+        }
+        let results = NSLock()
+        var telemetryRows: [ProviderRuntimeProcess] = []
+        let group = DispatchGroup()
+
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            if let rows = try? snapshot.rowsAfterSweepLoad() {
+                results.lock()
+                telemetryRows = rows
+                results.unlock()
+            }
+            group.leave()
+        }
+        Thread.sleep(forTimeInterval: 0.02)
+        XCTAssertEqual(loads.read(), 0,
+                       "telemetry must wait instead of materializing rows before the sweep starts")
+
+        let sweepRows = try snapshot.rows()
+        XCTAssertEqual(group.wait(timeout: .now() + 1), .success)
+
+        XCTAssertEqual(loads.read(), 1,
+                       "telemetry and sweep must share one immutable process-list load per heartbeat")
+        XCTAssertEqual(sweepRows, expected)
+        XCTAssertEqual(telemetryRows, expected,
+                       "telemetry must consume the exact rows produced by the sweep")
+    }
+
+    func test_processListSnapshotRetriesFailureForTelemetry() {
+        // WHY: retrying only one half of a heartbeat after ps fails would let
+        // telemetry and ownership decisions describe different process tables.
+        enum ListFailure: Error { case failed }
+        let loads = LockedCounter()
+        let expected = [
+            ProviderRuntimeProcess(pid: 202, ppid: 1, rssKB: 32, command: "/opt/grok")
+        ]
+        let snapshot = ProviderProcessListSnapshot {
+            loads.increment()
+            if loads.read() == 1 { throw ListFailure.failed }
+            return expected
+        }
+
+        XCTAssertThrowsError(try snapshot.rows())
+        XCTAssertEqual(try snapshot.rowsAfterSweepLoad(), expected)
+        XCTAssertEqual(loads.read(), 2,
+                       "telemetry must retain its independent retry after a transient sweep ps failure")
+    }
+
+    func test_sharedSnapshotPreservesTelemetrySweepAndLedgerWhileHalvingLoads() throws {
+        // WHY: sharing is valid only if it removes enumeration work without
+        // changing either heartbeat accounting or ownership retention.
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let syntheticPID: pid_t = 2_000_000_000
+        let tag = SpawnedProcessTag(
+            pgid: syntheticPID,
+            spawnedAt: Date(timeIntervalSince1970: 100),
+            ownerPID: currentPID,
+            provider: .claude,
+            managedKind: .provider,
+            executablePath: "",
+            startIdentity: nil,
+            isolatedProcessGroup: nil
+        )
+        let rows = [
+            ProviderRuntimeProcess(
+                pid: syntheticPID,
+                ppid: 1,
+                rssKB: 256,
+                command: "sudo -u teammate claude"
+            )
+        ]
+
+        func makeStore(_ suffix: String) throws -> ProviderProcessOwnershipStore {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("heartbeat-snapshot-\(suffix)-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let store = ProviderProcessOwnershipStore(fileURL: directory.appendingPathComponent("ownership.json"))
+            try store.replace([tag])
+            return store
+        }
+
+        func runPair(
+            store: ProviderProcessOwnershipStore,
+            processList: @escaping ProviderProcessList
+        ) throws -> (ManagedProcessScan, ProviderProcessSweepResult, [SpawnedProcessTag]) {
+            let scan = try ProviderProcessSweeper.managedProcessScan(
+                store: store,
+                processList: processList,
+                processStartIdentity: { _ in nil }
+            )
+            let sweep = try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(
+                currentPID: currentPID,
+                minAge: 0,
+                store: store,
+                processList: processList
+            )
+            return (scan, sweep, try store.load())
+        }
+
+        let baselineStore = try makeStore("baseline")
+        defer { try? FileManager.default.removeItem(at: baselineStore.fileURL.deletingLastPathComponent()) }
+        let baselineLoads = LockedCounter()
+        let baseline = try runPair(store: baselineStore) {
+            baselineLoads.increment()
+            return rows
+        }
+
+        let sharedStore = try makeStore("shared")
+        defer { try? FileManager.default.removeItem(at: sharedStore.fileURL.deletingLastPathComponent()) }
+        let sharedLoads = LockedCounter()
+        let snapshot = ProviderProcessListSnapshot {
+            sharedLoads.increment()
+            return rows
+        }
+        let shared = try runPair(store: sharedStore) { try snapshot.rows() }
+
+        XCTAssertEqual(baselineLoads.read(), 2, "the old heartbeat launched one list per consumer")
+        XCTAssertEqual(sharedLoads.read(), 1, "the shared heartbeat must launch exactly one list")
+        XCTAssertEqual(shared.0, baseline.0, "managed telemetry must be byte-for-byte equivalent")
+        XCTAssertEqual(shared.1, baseline.1, "orphan sweep decisions must be identical")
+        XCTAssertEqual(shared.2, baseline.2, "ownership ledger retention must be identical")
+        XCTAssertEqual(shared.2, [tag], "a current-owner foreign row remains retained")
+    }
+
     func test_parsePSRowPreservesCommandWithSpaces() {
         let row: Substring = "  101     1  101  22048 /opt/homebrew/bin/node /Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/ClaudeAgentSDKBridge.mjs"
 

@@ -675,16 +675,32 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // Periodic heartbeats must never block MainActor on process scans or
         // SIGTERM grace sleeps — that freezes the whole UI every 60s once orphans
         // accumulate. App termination is the only path that still reaps inline.
+        let processList: ProviderProcessList
         if reason == "will_terminate" {
+            // Termination telemetry runs after the blocking reaper and must read
+            // the post-sweep table rather than reuse its pre-signal snapshot.
+            processList = { try ProviderProcessSweeper.psRowsThrowing() }
             reconcilePersistedProcessOwnership(reason: reason)
         } else {
-            scheduleOrphanRuntimeSweep(reason: reason)
+            let snapshot = ProviderProcessListSnapshot()
+            let sweepDecision = scheduleOrphanRuntimeSweep(
+                reason: reason,
+                processSnapshot: snapshot
+            )
+            if sweepDecision == .start {
+                // Only the reaper may materialize the snapshot. This prevents a
+                // delayed sweep from acting on rows captured earlier by telemetry.
+                processList = { try snapshot.rowsAfterSweepLoad() }
+            } else {
+                processList = { try ProviderProcessSweeper.psRowsThrowing() }
+            }
         }
         AppDiagnostics.heartbeat(
             reason: reason,
             activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
             profile: managedProcessMemoryProfile,
-            lifecycleRecorder: lifecycleRecorder
+            lifecycleRecorder: lifecycleRecorder,
+            processList: processList
         )
     }
 
@@ -759,10 +775,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     @MainActor
-    private func scheduleOrphanRuntimeSweep(reason: String) {
+    @discardableResult
+    private func scheduleOrphanRuntimeSweep(
+        reason: String,
+        processSnapshot: ProviderProcessListSnapshot = ProviderProcessListSnapshot()
+    ) -> OrphanSweepDecision {
         if Self.beginOrphanSweep(inFlight: &orphanSweepInFlight) == .skipInFlight {
             appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) result=skipped_in_flight")
-            return
+            return .skipInFlight
         }
         let minAge: TimeInterval = reason == "launch" ? 0 : ProcessSpawnTagger.defaultMinAge
         Task.detached(priority: .utility) { [weak self] in
@@ -772,9 +792,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 }
             }
             // nonisolated static body — never hop back to MainActor for the
-            // process scan / SIGTERM grace sleeps that freeze the UI.
-            Self.performOrphanRuntimeSweep(reason: reason, minAge: minAge)
+            // process scan / SIGTERM grace sleeps that freeze the UI. The
+            // terminate path materializes the snapshot immediately before its
+            // ownership evaluation, never earlier in telemetry.
+            Self.performOrphanRuntimeSweep(
+                reason: reason,
+                minAge: minAge,
+                processList: { try processSnapshot.rows() }
+            )
+            // An unconfigured store returns before asking for a process list.
+            // Resolve any telemetry waiter after that no-op sweep exits.
+            _ = try? processSnapshot.rows()
         }
+        return .start
     }
 
     private func reconcilePersistedProcessOwnership(reason: String) {
@@ -786,10 +816,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// or during applicationWillTerminate where the UI is already shutting down.
     /// nonisolated so Task.detached can run the process-table reaper without
     /// MainActor isolation (process I/O + Thread.sleep must stay off the UI thread).
-    nonisolated private static func performOrphanRuntimeSweep(reason: String, minAge: TimeInterval) {
+    nonisolated private static func performOrphanRuntimeSweep(
+        reason: String,
+        minAge: TimeInterval,
+        processList: ProviderProcessList = { try ProviderProcessSweeper.psRowsThrowing() }
+    ) {
         do {
             let result = try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(
-                minAge: minAge
+                minAge: minAge,
+                processList: processList
             )
             if !result.orphanRootPIDs.isEmpty || !result.failedPIDs.isEmpty {
                 appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) roots=\(result.orphanRootPIDs.count, privacy: .public) terminated=\(result.terminatedPIDs.count, privacy: .public) failed=\(result.failedPIDs.count, privacy: .public)")

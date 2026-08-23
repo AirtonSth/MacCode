@@ -552,7 +552,8 @@ enum AppDiagnostics {
         reason: String,
         activeAgentThreads: Int,
         profile: ManagedProcessMemoryProfile,
-        lifecycleRecorder: AppLifecycleRecorder? = nil
+        lifecycleRecorder: AppLifecycleRecorder? = nil,
+        processList: @escaping ProviderProcessList = { try ProviderProcessSweeper.psRowsThrowing() }
     ) {
         let snapshot = aggregateSurfaceSnapshot(SurfaceRegistry.shared.all())
         let footprint = currentProcessFootprintKB()
@@ -584,7 +585,10 @@ enum AppDiagnostics {
                 guard let store = ProviderProcessOwnership.shared.store() else {
                     throw ProviderProcessOwnershipError.storeNotConfigured
                 }
-                scan = try ProviderProcessSweeper.managedProcessScan(store: store)
+                scan = try ProviderProcessSweeper.managedProcessScan(
+                    store: store,
+                    processList: processList
+                )
                 scanState = scan?.isComplete == true ? "complete" : "incomplete_ownership"
             } catch {
                 scan = nil
