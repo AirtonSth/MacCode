@@ -69,12 +69,19 @@ public final class DiffPanelViewModel: ObservableObject {
     @Published public var cwd: String
     @Published public var summary: GitSummary
     @Published public var selectedPath: String?
-    @Published public var rawDiff: String = "" { didSet { rebuildStyledDiffAsync(); resetFindIndex() } }
+    @Published public var rawDiff: String = "" { didSet { rebuildStyledDiffAsync() } }
     /// Styled diff rebuilt once when `rawDiff` changes, not on every body
     /// pass, so unrelated @Published changes (wrap toggle, error banner,
     /// summary refresh) don't re-parse the whole diff (PERF-005). Capped
     /// to avoid laying out a multi-MB attributed string at once (PERF-006).
     @Published public private(set) var styledDiff: AttributedString = AttributedString()
+    /// Line descriptors for the same capped source as `styledDiff`. Find mode
+    /// reuses this cache instead of splitting and classifying `rawDiff` from
+    /// SwiftUI's body on every keystroke.
+    @Published public private(set) var renderedDiffSegments: [DiffSegmentDescriptor] = []
+    /// Exact source represented by `styledDiff` / `renderedDiffSegments`.
+    /// The full `rawDiff` remains available to Copy diff.
+    private var renderedDiffSource: String = ""
     /// Monotonic token: each rebuildStyledDiffAsync bumps it; only the
     /// matching completion may write styledDiff so a stale background task
     /// can't overwrite the result of a newer rawDiff assignment (PERF-008).
@@ -95,15 +102,34 @@ public final class DiffPanelViewModel: ObservableObject {
     /// True while the find bar is visible.
     @Published public var findActive: Bool = false
     /// Current query string typed by the user.
-    @Published public var findQuery: String = "" { didSet { resetFindIndex() } }
+    @Published public var findQuery: String = "" { didSet { rebuildFindIndex() } }
     /// 0-based index of the currently highlighted match. -1 when no matches.
     @Published public private(set) var findMatchIndex: Int = -1
-    /// Total number of matches for the current query in `rawDiff`.
+    /// Total number of matches for the current query in the rendered preview.
     @Published public private(set) var findMatchCount: Int = 0
+    /// Large rendered previews are searched off the main actor. This keeps the
+    /// bar honest while the latest generation is still in flight.
+    @Published public private(set) var findSearchInProgress: Bool = false
 
-    /// All NSRange matches in `rawDiff` for the current `findQuery`.
+    /// All NSRange matches in the rendered preview for the current query.
     /// Recomputed whenever `findQuery` or `rawDiff` changes.
     public private(set) var findMatchRanges: [NSRange] = []
+    /// Cached line index for each range, preserving document order. Navigation
+    /// no longer recounts the raw prefix for every Cmd+G.
+    private var findMatchLines: [Int] = []
+    private var findGeneration: Int = 0
+    /// Own exactly one large-preview scan. Replacing or clearing a query
+    /// cancels obsolete work instead of merely discarding its publication.
+    private var findTask: Task<Void, Never>?
+    private var findTaskGeneration: Int?
+    private var findScrollCoordinator = DiffFindScrollCoordinator()
+    private var findScrollGeneration: Int = 0
+    /// Changes only when both a result line and its rendered row anchor exist.
+    @Published public private(set) var findScrollRequest: DiffFindScrollRequest?
+
+    /// Tiny previews retain immediate find behavior. Anything large enough to
+    /// make a keystroke perceptible moves to the generation-guarded worker.
+    nonisolated static let maxSynchronousFindBytes = 32 * 1024
 
     /// Show the find bar. Called by Cmd+F.
     public func activateFind() { findActive = true }
@@ -111,41 +137,134 @@ public final class DiffPanelViewModel: ObservableObject {
     /// Hide the find bar and clear state.
     public func dismissFind() {
         findActive = false
-        findQuery = ""  // didSet -> resetFindIndex() clears ranges, count, index.
+        findQuery = ""  // didSet -> rebuildFindIndex() clears ranges, count, index.
     }
 
     /// Advance to the next match, wrapping past the last.
     public func nextFindMatch() {
         guard findMatchCount > 0 else { return }
         findMatchIndex = (findMatchIndex + 1) % findMatchCount
+        publishFindScrollTarget(findScrollCoordinator.updateMatchLine(findCurrentMatchLine))
     }
 
     /// Move to the previous match, wrapping before the first.
     public func prevFindMatch() {
         guard findMatchCount > 0 else { return }
         findMatchIndex = (findMatchIndex - 1 + findMatchCount) % findMatchCount
+        publishFindScrollTarget(findScrollCoordinator.updateMatchLine(findCurrentMatchLine))
     }
 
-    /// Recompute ranges when the query changes; reset the index.
-    private func resetFindIndex() {
-        let ranges = Self.matchRanges(in: rawDiff, query: findQuery, caseInsensitive: true)
-        findMatchRanges = ranges
-        findMatchCount = ranges.count
-        findMatchIndex = ranges.isEmpty ? -1 : 0
+    /// Recompute ranges when the query or rendered source changes. Large
+    /// previews run off-main; only the newest query/source generation may
+    /// publish results.
+    private func rebuildFindIndex() {
+        findTask?.cancel()
+        findTask = nil
+        findTaskGeneration = nil
+        findGeneration &+= 1
+        let generation = findGeneration
+        let source = renderedDiffSource
+        let query = findQuery
+
+        guard !query.isEmpty, !source.isEmpty else {
+            applyFindSnapshot(.empty, generation: generation)
+            return
+        }
+
+        if source.utf8.count <= Self.maxSynchronousFindBytes {
+            applyFindSnapshot(
+                Self.findSnapshot(in: source, query: query, caseInsensitive: true),
+                generation: generation
+            )
+            return
+        }
+
+        findMatchRanges = []
+        findMatchLines = []
+        findMatchCount = 0
+        findMatchIndex = -1
+        publishFindScrollTarget(findScrollCoordinator.updateMatchLine(nil))
+        findSearchInProgress = true
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let snapshot = Self.findSnapshot(
+                in: source,
+                query: query,
+                caseInsensitive: true,
+                shouldCancel: { Task.isCancelled }
+            ), !Task.isCancelled else { return }
+            await self?.applyFindSnapshot(snapshot, generation: generation)
+        }
+        findTask = task
+        findTaskGeneration = generation
+    }
+
+    private func applyFindSnapshot(_ snapshot: DiffFindSnapshot, generation: Int) {
+        guard findGeneration == generation else { return }
+        findMatchRanges = snapshot.ranges
+        findMatchLines = snapshot.lines
+        findMatchCount = snapshot.ranges.count
+        findMatchIndex = snapshot.ranges.isEmpty ? -1 : 0
+        findSearchInProgress = false
+        if findTaskGeneration == generation {
+            findTask = nil
+            findTaskGeneration = nil
+        }
+        publishFindScrollTarget(findScrollCoordinator.updateMatchLine(findCurrentMatchLine))
+    }
+
+    private func publishFindScrollTarget(_ line: Int?) {
+        guard let line else { return }
+        findScrollGeneration &+= 1
+        findScrollRequest = DiffFindScrollRequest(line: line, generation: findScrollGeneration)
     }
 
     // MARK: - Pure find seam (testable, nonisolated)
 
-    /// Returns the 0-based line index in `rawDiff` that contains the current
+    /// Returns the 0-based rendered line index that contains the current
     /// match, or nil when there is no active match. Used by the find bar to
     /// scroll the diff to the right line.
     public var findCurrentMatchLine: Int? {
-        guard findMatchIndex >= 0, findMatchIndex < findMatchRanges.count else { return nil }
-        let r = findMatchRanges[findMatchIndex]
-        guard r.location != NSNotFound, r.location < rawDiff.utf16.count else { return nil }
-        // Count newlines before the match location (UTF-16 offset).
-        let prefix = rawDiff.utf16.prefix(r.location)
-        return prefix.filter { $0 == 0x0A /* \n */ }.count
+        guard findMatchIndex >= 0, findMatchIndex < findMatchLines.count else { return nil }
+        return findMatchLines[findMatchIndex]
+    }
+
+    public struct DiffFindSnapshot: Sendable, Equatable {
+        public let ranges: [NSRange]
+        public let lines: [Int]
+
+        fileprivate static let empty = DiffFindSnapshot(ranges: [], lines: [])
+    }
+
+    public struct DiffFindScrollRequest: Sendable, Equatable {
+        public let line: Int
+        public let generation: Int
+    }
+
+    /// Coordinates two independently-completing inputs: search results and
+    /// rendered row anchors. Either publication order emits the same target,
+    /// but never before the target row exists.
+    public struct DiffFindScrollCoordinator: Sendable, Equatable {
+        private var matchLine: Int?
+        private var renderedLineCount: Int = 0
+
+        public init() {}
+
+        public mutating func updateMatchLine(_ line: Int?) -> Int? {
+            matchLine = line
+            return readyTarget
+        }
+
+        public mutating func updateRenderedLineCount(_ count: Int) -> Int? {
+            renderedLineCount = max(0, count)
+            return readyTarget
+        }
+
+        private var readyTarget: Int? {
+            guard let matchLine,
+                  matchLine >= 0,
+                  matchLine < renderedLineCount else { return nil }
+            return matchLine
+        }
     }
 
     /// Returns all NSRange occurrences of `query` in `text`.
@@ -156,17 +275,54 @@ public final class DiffPanelViewModel: ObservableObject {
         query: String,
         caseInsensitive: Bool
     ) -> [NSRange] {
-        guard !query.isEmpty else { return [] }
+        findSnapshot(in: text, query: query, caseInsensitive: caseInsensitive).ranges
+    }
+
+    /// Produces UTF-16 ranges and their line anchors in one ordered pass.
+    /// Pure and nonisolated so large previews can be searched off-main.
+    nonisolated public static func findSnapshot(
+        in text: String,
+        query: String,
+        caseInsensitive: Bool
+    ) -> DiffFindSnapshot {
+        findSnapshot(
+            in: text,
+            query: query,
+            caseInsensitive: caseInsensitive,
+            shouldCancel: { false }
+        ) ?? .empty
+    }
+
+    /// Cancellation-aware variant used by the owned background task. A check
+    /// occurs before and after every literal search step, so dense results stop
+    /// before obsolete range/line arrays can continue growing. A sparse step
+    /// remains bounded by the 400 KiB rendered-preview cap.
+    nonisolated static func findSnapshot(
+        in text: String,
+        query: String,
+        caseInsensitive: Bool,
+        shouldCancel: () -> Bool
+    ) -> DiffFindSnapshot? {
+        guard !query.isEmpty else { return .empty }
         var opts: NSString.CompareOptions = [.literal]
         if caseInsensitive { opts.insert(.caseInsensitive) }
-        var result: [NSRange] = []
+        var ranges: [NSRange] = []
+        var lines: [Int] = []
+        var currentLine = 0
+        var lineCursor = text.startIndex
         var searchRange = text.startIndex..<text.endIndex
         while !searchRange.isEmpty {
+            guard !shouldCancel() else { return nil }
             guard let r = text.range(of: query, options: opts, range: searchRange) else { break }
-            result.append(NSRange(r, in: text))
+            guard !shouldCancel() else { return nil }
+            currentLine += text[lineCursor..<r.lowerBound].utf8.lazy.filter { $0 == 0x0A }.count
+            ranges.append(NSRange(r, in: text))
+            lines.append(currentLine)
+            lineCursor = r.lowerBound
             searchRange = r.upperBound..<text.endIndex
         }
-        return result
+        guard !shouldCancel() else { return nil }
+        return DiffFindSnapshot(ranges: ranges, lines: lines)
     }
 
     @Published public var branches: GitBranches
@@ -310,6 +466,10 @@ public final class DiffPanelViewModel: ObservableObject {
         let (source, truncated) = Self.cappedDiffSourceForRender(rawDiff)
         // Update truncation flag immediately (cheap, stays on main).
         diffTruncated = truncated
+        renderedDiffSource = source
+        renderedDiffSegments = []
+        publishFindScrollTarget(findScrollCoordinator.updateRenderedLineCount(0))
+        rebuildFindIndex()
         styledDiffGen &+= 1
         let gen = styledDiffGen
         Task.detached(priority: .userInitiated) { [weak self] in
@@ -340,6 +500,10 @@ public final class DiffPanelViewModel: ObservableObject {
                     }
                     out.append(a)
                 }
+                self.renderedDiffSegments = segments
+                self.publishFindScrollTarget(
+                    self.findScrollCoordinator.updateRenderedLineCount(segments.count)
+                )
                 self.styledDiff = out
             }
         }
@@ -810,6 +974,7 @@ public final class DiffPanelViewModel: ObservableObject {
     }
 
     deinit {
+        findTask?.cancel()
         // deinit is nonisolated; mirror stopFSWatcher without calling it.
         if let s = fsStream {
             FSEventStreamStop(s)
@@ -1739,7 +1904,7 @@ public struct DiffPanelView: View {
                                     .accessibilityIdentifier("diff.body")
                             }
                             if vm.diffTruncated {
-                                Text("Diff truncated -- too large to render fully. Use Copy diff for the complete text.")
+                                Text("Diff truncated -- Find searches only this rendered preview. Use Copy diff for the complete text.")
                                     .font(DS.Font.caption2)
                                     .foregroundColor(DS.Palette.textTertiary)
                                     .padding(.horizontal, DS.Space.lg)
@@ -1753,9 +1918,10 @@ public struct DiffPanelView: View {
                             ProgressView().controlSize(.small).padding(DS.Space.md)
                         }
                     }
-                    // Scroll to the line that contains the current match.
-                    .onChange(of: vm.findMatchIndex) { _ in
-                        if let line = vm.findCurrentMatchLine {
+                    // Scroll only after both the current result and its cached
+                    // row anchor exist, regardless of which finished first.
+                    .onChange(of: vm.findScrollRequest) { request in
+                        if let line = request?.line {
                             withAnimation(DS.Motion.micro) {
                                 proxy.scrollTo("diff.line.\(line)", anchor: .center)
                             }
@@ -1767,45 +1933,35 @@ public struct DiffPanelView: View {
         .onChange(of: vm.ignoreWhitespace) { _ in vm.reloadDiff() }
     }
 
-    /// Per-line breakdown of `vm.styledDiff` used while find is active.
-    /// Each row carries an id anchor so `ScrollViewReader` can jump to it.
-    /// This view is only instantiated when find is active with a non-empty
-    /// query, so it does not affect normal diff rendering performance.
+    /// Cached per-line breakdown used while find is active. Each row carries
+    /// an id anchor so `ScrollViewReader` can jump to it. `LazyVStack` creates
+    /// only visible rows instead of eagerly materializing the whole preview.
     @ViewBuilder
     private var diffLinesView: some View {
-        // Split the raw diff into lines and walk segments to assign each
-        // line its styled AttributedString. We pair rawDiff lines with the
-        // pre-built styledDiff segments (one segment per line from
-        // buildDiffSegments). The current-match line gets a distinct
-        // background highlight so it is immediately visible.
-        let rawLines = vm.rawDiff.components(separatedBy: "\n")
         let currentLine = vm.findCurrentMatchLine ?? -1
-        let segments = DiffPanelViewModel.buildDiffSegments(vm.rawDiff)
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(rawLines.indices, id: \.self) { idx in
+        let segments = vm.renderedDiffSegments
+        LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(segments.indices, id: \.self) { idx in
                 let isMatchLine = idx == currentLine
-                // Use the styled segment text if available; fall back to plain.
                 let lineText: AttributedString = {
-                    if idx < segments.count {
-                        var a = AttributedString(segments[idx].text)
-                        switch segments[idx].kind {
-                        case .add:
-                            a.foregroundColor = DS.Palette.success
-                            a.backgroundColor = DS.Palette.success.opacity(0.08)
-                        case .del:
-                            a.foregroundColor = DS.Palette.danger
-                            a.backgroundColor = DS.Palette.danger.opacity(0.08)
-                        case .hunk:
-                            a.foregroundColor = DS.Palette.accent
-                            a.backgroundColor = DS.Palette.accent.opacity(0.08)
-                        case .header:
-                            a.foregroundColor = DS.Palette.warning
-                        case .context:
-                            a.foregroundColor = DS.Palette.textSecondary
-                        }
-                        return a
+                    let segment = segments[idx]
+                    var a = AttributedString(segment.text)
+                    switch segment.kind {
+                    case .add:
+                        a.foregroundColor = DS.Palette.success
+                        a.backgroundColor = DS.Palette.success.opacity(0.08)
+                    case .del:
+                        a.foregroundColor = DS.Palette.danger
+                        a.backgroundColor = DS.Palette.danger.opacity(0.08)
+                    case .hunk:
+                        a.foregroundColor = DS.Palette.accent
+                        a.backgroundColor = DS.Palette.accent.opacity(0.08)
+                    case .header:
+                        a.foregroundColor = DS.Palette.warning
+                    case .context:
+                        a.foregroundColor = DS.Palette.textSecondary
                     }
-                    return AttributedString(rawLines[idx])
+                    return a
                 }()
                 Text(lineText)
                     .font(DS.Font.mono)
@@ -1850,12 +2006,13 @@ public struct DiffPanelView: View {
                     .accessibilityHidden(true)
                 )
             if !vm.findQuery.isEmpty {
-                // Match count indicator.
-                Text(vm.findMatchCount == 0
-                     ? "No matches"
-                     : "\(vm.findMatchIndex + 1) of \(vm.findMatchCount)")
+                Text(vm.findSearchInProgress
+                     ? "Searching..."
+                     : vm.findMatchCount == 0
+                        ? "No matches"
+                        : "\(vm.findMatchIndex + 1) of \(vm.findMatchCount)")
                     .font(DS.Font.caption2.monospacedDigit())
-                    .foregroundColor(vm.findMatchCount == 0
+                    .foregroundColor(!vm.findSearchInProgress && vm.findMatchCount == 0
                                      ? DS.Palette.danger
                                      : DS.Palette.textSecondary)
                     .accessibilityIdentifier("diff.find.count")
@@ -1865,7 +2022,7 @@ public struct DiffPanelView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(DS.Palette.textSecondary)
-                .disabled(vm.findMatchCount == 0)
+                .disabled(vm.findSearchInProgress || vm.findMatchCount == 0)
                 .help("Previous match (Shift+Cmd+G)")
                 .accessibilityIdentifier("diff.find.prev")
                 Button { vm.nextFindMatch() } label: {
@@ -1874,7 +2031,7 @@ public struct DiffPanelView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(DS.Palette.textSecondary)
-                .disabled(vm.findMatchCount == 0)
+                .disabled(vm.findSearchInProgress || vm.findMatchCount == 0)
                 .help("Next match (Cmd+G)")
                 .accessibilityIdentifier("diff.find.next")
             }

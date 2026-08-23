@@ -173,4 +173,94 @@ final class DiffPanelFindTests: XCTestCase {
         vm.findQuery = "zzz"
         XCTAssertNil(vm.findCurrentMatchLine, "no match -> nil line")
     }
+
+    func test_truncatedDiffFindDoesNotNavigateToUnrenderedMatch() async {
+        let vm = DiffPanelViewModel(cwd: "/tmp", settings: nil, asyncLoad: false)
+        vm.rawDiff = String(repeating: "x", count: DiffPanelViewModel.maxDiffRenderChars)
+            + "\nneedle"
+        XCTAssertTrue(vm.diffTruncated, "setup must exercise the rendered-diff cap")
+
+        vm.findQuery = "needle"
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while vm.findSearchInProgress, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+
+        // WHY: a match beyond the rendered cap has no diff.line anchor. Find
+        // must not claim it is navigable and then scroll to nowhere.
+        XCTAssertFalse(vm.findSearchInProgress, "capped preview search must settle")
+        XCTAssertEqual(vm.findMatchCount, 0)
+        XCTAssertNil(vm.findCurrentMatchLine)
+    }
+
+    func test_latestLargeQueryGenerationWins() async {
+        let vm = DiffPanelViewModel(cwd: "/tmp", settings: nil, asyncLoad: false)
+        vm.rawDiff = String(repeating: "+oldmatch payload\n", count: 30_000)
+
+        vm.findQuery = "oldmatch"
+        vm.findQuery = "latestzz"
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while vm.findSearchInProgress, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+
+        // WHY: an older expensive search may finish after the latest query;
+        // it must never republish stale ranges into the find bar.
+        XCTAssertFalse(vm.findSearchInProgress)
+        XCTAssertEqual(vm.findQuery, "latestzz")
+        XCTAssertEqual(vm.findMatchCount, 0)
+        XCTAssertNil(vm.findCurrentMatchLine)
+    }
+
+    func test_matchRangesPreserveUTF16OffsetsAndDocumentOrder() {
+        let text = "😀 first needle\né second NEEDLE"
+        let ranges = DiffPanelViewModel.matchRanges(in: text, query: "needle", caseInsensitive: true)
+
+        // WHY: NSRange consumers use UTF-16 offsets; an emoji before the first
+        // match must not shift highlights or reverse navigation order.
+        XCTAssertEqual(ranges.count, 2)
+        XCTAssertEqual((text as NSString).substring(with: ranges[0]), "needle")
+        XCTAssertEqual((text as NSString).substring(with: ranges[1]), "NEEDLE")
+        XCTAssertLessThan(ranges[0].location, ranges[1].location)
+        XCTAssertEqual(ranges[0].location, (text as NSString).range(of: "needle").location)
+    }
+
+    func test_scrollCoordinatorRequestsTargetWhenResultsArriveBeforeAnchors() {
+        var coordinator = DiffPanelViewModel.DiffFindScrollCoordinator()
+
+        XCTAssertNil(coordinator.updateMatchLine(8),
+                     "a result cannot scroll before its row anchor exists")
+        XCTAssertEqual(coordinator.updateRenderedLineCount(9), 8,
+                       "publishing anchors must retry the pending match line")
+    }
+
+    func test_scrollCoordinatorRequestsTargetWhenAnchorsArriveBeforeResults() {
+        var coordinator = DiffPanelViewModel.DiffFindScrollCoordinator()
+
+        XCTAssertNil(coordinator.updateRenderedLineCount(9),
+                     "anchors alone do not identify a scroll target")
+        XCTAssertEqual(coordinator.updateMatchLine(8), 8,
+                       "publishing results must scroll when the anchor is ready")
+    }
+
+    func test_cancellableSnapshotAbortsDenseScanAtBoundedCheck() {
+        let text = String(repeating: "x", count: 100_000)
+        var cancellationChecks = 0
+
+        let snapshot = DiffPanelViewModel.findSnapshot(
+            in: text,
+            query: "x",
+            caseInsensitive: false,
+            shouldCancel: {
+                cancellationChecks += 1
+                return cancellationChecks == 5
+            }
+        )
+
+        // WHY: replacing a query must stop obsolete range/line array growth,
+        // not merely prevent the completed stale result from publishing.
+        XCTAssertNil(snapshot)
+        XCTAssertEqual(cancellationChecks, 5,
+                       "dense work must observe cancellation inside the scan loop")
+    }
 }
