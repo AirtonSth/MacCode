@@ -1,3 +1,3 @@
 runModal 30
 threadSleep 27
-semaphoreWait 11
+semaphoreWait 12
