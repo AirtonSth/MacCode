@@ -52,6 +52,30 @@ final class ToonCodecTests: XCTestCase {
         XCTAssertNil(ToonCodec.encodeIfEfficient(#"{"a":1}"#))
     }
 
+    /// WHY: ICU `$` can match before a trailing Unicode line terminator, but
+    /// lexical classification must accept only a match covering the whole input.
+    func test_cachedLexicalRegexesRejectPartialUnicodeLineTerminatorMatches() {
+        let lineTerminators: [(name: String, scalar: UnicodeScalar)] = [
+            ("U+0085", "\u{0085}"),
+            ("U+2028", "\u{2028}"),
+            ("U+2029", "\u{2029}"),
+        ]
+
+        for lineTerminator in lineTerminators {
+            let suffix = String(lineTerminator.scalar)
+            XCTAssertEqual(
+                ToonCodec.encodeKey("field" + suffix),
+                "\"field" + suffix + "\"",
+                "\(lineTerminator.name) must not leave a partially matched key unquoted"
+            )
+            XCTAssertEqual(
+                ToonCodec.encodeString("123" + suffix),
+                "123" + suffix,
+                "\(lineTerminator.name) must not make a partial numeric match"
+            )
+        }
+    }
+
     /// WHY: JSON tool output can contain thousands of keys and string cells;
     /// compiling the same lexical regex for every field makes deterministic
     /// JSON-to-TOON routing spend CPU on regex construction instead of encoding.

@@ -349,7 +349,7 @@ public enum ToonCodec: Sendable {
 
     static func encodeKey(_ key: String) -> String {
         let range = NSRange(key.startIndex..<key.endIndex, in: key)
-        if unquotedKeyRegex.firstMatch(in: key, range: range) != nil {
+        if unquotedKeyRegex.firstMatch(in: key, range: range)?.range == range {
             return key
         }
         return "\"" + escape(key) + "\""
@@ -367,7 +367,7 @@ public enum ToonCodec: Sendable {
         if string.hasPrefix("-") || string.hasPrefix("#") { return true }
         if string.unicodeScalars.contains(where: { $0.value < 0x20 }) { return true }
         let range = NSRange(string.startIndex..<string.endIndex, in: string)
-        if numericStringRegex.firstMatch(in: string, range: range) != nil {
+        if numericStringRegex.firstMatch(in: string, range: range)?.range == range {
             return true
         }
         return false
