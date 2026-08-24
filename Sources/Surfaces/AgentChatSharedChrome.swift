@@ -247,6 +247,19 @@ struct AgentAttachmentThumbnailKey: Hashable, Sendable {
     let path: String
     let modificationTimeNanoseconds: Int64
     let sizeBytes: Int64
+    let maxPixel: Int
+
+    init(
+        path: String,
+        modificationTimeNanoseconds: Int64,
+        sizeBytes: Int64,
+        maxPixel: Int = 64
+    ) {
+        self.path = path
+        self.modificationTimeNanoseconds = modificationTimeNanoseconds
+        self.sizeBytes = sizeBytes
+        self.maxPixel = max(1, maxPixel)
+    }
 }
 
 struct AgentAttachmentDecodedThumbnail {
@@ -292,9 +305,12 @@ struct AgentAttachmentThumbnailMemoryCache {
         let cost = max(1, value.costBytes)
         guard cost <= costLimitBytes, countLimit > 0 else { return }
 
-        // Only the newest signature for a path is useful. Drop replaced payloads eagerly
-        // instead of waiting for general LRU pressure.
-        let obsoleteKeys = entries.keys.filter { $0.path == key.path && $0 != key }
+        // Only the newest signature for a path/presentation size is useful. Drop
+        // replaced payloads eagerly while allowing chip and transcript resolutions
+        // of the same current file to coexist inside the shared hard budget.
+        let obsoleteKeys = entries.keys.filter {
+            $0.path == key.path && $0.maxPixel == key.maxPixel && $0 != key
+        }
         for obsoleteKey in obsoleteKeys {
             remove(obsoleteKey)
         }
@@ -323,6 +339,8 @@ actor AgentAttachmentThumbnailLoader {
         let entryCount: Int
         let activeDecodeCount: Int
         let waitingDecodeCount: Int
+        let inFlightDecodeCount: Int
+        let inFlightConsumerCount: Int
     }
 
     private struct DecodeWaiter {
@@ -330,7 +348,20 @@ actor AgentAttachmentThumbnailLoader {
         let continuation: CheckedContinuation<Bool, Never>
     }
 
+    private struct InFlightDecode {
+        let id: UUID
+        let task: Task<AgentAttachmentDecodedThumbnail?, Never>
+        var consumers: Set<UUID>
+    }
+
     typealias Decoder = @Sendable (String, Int) -> AgentAttachmentDecodedThumbnail?
+    typealias RetrySleeper = @Sendable (UInt64) async -> Bool
+
+    private enum LoadAttempt {
+        case loaded(AgentAttachmentThumbnailResult)
+        case unavailable
+        case saturated
+    }
 
     static let shared = AgentAttachmentThumbnailLoader()
     static let defaultCostLimitBytes = 2 * 1_024 * 1_024
@@ -338,14 +369,26 @@ actor AgentAttachmentThumbnailLoader {
     static let defaultMaxPixel = 64
     static let defaultMaxConcurrentDecodes = 2
     static let defaultMaxWaitingDecodes = 8
+    private static let transcriptSaturationRetryNanoseconds: [UInt64] = [
+        25_000_000,
+        50_000_000,
+        100_000_000,
+        200_000_000,
+        250_000_000,
+        250_000_000,
+        250_000_000,
+        250_000_000,
+    ]
 
     private var cache: AgentAttachmentThumbnailMemoryCache
     private let maxPixel: Int
     private let maxConcurrentDecodes: Int
     private let maxWaitingDecodes: Int
     private let decoder: Decoder
+    private let retrySleeper: RetrySleeper
     private var activeDecodeCount = 0
     private var decodeWaiters: [DecodeWaiter] = []
+    private var inFlightDecodes: [AgentAttachmentThumbnailKey: InFlightDecode] = [:]
 
     init(
         costLimitBytes: Int = AgentAttachmentThumbnailLoader.defaultCostLimitBytes,
@@ -353,7 +396,8 @@ actor AgentAttachmentThumbnailLoader {
         maxPixel: Int = AgentAttachmentThumbnailLoader.defaultMaxPixel,
         maxConcurrentDecodes: Int = AgentAttachmentThumbnailLoader.defaultMaxConcurrentDecodes,
         maxWaitingDecodes: Int = AgentAttachmentThumbnailLoader.defaultMaxWaitingDecodes,
-        decoder: Decoder? = nil
+        decoder: Decoder? = nil,
+        retrySleeper: RetrySleeper? = nil
     ) {
         cache = AgentAttachmentThumbnailMemoryCache(
             costLimitBytes: costLimitBytes,
@@ -365,30 +409,93 @@ actor AgentAttachmentThumbnailLoader {
         self.decoder = decoder ?? { path, maxPixel in
             AgentAttachmentThumbnailLoader.decodeImage(path: path, maxPixel: maxPixel)
         }
+        self.retrySleeper = retrySleeper ?? { nanoseconds in
+            do {
+                try await Task.sleep(nanoseconds: nanoseconds)
+                return true
+            } catch {
+                return false
+            }
+        }
     }
 
-    func thumbnail(forPath path: String) async -> AgentAttachmentThumbnailResult? {
+    func thumbnail(
+        forPath path: String,
+        maxPixel requestedMaxPixel: Int? = nil
+    ) async -> AgentAttachmentThumbnailResult? {
+        switch await loadAttempt(forPath: path, maxPixel: requestedMaxPixel) {
+        case .loaded(let result):
+            return result
+        case .unavailable, .saturated:
+            return nil
+        }
+    }
+
+    private func loadAttempt(
+        forPath path: String,
+        maxPixel requestedMaxPixel: Int? = nil
+    ) async -> LoadAttempt {
         // Admission covers stat + decode, not just the expensive decoder. This
         // keeps detached metadata reads and actor continuations bounded when a
         // caller presents a large attachment batch. A saturated decorative
         // thumbnail remains the existing photo placeholder.
-        guard await acquireDecodePermit() else { return nil }
-        defer { releaseDecodePermit() }
         // A replacement racing a detached decode gets one retry with its new signature.
+        let requestedMaxPixel = max(1, requestedMaxPixel ?? maxPixel)
         for _ in 0..<2 {
-            guard !Task.isCancelled, let key = await readFileKey(forPath: path) else { return nil }
-            guard !Task.isCancelled else { return nil }
+            guard await acquireDecodePermit() else {
+                return Task.isCancelled ? .unavailable : .saturated
+            }
+            guard !Task.isCancelled,
+                  let key = await readFileKey(forPath: path, maxPixel: requestedMaxPixel) else {
+                releaseDecodePermit()
+                return .unavailable
+            }
+            guard !Task.isCancelled else {
+                releaseDecodePermit()
+                return .unavailable
+            }
             if let cached = cache.value(for: key) {
-                return AgentAttachmentThumbnailResult(key: key, image: cached.image)
+                releaseDecodePermit()
+                return .loaded(AgentAttachmentThumbnailResult(key: key, image: cached.image))
             }
 
-            let decoded = await decodedThumbnail(for: key)
-            guard !Task.isCancelled, let decoded else { return nil }
-            guard let currentKey = await readFileKey(forPath: path), currentKey == key else {
+            // This call consumes the permit: a coalesced/cache-hit caller releases
+            // it immediately, while a new physical decode releases it on completion.
+            let decoded = await decodedThumbnailConsumingPermit(for: key)
+            guard !Task.isCancelled, let decoded else { return .unavailable }
+            guard let currentKey = await readFileKey(
+                forPath: path,
+                maxPixel: requestedMaxPixel
+            ), currentKey == key else {
                 continue
             }
             cache.insert(decoded, for: key)
-            return AgentAttachmentThumbnailResult(key: key, image: decoded.image)
+            return .loaded(AgentAttachmentThumbnailResult(key: key, image: decoded.image))
+        }
+        return .unavailable
+    }
+
+    /// Transcript cards share the same cache/admission authority as composer
+    /// chips. 320 pt featured cards need at most 640 px on Retina displays;
+    /// grouped 112 pt strips retain their prior 280 px decode budget.
+    func transcriptThumbnail(
+        forPath path: String,
+        featured: Bool
+    ) async -> AgentAttachmentThumbnailResult? {
+        let maxPixel = featured ? 640 : 280
+        for retryIndex in 0...Self.transcriptSaturationRetryNanoseconds.count {
+            switch await loadAttempt(forPath: path, maxPixel: maxPixel) {
+            case .loaded(let result):
+                return result
+            case .unavailable:
+                return nil
+            case .saturated:
+                guard retryIndex < Self.transcriptSaturationRetryNanoseconds.count,
+                      !Task.isCancelled,
+                      await retrySleeper(Self.transcriptSaturationRetryNanoseconds[retryIndex]) else {
+                    return nil
+                }
+            }
         }
         return nil
     }
@@ -398,18 +505,26 @@ actor AgentAttachmentThumbnailLoader {
             costBytes: cache.totalCostBytes,
             entryCount: cache.count,
             activeDecodeCount: activeDecodeCount,
-            waitingDecodeCount: decodeWaiters.count
+            waitingDecodeCount: decodeWaiters.count,
+            inFlightDecodeCount: inFlightDecodes.count,
+            inFlightConsumerCount: inFlightDecodes.values.reduce(0) { partial, decode in
+                partial + decode.consumers.count
+            }
         )
     }
 
-    nonisolated static func fileKey(forPath path: String) -> AgentAttachmentThumbnailKey? {
+    nonisolated static func fileKey(
+        forPath path: String,
+        maxPixel: Int = AgentAttachmentThumbnailLoader.defaultMaxPixel
+    ) -> AgentAttachmentThumbnailKey? {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
               let size = attributes[.size] as? NSNumber,
               let modificationDate = attributes[.modificationDate] as? Date else { return nil }
         return AgentAttachmentThumbnailKey(
             path: path,
             modificationTimeNanoseconds: Int64((modificationDate.timeIntervalSince1970 * 1_000_000_000).rounded()),
-            sizeBytes: size.int64Value
+            sizeBytes: size.int64Value,
+            maxPixel: maxPixel
         )
     }
 
@@ -481,10 +596,13 @@ actor AgentAttachmentThumbnailLoader {
         )
     }
 
-    private func readFileKey(forPath path: String) async -> AgentAttachmentThumbnailKey? {
+    private func readFileKey(
+        forPath path: String,
+        maxPixel: Int
+    ) async -> AgentAttachmentThumbnailKey? {
         let task = Task.detached(priority: .utility) { () -> AgentAttachmentThumbnailKey? in
             guard !Task.isCancelled else { return nil }
-            return Self.fileKey(forPath: path)
+            return Self.fileKey(forPath: path, maxPixel: maxPixel)
         }
         return await withTaskCancellationHandler {
             await task.value
@@ -493,24 +611,109 @@ actor AgentAttachmentThumbnailLoader {
         }
     }
 
-    private func decodedThumbnail(
+    /// Called only after admission. Exactly one release occurs on every path:
+    /// duplicate callers give their provisional permit back before awaiting,
+    /// while the task that performs the physical decode owns it until it stops.
+    private func decodedThumbnailConsumingPermit(
         for key: AgentAttachmentThumbnailKey
     ) async -> AgentAttachmentDecodedThumbnail? {
-        guard !Task.isCancelled else { return nil }
-        if let cached = cache.value(for: key) { return cached }
+        guard !Task.isCancelled else {
+            releaseDecodePermit()
+            return nil
+        }
+        if let cached = cache.value(for: key) {
+            releaseDecodePermit()
+            return cached
+        }
+
+        if let existing = inFlightDecodes[key] {
+            let consumerID = UUID()
+            var registered = existing
+            registered.consumers.insert(consumerID)
+            inFlightDecodes[key] = registered
+            releaseDecodePermit()
+            return await awaitInFlightDecode(
+                key: key,
+                decodeID: existing.id,
+                consumerID: consumerID,
+                task: existing.task
+            )
+        }
 
         let decoder = self.decoder
-        let maxPixel = self.maxPixel
+        let maxPixel = key.maxPixel
+        let id = UUID()
+        let consumerID = UUID()
         let task = Task.detached(priority: .utility) { () -> AgentAttachmentDecodedThumbnail? in
-            guard !Task.isCancelled else { return nil }
-            return decoder(key.path, maxPixel)
+            let decoded = Task.isCancelled ? nil : decoder(key.path, maxPixel)
+            await self.releaseDecodePermit()
+            return decoded
         }
+        inFlightDecodes[key] = InFlightDecode(
+            id: id,
+            task: task,
+            consumers: [consumerID]
+        )
+        return await awaitInFlightDecode(
+            key: key,
+            decodeID: id,
+            consumerID: consumerID,
+            task: task
+        )
+    }
+
+    private func awaitInFlightDecode(
+        key: AgentAttachmentThumbnailKey,
+        decodeID: UUID,
+        consumerID: UUID,
+        task: Task<AgentAttachmentDecodedThumbnail?, Never>
+    ) async -> AgentAttachmentDecodedThumbnail? {
         let decoded = await withTaskCancellationHandler {
             await task.value
         } onCancel: {
-            task.cancel()
+            Task {
+                await self.cancelInFlightConsumer(
+                    key: key,
+                    decodeID: decodeID,
+                    consumerID: consumerID
+                )
+            }
         }
+        finishInFlightConsumer(
+            key: key,
+            decodeID: decodeID,
+            consumerID: consumerID
+        )
         return Task.isCancelled ? nil : decoded
+    }
+
+    private func cancelInFlightConsumer(
+        key: AgentAttachmentThumbnailKey,
+        decodeID: UUID,
+        consumerID: UUID
+    ) {
+        guard var inFlight = inFlightDecodes[key], inFlight.id == decodeID,
+              inFlight.consumers.remove(consumerID) != nil else { return }
+        if inFlight.consumers.isEmpty {
+            inFlight.task.cancel()
+            inFlightDecodes.removeValue(forKey: key)
+        } else {
+            inFlightDecodes[key] = inFlight
+        }
+    }
+
+    private func finishInFlightConsumer(
+        key: AgentAttachmentThumbnailKey,
+        decodeID: UUID,
+        consumerID: UUID
+    ) {
+        guard var inFlight = inFlightDecodes[key], inFlight.id == decodeID,
+              inFlight.consumers.remove(consumerID) != nil else { return }
+        if inFlight.consumers.isEmpty {
+            inFlightDecodes.removeValue(forKey: key)
+        } else {
+            inFlightDecodes[key] = inFlight
+        }
     }
 
     private func acquireDecodePermit() async -> Bool {
