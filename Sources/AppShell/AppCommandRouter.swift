@@ -1170,12 +1170,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         try context?.apply(.selectWorkspace(id))
         windowController?.refreshFromState()
-        reconcileSurfaceVisibility()
-        windowController?.repairSelectedTerminalFocus(reason: "workspace_select")
-        guard shouldPublishLayoutEvents else { return }
-        EventBus.shared.publish(kind: "workspace.selected", payload: .object([
-            "workspace_id": .string(id.value.uuidString)
-        ]))
+        if shouldPublishLayoutEvents {
+            // The canonical mirror must be observable before selectWorkspace
+            // returns so paired terminal clients cannot lag behind local state.
+            EventBus.shared.publish(kind: "workspace.selected", payload: .object([
+                "workspace_id": .string(id.value.uuidString)
+            ]))
+        }
+        // The reducer is the synchronous selection authority; surface
+        // reconciliation and focus repair are freshness work. Deferring them
+        // lets the cached content paint before any surface walk or focus repair
+        // runs. The canonical mirror remains synchronous for terminal clients.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.reconcileSurfaceVisibility()
+            self.windowController?.repairSelectedTerminalFocus(reason: "workspace_select")
+        }
     }
 
     public func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws {
@@ -2428,7 +2438,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         windowController?.presentBotsInMainContent()
         windowController?.flushPendingRefresh()
         guard let vm = botsViewModel else { return false }
-        guard let bot = vm.bots.first(where: { $0.id == botID }) else { return false }
+        guard let bot = vm.bots.first(where: { $0.id == botID })
+                ?? (context.flatMap { try? $0.botStore.get(id: botID) }) else { return false }
         vm.openDesk(bot)
         windowController?.flushPendingRefresh()
         guard vm.selectedBotID == botID, vm.screen == .desk else { return false }

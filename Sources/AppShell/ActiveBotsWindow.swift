@@ -105,9 +105,9 @@ public struct ActiveBotsRootView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.Palette.bg)
         .accessibilityIdentifier("bots.activeScreen")
-        .onAppear { vm.reloadActiveBotsScreen() }
+        .onAppear { vm.scheduleActiveBotsFreshness() }
         .onChange(of: vm.activeBotsTab) { _ in
-            vm.reloadActiveBotsScreen()
+            vm.scheduleActiveBotsFreshness()
         }
     }
 

@@ -2725,7 +2725,6 @@ public struct SidebarRootView: View {
                     isScheduledTasksSelected: vm.isScheduledTasksSelected,
                     onOpenScheduledTasks: onOpenScheduledTasks
                 )
-                    .transition(.opacity)
             } else {
             VStack(alignment: .leading, spacing: DS.Space.xxs) {
                 Button { vm.newWorkspace() } label: {
@@ -2865,7 +2864,6 @@ public struct SidebarRootView: View {
 
             accountFooter
         }
-        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: vm.isBotsSelected)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         // Subtle liquid-glass: a near-transparent tint over the
         // NSVisualEffectView the host sits in (see SidebarView).
