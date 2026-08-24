@@ -25,6 +25,7 @@ Usage:
   scripts/token-saver-round2-benchmark.sh verify-arm <arm-dir>
   scripts/token-saver-round2-benchmark.sh verify-pair <package-dir>
   scripts/token-saver-round2-benchmark.sh verify-suite <package-dir>
+  scripts/token-saver-round2-benchmark.sh verify-report-metadata <report.json>
   scripts/token-saver-round2-benchmark.sh verify-source-materialization <exact-git-sha>
   scripts/token-saver-round2-benchmark.sh verify-envelope-hash <provider-body> <expected-sha256>
   scripts/token-saver-round2-benchmark.sh verify-model-catalog-pair <baseline-response> <candidate-response>
@@ -316,6 +317,55 @@ expected_source_bindings() {
   '
 }
 
+expected_report_metadata() {
+  if [[ "${profile}" == envelope-slashes-v1 ]]; then
+    jq -cn --arg technique "${technique_id}" '{
+      technique_id:$technique,
+      scenarios:[
+        {id:"S0",expected_delta:"nonnegative_per_case_positive_aggregate"},
+        {id:"S2",expected_delta:"nonnegative_per_case_positive_aggregate"},
+        {id:"S4",expected_delta:"not_applicable_zero"},
+        {id:"S6",expected_delta:"nonnegative_per_case_positive_aggregate"}
+      ],
+      not_applicable:[
+        {id:"S1",reason:"slash unescaping applies only to serialized successful envelopes; no catalog lookup is required"},
+        {id:"S3",reason:"slash escaping does not change generation, parsing, or retry behavior"},
+        {id:"S5",reason:"S1 and S3 are source-bound not applicable for this slash-unescaping technique"}
+      ]
+    }'
+  else
+    jq -cn --arg technique "${technique_id}" '{
+      technique_id:$technique,
+      scenarios:[
+        {id:"S0",expected_delta:"positive"},
+        {id:"S2",expected_delta:"positive"},
+        {id:"S4",expected_delta:"zero"},
+        {id:"S6",expected_delta:"positive"}
+      ],
+      not_applicable:[
+        {id:"S1",reason:"ask_handle is a hot declared tool; no catalog lookup is required"},
+        {id:"S3",reason:"field elision does not change generation, parsing, or retry behavior"},
+        {id:"S5",reason:"S1 and S3 are source-bound not applicable for this field-only technique"}
+      ]
+    }'
+  fi
+}
+
+verify_report_metadata() {
+  local report="${1:-}" expected
+  [[ -n "${report}" ]] || usage
+  require_file "${report}"
+  expected="$(expected_report_metadata)"
+  jq -e --argjson expected "${expected}" '
+    .technique_id == $expected.technique_id and
+    (.cases | type == "array" and length > 0) and
+    all(.cases[];
+      ([.scenarios[] | {id,expected_delta}] | sort_by(.id)) == $expected.scenarios and
+      .not_applicable == $expected.not_applicable
+    )
+  ' "${report}" >/dev/null || die "report metadata does not match the exact ${profile} contract"
+}
+
 verify_arm() {
   require_tools
   local arm_dir="${1:-}" report expected_bindings
@@ -380,6 +430,7 @@ verify_arm() {
     .aggregate.not_applicable_scenarios == ["S1","S3","S5"] and
     .auth_persisted == false
   ' "${report}" >/dev/null || die "arm report contract invalid"
+  verify_report_metadata "${report}"
 
   local git_sha tree_sha
   git_sha="$(jq -r '.source.git_sha' "${report}")"
@@ -826,6 +877,11 @@ case "${command}" in
   verify-arm) verify_arm "$@" ;;
   verify-pair) verify_pair "$@" ;;
   verify-suite) verify_suite "$@" ;;
+  verify-report-metadata)
+    [[ "$#" -eq 1 ]] || usage
+    verify_report_metadata "$1"
+    echo "verify-report-metadata ok profile=${profile}"
+    ;;
   verify-source-materialization) verify_source_materialization "$@" ;;
   verify-envelope-hash) verify_envelope_hash "$@" ;;
   verify-model-catalog-pair) verify_model_catalog_pair "$@" ;;

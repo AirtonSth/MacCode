@@ -280,6 +280,96 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         )
     }
 
+    func test_slashReportMetadataRejectsQuestionElisionLabels() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-slash-metadata-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let reportURL = root.appendingPathComponent("report.json")
+        let slashReasons = [
+            ["id": "S1", "reason": "slash unescaping applies only to serialized successful envelopes; no catalog lookup is required"],
+            ["id": "S3", "reason": "slash escaping does not change generation, parsing, or retry behavior"],
+            ["id": "S5", "reason": "S1 and S3 are source-bound not applicable for this slash-unescaping technique"],
+        ]
+        let oldReasons = [
+            ["id": "S1", "reason": "ask_handle is a hot declared tool; no catalog lookup is required"],
+            ["id": "S3", "reason": "field elision does not change generation, parsing, or retry behavior"],
+            ["id": "S5", "reason": "S1 and S3 are source-bound not applicable for this field-only technique"],
+        ]
+        XCTAssertEqual(
+            CaptureProfile.envelopeSlashes.applicableExpectedDelta,
+            "nonnegative_per_case_positive_aggregate"
+        )
+        XCTAssertEqual(CaptureProfile.envelopeSlashes.s4ExpectedDelta, "not_applicable_zero")
+        XCTAssertEqual(CaptureProfile.envelopeSlashes.notApplicableMetadata, slashReasons)
+        func report(expected: [String: String], reasons: [[String: String]]) throws -> Data {
+            try canonicalJSON([
+                "technique_id": Self.slashTechniqueID,
+                "cases": [[
+                    "scenarios": ["S0", "S2", "S4", "S6"].map {
+                        ["id": $0, "expected_delta": expected[$0]!]
+                    },
+                    "not_applicable": reasons,
+                ]],
+            ])
+        }
+        let slashExpected = [
+            "S0": "nonnegative_per_case_positive_aggregate",
+            "S2": "nonnegative_per_case_positive_aggregate",
+            "S4": "not_applicable_zero",
+            "S6": "nonnegative_per_case_positive_aggregate",
+        ]
+        try report(expected: slashExpected, reasons: slashReasons).write(to: reportURL)
+        let valid = try runSlashBenchmark(["verify-report-metadata", reportURL.path])
+        XCTAssertEqual(valid.status, 0, valid.stderr)
+
+        var oldExpected = slashExpected
+        oldExpected["S0"] = "positive"
+        try report(expected: oldExpected, reasons: slashReasons).write(to: reportURL, options: .atomic)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-report-metadata", reportURL.path]).status,
+            0,
+            "the old positive label is false for slash cases whose measured delta is zero"
+        )
+
+        try report(expected: slashExpected, reasons: oldReasons).write(to: reportURL, options: .atomic)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-report-metadata", reportURL.path]).status,
+            0,
+            "question-field elision reasons must not describe slash escaping"
+        )
+    }
+
+    func test_questionElisionReportMetadataPreservesExistingContract() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-question-metadata-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let reportURL = root.appendingPathComponent("report.json")
+        let expected = ["S0": "positive", "S2": "positive", "S4": "zero", "S6": "positive"]
+        let reasons = [
+            ["id": "S1", "reason": "ask_handle is a hot declared tool; no catalog lookup is required"],
+            ["id": "S3", "reason": "field elision does not change generation, parsing, or retry behavior"],
+            ["id": "S5", "reason": "S1 and S3 are source-bound not applicable for this field-only technique"],
+        ]
+        XCTAssertEqual(CaptureProfile.questionElision.applicableExpectedDelta, "positive")
+        XCTAssertEqual(CaptureProfile.questionElision.s4ExpectedDelta, "zero")
+        XCTAssertEqual(CaptureProfile.questionElision.notApplicableMetadata, reasons)
+        let report = try canonicalJSON([
+            "technique_id": Self.techniqueID,
+            "cases": [[
+                "scenarios": ["S0", "S2", "S4", "S6"].map {
+                    ["id": $0, "expected_delta": expected[$0]!]
+                },
+                "not_applicable": reasons,
+            ]],
+        ])
+        try report.write(to: reportURL)
+
+        let result = try runBenchmark(["verify-report-metadata", reportURL.path])
+        XCTAssertEqual(result.status, 0, result.stderr)
+    }
+
     func test_verifierHashesRawEmbeddedEnvelopeTextWithoutReserializing() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("round2-envelope-hash-\(UUID().uuidString)", isDirectory: true)
@@ -778,10 +868,10 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
             )
             let s2Emitted = episode.emitted + Data("\n".utf8) + episode.retrieveEmitted
             let scenarios: [(id: String, turn: String, body: [String: Any], emitted: Data, expected: String)] = [
-                ("S0", "turn-1", s0, episode.emitted, "positive"),
-                ("S2", "turn-1", s2, s2Emitted, "positive"),
-                ("S4", "turn-1", s4, episode.failOpenEmitted, "zero"),
-                ("S6", "turn-2", s6, episode.emitted, "positive"),
+                ("S0", "turn-1", s0, episode.emitted, configuration.profile.applicableExpectedDelta),
+                ("S2", "turn-1", s2, s2Emitted, configuration.profile.applicableExpectedDelta),
+                ("S4", "turn-1", s4, episode.failOpenEmitted, configuration.profile.s4ExpectedDelta),
+                ("S6", "turn-2", s6, episode.emitted, configuration.profile.applicableExpectedDelta),
             ]
             var scenarioReports: [[String: Any]] = []
             for scenario in scenarios {
@@ -836,11 +926,7 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
                 "envelope_sha256": sha256(Data(episode.envelopeJSON.utf8)),
                 "emitted_sha256": sha256(episode.emitted),
                 "scenarios": scenarioReports,
-                "not_applicable": [
-                    ["id": "S1", "reason": "ask_handle is a hot declared tool; no catalog lookup is required"],
-                    ["id": "S3", "reason": "field elision does not change generation, parsing, or retry behavior"],
-                    ["id": "S5", "reason": "S1 and S3 are source-bound not applicable for this field-only technique"],
-                ],
+                "not_applicable": configuration.profile.notApplicableMetadata,
                 "shipping_latency_ms": shippingSamples,
                 "quality_passed": true,
                 "fallback_question_present": hasQuestion,
@@ -1571,6 +1657,29 @@ private struct CaptureConfiguration {
 private enum CaptureProfile: String {
     case questionElision = "question-elision-v1"
     case envelopeSlashes = "envelope-slashes-v1"
+
+    var applicableExpectedDelta: String {
+        self == .envelopeSlashes ? "nonnegative_per_case_positive_aggregate" : "positive"
+    }
+
+    var s4ExpectedDelta: String {
+        self == .envelopeSlashes ? "not_applicable_zero" : "zero"
+    }
+
+    var notApplicableMetadata: [[String: String]] {
+        if self == .envelopeSlashes {
+            return [
+                ["id": "S1", "reason": "slash unescaping applies only to serialized successful envelopes; no catalog lookup is required"],
+                ["id": "S3", "reason": "slash escaping does not change generation, parsing, or retry behavior"],
+                ["id": "S5", "reason": "S1 and S3 are source-bound not applicable for this slash-unescaping technique"],
+            ]
+        }
+        return [
+            ["id": "S1", "reason": "ask_handle is a hot declared tool; no catalog lookup is required"],
+            ["id": "S3", "reason": "field elision does not change generation, parsing, or retry behavior"],
+            ["id": "S5", "reason": "S1 and S3 are source-bound not applicable for this field-only technique"],
+        ]
+    }
 }
 
 private struct Round2Fixture: Decodable {
