@@ -99,22 +99,64 @@ public enum CommandWrapPolicy {
         return nil
     }
 
-    /// How the wrapper attaches the child's stdio. Compress-eligible invocations
-    /// capture stdout and stderr on one pipe so diagnostics cannot bypass Distill.
+    /// How the wrapper attaches the child's stdio.
+    ///
+    /// Exact-output / disabled / mid-pipeline (`isTerminalToAgent == false`) inherit
+    /// every stream so `swift test | grep FAIL` still feeds grep stdout-only.
+    /// Terminal compress-eligible wraps capture stdout and stderr on independent
+    /// pipes; Distill may join them only after `decide` returns `.compress`.
     public enum CommandWrapChildStreams: Equatable {
         case inheritAll
-        case captureCombinedStdoutAndStderr
+        case captureSeparateStdoutAndStderr
     }
 
     public static func childStreams(
         command: String,
         args: [String],
-        environment: [String: String]
+        environment: [String: String],
+        isTerminalToAgent: Bool
     ) -> CommandWrapChildStreams {
         if passthroughReason(command: command, args: args, environment: environment) != nil {
             return .inheritAll
         }
-        return .captureCombinedStdoutAndStderr
+        if !isTerminalToAgent {
+            return .inheritAll
+        }
+        return .captureSeparateStdoutAndStderr
+    }
+
+    /// Payload Distill sees when wrap `decide` returns `.compress`: stdout, then
+    /// stderr, with a separating newline when both are nonempty.
+    public static func combinedDistillInput(stdout: Data, stderr: Data) -> Data {
+        if stderr.isEmpty { return stdout }
+        if stdout.isEmpty { return stderr }
+        var combined = stdout
+        if stdout.last != 0x0A {
+            combined.append(0x0A)
+        }
+        combined.append(stderr)
+        return combined
+    }
+
+    /// After capture, Distill the joined streams only on `.compress`. Every
+    /// passthrough reason (`not_terminal`, `below_threshold`, `binary_output`, …)
+    /// keeps original stdout on stdout and original stderr on stderr.
+    public enum CommandWrapCapturedDelivery: Equatable {
+        case passthrough(stdout: Data, stderr: Data)
+        case distill(Data)
+    }
+
+    public static func capturedDelivery(
+        action: WrapAction,
+        stdout: Data,
+        stderr: Data
+    ) -> CommandWrapCapturedDelivery {
+        switch action {
+        case .passthrough:
+            return .passthrough(stdout: stdout, stderr: stderr)
+        case .compress:
+            return .distill(combinedDistillInput(stdout: stdout, stderr: stderr))
+        }
     }
 
     // PERF: passthroughReason runs on every PATH-wrapped spawn. Array literals

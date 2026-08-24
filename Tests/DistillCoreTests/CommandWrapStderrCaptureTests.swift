@@ -5,18 +5,23 @@ final class CommandWrapStderrCaptureTests: XCTestCase {
     private let noEnv: [String: String] = [:]
 
     func test_compressPathCapturesCombinedStdoutAndStderr() {
-        // WHY: compiler/test tools write diagnostics to stderr. Compress-eligible
-        // wraps must capture both streams on one Distill input or Token Saver never
-        // sees the failure.
+        // WHY: compiler/test tools write diagnostics to stderr. Terminal
+        // compress-eligible wraps capture both streams independently so Distill
+        // can join them only after decide() returns compress.
         for command in ["swift", "npm", "pytest"] {
             XCTAssertNil(
                 CommandWrapPolicy.passthroughReason(command: command, args: [], environment: noEnv),
                 "\(command) must stay compress-eligible"
             )
             XCTAssertEqual(
-                CommandWrapPolicy.childStreams(command: command, args: [], environment: noEnv),
-                .captureCombinedStdoutAndStderr,
-                "\(command) must capture combined stdout+stderr"
+                CommandWrapPolicy.childStreams(
+                    command: command,
+                    args: [],
+                    environment: noEnv,
+                    isTerminalToAgent: true
+                ),
+                .captureSeparateStdoutAndStderr,
+                "\(command) terminal wrap must capture stdout and stderr independently"
             )
         }
     }
@@ -31,7 +36,12 @@ final class CommandWrapStderrCaptureTests: XCTestCase {
                 "\(command) must remain exact-output"
             )
             XCTAssertEqual(
-                CommandWrapPolicy.childStreams(command: command, args: ["pattern"], environment: noEnv),
+                CommandWrapPolicy.childStreams(
+                    command: command,
+                    args: ["pattern"],
+                    environment: noEnv,
+                    isTerminalToAgent: true
+                ),
                 .inheritAll,
                 "\(command) must inherit all streams"
             )
@@ -49,7 +59,12 @@ final class CommandWrapStderrCaptureTests: XCTestCase {
                 "git \(args.joined(separator: " ")) must remain exact-output"
             )
             XCTAssertEqual(
-                CommandWrapPolicy.childStreams(command: command, args: args, environment: noEnv),
+                CommandWrapPolicy.childStreams(
+                    command: command,
+                    args: args,
+                    environment: noEnv,
+                    isTerminalToAgent: true
+                ),
                 .inheritAll
             )
         }
@@ -59,7 +74,12 @@ final class CommandWrapStderrCaptureTests: XCTestCase {
             "exact_patch_output"
         )
         XCTAssertEqual(
-            CommandWrapPolicy.childStreams(command: "git", args: ["diff"], environment: noEnv),
+            CommandWrapPolicy.childStreams(
+                command: "git",
+                args: ["diff"],
+                environment: noEnv,
+                isTerminalToAgent: true
+            ),
             .inheritAll
         )
 
@@ -69,14 +89,122 @@ final class CommandWrapStderrCaptureTests: XCTestCase {
             "disabled"
         )
         XCTAssertEqual(
-            CommandWrapPolicy.childStreams(command: "swift", args: ["test"], environment: disabled),
+            CommandWrapPolicy.childStreams(
+                command: "swift",
+                args: ["test"],
+                environment: disabled,
+                isTerminalToAgent: true
+            ),
             .inheritAll
         )
     }
 
+    func test_notTerminalAndBelowThresholdKeepStdoutAndStderrSeparate() {
+        // WHY: `swift test | grep FAIL` is a wrap of swift that is not
+        // terminal-to-agent. Mixing captured stderr into stdout would make grep
+        // see compiler diagnostics. below_threshold and binary passthrough have
+        // the same stream-identity contract after independent capture.
+        let stdout = Data("ok\nPASS\n".utf8)
+        let stderr = Data("warning: File.swift:12: unused; test must not mix\n".utf8)
+        XCTAssertNotEqual(stdout, stderr)
+
+        XCTAssertEqual(
+            CommandWrapPolicy.childStreams(
+                command: "swift",
+                args: ["test"],
+                environment: noEnv,
+                isTerminalToAgent: false
+            ),
+            .inheritAll,
+            "mid-pipeline wrap must inherit streams so grep sees stdout only"
+        )
+
+        let notTerminal = CommandWrapPolicy.decide(
+            command: "swift",
+            isTerminalToAgent: false,
+            outputIsValidUTF8: true,
+            byteCount: 4_000,
+            lineCount: 80,
+            environment: noEnv
+        )
+        XCTAssertEqual(notTerminal, .passthrough(reason: "not_terminal"))
+        switch CommandWrapPolicy.capturedDelivery(action: notTerminal, stdout: stdout, stderr: stderr) {
+        case .passthrough(let out, let err):
+            XCTAssertEqual(out, stdout)
+            XCTAssertEqual(err, stderr)
+        case .distill:
+            XCTFail("not_terminal must not Distill mixed stdout+stderr")
+        }
+
+        let smallCombined = CommandWrapPolicy.combinedDistillInput(stdout: stdout, stderr: stderr)
+        XCTAssertLessThanOrEqual(smallCombined.count, CommandWrapPolicy.defaultMinBytes)
+        let below = CommandWrapPolicy.decide(
+            command: "swift",
+            isTerminalToAgent: true,
+            outputIsValidUTF8: true,
+            byteCount: smallCombined.count,
+            lineCount: 2,
+            environment: noEnv
+        )
+        XCTAssertEqual(below, .passthrough(reason: "below_threshold"))
+        switch CommandWrapPolicy.capturedDelivery(action: below, stdout: stdout, stderr: stderr) {
+        case .passthrough(let out, let err):
+            XCTAssertEqual(out, stdout)
+            XCTAssertEqual(err, stderr)
+        case .distill:
+            XCTFail("below_threshold must emit original stdout and stderr separately")
+        }
+
+        let binary = CommandWrapPolicy.decide(
+            command: "swift",
+            isTerminalToAgent: true,
+            outputIsValidUTF8: false,
+            byteCount: 4_000,
+            lineCount: 80,
+            environment: noEnv
+        )
+        XCTAssertEqual(binary, .passthrough(reason: "binary_output"))
+        switch CommandWrapPolicy.capturedDelivery(action: binary, stdout: stdout, stderr: stderr) {
+        case .passthrough(let out, let err):
+            XCTAssertEqual(out, stdout)
+            XCTAssertEqual(err, stderr)
+        case .distill:
+            XCTFail("binary_output must emit original stdout and stderr separately")
+        }
+    }
+
+    func test_compressActionDistillsCombinedStdoutAndStderr() {
+        // WHY: only the admitted compress action may join streams into Distill
+        // input. Unique tokens from each stream must both be present.
+        let stdout = Data(String(repeating: "STDOUT_MARK build ok\n", count: 80).utf8)
+        let stderr = Data("STDERR_MARK error: File.swift:12: value is not used\n".utf8)
+        let combined = CommandWrapPolicy.combinedDistillInput(stdout: stdout, stderr: stderr)
+        XCTAssertGreaterThan(combined.count, CommandWrapPolicy.defaultMinBytes)
+        let action = CommandWrapPolicy.decide(
+            command: "swift",
+            isTerminalToAgent: true,
+            outputIsValidUTF8: true,
+            byteCount: combined.count,
+            lineCount: 80,
+            environment: noEnv
+        )
+        XCTAssertEqual(action, .compress)
+        switch CommandWrapPolicy.capturedDelivery(action: action, stdout: stdout, stderr: stderr) {
+        case .distill(let payload):
+            XCTAssertEqual(payload, combined)
+            let text = String(data: payload, encoding: .utf8)
+            XCTAssertNotNil(text)
+            XCTAssertTrue(text?.contains("STDOUT_MARK") == true)
+            XCTAssertTrue(text?.contains("STDERR_MARK") == true)
+        case .passthrough:
+            XCTFail("terminal compress-eligible output must Distill joined streams")
+        }
+    }
+
     func test_wrapRunnerSourceBindsStderrToCapturePipe() throws {
-        // WHY: policy alone cannot Distill stderr-only diagnostics; the runner must
-        // bind both child streams to the same capture pipe on the compress path.
+        // WHY: CommandWrapRunner is an executable-only type; DistillCoreTests
+        // cannot spawn it. The runner must still call the shipped policy:
+        // independent pipes, capturedDelivery, STDERR on passthrough.
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -92,12 +220,36 @@ final class CommandWrapStderrCaptureTests: XCTestCase {
             "CommandWrapRunner must call CommandWrapPolicy.childStreams rather than duplicating passthrough logic"
         )
         XCTAssertTrue(
-            source.contains("standardError = outPipe"),
-            "compress capture path must assign standardError to the capture pipe (outPipe)"
+            source.contains("isTerminalToAgent:"),
+            "childStreams must receive WrapPipeInspector.isTerminalToAgent so pipelines inherit"
         )
         XCTAssertTrue(
-            source.contains("standardOutput = outPipe"),
-            "compress capture path must bind stdout to the same capture pipe as stderr"
+            source.contains("let outPipe = Pipe()"),
+            "compress capture path must have a stdout pipe"
+        )
+        XCTAssertTrue(
+            source.contains("let errPipe = Pipe()"),
+            "compress capture path must capture stderr on a separate pipe"
+        )
+        XCTAssertTrue(
+            source.contains("process.standardOutput = outPipe"),
+            "stdout must bind to outPipe"
+        )
+        XCTAssertTrue(
+            source.contains("process.standardError = errPipe"),
+            "stderr must bind to errPipe, not outPipe"
+        )
+        XCTAssertFalse(
+            source.contains("standardError = outPipe"),
+            "stderr must not share the stdout capture pipe (that mixed streams into pipelines)"
+        )
+        XCTAssertTrue(
+            source.contains("CommandWrapPolicy.capturedDelivery"),
+            "runner must Distill joined bytes only through capturedDelivery"
+        )
+        XCTAssertTrue(
+            source.contains("STDERR_FILENO"),
+            "passthrough must write original stderr to STDERR_FILENO"
         )
         XCTAssertTrue(
             source.contains("runInheritingAllStreams"),
