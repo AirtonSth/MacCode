@@ -366,7 +366,7 @@ public struct ManagedRetrieveMCP: Sendable {
             input: input,
             question: args?["question"] as? String,
             provider: args?["provider"] as? String,
-            recordSavings: false,
+            recordSavings: true,
             maxOutputCharacters: maxOutputCharacters,
             reversibleStoreMinBytes: reversibleStoreMinBytes
         )
@@ -407,7 +407,7 @@ public struct ManagedRetrieveMCP: Sendable {
             input: input,
             question: args?["question"] as? String,
             provider: args?["provider"] as? String,
-            recordSavings: true,
+            recordSavings: false,
             maxOutputCharacters: maxOutputCharacters,
             reversibleStoreMinBytes: reversibleStoreMinBytes,
             precomputedOutput: delivered,

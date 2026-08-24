@@ -369,9 +369,10 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         XCTAssertEqual(result["isError"] as? Bool, false)
     }
 
-    func test_trustedCompressDefersExactDeliveredLedgerUntilAfterResponseWrite() async throws {
-        // WHY: the candidate must not claim savings. Only receipt-inclusive bytes that
-        // survived every trust/recovery/net-shrink gate may enter the ledger after write.
+    func test_trustedCompressRecordsSidecarBodyThenConfirmsRecoveryAfterResponseWrite() async throws {
+        // WHY: displayed savings use the sidecar compressed body on the first
+        // compress call. Recovery confirm is deferred until after the MCP response
+        // is written and must not mint a second savings row.
         let recorder = RequestRecorder()
         let input = String(repeating: #"{"status":"ok","detail":"repeated"}"#, count: 80)
         let srv = ManagedRetrieveMCP(
@@ -423,21 +424,21 @@ final class ManagedRetrieveMCPTests: XCTestCase {
             JSONSerialization.jsonObject(with: Data(jsonPrefix.utf8)) as? [String: Any]
         )
         XCTAssertEqual(decodedPrefix["status"] as? String, "ok")
-        XCTAssertEqual(requestsBeforeDelivery.count, 1, "ledger must not run before the response is written")
-        XCTAssertEqual(requestsBeforeDelivery.first?.recordSavings, false)
+        XCTAssertEqual(requestsBeforeDelivery.count, 1, "recovery confirm must not run before the response is written")
+        XCTAssertEqual(requestsBeforeDelivery.first?.recordSavings, true, "sidecar-body savings land on the compress call")
         XCTAssertNil(requestsBeforeDelivery.first?.precomputedOutput)
 
         let deferred = try XCTUnwrap(outcome.deferredSideEffect)
         await deferred()
         let requestsAfterDelivery = await recorder.all()
         XCTAssertEqual(requestsAfterDelivery.count, 2)
-        let ledger = try XCTUnwrap(requestsAfterDelivery.last)
-        XCTAssertEqual(ledger.recordSavings, true)
-        XCTAssertEqual(ledger.input, input)
-        XCTAssertEqual(ledger.precomputedOutput, text)
-        XCTAssertEqual(ledger.precomputedRouteStage, .encoderBERT)
+        let confirm = try XCTUnwrap(requestsAfterDelivery.last)
+        XCTAssertEqual(confirm.recordSavings, false, "recovery confirm must not write a second savings row")
+        XCTAssertEqual(confirm.input, input)
+        XCTAssertEqual(confirm.precomputedOutput, text)
+        XCTAssertEqual(confirm.precomputedRouteStage, .encoderBERT)
         XCTAssertEqual(
-            ledger.precomputedRecoveryConfirmations,
+            confirm.precomputedRecoveryConfirmations,
             [.init(capability: "mcp-h", idempotencyKey: "mcp-op")]
         )
     }
@@ -474,7 +475,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         XCTAssertNil(outcome.deferredSideEffect)
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.recordSavings, false)
+        XCTAssertEqual(requests.first?.recordSavings, true)
     }
 
     func test_notificationGetsNoResponse() async {

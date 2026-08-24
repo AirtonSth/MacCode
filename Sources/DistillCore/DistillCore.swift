@@ -558,10 +558,10 @@ public enum DistillSavingsCalculator {
 
         switch request.mode {
         case .commandOutput:
-            // Honest token accounting: the raw command output is replaced by the
-            // distilled output before it ever reaches the provider, so savings =
-            // estimate(raw input) - estimate(distilled output). The response
-            // already carries those estimates from the scheduler.
+            // Display accounting: estimate(raw) − estimate(sidecar compressed body).
+            // Receipt / recovery markers are appended later by the client and must
+            // not shrink this delta. The response already carries those estimates
+            // from the scheduler.
             return DistillSavingsRecord(
                 provider: provider,
                 mode: TokenSaverEngineLabel.mode(base: "command-output", stage: response.routeStage),

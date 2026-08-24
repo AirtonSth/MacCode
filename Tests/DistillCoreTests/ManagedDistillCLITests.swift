@@ -147,7 +147,7 @@ final class ManagedDistillCLITests: XCTestCase {
         receiptKey: managedDistillCLITestReceiptKey
     )
 
-    func test_compress_success_recordsOnlyTheExactReceiptInclusiveDeliveredOutput() async throws {
+    func test_compress_success_recordsSidecarBodySavingsAndConfirmsRecoverySeparately() async throws {
         let raw = Data(String(repeating: "verbose build output that passed\n", count: 20).utf8)
         let resp = DistillResponse(
             requestID: UUID(), output: "PASS", inputCharacters: raw.count,
@@ -160,7 +160,7 @@ final class ManagedDistillCLITests: XCTestCase {
             if let body = request.httpBody,
                let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
                 await recorder.append(decoded)
-                if decoded.recordSavings != true {
+                if decoded.recordSavings == true && decoded.precomputedOutput == nil {
                     XCTAssertEqual(request.value(forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred"), "1")
                 }
             }
@@ -176,22 +176,27 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertLessThan(out.count, raw.count, "recovery and receipt lines are part of the net UTF-8 shrink gate")
 
         let requests = await recorder.all()
-        XCTAssertEqual(requests.count, 2, "compression and delivered-savings recording must be separate requests")
-        XCTAssertEqual(requests.first?.recordSavings, false, "candidate compression must never claim delivery")
-        let ledger = try XCTUnwrap(requests.last)
-        XCTAssertEqual(ledger.recordSavings, true)
-        XCTAssertEqual(ledger.precomputedOutput, s, "ledger bytes must exactly match provider-visible receipt/handle output")
+        XCTAssertEqual(requests.count, 2, "compression (savings) and recovery confirmation must be separate requests")
+        let compress = try XCTUnwrap(requests.first)
+        XCTAssertEqual(compress.recordSavings, true, "displayed savings use the sidecar compressed body")
+        XCTAssertNil(compress.precomputedOutput)
+        let confirm = try XCTUnwrap(requests.last)
+        XCTAssertEqual(confirm.recordSavings, false, "recovery confirm must not write a second savings row")
+        XCTAssertEqual(confirm.precomputedOutput, s)
         XCTAssertEqual(
-            ledger.precomputedRecoveryConfirmations,
+            confirm.precomputedRecoveryConfirmations,
             [.init(capability: "abc123", idempotencyKey: "delivery-key")]
         )
         let record = try XCTUnwrap(DistillSavingsCalculator.record(
-            for: ledger,
-            response: try XCTUnwrap(ledger.responseUsingPrecomputedOutput())
+            for: compress,
+            response: resp
         ))
-        XCTAssertEqual(record.outputTokens, TokenEstimator.estimate(s))
-        XCTAssertEqual(record.savedTokens, max(TokenEstimator.estimate(String(decoding: raw, as: UTF8.self)) - TokenEstimator.estimate(s), 0))
+        XCTAssertEqual(record.outputTokens, 1)
+        XCTAssertEqual(record.savedTokens, max(25 - 1, 0))
         XCTAssertEqual(record.routeStage, .llmMLX)
+        let bodyDelta = max(TokenEstimator.estimate(String(decoding: raw, as: UTF8.self)) - TokenEstimator.estimate("PASS"), 0)
+        let deliveredDelta = max(TokenEstimator.estimate(String(decoding: raw, as: UTF8.self)) - TokenEstimator.estimate(s), 0)
+        XCTAssertGreaterThan(bodyDelta, deliveredDelta, "sidecar body must out-save receipt-inclusive stdout")
     }
 
     func test_compress_deterministicWithoutHandle_emitsAppliedReceiptAfterNetUTF8Shrink() async throws {
@@ -577,14 +582,14 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertFalse(DistillAppliedReceipt.containsMarker(String(decoding: out, as: UTF8.self)))
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.recordSavings, false, "a receipt-inclusive rejection must never pre-record savings")
+        XCTAssertEqual(requests.first?.recordSavings, true, "display savings use the sidecar body even if the receipt gate fail-opens")
         XCTAssertNil(requests.first?.precomputedOutput)
     }
 
-    func test_wrapperFaithfulnessRejectionCanDropDeferredLedgerWithoutARecordedSaving() async throws {
-        // WHY: CommandWrapRunner applies a final faithfulness floor after the CLI.
-        // The candidate request must be accounting-disabled so dropping the deferred
-        // side effect also drops every savings write when a tiny summary is rejected.
+    func test_wrapperFaithfulnessRejectionStillRecordedSidecarBodySavings() async throws {
+        // WHY: displayed savings follow the sidecar compressed body. Wrapper
+        // faithfulness may drop the emitted stdout and skip recovery confirm,
+        // but the compress POST already recorded the body delta.
         let rawText = String(repeating: "verbose compiler progress line\n", count: 80)
         let response = DistillResponse(
             requestID: UUID(),
@@ -604,7 +609,7 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let result = await cli.runResult()
         let emitted = String(decoding: result.stdout, as: UTF8.self)
-        XCTAssertNotNil(result.deferredSideEffect)
+        XCTAssertNil(result.deferredSideEffect, "no recovery handle → no deferred confirm POST")
         XCTAssertFalse(CommandWrapPolicy.isFaithfulCompression(
             rawByteCount: Data(rawText.utf8).count,
             compressedContentByteCount: CommandWrapPolicy.compressedContentByteCount(emitted)
@@ -614,8 +619,8 @@ final class ManagedDistillCLITests: XCTestCase {
         await Task.yield()
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.recordSavings, false)
-        XCTAssertFalse(requests.contains { $0.recordSavings == true })
+        XCTAssertEqual(requests.first?.recordSavings, true, "sidecar-body savings already landed on the compress POST")
+        XCTAssertNil(requests.first?.precomputedOutput)
     }
 
     func test_emptyStdin_returnsEmptyExitZero() async {
@@ -651,11 +656,9 @@ final class ManagedDistillCLITests: XCTestCase {
         // so TokenSaverSavingsRepository never saw a row. Real byte savings were
         // computed and then silently dropped for every provider.
         //
-        // WHY (BUG 1): the ledger POST must carry the final receipt-inclusive output so
-        // the sidecar records the delivered delta — NOT an independent recompute or
-        // the smaller pre-receipt prepass body.
-        // The stub intentionally returns DIFFERENT bytes than pre.output; if the
-        // client (or server) used that response body for savings, numbers would diverge.
+        // Display accounting records the Wave A prepass body (no receipt). The stub
+        // returns DIFFERENT bytes than pre.output; if the client used that response
+        // body for savings, numbers would diverge.
         TokenSaverWaveLiveRollout.activate(.waveA)
         setenv("RC_TOKEN_SAVER_DISTILL_HINT", "1", 1)
 
@@ -717,14 +720,19 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let expectedRecord = ManagedDistillCLI.prepassSavingsRecord(
             original: input,
-            compressed: text,
+            compressed: pre.output,
             provider: "grok",
             waveID: pre.waveID
         )
-        XCTAssertNotNil(expectedRecord, "DistillSavingsCalculator must accept the delivered delta")
+        XCTAssertNotNil(expectedRecord, "DistillSavingsCalculator must accept the sidecar-body delta")
         XCTAssertEqual(
             expectedRecord?.savedTokens,
-            max(TokenEstimator.estimate(input) - TokenEstimator.estimate(text), 0)
+            max(TokenEstimator.estimate(input) - TokenEstimator.estimate(pre.output), 0)
+        )
+        XCTAssertGreaterThanOrEqual(
+            expectedRecord?.savedTokens ?? 0,
+            max(TokenEstimator.estimate(input) - TokenEstimator.estimate(text), 0),
+            "prepass body savings must not be smaller than the receipt-inclusive delivered delta"
         )
 
         let transportCalls = await calls.count()
@@ -736,14 +744,13 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(posted.input, input, "ledger POST must send original pre-prepass bytes")
         XCTAssertEqual(
             posted.precomputedOutput,
-            text,
-            "ledger POST must carry the exact receipt-inclusive Wave A output"
+            pre.output,
+            "ledger POST must carry the Wave A sidecar body, not the receipt-inclusive stdout"
         )
         XCTAssertEqual(posted.precomputedRouteStage, .deterministic)
         XCTAssertEqual(posted.cacheState, "wave_prepass_\(pre.waveID)")
         XCTAssertEqual(posted.provider, "grok")
 
-        // Honest delta is original→provider-visible receipt output, not independent recompute.
         let honest = DistillSavingsCalculator.record(
             for: posted,
             response: try XCTUnwrap(posted.responseUsingPrecomputedOutput())
@@ -1147,10 +1154,10 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 2)
-        XCTAssertEqual(requests.first?.recordSavings, false)
+        XCTAssertEqual(requests.first?.recordSavings, true, "hook compress POST records sidecar-body savings")
         XCTAssertEqual(requests.first?.input, rawToolOutput)
         XCTAssertEqual(requests.first?.provider, "claude")
-        XCTAssertEqual(requests.last?.recordSavings, true)
+        XCTAssertEqual(requests.last?.recordSavings, false, "recovery confirm must not double-count savings")
         XCTAssertEqual(requests.last?.precomputedOutput, updated)
         XCTAssertEqual(requests.last?.precomputedRouteStage, .deterministic)
         XCTAssertEqual(
@@ -1159,9 +1166,10 @@ final class ManagedDistillCLITests: XCTestCase {
         )
     }
 
-    func test_hookPostToolUse_receiptInclusiveRejectionNeverRecordsSavings() async throws {
-        // WHY: PostToolUse has its own final replacement gate. A sidecar candidate
-        // that loses its gain after the receipt must return `{}` and leave no ledger row.
+    func test_hookPostToolUse_receiptInclusiveRejectionStillRecordsSidecarBodySavings() async throws {
+        // WHY: displayed savings use the sidecar body. The hook still fail-opens
+        // stdout when the receipt wipes the shrink, but the compress POST already
+        // recorded the body delta.
         let rawToolOutput = String(repeating: "tool diagnostic line\n", count: 60)
         let response = DistillResponse(
             requestID: UUID(),
@@ -1195,7 +1203,7 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.recordSavings, false)
+        XCTAssertEqual(requests.first?.recordSavings, true)
         XCTAssertNil(requests.first?.precomputedOutput)
     }
 
@@ -1281,12 +1289,9 @@ final class ManagedDistillCLITests: XCTestCase {
             _ = await calls.increment()
             if let body = request.httpBody,
                let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
-                let delivered = decoded.precomputedOutput ?? ""
-                XCTAssertTrue(DistillAppliedReceipt.containsMarker(delivered))
-                XCTAssertEqual(
-                    ManagedDistillCLI.stripTrailingNewlines(DistillAppliedReceipt.strip(delivered)),
-                    ManagedDistillCLI.stripTrailingNewlines(pre.output)
-                )
+                XCTAssertEqual(decoded.recordSavings, true)
+                XCTAssertEqual(decoded.precomputedOutput, pre.output)
+                XCTAssertFalse(DistillAppliedReceipt.containsMarker(decoded.precomputedOutput ?? ""))
             }
             return (Data("{}".utf8), 200)
         }
@@ -1545,11 +1550,11 @@ final class ManagedDistillCLITests: XCTestCase {
         let decodedRequests = await recorder.all()
 
         XCTAssertEqual(code, 0)
-        let candidates = decodedRequests.filter { $0.recordSavings != true }
-        let ledgerRequests = decodedRequests.filter { $0.recordSavings == true }
-        XCTAssertGreaterThan(candidates.count, 1, "over-cap input must be split into multiple bounded requests")
-        XCTAssertTrue(candidates.allSatisfy { $0.input.utf8.count <= ManagedDistillCLI.stdinCapBytes })
-        XCTAssertTrue(candidates.allSatisfy { $0.recordSavings == false })
+        let savingsRequests = decodedRequests.filter { $0.recordSavings == true }
+        let confirmRequests = decodedRequests.filter { $0.recordSavings != true }
+        XCTAssertGreaterThan(savingsRequests.count, 1, "over-cap input must be split into multiple bounded savings requests")
+        XCTAssertTrue(savingsRequests.allSatisfy { $0.input.utf8.count <= ManagedDistillCLI.stdinCapBytes })
+        XCTAssertTrue(savingsRequests.allSatisfy { $0.precomputedOutput == nil })
         let text = String(decoding: out, as: UTF8.self)
         XCTAssertTrue(text.contains("chunk summary"))
         XCTAssertTrue(text.contains("[[rc:h]]"), "each lossy chunk must remain retrievable")
@@ -1557,21 +1562,19 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertTrue(text.hasSuffix("\n"), "chunked CLI output must retain its terminal LF")
         XCTAssertLessThan(out.count, oneMB.count, "all chunk handles plus the final receipt must be a net UTF-8 shrink")
         XCTAssertNotEqual(out, oneMB, "successful chunked compression should not fall back to raw output")
-        XCTAssertEqual(ledgerRequests.count, 1, "all chunks must produce one aggregate delivered-savings row")
-        let ledger = try XCTUnwrap(ledgerRequests.first)
-        XCTAssertEqual(ledger.input, String(decoding: oneMB, as: UTF8.self))
-        XCTAssertEqual(ledger.precomputedOutput, text)
-        XCTAssertEqual(ledger.precomputedRouteStage, .encoderBERT)
-        XCTAssertEqual(ledger.precomputedRecoveryConfirmations?.count, candidates.count)
-        XCTAssertTrue(ledger.precomputedRecoveryConfirmations?.allSatisfy {
+        XCTAssertEqual(confirmRequests.count, 1, "one recovery-confirm POST after all chunks")
+        let confirm = try XCTUnwrap(confirmRequests.first)
+        XCTAssertEqual(confirm.input, String(decoding: oneMB, as: UTF8.self))
+        XCTAssertEqual(confirm.precomputedOutput, text)
+        XCTAssertEqual(confirm.precomputedRouteStage, .encoderBERT)
+        XCTAssertEqual(confirm.precomputedRecoveryConfirmations?.count, savingsRequests.count)
+        XCTAssertTrue(confirm.precomputedRecoveryConfirmations?.allSatisfy {
             $0.capability == "h" && $0.idempotencyKey == "chunk-delivery-key"
         } == true)
-        let record = try XCTUnwrap(DistillSavingsCalculator.record(
-            for: ledger,
-            response: try XCTUnwrap(ledger.responseUsingPrecomputedOutput())
-        ))
-        XCTAssertEqual(record.outputTokens, TokenEstimator.estimate(text))
-        XCTAssertEqual(record.savedTokens, max(TokenEstimator.estimate(ledger.input) - TokenEstimator.estimate(text), 0))
+        XCTAssertNil(DistillSavingsCalculator.record(
+            for: confirm,
+            response: try XCTUnwrap(confirm.responseUsingPrecomputedOutput())
+        ), "recovery confirm must not mint a second savings row")
     }
 
     func test_compress_overCapChunkFailureFailsOpenToExactRawInput() async {
