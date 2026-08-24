@@ -479,6 +479,13 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(persistedCallerThread.worktreePath, worktreePath)
         XCTAssertEqual(persistedCallerThread.runAsUser, runAsUser)
         XCTAssertEqual(persistedCallerThread.effectiveRoutingConfiguration.mode, .manual)
+        let callerWorkspaceID = try XCTUnwrap(callerThread.workspaceId)
+        let callerWorkspaceThreadIDsBeforeConsultation = Set(
+            try ctx.threadRepo.list(workspaceId: callerWorkspaceID).map(\.id)
+        )
+        let callerWorkspaceThreadCountBeforeConsultation = try ctx.threadRepo.count(
+            workspaceId: callerWorkspaceID
+        )
         surface.viewModel.selectThread(threadID)
 
         let hostSend = try await router.sendAgentMessage(
@@ -541,7 +548,7 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(inheritedPeerThread.effectiveRoutingConfiguration.mode, .manual)
         XCTAssertEqual(inheritedPeerThread.providerThreadId, firstPeerThreadID.value.uuidString)
         XCTAssertEqual(inheritedPeerThread.projectId, projectID)
-        XCTAssertEqual(inheritedPeerThread.workspaceId, callerThread.workspaceId)
+        XCTAssertNil(inheritedPeerThread.workspaceId)
         XCTAssertEqual(inheritedPeerThread.executionMode, .worktree)
         XCTAssertEqual(inheritedPeerThread.baseBranch, "feature/caller-context")
         XCTAssertEqual(inheritedPeerThread.worktreePath, worktreePath)
@@ -549,6 +556,16 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(firstPeerRequest.threadId, firstPeerThreadID)
         XCTAssertEqual(firstPeerRequest.cwd, worktreePath)
         XCTAssertEqual(firstPeerRequest.runAsUser, runAsUser)
+        XCTAssertEqual(
+            Set(try ctx.threadRepo.list(workspaceId: callerWorkspaceID).map(\.id)),
+            callerWorkspaceThreadIDsBeforeConsultation,
+            "a workspace-less peer consultation must not appear in the caller's Agent App rail"
+        )
+        XCTAssertEqual(
+            try ctx.threadRepo.count(workspaceId: callerWorkspaceID),
+            callerWorkspaceThreadCountBeforeConsultation,
+            "a workspace-less peer consultation must not consume the caller's 20-thread cap"
+        )
 
         let continuationAsk = Task { @MainActor in
             try await router.askBotPeer(
@@ -629,6 +646,16 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertNotEqual(independentHandoff.peerConversationID, firstHandoff.peerConversationID)
         XCTAssertNotEqual(independentHandoff.peerThreadID, firstPeerThreadID)
         XCTAssertNotEqual(independentHandoff.peerRunID, firstHandoff.peerRunID)
+        let independentPeerThreadID = try XCTUnwrap(independentHandoff.peerThreadID)
+        XCTAssertNil(try ctx.threadRepo.get(id: independentPeerThreadID)?.workspaceId)
+        XCTAssertEqual(
+            Set(try ctx.threadRepo.list(workspaceId: callerWorkspaceID).map(\.id)),
+            callerWorkspaceThreadIDsBeforeConsultation
+        )
+        XCTAssertEqual(
+            try ctx.threadRepo.count(workspaceId: callerWorkspaceID),
+            callerWorkspaceThreadCountBeforeConsultation
+        )
 
         do {
             _ = try await router.askBotPeer(
@@ -646,7 +673,6 @@ final class AgentAppBotMentionTests: XCTestCase {
         }
         XCTAssertEqual(runner.requests.count, 4, "cross-Bot rejection must happen before dispatch")
 
-        let independentPeerThreadID = try XCTUnwrap(independentHandoff.peerThreadID)
         try ctx.threadRepo.delete(id: independentPeerThreadID)
         let requestsBeforeDeletedRejection = runner.requests.count
         do {

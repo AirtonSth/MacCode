@@ -920,6 +920,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                     title: Self.titleFromFirstMessage(peerDisplay)
                 )
                 routing = BotDeskRouting(thread: originThread, activeRun: activeCallerRun)
+                var peerInheritanceContext = originThread
+                peerInheritanceContext.workspaceId = nil
                 try botStore.upsertConversation(conversation)
                 thread = try router.createAgentThread(
                     workspace: nil,
@@ -940,7 +942,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                     surfaceID: nil,
                     routingConfiguration: peerRoutingConfiguration(routing),
                     quiet: true,
-                    inheriting: originThread
+                    inheriting: peerInheritanceContext
                 )
                 conversation.linkedAgentThreadID = thread.id
                 try botStore.upsertConversation(conversation)
