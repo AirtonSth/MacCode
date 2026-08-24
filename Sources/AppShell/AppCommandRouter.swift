@@ -699,6 +699,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             since: nil,
                             filter: .agentThreadAndQueue
                         ) { [weak agent] ev in
+                            guard Self.shouldAdmitAgentLifecycleEvent(
+                                payload: ev.payload,
+                                workspaceID: wid
+                            ) else { return }
                             DispatchQueue.main.async {
                                 guard let agent else { return }
                                 agent.viewModel.handleThreadLifecycleEvent(
@@ -7647,6 +7651,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     since: nil,
                     filter: .agentThreadAndQueue
                 ) { [weak agent] ev in
+                    guard Self.shouldAdmitAgentLifecycleEvent(
+                        payload: ev.payload,
+                        workspaceID: workspace
+                    ) else { return }
                     DispatchQueue.main.async {
                         guard let agent else { return }
                         agent.viewModel.handleThreadLifecycleEvent(
@@ -7795,6 +7803,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func defaultTitle(for type: SurfaceType) -> String {
         type.displayLabel.lowercased() == "agent app" ? "Agent App" : type.displayLabel.lowercased()
+    }
+
+    /// Reject only events that carry a valid, known workspace identity for a
+    /// different Agent surface. Legacy or malformed payloads stay fail-open.
+    nonisolated static func shouldAdmitAgentLifecycleEvent(
+        payload: JSONValue,
+        workspaceID: WorkspaceID
+    ) -> Bool {
+        guard let workspaceValue = payload.objectValue?["workspace_id"]?.stringValue,
+              let eventWorkspaceID = UUID(uuidString: workspaceValue) else {
+            return true
+        }
+        return eventWorkspaceID == workspaceID.value
     }
 
     private func makeSSHSurface(profile: SSHHostProfile, title: String?, workspace: WorkspaceID, cwd: String) throws -> SurfaceDescriptor {
