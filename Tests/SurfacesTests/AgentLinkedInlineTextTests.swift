@@ -302,4 +302,60 @@ final class AgentLinkedInlineTextTests: XCTestCase {
             "sizeThatFits must still report a concrete wrapped height for the proposed width"
         )
     }
+
+    /// WHY: live freeze pid 65678 spent the entire 8s sample on the main thread
+    /// in LazyVStackLayout.sizeThatFits → AgentLinkedInlineText. SwiftUI proposes
+    /// the column width while the NSView frame is still the previous estimate.
+    /// Measuring against bounds (widthTracksTextView / reentrant layout()) reports
+    /// height-for-240 as height-for-400 and placement never settles.
+    func test_sizeThatFits_usesProposedWidthEvenWhenFrameIsNarrower() {
+        let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        tv.string = String(repeating: "wrapping word ", count: 60)
+        tv.font = NSFont.systemFont(ofSize: 13)
+        tv.textContainer?.widthTracksTextView = true
+        tv.frame = NSRect(x: 0, y: 0, width: 240, height: 40)
+        tv.layoutSubtreeIfNeeded()
+        let heightAt240 = tv.sizeThatFitsWidth(240).height
+        let heightAt400 = tv.sizeThatFitsWidth(400).height
+        XCTAssertGreaterThan(
+            heightAt240,
+            heightAt400,
+            "narrower width must wrap to a taller block"
+        )
+        XCTAssertEqual(
+            tv.sizeThatFitsWidth(400).height,
+            heightAt400,
+            "repeated proposed-width measurement must stay stable"
+        )
+    }
+
+    func test_intrinsicContentSize_reusesMeasuredHeightWhenBoundsAreEmpty() {
+        let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        tv.string = String(repeating: "wrapping word ", count: 60)
+        tv.font = NSFont.systemFont(ofSize: 13)
+        tv.frame = .zero
+        let fitted = tv.sizeThatFitsWidth(240)
+        XCTAssertGreaterThan(fitted.height, tv.font!.boundingRectForFont.height)
+        XCTAssertEqual(
+            tv.intrinsicContentSize.height,
+            fitted.height,
+            "empty bounds must not remeasure at an unconstrained fallback width"
+        )
+    }
+
+    func test_sizeThatFits_sameWidthDoesNotInvalidateIntrinsicSize() {
+        let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        tv.string = String(repeating: "word ", count: 80)
+        tv.frame = NSRect(x: 0, y: 0, width: 240, height: 40)
+        _ = tv.sizeThatFitsWidth(240)
+        let afterMeasure = tv.intrinsicInvalidationCountForTesting
+        for _ in 0..<20 {
+            _ = tv.sizeThatFitsWidth(240)
+        }
+        XCTAssertEqual(
+            tv.intrinsicInvalidationCountForTesting,
+            afterMeasure,
+            "settled-width sizeThatFits must not dirty intrinsic size"
+        )
+    }
 }
