@@ -80,6 +80,74 @@ final class GlobalCommandInterceptorTests: XCTestCase {
         )
     }
 
+    func test_globalInterceptor_argvWrapsArbitraryCommandsAndKeepsPipelineStreamsSeparate() {
+        // WHY: Token Saver on every provider depends on the Distill sidecar
+        // classifying PATH wrappers as wrap, not HTTP. Pipelines must inherit
+        // streams so `swift test | grep` never sees mixed stderr.
+        XCTAssertEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "workspace-report",
+                arguments: ["--summary"]
+            ),
+            .wrap(command: "workspace-report", arguments: ["--summary"])
+        )
+        XCTAssertEqual(
+            DistillServiceLaunch.argvMode(programName: "swift", arguments: ["test"]),
+            .wrap(command: "swift", arguments: ["test"])
+        )
+        XCTAssertEqual(
+            DistillServiceLaunch.argvMode(programName: "rg", arguments: ["pattern"]),
+            .wrap(command: "rg", arguments: ["pattern"])
+        )
+        XCTAssertEqual(
+            DistillServiceLaunch.argvMode(
+                programName: "node",
+                arguments: ["/opt/homebrew/bin/codex", "app-server"]
+            ),
+            .passthrough,
+            "shebang interpreters must not become Distill HTTP or wrap"
+        )
+
+        XCTAssertEqual(
+            CommandWrapPolicy.childStreams(
+                command: "swift",
+                args: ["test"],
+                environment: noEnvironment,
+                isTerminalToAgent: false
+            ),
+            .inheritAll,
+            "mid-pipeline wrap must inherit stdout/stderr"
+        )
+        XCTAssertEqual(
+            CommandWrapPolicy.childStreams(
+                command: "swift",
+                args: ["test"],
+                environment: noEnvironment,
+                isTerminalToAgent: true
+            ),
+            .captureSeparateStdoutAndStderr
+        )
+
+        let stdout = Data("ok\n".utf8)
+        let stderr = Data("error: File.swift:1\n".utf8)
+        let pipeline = CommandWrapPolicy.decide(
+            command: "swift",
+            isTerminalToAgent: false,
+            outputIsValidUTF8: true,
+            byteCount: 4_000,
+            lineCount: 80,
+            environment: noEnvironment
+        )
+        XCTAssertEqual(pipeline, .passthrough(reason: "not_terminal"))
+        switch CommandWrapPolicy.capturedDelivery(action: pipeline, stdout: stdout, stderr: stderr) {
+        case .passthrough(let out, let err):
+            XCTAssertEqual(out, stdout)
+            XCTAssertEqual(err, stderr)
+        case .distill:
+            XCTFail("pipeline interceptor must not Distill mixed streams")
+        }
+    }
+
     func test_globalInterceptor_emitsAppliedReceiptOnlyForNetShrunkProviderVisibleOutput() async throws {
         // WHY: the interceptor's success receipt is the provider-visible proof that
         // bytes changed; a transport response alone is not an applied Distill claim.

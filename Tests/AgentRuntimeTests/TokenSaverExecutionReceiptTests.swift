@@ -242,6 +242,51 @@ final class TokenSaverExecutionReceiptTests: XCTestCase {
         XCTAssertFalse(json.contains("provider-secret-stays-outside-receipt"))
     }
 
+    func test_stampIdentityRestoresManagedPathOnAdmittedReceipt() {
+        // WHY: startRun always stampIdentity's the host env. scrub() drops
+        // ~/.remote-code/bin from PATH; without restoring it, Bot Desk and
+        // Agent App provider processes lose the global Distill interceptor.
+        let managed = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+        var env = TokenSaverExecutionReceiptSeam.environment(
+            from: receipt(provider: .codex, sidecarAvailable: true)
+        )
+        env["PATH"] = "\(managed):/usr/bin:/bin"
+        env["RC_REMOTE_CODE_MANAGED_BIN"] = managed
+        env["REMOTE_CODE_DISTILL_STATE_PATH"] = "/tmp/DistillCLIState.json"
+        let stamped = TokenSaverExecutionReceiptSeam.stampIdentity(
+            environment: env,
+            rootRunId: rootRunID,
+            attemptId: attemptID,
+            provider: .codex
+        )
+        XCTAssertEqual(stamped["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+        XCTAssertEqual(stamped["RC_REMOTE_CODE_MANAGED_BIN"], managed)
+        let path = stamped["PATH"] ?? ""
+        XCTAssertTrue(
+            path == managed || path.hasPrefix(managed + ":"),
+            "admitted stamp must keep wrappers first: \(path)"
+        )
+        XCTAssertEqual(stamped["REMOTE_CODE_DISTILL_STATE_PATH"], "/tmp/DistillCLIState.json")
+
+        var degraded = TokenSaverExecutionReceiptSeam.environment(
+            from: receipt(provider: .grok, sidecarAvailable: false)
+        )
+        degraded["PATH"] = "\(managed):/usr/bin"
+        degraded["RC_REMOTE_CODE_MANAGED_BIN"] = managed
+        let stillDegraded = TokenSaverExecutionReceiptSeam.stampIdentity(
+            environment: degraded,
+            rootRunId: rootRunID,
+            attemptId: attemptID,
+            provider: .grok
+        )
+        XCTAssertNil(stillDegraded["RC_TOKEN_SAVER_DISTILL_HINT"])
+        let degradedPath = stillDegraded["PATH"] ?? ""
+        XCTAssertFalse(
+            degradedPath == managed || degradedPath.hasPrefix(managed + ":"),
+            "sidecar-unavailable receipts must not keep wrap PATH"
+        )
+    }
+
     func test_recoveryStampKeepsRootIdentityAndRotatesAttemptIdentity() throws {
         // WHY: crash recovery must attribute work to the durable run while giving
         // the replacement process a distinct attempt for retry diagnostics.

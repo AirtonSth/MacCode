@@ -1968,36 +1968,10 @@ public final class AppContext {
             environment: baseEnvironment,
             cliState: cliState
         )
-        // Installation is not readiness. Prefer the controller's `.running`
-        // event, but also accept a live DistillCLIState lease so a lagging
-        // `.starting` / transient status mismatch cannot sticky-deny distill
-        // for primary and nested runs after the sidecar is already serving.
-        let sidecarAvailable: Bool
-        if case .running = tokenSaverDistillServiceController.status {
-            sidecarAvailable = true
-        } else if Self.isRunningUnitTests,
-                  distillClientOverrideForTesting != nil {
-            // Unit tests that inject a live DistillServiceClient are exercising
-            // environment admission, not the controller's process lifecycle.
-            // Dedicated controller tests still cover failed/blocked readiness
-            // without an injected client.
-            sidecarAvailable = true
-        } else if Self.isRunningUnitTests,
-                  tokenSaverDistillServiceController.status == .notStarted {
-            // Pure environment-matrix tests have no sidecar process to start.
-            // Treat the untouched test controller as an injected-ready seam;
-            // explicit failed/blocked states remain fail-open below.
-            sidecarAvailable = true
-        } else if case .blocked = tokenSaverDistillServiceController.status {
-            // Explicit eligibility block (subscription/model) must fail open.
-            sidecarAvailable = false
-        } else if TokenSaverSidecarLeaseProbe.isHealthy(stateFileURL: tokenSaverDistillCLIStateURL) {
-            // Controller lag: ready lease on disk while status is still starting
-            // or briefly notStarted after a restart.
-            sidecarAvailable = true
-        } else {
-            sidecarAvailable = false
-        }
+        // Token Saver ON admits DISTILL_HINT and PATH wrappers. Sidecar
+        // blocked/failed/starting is Distill fail-open, not interceptor denial:
+        // Bot Desk compress demand-starts Distill, and stampIdentity would
+        // otherwise scrub the same turn.
         let live = TokenSaverWaveLiveRollout.liveWaves.map(\.rawValue).sorted().joined(separator: ",")
         let thread = try? threadRepo.get(id: threadId)
         let scope = tokenSaverPersistentScope(threadId: threadId)
@@ -2006,7 +1980,7 @@ public final class AppContext {
         let receipt = TokenSaverExecutionReceiptSeam.admit(
             tokenSaverEnabled: true,
             sameUser: true,
-            sidecarAvailable: sidecarAvailable,
+            sidecarAvailable: true,
             provider: provider,
             threadId: threadId.value.uuidString,
             workspaceId: workspaceID,
