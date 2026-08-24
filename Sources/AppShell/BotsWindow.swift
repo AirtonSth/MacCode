@@ -2869,6 +2869,9 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var lastAttentionAcknowledgedOnScreenForTesting: BotsScreen?
     /// Test seam: full-fleet reloads. Roster dest must not increment this.
     public private(set) var fleetReloadCountForTesting = 0
+    /// Test seam: actual Active Bots store hydration passes, excluding
+    /// generation-coalesced appearance/tab requests.
+    public private(set) var activeBotsHydrationCountForTesting = 0
     /// Test seam: thread message rereads. Warm-cache dest must not increment this.
     public private(set) var deskMessageRestoreCountForTesting = 0
     /// Test seam: listRecentFinished scans. Dest after first lookup must not increment this.
@@ -3051,12 +3054,20 @@ public final class BotsViewModel: ObservableObject {
     private var shellSidebarVisibilityObserver: NSObjectProtocol?
     private var deskLiveTurnWatch: Task<Void, Never>?
     private var tokenSaverFooterReloadTask: Task<Void, Never>?
+    private var navigationFreshnessTask: Task<Void, Never>?
+    private var navigationFreshnessGeneration: UInt64 = 0
+    private var detachedDeskBotID: BotID?
+    var navigationFirstFrameDeferral = false
     private var tokenSaverFooterObserver: NSObjectProtocol?
     private var tokenSaverFooterAccountObserver: NSObjectProtocol?
     private var tokenSaverFooterStatusObserver: NSObjectProtocol?
     public var computerGuestService: BotComputerGuestService?
 
-    public init(context: AppContext, router: AppCommandRouter? = nil) {
+    public init(
+        context: AppContext,
+        router: AppCommandRouter? = nil,
+        loadImmediately: Bool = true
+    ) {
         self.context = context
         self.router = router
         self.botStore = context.botStore
@@ -3089,7 +3100,9 @@ public final class BotsViewModel: ObservableObject {
         restoreShellSidebarCollapsedIfNeeded()
         observeShellSidebarVisibility()
         bindTokenSaverThreadFooter()
-        reload()
+        if loadImmediately {
+            reload()
+        }
         restoreScreenIfNeeded()
         studioDraftHydrated = true
         if !composerHydrated {
@@ -3107,6 +3120,7 @@ public final class BotsViewModel: ObservableObject {
     deinit {
         deskLiveTurnWatch?.cancel()
         tokenSaverFooterReloadTask?.cancel()
+        navigationFreshnessTask?.cancel()
         if let shellSidebarVisibilityObserver {
             NotificationCenter.default.removeObserver(shellSidebarVisibilityObserver)
         }
@@ -3120,6 +3134,45 @@ public final class BotsViewModel: ObservableObject {
             NotificationCenter.default.removeObserver(tokenSaverFooterStatusObserver)
         }
         context.coordinator.removeObserver(self)
+    }
+
+    /// Shell and detached hosts opt into cache-first selection. Direct model
+    /// callers retain eager loading for backwards-compatible unit semantics.
+    public func enableNavigationFirstFrameDeferral() {
+        navigationFirstFrameDeferral = true
+    }
+
+    /// Detached windows seed only the requested identity for first paint. The
+    /// normal Desk side effects run from `scheduleFreshnessPass` after SwiftUI
+    /// has had one turn to mount the exact destination.
+    func prepareDetachedDesk(botID: BotID) {
+        detachedDeskBotID = botID
+        if let bot = try? botStore.get(id: botID), bot.deletedAt == nil {
+            openDeskFromCache(bot)
+        } else {
+            adoptSelectedBot(botID)
+            screen = .desk
+        }
+    }
+
+    public func scheduleFreshnessPass() {
+        guard navigationFirstFrameDeferral else { return }
+        if let botID = detachedDeskBotID {
+            scheduleNavigationFreshness(.desk(botID: botID, reloadFirst: true))
+        } else {
+            scheduleNavigationFreshness(.reload)
+        }
+    }
+
+    func waitForNavigationFreshnessForTesting() async {
+        while let task = navigationFreshnessTask {
+            let generation = navigationFreshnessGeneration
+            await task.value
+            if navigationFreshnessGeneration == generation,
+               navigationFreshnessTask == nil {
+                return
+            }
+        }
     }
 
     public var selectedBot: BotDefinition? {
@@ -3214,7 +3267,11 @@ public final class BotsViewModel: ObservableObject {
 
     private func openScheduleTasksNow() {
         screen = .scheduleTasks
-        reloadScheduleTasks()
+        if navigationFirstFrameDeferral {
+            scheduleFreshnessPass()
+        } else {
+            reloadScheduleTasks()
+        }
     }
 
     public func reloadScheduleTasks() {
@@ -3360,7 +3417,15 @@ public final class BotsViewModel: ObservableObject {
 
     private func openActiveBotsNow() {
         screen = .activeBots
-        reloadActiveBotsScreen()
+        scheduleActiveBotsFreshness()
+    }
+
+    public func scheduleActiveBotsFreshness() {
+        if navigationFirstFrameDeferral {
+            scheduleNavigationFreshness(.activeBots)
+        } else {
+            reloadActiveBotsScreen()
+        }
     }
 
     public func openActiveBotItem(_ item: ActiveBotScreenItem) {
@@ -3376,6 +3441,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func reloadActiveBotsScreen() {
+        activeBotsHydrationCountForTesting += 1
         settleTerminalWorkingConversations()
         let liveBots = liveWorkingBots()
         let inMemoryStartedAt = Dictionary(uniqueKeysWithValues: liveBots.compactMap { bot in
@@ -3880,7 +3946,9 @@ public final class BotsViewModel: ObservableObject {
     public func requestLeaveBotsMode() {
         flushPendingDraftPersistence()
         requestLeaveUnsavedNewBot { [weak self] in
-            self?.onLeaveBots?()
+            guard let self else { return }
+            self.invalidateNavigationFreshness()
+            self.onLeaveBots?()
         }
     }
 
@@ -4001,6 +4069,11 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func openDesk(_ bot: BotDefinition) {
+        guard !navigationFirstFrameDeferral else {
+            openDeskFromCache(bot)
+            scheduleNavigationFreshness(.desk(botID: bot.id, reloadFirst: false))
+            return
+        }
         _ = refreshPublishedIdentity(for: bot.id)
         adoptSelectedBot(bot.id)
         screen = .desk
@@ -4013,6 +4086,141 @@ public final class BotsViewModel: ObservableObject {
         lastGuestScreenURL = guestScreenURLByBot[bot.id.value]
         if displayedDesktopKind == .dockerDesktop {
             presentGuestDesktop(botID: bot.id)
+        }
+    }
+
+    /// Publish only facts already retained by the selected Bot. The store and
+    /// coordinator hydration runs in the one deferred pass below, so a cold
+    /// Bot can never briefly show another Bot's transcript or live turn.
+    private func openDeskFromCache(_ bot: BotDefinition) {
+        let cachedBot = bots.first(where: { $0.id == bot.id }) ?? bot
+        adoptSelectedBot(cachedBot.id)
+        screen = .desk
+        persistSelection()
+        resetTokenSaverFooterSnapshot()
+        let cachedConversation = destConversation(for: cachedBot.id)
+        selectedConversation = cachedConversation
+        conversations = studioSupportByBot[cachedBot.id]?.conversations
+            ?? conversations.filter { $0.botID == cachedBot.id }
+        let cachedConversationID = messagesConversationIDByBot[cachedBot.id]
+        deskMessages = cachedConversation?.id == cachedConversationID
+            ? (messagesByBot[cachedBot.id] ?? [])
+            : []
+        if let threadID = cachedConversation?.linkedAgentThreadID {
+            deskLiveTimeline = liveTimelineByThread[threadID] ?? AssistantTimelineState()
+            deskStreamEventCount = liveStreamCountByThread[threadID] ?? 0
+        } else {
+            deskLiveTimeline = AssistantTimelineState()
+            deskStreamEventCount = 0
+        }
+        syncQueuedFollowUps()
+        lastGuestScreenURL = guestScreenURLByBot[cachedBot.id.value]
+    }
+
+    private enum NavigationFreshnessOperation {
+        case reload
+        case activeBots
+        case desk(botID: BotID, reloadFirst: Bool)
+        case thread(botID: BotID, conversationID: BotConversationID)
+    }
+
+    private func scheduleNavigationFreshness(_ operation: NavigationFreshnessOperation) {
+        navigationFreshnessGeneration &+= 1
+        let generation = navigationFreshnessGeneration
+        navigationFreshnessTask?.cancel()
+        navigationFreshnessTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            defer {
+                // A cancelled task may resume after its replacement has been
+                // installed. Only the owner generation may clear the handle.
+                if self.navigationFreshnessGeneration == generation {
+                    self.navigationFreshnessTask = nil
+                }
+            }
+            guard self.navigationFreshnessIsCurrent(generation) else { return }
+            switch operation {
+            case .reload:
+                self.reload()
+            case .activeBots:
+                guard self.screen.resolvedDestination == .activeBots else { return }
+                self.reloadActiveBotsScreen()
+            case .desk(let botID, let reloadFirst):
+                self.performDeskFreshness(
+                    botID: botID,
+                    reloadFirst: reloadFirst,
+                    generation: generation
+                )
+            case .thread(let botID, let conversationID):
+                self.performThreadFreshness(
+                    botID: botID,
+                    conversationID: conversationID,
+                    generation: generation
+                )
+            }
+        }
+    }
+
+    private func invalidateNavigationFreshness() {
+        navigationFreshnessGeneration &+= 1
+        navigationFreshnessTask?.cancel()
+        navigationFreshnessTask = nil
+    }
+
+    private func navigationFreshnessIsCurrent(
+        _ generation: UInt64,
+        botID: BotID? = nil,
+        conversationID: BotConversationID? = nil
+    ) -> Bool {
+        guard !Task.isCancelled,
+              navigationFreshnessGeneration == generation else { return false }
+        if let botID {
+            guard selectedBotID == botID,
+                  screen.resolvedDestination == .desk else { return false }
+        }
+        if let conversationID {
+            guard selectedConversation?.id == conversationID else { return false }
+        }
+        return true
+    }
+
+    private func performDeskFreshness(
+        botID: BotID,
+        reloadFirst: Bool,
+        generation: UInt64
+    ) {
+        guard navigationFreshnessIsCurrent(generation, botID: botID) else { return }
+        if reloadFirst {
+            reload()
+            guard navigationFreshnessIsCurrent(generation, botID: botID) else {
+                // `reload` may find that the exact target was deleted. Never
+                // leave this detached window pointing at a fallback teammate.
+                if navigationFreshnessGeneration == generation {
+                    adoptSelectedBot(botID)
+                    screen = .desk
+                }
+                return
+            }
+        }
+        guard let storedBot = try? botStore.get(id: botID),
+              storedBot.deletedAt == nil else { return }
+        adoptSelectedBot(botID)
+        screen = .desk
+        persistSelection()
+        guard navigationFreshnessIsCurrent(generation, botID: botID) else { return }
+        markOpenedConversationRead(botID: botID)
+        guard navigationFreshnessIsCurrent(generation, botID: botID) else { return }
+        _ = refreshPublishedIdentity(for: botID)
+        guard navigationFreshnessIsCurrent(generation, botID: botID) else { return }
+        reloadSelectedBot(id: botID)
+        guard navigationFreshnessIsCurrent(generation, botID: botID) else { return }
+        syncQueuedFollowUps()
+        drainQueuedFollowUp()
+        guard navigationFreshnessIsCurrent(generation, botID: botID) else { return }
+        deskTimelineRejoinToken &+= 1
+        lastGuestScreenURL = guestScreenURLByBot[botID.value]
+        if displayedDesktopKind == .dockerDesktop {
+            presentGuestDesktop(botID: botID)
         }
     }
 
@@ -4116,10 +4324,54 @@ public final class BotsViewModel: ObservableObject {
         selectedConversationByBot[conversation.botID] = conversation.id
         applyDeskRouting(for: conversation)
         rememberStudioSupport(for: conversation.botID)
+        guard !navigationFirstFrameDeferral else {
+            deskMessages = messagesByBot[conversation.botID] ?? []
+            if messagesConversationIDByBot[conversation.botID] != conversation.id {
+                deskMessages = []
+            }
+            deskWorkLog = []
+            if let threadID = conversation.linkedAgentThreadID {
+                deskLiveTimeline = liveTimelineByThread[threadID] ?? AssistantTimelineState()
+            } else {
+                deskLiveTimeline = AssistantTimelineState()
+            }
+            deskTimelineRejoinToken &+= 1
+            scheduleNavigationFreshness(
+                .thread(botID: conversation.botID, conversationID: conversation.id)
+            )
+            return
+        }
         restoreDeskMessages(botID: conversation.botID)
         restoreDeskWorkLog(botID: conversation.botID)
         restoreDeskLiveTurn(botID: conversation.botID)
         reloadTokenSaverThreadSavings()
+        deskTimelineRejoinToken &+= 1
+    }
+
+    private func performThreadFreshness(
+        botID: BotID,
+        conversationID: BotConversationID,
+        generation: UInt64
+    ) {
+        guard navigationFreshnessIsCurrent(
+            generation,
+            botID: botID,
+            conversationID: conversationID
+        ) else { return }
+        restoreDeskMessages(botID: botID)
+        guard navigationFreshnessIsCurrent(
+            generation,
+            botID: botID,
+            conversationID: conversationID
+        ) else { return }
+        restoreDeskWorkLog(botID: botID)
+        restoreDeskLiveTurn(botID: botID)
+        reloadTokenSaverThreadSavings()
+        guard navigationFreshnessIsCurrent(
+            generation,
+            botID: botID,
+            conversationID: conversationID
+        ) else { return }
         deskTimelineRejoinToken &+= 1
     }
 
@@ -9568,20 +9820,15 @@ public struct BotsRootView: View {
                 switch vm.screen.resolvedDestination {
                 case .studio:
                     studioScreen
-                        .transition(.opacity)
                 case .activeBots:
                     ActiveBotsRootView(vm: vm)
-                        .transition(.opacity)
                 case .scheduleTasks:
                     BotScheduleTasksRootView(vm: vm)
-                        .transition(.opacity)
                 case .desk, .fleet, .attention:
                     deskScreen
-                        .transition(.opacity)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .animation(DS.Motion.standard, value: vm.screen.resolvedDestination)
         }
         .frame(minWidth: embedsRosterRail ? 980 : 700, minHeight: 680)
         .background(DS.Palette.bg)
@@ -9600,7 +9847,7 @@ public struct BotsRootView: View {
         }
         .modifier(BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail))
         .modifier(BotsUnsavedNewBotConfirmation(vm: vm))
-        .onAppear { vm.reload() }
+        .onAppear { vm.scheduleFreshnessPass() }
     }
 
     private var showsRosterRail: Bool {
@@ -11558,7 +11805,9 @@ public final class BotsWindowController: NSWindowController, NSWindowDelegate {
     private let viewModel: BotsViewModel
 
     public init(context: AppContext, router: AppCommandRouter) {
-        self.viewModel = BotsViewModel(context: context, router: router)
+        let vm = BotsViewModel(context: context, router: router, loadImmediately: false)
+        vm.enableNavigationFirstFrameDeferral()
+        self.viewModel = vm
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1120, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -11581,7 +11830,6 @@ public final class BotsWindowController: NSWindowController, NSWindowDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     public func show() {
-        viewModel.reload()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -11599,12 +11847,10 @@ public final class BotDeskWindowController: NSWindowController, NSWindowDelegate
         router: AppCommandRouter,
         onClose: @escaping () -> Void
     ) {
-        let vm = BotsViewModel(context: context, router: router)
+        let vm = BotsViewModel(context: context, router: router, loadImmediately: false)
         vm.presentsAsDetachedWindow = true
-        vm.reload()
-        if let bot = vm.bots.first(where: { $0.id == botID }) {
-            vm.openDesk(bot)
-        }
+        vm.enableNavigationFirstFrameDeferral()
+        vm.prepareDetachedDesk(botID: botID)
         self.viewModel = vm
         self.onClose = onClose
         let window = NSWindow(
@@ -11632,10 +11878,7 @@ public final class BotDeskWindowController: NSWindowController, NSWindowDelegate
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     public func show() {
-        viewModel.reload()
-        if let bot = viewModel.selectedBot {
-            viewModel.openDesk(bot)
-        }
+        viewModel.scheduleFreshnessPass()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -11659,11 +11902,9 @@ public final class BotGuestDesktopWindowController: NSWindowController, NSWindow
         onClose: @escaping () -> Void
     ) {
         self.botID = botID
-        let vm = BotsViewModel(context: context, router: router)
-        vm.reload()
-        if let bot = vm.bots.first(where: { $0.id == botID }) {
-            vm.openDesk(bot)
-        }
+        let vm = BotsViewModel(context: context, router: router, loadImmediately: false)
+        vm.enableNavigationFirstFrameDeferral()
+        vm.prepareDetachedDesk(botID: botID)
         self.viewModel = vm
         self.onClose = onClose
         let window = NSWindow(
@@ -11691,10 +11932,7 @@ public final class BotGuestDesktopWindowController: NSWindowController, NSWindow
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     public func show() {
-        viewModel.reload()
-        if let bot = viewModel.bots.first(where: { $0.id == botID }) {
-            viewModel.openDesk(bot)
-        }
+        viewModel.scheduleFreshnessPass()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -11741,5 +11979,6 @@ private struct BotGuestDesktopRoot: View {
         } message: {
             Text(vm.errorMessage ?? "")
         }
+        .onAppear { vm.scheduleFreshnessPass() }
     }
 }

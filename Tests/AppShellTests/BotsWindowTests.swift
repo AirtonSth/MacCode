@@ -3172,6 +3172,61 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.activeBotsSubtitle, "1 bot is running")
     }
 
+    func test_deferredActiveBotsAppearanceAndTabCoalesce_onNextMainTurn() async throws {
+        // WHY: ActiveBotsRootView used to synchronously scan active and
+        // finished rows on appearance, then repeat the same work for a tab
+        // change before the deferred main-actor turn could begin.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        _ = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.enableNavigationFirstFrameDeferral()
+
+        let beforeNavigation = vm.activeBotsHydrationCountForTesting
+        vm.openActiveBots()
+        vm.scheduleActiveBotsFreshness() // ActiveBotsRootView.onAppear
+        vm.activeBotsTab = .lastFinished
+        vm.scheduleActiveBotsFreshness() // ActiveBotsRootView.onChange
+
+        XCTAssertEqual(
+            vm.activeBotsHydrationCountForTesting,
+            beforeNavigation,
+            "appearance and tab selection must do zero synchronous hydration"
+        )
+        await vm.waitForNavigationFreshnessForTesting()
+        XCTAssertEqual(
+            vm.activeBotsHydrationCountForTesting,
+            beforeNavigation + 1,
+            "generation coalescing must leave exactly one deferred hydration pass"
+        )
+        XCTAssertEqual(vm.screen, .activeBots)
+        XCTAssertEqual(vm.activeBotsTab, .lastFinished)
+
+        let beforeDestinationChange = vm.activeBotsHydrationCountForTesting
+        vm.scheduleActiveBotsFreshness()
+        vm.screen = .desk
+        await vm.waitForNavigationFreshnessForTesting()
+        XCTAssertEqual(
+            vm.activeBotsHydrationCountForTesting,
+            beforeDestinationChange,
+            "a stale Active Bots task must not hydrate after the destination changes"
+        )
+
+        var didLeaveBots = false
+        vm.onLeaveBots = { didLeaveBots = true }
+        vm.openActiveBots()
+        let beforeLeave = vm.activeBotsHydrationCountForTesting
+        vm.requestLeaveBotsMode()
+        await vm.waitForNavigationFreshnessForTesting()
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(didLeaveBots)
+        XCTAssertEqual(
+            vm.activeBotsHydrationCountForTesting,
+            beforeLeave,
+            "leaving for Workspaces must invalidate offscreen Active Bots hydration"
+        )
+    }
+
     func test_openActiveBotItemOpensDesk() throws {
         // WHY: a row on the Active Bots screen must dest that teammate's
         // Desk, same as opening an Active Threads row dests the thread.
@@ -10870,6 +10925,91 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertEqual(vm.selectedBotID, quinn.id)
         XCTAssertEqual(vm.screen, .desk)
+    }
+
+    func test_deferredDetachedDeskCompletesExactOpenEffects_onNextMainTurn() async throws {
+        // WHY: detached windows used to stop after their deferred reload, so
+        // identity, mark-read, persisted selection, and Docker presentation
+        // could all be skipped even though the requested Desk was visible.
+        let (context, owner, piper, _) = try makeDockerStudio()
+        let quinn = try owner.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        let unread = BotConversation(
+            botID: piper.id,
+            title: "Unread",
+            unread: true,
+            attentionState: .unreadActivity
+        )
+        try context.botStore.upsertConversation(unread)
+
+        let detached = BotsViewModel(context: context, loadImmediately: false)
+        detached.enableNavigationFirstFrameDeferral()
+        detached.prepareDetachedDesk(botID: piper.id)
+        XCTAssertEqual(detached.selectedBotID, piper.id, "first paint must already belong to Piper")
+
+        _ = try context.botStore.renameHandle(id: piper.id, handle: "piper-fresh")
+        UserDefaults.standard.set(
+            quinn.id.value.uuidString.lowercased(),
+            forKey: "bots.selectedBotID"
+        )
+        detached.desktopKindOverrideForTesting = .dockerDesktop
+        detached.dockerGuestReadyOverrideForTesting = false
+        detached.scheduleFreshnessPass()
+        await detached.waitForNavigationFreshnessForTesting()
+
+        XCTAssertEqual(detached.selectedBotID, piper.id)
+        XCTAssertEqual(detached.selectedBot?.handle, "piper-fresh", "deferred identity must be fresh")
+        XCTAssertEqual(
+            UserDefaults.standard.string(forKey: "bots.selectedBotID"),
+            piper.id.value.uuidString.lowercased(),
+            "the exact detached destination must win persisted selection"
+        )
+        XCTAssertFalse(try XCTUnwrap(
+            context.botStore.conversation(id: unread.id)
+        ).unread)
+        XCTAssertEqual(
+            detached.guestLaunchState(for: piper.id),
+            .failed(BotComputerDockerError.cliMissing.description),
+            "the original openDesk Docker presentation effect must still run"
+        )
+    }
+
+    func test_deferredDeskRaceKeepsNewestBot_andOldTaskCannotClearItsHandle() async throws {
+        // WHY: a cancelled freshness task could resume and nil the replacement
+        // handle. Rapid Piper -> Quinn selection then skipped Quinn's effects
+        // or briefly restored Piper's transcript.
+        let context = try makeContext()
+        let owner = BotsViewModel(context: context)
+        let piper = try owner.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try owner.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        let piperUnread = BotConversation(
+            botID: piper.id,
+            title: "Piper unread",
+            unread: true,
+            attentionState: .unreadActivity
+        )
+        try context.botStore.upsertConversation(piperUnread)
+        let quinnUnread = BotConversation(
+            botID: quinn.id,
+            title: "Quinn unread",
+            unread: true,
+            attentionState: .unreadActivity
+        )
+        try context.botStore.upsertConversation(quinnUnread)
+
+        let deferred = BotsViewModel(context: context, loadImmediately: false)
+        deferred.enableNavigationFirstFrameDeferral()
+        deferred.openDesk(piper)
+        deferred.openDesk(quinn)
+        await deferred.waitForNavigationFreshnessForTesting()
+
+        XCTAssertEqual(deferred.selectedBotID, quinn.id)
+        XCTAssertTrue(deferred.conversations.allSatisfy { $0.botID == quinn.id })
+        XCTAssertTrue(try XCTUnwrap(
+            context.botStore.conversation(id: piperUnread.id)
+        ).unread, "the cancelled Piper task must have no mark-read side effect")
+        XCTAssertFalse(try XCTUnwrap(
+            context.botStore.conversation(id: quinnUnread.id)
+        ).unread, "the newest Quinn task must complete its exact open effects")
     }
 
     func test_studioDoesNotHideUnread_becauseOnlyTheOpenDeskIsBeingRead() throws {

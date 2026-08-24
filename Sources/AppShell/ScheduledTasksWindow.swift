@@ -165,9 +165,14 @@ public final class ScheduledTasksViewModel: ObservableObject {
     @Published public private(set) var activeRunStatuses: [UUID: ScheduledTaskRunStatus] = [:]
     /// Counts for All / Active / Paused chips (search-scoped, not status-filtered).
     @Published public private(set) var filterCounts: (all: Int, active: Int, paused: Int) = (0, 0, 0)
-    @Published public var searchText: String = "" { didSet { reloadTasks() } }
-    @Published public var statusFilter: ScheduledTaskStatusFilter = .all { didSet { reloadTasks() } }
-    @Published public var selectedTaskID: UUID? { didSet { reloadRuns() } }
+    @Published public var searchText: String = "" { didSet { reloadTasksOrDefer() } }
+    @Published public var statusFilter: ScheduledTaskStatusFilter = .all { didSet { reloadTasksOrDefer() } }
+    @Published public var selectedTaskID: UUID? {
+        didSet {
+            guard !suppressSelectedTaskReload else { return }
+            reloadRunsOrDefer()
+        }
+    }
     @Published public var editorDraft: ScheduledTaskEditorDraft?
     @Published public var errorMessage: String?
     @Published public private(set) var serviceStatus: String = "Runs inside RemoteCode while the app is open"
@@ -182,18 +187,75 @@ public final class ScheduledTasksViewModel: ObservableObject {
     private let settingsStore: SettingsStore
     private var providerLoadCount = 0
     private var activeRunPollTask: Task<Void, Never>?
+    private var freshnessTask: Task<Void, Never>?
+    private var navigationTask: Task<Void, Never>?
+    private var freshnessGeneration: UInt64 = 0
+    private var navigationGeneration: UInt64 = 0
+    private var suppressSelectedTaskReload = false
+    private let deferHydration: Bool
+    private(set) var fullHydrationCountForTesting = 0
 
-    public init(context: AppContext, router: AppCommandRouter) {
+    public init(context: AppContext, router: AppCommandRouter, loadImmediately: Bool = true) {
         self.context = context
         self.router = router
         self.store = ScheduledTaskStore(db: context.db)
         self.settingsStore = SettingsStore(db: context.db)
-        reload()
+        self.deferHydration = !loadImmediately
+        if loadImmediately {
+            reload()
+        }
+    }
+
+    deinit {
+        freshnessTask?.cancel()
+        activeRunPollTask?.cancel()
+        navigationTask?.cancel()
+    }
+
+    /// Mount callers use the existing published cache for the first frame and
+    /// ask the model for one coalesced freshness pass on the next main turn.
+    public func scheduleFreshnessPass() {
+        guard deferHydration else { return }
+        freshnessTask?.cancel()
+        freshnessGeneration &+= 1
+        let generation = freshnessGeneration
+        freshnessTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            defer { self.finishFreshnessTask(ownedBy: generation) }
+            guard !Task.isCancelled,
+                  self.freshnessGeneration == generation else { return }
+            self.reload()
+        }
+    }
+
+    private func finishFreshnessTask(ownedBy generation: UInt64) {
+        guard freshnessGeneration == generation else { return }
+        freshnessTask = nil
+    }
+
+    func waitForFreshnessForTesting() async {
+        while let task = freshnessTask {
+            let generation = freshnessGeneration
+            await task.value
+            if freshnessGeneration == generation, freshnessTask == nil {
+                return
+            }
+        }
+    }
+
+    private func reloadTasksOrDefer() {
+        if deferHydration { scheduleFreshnessPass() } else { reloadTasks() }
+    }
+
+    private func reloadRunsOrDefer() {
+        if deferHydration { scheduleFreshnessPass() } else { reloadRuns() }
     }
 
     public var selectedTask: ScheduledTask? { tasks.first { $0.id == selectedTaskID } }
 
     public func reload() {
+        fullHydrationCountForTesting += 1
         do {
             workspaces = try router.listWorkspaces()
             users = ScheduledSystemUserCatalog.eligibleUsers()
@@ -333,8 +395,29 @@ public final class ScheduledTasksViewModel: ObservableObject {
 
     public func openThread(_ run: ScheduledTaskRun) {
         guard let threadID = run.threadID else { return }
+        guard !deferHydration else {
+            router.windowController?.presentWorkspaceContent()
+            navigationTask?.cancel()
+            navigationGeneration &+= 1
+            let generation = navigationGeneration
+            navigationTask = Task { @MainActor [weak self] in
+                await Task.yield()
+                guard let self else { return }
+                defer { self.finishNavigationTask(ownedBy: generation) }
+                guard !Task.isCancelled,
+                      self.navigationGeneration == generation else { return }
+                do { _ = try self.router.openAgentThread(thread: threadID, markRead: true) }
+                catch { self.errorMessage = String(describing: error) }
+            }
+            return
+        }
         do { _ = try router.openAgentThread(thread: threadID, markRead: true) }
         catch { errorMessage = String(describing: error) }
+    }
+
+    private func finishNavigationTask(ownedBy generation: UInt64) {
+        guard navigationGeneration == generation else { return }
+        navigationTask = nil
     }
 
     public func providerSnapshots(for provider: AgentProvider) -> [AgentProviderSnapshot] {
@@ -361,7 +444,9 @@ public final class ScheduledTasksViewModel: ObservableObject {
             runCounts = try store.runCounts()
             // Overview is a full list; do not auto-select a task into the detail page.
             if let selectedTaskID, !matching.contains(where: { $0.id == selectedTaskID }) {
+                suppressSelectedTaskReload = true
                 self.selectedTaskID = nil
+                suppressSelectedTaskReload = false
             }
             reloadActiveRunStatuses()
         } catch { errorMessage = String(describing: error) }
@@ -525,7 +610,7 @@ public struct ScheduledTasksRootView: View {
         } message: {
             Text(vm.errorMessage ?? "")
         }
-        .onAppear { vm.reload() }
+        .onAppear { vm.scheduleFreshnessPass() }
         .onChange(of: vm.editorDraft) { draft in
             // External create/edit still routes into the full-page editor.
             if draft != nil, screen != .editor {
@@ -1663,7 +1748,7 @@ public final class ScheduledTasksWindowController: NSWindowController, NSWindowD
     private let viewModel: ScheduledTasksViewModel
 
     public init(context: AppContext, router: AppCommandRouter) {
-        self.viewModel = ScheduledTasksViewModel(context: context, router: router)
+        self.viewModel = ScheduledTasksViewModel(context: context, router: router, loadImmediately: false)
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1120, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -1683,7 +1768,6 @@ public final class ScheduledTasksWindowController: NSWindowController, NSWindowD
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     public func show() {
-        viewModel.reload()
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

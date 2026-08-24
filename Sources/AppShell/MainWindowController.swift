@@ -292,6 +292,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     /// unchanged signature comes back through `refreshFromState` (app
     /// become-key/active/reopen) the full teardown/rebuild is skipped.
     private var lastWorkspaceContainerSignature: String?
+    /// Cached workspace content stays mounted (but hidden) while a shell
+    /// destination is visible. Keeping this tree alive lets a shell switch
+    /// paint from the existing workspace cache instead of tearing down panes
+    /// on the click-to-first-frame path.
+    private var cachedWorkspaceContentViews: [NSView] = []
+    private var cachedWorkspaceID: WorkspaceID?
     /// UX-MAC_SHELL_WINDOW-014: true between launch and the first refresh
     /// after restored surfaces are reinstantiated. While restoring, an
     /// empty container shows a "Restoring workspaces…" affordance instead
@@ -320,6 +326,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     private var activeThreadsHostingView: NSView?
     private var botsViewModel: BotsViewModel?
     private var botsHostingView: NSView?
+    private var currentShellHostingView: NSView?
+    private var destinationPersistenceTask: Task<Void, Never>?
+    private var workspaceRebuildTask: Task<Void, Never>?
+    private var workspaceRebuildGeneration: UInt64 = 0
 
     public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
@@ -389,6 +399,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     }
 
     deinit {
+        destinationPersistenceTask?.cancel()
+        workspaceRebuildTask?.cancel()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -1154,13 +1166,16 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     /// workspace panes), not a floating NSWindow. Workspace rows are fully
     /// deselected and the title bar reads "Schedule Tasks".
     func presentScheduledTasksInMainContent() {
+        guard shellContentMode != .scheduledTasks else {
+            scheduledTasksViewModel?.scheduleFreshnessPass()
+            return
+        }
         shellContentMode = .scheduledTasks
         sidebar.setScheduledTasksSelected(true)
         sidebar.setActiveThreadsSelected(false)
         sidebar.setBotsSelected(false)
         activeThreadsHostingView = nil
         botsHostingView = nil
-        lastWorkspaceContainerSignature = nil
         persistBotsShellDestination()
         installScheduledTasksContent()
         updateCollapsedWorkspaceHeader()
@@ -1169,13 +1184,16 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
 
     /// Active Threads shell destination: live actives + recent finished runs.
     func presentActiveThreadsInMainContent() {
+        guard shellContentMode != .activeThreads else {
+            activeThreadsViewModel?.scheduleFreshnessPass()
+            return
+        }
         shellContentMode = .activeThreads
         sidebar.setActiveThreadsSelected(true)
         sidebar.setScheduledTasksSelected(false)
         sidebar.setBotsSelected(false)
         scheduledTasksHostingView = nil
         botsHostingView = nil
-        lastWorkspaceContainerSignature = nil
         persistBotsShellDestination()
         installActiveThreadsContent()
         updateCollapsedWorkspaceHeader()
@@ -1191,7 +1209,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.setActiveThreadsSelected(false)
         scheduledTasksHostingView = nil
         activeThreadsHostingView = nil
-        lastWorkspaceContainerSignature = nil
         persistBotsShellDestination()
         installBotsContent()
         updateCollapsedWorkspaceHeader()
@@ -1207,26 +1224,38 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.setBotsSelected(false)
         scheduledTasksHostingView = nil
         activeThreadsHostingView = nil
-        botsHostingView = nil
-        lastWorkspaceContainerSignature = nil
         persistBotsShellDestination()
-        rebuildWorkspaceContainer()
+        currentShellHostingView?.removeFromSuperview()
+        botsHostingView = nil
+        currentShellHostingView = nil
+        let selectedWorkspaceID = context?.state.window.selectedWorkspaceID
+        let cachedWorkspaceIsCurrent = cachedWorkspaceID == selectedWorkspaceID
+        cachedWorkspaceContentViews.forEach { $0.isHidden = !cachedWorkspaceIsCurrent }
+        if !cachedWorkspaceIsCurrent || cachedWorkspaceContentViews.isEmpty {
+            scheduleWorkspaceRebuild()
+        } else if workspaceContainerSignature() != lastWorkspaceContainerSignature {
+            scheduleWorkspaceRebuild()
+        }
         updateCollapsedWorkspaceHeader()
         shellLog.debug("shellContentMode=workspace")
     }
 
     private func installScheduledTasksContent() {
-        for sub in workspaceContent.subviews { sub.removeFromSuperview() }
-        paneControllers.removeAll()
         guard let context, let router else {
             let empty = makeEmptyState()
             workspaceContent.addSubview(empty)
             pin(empty, to: workspaceContent)
             return
         }
-        let vm = scheduledTasksViewModel ?? ScheduledTasksViewModel(context: context, router: router)
+        let previous = currentShellHostingView
+        prepareShellMount(previous)
+        let vm = scheduledTasksViewModel ?? ScheduledTasksViewModel(
+            context: context,
+            router: router,
+            loadImmediately: false
+        )
         scheduledTasksViewModel = vm
-        vm.reload()
+        vm.scheduleFreshnessPass()
         let host = NSHostingView(rootView: ScheduledTasksRootView(vm: vm))
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
@@ -1235,22 +1264,26 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         workspaceContent.addSubview(host)
         pin(host, to: workspaceContent)
         scheduledTasksHostingView = host
-        lastWorkspaceContainerSignature = "scheduledTasks"
-        rebuildCount += 1
+        currentShellHostingView = host
+        removePreviousShellHostAfterFirstFrame(previous)
     }
 
     private func installActiveThreadsContent() {
-        for sub in workspaceContent.subviews { sub.removeFromSuperview() }
-        paneControllers.removeAll()
         guard let context, let router else {
             let empty = makeEmptyState()
             workspaceContent.addSubview(empty)
             pin(empty, to: workspaceContent)
             return
         }
-        let vm = activeThreadsViewModel ?? ActiveThreadsViewModel(context: context, router: router)
+        let previous = currentShellHostingView
+        prepareShellMount(previous)
+        let vm = activeThreadsViewModel ?? ActiveThreadsViewModel(
+            context: context,
+            router: router,
+            loadImmediately: false
+        )
         activeThreadsViewModel = vm
-        vm.reload()
+        vm.scheduleFreshnessPass()
         let host = NSHostingView(rootView: ActiveThreadsRootView(vm: vm))
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
@@ -1259,27 +1292,37 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         workspaceContent.addSubview(host)
         pin(host, to: workspaceContent)
         activeThreadsHostingView = host
-        lastWorkspaceContainerSignature = "activeThreads"
-        rebuildCount += 1
+        currentShellHostingView = host
+        removePreviousShellHostAfterFirstFrame(previous)
     }
 
     private func installBotsContent() {
-        for sub in workspaceContent.subviews { sub.removeFromSuperview() }
-        paneControllers.removeAll()
-        guard let context, let router else {
+        guard context != nil, router != nil else {
             let empty = makeEmptyState()
             workspaceContent.addSubview(empty)
             pin(empty, to: workspaceContent)
             return
         }
+        let previous = currentShellHostingView
+        prepareShellMount(previous)
         let vm = sidebar.botsViewModel
         botsViewModel = vm
+        vm.enableNavigationFirstFrameDeferral()
         vm.onLeaveBots = { [weak self] in
             self?.presentWorkspaceContent()
         }
-        vm.reload()
         // Keep Desk / Studio / Attention. openFleet() here kicked users
         // home every time they left Bots and came back.
+        let host: NSView
+        host = makeBotsShellHost(vm: vm)
+        workspaceContent.addSubview(host)
+        pin(host, to: workspaceContent)
+        botsHostingView = host
+        currentShellHostingView = host
+        removePreviousShellHostAfterFirstFrame(previous)
+    }
+
+    private func makeBotsShellHost(vm: BotsViewModel) -> NSView {
         let host = ContentColumnHostingView(rootView: BotsRootView(vm: vm, embedsRosterRail: false))
         host.cancelHorizontalTitlebarGutter = BotsViewModel.cancelsWindowLeadingTitlebarGutter(
             presentsAsDetachedWindow: vm.presentsAsDetachedWindow
@@ -1288,11 +1331,43 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         host.wantsLayer = true
         host.layer?.backgroundColor = DS.NS.bg.cgColor
         RemoteCodeAppearance.apply(to: host)
-        workspaceContent.addSubview(host)
-        pin(host, to: workspaceContent)
-        botsHostingView = host
-        lastWorkspaceContainerSignature = "bots"
-        rebuildCount += 1
+        return host
+    }
+
+    private func prepareShellMount(_ previous: NSView?) {
+        cachedWorkspaceContentViews.forEach { $0.isHidden = true }
+        previous?.isHidden = true
+    }
+
+    private func removePreviousShellHostAfterFirstFrame(_ previous: NSView?) {
+        guard let previous, previous !== currentShellHostingView else { return }
+        DispatchQueue.main.async { [weak self, weak previous] in
+            guard let previous else { return }
+            previous.removeFromSuperview()
+        }
+    }
+
+    private func scheduleWorkspaceRebuild() {
+        workspaceRebuildTask?.cancel()
+        workspaceRebuildGeneration &+= 1
+        let generation = workspaceRebuildGeneration
+        workspaceRebuildTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            defer {
+                if self.workspaceRebuildGeneration == generation {
+                    self.workspaceRebuildTask = nil
+                }
+            }
+            guard !Task.isCancelled,
+                  self.workspaceRebuildGeneration == generation,
+                  self.shellContentMode == .workspace else { return }
+            // Let rebuildWorkspaceContainer inspect its structural fingerprint
+            // first. A refresh may already have won the race and reconciled the
+            // existing cached tree in place; removing that cache here would make
+            // the idempotent pass paint an empty content column.
+            self.rebuildWorkspaceContainer()
+        }
     }
 
     private func rebuildWorkspaceContainer() {
@@ -1300,7 +1375,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         // bursts while the user is on that shell destination.
         if shellContentMode == .scheduledTasks {
             if scheduledTasksHostingView?.superview === workspaceContent {
-                scheduledTasksViewModel?.reload()
+                scheduledTasksViewModel?.scheduleFreshnessPass()
                 return
             }
             installScheduledTasksContent()
@@ -1308,7 +1383,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         }
         if shellContentMode == .activeThreads {
             if activeThreadsHostingView?.superview === workspaceContent {
-                activeThreadsViewModel?.reload()
+                activeThreadsViewModel?.scheduleFreshnessPass()
                 return
             }
             installActiveThreadsContent()
@@ -1316,7 +1391,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         }
         if shellContentMode == .bots {
             if botsHostingView?.superview === workspaceContent {
-                botsViewModel?.reload()
+                botsViewModel?.scheduleFreshnessPass()
                 return
             }
             installBotsContent()
@@ -1376,6 +1451,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         var primaryControlsAvailable = true
         let layoutView = buildLayoutView(node: ws.layout, primaryControlsAvailable: &primaryControlsAvailable)
         attachRootLayoutView(layoutView)
+        cachedWorkspaceContentViews = [layoutView]
+        cachedWorkspaceID = wid
         let rebuildMs = Double(DispatchTime.now().uptimeNanoseconds - rebuildStart.uptimeNanoseconds) / 1_000_000
         shellLog.debug("rebuildWorkspaceContainer panes=\(self.paneControllers.count, privacy: .public) ms=\(rebuildMs, privacy: .public)")
         // Freshly built pane headers default to "sidebar visible"; if it
@@ -1675,7 +1752,20 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         case .activeThreads: value = "activeThreads"
         case .workspace: value = "workspace"
         }
-        try? context?.settingsRepo.set(Self.botsShellSettingsKey, value)
+        // Construction/restoration tests and first-launch setup happen before
+        // the window is visible; retain their crash-safe synchronous receipt.
+        // User clicks on a live shell window take the deferred path below.
+        guard window.isVisible else {
+            try? context?.settingsRepo.set(Self.botsShellSettingsKey, value)
+            return
+        }
+        destinationPersistenceTask?.cancel()
+        destinationPersistenceTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            try? self.context?.settingsRepo.set(Self.botsShellSettingsKey, value)
+            self.destinationPersistenceTask = nil
+        }
     }
 
     private func restoreBotsShellDestinationIfNeeded() {
@@ -1707,6 +1797,7 @@ final class ContentColumnHostingView<Root: View>: NSHostingView<Root> {
         }
         return insets
     }
+
 }
 
 // MARK: - Sidebar resize handle

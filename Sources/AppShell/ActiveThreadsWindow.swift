@@ -31,11 +31,45 @@ public final class ActiveThreadsViewModel: ObservableObject {
     private let context: AppContext
     private let router: AppCommandRouter
     private var startedAtByThread: [AgentThreadID: Date] = [:]
+    private var freshnessTask: Task<Void, Never>?
+    private var navigationTask: Task<Void, Never>?
+    private var freshnessGeneration: UInt64 = 0
+    private var navigationGeneration: UInt64 = 0
+    fileprivate let deferHydration: Bool
 
-    public init(context: AppContext, router: AppCommandRouter) {
+    public init(context: AppContext, router: AppCommandRouter, loadImmediately: Bool = true) {
         self.context = context
         self.router = router
-        reload()
+        self.deferHydration = !loadImmediately
+        if loadImmediately {
+            reload()
+        }
+    }
+
+    deinit {
+        freshnessTask?.cancel()
+        navigationTask?.cancel()
+    }
+
+    /// Use the published cache for the first frame, then perform one
+    /// cancellation-safe repository/coordinator refresh.
+    public func scheduleFreshnessPass() {
+        guard deferHydration else { return }
+        freshnessTask?.cancel()
+        freshnessGeneration &+= 1
+        let generation = freshnessGeneration
+        freshnessTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self,
+                  !Task.isCancelled,
+                  self.freshnessGeneration == generation else { return }
+            defer {
+                if self.freshnessGeneration == generation {
+                    self.freshnessTask = nil
+                }
+            }
+            self.reload()
+        }
     }
 
     public var activeCount: Int { activeItems.count }
@@ -124,6 +158,34 @@ public final class ActiveThreadsViewModel: ObservableObject {
 
     public func openActive(_ item: PetActiveThreadItem) {
         if case .botsDesk(let botID) = item.route {
+            // Publish the shell destination in the click turn. Only the exact
+            // Bot lookup/Desk hydration waits for the deferred pass.
+            router.windowController?.presentBotsInMainContent()
+            guard !deferHydration else {
+                navigationTask?.cancel()
+                navigationGeneration &+= 1
+                let generation = navigationGeneration
+                navigationTask = Task { @MainActor [weak self] in
+                    await Task.yield()
+                    guard let self,
+                          !Task.isCancelled,
+                          self.navigationGeneration == generation else { return }
+                    defer {
+                        if self.navigationGeneration == generation {
+                            self.navigationTask = nil
+                        }
+                    }
+                    do {
+                        guard try self.router.openBotsDesk(botID: botID) else {
+                            self.errorMessage = "Could not open bot Desk."
+                            return
+                        }
+                    } catch {
+                        self.errorMessage = "Could not open bot Desk: \(error.localizedDescription)"
+                    }
+                }
+                return
+            }
             do {
                 guard try router.openBotsDesk(botID: botID) else {
                     errorMessage = "Could not open bot Desk."
@@ -149,13 +211,28 @@ public final class ActiveThreadsViewModel: ObservableObject {
     }
 
     private func openThread(_ threadID: AgentThreadID, workspaceID: WorkspaceID?) {
-        do {
-            // Leave the shell destination first so Agent App can mount in the
-            // main content column (same bug class as Schedule Tasks open).
-            router.windowController?.presentWorkspaceContent()
-            _ = try router.openAgentThread(thread: threadID, markRead: false)
-        } catch {
-            errorMessage = "Could not open thread: \(error.localizedDescription)"
+        // Leave the shell destination first so the workspace cache can paint.
+        router.windowController?.presentWorkspaceContent()
+        guard deferHydration else {
+            do { _ = try router.openAgentThread(thread: threadID, markRead: false) }
+            catch { errorMessage = "Could not open thread: \(error.localizedDescription)" }
+            return
+        }
+        navigationTask?.cancel()
+        navigationGeneration &+= 1
+        let generation = navigationGeneration
+        navigationTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self,
+                  !Task.isCancelled,
+                  self.navigationGeneration == generation else { return }
+            defer {
+                if self.navigationGeneration == generation {
+                    self.navigationTask = nil
+                }
+            }
+            do { _ = try self.router.openAgentThread(thread: threadID, markRead: false) }
+            catch { self.errorMessage = "Could not open thread: \(error.localizedDescription)" }
         }
     }
 }
@@ -223,12 +300,12 @@ public struct ActiveThreadsRootView: View {
         } message: {
             Text(vm.errorMessage ?? "")
         }
-        .onAppear { vm.reload() }
+        .onAppear { vm.scheduleFreshnessPass() }
         .onChange(of: vm.selectedTab) { tab in
             if tab == .lastFinished {
-                vm.reloadFinished()
+                if vm.deferHydration { vm.scheduleFreshnessPass() } else { vm.reloadFinished() }
             } else {
-                vm.reloadActive()
+                if vm.deferHydration { vm.scheduleFreshnessPass() } else { vm.reloadActive() }
             }
         }
     }

@@ -90,7 +90,7 @@ public struct BotScheduleTasksRootView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.Palette.bg)
         .accessibilityIdentifier("bots.scheduleTasks.screen")
-        .onAppear { vm.reloadScheduleTasks() }
+        .onAppear { vm.scheduleFreshnessPass() }
     }
 
     private var overviewScreen: some View {
