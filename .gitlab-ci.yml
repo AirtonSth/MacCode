@@ -70,7 +70,7 @@ lint_scripts:
       when: manual
       allow_failure: true
   script:
-    - brew install shellcheck
+    - command -v shellcheck >/dev/null || brew install shellcheck
     - shellcheck -S error scripts/*.sh
     - |
       for script in scripts/*.sh; do
