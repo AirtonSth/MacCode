@@ -80,6 +80,10 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         }
         let eventChildThreadID = AgentThreadID()
         XCTAssertNotEqual(eventChildThreadID, fixture.parentThreadID)
+        XCTAssertFalse(
+            fixture.vm.subagentActivity.isEmpty,
+            "the parent activity must be seeded before testing child-triggered refresh"
+        )
 
         fixture.coordinator.requestCoalescedSubagentActivityRefresh(
             workspaceID: fixture.workspaceID
