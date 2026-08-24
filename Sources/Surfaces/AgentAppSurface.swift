@@ -1371,7 +1371,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Loads every visible workspace badge from one receipt-store scan. A poll
     /// round used to repeat the same JSON scan once per restored workspace.
     func loadSubagentActivitySnapshotsOffMainActor(
-        for threadIds: [AgentThreadID]
+        for threadIds: [AgentThreadID],
+        persistLifecycleReconciliation: Bool = false
     ) async -> [AgentThreadID: SubagentActivitySnapshot] {
         guard !isDisposed else { return [:] }
         let uniqueThreadIds = Array(Set(threadIds))
@@ -1388,7 +1389,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let receipts = (try? orchestrationRuntime.activityReceipts(
                 threadIds: Set(uniqueThreadIds),
                 limit: SubagentActivityProjection.defaultReceiptFetchLimit * uniqueThreadIds.count,
-                persistLifecycleReconciliation: false
+                persistLifecycleReconciliation: persistLifecycleReconciliation
             )) ?? []
             let now = clock()
             return Dictionary(uniqueKeysWithValues: uniqueThreadIds.map { threadId in
@@ -8437,9 +8438,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.runThreads[runId] = nil
                 _ = self.coordinator.reconcileStaleActiveOwnershipWithDurableState()
             }
-            // Admission receipts finalize on terminal status; refresh so Active/Done
-            // lists track real lifecycle without a separate poll.
-            self.refreshSubagentActivity()
+            // Admission receipts finalize on terminal status. One shared,
+            // off-main read updates every selected surface for this workspace.
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedSubagentActivityRefresh(
+                workspaceID: self.workspaceID,
+                threadID: threadId
+            )
             self.onRunStateChange?()
         }
     }
@@ -11396,6 +11400,28 @@ public struct AgentAppView: View {
         }
     }
 
+    /// Immutable context derived once for the current transcript paint. Peer
+    /// group headers and duplicate-final decisions used to rescan row suffixes
+    /// and visible entries independently for every mounted row.
+    struct ChatRowPaintContext {
+        let peerGroupHeadersByRowID: [String: AgentChatPeerGroupHeader]
+        let hideAssistantOutputByTurnId: [String: Bool]
+
+        func peerGroupHeader(for row: ChatFlowRow) -> AgentChatPeerGroupHeader? {
+            peerGroupHeadersByRowID[row.id]
+        }
+
+        func hidesAssistantOutput(for row: ChatFlowRow) -> Bool {
+            switch row {
+            case .entry(.turn(let turn)):
+                return hideAssistantOutputByTurnId[turn.turnId] ?? false
+            case .segment(let segment):
+                return hideAssistantOutputByTurnId[segment.snapshot.turnId] ?? false
+            case .entry(.message): return false
+            }
+        }
+    }
+
     /// Only bot-peer chrome interleaves a turn: waiting/needs-attention
     /// activity rows and attributed "From <bot>" replies. Every other message
     /// (user prompts, the turn's own durable final, system rows) ends boundary
@@ -11447,6 +11473,66 @@ public struct AgentAppView: View {
             index = next
         }
         return rows
+    }
+
+    /// Derive all row-local peer and prior-turn context in one linear pass per
+    /// input. This preserves the old contiguous-group and chronological prior
+    /// turn semantics without making every row scan the same transcript again.
+    static func makeChatRowPaintContext(
+        rows: [ChatFlowRow],
+        visibleEntries: [TranscriptEntry],
+        bots: [BotDefinition]
+    ) -> ChatRowPaintContext {
+        let identities = rows.map { peerHopIdentity(for: $0, bots: bots) }
+        var groupHeaders: [String: AgentChatPeerGroupHeader] = [:]
+        var index = 0
+        while index < rows.count {
+            guard let peer = identities[index] else {
+                index += 1
+                continue
+            }
+            if index > 0,
+               let previous = identities[index - 1],
+               previous.handle.caseInsensitiveCompare(peer.handle) == .orderedSame {
+                index += 1
+                continue
+            }
+            var end = index + 1
+            while end < rows.count,
+                  let next = identities[end],
+                  next.handle.caseInsensitiveCompare(peer.handle) == .orderedSame {
+                end += 1
+            }
+            if end - index >= 2 {
+                groupHeaders[rows[index].id] = AgentChatPeerGroupHeader(
+                    hostName: "",
+                    hostHandle: "",
+                    peerName: peer.name,
+                    peerHandle: peer.handle,
+                    peerSymbol: peer.symbol,
+                    count: end - index,
+                    accessibilityIdentifier: "agent.peer.group"
+                )
+            }
+            index = end
+        }
+
+        var priorTurns: [AssistantTurnSnapshot] = []
+        priorTurns.reserveCapacity(visibleEntries.count)
+        var hideAssistantOutputByTurnId: [String: Bool] = [:]
+        hideAssistantOutputByTurnId.reserveCapacity(visibleEntries.count)
+        for entry in visibleEntries {
+            guard case .turn(let turn) = entry else { continue }
+            hideAssistantOutputByTurnId[turn.turnId] = AgentChatLiveTurnChrome.shouldHideAssistantOutput(
+                turn,
+                previousTurns: priorTurns
+            )
+            priorTurns.append(turn)
+        }
+        return ChatRowPaintContext(
+            peerGroupHeadersByRowID: groupHeaders,
+            hideAssistantOutputByTurnId: hideAssistantOutputByTurnId
+        )
     }
 
     /// Returns the ordered slice of `allItems` not present in `visibleWindow`.
@@ -12842,6 +12928,11 @@ public struct AgentAppView: View {
                         let liveRows = Self.chatFlowRows(split.liveTail)
                         let allRows = historyRows + liveRows
                         let mentionBots = vm.mentionableBotsProvider()
+                        let rowPaintContext = Self.makeChatRowPaintContext(
+                            rows: allRows,
+                            visibleEntries: visibleTranscriptEntries,
+                            bots: mentionBots
+                        )
                         VStack(alignment: .leading, spacing: 32) {
                             if vm.messageHistoryIsPartial {
                                 VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -12887,45 +12978,36 @@ public struct AgentAppView: View {
                             // boundary. Larger windows retain viewport virtualization.
                             if Self.usesLazyTranscriptHistoryLayout(entryCount: historyRows.count) {
                                 LazyVStack(alignment: .leading, spacing: 32) {
-                                    ForEach(Array(historyRows.enumerated()), id: \.element.id) { index, row in
+                                    ForEach(Array(historyRows.enumerated()), id: \.element.id) { _, row in
                                         chatFlowRowView(
                                             row,
                                             columnWidth: timelineColumnWidth,
-                                            groupHeader: peerHopGroupHeader(
-                                                at: index,
-                                                rows: allRows,
-                                                bots: mentionBots
-                                            )
+                                            groupHeader: rowPaintContext.peerGroupHeader(for: row),
+                                            hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row)
                                         )
                                         .id(row.id)
                                     }
                                 }
                             } else {
                                 VStack(alignment: .leading, spacing: 32) {
-                                    ForEach(Array(historyRows.enumerated()), id: \.element.id) { index, row in
+                                    ForEach(Array(historyRows.enumerated()), id: \.element.id) { _, row in
                                         chatFlowRowView(
                                             row,
                                             columnWidth: timelineColumnWidth,
-                                            groupHeader: peerHopGroupHeader(
-                                                at: index,
-                                                rows: allRows,
-                                                bots: mentionBots
-                                            )
+                                            groupHeader: rowPaintContext.peerGroupHeader(for: row),
+                                            hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row)
                                         )
                                         .id(row.id)
                                     }
                                 }
                             }
                             // Live streaming turns — eager, outside Lazy.
-                            ForEach(Array(liveRows.enumerated()), id: \.element.id) { index, row in
+                            ForEach(Array(liveRows.enumerated()), id: \.element.id) { _, row in
                                 chatFlowRowView(
                                     row,
                                     columnWidth: timelineColumnWidth,
-                                    groupHeader: peerHopGroupHeader(
-                                        at: historyRows.count + index,
-                                        rows: allRows,
-                                        bots: mentionBots
-                                    )
+                                    groupHeader: rowPaintContext.peerGroupHeader(for: row),
+                                    hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row)
                                 )
                                 .id(row.id)
                             }
@@ -14399,7 +14481,8 @@ public struct AgentAppView: View {
     private func transcriptEntryRow(
         _ entry: TranscriptEntry,
         columnWidth: CGFloat,
-        groupHeader: AgentChatPeerGroupHeader? = nil
+        groupHeader: AgentChatPeerGroupHeader? = nil,
+        hideAssistantOutput: Bool = false
     ) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             if let groupHeader {
@@ -14409,7 +14492,7 @@ public struct AgentAppView: View {
             case .message(let message):
                 messageRow(message, columnWidth: columnWidth)
             case .turn(let turn):
-                turnView(turn)
+                turnView(turn, hideAssistantOutput: hideAssistantOutput)
             }
         }
     }
@@ -14418,13 +14501,19 @@ public struct AgentAppView: View {
     private func chatFlowRowView(
         _ row: ChatFlowRow,
         columnWidth: CGFloat,
-        groupHeader: AgentChatPeerGroupHeader? = nil
+        groupHeader: AgentChatPeerGroupHeader? = nil,
+        hideAssistantOutput: Bool = false
     ) -> some View {
         switch row {
         case .entry(let entry):
-            transcriptEntryRow(entry, columnWidth: columnWidth, groupHeader: groupHeader)
+            transcriptEntryRow(
+                entry,
+                columnWidth: columnWidth,
+                groupHeader: groupHeader,
+                hideAssistantOutput: hideAssistantOutput
+            )
         case .segment(let segment):
-            turnSegmentView(segment)
+            turnSegmentView(segment, hideAssistantOutput: hideAssistantOutput)
         }
     }
 
@@ -14433,7 +14522,10 @@ public struct AgentAppView: View {
     /// paint their blocks headerless so the chat reads as one appended flow;
     /// only the last segment renders plans and the final answer.
     @ViewBuilder
-    private func turnSegmentView(_ segment: AgentChatTurnSegmentation.TurnSegment) -> some View {
+    private func turnSegmentView(
+        _ segment: AgentChatTurnSegmentation.TurnSegment,
+        hideAssistantOutput: Bool
+    ) -> some View {
         let turn = segment.snapshot
         let durableFinalMessageId = vm.tokenSaverMessageId(forRCW1TurnId: turn.turnId)
         let turnPlans: [AssistantProposedPlan] = segment.isLast
@@ -14446,10 +14538,7 @@ public struct AgentAppView: View {
             turn: turn,
             live: !turn.finished,
             hideAssistantOutput: segment.isLast
-                ? AgentChatLiveTurnChrome.shouldHideAssistantOutput(
-                    turn,
-                    previousTurns: previousTurns(before: turn)
-                )
+                ? hideAssistantOutput
                 : false,
             showsWorkHeader: AgentChatLiveTurnChrome.showsWorkHeader(for: segment),
             renderFinal: segment.isLast
@@ -14467,7 +14556,7 @@ public struct AgentAppView: View {
         )
     }
 
-    private func peerHopIdentity(
+    private static func peerHopIdentity(
         for entry: TranscriptEntry,
         bots: [BotDefinition]
     ) -> (name: String, handle: String, symbol: String?)? {
@@ -14491,7 +14580,7 @@ public struct AgentAppView: View {
         }
     }
 
-    private func peerHopIdentity(
+    private static func peerHopIdentity(
         for row: ChatFlowRow,
         bots: [BotDefinition]
     ) -> (name: String, handle: String, symbol: String?)? {
@@ -14499,57 +14588,17 @@ public struct AgentAppView: View {
         return peerHopIdentity(for: entry, bots: bots)
     }
 
-    private func peerHopGroupHeader(
-        at index: Int,
-        rows: [ChatFlowRow],
-        bots: [BotDefinition]
-    ) -> AgentChatPeerGroupHeader? {
-        guard rows.indices.contains(index),
-              let peer = peerHopIdentity(for: rows[index], bots: bots) else { return nil }
-        if index > 0, let previous = peerHopIdentity(for: rows[index - 1], bots: bots),
-           previous.handle.caseInsensitiveCompare(peer.handle) == .orderedSame {
-            return nil
-        }
-        var count = 0
-        for later in rows[index...] {
-            guard let next = peerHopIdentity(for: later, bots: bots),
-                  next.handle.caseInsensitiveCompare(peer.handle) == .orderedSame else { break }
-            count += 1
-        }
-        guard count >= 2 else { return nil }
-        return AgentChatPeerGroupHeader(
-            hostName: "",
-            hostHandle: "",
-            peerName: peer.name,
-            peerHandle: peer.handle,
-            peerSymbol: peer.symbol,
-            count: count,
-            accessibilityIdentifier: "agent.peer.group"
-        )
-    }
-
-    private func previousTurns(before turn: AssistantTurnSnapshot) -> [AssistantTurnSnapshot] {
-        var found: [AssistantTurnSnapshot] = []
-        for entry in visibleTranscriptEntries {
-            if case .turn(let other) = entry {
-                if other.turnId == turn.turnId { break }
-                found.append(other)
-            }
-        }
-        return found
-    }
-
     @ViewBuilder
-    private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
+    private func turnView(
+        _ turn: AssistantTurnSnapshot,
+        hideAssistantOutput: Bool
+    ) -> some View {
         let inputs = turnRenderInputs(for: turn)
         let durableFinalMessageId = vm.tokenSaverMessageId(forRCW1TurnId: turn.turnId)
         AgentChatLiveTurnView(
             turn: turn,
             live: !turn.finished,
-            hideAssistantOutput: AgentChatLiveTurnChrome.shouldHideAssistantOutput(
-                turn,
-                previousTurns: previousTurns(before: turn)
-            ),
+            hideAssistantOutput: hideAssistantOutput,
             renderFinal: { final in
                 AnyView(agentTurnFinal(final, turn: turn, durableFinalMessageId: durableFinalMessageId))
             },

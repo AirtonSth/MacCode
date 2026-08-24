@@ -44,6 +44,9 @@ public final class AgentWorkspaceRailReloadCoordinator {
     private var members: [WorkspaceID: [ObjectIdentifier: WeakBox]] = [:]
     private var railDebounceTasks: [WorkspaceID: Task<Void, Never>] = [:]
     private var queueDebounceTasks: [WorkspaceID: Task<Void, Never>] = [:]
+    private var subagentActivityRefreshTasks: [WorkspaceID: Task<Void, Never>] = [:]
+    private var subagentActivityRefreshThreadIDs: [WorkspaceID: Set<AgentThreadID>] = [:]
+    private var subagentActivityRefreshGenerations: [WorkspaceID: UInt64] = [:]
     private var subagentPollTask: Task<Void, Never>?
     /// Debounce window for EventBus fan-out storms.
     public var debounceNanoseconds: UInt64 = 50_000_000
@@ -54,6 +57,9 @@ public final class AgentWorkspaceRailReloadCoordinator {
     private var subagentPollHasMembersForTesting: (() -> Bool)?
     private var subagentPollSleepForTesting: ((UInt64) async throws -> Void)?
     private var subagentPollRoundForTesting: (() async -> Void)?
+    private var subagentActivityRefreshSleepForTesting: ((UInt64) async throws -> Void)?
+    private var subagentActivityRefreshRoundForTesting: ((Set<AgentThreadID>) async -> Void)?
+    private var subagentActivityRefreshApplyForTesting: ((Set<AgentThreadID>) -> Void)?
     var subagentPollIsRunningForTesting: Bool { subagentPollTask != nil }
     #endif
 
@@ -64,12 +70,18 @@ public final class AgentWorkspaceRailReloadCoordinator {
         subagentPollNanoseconds: UInt64,
         hasMembers: @escaping () -> Bool,
         sleep: @escaping (UInt64) async throws -> Void,
-        pollRound: @escaping () async -> Void
+        pollRound: @escaping () async -> Void,
+        subagentActivityRefreshSleep: ((UInt64) async throws -> Void)? = nil,
+        subagentActivityRefreshRound: ((Set<AgentThreadID>) async -> Void)? = nil,
+        subagentActivityRefreshApply: ((Set<AgentThreadID>) -> Void)? = nil
     ) {
         self.subagentPollNanoseconds = subagentPollNanoseconds
         subagentPollHasMembersForTesting = hasMembers
         subagentPollSleepForTesting = sleep
         subagentPollRoundForTesting = pollRound
+        subagentActivityRefreshSleepForTesting = subagentActivityRefreshSleep
+        subagentActivityRefreshRoundForTesting = subagentActivityRefreshRound
+        subagentActivityRefreshApplyForTesting = subagentActivityRefreshApply
     }
 
     func reconcileSubagentPollForTesting() {
@@ -129,6 +141,36 @@ public final class AgentWorkspaceRailReloadCoordinator {
             try? await Task.sleep(nanoseconds: delay)
             guard !Task.isCancelled else { return }
             self?.flushQueue(workspaceID)
+        }
+    }
+
+    /// Coalesce status-driven receipt refreshes across every surface in a
+    /// workspace. The receipt read is off-main and the generation check keeps a
+    /// slow, cancelled read from overwriting a newer lifecycle result.
+    public func requestCoalescedSubagentActivityRefresh(
+        workspaceID: WorkspaceID,
+        threadID: AgentThreadID
+    ) {
+        subagentActivityRefreshThreadIDs[workspaceID, default: []].insert(threadID)
+        let generation = (subagentActivityRefreshGenerations[workspaceID] ?? 0) &+ 1
+        subagentActivityRefreshGenerations[workspaceID] = generation
+        subagentActivityRefreshTasks[workspaceID]?.cancel()
+        subagentActivityRefreshTasks[workspaceID] = Task { @MainActor [weak self] in
+            let delay = self?.debounceNanoseconds ?? 50_000_000
+            #if DEBUG
+            if let sleep = self?.subagentActivityRefreshSleepForTesting {
+                try? await sleep(delay)
+            } else {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            #else
+            try? await Task.sleep(nanoseconds: delay)
+            #endif
+            guard !Task.isCancelled else { return }
+            await self?.flushSubagentActivityRefresh(
+                workspaceID: workspaceID,
+                generation: generation
+            )
         }
     }
 
@@ -216,6 +258,55 @@ public final class AgentWorkspaceRailReloadCoordinator {
                 loadedFor: target.threadId
             )
         }
+    }
+
+    private func flushSubagentActivityRefresh(
+        workspaceID: WorkspaceID,
+        generation: UInt64
+    ) async {
+        guard subagentActivityRefreshGenerations[workspaceID] == generation else { return }
+        let threadIDs = subagentActivityRefreshThreadIDs[workspaceID] ?? []
+        let live = liveViewModels(for: workspaceID)
+        #if DEBUG
+        if let refreshRound = subagentActivityRefreshRoundForTesting {
+            await refreshRound(threadIDs)
+            guard subagentActivityRefreshGenerations[workspaceID] == generation else { return }
+            subagentActivityRefreshApplyForTesting?(threadIDs)
+            clearSubagentActivityRefreshIfCurrent(workspaceID: workspaceID, generation: generation)
+            return
+        }
+        #endif
+        let targets: [(viewModel: AgentAppViewModel, threadId: AgentThreadID)] = live
+            .compactMap { viewModel in
+                guard let threadId = viewModel.selectedThreadId,
+                      threadIDs.contains(threadId) else { return nil }
+                return (viewModel, threadId)
+            }
+        guard let lead = live.first else {
+            clearSubagentActivityRefreshIfCurrent(workspaceID: workspaceID, generation: generation)
+            return
+        }
+        let snapshots = await lead.loadSubagentActivitySnapshotsOffMainActor(
+            for: Array(threadIDs),
+            persistLifecycleReconciliation: true
+        )
+        guard subagentActivityRefreshGenerations[workspaceID] == generation else { return }
+        for target in targets {
+            target.viewModel.applySubagentActivity(
+                snapshots[target.threadId] ?? .empty,
+                loadedFor: target.threadId
+            )
+        }
+        clearSubagentActivityRefreshIfCurrent(workspaceID: workspaceID, generation: generation)
+    }
+
+    private func clearSubagentActivityRefreshIfCurrent(
+        workspaceID: WorkspaceID,
+        generation: UInt64
+    ) {
+        guard subagentActivityRefreshGenerations[workspaceID] == generation else { return }
+        subagentActivityRefreshThreadIDs.removeValue(forKey: workspaceID)
+        subagentActivityRefreshTasks.removeValue(forKey: workspaceID)
     }
 
     private func liveViewModels(for workspaceID: WorkspaceID) -> [AgentAppViewModel] {
