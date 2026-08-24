@@ -9,18 +9,14 @@ require_value() {
   fi
 }
 
+if [ -z "${RELEASE_TAG:-}" ] && [ -n "${CI_COMMIT_TAG:-}" ]; then
+  RELEASE_TAG="$CI_COMMIT_TAG"
+fi
+
 for name in \
   RELEASE_TAG \
   CI_COMMIT_TAG \
-  CI_COMMIT_SHA \
-  CI_PIPELINE_ID \
-  CI_API_V4_URL \
-  CI_PROJECT_ID \
-  CI_JOB_TOKEN \
-  RC2_VALIDATED_PIPELINE_ID \
-  RC2_VALIDATED_JOB_ID \
-  RC2_ACCEPTANCE_MANIFEST_BASE64 \
-  RC2_ACCEPTANCE_MANIFEST_SHA256
+  CI_COMMIT_SHA
 do
   require_value "$name"
 done
@@ -33,6 +29,44 @@ if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "release preflight: RELEASE_TAG must be a stable semantic version" >&2
   exit 1
 fi
+
+command -v git >/dev/null || {
+  echo "release preflight: missing command git" >&2
+  exit 1
+}
+
+tag_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
+if [ "$tag_sha" != "$CI_COMMIT_SHA" ]; then
+  echo "release preflight: tag does not peel to CI_COMMIT_SHA" >&2
+  exit 1
+fi
+
+validate_receipt=0
+if [ -n "${RC2_VALIDATED_PIPELINE_ID:-}" ] \
+  || [ -n "${RC2_VALIDATED_JOB_ID:-}" ] \
+  || [ -n "${RC2_ACCEPTANCE_MANIFEST_BASE64:-}" ] \
+  || [ -n "${RC2_ACCEPTANCE_MANIFEST_SHA256:-}" ]; then
+  validate_receipt=1
+fi
+
+if [ "$validate_receipt" = "0" ]; then
+  echo "release preflight: PASS tag=$RELEASE_TAG sha=$CI_COMMIT_SHA (tag-only deploy)"
+  exit 0
+fi
+
+for name in \
+  CI_PIPELINE_ID \
+  CI_API_V4_URL \
+  CI_PROJECT_ID \
+  CI_JOB_TOKEN \
+  RC2_VALIDATED_PIPELINE_ID \
+  RC2_VALIDATED_JOB_ID \
+  RC2_ACCEPTANCE_MANIFEST_BASE64 \
+  RC2_ACCEPTANCE_MANIFEST_SHA256
+do
+  require_value "$name"
+done
+
 if ! [[ "$RC2_VALIDATED_PIPELINE_ID" =~ ^[0-9]+$ ]]; then
   echo "release preflight: RC2_VALIDATED_PIPELINE_ID must be numeric" >&2
   exit 1
@@ -50,18 +84,12 @@ if ! [[ "$RC2_ACCEPTANCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 
-for command in git curl jq shasum base64; do
+for command in curl jq shasum base64; do
   command -v "$command" >/dev/null || {
     echo "release preflight: missing command $command" >&2
     exit 1
   }
 done
-
-tag_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
-if [ "$tag_sha" != "$CI_COMMIT_SHA" ]; then
-  echo "release preflight: tag does not peel to CI_COMMIT_SHA" >&2
-  exit 1
-fi
 
 work_dir="$(mktemp -d)"
 cleanup_preflight() {
