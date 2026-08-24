@@ -17,6 +17,70 @@ public struct ProviderRuntimeProcess: Sendable, Equatable {
     }
 }
 
+public typealias ProviderProcessList = @Sendable () throws -> [ProviderRuntimeProcess]
+
+/// One process-table read produced by the ownership sweep and then consumed as
+/// an immutable diagnostics snapshot. Telemetry waits so it can never make the
+/// sweep act on rows that were captured earlier by a delayed consumer.
+public final class ProviderProcessListSnapshot: @unchecked Sendable {
+    private enum State {
+        case pending
+        case loading
+        case finished(Result<[ProviderRuntimeProcess], Error>)
+    }
+
+    private let condition = NSCondition()
+    private let loader: ProviderProcessList
+    private var state: State = .pending
+
+    public init(
+        loader: @escaping ProviderProcessList = { try ProviderProcessSweeper.psRowsThrowing() }
+    ) {
+        self.loader = loader
+    }
+
+    public func rows() throws -> [ProviderRuntimeProcess] {
+        condition.lock()
+        while true {
+            switch state {
+            case .pending:
+                state = .loading
+                condition.unlock()
+                let result = Result { try loader() }
+                condition.lock()
+                state = .finished(result)
+                condition.broadcast()
+                condition.unlock()
+                return try result.get()
+            case .loading:
+                condition.wait()
+            case .finished(let result):
+                condition.unlock()
+                return try result.get()
+            }
+        }
+    }
+
+    /// Waits for the sweep-owned first read. A failed first read is retried once
+    /// for telemetry, preserving the two independent chances from the old path.
+    public func rowsAfterSweepLoad() throws -> [ProviderRuntimeProcess] {
+        condition.lock()
+        while true {
+            switch state {
+            case .pending, .loading:
+                condition.wait()
+            case .finished(let result):
+                condition.unlock()
+                do {
+                    return try result.get()
+                } catch {
+                    return try loader()
+                }
+            }
+        }
+    }
+}
+
 public struct ManagedProcessScan: Sendable, Equatable {
     public let providerProcesses: [ProviderRuntimeProcess]
     public let sidecarProcesses: [ProviderRuntimeProcess]
@@ -218,6 +282,17 @@ public enum ProviderProcessSweeper {
             processes: processes,
             processStartIdentity: processStartIdentity
         )
+    }
+
+    /// Loads the process table only when durable ownership can make its rows
+    /// observable to managed telemetry or orphan cleanup. Command text alone
+    /// never grants ownership, so an empty ledger has an exact empty result.
+    public static func persistedOwnershipRows(
+        store: ProviderProcessOwnershipStore,
+        processList: ProviderProcessList = { try ProviderProcessSweeper.psRowsThrowing() }
+    ) throws -> [ProviderRuntimeProcess] {
+        guard !(try store.load()).isEmpty else { return [] }
+        return try processList()
     }
 
     public static func psRowsThrowing() throws -> [ProviderRuntimeProcess] {

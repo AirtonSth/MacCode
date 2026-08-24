@@ -183,6 +183,7 @@ public enum TerminalTransitionPolicy {
 public final class TerminalTransitionLedger: @unchecked Sendable {
     public static let defaultMaxRows = 5_000
     public static let defaultTTL: TimeInterval = 30 * 24 * 60 * 60
+    static let defaultPruneSlack = 1_024
 
     /// Best-effort boot session UUID (empty when unavailable).
     public static func currentBootId() -> String {
@@ -197,6 +198,7 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
 
     private let fileURL: URL
     private let maxRows: Int
+    private let pruneSlack: Int
     private let ttl: TimeInterval
     private let queue = DispatchQueue(label: "io.remotecode.terminal-ledger")
     /// PERF: avoid re-reading + splitting the whole JSONL on every append just to
@@ -214,13 +216,29 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
         return d
     }()
 
-    public init(
+    public convenience init(
         directory: URL,
         maxRows: Int = TerminalTransitionLedger.defaultMaxRows,
         ttl: TimeInterval = TerminalTransitionLedger.defaultTTL
     ) {
+        self.init(
+            directory: directory,
+            maxRows: maxRows,
+            ttl: ttl,
+            pruneSlack: Self.defaultPruneSlack
+        )
+    }
+
+    init(
+        directory: URL,
+        maxRows: Int,
+        ttl: TimeInterval,
+        pruneSlack: Int
+    ) {
+        let boundedMaxRows = max(1, maxRows)
         self.fileURL = directory.appendingPathComponent("terminal-transitions.jsonl")
-        self.maxRows = max(1, maxRows)
+        self.maxRows = boundedMaxRows
+        self.pruneSlack = min(max(0, pruneSlack), boundedMaxRows)
         self.ttl = max(60, ttl)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
@@ -234,7 +252,7 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
             try appendLocked(committed)
             // Prune only when over soft budget — avoid O(n) rewrite every terminal.
             let count = try rowCountLocked()
-            if count > maxRows {
+            if count > maxRows, count - maxRows > pruneSlack {
                 try pruneLocked(now: committed.commitTime ?? Date())
             }
         }
@@ -277,7 +295,11 @@ public final class TerminalTransitionLedger: @unchecked Sendable {
 
     public func allRecords() throws -> [TerminalTransitionRecord] {
         try queue.sync {
-            try loadLocked()
+            let rows = try loadLocked()
+            if rows.count > maxRows {
+                return Array(rows.suffix(maxRows))
+            }
+            return rows
         }
     }
 

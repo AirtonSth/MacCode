@@ -675,6 +675,7 @@ final class ProviderSpawnTagTests: ProviderProcessTestCase {
         try store.replace([tag])
         var identities: [pid_t: ProviderProcessStartIdentity] = [82: childIdentity]
         var signals: [(pid_t, Int32)] = []
+        var groupEnumerationCount = 0
 
         let result = try ProviderProcessSweeper.sweepPersistedOrphans(
             store: store,
@@ -685,7 +686,10 @@ final class ProviderSpawnTagTests: ProviderProcessTestCase {
             processCommand: { _ in nil },
             processStartIdentity: { identities[$0] },
             descendantPIDs: { _ in [] },
-            processGroupMembers: { $0 == 81 ? [82] : [] },
+            processGroupMembers: { group in
+                groupEnumerationCount += 1
+                return group == 81 ? [82] : []
+            },
             processIsAlive: { identities[$0] != nil },
             graceInterval: 0,
             wait: { _ in },
@@ -699,6 +703,8 @@ final class ProviderSpawnTagTests: ProviderProcessTestCase {
         XCTAssertEqual(signals.map(\.0), [82],
                        "a verified provider group must remain recoverable after its leader exits and its child reparents")
         XCTAssertEqual(signals.map(\.1), [SIGTERM])
+        XCTAssertEqual(groupEnumerationCount, 1,
+                       "the dead-root decision and its target list must share one process-table enumeration")
         XCTAssertEqual(result.terminatedPIDs, [81])
         XCTAssertTrue(try store.load().isEmpty,
                       "the group ownership row may clear only after every surviving member is confirmed dead")

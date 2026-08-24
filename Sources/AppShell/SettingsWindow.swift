@@ -1346,6 +1346,41 @@ private struct SettingsRouteAnchor: NSViewRepresentable {
     }
 }
 
+/// Finite one-second schedule for the Settings pairing-code countdown.
+/// It emits the exact expiry boundary once, then stops because every later
+/// presentation state is byte-for-byte identical to "Expired".
+struct PairingCodeTimelineSchedule: TimelineSchedule {
+    let expiresAt: Date
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        var next: Date? = startDate
+        return AnyIterator {
+            guard let current = next else { return nil }
+            if current >= expiresAt {
+                next = nil
+            } else {
+                next = min(current.addingTimeInterval(1), expiresAt)
+            }
+            return current
+        }
+    }
+}
+
+/// Pure presentation seam shared by the finite schedule and its regression
+/// tests. Rounding and copy intentionally match the prior inline TimelineView.
+struct PairingCodeCountdownPresentation: Equatable {
+    let remaining: Int
+
+    init(expiresAt: Date, now: Date) {
+        remaining = max(0, Int(expiresAt.timeIntervalSince(now).rounded(.up)))
+    }
+
+    var expired: Bool { remaining <= 0 }
+    var label: String {
+        expired ? "Expired" : String(format: "Expires in %d:%02d", remaining / 60, remaining % 60)
+    }
+}
+
 public struct SettingsView: View {
     @ObservedObject var vm: SettingsViewModel
     private let onClose: (() -> Void)?
@@ -2278,15 +2313,17 @@ public struct SettingsView: View {
                     .accessibilityIdentifier("settings.pairing.remoteAccessOffNote")
             }
             if let c = vm.newPairingCode, let expiresAt = vm.pairingCodeExpiresAt {
-                TimelineView(.periodic(from: .now, by: 1)) { context in
-                    let remaining = max(0, Int(expiresAt.timeIntervalSince(context.date).rounded(.up)))
-                    let expired = remaining <= 0
+                TimelineView(PairingCodeTimelineSchedule(expiresAt: expiresAt)) { context in
+                    let countdown = PairingCodeCountdownPresentation(
+                        expiresAt: expiresAt,
+                        now: context.date
+                    )
                     HStack(spacing: DS.Space.lg) {
-                        Button(expired ? "Generate again" : "Generate pairing code") { vm.createPairingCode() }
+                        Button(countdown.expired ? "Generate again" : "Generate pairing code") { vm.createPairingCode() }
                             .buttonStyle(DSSecondaryButtonStyle())
                             .accessibilityIdentifier("settings.pairing.generate")
                         Text(c).font(DS.Font.title2.monospaced())
-                            .foregroundColor(expired ? DS.Palette.textTertiary : DS.Palette.success)
+                            .foregroundColor(countdown.expired ? DS.Palette.textTertiary : DS.Palette.success)
                             .textSelection(.enabled)
                             .accessibilityIdentifier("settings.pairing.code")
                         Button {
@@ -2299,11 +2336,11 @@ public struct SettingsView: View {
                         }
                         .help("Copy pairing code")
                         .buttonStyle(DSSecondaryButtonStyle())
-                        .disabled(expired)
+                        .disabled(countdown.expired)
                         .accessibilityIdentifier("settings.pairing.copy")
-                        Text(expired ? "Expired" : String(format: "Expires in %d:%02d", remaining / 60, remaining % 60))
+                        Text(countdown.label)
                             .font(DS.Font.caption)
-                            .foregroundColor(expired ? DS.Palette.danger : DS.Palette.textTertiary)
+                            .foregroundColor(countdown.expired ? DS.Palette.danger : DS.Palette.textTertiary)
                     }
                 }
                 // QR code: shown while the code is live; hidden once expired.

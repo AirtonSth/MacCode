@@ -187,5 +187,6 @@ final class BackgroundWriterQueueTests: XCTestCase {
         // Clear so the global singleton does not hold a closure that captures
         // this test's AppContext after the test finishes.
         EventBus.shared.persister = nil
+        EventBus.shared.persistenceCommitFence = nil
     }
 }

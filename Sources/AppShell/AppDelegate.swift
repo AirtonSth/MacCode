@@ -227,17 +227,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         context.router = router
 
         // Wire EventBus to the persisted event log so events survive restart.
-        let log = context.eventLog
-        EventBus.shared.shouldRetainRecentEvent = { ev in
-            Self.shouldRetainRecentEvent(ev)
-        }
-        EventBus.shared.persister = { ev in
-            guard Self.shouldPersistEvent(ev) else { return }
-            let json = EventBus.encodePayloadForPersistence(ev.payload)
-            _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
-        }
+        // Encoding + SQLite run on AppContext's serial writer queue; publish
+        // remains ordered without blocking the producer on durable storage.
+        Self.wireEventPersistence(context: context)
         do {
-            EventBus.shared.reloadFromPersistence(lastSeq: try log.lastSeq(), recent: [])
+            EventBus.shared.reloadFromPersistence(lastSeq: try context.eventLog.lastSeq(), recent: [])
         } catch {
             appLifecycleLog.error("event_log.sequence_init_failed error=\(error.localizedDescription, privacy: .public)")
         }
@@ -553,6 +547,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         persistRestorableStateBeforeUpdate()
         stopPetController()
         stopLiveRuntimesForAppTermination()
+        // Runtime shutdown publishes final lifecycle events after the snapshot
+        // barrier above. Drain them before the process exits.
+        context?.flushEventPersistence()
         socketServer?.stop()
         directAccessSupervisor?.shutdown()
         directAccessSupervisor = nil
@@ -591,6 +588,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     private func persistRestorableStateBeforeUpdate() {
         context?.saveSnapshot()
+        // Sparkle may relaunch immediately after this hook returns. Make every
+        // previously published event durable before handing control back.
+        context?.flushEventPersistence()
+    }
+
+    static func wireEventPersistence(
+        context: AppContext,
+        eventBus: EventBus = .shared
+    ) {
+        eventBus.shouldRetainRecentEvent = { event in
+            Self.shouldRetainRecentEvent(event)
+        }
+        context.wireBackgroundPersister(eventBus: eventBus)
     }
 
     private func stopLiveRuntimesForAppTermination() {
@@ -602,6 +612,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func configureManagedProviderAdmission() {
+        guard ManagedProviderAdmissionPolicy.requiresProviderStartPreflight else {
+            return
+        }
         let profile = managedProcessMemoryProfile
         let gate = ManagedProviderAdmissionGate()
         // Best-effort accounting only: never refuse a user-started provider for
@@ -650,11 +663,28 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                // Grok first: the full Claude/Codex probe can stay busy for the
-                // whole interval, and its busy-skip must not starve the purple ring.
-                self.context?.refreshGrokTokenSaverAccountUsage(reason: "periodic")
-                self.context?.refreshTokenSaverAccountUsage(reason: "periodic")
+                // Grok stays independent from slow Claude/Codex probes, but the
+                // combined operation issues only one Grok credits request.
+                self.context?.refreshPeriodicTokenSaverAccountUsage()
             }
+        }
+    }
+
+    /// Periodic telemetry can only observe processes backed by durable ownership.
+    /// Termination is intentionally different: it samples the post-sweep table
+    /// directly so shutdown diagnostics retain their established ordering.
+    nonisolated static func providerProcessListForDiagnostics(
+        reason: String,
+        store: ProviderProcessOwnershipStore?,
+        processList: @escaping ProviderProcessList
+    ) -> ProviderProcessList {
+        guard reason != "will_terminate" else { return processList }
+        guard let store else { return { [] } }
+        return {
+            try ProviderProcessSweeper.persistedOwnershipRows(
+                store: store,
+                processList: processList
+            )
         }
     }
 
@@ -662,16 +692,41 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // Periodic heartbeats must never block MainActor on process scans or
         // SIGTERM grace sleeps — that freezes the whole UI every 60s once orphans
         // accumulate. App termination is the only path that still reaps inline.
+        let processList: ProviderProcessList
         if reason == "will_terminate" {
+            // Termination telemetry runs after the blocking reaper and must read
+            // the post-sweep table rather than reuse its pre-signal snapshot.
+            processList = Self.providerProcessListForDiagnostics(
+                reason: reason,
+                store: ProviderProcessOwnership.shared.store(),
+                processList: { try ProviderProcessSweeper.psRowsThrowing() }
+            )
             reconcilePersistedProcessOwnership(reason: reason)
         } else {
-            scheduleOrphanRuntimeSweep(reason: reason)
+            let persistedOwnershipProcessList = Self.providerProcessListForDiagnostics(
+                reason: reason,
+                store: ProviderProcessOwnership.shared.store(),
+                processList: { try ProviderProcessSweeper.psRowsThrowing() }
+            )
+            let snapshot = ProviderProcessListSnapshot(loader: persistedOwnershipProcessList)
+            let sweepDecision = scheduleOrphanRuntimeSweep(
+                reason: reason,
+                processSnapshot: snapshot
+            )
+            if sweepDecision == .start {
+                // Only the reaper may materialize the snapshot. This prevents a
+                // delayed sweep from acting on rows captured earlier by telemetry.
+                processList = { try snapshot.rowsAfterSweepLoad() }
+            } else {
+                processList = persistedOwnershipProcessList
+            }
         }
         AppDiagnostics.heartbeat(
             reason: reason,
             activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
             profile: managedProcessMemoryProfile,
-            lifecycleRecorder: lifecycleRecorder
+            lifecycleRecorder: lifecycleRecorder,
+            processList: processList
         )
     }
 
@@ -746,10 +801,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     @MainActor
-    private func scheduleOrphanRuntimeSweep(reason: String) {
+    @discardableResult
+    private func scheduleOrphanRuntimeSweep(
+        reason: String,
+        processSnapshot: ProviderProcessListSnapshot = ProviderProcessListSnapshot()
+    ) -> OrphanSweepDecision {
         if Self.beginOrphanSweep(inFlight: &orphanSweepInFlight) == .skipInFlight {
             appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) result=skipped_in_flight")
-            return
+            return .skipInFlight
         }
         let minAge: TimeInterval = reason == "launch" ? 0 : ProcessSpawnTagger.defaultMinAge
         Task.detached(priority: .utility) { [weak self] in
@@ -759,9 +818,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 }
             }
             // nonisolated static body — never hop back to MainActor for the
-            // process scan / SIGTERM grace sleeps that freeze the UI.
-            Self.performOrphanRuntimeSweep(reason: reason, minAge: minAge)
+            // process scan / SIGTERM grace sleeps that freeze the UI. The
+            // terminate path materializes the snapshot immediately before its
+            // ownership evaluation, never earlier in telemetry.
+            Self.performOrphanRuntimeSweep(
+                reason: reason,
+                minAge: minAge,
+                processList: { try processSnapshot.rows() }
+            )
+            // An unconfigured store returns before asking for a process list.
+            // Resolve any telemetry waiter after that no-op sweep exits.
+            _ = try? processSnapshot.rows()
         }
+        return .start
     }
 
     private func reconcilePersistedProcessOwnership(reason: String) {
@@ -773,10 +842,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// or during applicationWillTerminate where the UI is already shutting down.
     /// nonisolated so Task.detached can run the process-table reaper without
     /// MainActor isolation (process I/O + Thread.sleep must stay off the UI thread).
-    nonisolated private static func performOrphanRuntimeSweep(reason: String, minAge: TimeInterval) {
+    nonisolated private static func performOrphanRuntimeSweep(
+        reason: String,
+        minAge: TimeInterval,
+        processList: ProviderProcessList = { try ProviderProcessSweeper.psRowsThrowing() }
+    ) {
         do {
             let result = try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(
-                minAge: minAge
+                minAge: minAge,
+                processList: processList
             )
             if !result.orphanRootPIDs.isEmpty || !result.failedPIDs.isEmpty {
                 appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) roots=\(result.orphanRootPIDs.count, privacy: .public) terminated=\(result.terminatedPIDs.count, privacy: .public) failed=\(result.failedPIDs.count, privacy: .public)")

@@ -5073,6 +5073,71 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         (try? runRepo.countStreamEvents(threadId: threadId)) ?? 0
     }
 
+    public func streamEventCursor(threadId: AgentThreadID) -> AgentRunRepository.StreamEventCursor {
+        (try? runRepo.streamEventCursor(threadId: threadId))
+            ?? AgentRunRepository.StreamEventCursor(
+                count: 0,
+                rowId: nil,
+                runId: nil,
+                sequence: 0,
+                mutationId: nil
+            )
+    }
+
+    public struct StreamEventSuffix: Sendable, Equatable {
+        public let events: [AssistantEvent]
+        public let decodedPayloadBytes: Int64
+
+        public init(events: [AssistantEvent], decodedPayloadBytes: Int64) {
+            self.events = events
+            self.decodedPayloadBytes = decodedPayloadBytes
+        }
+    }
+
+    /// Decode only after every replay-view mutation covered by the cursor has
+    /// been proven to be the expected contiguous suffix of one run. An extra
+    /// external row, a sequence gap, corruption, or an oversized suffix returns
+    /// nil so callers fail closed to a full hot replay.
+    public func attestedStreamEventSuffix(
+        threadId: AgentThreadID,
+        afterMutationId: Int64,
+        throughMutationId: Int64,
+        runId: AgentRunID,
+        startingSequence: Int,
+        count: Int
+    ) -> StreamEventSuffix? {
+        guard count > 0,
+              count <= Self.hotReplayEventCount,
+              throughMutationId > afterMutationId else { return nil }
+        do {
+            let metadata = try runRepo.listStreamEventMutations(
+                threadId: threadId,
+                afterMutationId: afterMutationId,
+                throughMutationId: throughMutationId,
+                limit: count + 1
+            )
+            guard metadata.count == count,
+                  metadata.last?.mutationId == throughMutationId,
+                  metadata.enumerated().allSatisfy({ offset, row in
+                      row.runId == runId && row.sequence == startingSequence + offset
+                  }) else { return nil }
+            let bytes = metadata.reduce(Int64(0)) { $0 + $1.payloadBytes }
+            guard bytes <= Self.hotReplayEventBytes else { return nil }
+            let events = try runRepo.listStreamEventsByIds(
+                metadata.map(\.id),
+                strictDecoding: true,
+                remainingByteBudget: Self.hotReplayEventBytes
+            )
+            guard events.count == count else { return nil }
+            return StreamEventSuffix(
+                events: events,
+                decodedPayloadBytes: bytes
+            )
+        } catch {
+            return nil
+        }
+    }
+
     public func hotReplayIsPartial(threadId: AgentThreadID) -> Bool {
         ((try? runRepo.streamHistoryWasPruned(threadId: threadId)) ?? false)
             || ((try? runRepo.countStreamEvents(threadId: threadId)) ?? 0) > Self.hotReplayEventCount

@@ -265,21 +265,14 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                         return
                     }
                 }
-                // Re-read live previous after possible overflow of other keys.
+                // `candidate` was already derived from this exact previous frame
+                // for admission above. Re-merging here reparsed and re-encoded the
+                // growing delta a second time for every token.
                 if let livePrevious = self.pending[key] {
-                    if self.filter.coalescingMergesByConcatenation(for: event),
-                       let merged = Self.mergeAgentItemDeltaFrames(livePrevious, data) {
-                        self.onCoalescedAway?(livePrevious)
-                        self.pendingBytes -= livePrevious.count
-                        self.noteEnqueueLocked(merged)
-                        self.pending[key] = merged
-                    } else {
-                        // Last-write-wins: superseded summary never hits the socket.
-                        self.onCoalescedAway?(livePrevious)
-                        self.pendingBytes -= livePrevious.count
-                        self.noteEnqueueLocked(data)
-                        self.pending[key] = data
-                    }
+                    self.onCoalescedAway?(livePrevious)
+                    self.pendingBytes -= livePrevious.count
+                    self.noteEnqueueLocked(candidate)
+                    self.pending[key] = candidate
                 } else {
                     self.order.append(key)
                     self.noteEnqueueLocked(candidate)
@@ -443,9 +436,14 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     /// Merge two encoded `agent.item.delta` frames for the same thread + item by
     /// concatenating append fields. Returns nil when kinds/ids do not match.
     /// WHY: last-write-wins would drop tokens and corrupt agent text.
-    static func mergeAgentItemDeltaFrames(_ earlier: Data, _ later: Data) -> Data? {
-        guard var left = parseEventObject(earlier),
-              var right = parseEventObject(later),
+    static func mergeAgentItemDeltaFrames(
+        _ earlier: Data,
+        _ later: Data,
+        onParse: (() -> Void)? = nil,
+        onEncode: (() -> Void)? = nil
+    ) -> Data? {
+        guard var left = parseEventObject(earlier, onParse: onParse),
+              var right = parseEventObject(later, onParse: onParse),
               (left["kind"] as? String) == "agent.item.delta",
               (right["kind"] as? String) == "agent.item.delta",
               var leftPayload = left["payload"] as? [String: Any],
@@ -482,47 +480,185 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         right["payload"] = rightPayload
         // Keep the later (higher) sequence / eventId so the client watermark
         // advances once; earlier seq is reported via onCoalescedAway.
+        onEncode?()
         guard let data = try? JSONSerialization.data(withJSONObject: right) else {
             return nil
         }
         return data
     }
 
+    private struct AgentItemDeltaIdentity: Equatable {
+        let thread: String
+        let item: String
+        let turn: String?
+    }
+
+    private struct ParsedAgentItemDelta {
+        let data: Data
+        let object: [String: Any]
+        let payload: [String: Any]
+        let identity: AgentItemDeltaIdentity?
+    }
+
+    /// Linear accumulator for one consecutive same-item delta run. It retains
+    /// string segments and the latest frame object, then joins/serializes once.
+    private struct AgentItemDeltaMergeRun {
+        private(set) var rawFrames: [Data]
+        private var latestObject: [String: Any]
+        private var latestPayload: [String: Any]
+        private let identity: AgentItemDeltaIdentity?
+        private var bodySegments: [String]
+        private var outputSegments: [String]
+        private var textSegments: [String]
+        private var summary: Any?
+        private var progress: Any?
+        private var distillApplied: Bool
+
+        var absorbed: ArraySlice<Data> { rawFrames.dropLast() }
+
+        init(_ frame: ParsedAgentItemDelta) {
+            rawFrames = [frame.data]
+            latestObject = frame.object
+            latestPayload = frame.payload
+            identity = frame.identity
+            bodySegments = Self.initialSegments(frame.payload, field: "body_append")
+            outputSegments = Self.initialSegments(frame.payload, field: "output_append")
+            textSegments = Self.initialSegments(frame.payload, field: "text")
+            summary = frame.payload["summary"]
+            progress = frame.payload["progress"]
+            distillApplied = frame.payload["distill_applied"] as? Bool == true
+        }
+
+        mutating func append(_ frame: ParsedAgentItemDelta) -> Bool {
+            guard let identity, identity == frame.identity else { return false }
+
+            // The prior raw frame carries the same sequence as the cumulative
+            // frame the old fold reported, which is all gap accounting consumes.
+            rawFrames.append(frame.data)
+            latestObject = frame.object
+            latestPayload = frame.payload
+            Self.appendString(frame.payload, field: "body_append", to: &bodySegments)
+            Self.appendString(frame.payload, field: "output_append", to: &outputSegments)
+            Self.appendString(frame.payload, field: "text", to: &textSegments)
+            if let value = frame.payload["summary"] { summary = value }
+            if let value = frame.payload["progress"] { progress = value }
+            distillApplied = distillApplied
+                || frame.payload["distill_applied"] as? Bool == true
+            return true
+        }
+
+        func encoded(onEncode: (() -> Void)?) -> Data? {
+            guard rawFrames.count > 1 else { return rawFrames.first }
+            var payload = latestPayload
+            Self.apply(bodySegments, field: "body_append", to: &payload)
+            Self.apply(outputSegments, field: "output_append", to: &payload)
+            Self.apply(textSegments, field: "text", to: &payload)
+            if payload["summary"] == nil, let summary {
+                payload["summary"] = summary
+            }
+            if payload["progress"] == nil, let progress {
+                payload["progress"] = progress
+            }
+            if distillApplied { payload["distill_applied"] = true }
+            var object = latestObject
+            object["payload"] = payload
+            onEncode?()
+            return try? JSONSerialization.data(withJSONObject: object)
+        }
+
+        private static func initialSegments(
+            _ payload: [String: Any],
+            field: String
+        ) -> [String] {
+            guard let value = payload[field] as? String, !value.isEmpty else { return [] }
+            return [value]
+        }
+
+        private static func appendString(
+            _ payload: [String: Any],
+            field: String,
+            to segments: inout [String]
+        ) {
+            guard let value = payload[field] as? String, !value.isEmpty else { return }
+            segments.append(value)
+        }
+
+        private static func apply(
+            _ segments: [String],
+            field: String,
+            to payload: inout [String: Any]
+        ) {
+            guard !segments.isEmpty else { return }
+            payload[field] = segments.joined()
+        }
+    }
+
     /// Walk frames in arrival order; concatenate consecutive same-item deltas.
+    /// Each input is parsed once and each merged run is encoded once, avoiding the
+    /// old left fold over a repeatedly growing JSON frame.
     /// Returns (frames to send, frames absorbed whose sequences must be filtered).
-    static func mergeAgentItemDeltasInOrder(_ frames: [Data]) -> (merged: [Data], absorbed: [Data]) {
+    static func mergeAgentItemDeltasInOrder(
+        _ frames: [Data],
+        onParse: (() -> Void)? = nil,
+        onEncode: (() -> Void)? = nil
+    ) -> (merged: [Data], absorbed: [Data]) {
         var result: [Data] = []
         var absorbed: [Data] = []
-        var pendingDelta: Data?
+        var pendingRun: AgentItemDeltaMergeRun?
 
         func flushPending() {
-            if let pendingDelta {
-                result.append(pendingDelta)
+            guard let run = pendingRun else { return }
+            if let encoded = run.encoded(onEncode: onEncode) {
+                result.append(encoded)
+                absorbed.append(contentsOf: run.absorbed)
+            } else {
+                // Parsed JSON objects should always serialize. Preserve every raw
+                // frame if Foundation nevertheless rejects the final object.
+                result.append(contentsOf: run.rawFrames)
             }
-            pendingDelta = nil
+            pendingRun = nil
         }
 
         for frame in frames {
-            guard let object = parseEventObject(frame),
-                  (object["kind"] as? String) == "agent.item.delta" else {
+            guard let object = parseEventObject(frame, onParse: onParse),
+                  (object["kind"] as? String) == "agent.item.delta",
+                  let payload = object["payload"] as? [String: Any] else {
                 flushPending()
                 result.append(frame)
                 continue
             }
-            if let current = pendingDelta,
-               let merged = mergeAgentItemDeltaFrames(current, frame) {
-                absorbed.append(current)
-                pendingDelta = merged
-            } else {
+            let parsed = ParsedAgentItemDelta(
+                data: frame,
+                object: object,
+                payload: payload,
+                identity: deltaIdentity(payload)
+            )
+            if pendingRun == nil {
+                pendingRun = AgentItemDeltaMergeRun(parsed)
+            } else if pendingRun?.append(parsed) != true {
                 flushPending()
-                pendingDelta = frame
+                pendingRun = AgentItemDeltaMergeRun(parsed)
             }
         }
         flushPending()
         return (result, absorbed)
     }
 
-    private static func parseEventObject(_ data: Data) -> [String: Any]? {
+    private static func deltaIdentity(_ payload: [String: Any]) -> AgentItemDeltaIdentity? {
+        guard let thread = payload["thread_id"] as? String,
+              let item = payload["item_id"] as? String else { return nil }
+        return AgentItemDeltaIdentity(
+            thread: thread,
+            item: item,
+            turn: payload["turn_id"] as? String
+        )
+    }
+
+    private static func parseEventObject(
+        _ data: Data,
+        onParse: (() -> Void)? = nil
+    ) -> [String: Any]? {
+        onParse?()
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               (object["type"] as? String) == "event" else { return nil }
         return object

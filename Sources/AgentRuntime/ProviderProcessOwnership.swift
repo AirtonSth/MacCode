@@ -90,6 +90,23 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
         return try loadUnlocked()
     }
 
+    /// Preserve crash-recovery cleanup without forcing an unchanged ledger
+    /// through the write/fsync/rename protocol. The unlocked preflight avoids
+    /// creating a lock file when the ownership directory does not exist.
+    func cleanupAbandonedTemporaryFilesIfPresent() throws {
+        let fm = FileManager.default
+        let parent = fileURL.deletingLastPathComponent()
+        let prefix = ".\(fileURL.lastPathComponent).tmp-"
+        guard let names = try? fm.contentsOfDirectory(atPath: parent.path),
+              names.contains(where: { $0.hasPrefix(prefix) }) else { return }
+
+        lock.lock()
+        defer { lock.unlock() }
+        try withOwnershipLock {
+            cleanupAbandonedTemporaryFilesUnlocked(fileManager: fm, parent: parent)
+        }
+    }
+
     public func replace(_ tags: [SpawnedProcessTag]) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -220,6 +237,10 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
         guard dirSync == 0 else {
             throw ProviderProcessOwnershipError.processListFailed("ownership directory fsync failed")
         }
+        cleanupAbandonedTemporaryFilesUnlocked(fileManager: fm, parent: parent)
+    }
+
+    private func cleanupAbandonedTemporaryFilesUnlocked(fileManager fm: FileManager, parent: URL) {
         // Recover abandoned temps from any prior PID once mtime is old enough that
         // a concurrent writer is unlikely (stale-owner cleanup after relaunch).
         if let entries = try? fm.contentsOfDirectory(
@@ -296,6 +317,10 @@ public extension ProviderProcessSweeper {
         sendSignal: (pid_t, Int32) -> Bool
     ) throws -> ProviderProcessSweepResult {
         let tags = try store.load().sorted { $0.pgid < $1.pgid }
+        guard !tags.isEmpty else {
+            try store.cleanupAbandonedTemporaryFilesIfPresent()
+            return ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+        }
         var retained: [SpawnedProcessTag] = []
         var roots: [Int32] = []
         var terminated: [Int32] = []
@@ -305,9 +330,14 @@ public extension ProviderProcessSweeper {
             let rootIsAlive = processIsAlive(tag.pgid)
             let hasVerifiedGroupIdentity = tag.isolatedProcessGroup == tag.pgid
                 && tag.startIdentity != nil
-            let groupMembers = hasVerifiedGroupIdentity
-                ? processGroupMembers(tag.pgid).filter { $0 > 0 && $0 != currentPID }
-                : []
+            var cachedGroupMembers: [pid_t]?
+            func verifiedGroupMembers() -> [pid_t] {
+                guard hasVerifiedGroupIdentity else { return [] }
+                if let cachedGroupMembers { return cachedGroupMembers }
+                let members = processGroupMembers(tag.pgid).filter { $0 > 0 && $0 != currentPID }
+                cachedGroupMembers = members
+                return members
+            }
 
             if tag.ownerPID == currentPID,
                let expectedOwnerIdentity = tag.ownerStartIdentity,
@@ -319,7 +349,7 @@ public extension ProviderProcessSweeper {
                         || processStartIdentity(tag.pgid) == tag.startIdentity {
                         retained.append(tag)
                     }
-                } else if !groupMembers.isEmpty {
+                } else if !verifiedGroupMembers().isEmpty {
                     // The root exited, but its certified group still has late
                     // descendants. Retain ownership until the group drains.
                     retained.append(tag)
@@ -370,7 +400,7 @@ public extension ProviderProcessSweeper {
                     retained.append(tag)
                     continue
                 }
-            } else if groupMembers.isEmpty {
+            } else if verifiedGroupMembers().isEmpty {
                 // The exact root lifetime and its verified group are both gone.
                 // The ownership row is now exhausted and may be removed.
                 continue
@@ -385,7 +415,7 @@ public extension ProviderProcessSweeper {
             let rootTargets = rootIsAlive ? [tag.pgid] : []
             let targets = (
                 Array(descendantPIDs(tag.pgid).reversed())
-                    + Array(groupMembers.reversed())
+                    + Array(verifiedGroupMembers().reversed())
                     + rootTargets
             ).filter {
                 seen.insert($0).inserted

@@ -2478,18 +2478,264 @@ private final class DeskStopJoin {
     var task: Task<Bool, Never>!
 }
 
+struct BotDraftPersistenceMetrics: Equatable {
+    var encodeCount = 0
+    var setCount = 0
+    var encodedBytes = 0
+}
+
+/// One persistence owner per AppContext. Bot windows keep their visible fields
+/// locally, while this authority orders the canonical draft maps and performs
+/// lifecycle/deadline writes once for every surface sharing that context.
+@MainActor
+final class BotDraftPersistenceAuthority {
+    private static let delayNanoseconds: UInt64 = 250_000_000
+
+    private(set) var composerDraftsByBot: [BotID: BotComposerDraft] = [:]
+    private(set) var inspectorDraftsByBot: [BotID: BotInspectorDraft] = [:]
+    private(set) var studioDraftsByBot: [BotID: BotStudioDraft] = [:]
+    private var metrics = BotDraftPersistenceMetrics()
+    private var composerDirty = false
+    private var inspectorDirty = false
+    private var studioDirty = false
+    private var flushScheduled = false
+    private var flushGeneration: UInt64 = 0
+    private var flushTask: Task<Void, Never>?
+    private var lifecycleObservers: [NSObjectProtocol] = []
+    var scheduleForTesting: ((UInt64, @escaping () -> Void) -> Void)?
+
+    init() {
+        reloadFromUserDefaults()
+        let center = NotificationCenter.default
+        for name in [
+            NSApplication.willHideNotification,
+            NSWindow.willCloseNotification,
+            NSApplication.willTerminateNotification,
+        ] {
+            lifecycleObservers.append(center.addObserver(
+                forName: name,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.flushPending()
+                }
+            })
+        }
+    }
+
+    deinit {
+        flushTask?.cancel()
+        for observer in lifecycleObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    func updateComposer(_ draft: BotComposerDraft?, for botID: BotID) {
+        composerDraftsByBot[botID] = draft.flatMap { $0.isEmpty ? nil : $0 }
+        composerDirty = true
+        scheduleFlush()
+    }
+
+    func updateInspector(_ draft: BotInspectorDraft?, for botID: BotID) {
+        inspectorDraftsByBot[botID] = draft.flatMap { $0.isEmpty ? nil : $0 }
+        inspectorDirty = true
+        scheduleFlush()
+    }
+
+    func updateStudio(_ draft: BotStudioDraft, for botID: BotID) {
+        studioDraftsByBot[botID] = draft
+        studioDirty = true
+        scheduleFlush()
+    }
+
+    func removeDrafts(for botID: BotID) {
+        if composerDraftsByBot.removeValue(forKey: botID) != nil {
+            composerDirty = true
+        }
+        if inspectorDraftsByBot.removeValue(forKey: botID) != nil {
+            inspectorDirty = true
+        }
+        if studioDraftsByBot.removeValue(forKey: botID) != nil {
+            studioDirty = true
+        }
+        if composerDirty || inspectorDirty || studioDirty {
+            scheduleFlush()
+        }
+    }
+
+    @discardableResult
+    func retainComposerDrafts(for liveBotIDs: Set<BotID>) -> Bool {
+        let next = composerDraftsByBot.filter { liveBotIDs.contains($0.key) }
+        guard next.count != composerDraftsByBot.count else { return false }
+        composerDraftsByBot = next
+        composerDirty = true
+        scheduleFlush()
+        return true
+    }
+
+    @discardableResult
+    func retainInspectorDrafts(for liveBotIDs: Set<BotID>) -> Bool {
+        let next = inspectorDraftsByBot.filter { liveBotIDs.contains($0.key) }
+        guard next.count != inspectorDraftsByBot.count else { return false }
+        inspectorDraftsByBot = next
+        inspectorDirty = true
+        scheduleFlush()
+        return true
+    }
+
+    @discardableResult
+    func retainStudioDrafts(for liveBotIDs: Set<BotID>) -> Bool {
+        let next = studioDraftsByBot.filter { liveBotIDs.contains($0.key) }
+        guard next.count != studioDraftsByBot.count else { return false }
+        studioDraftsByBot = next
+        studioDirty = true
+        scheduleFlush()
+        return true
+    }
+
+    func flushPending() {
+        flushTask?.cancel()
+        flushTask = nil
+        flushScheduled = false
+        flushGeneration &+= 1
+        if composerDirty {
+            persistComposerDrafts()
+        }
+        if inspectorDirty {
+            persistInspectorDrafts()
+        }
+        if studioDirty {
+            persistStudioDrafts()
+        }
+    }
+
+    func resetMetricsForTesting() {
+        metrics = BotDraftPersistenceMetrics()
+    }
+
+    var metricsForTesting: BotDraftPersistenceMetrics {
+        metrics
+    }
+
+    func reloadFromUserDefaultsForTesting() {
+        flushTask?.cancel()
+        flushTask = nil
+        flushScheduled = false
+        flushGeneration &+= 1
+        composerDirty = false
+        inspectorDirty = false
+        studioDirty = false
+        reloadFromUserDefaults()
+    }
+
+    private func scheduleFlush() {
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        flushGeneration &+= 1
+        let generation = flushGeneration
+        let action = { [weak self] in
+            guard let self,
+                  self.flushScheduled,
+                  self.flushGeneration == generation
+            else { return }
+            self.flushPending()
+        }
+        if let schedule = scheduleForTesting {
+            schedule(Self.delayNanoseconds, action)
+            return
+        }
+        flushTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: Self.delayNanoseconds)
+            } catch {
+                return
+            }
+            action()
+        }
+    }
+
+    private func persistComposerDrafts() {
+        composerDirty = false
+        let payload = Dictionary(uniqueKeysWithValues: composerDraftsByBot.map {
+            ($0.key.value.uuidString.lowercased(), $0.value)
+        })
+        persist(payload, key: BotsViewModel.composerDraftsDefaultsKey)
+    }
+
+    private func persistInspectorDrafts() {
+        inspectorDirty = false
+        let payload = Dictionary(uniqueKeysWithValues: inspectorDraftsByBot.map {
+            ($0.key.value.uuidString.lowercased(), $0.value)
+        })
+        persist(payload, key: BotsViewModel.inspectorDraftsDefaultsKey)
+    }
+
+    private func persistStudioDrafts() {
+        studioDirty = false
+        let payload = Dictionary(uniqueKeysWithValues: studioDraftsByBot.map {
+            ($0.key.value.uuidString.lowercased(), $0.value)
+        })
+        persist(payload, key: BotsViewModel.studioDraftDefaultsKey)
+    }
+
+    private func persist<T: Encodable>(_ payload: [String: T], key: String) {
+        guard !payload.isEmpty else {
+            UserDefaults.standard.removeObject(forKey: key)
+            return
+        }
+        if let data = try? BotsViewModel.encodeJSON(payload) {
+            metrics.encodeCount += 1
+            metrics.encodedBytes += data.count
+            UserDefaults.standard.set(data, forKey: key)
+            metrics.setCount += 1
+        }
+    }
+
+    private func reloadFromUserDefaults() {
+        composerDraftsByBot = decodeDraftMap(
+            BotComposerDraft.self,
+            key: BotsViewModel.composerDraftsDefaultsKey
+        ).filter { !$0.value.isEmpty }
+        inspectorDraftsByBot = decodeDraftMap(
+            BotInspectorDraft.self,
+            key: BotsViewModel.inspectorDraftsDefaultsKey
+        ).filter { !$0.value.isEmpty }
+        studioDraftsByBot = decodeDraftMap(
+            BotStudioDraft.self,
+            key: BotsViewModel.studioDraftDefaultsKey
+        )
+        if studioDraftsByBot.isEmpty,
+           let data = UserDefaults.standard.data(forKey: BotsViewModel.studioDraftDefaultsKey),
+           let draft = try? BotsViewModel.decodeJSON(BotStudioDraft.self, from: data),
+           let botID = draft.botID {
+            studioDraftsByBot = [botID: draft]
+        }
+    }
+
+    private func decodeDraftMap<T: Decodable>(_ type: T.Type, key: String) -> [BotID: T] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let payload = try? BotsViewModel.decodeJSON([String: T].self, from: data)
+        else { return [:] }
+        return Dictionary(uniqueKeysWithValues: payload.compactMap { raw, draft in
+            guard let uuid = UUID(uuidString: raw) else { return nil }
+            return (BotID(uuid), draft)
+        })
+    }
+}
+
 @MainActor
 public final class BotsViewModel: ObservableObject {
     // PERF: share JSON codec to avoid per-call allocation (many UserDefaults encode/decode per UI update).
     private static let sharedEncoder = JSONEncoder()
     private static let sharedDecoder = JSONDecoder()
     private static let codecLock = NSLock()
-    private static func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
+    fileprivate static func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
         Self.codecLock.lock()
         defer { Self.codecLock.unlock() }
         return try Self.sharedEncoder.encode(value)
     }
-    private static func decodeJSON<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+    fileprivate static func decodeJSON<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         Self.codecLock.lock()
         defer { Self.codecLock.unlock() }
         return try Self.sharedDecoder.decode(type, from: data)
@@ -2612,6 +2858,10 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var deskStopRunIssuedCountForTesting = 0
     /// Test seam: how many times Desk actually decoded stream events.
     public private(set) var deskLiveReplayFetchCountForTesting = 0
+    /// Test seams: persisted suffix work used to confirm an observer watermark.
+    public private(set) var deskLiveIncrementalDecodeEventCountForTesting = 0
+    public private(set) var deskLiveIncrementalDecodeBytesForTesting: Int64 = 0
+    var deskLiveObservedEventByteLimitForTesting: Int?
     /// Test seam: dest at the moment send first acknowledged the click.
     public private(set) var lastSendAcknowledgedOnScreenForTesting: BotsScreen?
     /// Test seam: dest at the moment Attention acknowledge ran. Dest-first
@@ -2661,10 +2911,33 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var attentionListCountForTesting = 0
     private var cachedPreviewBrain: ContextAssemblyReceipt?
     private var cachedPreviewBrainKey: String?
+    private var cachedClaudeSlashEntries: (
+        home: String,
+        revision: String,
+        refreshedAt: TimeInterval,
+        entries: [String]
+    )?
+    var claudeSlashDiscoveryForTesting: ((String) -> [String])? {
+        didSet { cachedClaudeSlashEntries = nil }
+    }
+    var claudeSlashCatalogRevisionForTesting: ((String) -> String)? {
+        didSet { cachedClaudeSlashEntries = nil }
+    }
+    var claudeSlashCacheTimeForTesting: (() -> TimeInterval)? {
+        didSet { cachedClaudeSlashEntries = nil }
+    }
     private var studioSupportByBot: [BotID: BotStudioSupportSnapshot] = [:]
     private var revisionByID: [BotRevisionID: BotRevision] = [:]
     @Published public private(set) var conversations: [BotConversation] = []
-    @Published public private(set) var selectedConversation: BotConversation?
+    @Published public private(set) var selectedConversation: BotConversation? {
+        didSet {
+            let previousThreadID = oldValue?.linkedAgentThreadID
+            if let previousThreadID,
+               previousThreadID != selectedConversation?.linkedAgentThreadID {
+                clearDeskObservedEvents(threadID: previousThreadID)
+            }
+        }
+    }
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
     @Published public private(set) var memoryItems: [BotMemoryItem] = []
     @Published public private(set) var skillBindings: [BotSkillBinding] = []
@@ -2732,6 +3005,7 @@ public final class BotsViewModel: ObservableObject {
     private let router: AppCommandRouter?
     private let botStore: BotStore
     private let settingsStore: SettingsStore
+    private let draftPersistenceAuthority: BotDraftPersistenceAuthority
     private var messagesByBot: [BotID: [BotDeskMessage]] = [:]
     private var messagesConversationIDByBot: [BotID: BotConversationID] = [:]
     private var selectedConversationByBot: [BotID: BotConversationID] = [:]
@@ -2742,6 +3016,12 @@ public final class BotsViewModel: ObservableObject {
     private var lastStartedConversationByBot: [BotID: BotConversation] = [:]
     private var liveTimelineByThread: [AgentThreadID: AssistantTimelineState] = [:]
     private var liveStreamCountByThread: [AgentThreadID: Int] = [:]
+    private var liveStreamCursorByThread: [AgentThreadID: AgentRunRepository.StreamEventCursor] = [:]
+    private var liveObservedEventsByThread: [AgentThreadID: [AssistantEvent]] = [:]
+    private var liveObservedEventBytesByThread: [AgentThreadID: Int] = [:]
+    private var liveObservedEventBytesTotal = 0
+    private var liveObservedEventOverflowThreads: Set<AgentThreadID> = []
+    private var settledTerminalRunIDByThread: [AgentThreadID: AgentRunID] = [:]
     private var queuedFollowUpsByBot: [BotID: [BotQueuedFollowUp]] = [:]
     private var composerDraftsByBot: [BotID: BotComposerDraft] = [:]
     private var composerHydrated = false
@@ -2764,6 +3044,10 @@ public final class BotsViewModel: ObservableObject {
     private var studioDraftsByBot: [BotID: BotStudioDraft] = [:]
     private var studioDraftHydrated = false
     private var isApplyingStudioDraft = false
+    var draftPersistenceScheduleForTesting: ((UInt64, @escaping () -> Void) -> Void)? {
+        get { draftPersistenceAuthority.scheduleForTesting }
+        set { draftPersistenceAuthority.scheduleForTesting = newValue }
+    }
     private var shellSidebarVisibilityObserver: NSObjectProtocol?
     private var deskLiveTurnWatch: Task<Void, Never>?
     private var tokenSaverFooterReloadTask: Task<Void, Never>?
@@ -2777,6 +3061,7 @@ public final class BotsViewModel: ObservableObject {
         self.router = router
         self.botStore = context.botStore
         self.settingsStore = SettingsStore(db: context.db)
+        self.draftPersistenceAuthority = context.botDraftPersistenceAuthority
         context.botPeerHandoffAuthority.router = router ?? context.router
         self.computerGuestService = BotComputerGuestService(
             appSupport: context.appSupportDirectory,
@@ -3092,14 +3377,22 @@ public final class BotsViewModel: ObservableObject {
 
     public func reloadActiveBotsScreen() {
         settleTerminalWorkingConversations()
-        activeBotItems = liveWorkingBots().map { bot in
+        let liveBots = liveWorkingBots()
+        let inMemoryStartedAt = Dictionary(uniqueKeysWithValues: liveBots.compactMap { bot in
+            inMemoryStartedAtForLiveBot(bot).map { (bot.id, $0) }
+        })
+        let fallbackBotIDs = Set(liveBots.map(\.id)).subtracting(Set(inMemoryStartedAt.keys))
+        let persistedStartedAt = (
+            try? botStore.latestConversationUpdatedAt(botIDs: fallbackBotIDs)
+        ) ?? [:]
+        activeBotItems = liveBots.map { bot in
             ActiveBotScreenItem(
                 bot: bot,
                 preview: rosterPreview(for: bot),
                 providerName: PetActiveThreadProjector.providerLabel(
                     resolvedProvider(for: bot) ?? deskRouting.provider
                 ),
-                startedAt: startedAtForLiveBot(bot)
+                startedAt: inMemoryStartedAt[bot.id] ?? persistedStartedAt[bot.id]
             )
         }
         reloadFinishedBots()
@@ -3108,9 +3401,13 @@ public final class BotsViewModel: ObservableObject {
     public func liveWorkingBots() -> [BotDefinition] {
         var seen = Set<BotID>()
         var result: [BotDefinition] = []
-        for botID in activeHandoffBotIDs() {
+        let handoffBotIDs = activeHandoffBotIDs()
+        let rosterBotIDs = Set(bots.map(\.id))
+        let missingHandoffBotIDs = handoffBotIDs.subtracting(rosterBotIDs)
+        let missingHandoffBots = (try? botStore.bots(ids: missingHandoffBotIDs)) ?? [:]
+        for botID in handoffBotIDs {
             guard let bot = bots.first(where: { $0.id == botID })
-                    ?? (try? botStore.get(id: botID)) else { continue }
+                    ?? missingHandoffBots[botID] else { continue }
             seen.insert(botID)
             result.append(bot)
         }
@@ -3123,8 +3420,9 @@ public final class BotsViewModel: ObservableObject {
         }
         let activeThreadIDs = activeThreadIDsOverrideForTesting
             ?? context.coordinator.activeThreadIdsSnapshot()
+        let linkedConversations = (try? botStore.conversationsLinked(to: activeThreadIDs)) ?? [:]
         for threadID in activeThreadIDs {
-            guard let conversation = try? botStore.conversationLinked(to: threadID) else { continue }
+            guard let conversation = linkedConversations[threadID] else { continue }
             guard !seen.contains(conversation.botID) else { continue }
             guard let bot = bots.first(where: { $0.id == conversation.botID }) else { continue }
             seen.insert(bot.id)
@@ -3133,26 +3431,31 @@ public final class BotsViewModel: ObservableObject {
         return result
     }
 
-    private func startedAtForLiveBot(_ bot: BotDefinition) -> Date? {
+    private func inMemoryStartedAtForLiveBot(_ bot: BotDefinition) -> Date? {
         if let handoff = peerHandoffs.values
             .filter({ activeBotIDs(for: $0).contains(bot.id) })
             .min(by: { $0.createdAt < $1.createdAt }) {
             return handoff.createdAt
         }
-        if let stamped = lastUpdatedByBot[bot.id] { return stamped }
-        return (try? botStore.listConversations(botID: bot.id))?.first?.updatedAt
+        return lastUpdatedByBot[bot.id]
     }
 
     private func reloadFinishedBots() {
         let runs = (try? context.runRepo.listRecentFinished(limit: 200)) ?? []
+        let linkedConversations = (
+            try? botStore.conversationsLinked(to: Set(runs.map(\.threadId)))
+        ) ?? [:]
+        let rosterBotIDs = Set(bots.map(\.id))
+        let missingBotIDs = Set(linkedConversations.values.map(\.botID)).subtracting(rosterBotIDs)
+        let missingBots = (try? botStore.bots(ids: missingBotIDs)) ?? [:]
         var items: [FinishedBotScreenItem] = []
         var seen = Set<AgentRunID>()
         for run in runs {
             guard items.count < 50 else { break }
             guard !seen.contains(run.id) else { continue }
-            guard let conversation = try? botStore.conversationLinked(to: run.threadId) else { continue }
+            guard let conversation = linkedConversations[run.threadId] else { continue }
             let bot = bots.first(where: { $0.id == conversation.botID })
-                ?? (try? botStore.get(id: conversation.botID))
+                ?? missingBots[conversation.botID]
             guard let bot else { continue }
             seen.insert(run.id)
             items.append(
@@ -3575,6 +3878,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func requestLeaveBotsMode() {
+        flushPendingDraftPersistence()
         requestLeaveUnsavedNewBot { [weak self] in
             self?.onLeaveBots?()
         }
@@ -3765,6 +4069,10 @@ public final class BotsViewModel: ObservableObject {
 
     public func clearAllDeskThreads() {
         guard let bot = selectedBot else { return }
+        for threadID in conversations.compactMap(\.linkedAgentThreadID) {
+            clearDeskObservedEvents(threadID: threadID)
+            settledTerminalRunIDByThread[threadID] = nil
+        }
         let handoffDeletion = context.botPeerHandoffAuthority.beginDeletion(originBotID: bot.id)
         if deskRunIsLive {
             stopDeskRun()
@@ -4017,6 +4325,7 @@ public final class BotsViewModel: ObservableObject {
 
     @discardableResult
     public func saveStudio() throws -> BotDefinition {
+        defer { flushPendingDraftPersistence() }
         let name = studioDraft.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else {
             errorMessage = "Name is required."
@@ -4216,12 +4525,12 @@ public final class BotsViewModel: ObservableObject {
             queuedFollowUpsByBot[id] = nil
             composerDraftsByBot[id] = nil
             inspectorDraftsByBot[id] = nil
+            studioDraftsByBot[id] = nil
             studioFilesLocationsByBot[id] = nil
-            clearPersistedStudioDraft(for: id)
+            draftPersistenceAuthority.removeDrafts(for: id)
             clearDeskSendInFlight(for: id)
             persistQueuedFollowUps()
-            persistComposerDrafts()
-            persistInspectorDrafts()
+            flushPendingDraftPersistence()
             persistStudioFilesLocations()
             syncQueuedFollowUps()
             // Dest first. Delete used to reloadFleet (every teammate's
@@ -4315,6 +4624,25 @@ public final class BotsViewModel: ObservableObject {
 
     func applyDeskLiveEventForTesting(_ event: AssistantEvent, threadId: AgentThreadID) {
         applyIncomingDeskEvent(event, threadId: threadId)
+    }
+
+    func applyDeskLiveEventForTesting(
+        _ event: AssistantEvent,
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        applyIncomingDeskEvent(event, runId: runId, threadId: threadId)
+    }
+
+    func deskLiveObservedEventBufferForTesting(
+        threadId: AgentThreadID
+    ) -> (count: Int, bytes: Int, totalBytes: Int, overflowed: Bool) {
+        (
+            liveObservedEventsByThread[threadId]?.count ?? 0,
+            liveObservedEventBytesByThread[threadId] ?? 0,
+            liveObservedEventBytesTotal,
+            liveObservedEventOverflowThreads.contains(threadId)
+        )
     }
 
     public func addAttachments(_ paths: [String]) {
@@ -4537,6 +4865,7 @@ public final class BotsViewModel: ObservableObject {
         composerText = ""
         composerCursorOffset = nil
         attachments = []
+        flushPendingDraftPersistence()
         lastSendStartedProviderRun = false
         lastMentionedBotIDForTesting = nil
         lastHopUserTextForTesting = nil
@@ -4663,6 +4992,7 @@ public final class BotsViewModel: ObservableObject {
             )
             try botStore.setSkillBinding(binding)
             skillDraft = ""
+            flushPendingDraftPersistence()
             adoptWrittenSkill(binding)
         } catch {
             errorMessage = String(describing: error)
@@ -5130,6 +5460,7 @@ public final class BotsViewModel: ObservableObject {
                 source: "studio"
             )
             memoryDraft = ""
+            flushPendingDraftPersistence()
             adoptWrittenMemory(item)
         } catch {
             errorMessage = String(describing: error)
@@ -5188,6 +5519,7 @@ public final class BotsViewModel: ObservableObject {
             routineName = ""
             routinePrompt = ""
             routineScheduleNote = ""
+            flushPendingDraftPersistence()
             adoptWrittenRoutine(definition)
         } catch {
             errorMessage = String(describing: error)
@@ -5421,6 +5753,19 @@ public final class BotsViewModel: ObservableObject {
     private func leaveDeskLiveWatch() {
         deskLiveTurnWatch?.cancel()
         deskLiveTurnWatch = nil
+        if let threadID = selectedConversation?.linkedAgentThreadID {
+            clearDeskObservedEvents(threadID: threadID)
+        }
+    }
+
+    private func clearDeskObservedEvents(threadID: AgentThreadID) {
+        liveObservedEventBytesTotal = max(
+            0,
+            liveObservedEventBytesTotal - (liveObservedEventBytesByThread[threadID] ?? 0)
+        )
+        liveObservedEventsByThread[threadID] = nil
+        liveObservedEventBytesByThread[threadID] = nil
+        liveObservedEventOverflowThreads.remove(threadID)
     }
 
     /// Studio dest needs revision, memory, skills, routines, and the last
@@ -5656,13 +6001,13 @@ public final class BotsViewModel: ObservableObject {
     private static let showHiddenDefaultsKey = "bots.showHidden"
     private static let brainPaneDefaultsKey = "bots.brainPane"
     private static let queuedFollowUpsDefaultsKey = "bots.queuedFollowUps"
-    private static let composerDraftsDefaultsKey = "bots.composerDrafts"
+    fileprivate static let composerDraftsDefaultsKey = "bots.composerDrafts"
     private static let deskRoutingDefaultsKey = "bots.deskThreadRouting"
     private static let legacyBotRoutingDefaultsKey = "bots.deskRouting"
     private static let peerHandoffsDefaultsKey = "bots.peerTurns.v2"
     private static let studioFilesLocationsDefaultsKey = "bots.studioFilesLocations"
-    private static let inspectorDraftsDefaultsKey = "bots.inspectorDrafts"
-    private static let studioDraftDefaultsKey = "bots.studioDraft"
+    fileprivate static let inspectorDraftsDefaultsKey = "bots.inspectorDrafts"
+    fileprivate static let studioDraftDefaultsKey = "bots.studioDraft"
     private static let searchTextDefaultsKey = "bots.searchText"
     private static let unpublishedNewBotDefaultsKey = "bots.unpublishedNewBotIDs"
 
@@ -5848,6 +6193,14 @@ public final class BotsViewModel: ObservableObject {
         persistUnpublishedNewBotIDs()
     }
 
+    private func flushPendingDraftPersistence() {
+        draftPersistenceAuthority.flushPending()
+    }
+
+    func flushDraftPersistenceForTesting() {
+        flushPendingDraftPersistence()
+    }
+
     private func persistStudioDraftIfHydrated() {
         guard studioDraftHydrated, !isApplyingStudioDraft else { return }
         persistStudioDraft()
@@ -5858,57 +6211,25 @@ public final class BotsViewModel: ObservableObject {
         var draft = studioDraft
         draft.desktopKind = resolvedDesktopKind(draft.desktopKind)
         studioDraftsByBot[botID] = draft
-        persistStudioDrafts()
-    }
-
-    private func persistStudioDrafts() {
-        let payload = Dictionary(uniqueKeysWithValues: studioDraftsByBot.map {
-            ($0.key.value.uuidString.lowercased(), $0.value)
-        })
-        if payload.isEmpty {
-            UserDefaults.standard.removeObject(forKey: Self.studioDraftDefaultsKey)
-            return
-        }
-        if let data = try? Self.encodeJSON(payload) {
-            UserDefaults.standard.set(data, forKey: Self.studioDraftDefaultsKey)
-        }
+        draftPersistenceAuthority.updateStudio(draft, for: botID)
     }
 
     private func restoreStudioDraftIfNeeded() {
-        guard let data = UserDefaults.standard.data(forKey: Self.studioDraftDefaultsKey) else { return }
-        if let payload = try? Self.decodeJSON([String: BotStudioDraft].self, from: data) {
-            var restored: [BotID: BotStudioDraft] = [:]
-            for (raw, draft) in payload {
-                guard let uuid = UUID(uuidString: raw) else { continue }
-                restored[BotID(uuid)] = draft
-            }
-            studioDraftsByBot = restored
-            return
-        }
-        if let draft = try? Self.decodeJSON(BotStudioDraft.self, from: data),
-           let botID = draft.botID {
-            studioDraftsByBot = [botID: draft]
-        }
+        studioDraftsByBot = draftPersistenceAuthority.studioDraftsByBot
     }
 
     private func applyPersistedStudioDraftIfMatching(_ botID: BotID) {
-        guard var saved = studioDraftsByBot[botID] else { return }
+        guard var saved = draftPersistenceAuthority.studioDraftsByBot[botID] else { return }
+        studioDraftsByBot[botID] = saved
         saved.desktopKind = resolvedDesktopKind(saved.desktopKind)
         studioDraft = saved
     }
 
-    private func clearPersistedStudioDraft(for botID: BotID) {
-        guard studioDraftsByBot[botID] != nil else { return }
-        studioDraftsByBot[botID] = nil
-        persistStudioDrafts()
-    }
-
     private func pruneStudioDraftsToFleet() {
         let live = Set(bots.map(\.id))
-        let next = studioDraftsByBot.filter { live.contains($0.key) }
-        guard next.count != studioDraftsByBot.count else { return }
-        studioDraftsByBot = next
-        persistStudioDrafts()
+        guard draftPersistenceAuthority.retainStudioDrafts(for: live) else { return }
+        studioDraftsByBot = draftPersistenceAuthority.studioDraftsByBot
+        flushPendingDraftPersistence()
     }
 
     private func persistSearchText() {
@@ -6099,16 +6420,11 @@ public final class BotsViewModel: ObservableObject {
 
     private func adoptSelectedBot(_ id: BotID?) {
         if selectedBotID == id {
-            if composerHydrated {
-                captureComposerDraft()
-            } else {
-                applyComposerDraft(for: id)
-            }
-            if inspectorHydrated {
-                captureInspectorDraft()
-            } else {
-                applyInspectorDraft(for: id)
-            }
+            // Opening an already-selected bot is navigation, not an edit. Read
+            // the AppContext authority so a stale window cannot manufacture a
+            // later draft mutation merely by reopening the same teammate.
+            applyComposerDraft(for: id)
+            applyInspectorDraft(for: id)
             if deskRoutingHydrated {
                 captureDeskRouting()
             } else {
@@ -6116,15 +6432,16 @@ public final class BotsViewModel: ObservableObject {
             }
             return
         }
-        if composerHydrated {
-            captureComposerDraft()
-        }
-        if inspectorHydrated {
-            captureInspectorDraft()
-        }
+        // Draft field didSets update the AppContext authority immediately.
+        // Recapturing here would let a stale window replace a newer window's
+        // draft merely by navigating to another teammate.
         if deskRoutingHydrated {
             captureDeskRouting()
         }
+        if let threadID = selectedConversation?.linkedAgentThreadID {
+            clearDeskObservedEvents(threadID: threadID)
+        }
+        flushPendingDraftPersistence()
         selectedBotID = id
         applyComposerDraft(for: id)
         applyInspectorDraft(for: id)
@@ -6138,11 +6455,14 @@ public final class BotsViewModel: ObservableObject {
         } else {
             composerDraftsByBot[botID] = draft
         }
-        persistComposerDrafts()
+        draftPersistenceAuthority.updateComposer(draft, for: botID)
     }
 
     private func applyComposerDraft(for botID: BotID?) {
-        let draft = botID.flatMap { composerDraftsByBot[$0] }
+        let draft = botID.flatMap { draftPersistenceAuthority.composerDraftsByBot[$0] }
+        if let botID {
+            composerDraftsByBot[botID] = draft
+        }
         isApplyingComposerDraft = true
         composerText = draft?.text ?? ""
         composerCursorOffset = nil
@@ -6208,6 +6528,51 @@ public final class BotsViewModel: ObservableObject {
         providers = snapshots
     }
 
+    /// Cheap user-catalog fingerprint used on every composer reevaluation. Entry
+    /// add/remove/rename mutates the parent directory metadata, invalidating the
+    /// expensive recursive discovery without rescanning it on each keystroke.
+    nonisolated static func claudeSlashCatalogRevision(home: String) -> String {
+        let claudeRoot = URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent(".claude", isDirectory: true)
+        return ["skills", "commands"].map { component in
+            let path = claudeRoot.appendingPathComponent(component, isDirectory: true).path
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else {
+                return "missing"
+            }
+            let modificationNanoseconds = (attributes[.modificationDate] as? Date).map {
+                Int64(($0.timeIntervalSince1970 * 1_000_000_000).rounded())
+            } ?? 0
+            let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+            return "\(fileNumber):\(modificationNanoseconds)"
+        }.joined(separator: "|")
+    }
+
+    private static let claudeSlashCacheTTL: TimeInterval = 1
+
+    /// Bots have no project cwd, so Claude discovery is user-scoped. Cache it
+    /// while the catalog fingerprint and short freshness bound are stable.
+    /// The bound also retries empty/error results and catches nested manifest
+    /// changes that do not mutate the top-level skills directory metadata.
+    private func claudeSlashEntries() -> [String] {
+        let home = ProcessInfo.processInfo.environment["HOME"]
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let revision = claudeSlashCatalogRevisionForTesting?(home)
+            ?? Self.claudeSlashCatalogRevision(home: home)
+        let now = claudeSlashCacheTimeForTesting?()
+            ?? ProcessInfo.processInfo.systemUptime
+        if let cached = cachedClaudeSlashEntries,
+           cached.home == home,
+           cached.revision == revision,
+           now >= cached.refreshedAt,
+           now - cached.refreshedAt < Self.claudeSlashCacheTTL {
+            return cached.entries
+        }
+        let entries = claudeSlashDiscoveryForTesting?(home)
+            ?? ClaudeSlashCommandDiscovery.discover(cwd: nil, home: home)
+        cachedClaudeSlashEntries = (home, revision, now, entries)
+        return entries
+    }
+
     public var composerSuggestions: [AgentComposerSuggestion] {
         let snapshot = selectedDeskSnapshot
         let isClaude = snapshot?.provider == .claude || deskRouting.provider == .claude
@@ -6217,11 +6582,7 @@ public final class BotsViewModel: ObservableObject {
             snapshot: snapshot,
             localSlashCommands: [],
             extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
-            extraSkillNames: isClaude ? ClaudeSlashCommandDiscovery.discover(
-                cwd: nil,
-                home: ProcessInfo.processInfo.environment["HOME"]
-                    ?? FileManager.default.homeDirectoryForCurrentUser.path
-            ) : [],
+            extraSkillNames: isClaude ? claudeSlashEntries() : [],
             mentionableBots: bots.filter { $0.id != selectedBotID }
         )
     }
@@ -6561,12 +6922,18 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func activeHandoffBotIDs() -> Set<BotID> {
-        peerHandoffs.values.reduce(into: Set<BotID>()) { result, handoff in
-            if let conversationID = handoff.originConversationID,
-               (try? botStore.conversation(id: conversationID)) == nil {
+        let activeHandoffs = peerHandoffs.values.compactMap { handoff -> (PersistedBotPeerHandoff, Set<BotID>)? in
+            let botIDs = activeBotIDs(for: handoff)
+            return botIDs.isEmpty ? nil : (handoff, botIDs)
+        }
+        let originConversationIDs = Set(activeHandoffs.compactMap { $0.0.originConversationID })
+        let existingOrigins = (try? botStore.conversations(ids: originConversationIDs)) ?? [:]
+        return activeHandoffs.reduce(into: Set<BotID>()) { result, item in
+            if let conversationID = item.0.originConversationID,
+               existingOrigins[conversationID] == nil {
                 return
             }
-            result.formUnion(activeBotIDs(for: handoff))
+            result.formUnion(item.1)
         }
     }
 
@@ -6679,37 +7046,15 @@ public final class BotsViewModel: ObservableObject {
         })
     }
 
-    private func persistComposerDrafts() {
-        let payload = Dictionary(uniqueKeysWithValues: composerDraftsByBot.compactMap { id, draft -> (String, BotComposerDraft)? in
-            draft.isEmpty ? nil : (id.value.uuidString.lowercased(), draft)
-        })
-        if payload.isEmpty {
-            UserDefaults.standard.removeObject(forKey: Self.composerDraftsDefaultsKey)
-            return
-        }
-        if let data = try? Self.encodeJSON(payload) {
-            UserDefaults.standard.set(data, forKey: Self.composerDraftsDefaultsKey)
-        }
-    }
-
     private func restoreComposerDraftsIfNeeded() {
-        guard let data = UserDefaults.standard.data(forKey: Self.composerDraftsDefaultsKey),
-              let payload = try? Self.decodeJSON([String: BotComposerDraft].self, from: data)
-        else { return }
-        var restored: [BotID: BotComposerDraft] = [:]
-        for (raw, draft) in payload {
-            guard let uuid = UUID(uuidString: raw), !draft.isEmpty else { continue }
-            restored[BotID(uuid)] = draft
-        }
-        composerDraftsByBot = restored
+        composerDraftsByBot = draftPersistenceAuthority.composerDraftsByBot
     }
 
     private func pruneComposerDraftsToFleet() {
         let live = Set(bots.map(\.id))
-        let next = composerDraftsByBot.filter { live.contains($0.key) }
-        guard next.count != composerDraftsByBot.count else { return }
-        composerDraftsByBot = next
-        persistComposerDrafts()
+        guard draftPersistenceAuthority.retainComposerDrafts(for: live) else { return }
+        composerDraftsByBot = draftPersistenceAuthority.composerDraftsByBot
+        flushPendingDraftPersistence()
     }
 
     private func persistInspectorIfHydrated() {
@@ -6732,11 +7077,15 @@ public final class BotsViewModel: ObservableObject {
         } else {
             inspectorDraftsByBot[botID] = draft
         }
-        persistInspectorDrafts()
+        draftPersistenceAuthority.updateInspector(draft, for: botID)
     }
 
     private func applyInspectorDraft(for botID: BotID?) {
-        let draft = botID.flatMap { inspectorDraftsByBot[$0] } ?? BotInspectorDraft()
+        let saved = botID.flatMap { draftPersistenceAuthority.inspectorDraftsByBot[$0] }
+        if let botID {
+            inspectorDraftsByBot[botID] = saved
+        }
+        let draft = saved ?? BotInspectorDraft()
         isApplyingInspectorDraft = true
         memoryDraft = draft.memoryDraft
         skillDraft = draft.skillDraft
@@ -6748,37 +7097,23 @@ public final class BotsViewModel: ObservableObject {
         inspectorHydrated = true
     }
 
-    private func persistInspectorDrafts() {
-        let payload = Dictionary(uniqueKeysWithValues: inspectorDraftsByBot.compactMap { id, draft -> (String, BotInspectorDraft)? in
-            draft.isEmpty ? nil : (id.value.uuidString.lowercased(), draft)
-        })
-        if payload.isEmpty {
-            UserDefaults.standard.removeObject(forKey: Self.inspectorDraftsDefaultsKey)
-            return
-        }
-        if let data = try? Self.encodeJSON(payload) {
-            UserDefaults.standard.set(data, forKey: Self.inspectorDraftsDefaultsKey)
-        }
+    func resetDraftPersistenceMetricsForTesting() {
+        draftPersistenceAuthority.resetMetricsForTesting()
+    }
+
+    var draftPersistenceMetricsForTesting: BotDraftPersistenceMetrics {
+        draftPersistenceAuthority.metricsForTesting
     }
 
     private func restoreInspectorDraftsIfNeeded() {
-        guard let data = UserDefaults.standard.data(forKey: Self.inspectorDraftsDefaultsKey),
-              let payload = try? Self.decodeJSON([String: BotInspectorDraft].self, from: data)
-        else { return }
-        var restored: [BotID: BotInspectorDraft] = [:]
-        for (raw, draft) in payload {
-            guard let uuid = UUID(uuidString: raw), !draft.isEmpty else { continue }
-            restored[BotID(uuid)] = draft
-        }
-        inspectorDraftsByBot = restored
+        inspectorDraftsByBot = draftPersistenceAuthority.inspectorDraftsByBot
     }
 
     private func pruneInspectorDraftsToFleet() {
         let live = Set(bots.map(\.id))
-        let next = inspectorDraftsByBot.filter { live.contains($0.key) }
-        guard next.count != inspectorDraftsByBot.count else { return }
-        inspectorDraftsByBot = next
-        persistInspectorDrafts()
+        guard draftPersistenceAuthority.retainInspectorDrafts(for: live) else { return }
+        inspectorDraftsByBot = draftPersistenceAuthority.inspectorDraftsByBot
+        flushPendingDraftPersistence()
     }
 
     private func restoreInspectorTabIfNeeded() {
@@ -7210,7 +7545,10 @@ public final class BotsViewModel: ObservableObject {
         messagesByBot[botID] = dest
     }
 
-    private func restoreDeskLiveTurn(botID: BotID) {
+    private func restoreDeskLiveTurn(
+        botID: BotID,
+        reconcileObservedAtTerminal: Bool = false
+    ) {
         let conversation = conversationForBot(botID)
         guard let threadID = conversation?.linkedAgentThreadID else {
             if selectedBotID == botID {
@@ -7221,20 +7559,79 @@ public final class BotsViewModel: ObservableObject {
             }
             return
         }
-        applyDeskLiveReplay(botID: botID, threadID: threadID, force: false)
+        applyDeskLiveReplay(
+            botID: botID,
+            threadID: threadID,
+            reconcileObservedAtTerminal: reconcileObservedAtTerminal
+        )
         if selectedBotID == botID, screen == .desk, deskRunIsLive {
             startDeskLiveTurnWatch(botID: botID, threadID: threadID)
         }
     }
 
-    private func applyDeskLiveReplay(botID: BotID, threadID: AgentThreadID, force: Bool = false) {
-        let count = context.coordinator.countStreamEvents(threadId: threadID)
-        if !force, liveStreamCountByThread[threadID] == count {
+    @discardableResult
+    private func applyDeskLiveReplay(
+        botID: BotID,
+        threadID: AgentThreadID,
+        reconcileObservedAtTerminal: Bool = false
+    ) -> Bool {
+        let cursor = context.coordinator.streamEventCursor(threadId: threadID)
+        let hasUnconfirmedObservedEvents = liveObservedEventsByThread[threadID]?.isEmpty == false
+            || liveObservedEventOverflowThreads.contains(threadID)
+        let requiresTerminalReconciliation = reconcileObservedAtTerminal
+            && hasUnconfirmedObservedEvents
+        if let previous = liveStreamCursorByThread[threadID],
+           previous == cursor,
+           !requiresTerminalReconciliation {
             if selectedBotID == botID {
                 deskLiveTimeline = liveTimelineByThread[threadID] ?? deskLiveTimeline
-                deskStreamEventCount = liveStreamCountByThread[threadID] ?? count
+                deskStreamEventCount = liveStreamCountByThread[threadID] ?? cursor.count
             }
-            return
+            return false
+        }
+        if let previous = liveStreamCursorByThread[threadID],
+           let runId = cursor.runId,
+           previous.runId == runId,
+           cursor.sequence > previous.sequence,
+           let previousMutationId = previous.mutationId,
+           let mutationId = cursor.mutationId,
+           !liveObservedEventOverflowThreads.contains(threadID) {
+            let advance = cursor.sequence - previous.sequence
+            let observed = liveObservedEventsByThread[threadID] ?? []
+            if advance <= observed.count,
+               let suffix = context.coordinator.attestedStreamEventSuffix(
+                   threadId: threadID,
+                   afterMutationId: previousMutationId,
+                   throughMutationId: mutationId,
+                   runId: runId,
+                   startingSequence: previous.sequence + 1,
+                   count: advance
+               ) {
+                deskLiveIncrementalDecodeEventCountForTesting += suffix.events.count
+                deskLiveIncrementalDecodeBytesForTesting += suffix.decodedPayloadBytes
+                if suffix.events == Array(observed.prefix(advance)) {
+                    let remaining = Array(observed.dropFirst(advance))
+                    let previousBytes = liveObservedEventBytesByThread[threadID] ?? 0
+                    let remainingBytes = remaining.reduce(0) {
+                        $0 + max(1, $1.estimatedHotQueueBytes)
+                    }
+                    liveObservedEventBytesTotal = max(
+                        0,
+                        liveObservedEventBytesTotal - previousBytes + remainingBytes
+                    )
+                    liveObservedEventsByThread[threadID] = remaining.isEmpty ? nil : remaining
+                    liveObservedEventBytesByThread[threadID] = remaining.isEmpty
+                        ? nil
+                        : remainingBytes
+                    liveStreamCursorByThread[threadID] = cursor
+                    liveStreamCountByThread[threadID] = cursor.count
+                    if selectedBotID == botID {
+                        deskLiveTimeline = liveTimelineByThread[threadID] ?? deskLiveTimeline
+                        deskStreamEventCount = cursor.count
+                    }
+                    return true
+                }
+            }
         }
         deskLiveReplayFetchCountForTesting += 1
         let events = context.coordinator.latestStreamEvents(threadId: threadID)
@@ -7242,23 +7639,38 @@ public final class BotsViewModel: ObservableObject {
         // Compare against THIS thread. A per-bot cache kept a richer
         // hop's Worked rows after the user opened another conversation.
         let current = liveTimelineByThread[threadID] ?? AssistantTimelineState()
-        if AgentChatLiveTurnChrome.isRicher(current, than: state) {
-            liveStreamCountByThread[threadID] = max(count, liveStreamCountByThread[threadID] ?? 0)
+        liveStreamCursorByThread[threadID] = cursor
+        if !requiresTerminalReconciliation,
+           AgentChatLiveTurnChrome.isRicher(current, than: state) {
+            liveStreamCountByThread[threadID] = max(
+                cursor.count,
+                liveStreamCountByThread[threadID] ?? 0
+            )
+            clearDeskObservedEvents(threadID: threadID)
+            if hasUnconfirmedObservedEvents {
+                liveObservedEventOverflowThreads.insert(threadID)
+            }
             if selectedBotID == botID {
                 deskLiveTimeline = current
-                deskStreamEventCount = liveStreamCountByThread[threadID] ?? count
+                deskStreamEventCount = liveStreamCountByThread[threadID] ?? cursor.count
             }
-            return
+            return true
         }
         liveTimelineByThread[threadID] = state
-        liveStreamCountByThread[threadID] = count
+        liveStreamCountByThread[threadID] = cursor.count
+        clearDeskObservedEvents(threadID: threadID)
         if selectedBotID == botID {
             deskLiveTimeline = state
-            deskStreamEventCount = count
+            deskStreamEventCount = cursor.count
         }
+        return true
     }
 
-    private func applyIncomingDeskEvent(_ event: AssistantEvent, threadId: AgentThreadID) {
+    private func applyIncomingDeskEvent(
+        _ event: AssistantEvent,
+        runId: AgentRunID? = nil,
+        threadId: AgentThreadID
+    ) {
         guard screen == .desk,
               selectedConversation?.linkedAgentThreadID == threadId
         else { return }
@@ -7267,29 +7679,61 @@ public final class BotsViewModel: ObservableObject {
         next.enforceAggregateHotTextBudget()
         deskLiveTimeline = next
         liveTimelineByThread[threadId] = next
+        if !liveObservedEventOverflowThreads.contains(threadId) {
+            var observed = liveObservedEventsByThread[threadId] ?? []
+            let eventBytes = max(1, event.estimatedHotQueueBytes)
+            let threadBytes = liveObservedEventBytesByThread[threadId] ?? 0
+            let byteLimit = max(
+                1,
+                deskLiveObservedEventByteLimitForTesting
+                    ?? Int(AgentRunCoordinator.hotReplayEventBytes)
+            )
+            if observed.count < AgentRunCoordinator.hotReplayEventCount,
+               eventBytes <= byteLimit,
+               threadBytes <= byteLimit - eventBytes,
+               liveObservedEventBytesTotal <= byteLimit - eventBytes {
+                observed.append(event)
+                liveObservedEventsByThread[threadId] = observed
+                liveObservedEventBytesByThread[threadId] = threadBytes + eventBytes
+                liveObservedEventBytesTotal += eventBytes
+            } else {
+                clearDeskObservedEvents(threadID: threadId)
+                liveObservedEventOverflowThreads.insert(threadId)
+            }
+        }
+        if let runId,
+           settledTerminalRunIDByThread[threadId] == runId,
+           let botID = selectedBotID {
+            _ = applyDeskLiveReplay(
+                botID: botID,
+                threadID: threadId,
+                reconcileObservedAtTerminal: true
+            )
+        }
     }
 
     private func refreshDeskLiveTurnIfCountChanged(botID: BotID, threadID: AgentThreadID) {
-        applyDeskLiveReplay(botID: botID, threadID: threadID, force: false)
+        applyDeskLiveReplay(botID: botID, threadID: threadID)
     }
 
     private func startDeskLiveTurnWatch(botID: BotID, threadID: AgentThreadID) {
         deskLiveTurnWatch?.cancel()
         deskLiveTurnWatch = Task { [weak self] in
-            var lastCount = -1
             while !Task.isCancelled {
                 guard let self else { return }
                 guard self.selectedBotID == botID, self.screen == .desk else { return }
-                let count = self.context.coordinator.countStreamEvents(threadId: threadID)
-                if count != lastCount {
-                    lastCount = count
-                    self.applyDeskLiveReplay(botID: botID, threadID: threadID, force: true)
+                if self.applyDeskLiveReplay(botID: botID, threadID: threadID) {
                     self.refreshPublishedIdentity(for: botID)
                 }
                 let run = self.linkedRun(for: threadID, botID: botID)
                 if let run, BotsDeskFollowThrough.isTerminal(run.status) {
-                    self.applyDeskLiveReplay(botID: botID, threadID: threadID, force: true)
-                    self.refreshPublishedIdentity(for: botID)
+                    if self.applyDeskLiveReplay(
+                        botID: botID,
+                        threadID: threadID,
+                        reconcileObservedAtTerminal: true
+                    ) {
+                        self.refreshPublishedIdentity(for: botID)
+                    }
                     return
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
@@ -8105,11 +8549,14 @@ public final class BotsViewModel: ObservableObject {
         if let run {
             lastLinkedRunIDByBot[bot.id] = run.id
         }
-        restoreDeskWorkLog(botID: bot.id, preferredRun: run)
-        restoreDeskLiveTurn(botID: bot.id)
-        refreshPublishedIdentity(for: bot.id)
         let status = run?.status ?? .interrupted
         let reason = run?.terminalReason
+        restoreDeskWorkLog(botID: bot.id, preferredRun: run)
+        restoreDeskLiveTurn(
+            botID: bot.id,
+            reconcileObservedAtTerminal: BotsDeskFollowThrough.isTerminal(status)
+        )
+        refreshPublishedIdentity(for: bot.id)
         let viewingDesk = isViewing(bot.id)
         next.attentionState = BotsDeskFollowThrough.conversationState(
             for: status,
@@ -8402,6 +8849,7 @@ public final class BotsViewModel: ObservableObject {
     /// Finish events and relaunch must settle that row, not just refresh
     /// Active Bots from the stale attention flag.
     private func adoptLinkedRunTerminal(runId: AgentRunID, threadId: AgentThreadID) {
+        settledTerminalRunIDByThread[threadId] = runId
         guard let conversation = try? botStore.conversationLinked(to: threadId) else {
             if screen == .desk,
                let botID = selectedBotID,
@@ -8620,7 +9068,7 @@ extension BotsViewModel: AgentRunObserver {
         threadId: AgentThreadID
     ) {
         Task { @MainActor [weak self] in
-            self?.applyIncomingDeskEvent(event, threadId: threadId)
+            self?.applyIncomingDeskEvent(event, runId: run, threadId: threadId)
         }
     }
 
@@ -9068,6 +9516,22 @@ private struct BotsDeleteConfirmation: ViewModifier {
 }
 
 // MARK: - Root view
+
+/// Keeps the Desk composer's elapsed label live only while a run can change it.
+/// An idle schedule yields the initial render and then ends, while a live run
+/// preserves the prior one-second cadence.
+struct BotsComposerTimelineSchedule: TimelineSchedule {
+    let runIsLive: Bool
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        var next: Date? = startDate
+        return AnyIterator {
+            guard let current = next else { return nil }
+            next = runIsLive ? current.addingTimeInterval(1) : nil
+            return current
+        }
+    }
+}
 
 public struct BotsRootView: View {
     @ObservedObject private var vm: BotsViewModel
@@ -10627,7 +11091,7 @@ public struct BotsRootView: View {
     }
 
     private func composerBar(_ bot: BotDefinition) -> some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
+        TimelineView(BotsComposerTimelineSchedule(runIsLive: vm.deskRunIsLive)) { context in
             AgentChatComposerBar(
                 text: $vm.composerText,
                 attachments: vm.attachments,

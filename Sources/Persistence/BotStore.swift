@@ -42,6 +42,7 @@ public struct BotQueuedFollowUpRecord: Equatable, Sendable {
 }
 
 public final class BotStore: @unchecked Sendable {
+    private static let lookupBatchSize = 200
     // These values satisfy the pre-thread-routing NOT NULL columns only. They
     // are never decoded into BotRevision or consulted as an execution route.
     private static let legacyProviderColumnValue: AgentProvider = .codex
@@ -82,6 +83,28 @@ public final class BotStore: @unchecked Sendable {
     public func get(id: BotID) throws -> BotDefinition? {
         try db.performSync { database in
             try loadBot(id: id, database: database)
+        }
+    }
+
+    public func bots(ids: Set<BotID>) throws -> [BotID: BotDefinition] {
+        guard !ids.isEmpty else { return [:] }
+        let ids = Array(ids)
+        return try db.performSync { database in
+            var bots: [BotID: BotDefinition] = [:]
+            for start in stride(from: 0, to: ids.count, by: Self.lookupBatchSize) {
+                let batch = ids[start..<min(start + Self.lookupBatchSize, ids.count)]
+                let marks = Array(repeating: "?", count: batch.count).joined(separator: ",")
+                let statement = try database.prepare(Self.botSelect + " WHERE id IN (\(marks));")
+                defer { statement.reset() }
+                for (index, id) in batch.enumerated() {
+                    try statement.bind(Int32(index + 1), id.value.uuidString.lowercased())
+                }
+                while try statement.step() {
+                    guard let bot = try? decodeBot(statement) else { continue }
+                    bots[bot.id] = bot
+                }
+            }
+            return bots
         }
     }
 
@@ -485,6 +508,30 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func conversations(ids: Set<BotConversationID>) throws -> [BotConversationID: BotConversation] {
+        guard !ids.isEmpty else { return [:] }
+        let ids = Array(ids)
+        return try db.performSync { database in
+            var conversations: [BotConversationID: BotConversation] = [:]
+            for start in stride(from: 0, to: ids.count, by: Self.lookupBatchSize) {
+                let batch = ids[start..<min(start + Self.lookupBatchSize, ids.count)]
+                let marks = Array(repeating: "?", count: batch.count).joined(separator: ",")
+                let statement = try database.prepare(
+                    Self.conversationSelect + " WHERE id IN (\(marks));"
+                )
+                defer { statement.reset() }
+                for (index, id) in batch.enumerated() {
+                    try statement.bind(Int32(index + 1), id.value.uuidString.lowercased())
+                }
+                while try statement.step() {
+                    guard let conversation = try? decodeConversation(statement) else { continue }
+                    conversations[conversation.id] = conversation
+                }
+            }
+            return conversations
+        }
+    }
+
     public func conversationLinked(to threadID: AgentThreadID) throws -> BotConversation? {
         try db.performSync { database in
             let statement = try database.prepare(
@@ -493,6 +540,34 @@ public final class BotStore: @unchecked Sendable {
             defer { statement.reset() }
             try statement.bind(1, threadID.value.uuidString.lowercased())
             return try statement.step() ? try decodeConversation(statement) : nil
+        }
+    }
+
+    public func conversationsLinked(
+        to threadIDs: Set<AgentThreadID>
+    ) throws -> [AgentThreadID: BotConversation] {
+        guard !threadIDs.isEmpty else { return [:] }
+        let threadIDs = Array(threadIDs)
+        return try db.performSync { database in
+            var conversations: [AgentThreadID: BotConversation] = [:]
+            for start in stride(from: 0, to: threadIDs.count, by: Self.lookupBatchSize) {
+                let batch = threadIDs[start..<min(start + Self.lookupBatchSize, threadIDs.count)]
+                let marks = Array(repeating: "?", count: batch.count).joined(separator: ",")
+                let statement = try database.prepare(
+                    Self.conversationSelect + " WHERE linked_agent_thread_id IN (\(marks));"
+                )
+                defer { statement.reset() }
+                for (index, threadID) in batch.enumerated() {
+                    try statement.bind(Int32(index + 1), threadID.value.uuidString.lowercased())
+                }
+                while try statement.step() {
+                    guard let conversation = try? decodeConversation(statement),
+                          let threadID = conversation.linkedAgentThreadID,
+                          conversations[threadID] == nil else { continue }
+                    conversations[threadID] = conversation
+                }
+            }
+            return conversations
         }
     }
 
@@ -583,6 +658,35 @@ public final class BotStore: @unchecked Sendable {
             var result: [BotConversation] = []
             while try statement.step() { result.append(try decodeConversation(statement)) }
             return result
+        }
+    }
+
+    public func latestConversationUpdatedAt(botIDs: Set<BotID>) throws -> [BotID: Date] {
+        guard !botIDs.isEmpty else { return [:] }
+        let botIDs = Array(botIDs)
+        return try db.performSync { database in
+            var latest: [BotID: Date] = [:]
+            for start in stride(from: 0, to: botIDs.count, by: Self.lookupBatchSize) {
+                let batch = botIDs[start..<min(start + Self.lookupBatchSize, botIDs.count)]
+                let marks = Array(repeating: "?", count: batch.count).joined(separator: ",")
+                let statement = try database.prepare("""
+                    SELECT bot_id, MAX(updated_at)
+                    FROM bot_conversations
+                    WHERE bot_id IN (\(marks))
+                    GROUP BY bot_id;
+                    """)
+                defer { statement.reset() }
+                for (index, botID) in batch.enumerated() {
+                    try statement.bind(Int32(index + 1), botID.value.uuidString.lowercased())
+                }
+                while try statement.step() {
+                    guard let rawID = statement.columnText(0),
+                          let id = UUID(uuidString: rawID),
+                          let updatedAt = date(statement.columnText(1)) else { continue }
+                    latest[BotID(id)] = updatedAt
+                }
+            }
+            return latest
         }
     }
 

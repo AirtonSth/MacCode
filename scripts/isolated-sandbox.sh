@@ -35,6 +35,10 @@ Environment:
   RC2_SANDBOX_HOME        debug process home (default <worktree>/.sandbox-state/home)
   RC2_SANDBOX_ALLOW_PRIMARY=1  allow test/build/run in the primary checkout
   RC2_SANDBOX_FETCH=1     fetch origin production before ensure
+
+SwiftPM tests also receive a sandbox-private CFFIXED_USER_HOME beneath App
+Support and bypass cfprefsd so UserDefaults.standard cannot collide with
+another worktree.
 EOF
   exit 2
 }
@@ -90,6 +94,10 @@ sandbox_home_dir() {
   echo "${RC2_SANDBOX_HOME:-$(repo_root)/.sandbox-state/home}"
 }
 
+test_user_home_dir() {
+  echo "$(app_support_dir)/TestUserHome"
+}
+
 app_executable() {
   echo "$(app_path)/Contents/MacOS/RemoteCode"
 }
@@ -140,6 +148,7 @@ linked_worktree=$(is_linked_worktree && echo yes || echo no)
 app_path=$(app_path)
 app_support=$(app_support_dir)
 sandbox_home=$(sandbox_home_dir)
+test_user_home=$(test_user_home_dir)
 stable_bundle_id=$STABLE_BUNDLE_ID
 EOF
 }
@@ -173,9 +182,19 @@ cmd_test() {
   require_sandbox_tree
   require_product_tree
   ensure_developer_dir
-  local root
+  local root support test_user_home
   root="$(repo_root)"
+  support="$(app_support_dir)"
+  test_user_home="$(test_user_home_dir)"
+  mkdir -p "$support" "$test_user_home/Library/Preferences"
   cd "$root"
+  export CFFIXED_USER_HOME="$test_user_home"
+  export __CFPREFERENCES_AVOID_DAEMON=1
+  export RC2_BUNDLE_ID="$BUNDLE_ID"
+  export RC2_CHANNEL="$CHANNEL"
+  export RC2_HTTP_PORT="$HTTP_PORT"
+  export RC2_APP_SUPPORT="$support"
+  export RC2_DB_PATH="$support/remotecode.sqlite"
   if [ "$#" -eq 0 ]; then
     exec ./scripts/test-unit.sh
   fi

@@ -12,6 +12,83 @@ final class PairingCountdownTests: XCTestCase {
     // Stable epoch for all cases
     private let epoch = Date(timeIntervalSince1970: 1_700_000_000)
 
+    func test_pairingCodeTimelineSchedule_stopsAfterExpiredInitialRender() {
+        // WHY: once Settings already says Expired, another 60 one-second
+        // invalidations cannot change its label, color, or button state.
+        let now = epoch.addingTimeInterval(601)
+        let entries = PairingCodeTimelineSchedule(expiresAt: epoch.addingTimeInterval(600))
+            .entries(from: now, mode: .normal)
+        let renderedDates = Array(entries.prefix(61))
+
+        XCTAssertEqual(renderedDates, [now])
+        XCTAssertEqual(renderedDates.dropFirst().count, 0)
+    }
+
+    func test_pairingCodeTimelineSchedule_keepsCadenceAndExpiryLabel() {
+        // WHY: before expiry the visible countdown must still advance every
+        // second and render the exact terminal Expired state at the boundary.
+        let expiresAt = epoch.addingTimeInterval(60)
+        let entries = PairingCodeTimelineSchedule(expiresAt: expiresAt)
+            .entries(from: epoch, mode: .normal)
+        let renderedDates = Array(entries.prefix(62))
+
+        XCTAssertEqual(renderedDates.count, 61)
+        XCTAssertEqual(renderedDates.first, epoch)
+        XCTAssertEqual(renderedDates.last, expiresAt)
+        XCTAssertTrue(zip(renderedDates, renderedDates.dropFirst()).allSatisfy {
+            $1.timeIntervalSince($0) == 1
+        })
+        XCTAssertEqual(
+            PairingCodeCountdownPresentation(expiresAt: expiresAt, now: epoch).label,
+            "Expires in 1:00"
+        )
+        XCTAssertEqual(
+            PairingCodeCountdownPresentation(expiresAt: expiresAt, now: expiresAt).label,
+            "Expired"
+        )
+    }
+
+    func test_pairingCodeCountdownPresentation_preservesRoundingAndState() {
+        let expiresAt = epoch.addingTimeInterval(60)
+        let live = PairingCodeCountdownPresentation(
+            expiresAt: expiresAt,
+            now: epoch.addingTimeInterval(0.2)
+        )
+        XCTAssertEqual(live.remaining, 60,
+                       "the existing rounded-up countdown must not lose a second")
+        XCTAssertFalse(live.expired)
+        XCTAssertEqual(live.label, "Expires in 1:00")
+
+        let expired = PairingCodeCountdownPresentation(
+            expiresAt: expiresAt,
+            now: expiresAt.addingTimeInterval(20)
+        )
+        XCTAssertEqual(expired.remaining, 0)
+        XCTAssertTrue(expired.expired)
+        XCTAssertEqual(expired.label, "Expired")
+    }
+
+    func test_microbenchPairingCodeTimelineSchedule_eliminatesExpiredInvalidations() {
+        let warmups = 2
+        let samples = 7
+        let expiresAt = epoch.addingTimeInterval(600)
+        let expiredNow = expiresAt.addingTimeInterval(1)
+        var optimizedSamples: [Int] = []
+
+        for iteration in 0..<(warmups + samples) {
+            let entries = PairingCodeTimelineSchedule(expiresAt: expiresAt)
+                .entries(from: expiredNow, mode: .normal)
+            let optimizedInvalidations = Array(entries.prefix(61)).dropFirst().count
+            if iteration >= warmups {
+                XCTAssertEqual(optimizedInvalidations, 0)
+                optimizedSamples.append(optimizedInvalidations)
+            }
+        }
+
+        XCTAssertEqual(optimizedSamples, Array(repeating: 0, count: samples))
+        print("PERF expired_pairing_clock warmup=2 n=7 baseline_invalidations=60 optimized_invalidations=0 reduction_pct=100 live_invalidations=60")
+    }
+
     // MARK: remainingSecs
 
     func test_remainingSecs_atCreation_equalsFullTTL() {

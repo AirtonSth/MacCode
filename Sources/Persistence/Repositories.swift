@@ -63,6 +63,10 @@ public enum AgentRoutingPersistenceError: Error, Equatable {
     case revisionConflict(column: Int, configuration: Int)
 }
 
+public enum AgentThreadPersistenceError: Error, Equatable {
+    case invalidThreadID(String)
+}
+
 private func parseDate(_ s: String?) -> Date {
     guard let s else { return Date() }
     if let d = isoFractional.date(from: s) { return d }
@@ -789,6 +793,36 @@ public final class AgentThreadRepository {
             ))
         }
         return out
+    }
+
+    /// IDs of threads whose persisted run state is active. The provider-session
+    /// reaper polls this on MainActor every 30 seconds and needs no thread model
+    /// or recency ordering. Validate routing only for running rows so corrupt
+    /// active persistence aborts cleanup before it can terminate any session;
+    /// routing attached to a non-running row cannot make that row active.
+    public func runningThreadIds() throws -> Set<AgentThreadID> {
+        let statement = try db.prepare("""
+            SELECT t.id, r.mode, r.configuration_json, r.revision
+            FROM agent_threads t
+            LEFT JOIN agent_thread_routing r ON r.thread_id = t.id
+            WHERE t.status = 'running';
+        """)
+        var ids = Set<AgentThreadID>()
+        while try statement.step() {
+            let rawID = statement.columnText(0) ?? ""
+            guard let uuid = UUID(uuidString: rawID) else {
+                throw AgentThreadPersistenceError.invalidThreadID(rawID)
+            }
+            if let routingJSON = statement.columnText(2) {
+                _ = try decodeRoutingConfiguration(
+                    json: routingJSON,
+                    storedMode: statement.columnText(1),
+                    storedRevision: statement.columnIsNull(3) ? nil : Int(statement.columnInt64(3))
+                )
+            }
+            ids.insert(AgentThreadID(uuid))
+        }
+        return ids
     }
 
     public func get(id: AgentThreadID) throws -> AgentThread? {
@@ -3668,6 +3702,9 @@ public final class AgentRunRepository: @unchecked Sendable {
     // a short lock so concurrent thread reads avoid per-call codec construction.
     private let streamEventCodecLock = NSLock()
     private let streamEventDecoder = JSONDecoder()
+    // Used only inside db.performSync writer transactions. Keep it separate
+    // from the read decoder to avoid reversing the database/codec lock order.
+    private let durableHostMetadataDecoder = JSONDecoder()
     /// Highest durable `seq` observed for a run on this repository instance.
     /// Token-rate flushes used to SELECT `(run_id, seq)` before every INSERT
     /// even when the coordinator had just allocated a never-written sequence.
@@ -3686,6 +3723,8 @@ public final class AgentRunRepository: @unchecked Sendable {
     private static let committedProviderEventCacheLimit = 128
     public init(db: SQLiteDB) { self.db = db }
 #if DEBUG
+    /// Exact pre-screening path retained only for same-process A/B receipts.
+    var useLegacyDurableHostMetadataDecodingForBenchmark = false
     /// `iso.string(from:)` calls from `persistStreamBatch` (one per flush).
     private(set) var streamBatchISO8601FormatCountForTesting = 0
     /// Identity `SELECT` probes from `persistStreamEventIdempotently`.
@@ -3694,6 +3733,8 @@ public final class AgentRunRepository: @unchecked Sendable {
     private(set) var providerEventIdentitySelectCountForTesting = 0
     /// ReversibleContentStore constructions from bound/persist helpers.
     private(set) var reversibleStoreInitCountForTesting = 0
+    /// AssistantEvent decodes attempted while screening durable host metadata.
+    private(set) var durableHostMetadataDecodeCountForTesting = 0
 #endif
 
     /// Store-before-loss soft bound used by coordinator + repository (S3).
@@ -4069,9 +4110,10 @@ public final class AgentRunRepository: @unchecked Sendable {
         payloadJSON: String,
         createdAt: String
     ) throws {
-        guard let data = payloadJSON.data(using: .utf8),
-              let event = try? JSONDecoder().decode(AssistantEvent.self, from: data),
-              case .itemHostMetadata(_, _, let applied, let attestation) = event,
+        guard let event = durableHostMetadataEvent(payloadJSON: payloadJSON) else {
+            return
+        }
+        guard case .itemHostMetadata(_, _, let applied, let attestation) = event,
               applied == true,
               let attestation,
               attestation.isWellFormed else {
@@ -4122,6 +4164,27 @@ public final class AgentRunRepository: @unchecked Sendable {
         try insert.bind(5, payloadJSON)
         try insert.bind(6, createdAt)
         _ = try insert.step()
+    }
+
+    private func durableHostMetadataEvent(payloadJSON: String) -> AssistantEvent? {
+#if DEBUG
+        if useLegacyDurableHostMetadataDecodingForBenchmark {
+            guard let data = payloadJSON.data(using: .utf8) else { return nil }
+            return try? JSONDecoder().decode(AssistantEvent.self, from: data)
+        }
+#endif
+        // Valid JSON can spell an ASCII key literally or with a `\u` escape.
+        // Ordinary stream events have neither signal, so avoid materializing
+        // Data and decoding AssistantEvent for every token-rate row.
+        guard payloadJSON.contains(#""itemHostMetadata""#)
+                || payloadJSON.contains("\\u") else {
+            return nil
+        }
+        guard let data = payloadJSON.data(using: .utf8) else { return nil }
+#if DEBUG
+        durableHostMetadataDecodeCountForTesting += 1
+#endif
+        return try? durableHostMetadataDecoder.decode(AssistantEvent.self, from: data)
     }
 
     private func rememberedCommittedStreamSeq(runId: AgentRunID) -> Int? {
@@ -5179,6 +5242,150 @@ public final class AgentRunRepository: @unchecked Sendable {
         return 0
     }
 
+    /// Payload-free identity of the newest replay row plus the replay-view count
+    /// and thread-wide insertion watermark. Unlike COUNT(*) or the presentation
+    /// tail alone, this advances when retention replaces a historical-run row
+    /// while a newer run remains the visible tail.
+    public struct StreamEventCursor: Sendable, Equatable {
+        public let count: Int
+        public let rowId: Int64?
+        public let runId: AgentRunID?
+        public let sequence: Int
+        /// Highest raw stream id represented anywhere in the replay view.
+        public let mutationId: Int64?
+
+        public init(
+            count: Int,
+            rowId: Int64?,
+            runId: AgentRunID?,
+            sequence: Int,
+            mutationId: Int64?
+        ) {
+            self.count = count
+            self.rowId = rowId
+            self.runId = runId
+            self.sequence = sequence
+            self.mutationId = mutationId
+        }
+    }
+
+    public func streamEventCursor(threadId: AgentThreadID) throws -> StreamEventCursor {
+        let st = try db.prepare("""
+            WITH scoped AS (
+                SELECT id, run_id, seq, started_at, ordering_id
+                FROM agent_replay_stream_events
+                WHERE thread_id = ?
+            ), newest AS (
+                SELECT id, run_id, seq
+                FROM scoped
+                ORDER BY started_at DESC, seq DESC, ordering_id DESC
+                LIMIT 1
+            )
+            SELECT
+                (SELECT COUNT(*) FROM scoped),
+                (SELECT id FROM newest),
+                (SELECT run_id FROM newest),
+                (SELECT seq FROM newest),
+                (SELECT MAX(ordering_id) FROM scoped);
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        guard try st.step() else {
+            return StreamEventCursor(
+                count: 0,
+                rowId: nil,
+                runId: nil,
+                sequence: 0,
+                mutationId: nil
+            )
+        }
+        let runId = st.columnText(2)
+            .flatMap(UUID.init(uuidString:))
+            .map(AgentRunID.init)
+        return StreamEventCursor(
+            count: Int(st.columnInt64(0)),
+            rowId: runId == nil ? nil : st.columnInt64(1),
+            runId: runId,
+            sequence: runId == nil ? 0 : Int(st.columnInt64(3)),
+            mutationId: runId == nil ? nil : st.columnInt64(4)
+        )
+    }
+
+    /// Payload-free identity for one replay row admitted after a cursor's
+    /// thread-wide insertion watermark.
+    public struct StreamEventMutationRow: Sendable, Equatable {
+        public let id: Int64
+        public let runId: AgentRunID
+        public let sequence: Int
+        public let mutationId: Int64
+        public let payloadBytes: Int64
+
+        public init(
+            id: Int64,
+            runId: AgentRunID,
+            sequence: Int,
+            mutationId: Int64,
+            payloadBytes: Int64
+        ) {
+            self.id = id
+            self.runId = runId
+            self.sequence = sequence
+            self.mutationId = mutationId
+            self.payloadBytes = payloadBytes
+        }
+    }
+
+    /// All replay-view insertions covered by `(afterMutationId, throughMutationId]`,
+    /// ordered by durable insertion identity. The caller uses `limit = expected + 1`
+    /// so one unexpected in-process or external row fails closed without decoding.
+    public func listStreamEventMutations(
+        threadId: AgentThreadID,
+        afterMutationId: Int64,
+        throughMutationId: Int64,
+        limit: Int
+    ) throws -> [StreamEventMutationRow] {
+        let safeLimit = max(0, limit)
+        guard safeLimit > 0, throughMutationId > afterMutationId else { return [] }
+        let st = try db.prepare("""
+            SELECT id, run_id, seq, ordering_id,
+                   LENGTH(CAST(payload_json AS BLOB)) AS presentation_bytes,
+                   substr(payload_json, -240) AS trailer_suffix
+            FROM agent_replay_stream_events
+            WHERE thread_id = ?
+              AND ordering_id > ?
+              AND ordering_id <= ?
+            ORDER BY ordering_id ASC
+            LIMIT ?;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        try st.bind(2, afterMutationId)
+        try st.bind(3, throughMutationId)
+        try st.bind(4, Int64(safeLimit))
+        var rows: [StreamEventMutationRow] = []
+        while try st.step() {
+            let id = st.columnInt64(0)
+            guard let rawRunId = st.columnText(1),
+                  let runUUID = UUID(uuidString: rawRunId) else {
+                throw PersistenceDataError.corruptStreamEvent("row \(id) has invalid run id")
+            }
+            let presentation = st.columnInt64(4)
+            let trailer = st.columnText(5) ?? ""
+            let authoritative = Int64(
+                AuthoritativePayloadRecovery.authoritativeByteCount(
+                    forStoredPayload: trailer,
+                    presentationFallback: Int(presentation)
+                )
+            )
+            rows.append(StreamEventMutationRow(
+                id: id,
+                runId: AgentRunID(runUUID),
+                sequence: Int(st.columnInt64(2)),
+                mutationId: st.columnInt64(3),
+                payloadBytes: authoritative
+            ))
+        }
+        return rows
+    }
+
     public func listLatestStreamEvents(
         threadId: AgentThreadID,
         limit: Int = 500,
@@ -5625,6 +5832,11 @@ public final class AgentTurnCheckpointRepository {
     let db: SQLiteDB
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+#if DEBUG
+    /// Exact growing-prefix path retained only for same-process A/B receipts.
+    var useLegacyBoundedFileSummaryForBenchmark = false
+    private(set) var fileSummaryEncodedElementCountForTesting = 0
+#endif
     /// Checkpoint list keyset timestamps must round-trip sub-second values so
     /// iOS item equality and DB continuation use the same bound string.
     private static let completedAtFractional: ISO8601DateFormatter = {
@@ -5728,22 +5940,47 @@ public final class AgentTurnCheckpointRepository {
     ) throws -> (json: String, truncated: Bool) {
         let maxFiles = AgentTurnCheckpointListWireProjection.maxFiles
         let maxBytes = AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes
-        var kept: [AgentTurnCheckpointFile] = []
-        kept.reserveCapacity(min(files.count, maxFiles))
-        var encoded = try encoder.encode(kept)
+#if DEBUG
+        if useLegacyBoundedFileSummaryForBenchmark {
+            var kept: [AgentTurnCheckpointFile] = []
+            kept.reserveCapacity(min(files.count, maxFiles))
+            var encoded = try encoder.encode(kept)
+            for file in files {
+                guard kept.count < maxFiles else { break }
+                let candidate = kept + [file]
+                let candidateData = try encoder.encode(candidate)
+                guard candidateData.count <= maxBytes else {
+                    break
+                }
+                kept = candidate
+                encoded = candidateData
+            }
+            return (
+                String(data: encoded, encoding: .utf8) ?? "[]",
+                kept.count < files.count
+            )
+        }
+#endif
+        var keptCount = 0
+        var encoded = Data([0x5B]) // [
         for file in files {
-            guard kept.count < maxFiles else { break }
-            let candidate = kept + [file]
-            let candidateData = try encoder.encode(candidate)
-            guard candidateData.count <= maxBytes else {
+            guard keptCount < maxFiles else { break }
+#if DEBUG
+            fileSummaryEncodedElementCountForTesting += 1
+#endif
+            let fileData = try encoder.encode(file)
+            let separatorBytes = keptCount == 0 ? 0 : 1
+            guard encoded.count + separatorBytes + fileData.count + 1 <= maxBytes else {
                 break
             }
-            kept = candidate
-            encoded = candidateData
+            if separatorBytes == 1 { encoded.append(0x2C) } // ,
+            encoded.append(fileData)
+            keptCount += 1
         }
+        encoded.append(0x5D) // ]
         return (
             String(data: encoded, encoding: .utf8) ?? "[]",
-            kept.count < files.count
+            keptCount < files.count
         )
     }
 
@@ -8176,6 +8413,24 @@ public final class TerminalOutputRepository {
         try failureLedger?.pendingDeleteURL(surfaceID: surfaceID, id: id)
     }
 
+    /// A nil estimate deliberately forces a real global check. The connection
+    /// owns this value so multiple repository instances cannot undercount.
+    public func terminalGlobalRetentionRequired(maxBytes: Int) -> Bool {
+        db.terminalOutputRetentionRequired(maxBytes: maxBytes)
+    }
+
+    public func invalidateTerminalGlobalRetentionEstimate() {
+        db.invalidateTerminalOutputBytes()
+    }
+
+    private func recordTerminalBytesAppended(_ byteCount: Int) {
+        db.noteTerminalOutputBytesInserted(byteCount)
+    }
+
+    private func recordTerminalGlobalRetentionBytes(_ byteCount: Int) {
+        db.rememberTerminalOutputBytes(byteCount)
+    }
+
     public func append(surfaceID: String, workspaceID: String?, chunkIndex: Int64, data: Data) throws {
         guard !data.isEmpty else { return }
         try db.performSync { database in
@@ -8192,6 +8447,7 @@ public final class TerminalOutputRepository {
             // A successful INSERT step already admitted one row. SELECT
             // changes() was a second statement on every PTY persist.
             _ = try st.step()
+            recordTerminalBytesAppended(data.count)
         }
     }
 
@@ -8397,6 +8653,7 @@ public final class TerminalOutputRepository {
                     key: Self.dirtyHistoryKey(surfaceID: surfaceID),
                     database: database
                 )
+                recordTerminalBytesAppended(data.count)
             }
         }
     }
@@ -8530,13 +8787,26 @@ public final class TerminalOutputRepository {
         maxDeleteBytes: Int = 8 * 1_024 * 1_024
     ) throws -> TerminalHistoryGlobalPruneResult {
         guard maxBytes > 0 else {
-            return TerminalHistoryGlobalPruneResult(deletedRows: 0, deletedBytes: 0, truncatedSurfaceIDs: [], remainsOverBudget: false)
+            invalidateTerminalGlobalRetentionEstimate()
+            return TerminalHistoryGlobalPruneResult(
+                deletedRows: 0,
+                deletedBytes: 0,
+                truncatedSurfaceIDs: [],
+                remainsOverBudget: false
+            )
         }
         return try db.performSync { database in
-            try database.transaction {
+            var remainingBytes = 0
+            let result = try database.transaction {
                 let total = try Self.totalBytesAllSurfaces(database: database)
+                remainingBytes = total
                 guard total > maxBytes else {
-                    return TerminalHistoryGlobalPruneResult(deletedRows: 0, deletedBytes: 0, truncatedSurfaceIDs: [], remainsOverBudget: false)
+                    return TerminalHistoryGlobalPruneResult(
+                        deletedRows: 0,
+                        deletedBytes: 0,
+                        truncatedSurfaceIDs: [],
+                        remainsOverBudget: false
+                    )
                 }
                 let needed = min(total - maxBytes, max(1, maxDeleteBytes))
                 let candidates = try database.prepare("""
@@ -8558,7 +8828,12 @@ public final class TerminalOutputRepository {
                     if deletedBytes >= needed { break }
                 }
                 guard !ids.isEmpty else {
-                    return TerminalHistoryGlobalPruneResult(deletedRows: 0, deletedBytes: 0, truncatedSurfaceIDs: [], remainsOverBudget: true)
+                    return TerminalHistoryGlobalPruneResult(
+                        deletedRows: 0,
+                        deletedBytes: 0,
+                        truncatedSurfaceIDs: [],
+                        remainsOverBudget: true
+                    )
                 }
                 var nextIndexes: [String: Int64] = [:]
                 for surface in surfaces {
@@ -8581,6 +8856,7 @@ public final class TerminalOutputRepository {
                     )
                 }
                 let remaining = max(0, total - deletedBytes)
+                remainingBytes = remaining
                 return TerminalHistoryGlobalPruneResult(
                     deletedRows: ids.count,
                     deletedBytes: deletedBytes,
@@ -8588,6 +8864,8 @@ public final class TerminalOutputRepository {
                     remainsOverBudget: remaining > maxBytes
                 )
             }
+            recordTerminalGlobalRetentionBytes(remainingBytes)
+            return result
         }
     }
 
@@ -8807,33 +9085,36 @@ public final class TerminalOutputRepository {
     ) throws -> Bool {
         let total = try totalBytes(surfaceID: surfaceID, database: database)
         guard total > maxBytes else { return false }
-        let overflow = total - maxBytes
-        let candidates = try database.prepare("""
-            SELECT id, byte_count
-            FROM terminal_output_chunks
-            WHERE surface_id = ?
-            ORDER BY id ASC
-            LIMIT 512;
-        """)
-        try candidates.bind(1, surfaceID)
-        var ids: [Int64] = []
-        var bytes = 0
-        while try candidates.step() {
-            ids.append(candidates.columnInt64(0))
-            bytes += max(0, Int(candidates.columnInt64(1)))
-            if bytes >= overflow { break }
+        var remainingOverflow = total - maxBytes
+        while remainingOverflow > 0 {
+            let candidates = try database.prepare("""
+                SELECT id, byte_count
+                FROM terminal_output_chunks
+                WHERE surface_id = ?
+                ORDER BY id ASC
+                LIMIT 512;
+            """)
+            try candidates.bind(1, surfaceID)
+            var ids: [Int64] = []
+            var bytes = 0
+            while try candidates.step() {
+                ids.append(candidates.columnInt64(0))
+                bytes += max(0, Int(candidates.columnInt64(1)))
+                if bytes >= remainingOverflow { break }
+            }
+            guard !ids.isEmpty else { break }
+            let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+            let deletion = try database.prepare(
+                "DELETE FROM terminal_output_chunks WHERE surface_id = ? AND id IN (\(placeholders));"
+            )
+            try deletion.bind(1, surfaceID)
+            for (index, id) in ids.enumerated() {
+                try deletion.bind(Int32(index + 2), id)
+            }
+            _ = try deletion.step()
+            remainingOverflow = max(0, remainingOverflow - bytes)
         }
-        guard !ids.isEmpty else { return false }
-        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
-        let deletion = try database.prepare(
-            "DELETE FROM terminal_output_chunks WHERE surface_id = ? AND id IN (\(placeholders));"
-        )
-        try deletion.bind(1, surfaceID)
-        for (index, id) in ids.enumerated() {
-            try deletion.bind(Int32(index + 2), id)
-        }
-        _ = try deletion.step()
-        return true
+        return remainingOverflow == 0
     }
 
     private static func deleteHistoryState(
@@ -8845,6 +9126,7 @@ public final class TerminalOutputRepository {
         )
         try chunks.bind(1, surfaceID)
         _ = try chunks.step()
+        database.invalidateTerminalOutputBytes()
         try deleteSetting(
             key: partialHistoryKey(surfaceID: surfaceID),
             database: database

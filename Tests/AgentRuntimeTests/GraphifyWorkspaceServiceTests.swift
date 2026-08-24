@@ -1,5 +1,6 @@
 import XCTest
 import CoreModel
+import Darwin
 @testable import AgentRuntime
 
 /// WHY: ArtifactRoot must be unique per commonDir; binary missing is fail-open unavailable;
@@ -21,6 +22,9 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
         service?.runProcess = nil
         service?.headProbe = nil
         service?.checkoutIdentityProbe = nil
+        service?.beforeMarkDirtyLockForTesting = nil
+        service?.beforeWatchCheckoutLockForTesting = nil
+        service?.beforeVerifyScheduleWarmLockForTesting = nil
         service?.setPressurePauseEnsureAndWatch(false)
         service?.enabled = false
         service?.autoEnsure = false
@@ -431,7 +435,327 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
         wait(for: [ensureStarted], timeout: 3.0)
     }
 
+    func test_stopWatchingAll_releasesPendingDebounces_and_rearmsOnNextRefresh() throws {
+        // WHY: Token Saver OFF must release delayed work immediately, while the
+        // retained schedule still forces the next active checkout refresh and
+        // the rearmed real FSEventStream must observe later source edits.
+        service.autoEnsure = true
+        service.fseventsDebounce = 0.01
+        let root = tempRoot.appendingPathComponent("toggle-rearm", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let checkout = GraphifyCheckout(
+            key: GraphifyRepoKey(commonDir: root.appendingPathComponent(".git").path),
+            displayRoot: root.path
+        )
+        let fakeBinary = tempRoot.appendingPathComponent("fake-graphify-toggle")
+        try "#!/bin/sh\nexit 0\n".write(to: fakeBinary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeBinary.path)
+        service.binaryPathOverride = fakeBinary.path
+        service.headProbe = { _ in "toggle-head" }
+        let runLock = NSLock()
+        var updateStarts = 0
+        service.runProcess = { args, _, environment in
+            guard args.first == fakeBinary.path, args.dropFirst().first == "update" else {
+                return (0, "", "")
+            }
+            if let output = environment?["GRAPHIFY_OUT"] {
+                try? FileManager.default.createDirectory(
+                    atPath: output,
+                    withIntermediateDirectories: true
+                )
+                try? "{\"nodes\":[]}".write(
+                    to: URL(fileURLWithPath: output).appendingPathComponent("graph.json"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+            runLock.lock(); updateStarts += 1; runLock.unlock()
+            return (0, "", "")
+        }
+        XCTAssertEqual(service.ensureSync(checkout: checkout), .fresh)
+        runLock.lock(); updateStarts = 0; runLock.unlock()
+        service.checkoutIdentityProbe = { _ in checkout }
+
+        service.watchCheckout(checkout)
+        service.markDirtyFromFilesystem(checkout: checkout)
+        XCTAssertEqual(service.lifecycleSnapshotForTesting.watchers, 1)
+        XCTAssertEqual(service.lifecycleSnapshotForTesting.debounceTasks, 1)
+
+        service.enabled = false
+        service.stopWatchingAll()
+        let disabled = service.lifecycleSnapshotForTesting
+        XCTAssertEqual(disabled.watchers, 0)
+        XCTAssertEqual(disabled.debounceTasks, 0, "OFF must not retain a delayed task per checkout")
+        XCTAssertEqual(disabled.schedules, 1, "dirty schedule is the rearm authority")
+
+        service.enabled = true
+        service.resumeAfterDisable()
+        service.requestRefresh(checkout: checkout)
+        XCTAssertEqual(service.lifecycleSnapshotForTesting.watchers, 1, "next active refresh rearms FSEvents")
+        XCTAssertEqual(service.lifecycleSnapshotForTesting.schedules, 1)
+
+        var deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            runLock.lock(); let starts = updateStarts; runLock.unlock()
+            if starts >= 1, service.verify(checkout) == .fresh { break }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        runLock.lock(); let resumeStarts = updateStarts; updateStarts = 0; runLock.unlock()
+        XCTAssertEqual(resumeStarts, 1, "dirty work retained through OFF must rebuild once")
+
+        try "let changed = true\n".write(
+            to: root.appendingPathComponent("Changed.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            runLock.lock(); let starts = updateStarts; runLock.unlock()
+            if starts >= 1 { break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        runLock.lock(); let postRearmStarts = updateStarts; runLock.unlock()
+        XCTAssertEqual(postRearmStarts, 1, "rearmed FSEvents must rebuild after a real source write")
+    }
+
+    func test_completedDebounce_releasesItsRegistryEntry() throws {
+        // WHY: a checkout touched once must not retain its completed work item
+        // for the lifetime of the app.
+        service.autoEnsure = true
+        service.fseventsDebounce = 0.01
+        service.binaryPathOverride = "/nonexistent/graphify-\(UUID().uuidString)"
+        service.headProbe = { _ in nil }
+        let root = tempRoot.appendingPathComponent("completed-debounce", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let checkout = GraphifyCheckout(
+            key: GraphifyRepoKey(commonDir: root.appendingPathComponent(".git").path),
+            displayRoot: root.path
+        )
+
+        service.markDirtyFromFilesystem(checkout: checkout)
+        let deadline = Date().addingTimeInterval(1)
+        while service.lifecycleSnapshotForTesting.debounceTasks != 0, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        XCTAssertEqual(
+            service.lifecycleSnapshotForTesting.debounceTasks,
+            0,
+            "a fired debounce must release its retained checkout/work item"
+        )
+    }
+
+    func test_disableRacingAdmittedFilesystemCallback_leavesNoDelayedWork() throws {
+        // WHY: the callback can pass the unlocked public gate just before the
+        // settings thread turns Graphify off. Revalidate under the scheduler lock.
+        service.autoEnsure = true
+        service.fseventsDebounce = 30
+        let root = tempRoot.appendingPathComponent("disable-race", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let checkout = GraphifyCheckout(
+            key: GraphifyRepoKey(commonDir: root.appendingPathComponent(".git").path),
+            displayRoot: root.path
+        )
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        service.beforeMarkDirtyLockForTesting = {
+            entered.signal()
+            release.wait()
+        }
+        let finished = expectation(description: "filesystem callback finished")
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.service.markDirtyFromFilesystem(checkout: checkout)
+            finished.fulfill()
+        }
+
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        service.enabled = false
+        service.stopWatchingAll()
+        release.signal()
+        wait(for: [finished], timeout: 1)
+
+        let disabled = service.lifecycleSnapshotForTesting
+        XCTAssertEqual(disabled.watchers, 0)
+        XCTAssertEqual(disabled.schedules, 0)
+        XCTAssertEqual(disabled.debounceTasks, 0)
+    }
+
+    func test_disableRacingAdmittedRefresh_doesNotInstallWatcherAfterStop() throws {
+        // WHY: refresh can pass its unlocked gate before OFF, then reach watcher
+        // registration only after stopWatchingAll has already returned.
+        service.autoEnsure = true
+        service.binaryPathOverride = "/nonexistent/graphify-\(UUID().uuidString)"
+        let root = tempRoot.appendingPathComponent("refresh-disable-race", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let checkout = GraphifyCheckout(
+            key: GraphifyRepoKey(commonDir: root.appendingPathComponent(".git").path),
+            displayRoot: root.path
+        )
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        service.beforeWatchCheckoutLockForTesting = {
+            entered.signal()
+            release.wait()
+        }
+        let finished = expectation(description: "admitted refresh finished")
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.service.requestRefresh(checkout: checkout)
+            finished.fulfill()
+        }
+
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        service.enabled = false
+        service.stopWatchingAll()
+        release.signal()
+        wait(for: [finished], timeout: 1)
+
+        let disabled = service.lifecycleSnapshotForTesting
+        XCTAssertEqual(disabled.watchers, 0, "OFF must linearize before late watcher registration")
+        XCTAssertEqual(disabled.schedules, 0)
+        XCTAssertEqual(disabled.debounceTasks, 0)
+    }
+
+    func test_disableDuringRefreshVerify_doesNotRecreateColdScheduleAfterStop() throws {
+        // WHY: verify performs disk/git probes outside the scheduler lock. OFF
+        // must prevent its cold fingerprint warm-up from recreating retained
+        // schedule state after stopWatchingAll has returned.
+        let raceService = GraphifyWorkspaceService(appSupportDirectory: tempRoot.appendingPathComponent("race-graphs"))
+        raceService.enabled = true
+        raceService.autoEnsure = true
+        raceService.headProbe = { _ in "race-head" }
+        let fakeBinary = tempRoot.appendingPathComponent("fake-graphify-race")
+        try "#!/bin/sh\nexit 0\n".write(to: fakeBinary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeBinary.path)
+        raceService.binaryPathOverride = fakeBinary.path
+        defer {
+            raceService.beforeVerifyScheduleWarmLockForTesting = nil
+            raceService.enabled = false
+            raceService.stopWatchingAll()
+        }
+
+        let root = tempRoot.appendingPathComponent("verify-disable-race", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let checkout = GraphifyCheckout(
+            key: GraphifyRepoKey(commonDir: root.appendingPathComponent(".git").path),
+            displayRoot: root.path
+        )
+        let artifact = raceService.artifactRoot(for: checkout)
+        try FileManager.default.createDirectory(at: artifact, withIntermediateDirectories: true)
+        try "{\"nodes\":[]}".write(
+            to: artifact.appendingPathComponent("graph.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let fingerprint = try JSONSerialization.data(withJSONObject: [
+            "head": "race-head",
+            "displayRoot": root.path,
+            "builtAt": Date().timeIntervalSince1970,
+        ])
+        try fingerprint.write(to: artifact.appendingPathComponent("fingerprint.json"), options: .atomic)
+
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        raceService.beforeVerifyScheduleWarmLockForTesting = {
+            entered.signal()
+            release.wait()
+        }
+        let finished = expectation(description: "refresh verify finished")
+        DispatchQueue.global(qos: .userInitiated).async {
+            raceService.requestRefresh(checkout: checkout)
+            finished.fulfill()
+        }
+
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        raceService.enabled = false
+        raceService.stopWatchingAll()
+        release.signal()
+        wait(for: [finished], timeout: 1)
+
+        let disabled = raceService.lifecycleSnapshotForTesting
+        XCTAssertEqual(disabled.watchers, 0)
+        XCTAssertEqual(disabled.schedules, 0, "OFF must reject a late cold-schedule warm-up")
+        XCTAssertEqual(disabled.debounceTasks, 0)
+    }
+
+    func test_microbenchWatcherLifecycleRelease() throws {
+        // WHY: a feature OFF must release live streams and delayed work even
+        // after many checkouts were touched. This benchmark uses real
+        // FSEventStream registrations plus process RSS/FD/CPU counters.
+        let warmups = 2
+        let measured = 7
+        let rootCount = 32
+
+        for sample in 0..<(warmups + measured) {
+            let sampleRoot = tempRoot.appendingPathComponent("watcher-bench-\(sample)", isDirectory: true)
+            let sampleService = GraphifyWorkspaceService(
+                appSupportDirectory: sampleRoot.appendingPathComponent("graphs", isDirectory: true)
+            )
+            sampleService.enabled = true
+            sampleService.autoEnsure = true
+            sampleService.fseventsDebounce = 0.5
+            sampleService.headProbe = { _ in nil }
+
+            for index in 0..<rootCount {
+                let root = sampleRoot.appendingPathComponent("repo-\(index)", isDirectory: true)
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                let checkout = GraphifyCheckout(
+                    key: GraphifyRepoKey(commonDir: root.appendingPathComponent(".git").path),
+                    displayRoot: root.path
+                )
+                sampleService.watchCheckout(checkout)
+                sampleService.markDirtyFromFilesystem(checkout: checkout)
+            }
+
+            let before = sampleService.lifecycleSnapshotForTesting
+            let fdBefore = Self.openFileDescriptorCount()
+            let processBefore = Self.processTaskInfo()
+            let started = ContinuousClock.now
+            sampleService.enabled = false
+            sampleService.stopWatchingAll()
+            let wall = ContinuousClock.now - started
+            let processAfter = Self.processTaskInfo()
+            let fdAfter = Self.openFileDescriptorCount()
+            let after = sampleService.lifecycleSnapshotForTesting
+
+            let wallMilliseconds = Double(wall.components.seconds) * 1_000
+                + Double(wall.components.attoseconds) / 1_000_000_000_000_000
+            let cpuMilliseconds = Double(
+                (processAfter.pti_total_user &+ processAfter.pti_total_system)
+                    &- (processBefore.pti_total_user &+ processBefore.pti_total_system)
+            ) / 1_000_000
+            let rssBefore = processBefore.pti_resident_size
+            let rssAfter = processAfter.pti_resident_size
+            print(
+                "GRAPHIFY_WATCHER_BENCH sample=\(sample) measured=\(sample >= warmups) "
+                    + "watchers_before=\(before.watchers) watchers_after=\(after.watchers) "
+                    + "schedules_after=\(after.schedules) debounce_after=\(after.debounceTasks) "
+                    + "retained_after=\(after.schedules + after.debounceTasks + after.watchers) "
+                    + "fd_before=\(fdBefore) fd_after=\(fdAfter) "
+                    + "rss_before=\(rssBefore) rss_after=\(rssAfter) "
+                    + "wall_ms=\(wallMilliseconds) cpu_ms=\(cpuMilliseconds)"
+            )
+
+            // Let the baseline's uncancelled delayed items drain before the
+            // next same-process sample, keeping all seven samples comparable.
+            Thread.sleep(forTimeInterval: 0.55)
+        }
+    }
+
     // MARK: helpers
+
+    private static func processTaskInfo() -> proc_taskinfo {
+        var info = proc_taskinfo()
+        let size = Int32(MemoryLayout<proc_taskinfo>.stride)
+        _ = withUnsafeMutablePointer(to: &info) { pointer in
+            proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, pointer, size)
+        }
+        return info
+    }
+
+    private static func openFileDescriptorCount() -> Int {
+        let bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, nil, 0)
+        guard bytes > 0 else { return -1 }
+        return Int(bytes) / MemoryLayout<proc_fdinfo>.stride
+    }
 
     private func makeGitRepo(named: String, parent: URL? = nil) throws -> URL {
         let base = parent ?? tempRoot!

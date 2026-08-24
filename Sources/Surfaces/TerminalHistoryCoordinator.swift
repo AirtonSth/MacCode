@@ -459,6 +459,7 @@ private final class TerminalHistoryQueueState: @unchecked Sendable {
     private var durablePartial = false
     private var retentionMaintenanceScheduled = false
     private var globalRetentionMaintenanceScheduled = false
+    private var retentionCheckRequired = false
     private var retryDeadline = Date.distantFuture
     private var retriesCancelled = false
 
@@ -492,10 +493,30 @@ private final class TerminalHistoryQueueState: @unchecked Sendable {
         durablePartial = false
         retentionMaintenanceScheduled = false
         globalRetentionMaintenanceScheduled = false
+        retentionCheckRequired = false
         retryDeadline = .distantFuture
         retriesCancelled = false
         condition.broadcast()
         condition.unlock()
+    }
+
+    func finishRetentionCheck() {
+        condition.lock()
+        retentionCheckRequired = false
+        condition.unlock()
+    }
+
+    func recordRetentionCheckFailure() {
+        condition.lock()
+        retentionCheckRequired = true
+        failureGeneration &+= 1
+        condition.unlock()
+    }
+
+    func requiresRetentionCheck() -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return retentionCheckRequired
     }
 
     func beginRetentionMaintenanceIfNeeded() -> Bool {
@@ -722,7 +743,8 @@ final class TerminalHistoryCoordinator {
     /// ever-heavier per-surface transcript.
     // Leave one chunk of slack so a small pre-existing baseline is not evicted
     // merely because the newest bounded window lands exactly on the byte cap.
-    // Retention still prunes before the next full chunk can exceed this bound.
+    // Per-surface retention still runs after every completed write; only the
+    // aggregate global scan uses the sampled cadence below.
     nonisolated static let maxPersistedBytes = (8 * 1024 * 1024) + maxChunkBytes
     /// Aggregate disk ceiling across dormant terminal histories. The currently
     /// writing surface is protected and remains governed by its per-surface cap.
@@ -748,6 +770,8 @@ final class TerminalHistoryCoordinator {
     private let workspaceID: String
     private let queue: DispatchQueue
     private let queueState = TerminalHistoryQueueState()
+    private let effectiveRetentionCheckInterval: Int
+    private let effectiveGlobalRetentionByteCap: Int
 
     /// Bytes accepted before the authoritative chunk index is available. This
     /// is intentionally separate from the 64 KiB ready-state accumulator: its
@@ -757,7 +781,8 @@ final class TerminalHistoryCoordinator {
     private var pendingData = Data()
     private var backlogOverflowed = false
     private var flushScheduled = false
-    private var bytesSinceRetentionCheck = TerminalHistoryCoordinator.retentionCheckInterval
+    private var bytesSinceRetentionCheck: Int
+    private var needsExplicitRetentionCheck = false
     private var nextChunkIndex: Int64?
     private var preparationState: PreparationState = .idle
     private var deferredOperations: [DeferredOperation] = []
@@ -820,7 +845,9 @@ final class TerminalHistoryCoordinator {
         surfaceID: String,
         workspaceID: String,
         prepareIndex: PrepareIndex? = nil,
-        readWindow: (@Sendable (String) throws -> TerminalOutputWindow)? = nil
+        readWindow: (@Sendable (String) throws -> TerminalOutputWindow)? = nil,
+        retentionCheckIntervalForTesting: Int? = nil,
+        globalRetentionByteCapForTesting: Int? = nil
     ) {
         self.repository = repository
         self.prepareIndex = prepareIndex
@@ -846,6 +873,15 @@ final class TerminalHistoryCoordinator {
         self.surfaceID = surfaceID
         self.workspaceID = workspaceID
         self.queue = DispatchQueue(label: "rc2.terminal.history", qos: .utility)
+        self.effectiveRetentionCheckInterval = max(
+            1,
+            retentionCheckIntervalForTesting ?? Self.retentionCheckInterval
+        )
+        self.effectiveGlobalRetentionByteCap = max(
+            1,
+            globalRetentionByteCapForTesting ?? Self.maxGlobalPersistedBytes
+        )
+        self.bytesSinceRetentionCheck = self.effectiveRetentionCheckInterval
     }
 
     /// - Parameters:
@@ -888,6 +924,7 @@ final class TerminalHistoryCoordinator {
         let surfaceID = surfaceID
         let queueState = queueState
         let historyQueue = queue
+        let globalRetentionByteCap = effectiveGlobalRetentionByteCap
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard !queueState.retriesAreCancelled() else { return }
             do {
@@ -928,7 +965,7 @@ final class TerminalHistoryCoordinator {
                         }
                     }
                     let globalResult = try repository.pruneGlobalByteCapAndMarkHistoryPartial(
-                        maxBytes: Self.maxGlobalPersistedBytes,
+                        maxBytes: globalRetentionByteCap,
                         protectedSurfaceID: surfaceID
                     )
                     if globalResult.remainsOverBudget,
@@ -937,7 +974,8 @@ final class TerminalHistoryCoordinator {
                             repository: repository,
                             surfaceID: surfaceID,
                             queue: historyQueue,
-                            queueState: queueState
+                            queueState: queueState,
+                            maxBytes: globalRetentionByteCap
                         )
                     }
                 }
@@ -960,6 +998,7 @@ final class TerminalHistoryCoordinator {
                     )
                 }
             } catch {
+                repository?.invalidateTerminalGlobalRetentionEstimate()
                 NSLog(
                     "RemoteCode terminal history prepare failed surface=%@ attempt=%d error=%@",
                     surfaceID,
@@ -1018,6 +1057,9 @@ final class TerminalHistoryCoordinator {
         deferredOperations.removeAll(keepingCapacity: false)
         let barrier = deferredBarrier
         deferredBarrier = nil
+        if barrier != nil {
+            schedulePendingRetentionCheckIfNeeded()
+        }
         for operation in operations {
             scheduleDeferredOperation(operation)
         }
@@ -1157,6 +1199,11 @@ final class TerminalHistoryCoordinator {
         /// True when any oldest buffered or leading incoming bytes were dropped
         /// or the chunk was refused entirely.
         let discarded: Bool
+    }
+
+    private struct RetentionCheckOutcome: Sendable {
+        let truncated: Bool
+        let maintenanceFailed: Bool
     }
 
     /// Drop oldest buffered bytes until `incoming` fits, then append. Newest
@@ -1345,6 +1392,7 @@ final class TerminalHistoryCoordinator {
         let failureGeneration = queueState.currentFailureGeneration()
         if case .ready = preparationState {
             flushReadyPending()
+            schedulePendingRetentionCheckIfNeeded()
             scheduleBarrier(
                 state,
                 failureGeneration: failureGeneration,
@@ -1399,17 +1447,19 @@ final class TerminalHistoryCoordinator {
         pendingData = Data()
         nextChunkIndex = chunkIndex + 1
         preparationState = .ready(nextChunkIndex: chunkIndex + 1)
-        // Cap enforcement is cheap relative to the write and must not miss a
-        // final partial MiB just because the sampling interval has not elapsed.
-        bytesSinceRetentionCheck += data.count
-        let shouldCheckRetention = true
-        if bytesSinceRetentionCheck >= Self.retentionCheckInterval {
+        let accumulatedRetentionBytes = bytesSinceRetentionCheck + data.count
+        let cadenceCheckRequested = accumulatedRetentionBytes >= effectiveRetentionCheckInterval
+        if cadenceCheckRequested {
             bytesSinceRetentionCheck = 0
+        } else {
+            bytesSinceRetentionCheck = accumulatedRetentionBytes
         }
+        needsExplicitRetentionCheck = true
         let surfaceID = surfaceID
         let workspaceID = workspaceID
         let queueState = queueState
         let historyQueue = queue
+        let globalRetentionByteCap = effectiveGlobalRetentionByteCap
         let beforePersistForTesting = beforePersistForTesting
 
         queue.async { [weak self] in
@@ -1587,81 +1637,37 @@ final class TerminalHistoryCoordinator {
                 )
             }
 
-            var retentionTruncated = false
-            if shouldCheckRetention {
-                do {
-                    let total = try repository.totalBytes(surfaceID: surfaceID)
-                    retentionTruncated = total > Self.maxPersistedBytes
-                    if retentionTruncated {
-                        retentionTruncated = try repository.pruneByteCapAndMarkHistoryPartial(
-                            surfaceID: surfaceID,
-                            maxBytes: Self.maxPersistedBytes,
-                            reason: "history_retention_cap",
-                            nextChunkIndex: chunkIndex + 1,
-                            expectedWriterGeneration: writerGeneration
-                        )
-                        if retentionTruncated {
-                            queueState.recordDurablePartial()
-                        }
-                    }
-                    let globalResult = try repository.pruneGlobalByteCapAndMarkHistoryPartial(
-                        maxBytes: Self.maxGlobalPersistedBytes,
-                        protectedSurfaceID: surfaceID
+            let retryRequired = queueState.requiresRetentionCheck()
+            let shouldCheckGlobal = cadenceCheckRequested
+                || retryRequired
+                || repository.terminalGlobalRetentionRequired(
+                    maxBytes: globalRetentionByteCap
+                )
+            let retentionOutcome = Self.performRetentionCheck(
+                repository: repository,
+                surfaceID: surfaceID,
+                historyQueue: historyQueue,
+                queueState: queueState,
+                writerGeneration: writerGeneration,
+                minimumNextChunkIndex: chunkIndex + 1,
+                shouldCheckGlobal: shouldCheckGlobal,
+                globalRetentionByteCap: globalRetentionByteCap,
+                onRecovered: { [weak self] truncated in
+                    guard let self else { return }
+                    self.delegate?.terminalHistoryCoordinator(
+                        self,
+                        didEncounter: truncated
+                            ? .retentionCap
+                            : .retentionMaintenanceRecovered
                     )
-                    if globalResult.remainsOverBudget,
-                       queueState.beginGlobalRetentionMaintenanceIfNeeded() {
-                        Self.scheduleGlobalRetentionMaintenance(
-                            repository: repository,
-                            surfaceID: surfaceID,
-                            queue: historyQueue,
-                            queueState: queueState
-                        )
-                    }
-                } catch {
-                    NSLog(
-                        "RemoteCode terminal history retention maintenance failed surface=%@ error=%@",
-                        surfaceID,
-                        String(describing: error)
-                    )
-                    if Self.isRetryableDatabaseLock(error),
-                       queueState.beginRetentionMaintenanceIfNeeded() {
-                        Self.scheduleRetentionMaintenance(
-                            repository: repository,
-                            surfaceID: surfaceID,
-                            queue: historyQueue,
-                            queueState: queueState,
-                            writerGeneration: writerGeneration,
-                            minimumNextChunkIndex: chunkIndex + 1,
-                            operationStartedAt: Date(),
-                            attempt: 0,
-                            onRecovered: { [weak self] truncated in
-                                guard let self else { return }
-                                self.delegate?.terminalHistoryCoordinator(
-                                    self,
-                                    didEncounter: truncated
-                                        ? .retentionCap
-                                        : .retentionMaintenanceRecovered
-                                )
-                            }
-                        )
-                    }
-                    DispatchQueue.main.async { [weak self] in
-                        self?.completeWrite(
-                            byteCount: data.count,
-                            failed: false,
-                            retentionTruncated: false,
-                            retentionMaintenanceFailed: true
-                        )
-                    }
-                    return
                 }
-            }
+            )
             DispatchQueue.main.async { [weak self] in
                 self?.completeWrite(
                     byteCount: data.count,
                     failed: false,
-                    retentionTruncated: retentionTruncated,
-                    retentionMaintenanceFailed: false
+                    retentionTruncated: retentionOutcome.truncated,
+                    retentionMaintenanceFailed: retentionOutcome.maintenanceFailed
                 )
             }
         }
@@ -1715,6 +1721,131 @@ final class TerminalHistoryCoordinator {
                 delegate?.terminalHistoryCoordinator(self, didEncounter: .retentionCap)
             }
         }
+    }
+
+    /// Explicit barriers enqueue this after accepted writes even if the last
+    /// chunk already drained. Keeping it on the same serial queue makes the
+    /// barrier cover retention failures and a sub-interval tail.
+    private func schedulePendingRetentionCheckIfNeeded() {
+        guard needsExplicitRetentionCheck || queueState.requiresRetentionCheck(),
+              let repository,
+              case .ready = preparationState,
+              let writerGeneration else { return }
+        needsExplicitRetentionCheck = false
+        bytesSinceRetentionCheck = 0
+        let surfaceID = surfaceID
+        let historyQueue = queue
+        let queueState = queueState
+        let minimumNextChunkIndex = nextChunkIndex ?? 1
+        let globalRetentionByteCap = effectiveGlobalRetentionByteCap
+        queue.async { [weak self] in
+            let outcome = Self.performRetentionCheck(
+                repository: repository,
+                surfaceID: surfaceID,
+                historyQueue: historyQueue,
+                queueState: queueState,
+                writerGeneration: writerGeneration,
+                minimumNextChunkIndex: minimumNextChunkIndex,
+                shouldCheckGlobal: true,
+                globalRetentionByteCap: globalRetentionByteCap,
+                onRecovered: { [weak self] truncated in
+                    guard let self else { return }
+                    self.delegate?.terminalHistoryCoordinator(
+                        self,
+                        didEncounter: truncated
+                            ? .retentionCap
+                            : .retentionMaintenanceRecovered
+                    )
+                }
+            )
+            DispatchQueue.main.async { [weak self] in
+                self?.completeRetentionCheck(outcome)
+            }
+        }
+    }
+
+    private func completeRetentionCheck(_ outcome: RetentionCheckOutcome) {
+        if outcome.maintenanceFailed {
+            writeFailures += 1
+            delegate?.terminalHistoryCoordinator(self, didEncounter: .retentionMaintenanceFailure)
+        } else if outcome.truncated {
+            delegate?.terminalHistoryCoordinator(self, didEncounter: .retentionCap)
+        }
+    }
+
+    private nonisolated static func performRetentionCheck(
+        repository: TerminalOutputRepository,
+        surfaceID: String,
+        historyQueue: DispatchQueue,
+        queueState: TerminalHistoryQueueState,
+        writerGeneration: String,
+        minimumNextChunkIndex: Int64,
+        shouldCheckGlobal: Bool,
+        globalRetentionByteCap: Int,
+        onRecovered: @escaping @MainActor @Sendable (Bool) -> Void
+    ) -> RetentionCheckOutcome {
+        var truncated = false
+        do {
+            let total = try repository.totalBytes(surfaceID: surfaceID)
+            if total > maxPersistedBytes {
+                truncated = try repository.pruneByteCapAndMarkHistoryPartial(
+                    surfaceID: surfaceID,
+                    maxBytes: maxPersistedBytes,
+                    reason: "history_retention_cap",
+                    nextChunkIndex: minimumNextChunkIndex,
+                    expectedWriterGeneration: writerGeneration
+                )
+                if truncated { queueState.recordDurablePartial() }
+            }
+            if shouldCheckGlobal {
+                let globalResult = try repository.pruneGlobalByteCapAndMarkHistoryPartial(
+                    maxBytes: globalRetentionByteCap,
+                    protectedSurfaceID: surfaceID
+                )
+                if globalResult.remainsOverBudget,
+                   queueState.beginGlobalRetentionMaintenanceIfNeeded() {
+                    scheduleGlobalRetentionMaintenance(
+                        repository: repository,
+                        surfaceID: surfaceID,
+                        queue: historyQueue,
+                        queueState: queueState,
+                        maxBytes: globalRetentionByteCap
+                    )
+                }
+            }
+        } catch {
+            repository.invalidateTerminalGlobalRetentionEstimate()
+            queueState.recordRetentionCheckFailure()
+            NSLog(
+                "RemoteCode terminal history retention maintenance failed surface=%@ error=%@",
+                surfaceID,
+                String(describing: error)
+            )
+            if isRetryableDatabaseLock(error),
+               queueState.beginRetentionMaintenanceIfNeeded() {
+                scheduleRetentionMaintenance(
+                    repository: repository,
+                    surfaceID: surfaceID,
+                    queue: historyQueue,
+                    queueState: queueState,
+                    writerGeneration: writerGeneration,
+                    minimumNextChunkIndex: minimumNextChunkIndex,
+                    operationStartedAt: Date(),
+                    attempt: 0,
+                    onRecovered: onRecovered
+                )
+            }
+            return RetentionCheckOutcome(
+                truncated: false,
+                maintenanceFailed: true
+            )
+        }
+
+        if shouldCheckGlobal { queueState.finishRetentionCheck() }
+        return RetentionCheckOutcome(
+            truncated: truncated,
+            maintenanceFailed: false
+        )
     }
 
     private nonisolated static func reconcileUnresolvedFailure(
@@ -2046,6 +2177,7 @@ final class TerminalHistoryCoordinator {
                     completion?(!result.remainsOverBudget)
                 }
             } catch {
+                repository.invalidateTerminalGlobalRetentionEstimate()
                 queueState.finishGlobalRetentionMaintenance()
                 completion?(false)
                 NSLog(
@@ -2267,6 +2399,8 @@ final class TerminalHistoryCoordinator {
             durablePartialState = nil
             backlogOverflowed = false
             queueState.resetAfterAcknowledgedClear()
+            bytesSinceRetentionCheck = effectiveRetentionCheckInterval
+            needsExplicitRetentionCheck = false
             acceptsWrites = !finalFlushScheduled && !finalDeleteScheduled
 
             if finalDeleteScheduled {
@@ -2323,6 +2457,7 @@ final class TerminalHistoryCoordinator {
         if let barrier {
             if clearSucceeded {
                 flushReadyPending()
+                schedulePendingRetentionCheckIfNeeded()
                 scheduleBarrier(
                     barrier.state,
                     failureGeneration: queueState.currentFailureGeneration(),
@@ -2342,6 +2477,9 @@ final class TerminalHistoryCoordinator {
         deferredBarrier = nil
 
         if succeeded {
+            if barrier != nil {
+                schedulePendingRetentionCheckIfNeeded()
+            }
             for operation in operations {
                 scheduleDeferredOperation(operation)
             }

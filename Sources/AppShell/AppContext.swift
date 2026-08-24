@@ -365,6 +365,7 @@ public final class AppContext {
         appSupportDirectory: appSupportDirectory,
         orchestrationRuntime: orchestrationRuntime
     )
+    lazy var botDraftPersistenceAuthority = BotDraftPersistenceAuthority()
     private var tokenSaverCodexAdapter: CodexAppServerAdapter
     public var router: AppCommandRouter! {
         didSet {
@@ -395,6 +396,18 @@ public final class AppContext {
     public var socketServer: UnixSocketServer?
     private let tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing
     private var tokenSaverAccountUsageRefreshTask: Task<Void, Never>?
+    private var tokenSaverPeriodicGrokAccountUsageRefreshTask: Task<Void, Never>?
+    private var tokenSaverGrokAccountUsageRefreshGeneration: UInt64 = 0
+    private struct TokenSaverPeriodicAccountUsageCycle {
+        let id: UInt64
+        var grokFinished = false
+        var grokSucceeded = false
+        var otherProvidersFinished = false
+        var otherProvidersSucceeded = false
+        var reconciledMiss = false
+    }
+    private var tokenSaverPeriodicAccountUsageCycleID: UInt64 = 0
+    private var tokenSaverPeriodicAccountUsageCycle: TokenSaverPeriodicAccountUsageCycle?
     private var tokenSaverUsageNotificationTask: Task<Void, Never>?
     private var tokenSaverLastUsageNotificationAt: Date = .distantPast
     // PERF: daily economy upsert formats updatedAt. ISO8601DateFormatter
@@ -1859,7 +1872,7 @@ public final class AppContext {
     func prepareForApplicationTermination() -> [Task<Void, Never>] {
         isTerminating = true
         flushPendingTokenSaverUsage()
-        flushWriterQueue()
+        flushEventPersistence()
         return cancelAllQueueDrainWaiters()
     }
 
@@ -2850,7 +2863,7 @@ public final class AppContext {
         }
     }
 
-    public func refreshTokenSaverAccountUsage(reason: String) {
+    public func refreshTokenSaverAccountUsage(reason: String, includeGrok: Bool = true) {
         guard PrivateAccountSessionStore(repo: settingsRepo).load() != nil else {
             publishTokenSaverAccountUsageRefresh(state: "skipped", reason: reason, detail: "signed_out")
             return
@@ -2859,6 +2872,19 @@ public final class AppContext {
             publishTokenSaverAccountUsageRefresh(state: "skipped", reason: reason, detail: "busy")
             return
         }
+        let grokRefreshGeneration: UInt64?
+        if includeGrok {
+            tokenSaverGrokAccountUsageRefreshGeneration &+= 1
+            grokRefreshGeneration = tokenSaverGrokAccountUsageRefreshGeneration
+            tokenSaverPeriodicAccountUsageCycle = nil
+        } else {
+            grokRefreshGeneration = nil
+            if var cycle = tokenSaverPeriodicAccountUsageCycle {
+                cycle.otherProvidersFinished = false
+                tokenSaverPeriodicAccountUsageCycle = cycle
+            }
+        }
+        let periodicCycleID = includeGrok ? nil : tokenSaverPeriodicAccountUsageCycle?.id
         tokenSaverAccountUsageRefreshCount += 1
         publishTokenSaverAccountUsageRefresh(state: "started", reason: reason, detail: nil)
 
@@ -2872,6 +2898,7 @@ public final class AppContext {
             grokAuthFileURL: Self.defaultGrokAuthFileURL,
             claudeAuthFileURL: Self.defaultClaudeAuthFileURL,
             codexAuthFileURL: Self.defaultCodexAuthFileURL,
+            includeGrok: includeGrok,
             cwd: state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
             environment: [:]
         )
@@ -2881,7 +2908,10 @@ public final class AppContext {
             let usages = await Self.refreshAccountUsageWithTimeout(refresher: refresher, request: request)
             await MainActor.run {
                 guard let self else { return }
-                for usage in usages {
+                let acceptsGrok = includeGrok
+                    && grokRefreshGeneration == self.tokenSaverGrokAccountUsageRefreshGeneration
+                let acceptedUsages = usages.filter { $0.provider != .grok || acceptsGrok }
+                for usage in acceptedUsages {
                     self.recordTokenSaverAccountUsage(usage)
                     EventBus.shared.publish(kind: "agent.account.usage",
                         payload: .object(Self.accountUsagePayload(reason: reason, usage: usage)))
@@ -2894,13 +2924,13 @@ public final class AppContext {
                 // paint the purple ring as 0% while credits are mid-window.
                 // Full empty/timeout leaves the cache alone — that is noise, not
                 // proof every provider is inactive.
-                if !usages.isEmpty {
+                if !acceptedUsages.isEmpty {
                     let store = TokenSaverUsageStore(appSupportDirectory: self.appSupportDirectory)
                     let existing = store.load().providers
                     let toClear = TokenSaverUsageStore.providersToClearAfterPartialAccountUsageRefresh(
-                        returned: usages.map(\.provider),
+                        returned: acceptedUsages.map(\.provider),
                         existing: existing
-                    )
+                    ).filter { acceptsGrok || $0 != .grok }
                     for provider in toClear {
                         self.clearTokenSaverAccountUsagePercentages(provider)
                     }
@@ -2908,13 +2938,59 @@ public final class AppContext {
                 self.publishTokenSaverAccountUsageRefresh(
                     state: "finished",
                     reason: reason,
-                    detail: usages.isEmpty ? "empty" : nil,
-                    providers: usages.map(\.provider.rawValue)
+                    detail: acceptedUsages.isEmpty ? "empty" : nil,
+                    providers: acceptedUsages.map(\.provider.rawValue)
                 )
+                if let periodicCycleID,
+                   self.tokenSaverPeriodicAccountUsageCycle?.id == periodicCycleID {
+                    self.tokenSaverPeriodicAccountUsageCycle?.otherProvidersFinished = true
+                    if !acceptedUsages.isEmpty {
+                        self.tokenSaverPeriodicAccountUsageCycle?.otherProvidersSucceeded = true
+                    }
+                    _ = self.reconcilePeriodicGrokMissIfReady(cycleID: periodicCycleID)
+                }
                 self.publishTokenSaverWidgetDigestFromDisk(isRefreshing: false)
                 self.tokenSaverAccountUsageRefreshTask = nil
             }
         }
+    }
+
+    /// Keep the Grok ring fresh even when Codex/Claude are slow, without
+    /// duplicating the Grok credits request inside the full refresh.
+    public func refreshPeriodicTokenSaverAccountUsage() {
+        let cycleFinished = tokenSaverPeriodicAccountUsageCycle.map {
+            $0.grokFinished && $0.otherProvidersFinished
+        } ?? true
+        if tokenSaverPeriodicGrokAccountUsageRefreshTask == nil, cycleFinished {
+            tokenSaverPeriodicAccountUsageCycleID &+= 1
+            tokenSaverPeriodicAccountUsageCycle = TokenSaverPeriodicAccountUsageCycle(
+                id: tokenSaverPeriodicAccountUsageCycleID
+            )
+        }
+        refreshGrokTokenSaverAccountUsage(reason: "periodic", coalescePeriodic: true)
+        refreshTokenSaverAccountUsage(reason: "periodic", includeGrok: false)
+    }
+
+    @discardableResult
+    private func reconcilePeriodicGrokMissIfReady(cycleID: UInt64) -> Bool {
+        guard var cycle = tokenSaverPeriodicAccountUsageCycle,
+              cycle.id == cycleID,
+              cycle.grokFinished,
+              !cycle.grokSucceeded,
+              cycle.otherProvidersSucceeded,
+              !cycle.reconciledMiss else { return false }
+        let store = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory)
+        let shouldClearGrok = TokenSaverUsageStore.providersToClearAfterPartialAccountUsageRefresh(
+            returned: [],
+            existing: store.load().providers,
+            managed: [.grok]
+        ).contains(.grok)
+        if shouldClearGrok {
+            clearTokenSaverAccountUsagePercentages(.grok)
+        }
+        cycle.reconciledMiss = true
+        tokenSaverPeriodicAccountUsageCycle = cycle
+        return shouldClearGrok
     }
 
     private func clearTokenSaverAccountUsagePercentages(_ provider: AgentProvider) {
@@ -2941,14 +3017,29 @@ public final class AppContext {
     ///   - reason: telemetry label (`run_finished`, tests, …)
     ///   - billingLogURL: override for tests; default is the user billing log.
     ///     When set, the live credits API is skipped so tests stay offline.
+    ///   - coalescePeriodic: coalesce only timer ticks; run-finished refreshes
+    ///     remain immediate so a new local billing record is never delayed.
     public func refreshGrokTokenSaverAccountUsage(
         reason: String,
-        billingLogURL: URL? = nil
+        billingLogURL: URL? = nil,
+        coalescePeriodic: Bool = false
     ) {
         guard PrivateAccountSessionStore(repo: settingsRepo).load() != nil else {
             publishTokenSaverAccountUsageRefresh(state: "skipped", reason: reason, detail: "signed_out")
             return
         }
+        if coalescePeriodic, tokenSaverPeriodicGrokAccountUsageRefreshTask != nil {
+            publishTokenSaverAccountUsageRefresh(state: "skipped", reason: reason, detail: "grok_busy")
+            return
+        }
+        if !coalescePeriodic {
+            tokenSaverPeriodicAccountUsageCycle = nil
+        } else if var cycle = tokenSaverPeriodicAccountUsageCycle {
+            cycle.grokFinished = false
+            tokenSaverPeriodicAccountUsageCycle = cycle
+        }
+        tokenSaverGrokAccountUsageRefreshGeneration &+= 1
+        let refreshGeneration = tokenSaverGrokAccountUsageRefreshGeneration
         let logURL = billingLogURL
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".grok/logs/unified.jsonl")
@@ -2961,12 +3052,22 @@ public final class AppContext {
         let detail = billingLogURL == nil ? "grok_credits_api" : "grok_billing_log"
         publishTokenSaverAccountUsageRefresh(state: "started", reason: reason, detail: detail)
         let refresher = tokenSaverAccountUsageRefresher
-        Task { [weak self] in
+        let task = Task { [weak self] in
             let usage = await refresher.grokAccountUsage(request)
             await MainActor.run {
                 guard let self else { return }
+                defer {
+                    if coalescePeriodic {
+                        self.tokenSaverPeriodicGrokAccountUsageRefreshTask = nil
+                    }
+                }
+                guard refreshGeneration == self.tokenSaverGrokAccountUsageRefreshGeneration else {
+                    return
+                }
+                var shouldPublishWidgetDigest = false
                 if let usage {
                     self.recordTokenSaverAccountUsage(usage)
+                    shouldPublishWidgetDigest = true
                     EventBus.shared.publish(
                         kind: "agent.account.usage",
                         payload: .object(Self.accountUsagePayload(reason: reason, usage: usage))
@@ -2985,7 +3086,22 @@ public final class AppContext {
                         providers: []
                     )
                 }
+                if coalescePeriodic,
+                   var cycle = self.tokenSaverPeriodicAccountUsageCycle {
+                    cycle.grokFinished = true
+                    cycle.grokSucceeded = cycle.grokSucceeded || usage != nil
+                    self.tokenSaverPeriodicAccountUsageCycle = cycle
+                    shouldPublishWidgetDigest = self.reconcilePeriodicGrokMissIfReady(cycleID: cycle.id)
+                        || shouldPublishWidgetDigest
+                }
+                if shouldPublishWidgetDigest,
+                   !coalescePeriodic || self.tokenSaverAccountUsageRefreshTask == nil {
+                    self.publishTokenSaverWidgetDigestFromDisk(isRefreshing: false)
+                }
             }
+        }
+        if coalescePeriodic {
+            tokenSaverPeriodicGrokAccountUsageRefreshTask = task
         }
     }
 
@@ -5553,29 +5669,20 @@ public final class AppContext {
         return appendCount > 0 && appendCount % n == 0
     }
 
-    /// Wire EventBus.shared.persister to append to the event log off-main,
-    /// pruning on a counter cadence rather than on every append.
-    /// In production AppDelegate overrides this after init; in tests (no
-    /// AppDelegate) this persister is the active one and exercises the queue.
-    ///
-    /// The append counter is a local closure variable guarded by the serial
-    /// backgroundWriterQueue, so no lock or @MainActor access is needed.
-    public func wireBackgroundPersister() {
+    /// Wire an EventBus persister to encode and append on the serial writer
+    /// queue. Serial submission preserves event sequence while keeping payload
+    /// encoding and SQLite transactions off the producer/delivery path.
+    public func wireBackgroundPersister(eventBus: EventBus = .shared) {
         let log = eventLog
         let queue = backgroundWriterQueue
-        // Counter is local to the closure; only ever mutated on `queue` (serial).
-        var appendCount = 0
-        EventBus.shared.persister = { ev in
+        eventBus.persistenceCommitFence = {
+            queue.sync {}
+        }
+        eventBus.persister = { ev in
             guard AppDelegate.shouldPersistEvent(ev) else { return }
-            let json = EventBus.encodePayloadForPersistence(ev.payload)
             queue.async {
+                let json = EventBus.encodePayloadForPersistence(ev.payload)
                 _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
-                appendCount += 1
-                // shouldPrune gate: in future, move the bounded-log DELETE out of
-                // EventLogRepository.append and call it here when shouldPrune returns
-                // true. The counter is live now so the cadence logic is in place.
-                _ = AppContext.shouldPrune(appendCount: appendCount,
-                                           interval: AppContext.eventLogPruneInterval)
             }
         }
     }
@@ -5640,14 +5747,18 @@ public final class AppContext {
         backgroundWriterQueue.sync {}
     }
 
+    /// Drain EventBus delivery first, then its serial persistence queue. The
+    /// ordering closes the graceful-exit race where an accepted publish had not
+    /// submitted its writer work when a plain writer barrier was inserted.
+    public func flushEventPersistence(eventBus: EventBus = .shared) {
+        eventBus.flushPersistenceSubmissions()
+        flushWriterQueue()
+    }
+
     @discardableResult
     public func reapIdleProviderSessions(now: Date = Date(), idleAge: TimeInterval = 6 * 60 * 60) throws -> ProviderSessionReaperResult {
         let cutoff = now.addingTimeInterval(-idleAge)
-        let activeThreadIds = Set(
-            try threadRepo.list().filter { thread in
-                thread.status == .running
-            }.map(\.id)
-        )
+        let activeThreadIds = try threadRepo.runningThreadIds()
         let reaper = ProviderSessionReaper(
             sessionRepo: providerSessionRuntimeRepo,
             pendingCallbackRepo: providerPendingCallbackRepo

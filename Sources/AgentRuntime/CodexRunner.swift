@@ -527,16 +527,35 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
 /// trailing partial is held until the next read (or `flush()` at EOF).
 final class LineBuffer {
     private var buffer = Data()
+    /// Bytes in the trailing partial line that were already checked for a
+    /// newline. Pipe deliveries commonly split one long record into many small
+    /// chunks; resuming from this offset avoids rescanning the whole partial on
+    /// every delivery.
+    private var scannedByteCount = 0
 
     /// Append a chunk, return any now-complete lines (trimmed, non-empty).
     func take(_ data: Data) -> [String] {
         buffer.append(data)
         var lines: [String] = []
-        while let nl = buffer.firstIndex(of: 0x0A) {
-            let lineData = buffer.subdata(in: buffer.startIndex..<nl)
-            buffer.removeSubrange(buffer.startIndex...nl)
+        var lineStart = buffer.startIndex
+        var searchStart = buffer.index(
+            buffer.startIndex,
+            offsetBy: min(scannedByteCount, buffer.count)
+        )
+        while searchStart < buffer.endIndex,
+              let nl = buffer[searchStart...].firstIndex(of: 0x0A) {
+            let lineData = buffer.subdata(in: lineStart..<nl)
             if let s = Self.decode(lineData) { lines.append(s) }
+            searchStart = buffer.index(after: nl)
+            lineStart = searchStart
         }
+        if lineStart != buffer.startIndex {
+            buffer.removeSubrange(buffer.startIndex..<lineStart)
+        }
+        // The retained suffix has no newline; only bytes appended by the next
+        // delivery need to be searched. Complete-line prefixes are removed once
+        // per take instead of once per line.
+        scannedByteCount = buffer.count
         return lines
     }
 
@@ -545,6 +564,7 @@ final class LineBuffer {
         guard !buffer.isEmpty else { return [] }
         let rest = buffer
         buffer.removeAll()
+        scannedByteCount = 0
         return Self.decode(rest).map { [$0] } ?? []
     }
 

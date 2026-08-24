@@ -363,6 +363,11 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
             completedAt: Date(timeIntervalSince1970: 1_700_000_050)
         )
         try repo.upsert(checkpoint)
+        XCTAssertLessThanOrEqual(
+            repo.fileSummaryEncodedElementCountForTesting,
+            AgentTurnCheckpointListWireProjection.maxFiles,
+            "capture-time bounding must encode each admitted file at most once"
+        )
 
         let lengths = try db.prepare("""
             SELECT length(files_json), length(files_summary_json), files_summary_truncated

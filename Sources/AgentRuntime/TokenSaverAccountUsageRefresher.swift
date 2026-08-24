@@ -31,6 +31,10 @@ public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
     /// When set, Codex prefers `GET …/wham/usage`. Tests leave it nil.
     public let codexAuthFileURL: URL?
     public let codexUsageAPIURL: URL?
+    /// Periodic refreshes run a dedicated Grok probe first so it cannot be
+    /// starved by slower Codex/Claude work. Those full refreshes exclude Grok
+    /// to avoid issuing the same credits request twice in one tick.
+    public let includeGrok: Bool
     public let cwd: String
     public let environment: [String: String]
 
@@ -45,6 +49,7 @@ public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
         claudeUsageAPIURL: URL? = nil,
         codexAuthFileURL: URL? = nil,
         codexUsageAPIURL: URL? = nil,
+        includeGrok: Bool = true,
         cwd: String = NSHomeDirectory(),
         environment: [String: String] = [:]
     ) {
@@ -58,6 +63,7 @@ public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
         self.claudeUsageAPIURL = claudeUsageAPIURL
         self.codexAuthFileURL = codexAuthFileURL
         self.codexUsageAPIURL = codexUsageAPIURL
+        self.includeGrok = includeGrok
         self.cwd = cwd
         self.environment = environment
     }
@@ -714,8 +720,13 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     public func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
         async let codex = withProviderTimeout { await self.fetchCodexUsage(request) }
         async let claude = withProviderTimeout { await self.fetchClaudeUsage(request) }
-        async let grok = withProviderTimeout { await self.fetchGrokUsage(request) }
-        return await [codex, claude, grok]
+        if request.includeGrok {
+            async let grok = withProviderTimeout { await self.fetchGrokUsage(request) }
+            return await [codex, claude, grok]
+                .compactMap { $0 }
+                .sorted { $0.provider.rawValue < $1.provider.rawValue }
+        }
+        return await [codex, claude]
             .compactMap { $0 }
             .sorted { $0.provider.rawValue < $1.provider.rawValue }
     }

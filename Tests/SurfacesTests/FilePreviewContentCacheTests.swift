@@ -71,6 +71,25 @@ final class FilePreviewContentCacheTests: XCTestCase {
             "Evicted path must return nil -- retained cache entry would display stale content")
     }
 
+    func test_textCache_removeAll_releasesEveryRetainedPayload() {
+        // WHY: hidden and closed previews keep only lightweight scroll state. Text and
+        // its UTF-16 line index must both leave the cache, including entries for paths
+        // visited earlier by the same surface.
+        var cache = FilePreviewTextCache()
+        cache.store(path: "/first.txt", text: "one\ntwo\n")
+        cache.store(path: "/second.txt", text: "A\u{1F600}\nB")
+        XCTAssertEqual(cache.entryCountForTesting, 2)
+        XCTAssertGreaterThan(cache.retainedPayloadBytesForTesting, 0)
+
+        cache.removeAll()
+
+        XCTAssertEqual(cache.entryCountForTesting, 0)
+        XCTAssertEqual(cache.retainedPayloadBytesForTesting, 0,
+            "purging a hidden preview must release both String bytes and line-index offsets")
+        XCTAssertNil(cache.text(for: "/first.txt"))
+        XCTAssertNil(cache.text(for: "/second.txt"))
+    }
+
     // MARK: - FilePreviewTextCache: value semantics
 
     func test_textCache_hasValueSemantics() {
@@ -173,6 +192,74 @@ final class FilePreviewContentCacheTests: XCTestCase {
             XCTAssertNil(cache.document(for: url.path),
                 "Evicted path must return nil -- retained doc would serve stale PDF content")
         }
+    }
+
+    func test_pdfCache_removeAll_releasesDocumentOwnership() {
+        // WHY: PDFDocument can retain a parsed document graph much larger than the
+        // source file. Clearing a hidden preview must relinquish the cache's strong
+        // ownership rather than merely detaching its PDFView.
+        let cache = FilePreviewPDFCache()
+        weak var releasedDocument: PDFDocument?
+        autoreleasepool {
+            let document = PDFDocument()
+            releasedDocument = document
+            cache.store(path: "/large.pdf", document: document)
+        }
+        XCTAssertNotNil(releasedDocument, "the cache must own the PDF before purge")
+
+        cache.removeAll()
+
+        XCTAssertEqual(cache.entryCountForTesting, 0)
+        XCTAssertNil(releasedDocument, "removeAll must release the cached PDFDocument graph")
+    }
+
+    /// Conservative retained-payload proxy for the shipped cache representation. The
+    /// old hide path was a no-op, while the candidate purge drops the cache's sole
+    /// ownership of both a 512 KiB String and its ~50k-entry UInt32 line index. One
+    /// warmup precedes five recorded samples; allocator/dictionary overhead is excluded.
+    func test_microbench_hiddenPurge_releasesDirectTextPayload() {
+        let bytes = 512 * 1024
+        let newlineCount = 50_000
+        let expectedPayloadBytes = bytes + (newlineCount + 1) * MemoryLayout<UInt32>.stride
+        let warmup = 1
+        let samples = 5
+        var legacyRetainedRaw: [Int] = []
+        var purgedRetainedRaw: [Int] = []
+
+        func makeSoleOwnerCache() -> FilePreviewTextCache {
+            let prefix = String(repeating: "123456789\n", count: newlineCount)
+            let text = prefix + String(repeating: "x", count: bytes - prefix.utf8.count)
+            XCTAssertEqual(text.utf8.count, bytes, "fixture must be exactly 512 KiB")
+            var cache = FilePreviewTextCache()
+            cache.store(path: "/fixture.txt", text: text)
+            return cache
+        }
+
+        for iteration in 0..<(warmup + samples) {
+            var cache = makeSoleOwnerCache()
+            let legacyRetained = cache.retainedPayloadBytesForTesting
+            cache.removeAll()
+            let purgedRetained = cache.retainedPayloadBytesForTesting
+            if iteration >= warmup {
+                legacyRetainedRaw.append(legacyRetained)
+                purgedRetainedRaw.append(purgedRetained)
+            }
+        }
+
+        let legacyMedian = legacyRetainedRaw.sorted()[samples / 2]
+        let purgedMedian = purgedRetainedRaw.sorted()[samples / 2]
+        let improvement = Double(legacyMedian - purgedMedian) / Double(legacyMedian) * 100
+        NSLog(
+            "[perf-proof] filePreviewHiddenCache legacy_retained_bytes=%d purged_retained_bytes=%d improvement_pct=%.2f raw_legacy=%@ raw_purged=%@",
+            legacyMedian, purgedMedian, improvement,
+            String(describing: legacyRetainedRaw), String(describing: purgedRetainedRaw)
+        )
+
+        XCTAssertEqual(legacyRetainedRaw, Array(repeating: expectedPayloadBytes, count: samples),
+            "proxy must count the conservative String bytes plus UInt32 line-index payload")
+        XCTAssertEqual(purgedRetainedRaw, Array(repeating: 0, count: samples))
+        XCTAssertGreaterThan(improvement, 5.0,
+            "hidden-preview purge must reduce directly attributable retained payload by >5%")
     }
 
     // MARK: - Helpers

@@ -707,20 +707,29 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     /// Coalesce per key: LWW for summaries/geometry; **concatenate** for
     /// `agent.item.delta` (C-16 — LWW would drop tokens and corrupt text).
     /// Non-keyed frames keep arrival order.
-    static func coalesceApplicationFrames(_ frames: [Data]) -> [Data] {
+    static func coalesceApplicationFrames(
+        _ frames: [Data],
+        onParse: (() -> Void)? = nil,
+        onEncode: (() -> Void)? = nil
+    ) -> [Data] {
         guard !frames.isEmpty else { return [] }
         var result: [Data] = []
         var keySlots: [String: Int] = [:]
+        var deltaFramesBySlot: [Int: [Data]] = [:]
 
         for frame in frames {
-            guard let key = coalescingKey(for: frame) else {
+            onParse?()
+            let object = try? JSONSerialization.jsonObject(with: frame) as? [String: Any]
+            guard let key = coalescingKey(object: object) else {
                 result.append(frame)
                 continue
             }
             if let index = keySlots[key] {
-                if key.hasPrefix("agent.item.delta:"),
-                   let merged = WebSocketEventBatcher.mergeAgentItemDeltaFrames(result[index], frame) {
-                    result[index] = merged
+                if key.hasPrefix("agent.item.delta:") {
+                    if deltaFramesBySlot[index] == nil {
+                        deltaFramesBySlot[index] = [result[index]]
+                    }
+                    deltaFramesBySlot[index]?.append(frame)
                 } else {
                     result[index] = frame
                 }
@@ -728,6 +737,35 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
                 keySlots[key] = result.count
                 result.append(frame)
             }
+        }
+
+        // Pressure backlogs can contain hundreds of deltas for one item. Merge
+        // each keyed run once so parsing, concatenation, and encoding stay O(n)
+        // instead of repeatedly rewriting a growing JSON frame.
+        for (index, deltaFrames) in deltaFramesBySlot {
+            let linear = WebSocketEventBatcher.mergeAgentItemDeltasInOrder(
+                deltaFrames,
+                onParse: onParse,
+                onEncode: onEncode
+            )
+            if linear.merged.count == 1, let merged = linear.merged.first {
+                result[index] = merged
+                continue
+            }
+
+            // Same coalescing keys carry the same thread/item/turn identity, so
+            // this is reachable only if Foundation cannot encode a parsed frame.
+            // Preserve the prior pairwise behavior in that failure mode.
+            var fallback = deltaFrames[0]
+            for frame in deltaFrames.dropFirst() {
+                fallback = WebSocketEventBatcher.mergeAgentItemDeltaFrames(
+                    fallback,
+                    frame,
+                    onParse: onParse,
+                    onEncode: onEncode
+                ) ?? frame
+            }
+            result[index] = fallback
         }
         return result
     }

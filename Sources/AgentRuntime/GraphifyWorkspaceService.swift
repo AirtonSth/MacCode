@@ -31,7 +31,16 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     private var stickyByWorkspace: [String: String] = [:]
     private var schedules: [String: RefreshSchedule] = [:]
     private var watchers: [String: GraphifyCheckoutWatcher] = [:]
-    private var debounceWork: [String: DispatchWorkItem] = [:]
+    private struct PendingDebounce {
+        let token: UInt64
+        let work: DispatchWorkItem
+    }
+    private var debounceWork: [String: PendingDebounce] = [:]
+    private var nextDebounceToken: UInt64 = 0
+    /// Linearization gate for feature OFF. Public settings are updated before
+    /// `stopWatchingAll`; this lock-owned bit prevents already-admitted work
+    /// from installing a watcher or claiming a rebuild after stop returns.
+    private var lifecycleAdmissionOpen = true
     private var binaryInstallAttempted = false
     /// Process-wide gate: at most one graphify CLI child at a time. Per-checkout
     /// `inFlight` already coalesces same-root work; this stops two large monorepos
@@ -70,6 +79,23 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     public var headProbe: (@Sendable (String) -> String?)?
     /// Test seam: resolve display-root → checkout without blocking Process I/O.
     public var checkoutIdentityProbe: (@Sendable (String) -> GraphifyCheckout?)?
+
+    /// Deterministic lifecycle seam used by the Graphify watcher regression and
+    /// resource benchmark. Counts come from the production-owned registries.
+    var lifecycleSnapshotForTesting: (watchers: Int, schedules: Int, debounceTasks: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (watchers.count, schedules.count, debounceWork.count)
+    }
+
+    /// Pauses after the public feature gate but before the scheduler claim so
+    /// tests can reproduce an OFF racing an already-admitted FSEvents callback.
+    var beforeMarkDirtyLockForTesting: (@Sendable () -> Void)?
+    /// Pauses before watcher registration so tests can reproduce a refresh
+    /// admitted immediately before feature OFF tears the lifecycle down.
+    var beforeWatchCheckoutLockForTesting: (@Sendable () -> Void)?
+    /// Pauses before a cold fingerprint warms scheduler state so tests can
+    /// reproduce OFF landing during the unlocked verify probes.
+    var beforeVerifyScheduleWarmLockForTesting: (@Sendable () -> Void)?
 
     private struct RefreshSchedule {
         var dirtyGeneration: UInt64 = 0
@@ -180,6 +206,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         // Fail-open when Graphify/Token Saver is off: never probe or ensure.
         return enabled
             && autoEnsure
+            && lifecycleAdmissionOpen
             && !pressurePauseEnsureAndWatch
             && pressureUnpauseGeneration == unpauseGeneration
     }
@@ -320,7 +347,12 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         // Warm in-memory schedule from on-disk fingerprint so cold starts don't
         // look "never built" to the scheduler.
         if schedule == nil, let fp = loadFingerprint(checkout) {
+            beforeVerifyScheduleWarmLockForTesting?()
             lock.lock()
+            guard enabled, autoEnsure, lifecycleAdmissionOpen else {
+                lock.unlock()
+                return .fresh
+            }
             var s = schedules[checkout.scheduleID] ?? RefreshSchedule()
             s.displayRoot = checkout.displayRoot
             s.lastSuccessfulUpdate = Date(timeIntervalSince1970: fp.builtAt)
@@ -341,6 +373,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         guard enabled, autoEnsure else { return }
         // Pressure pause: record dirty only — no watch install, verify probes, or ensure.
         lock.lock()
+        guard enabled, autoEnsure, lifecycleAdmissionOpen else {
+            lock.unlock()
+            return
+        }
         let pressurePaused = pressurePauseEnsureAndWatch
         if pressurePaused {
             var schedule = schedules[checkout.scheduleID] ?? RefreshSchedule()
@@ -353,7 +389,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         }
         lock.unlock()
 
-        watchCheckout(checkout)
+        guard watchCheckout(checkout) else { return }
 
         let status = verify(checkout)
         let needs: Bool
@@ -368,6 +404,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         // Even when "fresh", max-age already folded into verify → stale.
 
         lock.lock()
+        guard enabled, autoEnsure, lifecycleAdmissionOpen else {
+            lock.unlock()
+            return
+        }
         var schedule = schedules[checkout.scheduleID] ?? RefreshSchedule()
         schedule.displayRoot = checkout.displayRoot
         if needs || force {
@@ -384,7 +424,14 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     public func markDirtyFromFilesystem(checkout: GraphifyCheckout) {
         guard enabled, autoEnsure else { return }
+        beforeMarkDirtyLockForTesting?()
         lock.lock()
+        // Feature OFF can race a callback that passed the unlocked fast gate.
+        // Claim schedule + debounce under the same lock as stopWatchingAll.
+        guard enabled, autoEnsure, lifecycleAdmissionOpen else {
+            lock.unlock()
+            return
+        }
         var schedule = schedules[checkout.scheduleID] ?? RefreshSchedule()
         schedule.displayRoot = checkout.displayRoot
         schedule.dirtyGeneration &+= 1
@@ -397,18 +444,35 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             return
         }
         schedules[checkout.scheduleID] = schedule
-        lock.unlock()
 
         // Trailing debounce: storms collapse into one delayed start.
         let id = checkout.scheduleID
-        lock.lock()
-        debounceWork[id]?.cancel()
+        debounceWork[id]?.work.cancel()
+        nextDebounceToken &+= 1
+        let token = nextDebounceToken
         let work = DispatchWorkItem { [weak self] in
-            self?.startEnsureIfNeeded(checkout: checkout)
+            self?.fireDebouncedEnsure(checkout: checkout, token: token)
         }
-        debounceWork[id] = work
+        debounceWork[id] = PendingDebounce(token: token, work: work)
         lock.unlock()
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + fseventsDebounce, execute: work)
+    }
+
+    private func fireDebouncedEnsure(checkout: GraphifyCheckout, token: UInt64) {
+        lock.lock()
+        guard debounceWork[checkout.scheduleID]?.token == token else {
+            lock.unlock()
+            return
+        }
+        debounceWork.removeValue(forKey: checkout.scheduleID)
+        let shouldStart = enabled
+            && autoEnsure
+            && lifecycleAdmissionOpen
+            && !pressurePauseEnsureAndWatch
+        lock.unlock()
+        if shouldStart {
+            startEnsureIfNeeded(checkout: checkout)
+        }
     }
 
     private func isHeadStale(checkout: GraphifyCheckout) -> Bool {
@@ -457,6 +521,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         guard enabled, autoEnsure else { return }
         // S7: pressure may pause ensure without disabling the feature gate.
         lock.lock()
+        guard enabled, autoEnsure, lifecycleAdmissionOpen else {
+            lock.unlock()
+            return
+        }
         let pressurePaused = pressurePauseEnsureAndWatch
         lock.unlock()
         if pressurePaused { return }
@@ -469,7 +537,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         lock.lock()
         // Revalidate gates under the same lock as inFlight claim. Token Saver /
         // Graphify may be disabled during unlocked probes above — fail open.
-        if !enabled || !autoEnsure {
+        if !enabled || !autoEnsure || !lifecycleAdmissionOpen {
             lock.unlock()
             return
         }
@@ -1019,12 +1087,18 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     // MARK: FSEvents
 
-    public func watchCheckout(_ checkout: GraphifyCheckout) {
+    @discardableResult
+    public func watchCheckout(_ checkout: GraphifyCheckout) -> Bool {
         let id = checkout.scheduleID
+        beforeWatchCheckoutLockForTesting?()
         lock.lock()
+        guard enabled, autoEnsure, lifecycleAdmissionOpen else {
+            lock.unlock()
+            return false
+        }
         if watchers[id] != nil {
             lock.unlock()
-            return
+            return true
         }
         // Ignore ArtifactRoot (and nested paths) so host graph writes never loop FSEvents.
         // Also ignore in-repo graphify-out via noise filter in the watcher.
@@ -1036,17 +1110,22 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             self?.markDirtyFromFilesystem(checkout: checkout)
         }
         watchers[id] = watcher
-        lock.unlock()
+        // Start while holding the lifecycle lock: stopWatchingAll cannot remove
+        // this entry and return before its stream has actually started.
         watcher.start()
+        lock.unlock()
+        return true
     }
 
     public func stopWatchingAll() {
-        // S9: cancel any in-flight rebuild before tearing down watchers so a
-        // late Process completion cannot mark the graph fresh after Token Saver off.
-        cancelInFlightRebuildIfNeeded()
         lock.lock()
+        // Close admission before cancellation so no refresh can claim a new
+        // watcher/rebuild in the gap after cancel observes an idle scheduler.
+        lifecycleAdmissionOpen = false
         let all = watchers
         watchers.removeAll()
+        let pendingDebounces = debounceWork.values.map(\.work)
+        debounceWork.removeAll()
         // Mark every in-flight schedule cancelled so completion cannot publish fresh.
         for id in Array(schedules.keys) {
             guard var s = schedules[id] else { continue }
@@ -1055,6 +1134,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             schedules[id] = s
         }
         lock.unlock()
+        // S9: cancel any in-flight rebuild before stopping streams so a late
+        // Process completion cannot mark the graph fresh after Token Saver off.
+        cancelInFlightRebuildIfNeeded()
+        for work in pendingDebounces { work.cancel() }
         for w in all.values { w.stop() }
     }
 
@@ -1107,6 +1190,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         let roots: [String]
         let unpauseGeneration: UInt64
         lock.lock()
+        lifecycleAdmissionOpen = true
         // Do not clear cancellation while an old process may still complete;
         // only clear when nothing is in flight.
         let anyInFlight = globalCLIInFlight

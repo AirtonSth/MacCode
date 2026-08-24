@@ -120,6 +120,10 @@ public final class EventBus: @unchecked Sendable {
     private var clock: @Sendable () -> Date
 
     public var persister: ((Event) -> Void)?
+    /// Optional durability fence for persisters that submit work asynchronously.
+    /// `commitPersistedEvents` invokes it from the serialized delivery lane so a
+    /// receipt cannot physically overtake an earlier normal event.
+    public var persistenceCommitFence: (() -> Void)?
     public var shouldRetainRecentEvent: ((Event) -> Bool)?
 
     // PERF: EventLog persisters encode payload on every retained publish.
@@ -213,6 +217,15 @@ public final class EventBus: @unchecked Sendable {
         }
     }
 
+    /// Wait until every publish accepted before this call has submitted its
+    /// persistence work. Lifecycle code follows this barrier by draining the
+    /// persistence queue, so a concurrent publisher cannot be stranded between
+    /// the EventBus delivery queue and durable storage during a graceful exit.
+    public func flushPersistenceSubmissions() {
+        precondition(DispatchQueue.getSpecific(key: deliveryQueueKey) == nil)
+        deliveryQueue.sync {}
+    }
+
     /// Serializes durable sequence allocation against every normal publisher.
     /// The closure commits receipt/outcome/events while the EventBus sequence is
     /// reserved; fanout and replay retention happen only after it returns.
@@ -221,6 +234,11 @@ public final class EventBus: @unchecked Sendable {
     ) throws -> [Event] {
         precondition(DispatchQueue.getSpecific(key: deliveryQueueKey) == nil)
         return try deliveryQueue.sync {
+            let fence: (() -> Void)?
+            lock.lock()
+            fence = persistenceCommitFence
+            lock.unlock()
+            fence?()
             snapshotBarrierLock.lock()
             let floor: Int64
             lock.lock()

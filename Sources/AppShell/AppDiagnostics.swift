@@ -184,6 +184,11 @@ public enum ManagedProviderAdmissionError: Error, LocalizedError, Sendable, Equa
 }
 
 public enum ManagedProviderAdmissionPolicy {
+    /// Starts are unconditionally user-controlled, so sampling the complete
+    /// process table before every provider launch cannot affect the decision.
+    /// Periodic diagnostics continue to collect the same telemetry off-path.
+    public static let requiresProviderStartPreflight = false
+
     /// Provider starts are user-controlled. Resource ceilings, session counts,
     /// incomplete process scans, and unknown memory samples must never refuse a
     /// start — they remain available only as telemetry enums for diagnostics.
@@ -547,7 +552,8 @@ enum AppDiagnostics {
         reason: String,
         activeAgentThreads: Int,
         profile: ManagedProcessMemoryProfile,
-        lifecycleRecorder: AppLifecycleRecorder? = nil
+        lifecycleRecorder: AppLifecycleRecorder? = nil,
+        processList: @escaping ProviderProcessList = { try ProviderProcessSweeper.psRowsThrowing() }
     ) {
         let snapshot = aggregateSurfaceSnapshot(SurfaceRegistry.shared.all())
         let footprint = currentProcessFootprintKB()
@@ -579,7 +585,10 @@ enum AppDiagnostics {
                 guard let store = ProviderProcessOwnership.shared.store() else {
                     throw ProviderProcessOwnershipError.storeNotConfigured
                 }
-                scan = try ProviderProcessSweeper.managedProcessScan(store: store)
+                scan = try ProviderProcessSweeper.managedProcessScan(
+                    store: store,
+                    processList: processList
+                )
                 scanState = scan?.isComplete == true ? "complete" : "incomplete_ownership"
             } catch {
                 scan = nil

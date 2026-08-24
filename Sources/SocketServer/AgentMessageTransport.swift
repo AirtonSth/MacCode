@@ -243,6 +243,11 @@ public enum AgentMessageTransport {
 
     // MARK: - Version 1 list
 
+    struct V1FitMeasurement {
+        let result: JSONValue?
+        let responseEncodingCount: Int
+    }
+
     /// Returns nil only when even an empty versioned envelope cannot fit the
     /// requested response budget (for example, an adversarially huge request id).
     public static func v1ListResult(
@@ -252,6 +257,50 @@ public enum AgentMessageTransport {
         basePayload: (AgentMessage) -> JSONValue,
         encodeCursor: (AgentMessageCursor) -> JSONValue
     ) -> JSONValue? {
+        fitV1ListResult(
+            from: source,
+            maxResponseBytes: maxResponseBytes,
+            responseID: responseID,
+            basePayload: basePayload,
+            encodeCursor: encodeCursor,
+            useFullFitFastPath: true
+        ).result
+    }
+
+    static func v1ListResultForTesting(
+        from source: AgentMessageBodyBudgetResult,
+        maxResponseBytes: Int,
+        responseID: JSONRPCID?,
+        basePayload: (AgentMessage) -> JSONValue,
+        encodeCursor: (AgentMessageCursor) -> JSONValue,
+        useFullFitFastPath: Bool
+    ) -> V1FitMeasurement {
+        fitV1ListResult(
+            from: source,
+            maxResponseBytes: maxResponseBytes,
+            responseID: responseID,
+            basePayload: basePayload,
+            encodeCursor: encodeCursor,
+            useFullFitFastPath: useFullFitFastPath
+        )
+    }
+
+    private static func fitV1ListResult(
+        from source: AgentMessageBodyBudgetResult,
+        maxResponseBytes: Int,
+        responseID: JSONRPCID?,
+        basePayload: (AgentMessage) -> JSONValue,
+        encodeCursor: (AgentMessageCursor) -> JSONValue,
+        useFullFitFastPath: Bool
+    ) -> V1FitMeasurement {
+        var responseEncodingCount = 0
+
+        func fits(_ result: JSONValue) -> Bool {
+            responseEncodingCount += 1
+            return encodedResponseBytes(id: responseID, result: result)
+                <= maxResponseBytes
+        }
+
         var retained = source.rows
         var droppedForEnvelope = false
 
@@ -261,13 +310,40 @@ public enum AgentMessageTransport {
             // an empty envelope with has_more=true and null cursors deadlocks the
             // client pager.
             if retained.isEmpty, !source.rows.isEmpty {
-                return nil
+                return V1FitMeasurement(
+                    result: nil,
+                    responseEncodingCount: responseEncodingCount
+                )
             }
             let maximumContentBytes = retained.reduce(0) {
                 $0 + $1.content.utf8.count
             }
+            // JSON string encoding cannot be smaller than its source UTF-8,
+            // and the RPC envelope adds bytes. At or above the response budget
+            // a full-fit probe is guaranteed to fail, so keep the old binary
+            // path without paying for an extra maximum-sized encode.
+            let shouldProbeFull = useFullFitFastPath
+                && maximumContentBytes < maxResponseBytes
+            if shouldProbeFull {
+                let complete = makeV1ListResult(
+                    source: source,
+                    retained: retained,
+                    contentBudget: maximumContentBytes,
+                    droppedForEnvelope: droppedForEnvelope,
+                    basePayload: basePayload,
+                    encodeCursor: encodeCursor
+                )
+                if fits(complete) {
+                    return V1FitMeasurement(
+                        result: complete,
+                        responseEncodingCount: responseEncodingCount
+                    )
+                }
+            }
             var lower = 0
+            // The full-fit probe already proved this endpoint cannot fit.
             var upper = maximumContentBytes
+                - (shouldProbeFull ? 1 : 0)
             var best: JSONValue?
             while lower <= upper {
                 let proposed = lower + (upper - lower) / 2
@@ -279,16 +355,25 @@ public enum AgentMessageTransport {
                     basePayload: basePayload,
                     encodeCursor: encodeCursor
                 )
-                if encodedResponseBytes(id: responseID, result: result)
-                    <= maxResponseBytes {
+                if fits(result) {
                     best = result
                     lower = proposed + 1
                 } else {
                     upper = proposed - 1
                 }
             }
-            if let best { return best }
-            guard !retained.isEmpty else { return nil }
+            if let best {
+                return V1FitMeasurement(
+                    result: best,
+                    responseEncodingCount: responseEncodingCount
+                )
+            }
+            guard !retained.isEmpty else {
+                return V1FitMeasurement(
+                    result: nil,
+                    responseEncodingCount: responseEncodingCount
+                )
+            }
             droppedForEnvelope = true
             if source.prefersNewestBodies {
                 retained.removeFirst()
@@ -377,79 +462,105 @@ public enum AgentMessageTransport {
         responseID: JSONRPCID?,
         basePayload: (AgentMessage) -> JSONValue
     ) -> JSONValue? {
+        fitV1GetResult(
+            chunk: chunk,
+            maxResponseBytes: maxResponseBytes,
+            responseID: responseID,
+            basePayload: basePayload,
+            useFullFitFastPath: true
+        ).result
+    }
+
+    static func v1GetResultForTesting(
+        chunk: AgentMessageBodyChunk,
+        maxResponseBytes: Int,
+        responseID: JSONRPCID?,
+        basePayload: (AgentMessage) -> JSONValue,
+        useFullFitFastPath: Bool
+    ) -> V1FitMeasurement {
+        fitV1GetResult(
+            chunk: chunk,
+            maxResponseBytes: maxResponseBytes,
+            responseID: responseID,
+            basePayload: basePayload,
+            useFullFitFastPath: useFullFitFastPath
+        )
+    }
+
+    private static func fitV1GetResult(
+        chunk: AgentMessageBodyChunk,
+        maxResponseBytes: Int,
+        responseID: JSONRPCID?,
+        basePayload: (AgentMessage) -> JSONValue,
+        useFullFitFastPath: Bool
+    ) -> V1FitMeasurement {
         let offsetBytes = chunk.bodyOffset
         guard offsetBytes >= 0,
               offsetBytes <= chunk.bodyByteCount,
               (offsetBytes == 0) == (chunk.metadata != nil) else {
-            return nil
+            return V1FitMeasurement(
+                result: nil,
+                responseEncodingCount: 0
+            )
         }
         let maximumChunkBytes = min(
             chunk.content.utf8.count,
             maxResponseBytes
         )
+        var responseEncodingCount = 0
+
+        func candidate(_ proposedBytes: Int) -> (
+            result: JSONValue,
+            end: Int
+        ) {
+            makeV1GetResult(
+                chunk: chunk,
+                contentBytes: proposedBytes,
+                basePayload: basePayload
+            )
+        }
+
+        func fits(_ result: JSONValue) -> Bool {
+            responseEncodingCount += 1
+            return encodedResponseBytes(id: responseID, result: result)
+                <= maxResponseBytes
+        }
+
+        // A candidate containing at least the entire response budget in body
+        // UTF-8 cannot fit once JSON escaping and the RPC envelope are added.
+        // Long-message pages commonly hit that cap, so do not regress their
+        // fallback path with a provably-failing extra encode.
+        let shouldProbeFull = useFullFitFastPath
+            && maximumChunkBytes < maxResponseBytes
+        if shouldProbeFull {
+            let complete = candidate(maximumChunkBytes)
+            if fits(complete.result) {
+                guard complete.end > offsetBytes
+                        || offsetBytes == chunk.bodyByteCount else {
+                    return V1FitMeasurement(
+                        result: nil,
+                        responseEncodingCount: responseEncodingCount
+                    )
+                }
+                return V1FitMeasurement(
+                    result: complete.result,
+                    responseEncodingCount: responseEncodingCount
+                )
+            }
+        }
+
         var lower = 0
+        // The full-fit probe already proved this endpoint cannot fit.
         var upper = maximumChunkBytes
+            - (shouldProbeFull ? 1 : 0)
         var best: (result: JSONValue, end: Int)?
 
         while lower <= upper {
             let proposed = lower + (upper - lower) / 2
-            let content = utf8Prefix(
-                chunk.content,
-                maxBytes: proposed
-            )
-            let end = offsetBytes + content.utf8.count
-            let nextOffset: Int? =
-                end < chunk.bodyByteCount ? end : nil
-            let wire: JSONValue
-            if let metadata = chunk.metadata {
-                let bounded = AgentMessage(
-                    id: chunk.id,
-                    threadId: metadata.threadId,
-                    role: metadata.role,
-                    content: content,
-                    createdAt: metadata.createdAt,
-                    attachments: metadata.attachments
-                )
-                wire = messageWireObject(
-                    base: basePayload(bounded),
-                    content: content,
-                    bodyAvailable: true,
-                    bodyTruncated: nextOffset != nil,
-                    bodyByteCount: chunk.bodyByteCount,
-                    bodySHA256: chunk.bodySHA256,
-                    bodyRevision: chunk.bodyRevision,
-                    bodyOffset: offsetBytes,
-                    bodyNextOffset: nextOffset,
-                    attachmentCount: metadata.attachmentCount,
-                    attachmentsTruncated:
-                        metadata.attachmentsTruncated
-                )
-            } else {
-                wire = .object([
-                    "id": .string(chunk.id.value.uuidString),
-                    "content": .string(content),
-                    "body_byte_count":
-                        .number(Double(chunk.bodyByteCount)),
-                    "body_sha256": .string(chunk.bodySHA256),
-                    "body_revision":
-                        .number(Double(chunk.bodyRevision)),
-                    "body_offset": .number(Double(offsetBytes)),
-                    "body_next_offset":
-                        nextOffset.map { .number(Double($0)) } ?? .null,
-                    "body_truncated": .bool(nextOffset != nil),
-                ])
-            }
-            let result: JSONValue = .object([
-                "version": .number(1),
-                "message": wire,
-                "body_offset": .number(Double(offsetBytes)),
-                "body_next_offset":
-                    nextOffset.map { .number(Double($0)) } ?? .null,
-            ])
-            if encodedResponseBytes(id: responseID, result: result)
-                <= maxResponseBytes {
-                if best == nil || end > best!.end {
-                    best = (result, end)
+            let proposedResult = candidate(proposed)
+            if fits(proposedResult.result) {
+                if best == nil || proposedResult.end > best!.end {
+                    best = proposedResult
                 }
                 lower = proposed + 1
             } else {
@@ -457,13 +568,88 @@ public enum AgentMessageTransport {
             }
         }
 
-        guard let best else { return nil }
+        guard let best else {
+            return V1FitMeasurement(
+                result: nil,
+                responseEncodingCount: responseEncodingCount
+            )
+        }
         // A non-final chunk must always advance; otherwise a client could loop.
         guard best.end > offsetBytes
                 || offsetBytes == chunk.bodyByteCount else {
-            return nil
+            return V1FitMeasurement(
+                result: nil,
+                responseEncodingCount: responseEncodingCount
+            )
         }
-        return best.result
+        return V1FitMeasurement(
+            result: best.result,
+            responseEncodingCount: responseEncodingCount
+        )
+    }
+
+    private static func makeV1GetResult(
+        chunk: AgentMessageBodyChunk,
+        contentBytes: Int,
+        basePayload: (AgentMessage) -> JSONValue
+    ) -> (result: JSONValue, end: Int) {
+        let offsetBytes = chunk.bodyOffset
+        let content = utf8Prefix(
+            chunk.content,
+            maxBytes: contentBytes
+        )
+        let end = offsetBytes + content.utf8.count
+        let nextOffset: Int? =
+            end < chunk.bodyByteCount ? end : nil
+        let wire: JSONValue
+        if let metadata = chunk.metadata {
+            let bounded = AgentMessage(
+                id: chunk.id,
+                threadId: metadata.threadId,
+                role: metadata.role,
+                content: content,
+                createdAt: metadata.createdAt,
+                attachments: metadata.attachments
+            )
+            wire = messageWireObject(
+                base: basePayload(bounded),
+                content: content,
+                bodyAvailable: true,
+                bodyTruncated: nextOffset != nil,
+                bodyByteCount: chunk.bodyByteCount,
+                bodySHA256: chunk.bodySHA256,
+                bodyRevision: chunk.bodyRevision,
+                bodyOffset: offsetBytes,
+                bodyNextOffset: nextOffset,
+                attachmentCount: metadata.attachmentCount,
+                attachmentsTruncated:
+                    metadata.attachmentsTruncated
+            )
+        } else {
+            wire = .object([
+                "id": .string(chunk.id.value.uuidString),
+                "content": .string(content),
+                "body_byte_count":
+                    .number(Double(chunk.bodyByteCount)),
+                "body_sha256": .string(chunk.bodySHA256),
+                "body_revision":
+                    .number(Double(chunk.bodyRevision)),
+                "body_offset": .number(Double(offsetBytes)),
+                "body_next_offset":
+                    nextOffset.map { .number(Double($0)) } ?? .null,
+                "body_truncated": .bool(nextOffset != nil),
+            ])
+        }
+        return (
+            .object([
+                "version": .number(1),
+                "message": wire,
+                "body_offset": .number(Double(offsetBytes)),
+                "body_next_offset":
+                    nextOffset.map { .number(Double($0)) } ?? .null,
+            ]),
+            end
+        )
     }
 
     // MARK: - Appended event

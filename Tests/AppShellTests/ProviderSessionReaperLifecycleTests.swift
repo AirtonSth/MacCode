@@ -37,4 +37,52 @@ final class ProviderSessionReaperLifecycleTests: XCTestCase {
         XCTAssertEqual(try ctx.providerSessionRuntimeRepo.get(threadId: running.id)?.status, .completed)
         XCTAssertEqual(try ctx.providerPendingCallbackRepo.get(threadId: idle.id, requestId: "approval-1", kind: .approval)?.state, .stale)
     }
+
+    @MainActor
+    func test_appContextFailsClosedBeforeReapingWhenRunningRoutingIsCorrupt() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-app-context-reaper-corrupt-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: tmp)
+        let old = Date(timeIntervalSince1970: 1_000)
+        let now = Date(timeIntervalSince1970: 10_000)
+        let idle = AgentThread(title: "idle victim", provider: .codex, model: "gpt-5.5")
+        let routing = AgentRoutingConfiguration(
+            mode: .auto,
+            manualSelection: AgentModelSelection(provider: .claude, modelId: "claude-opus-4-7"),
+            eligibleProviders: [.claude],
+            revision: 2
+        )
+        var corruptRunning = AgentThread(
+            title: "corrupt running",
+            provider: .claude,
+            model: "claude-opus-4-7",
+            routingConfiguration: routing
+        )
+        corruptRunning.status = .running
+        try ctx.threadRepo.upsert(idle)
+        try ctx.threadRepo.upsert(corruptRunning)
+        try ctx.providerSessionRuntimeRepo.upsert(
+            ProviderSessionRuntime(
+                threadId: idle.id,
+                provider: .codex,
+                status: .completed,
+                resumeCursor: "idle",
+                updatedAt: old
+            )
+        )
+        try ctx.db.execute(
+            "UPDATE agent_thread_routing SET configuration_json = '{}' "
+                + "WHERE thread_id = '\(corruptRunning.id.value.uuidString)';"
+        )
+
+        XCTAssertThrowsError(
+            try ctx.reapIdleProviderSessions(now: now, idleAge: 60),
+            "corrupt running persistence must abort the lifecycle tick before any session is stopped"
+        )
+        XCTAssertEqual(
+            try ctx.providerSessionRuntimeRepo.get(threadId: idle.id)?.status,
+            .completed,
+            "a failed active-thread snapshot must leave otherwise reap-eligible sessions untouched"
+        )
+    }
 }

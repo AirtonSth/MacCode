@@ -368,6 +368,80 @@ final class CellularDataOptimizationTests: XCTestCase {
                        "rendered text must be byte-identical to unaggregated stream")
     }
 
+    func test_C16_deltaRunMerge_matchesPairwiseSemanticsAndAbsorbedSequenceOrder() throws {
+        // WHY: the flush-time fast path must remain wire-compatible with the
+        // established pairwise merge while reporting every skipped sequence.
+        func frame(seq: Int64, payload: [String: Any]) throws -> Data {
+            try JSONSerialization.data(withJSONObject: [
+                "protocolVersion": 3,
+                "type": "event",
+                "connectionId": "connection-final-\(seq)",
+                "sequence": seq,
+                "eventId": "1:\(seq)",
+                "kind": "agent.item.delta",
+                "payload": payload,
+            ])
+        }
+
+        let identity: [String: Any] = [
+            "thread_id": "thread-a",
+            "turn_id": "turn-a",
+            "item_id": "item-a",
+        ]
+        let frames = try [
+            frame(seq: 20, payload: identity.merging([
+                "body_append": "A",
+                "output_append": "alpha ",
+                "text": "quoted: \\\"",
+                "summary": "starting",
+                "progress": 0.1,
+                "distill_applied": true,
+            ]) { _, new in new }),
+            frame(seq: 21, payload: identity.merging([
+                "body_append": "",
+                "output_append": "beta ",
+                "text": "line\\n",
+                "progress": 0.4,
+                "distill_applied": false,
+            ]) { _, new in new }),
+            frame(seq: 22, payload: identity.merging([
+                "body_append": "B\\\\",
+                "summary": NSNull(),
+            ]) { _, new in new }),
+            frame(seq: 23, payload: identity.merging([
+                "body_append": "👩‍💻",
+                "output_append": "gamma",
+                "text": "done",
+                "final_only": "preserved",
+            ]) { _, new in new }),
+        ]
+
+        let legacy = try frames.dropFirst().reduce(frames[0]) { current, next in
+            try XCTUnwrap(WebSocketEventBatcher.mergeAgentItemDeltaFrames(current, next))
+        }
+        let optimized = WebSocketEventBatcher.mergeAgentItemDeltasInOrder(frames)
+        XCTAssertEqual(optimized.merged.count, 1)
+        let output = try XCTUnwrap(optimized.merged.first)
+
+        func canonicalJSON(_ data: Data) throws -> Data {
+            let object = try JSONSerialization.jsonObject(with: data)
+            return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        }
+
+        XCTAssertEqual(
+            try canonicalJSON(output),
+            try canonicalJSON(legacy),
+            "linear accumulation must preserve the pairwise merge's complete JSON payload"
+        )
+        XCTAssertEqual(
+            optimized.absorbed.compactMap(WebSocketOutboundQueue.eventSequence(in:)),
+            [20, 21, 22],
+            "gap accounting must observe every absorbed sequence in arrival order"
+        )
+        XCTAssertEqual(WebSocketOutboundQueue.eventSequence(in: output), 23,
+                       "the emitted frame must retain the final sequence watermark")
+    }
+
     func test_C16_cellularCoalescingKey_requiresThreadItemAndTurn() {
         // WHY: provider item IDs can repeat across both threads and turns. A
         // delta without turn identity must stay in arrival-order buffering so

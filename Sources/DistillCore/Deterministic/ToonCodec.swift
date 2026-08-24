@@ -337,10 +337,19 @@ public enum ToonCodec: Sendable {
         return string
     }
 
+    // JSON tool outputs can contain thousands of fields. Compile each lexical
+    // predicate once instead of rebuilding identical regex state per key/value.
+    private static let unquotedKeyRegex = try! NSRegularExpression(
+        pattern: "^[A-Za-z_][A-Za-z0-9_.]*$"
+    )
+    private static let numericStringRegex = try! NSRegularExpression(
+        pattern: #"^[+-]?[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?$"#,
+        options: [.caseInsensitive]
+    )
+
     static func encodeKey(_ key: String) -> String {
-        let unquoted = try? NSRegularExpression(pattern: "^[A-Za-z_][A-Za-z0-9_.]*$")
         let range = NSRange(key.startIndex..<key.endIndex, in: key)
-        if unquoted?.firstMatch(in: key, range: range) != nil {
+        if unquotedKeyRegex.firstMatch(in: key, range: range)?.range == range {
             return key
         }
         return "\"" + escape(key) + "\""
@@ -357,7 +366,8 @@ public enum ToonCodec: Sendable {
         if string.contains(",") { return true }
         if string.hasPrefix("-") || string.hasPrefix("#") { return true }
         if string.unicodeScalars.contains(where: { $0.value < 0x20 }) { return true }
-        if string.range(of: #"^[+-]?[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?$"#, options: [.regularExpression, .caseInsensitive]) != nil {
+        let range = NSRange(string.startIndex..<string.endIndex, in: string)
+        if numericStringRegex.firstMatch(in: string, range: range)?.range == range {
             return true
         }
         return false

@@ -4,6 +4,49 @@ import Darwin
 @testable import AgentRuntime
 
 final class TokenSaverAccountUsageRefresherTests: XCTestCase {
+    private final class GrokProbeWorkload: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fetchCountStorage = 0
+        private var checksum: UInt64 = 0
+
+        var fetchCount: Int {
+            lock.withLock { fetchCountStorage }
+        }
+
+        func fetchPayload() -> [String: Any] {
+            // Deterministic CPU work stands in for JSON/network response handling.
+            // Retain the checksum so the optimizer cannot discard the loop.
+            var value: UInt64 = 0xcbf29ce484222325
+            for index in 0..<20_000 {
+                value = (value ^ UInt64(index)) &* 0x100000001b3
+            }
+            lock.withLock {
+                fetchCountStorage += 1
+                checksum ^= value
+            }
+            return [
+                "config": [
+                    "creditUsagePercent": 36.0,
+                    "currentPeriod": [
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "end": "2099-08-26T16:16:03Z"
+                    ]
+                ]
+            ]
+        }
+    }
+
+    private func processCPUTimeNanoseconds() -> UInt64 {
+        var value = timespec()
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value)
+        return UInt64(value.tv_sec) * 1_000_000_000 + UInt64(value.tv_nsec)
+    }
+
+    private func median(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        return sorted[sorted.count / 2]
+    }
+
     func test_codexParserPrefersWeeklyCodexLimitBucket() {
         let usage = AssistantAccountUsageParser.codex(from: [
             "rateLimits": [
@@ -287,6 +330,120 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         ))
         XCTAssertEqual(usage?.weeklyUsedPercent, 42,
                        "API miss must fall back to the billing log rather than recording 0%")
+    }
+
+    func test_microbench_periodicRefreshAvoidsDuplicateGrokProbe() async throws {
+        // WHY: the production timer used to execute this complete Grok auth,
+        // fetch and parse path twice per tick. Measure the exact eliminated work,
+        // not a synthetic counter-only helper.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-grok-periodic-perf-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let auth = directory.appendingPathComponent("grok-auth.json")
+        try JSONSerialization.data(withJSONObject: [
+            "https://auth.x.ai::live": ["key": "test-token", "expires_at": "2099-01-01T00:00:00Z"]
+        ]).write(to: auth)
+        let codexAuth = directory.appendingPathComponent("codex-auth.json")
+        try JSONSerialization.data(withJSONObject: [
+            "tokens": ["access_token": "codex-token", "account_id": "acct-1"]
+        ]).write(to: codexAuth)
+        let claudeAuth = directory.appendingPathComponent("claude-auth.json")
+        try JSONSerialization.data(withJSONObject: [
+            "claudeAiOauth": ["accessToken": "claude-token"]
+        ]).write(to: claudeAuth)
+        let grokURL = URL(string: "https://perf.invalid/grok")!
+        let codexURL = URL(string: "https://perf.invalid/codex")!
+        let claudeURL = URL(string: "https://perf.invalid/claude")!
+
+        let workload = GrokProbeWorkload()
+        let refresher = TokenSaverAccountUsageRefresher(
+            timeoutSeconds: 3,
+            jsonAPIFetcher: { url, _ in
+                switch url {
+                case grokURL:
+                    return workload.fetchPayload()
+                case codexURL:
+                    return [
+                        "rate_limit": [
+                            "secondary_window": [
+                                "used_percent": 41,
+                                "limit_window_seconds": 604_800
+                            ]
+                        ]
+                    ]
+                case claudeURL:
+                    return ["seven_day": ["utilization": 26]]
+                default:
+                    return nil
+                }
+            }
+        )
+        let ticksPerSample = 20
+
+        func measure(includeGrokInFullRefresh: Bool) async -> (wallMS: Double, cpuMS: Double, fetches: Int) {
+            let request = TokenSaverAccountUsageRefreshRequest(
+                grokAuthFileURL: auth,
+                grokCreditsAPIURL: grokURL,
+                claudeAuthFileURL: claudeAuth,
+                claudeUsageAPIURL: claudeURL,
+                codexAuthFileURL: codexAuth,
+                codexUsageAPIURL: codexURL,
+                includeGrok: includeGrokInFullRefresh
+            )
+            let fetchesBefore = workload.fetchCount
+            let wallStart = DispatchTime.now().uptimeNanoseconds
+            let cpuStart = processCPUTimeNanoseconds()
+            var invalidResults = 0
+            for _ in 0..<ticksPerSample {
+                async let dedicatedGrok = refresher.grokAccountUsage(request)
+                async let fullRefresh = refresher.refreshAccountUsage(request)
+                let (grok, usages) = await (dedicatedGrok, fullRefresh)
+                if grok?.weeklyUsedPercent != 36
+                    || usages.first(where: { $0.provider == .codex })?.weeklyUsedPercent != 41
+                    || usages.first(where: { $0.provider == .claude })?.weeklyUsedPercent != 26
+                    || usages.contains(where: { $0.provider == .grok }) != includeGrokInFullRefresh {
+                    invalidResults += 1
+                }
+            }
+            let cpuEnd = processCPUTimeNanoseconds()
+            let wallEnd = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(invalidResults, 0)
+            return (
+                Double(wallEnd - wallStart) / 1_000_000,
+                Double(cpuEnd - cpuStart) / 1_000_000,
+                workload.fetchCount - fetchesBefore
+            )
+        }
+
+        for _ in 0..<2 {
+            _ = await measure(includeGrokInFullRefresh: true)
+            _ = await measure(includeGrokInFullRefresh: false)
+        }
+
+        var beforeCPU: [Double] = []
+        var afterCPU: [Double] = []
+        var beforeWall: [Double] = []
+        var afterWall: [Double] = []
+        for sample in 0..<5 {
+            let first = await measure(includeGrokInFullRefresh: sample.isMultiple(of: 2))
+            let second = await measure(includeGrokInFullRefresh: !sample.isMultiple(of: 2))
+            let before = sample.isMultiple(of: 2) ? first : second
+            let after = sample.isMultiple(of: 2) ? second : first
+            XCTAssertEqual(before.fetches, ticksPerSample * 2)
+            XCTAssertEqual(after.fetches, ticksPerSample)
+            beforeCPU.append(before.cpuMS)
+            afterCPU.append(after.cpuMS)
+            beforeWall.append(before.wallMS)
+            afterWall.append(after.wallMS)
+        }
+
+        let beforeMedianCPU = median(beforeCPU)
+        let afterMedianCPU = median(afterCPU)
+        let improvement = (beforeMedianCPU - afterMedianCPU) / beforeMedianCPU * 100
+        print("[perf-proof] tokenSaverPeriodicGrok before_cpu_ms=\(beforeCPU) after_cpu_ms=\(afterCPU) before_wall_ms=\(beforeWall) after_wall_ms=\(afterWall) median_before_cpu_ms=\(beforeMedianCPU) median_after_cpu_ms=\(afterMedianCPU) improvement_pct=\(improvement) probes_per_20_ticks=40->20")
+        XCTAssertGreaterThan(improvement, 5,
+                             "removing one complete Grok probe per periodic tick must clear the performance gate")
     }
 
     func test_claudeOAuthUsage_readsSevenDayPercentAndFiveHourSession() {

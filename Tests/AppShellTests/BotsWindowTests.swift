@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 import SwiftUI
 import CoreModel
@@ -1715,6 +1716,55 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_deskComposerTimelineSchedule_stopsAfterInitialIdleRender() {
+        // WHY: with no live Desk run, the composer label is static. The old
+        // periodic TimelineView still invalidated it once per second forever.
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let entries = BotsComposerTimelineSchedule(runIsLive: false)
+            .entries(from: start, mode: .normal)
+        let renderedDates = Array(entries.prefix(61))
+
+        XCTAssertEqual(renderedDates, [start])
+        XCTAssertEqual(renderedDates.dropFirst().count, 0,
+                       "60 idle seconds must produce zero follow-up invalidations")
+    }
+
+    func test_deskComposerTimelineSchedule_keepsOneHertzDuringLiveRun() {
+        // WHY: the elapsed Working label must retain its existing one-second
+        // cadence while the selected Desk thread is actually running.
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let entries = BotsComposerTimelineSchedule(runIsLive: true)
+            .entries(from: start, mode: .normal)
+        let renderedDates = Array(entries.prefix(61))
+
+        XCTAssertEqual(renderedDates.count, 61)
+        XCTAssertEqual(renderedDates.first, start)
+        XCTAssertEqual(renderedDates.last, start.addingTimeInterval(60))
+        XCTAssertTrue(zip(renderedDates, renderedDates.dropFirst()).allSatisfy {
+            $1.timeIntervalSince($0) == 1
+        })
+    }
+
+    func test_microbenchDeskComposerTimelineSchedule_eliminatesIdleInvalidations() {
+        let warmups = 2
+        let samples = 7
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var optimizedSamples: [Int] = []
+
+        for iteration in 0..<(warmups + samples) {
+            let entries = BotsComposerTimelineSchedule(runIsLive: false)
+                .entries(from: start, mode: .normal)
+            let optimizedInvalidations = Array(entries.prefix(61)).dropFirst().count
+            if iteration >= warmups {
+                XCTAssertEqual(optimizedInvalidations, 0)
+                optimizedSamples.append(optimizedInvalidations)
+            }
+        }
+
+        XCTAssertEqual(optimizedSamples, Array(repeating: 0, count: samples))
+        print("PERF idle_bots_composer_clock warmup=2 n=7 baseline_invalidations=60 optimized_invalidations=0 reduction_pct=100 live_invalidations=60")
+    }
+
     func test_deskReplaysStreamEventsOnOpen_becauseThinkingMustSurviveClose() throws {
         // WHY: Desk is not a second Agent App window, but it must replay the
         // linked thread's persisted stream events so Thought / Worked remain
@@ -1947,6 +1997,470 @@ final class BotsWindowTests: XCTestCase {
             ),
             "Considering the failing test",
             "a lagging SQLite replay must not erase the live Thought row"
+        )
+    }
+
+    func test_deskLiveObserverWatermarkDoesNotReplayTheDurableCopy_becauseTheEventAlreadyPainted() throws {
+        // WHY: coordinator observers paint stream events immediately. Once the same
+        // ordered prefix reaches SQLite, the 250 ms watcher must advance its durable
+        // watermark instead of decoding and replaying the whole hot window again.
+        let fixture = try makeDeskReplayFixture()
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        let delta = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: " observed-once",
+            outputAppend: nil,
+            summary: nil
+        )
+
+        fixture.viewModel.applyDeskLiveEventForTesting(delta, threadId: fixture.thread.id)
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [delta],
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveReplayFetchCountForTesting,
+            replayCount,
+            "the durable copy of an already-observed event must not trigger a full hot-window replay"
+        )
+        XCTAssertEqual(fixture.viewModel.deskLiveIncrementalDecodeEventCountForTesting, 1)
+        let reasoning = try XCTUnwrap(
+            fixture.viewModel.deskLiveTimeline.turns.first?.items.first { $0.id == "r-watermark" }
+        )
+        XCTAssertEqual(reasoning.body, "seed observed-once", "a skipped replay must not duplicate the delta")
+    }
+
+    func test_deskLiveObserverWatermarkFallsBackWhenTheObserverMissedAnExternalEvent() throws {
+        // WHY: another process can commit to the shared database while this view
+        // has no matching observer callback. A watermark advance without a local
+        // event must retain the full-replay recovery path.
+        let fixture = try makeDeskReplayFixture()
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        let external = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: " external",
+            outputAppend: nil,
+            summary: nil
+        )
+
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [external],
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveReplayFetchCountForTesting,
+            replayCount + 1,
+            "a durable advance with no observer receipt must fall back to full replay"
+        )
+        let reasoning = try XCTUnwrap(
+            fixture.viewModel.deskLiveTimeline.turns.first?.items.first { $0.id == "r-watermark" }
+        )
+        XCTAssertEqual(reasoning.body, "seed external")
+    }
+
+    func test_deskLiveObserverWatermarkFallsBackWhenExternalAppendKeepsRetainedCountStable() throws {
+        // WHY: production retention can insert one row while pruning one old row,
+        // leaving COUNT(*) unchanged. Out-of-process recovery therefore needs the
+        // durable tail identity, not count alone, to notice the missed event.
+        let fixture = try makeDeskReplayFixture()
+        let fill: [AssistantEvent] = (0..<98).map {
+            .contextCompaction(summary: "retained-\($0)")
+        }
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: fill,
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+
+        let external = AssistantEvent.contextCompaction(summary: "external-at-stable-count")
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [external],
+            startSeq: 101
+        )
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+        fixture.viewModel.refreshDeskLiveTurn()
+
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, replayCount + 1)
+        XCTAssertEqual(fixture.viewModel.deskLiveTimeline.contextCompactionSummary, "external-at-stable-count")
+    }
+
+    func test_deskLiveObserverWatermarkDetectsHistoricalRunMutationAtStableCount() throws {
+        // WHY: presentation order follows run start time. A historical run can
+        // append and prune at the 100-row cap while a newer run remains the same
+        // visible tail, so the cursor also needs a thread-wide mutation watermark.
+        let fixture = try makeDeskReplayFixture()
+        let historicalFill: [AssistantEvent] = (0..<96).map {
+            .contextCompaction(summary: "historical-\($0)")
+        }
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: historicalFill,
+            startSeq: 3
+        )
+        let newerRun = AgentRun(
+            threadId: fixture.thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: fixture.run.startedAt.addingTimeInterval(60),
+            finishedAt: fixture.run.startedAt.addingTimeInterval(61)
+        )
+        try fixture.context.runRepo.upsert(newerRun)
+        try persistStreamEvents(
+            context: fixture.context,
+            run: newerRun,
+            events: [
+                .turnStarted(turnId: "t-newer"),
+                .turnCompleted(turnId: "t-newer", finalMessage: "newer-tail"),
+            ]
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+        let before = fixture.context.coordinator.streamEventCursor(threadId: fixture.thread.id)
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [.contextCompaction(summary: "historical-external-at-stable-count")],
+            startSeq: 99
+        )
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+        let after = fixture.context.coordinator.streamEventCursor(threadId: fixture.thread.id)
+        XCTAssertEqual(after.rowId, before.rowId, "the newer presentation tail intentionally stays unchanged")
+        XCTAssertEqual(after.runId, before.runId)
+        XCTAssertEqual(after.sequence, before.sequence)
+        XCTAssertNotEqual(after.mutationId, before.mutationId)
+
+        fixture.viewModel.refreshDeskLiveTurn()
+
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, replayCount + 1)
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveTimeline.contextCompactionSummary,
+            "historical-external-at-stable-count"
+        )
+    }
+
+    func test_deskLiveObserverWatermarkDoesNotMaskHistoricalMutationBehindObservedNewestAdvance() throws {
+        // WHY: one poll may cover both an observed event on the presentation-tail
+        // run and an unobserved append on a historical run. Confirming only the
+        // newest suffix would consume the thread-wide watermark and lose the
+        // external historical event permanently.
+        let fixture = try makeDeskReplayFixture()
+        let historicalRun = AgentRun(
+            threadId: fixture.thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: fixture.run.startedAt.addingTimeInterval(-60),
+            finishedAt: fixture.run.startedAt.addingTimeInterval(-59)
+        )
+        try fixture.context.runRepo.upsert(historicalRun)
+        let historicalFill: [AssistantEvent] = (0..<98).map {
+            .contextCompaction(summary: "historical-combined-\($0)")
+        }
+        try persistStreamEvents(
+            context: fixture.context,
+            run: historicalRun,
+            events: historicalFill
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+
+        try persistStreamEvents(
+            context: fixture.context,
+            run: historicalRun,
+            events: [.contextCompaction(summary: "historical-external-combined")],
+            startSeq: 99
+        )
+        let observedNewest = AssistantEvent.itemStarted(item: AssistantItem(
+            id: "newest-observed-combined",
+            turnId: "t-watermark",
+            type: .reasoning,
+            state: .streaming,
+            body: "newest local event",
+            startedAtMs: 20
+        ))
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [observedNewest],
+            startSeq: 3
+        )
+        fixture.viewModel.applyDeskLiveEventForTesting(
+            observedNewest,
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(fixture.context.coordinator.countStreamEvents(threadId: fixture.thread.id), 100)
+
+        fixture.viewModel.refreshDeskLiveTurn()
+
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveReplayFetchCountForTesting,
+            replayCount + 1,
+            "an observed newest-run suffix must not attest an unobserved historical mutation"
+        )
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveTimeline.contextCompactionSummary,
+            "historical-external-combined"
+        )
+        XCTAssertNotNil(
+            fixture.viewModel.deskLiveTimeline.turns
+                .flatMap(\.items)
+                .first { $0.id == "newest-observed-combined" }
+        )
+    }
+
+    func test_deskLiveObserverWatermarkBoundsObservedBytesAndFallsBackAfterSwitch() throws {
+        // WHY: observer confirmation is only an optimization. A large pending
+        // event must fail closed without being retained beyond the byte budget,
+        // and leaving the Desk must release a smaller pending prefix while a
+        // later durable append still rehydrates through the full fallback.
+        let fixture = try makeDeskReplayFixture()
+        fixture.viewModel.deskLiveObservedEventByteLimitForTesting = 512
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        let large = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: String(repeating: "x", count: 1_024),
+            outputAppend: nil,
+            summary: nil
+        )
+        fixture.viewModel.applyDeskLiveEventForTesting(large, threadId: fixture.thread.id)
+        var buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertEqual(buffer.bytes, 0)
+        XCTAssertEqual(buffer.totalBytes, 0)
+        XCTAssertTrue(buffer.overflowed)
+
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [large],
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, replayCount + 1)
+        XCTAssertFalse(
+            fixture.viewModel.deskLiveObservedEventBufferForTesting(threadId: fixture.thread.id).overflowed
+        )
+
+        let pending = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: " pending-after-switch",
+            outputAppend: nil,
+            summary: nil
+        )
+        fixture.viewModel.applyDeskLiveEventForTesting(pending, threadId: fixture.thread.id)
+        buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(threadId: fixture.thread.id)
+        XCTAssertEqual(buffer.count, 1)
+        XCTAssertGreaterThan(buffer.bytes, 0)
+        XCTAssertEqual(buffer.totalBytes, buffer.bytes)
+
+        _ = try fixture.viewModel.create(name: "Quinn", title: "Switch target", provider: .claude)
+        buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(threadId: fixture.thread.id)
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertEqual(buffer.bytes, 0)
+        XCTAssertEqual(buffer.totalBytes, 0)
+        XCTAssertFalse(buffer.overflowed)
+
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [pending],
+            startSeq: 4
+        )
+        let fallbackCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        fixture.viewModel.openDesk(fixture.bot)
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, fallbackCount + 1)
+        let reasoning = try XCTUnwrap(
+            fixture.viewModel.deskLiveTimeline.turns.first?.items.first { $0.id == "r-watermark" }
+        )
+        XCTAssertTrue(reasoning.body.hasSuffix("pending-after-switch"))
+    }
+
+    func test_deskLiveObserverWatermarkPreservesOrderedTerminalTailWithoutReplay() throws {
+        // WHY: eliminating redundant replay is safe only when ordered deltas and
+        // the terminal event survive exactly once after the durability barrier.
+        let fixture = try makeDeskReplayFixture()
+        let replayCount = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        let tail: [AssistantEvent] = [
+            .itemDelta(itemId: "r-watermark", bodyAppend: " A", outputAppend: nil, summary: nil),
+            .itemDelta(itemId: "r-watermark", bodyAppend: " B", outputAppend: nil, summary: nil),
+            .itemCompleted(itemId: "r-watermark", finalState: .completed),
+            .turnCompleted(turnId: "t-watermark", finalMessage: "done"),
+        ]
+        for event in tail {
+            fixture.viewModel.applyDeskLiveEventForTesting(event, threadId: fixture.thread.id)
+        }
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: tail,
+            startSeq: 3
+        )
+        var terminal = fixture.run
+        terminal.status = .completed
+        terminal.finishedAt = Date()
+        try fixture.context.runRepo.upsert(terminal)
+
+        fixture.viewModel.adoptLinkedRunTerminalForTests(
+            runId: terminal.id,
+            threadId: fixture.thread.id
+        )
+
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, replayCount)
+        let turn = try XCTUnwrap(fixture.viewModel.deskLiveTimeline.turns.first)
+        XCTAssertTrue(turn.finished)
+        XCTAssertEqual(turn.finalAssistantMessage, "done")
+        XCTAssertEqual(try XCTUnwrap(turn.items.first { $0.id == "r-watermark" }).body, "seed A B")
+    }
+
+    func test_deskLiveObserverWatermarkReconcilesPersistPollObserverRaceAtTerminal() throws {
+        // WHY: persistence can finish before its observer Task reaches MainActor.
+        // If the poll replays first, the late callback paints the same delta a
+        // second time while the cursor is already current. Terminal settlement
+        // must authoritatively reconcile once and release that pending receipt.
+        let fixture = try makeDeskReplayFixture()
+        let delta = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: " once",
+            outputAppend: nil,
+            summary: nil
+        )
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [delta],
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        let afterPoll = fixture.viewModel.deskLiveReplayFetchCountForTesting
+        XCTAssertEqual(
+            try XCTUnwrap(
+                fixture.viewModel.deskLiveTimeline.turns.first?.items
+                    .first { $0.id == "r-watermark" }
+            ).body,
+            "seed once"
+        )
+
+        fixture.viewModel.applyDeskLiveEventForTesting(delta, threadId: fixture.thread.id)
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveObservedEventBufferForTesting(
+                threadId: fixture.thread.id
+            ).count,
+            1
+        )
+
+        fixture.viewModel.adoptLinkedRunTerminalForTests(
+            runId: fixture.run.id,
+            threadId: fixture.thread.id
+        )
+
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, afterPoll + 1)
+        XCTAssertEqual(
+            try XCTUnwrap(
+                fixture.viewModel.deskLiveTimeline.turns.first?.items
+                    .first { $0.id == "r-watermark" }
+            ).body,
+            "seed once"
+        )
+        var buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertEqual(buffer.bytes, 0)
+        XCTAssertFalse(buffer.overflowed)
+
+        fixture.viewModel.adoptLinkedRunTerminalForTests(
+            runId: fixture.run.id,
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveReplayFetchCountForTesting,
+            afterPoll + 1,
+            "an identical terminal read after cleanup must be a no-op"
+        )
+        buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertFalse(buffer.overflowed)
+    }
+
+    func test_deskLiveObserverWatermarkReconcilesObserverArrivingAfterTerminal() throws {
+        // WHY: didReceive and didFinish reach MainActor through independent
+        // Tasks. Terminal settlement may finish and stop the watcher before a
+        // delayed didReceive runs, so that callback itself must close the race.
+        let fixture = try makeDeskReplayFixture()
+        let delta = AssistantEvent.itemDelta(
+            itemId: "r-watermark",
+            bodyAppend: " once",
+            outputAppend: nil,
+            summary: nil
+        )
+        try persistStreamEvents(
+            context: fixture.context,
+            run: fixture.run,
+            events: [delta],
+            startSeq: 3
+        )
+        fixture.viewModel.refreshDeskLiveTurn()
+        let afterPoll = fixture.viewModel.deskLiveReplayFetchCountForTesting
+
+        fixture.viewModel.adoptLinkedRunTerminalForTests(
+            runId: fixture.run.id,
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, afterPoll)
+
+        fixture.viewModel.applyDeskLiveEventForTesting(
+            delta,
+            runId: fixture.run.id,
+            threadId: fixture.thread.id
+        )
+
+        XCTAssertEqual(fixture.viewModel.deskLiveReplayFetchCountForTesting, afterPoll + 1)
+        XCTAssertEqual(
+            try XCTUnwrap(
+                fixture.viewModel.deskLiveTimeline.turns.first?.items
+                    .first { $0.id == "r-watermark" }
+            ).body,
+            "seed once"
+        )
+        let buffer = fixture.viewModel.deskLiveObservedEventBufferForTesting(
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertEqual(buffer.bytes, 0)
+        XCTAssertFalse(buffer.overflowed)
+
+        fixture.viewModel.refreshDeskLiveTurn()
+        fixture.viewModel.adoptLinkedRunTerminalForTests(
+            runId: fixture.run.id,
+            threadId: fixture.thread.id
+        )
+        XCTAssertEqual(
+            fixture.viewModel.deskLiveReplayFetchCountForTesting,
+            afterPoll + 1,
+            "subsequent identical reads must remain no-ops after late-event cleanup"
         )
     }
 
@@ -2732,6 +3246,346 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.filteredActiveBotItems().map(\.botID), [piper.id])
         vm.activeBotsSearchText = "no-such-bot"
         XCTAssertTrue(vm.filteredActiveBotItems().isEmpty)
+    }
+
+    func test_activeAndFinishedBots_batchLinkedConversations_withoutChangingOrderOrStatus() throws {
+        // WHY: opening Active Bots must not issue one SQLite lookup per active
+        // or recent run, while the projected links and finished-run ordering
+        // remain identical to the durable run roster.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .grok)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .grok)
+        let active = AgentThread(title: "Active", provider: .grok, model: "test")
+        let finishedNewer = AgentThread(title: "Newer", provider: .grok, model: "test")
+        let finishedOlder = AgentThread(title: "Older", provider: .grok, model: "test")
+        let finishedOldest = AgentThread(title: "Oldest", provider: .grok, model: "test")
+        let unlinked = AgentThread(title: "Unlinked", provider: .grok, model: "test")
+        for thread in [active, finishedNewer, finishedOlder, finishedOldest, unlinked] {
+            try context.threadRepo.upsert(thread)
+        }
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Active", linkedAgentThreadID: active.id)
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Newer", linkedAgentThreadID: finishedNewer.id)
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: quinn.id, title: "Older", linkedAgentThreadID: finishedOlder.id)
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: quinn.id, title: "Oldest", linkedAgentThreadID: finishedOldest.id)
+        )
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        try context.runRepo.upsert(AgentRun(
+            threadId: active.id,
+            provider: .grok,
+            model: "test",
+            status: .running,
+            startedAt: now
+        ))
+        try context.runRepo.upsert(AgentRun(
+            threadId: finishedOlder.id,
+            provider: .grok,
+            model: "test",
+            status: .completed,
+            startedAt: now.addingTimeInterval(-30),
+            finishedAt: now.addingTimeInterval(-20)
+        ))
+        try context.runRepo.upsert(AgentRun(
+            threadId: finishedOldest.id,
+            provider: .grok,
+            model: "test",
+            status: .completed,
+            startedAt: now.addingTimeInterval(-40),
+            finishedAt: now.addingTimeInterval(-30)
+        ))
+        try context.runRepo.upsert(AgentRun(
+            threadId: finishedNewer.id,
+            provider: .grok,
+            model: "test",
+            status: .failed,
+            startedAt: now.addingTimeInterval(-20),
+            finishedAt: now.addingTimeInterval(-10)
+        ))
+        try context.runRepo.upsert(AgentRun(
+            threadId: unlinked.id,
+            provider: .grok,
+            model: "test",
+            status: .completed,
+            startedAt: now.addingTimeInterval(-10),
+            finishedAt: now
+        ))
+        vm.activeThreadIDsOverrideForTesting = [active.id]
+        vm.setHidden(id: quinn.id, hidden: true)
+
+        var singleLookupSteps = 0
+        var singleBotLookupSteps = 0
+        var batchSQL = Set<String>()
+        var botBatchSQL = Set<String>()
+        context.db.beforeStatementStepForTesting = { sql in
+            if sql.contains("WHERE linked_agent_thread_id = ? LIMIT 1") {
+                singleLookupSteps += 1
+            }
+            if sql.contains("FROM bots"), sql.contains("WHERE id = ? LIMIT 1") {
+                singleBotLookupSteps += 1
+            }
+            if sql.contains("WHERE linked_agent_thread_id IN (") {
+                batchSQL.insert(sql)
+            }
+            if sql.contains("FROM bots"), sql.contains("WHERE id IN (") {
+                botBatchSQL.insert(sql)
+            }
+        }
+        vm.openActiveBots()
+        context.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(singleLookupSteps, 0)
+        XCTAssertEqual(singleBotLookupSteps, 0, "repeated hidden finished bots must not issue per-run gets")
+        XCTAssertEqual(batchSQL.count, 2, "active and finished projections each use one batched SQL shape")
+        XCTAssertEqual(botBatchSQL.count, 1, "the missing hidden roster entry is prefetched once")
+        XCTAssertEqual(vm.activeBotItems.map(\.botID), [piper.id])
+        XCTAssertEqual(vm.finishedBotItems.map(\.botID), [piper.id, quinn.id, quinn.id])
+        XCTAssertEqual(vm.finishedBotItems.map(\.status), [.failed, .completed, .completed])
+        XCTAssertEqual(vm.finishedBotItems.map(\.title), ["Piper", "Quinn", "Quinn"])
+    }
+
+    func test_activeBots_batchColdStartedAt_withoutChangingLatestConversationTimestamp() throws {
+        // WHY: a cold Active Bots screen has no lastUpdated cache. Computing
+        // startedAt must not list every conversation once per active Bot, and
+        // must still choose the exact newest conversation timestamp per Bot.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        var activeThreadIDs = Set<AgentThreadID>()
+        var expectedStartedAt: [BotID: Date] = [:]
+        for index in 0..<10 {
+            let bot = try vm.create(name: "Bot \(index)", title: "Worker")
+            let thread = AgentThread(title: "Active \(index)", provider: .grok, model: "test")
+            try context.threadRepo.upsert(thread)
+            activeThreadIDs.insert(thread.id)
+            let latest = base.addingTimeInterval(Double(index * 10))
+            try context.botStore.upsertConversation(BotConversation(
+                botID: bot.id,
+                title: "Older \(index)",
+                createdAt: latest.addingTimeInterval(-1_000),
+                updatedAt: latest.addingTimeInterval(-1_000)
+            ))
+            try context.botStore.upsertConversation(BotConversation(
+                botID: bot.id,
+                title: "Active \(index)",
+                linkedAgentThreadID: thread.id,
+                createdAt: latest,
+                updatedAt: latest
+            ))
+            expectedStartedAt[bot.id] = try XCTUnwrap(
+                context.botStore.listConversations(botID: bot.id).first?.updatedAt
+            )
+        }
+        vm.activeThreadIDsOverrideForTesting = activeThreadIDs
+
+        var singleConversationListSteps = 0
+        var latestBatchSQL = Set<String>()
+        context.db.beforeStatementStepForTesting = { sql in
+            if sql.contains("WHERE bot_id = ? ORDER BY updated_at DESC") {
+                singleConversationListSteps += 1
+            }
+            if sql.contains("SELECT bot_id, MAX(updated_at)"), sql.contains("WHERE bot_id IN (") {
+                latestBatchSQL.insert(sql)
+            }
+        }
+        vm.openActiveBots()
+        context.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(singleConversationListSteps, 0)
+        XCTAssertEqual(latestBatchSQL.count, 1)
+        XCTAssertEqual(vm.activeBotItems.count, 10)
+        XCTAssertEqual(
+            Dictionary(uniqueKeysWithValues: vm.activeBotItems.compactMap { item in
+                item.startedAt.map { (item.botID, $0) }
+            }),
+            expectedStartedAt
+        )
+    }
+
+    func test_activeBots_batchOnlyActiveHandoffOrigins_withoutScanningHistoricalRows() throws {
+        // WHY: the durable handoff snapshot retains terminal history. Opening
+        // Active Bots must discard that history before SQLite, batch only live
+        // origin existence checks, and preserve phase/orphan membership.
+        let context = try makeContext()
+        _ = context.botPeerHandoffAuthority
+        let origin = try context.botStore.create(
+            name: "Origin", title: "Controller", description: "", provider: .grok
+        )
+        let peer = try context.botStore.create(
+            name: "Peer", title: "Worker", description: "", provider: .grok
+        )
+        let hostOnlyOrigin = try context.botStore.create(
+            name: "Host", title: "Synthesizer", description: "", provider: .grok
+        )
+        let hostOnlyPeer = try context.botStore.create(
+            name: "Finished Peer", title: "Worker", description: "", provider: .grok
+        )
+        let legacyOrigin = try context.botStore.create(
+            name: "Legacy Origin", title: "Controller", description: "", provider: .grok
+        )
+        let legacyPeer = try context.botStore.create(
+            name: "Legacy Peer", title: "Worker", description: "", provider: .grok
+        )
+        let orphanOrigin = try context.botStore.create(
+            name: "Orphan Origin", title: "Controller", description: "", provider: .grok
+        )
+        let orphanPeer = try context.botStore.create(
+            name: "Orphan Peer", title: "Worker", description: "", provider: .grok
+        )
+        let historicalOrigin = try context.botStore.create(
+            name: "Historical Origin", title: "Controller", description: "", provider: .grok
+        )
+        let historicalPeer = try context.botStore.create(
+            name: "Historical Peer", title: "Worker", description: "", provider: .grok
+        )
+        let route = T005PeerHandoffRouteFixture(
+            provider: .grok,
+            providerInstanceID: nil,
+            model: "test",
+            permissionMode: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
+            runAsUser: AgentRunAsUser(
+                generatedUID: "active-handoff-batch",
+                shortName: "fixture",
+                uid: 0,
+                gid: 0,
+                homePath: "/tmp/active-handoff-batch"
+            ),
+            routingConfiguration: nil
+        )
+        func record(
+            originBotID: BotID?,
+            originConversationID: BotConversationID?,
+            peerBotID: BotID,
+            phase: BotPeerHandoffPhase,
+            index: Int
+        ) -> T005PeerHandoffRecordFixture {
+            let activityID = UUID()
+            return T005PeerHandoffRecordFixture(
+                version: 2,
+                activityID: activityID,
+                originBotID: originBotID,
+                originConversationID: originConversationID,
+                originAgentThreadID: nil,
+                peerBotID: peerBotID,
+                peerConversationID: BotConversationID(),
+                peerThreadID: nil,
+                peerRunID: nil,
+                inboundMessageID: activityID,
+                peerName: "Peer \(index)",
+                peerTitle: "Worker",
+                peerHandle: "peer-\(index)",
+                outboundText: "handoff \(index)",
+                createdAt: Date(timeIntervalSinceReferenceDate: Double(index)),
+                peerRoute: route,
+                hostThreadID: nil,
+                hostRunID: nil,
+                hostRoute: nil,
+                replyText: nil,
+                replyCreatedAt: nil,
+                phase: phase
+            )
+        }
+
+        var rows: [UUID: T005PeerHandoffRecordFixture] = [:]
+        for index in 0..<200 {
+            let conversation = BotConversation(
+                botID: origin.id,
+                title: "Active peer \(index)"
+            )
+            try context.botStore.upsertConversation(conversation)
+            let handoff = record(
+                originBotID: origin.id,
+                originConversationID: conversation.id,
+                peerBotID: peer.id,
+                phase: .peerRunning,
+                index: index
+            )
+            rows[handoff.activityID] = handoff
+        }
+        let hostConversation = BotConversation(botID: hostOnlyOrigin.id, title: "Active host")
+        try context.botStore.upsertConversation(hostConversation)
+        let hostHandoff = record(
+            originBotID: hostOnlyOrigin.id,
+            originConversationID: hostConversation.id,
+            peerBotID: hostOnlyPeer.id,
+            phase: .hostRunning,
+            index: 200
+        )
+        rows[hostHandoff.activityID] = hostHandoff
+        let legacyHandoff = record(
+            originBotID: legacyOrigin.id,
+            originConversationID: nil,
+            peerBotID: legacyPeer.id,
+            phase: .peerPrepared,
+            index: 201
+        )
+        rows[legacyHandoff.activityID] = legacyHandoff
+        let orphanHandoff = record(
+            originBotID: orphanOrigin.id,
+            originConversationID: BotConversationID(),
+            peerBotID: orphanPeer.id,
+            phase: .peerRunning,
+            index: 202
+        )
+        rows[orphanHandoff.activityID] = orphanHandoff
+        for index in 0..<500 {
+            let handoff = record(
+                originBotID: historicalOrigin.id,
+                originConversationID: BotConversationID(),
+                peerBotID: historicalPeer.id,
+                phase: index.isMultiple(of: 2) ? .completed : .needsAttention,
+                index: 1_000 + index
+            )
+            rows[handoff.activityID] = handoff
+        }
+        let payload = try JSONEncoder().encode(rows)
+        UserDefaults.standard.set(payload, forKey: "bots.peerTurns.v2")
+        try context.settingsRepo.set(
+            "bots.peerTurns.v2",
+            "base64:\(payload.base64EncodedString())"
+        )
+        _ = context.botPeerHandoffAuthority.delegatedBotID(forHostRunID: AgentRunID())
+        let vm = BotsViewModel(context: context)
+        let restoredHandoffs = vm.peerHandoffSnapshotsForTesting()
+        XCTAssertEqual(restoredHandoffs.count, rows.count)
+        XCTAssertEqual(restoredHandoffs.filter { $0.phase == .peerRunning }.count, 201)
+        XCTAssertEqual(restoredHandoffs.filter { $0.phase == .hostRunning }.count, 1)
+        XCTAssertEqual(restoredHandoffs.filter { $0.phase == .completed }.count, 250)
+        XCTAssertEqual(restoredHandoffs.filter { $0.phase == .needsAttention }.count, 250)
+
+        var singleConversationSteps = 0
+        var originBatchSQL = Set<String>()
+        context.db.beforeStatementStepForTesting = { sql in
+            if sql.contains("FROM bot_conversations"), sql.contains("WHERE id = ? LIMIT 1") {
+                singleConversationSteps += 1
+            }
+            if sql.contains("FROM bot_conversations"), sql.contains("WHERE id IN (") {
+                originBatchSQL.insert(sql)
+            }
+        }
+        vm.openActiveBots()
+        context.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(singleConversationSteps, 0, "historical and active handoffs must not point-query")
+        XCTAssertEqual(originBatchSQL.count, 2, "202 live origin IDs must use bounded chunks")
+        XCTAssertEqual(originBatchSQL.map { $0.filter { $0 == "?" }.count }.max(), 200)
+        XCTAssertEqual(
+            Set(vm.activeBotItems.map(\.botID)),
+            [origin.id, peer.id, hostOnlyOrigin.id, legacyOrigin.id, legacyPeer.id]
+        )
+        XCTAssertFalse(vm.activeBotItems.map(\.botID).contains(hostOnlyPeer.id))
+        XCTAssertFalse(vm.activeBotItems.map(\.botID).contains(orphanOrigin.id))
+        XCTAssertFalse(vm.activeBotItems.map(\.botID).contains(orphanPeer.id))
+        XCTAssertFalse(vm.activeBotItems.map(\.botID).contains(historicalOrigin.id))
+        XCTAssertFalse(vm.activeBotItems.map(\.botID).contains(historicalPeer.id))
     }
 
     func test_activeBotItemsClearWhenRunFinishes_becauseChipMustMatchFooter() throws {
@@ -5425,6 +6279,7 @@ final class BotsWindowTests: XCTestCase {
         vm.studioDraft.title = "Research lead"
         vm.studioDraft.soul = "Stand up for the brief."
         XCTAssertTrue(vm.studioHasUnpublishedChanges)
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
 
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.screen, .studio)
@@ -6046,6 +6901,112 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(inserts.contains("/sam-work"))
         XCTAssertTrue(inserts.contains("/sam-codex-advisor"))
         XCTAssertTrue(vm.composerSuggestions.contains { $0.kind == .skill })
+    }
+
+    func test_claudeComposerCachesUntilCatalogChanges_becauseTypingMustStayFastAndFresh() throws {
+        // WHY: SwiftUI reevaluates composer suggestions while the user types.
+        // Repeated reads of one catalog (including an empty one) must reuse
+        // discovery, while the short freshness bound must also catch skill
+        // manifests installed or removed inside a pre-existing directory.
+        let home = URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent("claude-home", isDirectory: true)
+        let skills = home.appendingPathComponent(".claude/skills", isDirectory: true)
+        let commands = home.appendingPathComponent(".claude/commands", isDirectory: true)
+        try FileManager.default.createDirectory(at: skills, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+
+        func installSkill(_ name: String) throws {
+            let skill = skills.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: skill, withIntermediateDirectories: true)
+            try Data("# \(name)".utf8).write(to: skill.appendingPathComponent("SKILL.md"))
+        }
+
+        try installSkill("sam-work")
+        let stagedSkill = skills.appendingPathComponent("sam-new", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagedSkill, withIntermediateDirectories: true)
+        let oldCommand = commands.appendingPathComponent("old-command.md")
+        try Data("# old".utf8).write(to: oldCommand)
+
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller")
+        vm.openDesk(piper)
+        vm.setDeskProvider(.claude)
+        var discoveryCount = 0
+        var cacheTime: TimeInterval = 100
+        vm.claudeSlashCatalogRevisionForTesting = { _ in
+            BotsViewModel.claudeSlashCatalogRevision(home: home.path)
+        }
+        vm.claudeSlashCacheTimeForTesting = { cacheTime }
+        vm.claudeSlashDiscoveryForTesting = { _ in
+            discoveryCount += 1
+            return ClaudeSlashCommandDiscovery.discover(cwd: nil, home: home.path)
+        }
+
+        vm.composerText = "/sam"
+        let first = vm.composerSuggestions
+        vm.composerText = "/sam-w"
+        let second = vm.composerSuggestions
+
+        XCTAssertEqual(discoveryCount, 1)
+        XCTAssertTrue(first.contains { $0.insertText == "/sam-work " })
+        XCTAssertTrue(second.contains { $0.insertText == "/sam-work " })
+
+        let beforeInstall = BotsViewModel.claudeSlashCatalogRevision(home: home.path)
+        try Data("# sam-new".utf8).write(to: stagedSkill.appendingPathComponent("SKILL.md"))
+        XCTAssertEqual(
+            BotsViewModel.claudeSlashCatalogRevision(home: home.path),
+            beforeInstall,
+            "writing SKILL.md inside an existing skill directory does not mutate the parent revision"
+        )
+        vm.composerText = "/sam-n"
+        XCTAssertFalse(vm.composerSuggestions.contains { $0.insertText == "/sam-new " })
+        XCTAssertEqual(discoveryCount, 1, "a stable fingerprint must remain a per-keystroke cache hit before TTL")
+
+        cacheTime += 2
+        let refreshed = vm.composerSuggestions
+        XCTAssertEqual(discoveryCount, 2)
+        XCTAssertTrue(refreshed.contains { $0.insertText == "/sam-new " })
+
+        let beforeManifestRemoval = BotsViewModel.claudeSlashCatalogRevision(home: home.path)
+        try FileManager.default.removeItem(at: stagedSkill.appendingPathComponent("SKILL.md"))
+        XCTAssertEqual(
+            BotsViewModel.claudeSlashCatalogRevision(home: home.path),
+            beforeManifestRemoval,
+            "removing only SKILL.md also leaves the parent revision unchanged"
+        )
+        XCTAssertTrue(vm.composerSuggestions.contains { $0.insertText == "/sam-new " })
+        XCTAssertEqual(discoveryCount, 2)
+        cacheTime += 2
+        XCTAssertFalse(vm.composerSuggestions.contains { $0.insertText == "/sam-new " })
+        XCTAssertEqual(discoveryCount, 3, "TTL must bound stale nested-manifest results")
+
+        let beforeCommandRemoval = BotsViewModel.claudeSlashCatalogRevision(home: home.path)
+        try FileManager.default.removeItem(at: oldCommand)
+        XCTAssertNotEqual(
+            BotsViewModel.claudeSlashCatalogRevision(home: home.path),
+            beforeCommandRemoval,
+            "removing a normal ~/.claude/commands/<name>.md file must invalidate the cache"
+        )
+        vm.composerText = "/old"
+        XCTAssertFalse(vm.composerSuggestions.contains { $0.insertText == "/old-command " })
+        XCTAssertEqual(discoveryCount, 4)
+
+        try FileManager.default.removeItem(at: skills.appendingPathComponent("sam-work"))
+        try FileManager.default.removeItem(at: stagedSkill)
+        vm.composerText = "/sam"
+        XCTAssertFalse(vm.composerSuggestions.contains { $0.kind == .skill })
+        _ = vm.composerSuggestions
+        XCTAssertEqual(discoveryCount, 5,
+            "a stable empty catalog must not rescan once per composer reevaluation")
+        cacheTime += 2
+        _ = vm.composerSuggestions
+        XCTAssertEqual(discoveryCount, 6,
+            "an empty or transiently failed discovery must be retried after the short TTL")
+
+        vm.setDeskProvider(.grok)
+        _ = vm.composerSuggestions
+        XCTAssertEqual(discoveryCount, 6, "non-Claude providers must not touch the Claude filesystem")
     }
 
     func test_deskApplyComposerSuggestionUsesCursorOffset() throws {
@@ -10571,6 +11532,7 @@ final class BotsWindowTests: XCTestCase {
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         vm.openDesk(bot)
         vm.composerText = "keep after relaunch"
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.selectedBotID, bot.id)
         XCTAssertEqual(reopened.screen, .desk)
@@ -10640,6 +11602,7 @@ final class BotsWindowTests: XCTestCase {
         vm.routineName = "Morning scan"
         vm.routinePrompt = "Scan overnight"
         vm.routineScheduleNote = "Weekdays 9:00"
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.selectedBotID, bot.id)
         XCTAssertEqual(reopened.memoryDraft, "keep inspector after relaunch")
@@ -10648,6 +11611,547 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(reopened.routinePrompt, "Scan overnight")
         XCTAssertEqual(reopened.routineScheduleNote, "Weekdays 9:00")
         XCTAssertTrue(reopened.memoryItems.isEmpty, "relaunch must restore the draft, not save it")
+    }
+
+    func test_draftPersistenceCoalescesUntilFakeClockDeadline_becauseTypingMustNotWritePerCharacter() throws {
+        // WHY: a 25 Hz editor must update visible/in-memory state immediately
+        // without rebuilding and writing the full 50-row JSON envelope per key.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        vm.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        vm.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        vm.resetDraftPersistenceMetricsForTesting()
+
+        for _ in 0..<6 {
+            vm.composerText.append("x")
+            clock.advance(byNanoseconds: 40_000_000)
+        }
+        XCTAssertEqual(vm.composerText, "xxxxxx", "the in-memory draft must be immediate")
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 0)
+        XCTAssertEqual(clock.pendingCount, 1)
+
+        clock.advance(byNanoseconds: 10_000_000)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.encodeCount, 1)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 1)
+        let data = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        let stored = try JSONDecoder().decode([String: BotComposerDraft].self, from: data)
+        XCTAssertEqual(stored[bot.id.value.uuidString.lowercased()]?.text, "xxxxxx")
+    }
+
+    func test_pendingDraftsFlushBeforeBotSwitch_becauseOwnershipMustNotLeakOrLoseWork() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.")
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", soul: "Be exact.")
+        vm.openStudio(piper)
+        vm.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        vm.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        vm.resetDraftPersistenceMetricsForTesting()
+        vm.composerText = "Piper composer"
+        vm.memoryDraft = "Piper memory"
+        vm.studioDraft.title = "Piper draft title"
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 0)
+
+        vm.openDesk(quinn)
+
+        XCTAssertEqual(vm.composerText, "")
+        XCTAssertEqual(vm.memoryDraft, "")
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.encodeCount, 3)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 3)
+        let decoder = JSONDecoder()
+        let composer = try decoder.decode(
+            [String: BotComposerDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        )
+        let inspector = try decoder.decode(
+            [String: BotInspectorDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+        )
+        let studio = try decoder.decode(
+            [String: BotStudioDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+        )
+        let key = piper.id.value.uuidString.lowercased()
+        XCTAssertEqual(composer[key]?.text, "Piper composer")
+        XCTAssertEqual(inspector[key]?.memoryDraft, "Piper memory")
+        XCTAssertEqual(studio[key]?.title, "Piper draft title")
+    }
+
+    func test_sendAndSaveSynchronouslyFlushPendingDraftState_becauseCommittedTextMustNotReturn() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.")
+        vm.openDesk(bot)
+        vm.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        vm.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+
+        vm.composerText = "send then forget"
+        XCTAssertTrue(vm.send())
+        XCTAssertNil(
+            UserDefaults.standard.data(forKey: "bots.composerDrafts"),
+            "Send must synchronously remove the consumed draft"
+        )
+
+        vm.beginEdit(bot)
+        vm.studioDraft.title = "Published title"
+        _ = try vm.saveStudio()
+        let studioData = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+        let studio = try JSONDecoder().decode([String: BotStudioDraft].self, from: studioData)
+        XCTAssertEqual(studio[bot.id.value.uuidString.lowercased()]?.title, "Published title")
+
+        let writes = vm.draftPersistenceMetricsForTesting.setCount
+        clock.advance(byNanoseconds: 1_000_000_000)
+        XCTAssertEqual(
+            vm.draftPersistenceMetricsForTesting.setCount,
+            writes,
+            "a cancelled deadline must not write a second time after explicit flush"
+        )
+    }
+
+    func test_hideCloseAndQuitFlushPendingDrafts_becauseLifecycleMustPreserveLatestText() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", soul: "Be brief.")
+        vm.beginEdit(bot)
+        vm.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        vm.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        vm.resetDraftPersistenceMetricsForTesting()
+
+        vm.studioDraft.title = "Before hide"
+        NotificationCenter.default.post(name: NSApplication.willHideNotification, object: nil)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 1)
+
+        vm.studioDraft.title = "Before close"
+        NotificationCenter.default.post(name: NSWindow.willCloseNotification, object: nil)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 2)
+
+        vm.studioDraft.title = "Before quit"
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.setCount, 3)
+        let data = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+        let stored = try JSONDecoder().decode([String: BotStudioDraft].self, from: data)
+        XCTAssertEqual(stored[bot.id.value.uuidString.lowercased()]?.title, "Before quit")
+    }
+
+    func test_olderPendingDraftFromAnotherViewModelCannotReplaceNewerCommittedText() throws {
+        // WHY: Desk, sidebar, and guest windows share one AppContext. A delayed
+        // write from an older surface must not undo text already committed by a
+        // newer surface for the same bot.
+        let context = try makeContext()
+        let older = BotsViewModel(context: context)
+        let bot = try older.create(name: "Piper", title: "Scout")
+        older.beginEdit(bot)
+        let newer = BotsViewModel(context: context)
+        newer.beginEdit(bot)
+        older.flushDraftPersistenceForTesting()
+        newer.flushDraftPersistenceForTesting()
+
+        let olderClock = BotDraftManualClock()
+        older.draftPersistenceScheduleForTesting = { delay, action in
+            olderClock.schedule(afterNanoseconds: delay, action)
+        }
+        older.composerText = "older pending"
+        older.memoryDraft = "older memory"
+        older.studioDraft.title = "Older title"
+        newer.composerText = "newer committed"
+        newer.memoryDraft = "newer memory"
+        newer.studioDraft.title = "Newer title"
+        newer.flushDraftPersistenceForTesting()
+        older.flushDraftPersistenceForTesting()
+
+        let decoder = JSONDecoder()
+        let composer = try decoder.decode(
+            [String: BotComposerDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        )
+        let inspector = try decoder.decode(
+            [String: BotInspectorDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+        )
+        let studio = try decoder.decode(
+            [String: BotStudioDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+        )
+        let key = bot.id.value.uuidString.lowercased()
+        XCTAssertEqual(composer[key]?.text, "newer committed")
+        XCTAssertEqual(inspector[key]?.memoryDraft, "newer memory")
+        XCTAssertEqual(studio[key]?.title, "Newer title")
+    }
+
+    func test_differentBotDraftsFromDifferentViewModelsPersistAsOneUnion() throws {
+        // WHY: independent windows may edit different teammates concurrently;
+        // persisting either surface must preserve the other teammate's work.
+        let context = try makeContext()
+        let first = BotsViewModel(context: context)
+        let piper = try first.create(name: "Piper", title: "Scout")
+        let quinn = try first.create(name: "Quinn", title: "Reviewer")
+        let second = BotsViewModel(context: context)
+        first.beginEdit(piper)
+        second.beginEdit(quinn)
+        first.flushDraftPersistenceForTesting()
+        second.flushDraftPersistenceForTesting()
+
+        first.composerText = "Piper unfinished"
+        first.memoryDraft = "Piper memory"
+        first.studioDraft.title = "Piper title"
+        second.composerText = "Quinn unfinished"
+        second.memoryDraft = "Quinn memory"
+        second.studioDraft.title = "Quinn title"
+        first.flushDraftPersistenceForTesting()
+        second.flushDraftPersistenceForTesting()
+
+        let decoder = JSONDecoder()
+        let composer = try decoder.decode(
+            [String: BotComposerDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        )
+        let inspector = try decoder.decode(
+            [String: BotInspectorDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+        )
+        let studio = try decoder.decode(
+            [String: BotStudioDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+        )
+        let piperKey = piper.id.value.uuidString.lowercased()
+        let quinnKey = quinn.id.value.uuidString.lowercased()
+        XCTAssertEqual(composer[piperKey]?.text, "Piper unfinished")
+        XCTAssertEqual(composer[quinnKey]?.text, "Quinn unfinished")
+        XCTAssertEqual(inspector[piperKey]?.memoryDraft, "Piper memory")
+        XCTAssertEqual(inspector[quinnKey]?.memoryDraft, "Quinn memory")
+        XCTAssertEqual(studio[piperKey]?.title, "Piper title")
+        XCTAssertEqual(studio[quinnKey]?.title, "Quinn title")
+    }
+
+    func test_staleEmptyDraftFromAnotherViewModelCannotDeleteNewerText() throws {
+        // WHY: an empty local snapshot is a real tombstone only at the moment
+        // the user clears it; it must not erase a later edit from another window.
+        let context = try makeContext()
+        let stale = BotsViewModel(context: context)
+        let bot = try stale.create(name: "Piper", title: "Scout")
+        stale.openDesk(bot)
+        let newer = BotsViewModel(context: context)
+        newer.openDesk(bot)
+        stale.flushDraftPersistenceForTesting()
+        newer.flushDraftPersistenceForTesting()
+
+        stale.composerText = "temporary"
+        stale.composerText = ""
+        newer.composerText = "newer survives"
+        newer.flushDraftPersistenceForTesting()
+        stale.flushDraftPersistenceForTesting()
+
+        let stored = try JSONDecoder().decode(
+            [String: BotComposerDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        )
+        XCTAssertEqual(stored[bot.id.value.uuidString.lowercased()]?.text, "newer survives")
+    }
+
+    func test_staleViewModelNavigationCannotRecaptureOlderComposerOrInspectorDraft() throws {
+        // WHY: Desk, sidebar, and guest windows can keep local fields for the
+        // same bot. Navigation from a stale window must not turn those fields
+        // into a newer edit that replaces another window's immediate changes.
+        let context = try makeContext()
+        let stale = BotsViewModel(context: context)
+        let piper = try stale.create(name: "Piper", title: "Scout")
+        let quinn = try stale.create(name: "Quinn", title: "Reviewer")
+        stale.beginEdit(piper)
+        stale.composerText = "older composer"
+        stale.memoryDraft = "older inspector"
+        stale.flushDraftPersistenceForTesting()
+
+        let newer = BotsViewModel(context: context)
+        newer.beginEdit(piper)
+        let clock = BotDraftManualClock()
+        stale.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        newer.composerText = "newer composer"
+        newer.memoryDraft = "newer inspector"
+
+        stale.openDesk(quinn)
+
+        XCTAssertEqual(
+            context.botDraftPersistenceAuthority.composerDraftsByBot[piper.id]?.text,
+            "newer composer"
+        )
+        XCTAssertEqual(
+            context.botDraftPersistenceAuthority.inspectorDraftsByBot[piper.id]?.memoryDraft,
+            "newer inspector"
+        )
+        let decoder = JSONDecoder()
+        let composer = try decoder.decode(
+            [String: BotComposerDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+        )
+        let inspector = try decoder.decode(
+            [String: BotInspectorDraft].self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+        )
+        let key = piper.id.value.uuidString.lowercased()
+        XCTAssertEqual(composer[key]?.text, "newer composer")
+        XCTAssertEqual(inspector[key]?.memoryDraft, "newer inspector")
+    }
+
+    func test_hideCloseAndQuitWithMultipleViewModelsWriteSharedFinalStateOnce() throws {
+        // WHY: every real surface sees app/window lifecycle notifications. One
+        // AppContext owner must persist the union exactly once, independent of
+        // NotificationCenter observer ordering.
+        let context = try makeContext()
+        let first = BotsViewModel(context: context)
+        let piper = try first.create(name: "Piper", title: "Scout")
+        let quinn = try first.create(name: "Quinn", title: "Reviewer")
+        let second = BotsViewModel(context: context)
+        first.beginEdit(piper)
+        second.beginEdit(quinn)
+        first.flushDraftPersistenceForTesting()
+        second.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        first.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        let events: [(Notification.Name, String)] = [
+            (NSApplication.willHideNotification, "hide"),
+            (NSWindow.willCloseNotification, "close"),
+            (NSApplication.willTerminateNotification, "quit"),
+        ]
+
+        for (name, label) in events {
+            first.composerText = "Piper before \(label)"
+            first.memoryDraft = "Piper memory before \(label)"
+            first.studioDraft.title = "Piper title before \(label)"
+            second.composerText = "Quinn before \(label)"
+            second.memoryDraft = "Quinn memory before \(label)"
+            second.studioDraft.title = "Quinn title before \(label)"
+            first.resetDraftPersistenceMetricsForTesting()
+            NotificationCenter.default.post(name: name, object: nil)
+
+            XCTAssertEqual(first.draftPersistenceMetricsForTesting.setCount, 3, label)
+            XCTAssertEqual(second.draftPersistenceMetricsForTesting.setCount, 3, label)
+            let decoder = JSONDecoder()
+            let composer = try decoder.decode(
+                [String: BotComposerDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+            )
+            let inspector = try decoder.decode(
+                [String: BotInspectorDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+            )
+            let studio = try decoder.decode(
+                [String: BotStudioDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+            )
+            let piperKey = piper.id.value.uuidString.lowercased()
+            let quinnKey = quinn.id.value.uuidString.lowercased()
+            XCTAssertEqual(
+                composer[piperKey]?.text,
+                "Piper before \(label)"
+            )
+            XCTAssertEqual(
+                composer[quinnKey]?.text,
+                "Quinn before \(label)"
+            )
+            XCTAssertEqual(inspector[piperKey]?.memoryDraft, "Piper memory before \(label)")
+            XCTAssertEqual(inspector[quinnKey]?.memoryDraft, "Quinn memory before \(label)")
+            XCTAssertEqual(studio[piperKey]?.title, "Piper title before \(label)")
+            XCTAssertEqual(studio[quinnKey]?.title, "Quinn title before \(label)")
+        }
+    }
+
+    /// Paired proof for the three per-keystroke UserDefaults paths. Fifty rows
+    /// is the production Bot cap; 500 mutations represent 20 seconds at 25 Hz.
+    func test_microbenchDraftPersistenceCoalescingReducesRealWrites() throws {
+        let context = try makeContext()
+        var bots: [BotDefinition] = []
+        for index in 0..<BotDefinition.liveAccountCap {
+            bots.append(try context.botStore.create(
+                name: "Draft Bot \(index)",
+                title: "Production operations teammate \(index)",
+                description: "Owns a realistic account workflow and keeps a concise handoff for the next shift.",
+                soul: String(repeating: "Operate carefully, cite evidence, and preserve unfinished user work. ", count: 8)
+            ))
+        }
+        let target = try XCTUnwrap(bots.last)
+        let encoder = JSONEncoder()
+        let composerPayload = Dictionary(uniqueKeysWithValues: bots.enumerated().map { index, bot in
+            (bot.id.value.uuidString.lowercased(), BotComposerDraft(
+                text: "Draft \(index): " + String(repeating: "check the deployment evidence before reporting completion. ", count: 6)
+            ))
+        })
+        let inspectorPayload = Dictionary(uniqueKeysWithValues: bots.enumerated().map { index, bot in
+            (bot.id.value.uuidString.lowercased(), BotInspectorDraft(
+                memoryDraft: "Customer \(index) prefers a written audit trail.",
+                skillDraft: "release-verification-\(index)",
+                routineName: "Morning account review \(index)",
+                routinePrompt: String(repeating: "Review alerts, reconcile ownership, and list blockers. ", count: 5),
+                routineScheduleNote: "Weekdays at 09:00",
+                routineSpec: BotScheduleSpec()
+            ))
+        })
+        let studioPayload = Dictionary(uniqueKeysWithValues: bots.enumerated().map { index, bot in
+            (bot.id.value.uuidString.lowercased(), BotStudioDraft(
+                botID: bot.id,
+                name: bot.name,
+                title: bot.title,
+                description: bot.description,
+                handle: bot.handle,
+                avatarSymbol: bot.avatarSymbol,
+                soul: String(repeating: "Keep the owner informed, verify final state, and fail loud on uncertainty. ", count: 10),
+                notificationsEnabled: bot.notificationsEnabled,
+                expectedRevisionID: bot.currentRevisionID
+            ))
+        })
+        let composerData = try encoder.encode(composerPayload)
+        let inspectorData = try encoder.encode(inspectorPayload)
+        let studioData = try encoder.encode(studioPayload)
+        let targetKey = target.id.value.uuidString.lowercased()
+        let expectedComposer = try XCTUnwrap(composerPayload[targetKey]).text
+            + String(repeating: "c", count: 200)
+        let expectedStudioSoul = try XCTUnwrap(studioPayload[targetKey]).soul
+            + String(repeating: "s", count: 150)
+        let expectedRoutinePrompt = try XCTUnwrap(inspectorPayload[targetKey]).routinePrompt
+            + String(repeating: "i", count: 150)
+
+        func measure(eager: Bool) throws -> (
+            wallMs: Double,
+            cpuMs: Double,
+            metrics: BotDraftPersistenceMetrics
+        ) {
+            UserDefaults.standard.set(composerData, forKey: "bots.composerDrafts")
+            UserDefaults.standard.set(inspectorData, forKey: "bots.inspectorDrafts")
+            UserDefaults.standard.set(studioData, forKey: "bots.studioDraft")
+            UserDefaults.standard.set(targetKey, forKey: "bots.selectedBotID")
+            UserDefaults.standard.set(BotsScreen.studio.rawValue, forKey: "bots.screen")
+            context.botDraftPersistenceAuthority.reloadFromUserDefaultsForTesting()
+            let vm = BotsViewModel(context: context)
+            vm.flushDraftPersistenceForTesting()
+            let clock = BotDraftManualClock()
+            if eager {
+                vm.draftPersistenceScheduleForTesting = { _, action in action() }
+            } else {
+                vm.draftPersistenceScheduleForTesting = { delay, action in
+                    clock.schedule(afterNanoseconds: delay, action)
+                }
+            }
+            vm.resetDraftPersistenceMetricsForTesting()
+            let cpuStart = Self.processCPUNanoseconds()
+            let wallStart = DispatchTime.now().uptimeNanoseconds
+            Self.performDraftTypingWorkload(vm) {
+                clock.advance(byNanoseconds: 40_000_000)
+            }
+            vm.flushDraftPersistenceForTesting()
+            let wallEnd = DispatchTime.now().uptimeNanoseconds
+            let cpuEnd = Self.processCPUNanoseconds()
+
+            let decoder = JSONDecoder()
+            let storedComposer = try decoder.decode(
+                [String: BotComposerDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
+            )
+            let storedInspector = try decoder.decode(
+                [String: BotInspectorDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.inspectorDrafts"))
+            )
+            let storedStudio = try decoder.decode(
+                [String: BotStudioDraft].self,
+                from: XCTUnwrap(UserDefaults.standard.data(forKey: "bots.studioDraft"))
+            )
+            XCTAssertEqual(storedComposer.count, BotDefinition.liveAccountCap)
+            XCTAssertEqual(storedInspector.count, BotDefinition.liveAccountCap)
+            XCTAssertEqual(storedStudio.count, BotDefinition.liveAccountCap)
+            XCTAssertEqual(storedComposer[targetKey]?.text, expectedComposer)
+            XCTAssertEqual(storedInspector[targetKey]?.routinePrompt, expectedRoutinePrompt)
+            XCTAssertEqual(storedStudio[targetKey]?.soul, expectedStudioSoul)
+            return (
+                Double(wallEnd - wallStart) / 1_000_000,
+                Double(cpuEnd - cpuStart) / 1_000_000,
+                vm.draftPersistenceMetricsForTesting
+            )
+        }
+
+        for index in 0..<2 {
+            if index.isMultiple(of: 2) {
+                _ = try measure(eager: true)
+                _ = try measure(eager: false)
+            } else {
+                _ = try measure(eager: false)
+                _ = try measure(eager: true)
+            }
+        }
+        var eagerSamples: [(wallMs: Double, cpuMs: Double, metrics: BotDraftPersistenceMetrics)] = []
+        var coalescedSamples: [(wallMs: Double, cpuMs: Double, metrics: BotDraftPersistenceMetrics)] = []
+        for index in 0..<5 {
+            if index.isMultiple(of: 2) {
+                eagerSamples.append(try measure(eager: true))
+                coalescedSamples.append(try measure(eager: false))
+            } else {
+                coalescedSamples.append(try measure(eager: false))
+                eagerSamples.append(try measure(eager: true))
+            }
+        }
+        XCTAssertTrue(eagerSamples.allSatisfy { $0.metrics.encodeCount == 500 })
+        XCTAssertTrue(eagerSamples.allSatisfy { $0.metrics.setCount == 500 })
+        XCTAssertTrue(coalescedSamples.allSatisfy { $0.metrics.encodeCount > 0 && $0.metrics.encodeCount < 100 })
+        XCTAssertTrue(coalescedSamples.allSatisfy { $0.metrics.setCount == $0.metrics.encodeCount })
+
+        func median(_ values: [Double]) -> Double {
+            values.sorted()[values.count / 2]
+        }
+        func reduction(before: Double, after: Double) -> Double {
+            (before - after) / before * 100
+        }
+        let wallReduction = reduction(
+            before: median(eagerSamples.map(\.wallMs)),
+            after: median(coalescedSamples.map(\.wallMs))
+        )
+        let cpuReduction = reduction(
+            before: median(eagerSamples.map(\.cpuMs)),
+            after: median(coalescedSamples.map(\.cpuMs))
+        )
+        let setReduction = reduction(
+            before: median(eagerSamples.map { Double($0.metrics.setCount) }),
+            after: median(coalescedSamples.map { Double($0.metrics.setCount) })
+        )
+        let encodedBytesReduction = reduction(
+            before: median(eagerSamples.map { Double($0.metrics.encodedBytes) }),
+            after: median(coalescedSamples.map { Double($0.metrics.encodedBytes) })
+        )
+        XCTAssertGreaterThan(wallReduction, 5)
+        XCTAssertGreaterThan(cpuReduction, 5)
+        XCTAssertGreaterThan(setReduction, 5)
+        XCTAssertGreaterThan(encodedBytesReduction, 5)
+        NSLog(
+            "[perf-proof] botDraftPersistence paired=true drafts=50 chars=500 cadence_hz=25 warmup=2 n=5 eager_wall_ms=%@ coalesced_wall_ms=%@ eager_cpu_ms=%@ coalesced_cpu_ms=%@ eager_encode_count=%@ coalesced_encode_count=%@ eager_set_count=%@ coalesced_set_count=%@ eager_encoded_bytes_proxy=%@ coalesced_encoded_bytes_proxy=%@ wall_reduction_pct=%.2f cpu_reduction_pct=%.2f set_reduction_pct=%.2f encoded_bytes_reduction_pct=%.2f",
+            String(describing: eagerSamples.map(\.wallMs)),
+            String(describing: coalescedSamples.map(\.wallMs)),
+            String(describing: eagerSamples.map(\.cpuMs)),
+            String(describing: coalescedSamples.map(\.cpuMs)),
+            String(describing: eagerSamples.map(\.metrics.encodeCount)),
+            String(describing: coalescedSamples.map(\.metrics.encodeCount)),
+            String(describing: eagerSamples.map(\.metrics.setCount)),
+            String(describing: coalescedSamples.map(\.metrics.setCount)),
+            String(describing: eagerSamples.map(\.metrics.encodedBytes)),
+            String(describing: coalescedSamples.map(\.metrics.encodedBytes)),
+            wallReduction,
+            cpuReduction,
+            setReduction,
+            encodedBytesReduction
+        )
     }
 
     func test_studioScheduleSpecStaysOnOwningBot_becauseFrequencyMustNotLeak() throws {
@@ -10699,6 +12203,7 @@ final class BotsWindowTests: XCTestCase {
         vm.routineSpec.localTimeHour = 9
         vm.routineSpec.localTimeMinute = 0
         vm.routineSpec.provider = .grok
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
         let reopened = BotsViewModel(context: context)
         XCTAssertEqual(reopened.selectedBotID, bot.id)
         XCTAssertEqual(reopened.routineName, "QA morning scan")
@@ -12582,6 +14087,57 @@ final class BotsWindowTests: XCTestCase {
         let eventCount: Int
     }
 
+    private struct DeskReplayFixture {
+        let context: AppContext
+        let viewModel: BotsViewModel
+        let bot: BotDefinition
+        let thread: AgentThread
+        let run: AgentRun
+    }
+
+    private func makeDeskReplayFixture() throws -> DeskReplayFixture {
+        let context = try makeContext()
+        let viewModel = BotsViewModel(context: context)
+        let bot = try viewModel.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Watermark", provider: .claude, model: "opus")
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .completed,
+            startedAt: Date(),
+            finishedAt: Date()
+        )
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(run)
+        try persistStreamEvents(
+            context: context,
+            run: run,
+            events: [
+                .turnStarted(turnId: "t-watermark"),
+                .itemStarted(item: AssistantItem(
+                    id: "r-watermark",
+                    turnId: "t-watermark",
+                    type: .reasoning,
+                    state: .streaming,
+                    body: "seed",
+                    startedAtMs: 10
+                )),
+            ]
+        )
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Watermark", linkedAgentThreadID: thread.id)
+        )
+        viewModel.openDesk(bot)
+        return DeskReplayFixture(
+            context: context,
+            viewModel: viewModel,
+            bot: bot,
+            thread: thread,
+            run: run
+        )
+    }
+
     @discardableResult
     private func seedLinkedTurn(
         context: AppContext,
@@ -12816,6 +14372,29 @@ final class BotsWindowTests: XCTestCase {
         return sorted[index]
     }
 
+    private static func performDraftTypingWorkload(
+        _ vm: BotsViewModel,
+        advanceCadence: () -> Void
+    ) {
+        for index in 0..<500 {
+            switch index {
+            case 0..<200:
+                vm.composerText.append("c")
+            case 200..<350:
+                vm.studioDraft.soul.append("s")
+            default:
+                vm.routinePrompt.append("i")
+            }
+            advanceCadence()
+        }
+    }
+
+    private static func processCPUNanoseconds() -> UInt64 {
+        var value = timespec()
+        precondition(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value) == 0)
+        return UInt64(value.tv_sec) * 1_000_000_000 + UInt64(value.tv_nsec)
+    }
+
     private func makeContext() throws -> AppContext {
         try AppContext(channel: .debug, appSupportOverride: directory)
     }
@@ -12924,6 +14503,36 @@ final class BotsWindowTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent(relative)
+    }
+}
+
+@MainActor
+private final class BotDraftManualClock {
+    private struct Scheduled {
+        let deadlineNanoseconds: UInt64
+        let action: () -> Void
+    }
+
+    private var nowNanoseconds: UInt64 = 0
+    private var scheduled: [Scheduled] = []
+
+    var pendingCount: Int { scheduled.count }
+
+    func schedule(afterNanoseconds delay: UInt64, _ action: @escaping () -> Void) {
+        scheduled.append(Scheduled(
+            deadlineNanoseconds: nowNanoseconds + delay,
+            action: action
+        ))
+    }
+
+    func advance(byNanoseconds delta: UInt64) {
+        nowNanoseconds += delta
+        while let index = scheduled.indices.first(where: {
+            scheduled[$0].deadlineNanoseconds <= nowNanoseconds
+        }) {
+            let action = scheduled.remove(at: index).action
+            action()
+        }
     }
 }
 

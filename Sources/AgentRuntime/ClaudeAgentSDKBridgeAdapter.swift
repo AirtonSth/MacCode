@@ -615,10 +615,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
         lock.lock(); defer { lock.unlock() }
         if let session = sessions[threadId] {
-            return session.events
+            return Array(session.events.suffix(maxReadableEvents))
         }
         if let events = recoveredEvents[threadId] {
-            return events
+            return Array(events.suffix(maxReadableEvents))
         }
         throw AgentProviderAdapterError.sessionNotFound(threadId)
     }
@@ -2045,10 +2045,32 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     private func record(_ event: AssistantEvent, session: Session) {
         lock.lock()
         session.events.append(event)
-        if session.events.count > maxReadableEvents {
-            session.events = Array(session.events.suffix(maxReadableEvents))
+        if let pruned = Self.prunedReadableEvents(
+            session.events,
+            cap: maxReadableEvents,
+            slack: Self.readableEventPruneSlack
+        ) {
+            session.events = pruned
         }
         lock.unlock()
+    }
+
+    /// Keep the public readable window exact while allowing enough internal
+    /// slack to amortize the suffix copy. Without slack, every streamed event
+    /// after the cap copied all 5,000 retained events under the adapter lock.
+    static let readableEventPruneSlack = 1_024
+
+    /// Returns a new bounded suffix only after the internal buffer crosses its
+    /// high-water mark. A nil result leaves the append O(1).
+    nonisolated static func prunedReadableEvents(
+        _ events: [AssistantEvent],
+        cap: Int,
+        slack: Int
+    ) -> [AssistantEvent]? {
+        let boundedCap = max(1, cap)
+        let boundedSlack = max(0, slack)
+        guard events.count > boundedCap + boundedSlack else { return nil }
+        return Array(events.suffix(boundedCap))
     }
 
     private func emitSessionSnapshot(session: Session, reason: String) {

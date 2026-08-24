@@ -10043,7 +10043,7 @@ private struct AgentTranscriptImageThumb: View {
         .accessibilityLabel("Image \(displayName)")
         .accessibilityHint("Opens the image")
         .dsPointingHandCursor()
-        .task(id: url.path) { await loadThumbnail() }
+        .task(id: "\(url.path)#\(style == .featured ? 640 : 280)") { await loadThumbnail() }
     }
 
     @MainActor
@@ -10051,33 +10051,18 @@ private struct AgentTranscriptImageThumb: View {
         failed = false
         image = nil
         let path = url.path
-        let maxPixel = style == .featured ? 960 : 280
-        let loaded: NSImage? = await Task.detached(priority: .utility) {
-            Self.downsampledImage(at: path, maxPixel: maxPixel)
-        }.value
+        // Reuse the process-wide hard-bounded loader so remounting transcript
+        // rows does not decode the same multi-megapixel citation again.
+        let loaded = await AgentAttachmentThumbnailLoader.shared.transcriptThumbnail(
+            forPath: path,
+            featured: style == .featured
+        )
+        guard !Task.isCancelled else { return }
         if let loaded {
-            image = loaded
+            image = loaded.image
         } else {
             failed = true
         }
-    }
-
-    /// Decode a bounded thumbnail so multi-megapixel screenshots don't stall the UI.
-    nonisolated private static func downsampledImage(at path: String, maxPixel: Int) -> NSImage? {
-        let url = URL(fileURLWithPath: path)
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
-        if let source = CGImageSourceCreateWithURL(url as CFURL, nil) {
-            let options: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: maxPixel,
-                kCGImageSourceShouldCacheImmediately: true
-            ]
-            if let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
-                return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-            }
-        }
-        return NSImage(contentsOf: url)
     }
 }
 

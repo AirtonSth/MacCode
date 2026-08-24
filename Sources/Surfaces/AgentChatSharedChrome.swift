@@ -1,6 +1,7 @@
 import AppKit
 import CoreModel
 import DesignSystemKit
+import ImageIO
 import SwiftUI
 
 public enum AgentChatThreadStatusMark: Equatable {
@@ -242,6 +243,545 @@ public struct AgentQueuedRow<Trailing: View>: View {
     }
 }
 
+struct AgentAttachmentThumbnailKey: Hashable, Sendable {
+    let path: String
+    let modificationTimeNanoseconds: Int64
+    let sizeBytes: Int64
+    let maxPixel: Int
+
+    init(
+        path: String,
+        modificationTimeNanoseconds: Int64,
+        sizeBytes: Int64,
+        maxPixel: Int = 64
+    ) {
+        self.path = path
+        self.modificationTimeNanoseconds = modificationTimeNanoseconds
+        self.sizeBytes = sizeBytes
+        self.maxPixel = max(1, maxPixel)
+    }
+}
+
+struct AgentAttachmentDecodedThumbnail {
+    let image: NSImage
+    let costBytes: Int
+}
+
+struct AgentAttachmentThumbnailResult {
+    let key: AgentAttachmentThumbnailKey
+    let image: NSImage
+}
+
+/// Strict decoded-pixel-cost LRU. Unlike NSCache, both limits are hard invariants;
+/// the entry cap also bounds object/key overhead that pixel cost does not include.
+struct AgentAttachmentThumbnailMemoryCache {
+    private struct Entry {
+        let value: AgentAttachmentDecodedThumbnail
+        var lastAccess: UInt64
+    }
+
+    let costLimitBytes: Int
+    let countLimit: Int
+    private var entries: [AgentAttachmentThumbnailKey: Entry] = [:]
+    private var accessClock: UInt64 = 0
+    private(set) var totalCostBytes = 0
+
+    init(costLimitBytes: Int, countLimit: Int) {
+        self.costLimitBytes = max(0, costLimitBytes)
+        self.countLimit = max(0, countLimit)
+    }
+
+    var count: Int { entries.count }
+
+    mutating func value(for key: AgentAttachmentThumbnailKey) -> AgentAttachmentDecodedThumbnail? {
+        guard var entry = entries[key] else { return nil }
+        accessClock &+= 1
+        entry.lastAccess = accessClock
+        entries[key] = entry
+        return entry.value
+    }
+
+    mutating func insert(_ value: AgentAttachmentDecodedThumbnail, for key: AgentAttachmentThumbnailKey) {
+        let cost = max(1, value.costBytes)
+        guard cost <= costLimitBytes, countLimit > 0 else { return }
+
+        // Only the newest signature for a path/presentation size is useful. Drop
+        // replaced payloads eagerly while allowing chip and transcript resolutions
+        // of the same current file to coexist inside the shared hard budget.
+        let obsoleteKeys = entries.keys.filter {
+            $0.path == key.path && $0.maxPixel == key.maxPixel && $0 != key
+        }
+        for obsoleteKey in obsoleteKeys {
+            remove(obsoleteKey)
+        }
+        remove(key)
+        while totalCostBytes + cost > costLimitBytes || entries.count >= countLimit {
+            guard let oldest = entries.min(by: { $0.value.lastAccess < $1.value.lastAccess })?.key else {
+                break
+            }
+            remove(oldest)
+        }
+
+        accessClock &+= 1
+        entries[key] = Entry(value: value, lastAccess: accessClock)
+        totalCostBytes += cost
+    }
+
+    private mutating func remove(_ key: AgentAttachmentThumbnailKey) {
+        guard let removed = entries.removeValue(forKey: key) else { return }
+        totalCostBytes -= max(1, removed.value.costBytes)
+    }
+}
+
+actor AgentAttachmentThumbnailLoader {
+    struct CacheSnapshot: Sendable, Equatable {
+        let costBytes: Int
+        let entryCount: Int
+        let activeDecodeCount: Int
+        let waitingDecodeCount: Int
+        let inFlightDecodeCount: Int
+        let inFlightConsumerCount: Int
+    }
+
+    private struct DecodeWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
+    private struct InFlightDecode {
+        let id: UUID
+        let task: Task<AgentAttachmentDecodedThumbnail?, Never>
+        var consumers: Set<UUID>
+    }
+
+    typealias Decoder = @Sendable (String, Int) -> AgentAttachmentDecodedThumbnail?
+    typealias RetrySleeper = @Sendable (UInt64) async -> Bool
+
+    private enum LoadAttempt {
+        case loaded(AgentAttachmentThumbnailResult)
+        case unavailable
+        case saturated
+    }
+
+    static let shared = AgentAttachmentThumbnailLoader()
+    static let defaultCostLimitBytes = 2 * 1_024 * 1_024
+    static let defaultCountLimit = 128
+    static let defaultMaxPixel = 64
+    static let defaultMaxConcurrentDecodes = 2
+    static let defaultMaxWaitingDecodes = 8
+    private static let transcriptSaturationRetryNanoseconds: [UInt64] = [
+        25_000_000,
+        50_000_000,
+        100_000_000,
+        200_000_000,
+        250_000_000,
+        250_000_000,
+        250_000_000,
+        250_000_000,
+    ]
+
+    private var cache: AgentAttachmentThumbnailMemoryCache
+    private let maxPixel: Int
+    private let maxConcurrentDecodes: Int
+    private let maxWaitingDecodes: Int
+    private let decoder: Decoder
+    private let retrySleeper: RetrySleeper
+    private var activeDecodeCount = 0
+    private var decodeWaiters: [DecodeWaiter] = []
+    private var inFlightDecodes: [AgentAttachmentThumbnailKey: InFlightDecode] = [:]
+
+    init(
+        costLimitBytes: Int = AgentAttachmentThumbnailLoader.defaultCostLimitBytes,
+        countLimit: Int = AgentAttachmentThumbnailLoader.defaultCountLimit,
+        maxPixel: Int = AgentAttachmentThumbnailLoader.defaultMaxPixel,
+        maxConcurrentDecodes: Int = AgentAttachmentThumbnailLoader.defaultMaxConcurrentDecodes,
+        maxWaitingDecodes: Int = AgentAttachmentThumbnailLoader.defaultMaxWaitingDecodes,
+        decoder: Decoder? = nil,
+        retrySleeper: RetrySleeper? = nil
+    ) {
+        cache = AgentAttachmentThumbnailMemoryCache(
+            costLimitBytes: costLimitBytes,
+            countLimit: countLimit
+        )
+        self.maxPixel = max(1, maxPixel)
+        self.maxConcurrentDecodes = max(1, maxConcurrentDecodes)
+        self.maxWaitingDecodes = max(0, maxWaitingDecodes)
+        self.decoder = decoder ?? { path, maxPixel in
+            AgentAttachmentThumbnailLoader.decodeImage(path: path, maxPixel: maxPixel)
+        }
+        self.retrySleeper = retrySleeper ?? { nanoseconds in
+            do {
+                try await Task.sleep(nanoseconds: nanoseconds)
+                return true
+            } catch {
+                return false
+            }
+        }
+    }
+
+    func thumbnail(
+        forPath path: String,
+        maxPixel requestedMaxPixel: Int? = nil
+    ) async -> AgentAttachmentThumbnailResult? {
+        switch await loadAttempt(forPath: path, maxPixel: requestedMaxPixel) {
+        case .loaded(let result):
+            return result
+        case .unavailable, .saturated:
+            return nil
+        }
+    }
+
+    private func loadAttempt(
+        forPath path: String,
+        maxPixel requestedMaxPixel: Int? = nil
+    ) async -> LoadAttempt {
+        // Admission covers stat + decode, not just the expensive decoder. This
+        // keeps detached metadata reads and actor continuations bounded when a
+        // caller presents a large attachment batch. A saturated decorative
+        // thumbnail remains the existing photo placeholder.
+        // A replacement racing a detached decode gets one retry with its new signature.
+        let requestedMaxPixel = max(1, requestedMaxPixel ?? maxPixel)
+        for _ in 0..<2 {
+            guard await acquireDecodePermit() else {
+                return Task.isCancelled ? .unavailable : .saturated
+            }
+            guard !Task.isCancelled,
+                  let key = await readFileKey(forPath: path, maxPixel: requestedMaxPixel) else {
+                releaseDecodePermit()
+                return .unavailable
+            }
+            guard !Task.isCancelled else {
+                releaseDecodePermit()
+                return .unavailable
+            }
+            if let cached = cache.value(for: key) {
+                releaseDecodePermit()
+                return .loaded(AgentAttachmentThumbnailResult(key: key, image: cached.image))
+            }
+
+            // This call consumes the permit: a coalesced/cache-hit caller releases
+            // it immediately, while a new physical decode releases it on completion.
+            let decoded = await decodedThumbnailConsumingPermit(for: key)
+            guard !Task.isCancelled, let decoded else { return .unavailable }
+            guard let currentKey = await readFileKey(
+                forPath: path,
+                maxPixel: requestedMaxPixel
+            ), currentKey == key else {
+                continue
+            }
+            cache.insert(decoded, for: key)
+            return .loaded(AgentAttachmentThumbnailResult(key: key, image: decoded.image))
+        }
+        return .unavailable
+    }
+
+    /// Transcript cards share the same cache/admission authority as composer
+    /// chips. 320 pt featured cards need at most 640 px on Retina displays;
+    /// grouped 112 pt strips retain their prior 280 px decode budget.
+    func transcriptThumbnail(
+        forPath path: String,
+        featured: Bool
+    ) async -> AgentAttachmentThumbnailResult? {
+        let maxPixel = featured ? 640 : 280
+        for retryIndex in 0...Self.transcriptSaturationRetryNanoseconds.count {
+            switch await loadAttempt(forPath: path, maxPixel: maxPixel) {
+            case .loaded(let result):
+                return result
+            case .unavailable:
+                return nil
+            case .saturated:
+                guard retryIndex < Self.transcriptSaturationRetryNanoseconds.count,
+                      !Task.isCancelled,
+                      await retrySleeper(Self.transcriptSaturationRetryNanoseconds[retryIndex]) else {
+                    return nil
+                }
+            }
+        }
+        return nil
+    }
+
+    func cacheSnapshot() -> CacheSnapshot {
+        CacheSnapshot(
+            costBytes: cache.totalCostBytes,
+            entryCount: cache.count,
+            activeDecodeCount: activeDecodeCount,
+            waitingDecodeCount: decodeWaiters.count,
+            inFlightDecodeCount: inFlightDecodes.count,
+            inFlightConsumerCount: inFlightDecodes.values.reduce(0) { partial, decode in
+                partial + decode.consumers.count
+            }
+        )
+    }
+
+    nonisolated static func fileKey(
+        forPath path: String,
+        maxPixel: Int = AgentAttachmentThumbnailLoader.defaultMaxPixel
+    ) -> AgentAttachmentThumbnailKey? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attributes[.size] as? NSNumber,
+              let modificationDate = attributes[.modificationDate] as? Date else { return nil }
+        return AgentAttachmentThumbnailKey(
+            path: path,
+            modificationTimeNanoseconds: Int64((modificationDate.timeIntervalSince1970 * 1_000_000_000).rounded()),
+            sizeBytes: size.int64Value,
+            maxPixel: maxPixel
+        )
+    }
+
+    nonisolated static func decodeImage(
+        path: String,
+        maxPixel: Int
+    ) -> AgentAttachmentDecodedThumbnail? {
+        let url = URL(fileURLWithPath: path)
+        let source = CGImageSourceCreateWithURL(
+            url as CFURL,
+            [kCGImageSourceShouldCache: false] as CFDictionary
+        )
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        if let source,
+           let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+            return decodedThumbnail(from: cgImage)
+        }
+
+        // AppKit accepts a few formats (notably SVG) that ImageIO cannot thumbnail.
+        // Rasterize those once on this detached decoder task so the old visible result
+        // is preserved without retaining an unbounded source image.
+        guard let sourceImage = NSImage(contentsOf: url),
+              sourceImage.size.width.isFinite,
+              sourceImage.size.height.isFinite,
+              sourceImage.size.width > 0,
+              sourceImage.size.height > 0 else { return nil }
+        let scale = min(1, CGFloat(maxPixel) / max(sourceImage.size.width, sourceImage.size.height))
+        let width = min(maxPixel, max(1, Int((sourceImage.size.width * scale).rounded())))
+        let height = min(maxPixel, max(1, Int((sourceImage.size.height * scale).rounded())))
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.interpolationQuality = .high
+        let graphicsContext = NSGraphicsContext(cgContext: context, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphicsContext
+        sourceImage.draw(
+            in: NSRect(x: 0, y: 0, width: width, height: height),
+            from: .zero,
+            operation: .copy,
+            fraction: 1
+        )
+        graphicsContext.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        guard let cgImage = context.makeImage() else { return nil }
+        return decodedThumbnail(from: cgImage)
+    }
+
+    nonisolated private static func decodedThumbnail(
+        from cgImage: CGImage
+    ) -> AgentAttachmentDecodedThumbnail {
+        return AgentAttachmentDecodedThumbnail(
+            image: NSImage(
+                cgImage: cgImage,
+                size: NSSize(width: cgImage.width, height: cgImage.height)
+            ),
+            costBytes: max(1, cgImage.bytesPerRow * cgImage.height)
+        )
+    }
+
+    private func readFileKey(
+        forPath path: String,
+        maxPixel: Int
+    ) async -> AgentAttachmentThumbnailKey? {
+        let task = Task.detached(priority: .utility) { () -> AgentAttachmentThumbnailKey? in
+            guard !Task.isCancelled else { return nil }
+            return Self.fileKey(forPath: path, maxPixel: maxPixel)
+        }
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    /// Called only after admission. Exactly one release occurs on every path:
+    /// duplicate callers give their provisional permit back before awaiting,
+    /// while the task that performs the physical decode owns it until it stops.
+    private func decodedThumbnailConsumingPermit(
+        for key: AgentAttachmentThumbnailKey
+    ) async -> AgentAttachmentDecodedThumbnail? {
+        guard !Task.isCancelled else {
+            releaseDecodePermit()
+            return nil
+        }
+        if let cached = cache.value(for: key) {
+            releaseDecodePermit()
+            return cached
+        }
+
+        if let existing = inFlightDecodes[key] {
+            let consumerID = UUID()
+            var registered = existing
+            registered.consumers.insert(consumerID)
+            inFlightDecodes[key] = registered
+            releaseDecodePermit()
+            return await awaitInFlightDecode(
+                key: key,
+                decodeID: existing.id,
+                consumerID: consumerID,
+                task: existing.task
+            )
+        }
+
+        let decoder = self.decoder
+        let maxPixel = key.maxPixel
+        let id = UUID()
+        let consumerID = UUID()
+        let task = Task.detached(priority: .utility) { () -> AgentAttachmentDecodedThumbnail? in
+            let decoded = Task.isCancelled ? nil : decoder(key.path, maxPixel)
+            await self.releaseDecodePermit()
+            return decoded
+        }
+        inFlightDecodes[key] = InFlightDecode(
+            id: id,
+            task: task,
+            consumers: [consumerID]
+        )
+        return await awaitInFlightDecode(
+            key: key,
+            decodeID: id,
+            consumerID: consumerID,
+            task: task
+        )
+    }
+
+    private func awaitInFlightDecode(
+        key: AgentAttachmentThumbnailKey,
+        decodeID: UUID,
+        consumerID: UUID,
+        task: Task<AgentAttachmentDecodedThumbnail?, Never>
+    ) async -> AgentAttachmentDecodedThumbnail? {
+        let decoded = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            Task {
+                await self.cancelInFlightConsumer(
+                    key: key,
+                    decodeID: decodeID,
+                    consumerID: consumerID
+                )
+            }
+        }
+        finishInFlightConsumer(
+            key: key,
+            decodeID: decodeID,
+            consumerID: consumerID
+        )
+        return Task.isCancelled ? nil : decoded
+    }
+
+    private func cancelInFlightConsumer(
+        key: AgentAttachmentThumbnailKey,
+        decodeID: UUID,
+        consumerID: UUID
+    ) {
+        guard var inFlight = inFlightDecodes[key], inFlight.id == decodeID,
+              inFlight.consumers.remove(consumerID) != nil else { return }
+        if inFlight.consumers.isEmpty {
+            inFlight.task.cancel()
+            inFlightDecodes.removeValue(forKey: key)
+        } else {
+            inFlightDecodes[key] = inFlight
+        }
+    }
+
+    private func finishInFlightConsumer(
+        key: AgentAttachmentThumbnailKey,
+        decodeID: UUID,
+        consumerID: UUID
+    ) {
+        guard var inFlight = inFlightDecodes[key], inFlight.id == decodeID,
+              inFlight.consumers.remove(consumerID) != nil else { return }
+        if inFlight.consumers.isEmpty {
+            inFlightDecodes.removeValue(forKey: key)
+        } else {
+            inFlightDecodes[key] = inFlight
+        }
+    }
+
+    private func acquireDecodePermit() async -> Bool {
+        guard !Task.isCancelled else { return false }
+        if activeDecodeCount < maxConcurrentDecodes {
+            activeDecodeCount += 1
+            return true
+        }
+        guard decodeWaiters.count < maxWaitingDecodes else { return false }
+
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                } else {
+                    decodeWaiters.append(DecodeWaiter(id: id, continuation: continuation))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelDecodeWaiter(id: id) }
+        }
+    }
+
+    private func cancelDecodeWaiter(id: UUID) {
+        guard let index = decodeWaiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = decodeWaiters.remove(at: index)
+        waiter.continuation.resume(returning: false)
+    }
+
+    private func releaseDecodePermit() {
+        if decodeWaiters.isEmpty {
+            activeDecodeCount = max(0, activeDecodeCount - 1)
+        } else {
+            let waiter = decodeWaiters.removeFirst()
+            waiter.continuation.resume(returning: true)
+        }
+    }
+}
+
+private struct AgentChatAttachmentThumbnail: View {
+    let path: String
+    @State private var loaded: AgentAttachmentThumbnailResult?
+
+    var body: some View {
+        Group {
+            if let loaded, loaded.key.path == path {
+                Image(nsImage: loaded.image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFill()
+                    .frame(width: 18, height: 18)
+                    .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+            } else {
+                Image(systemName: "photo")
+                    .font(.system(size: 9))
+            }
+        }
+        .task(id: path) {
+            loaded = nil
+            let requestedPath = path
+            let result = await AgentAttachmentThumbnailLoader.shared.thumbnail(forPath: requestedPath)
+            guard !Task.isCancelled, result?.key.path == requestedPath else { return }
+            loaded = result
+        }
+    }
+}
+
 public struct AgentChatAttachmentChips: View {
     public let attachments: [AgentAttachment]
     public let onRemove: (AgentAttachment) -> Void
@@ -262,18 +802,13 @@ public struct AgentChatAttachmentChips: View {
 
     public var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: DS.Space.sm) {
+            LazyHStack(spacing: DS.Space.sm) {
                 ForEach(attachments, id: \.self) { attachment in
                     HStack(spacing: DS.Space.xs) {
-                        if AgentChatTranscriptChrome.isImagePath(attachment.path),
-                           let img = NSImage(contentsOfFile: attachment.path) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 18, height: 18)
-                                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                        if AgentChatTranscriptChrome.isImagePath(attachment.path) {
+                            AgentChatAttachmentThumbnail(path: attachment.path)
                         } else {
-                            Image(systemName: AgentChatTranscriptChrome.isImagePath(attachment.path) ? "photo" : "doc")
+                            Image(systemName: "doc")
                                 .font(.system(size: 9))
                         }
                         Text(attachment.displayName)

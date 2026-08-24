@@ -105,6 +105,7 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
         )
         try store.replace([drained, lateGroup])
 
+        var enumeratedGroups: [pid_t] = []
         let result = try ProviderProcessSweeper.sweepPersistedOrphans(
             store: store,
             currentPID: 700,
@@ -114,7 +115,10 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
             processCommand: { _ in nil },
             processStartIdentity: { _ in nil },
             descendantPIDs: { _ in [] },
-            processGroupMembers: { $0 == 42 ? [420] : [] },
+            processGroupMembers: { group in
+                enumeratedGroups.append(group)
+                return group == 42 ? [420] : []
+            },
             processIsAlive: { _ in false },
             graceInterval: 0,
             wait: { _ in },
@@ -122,8 +126,135 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
         )
 
         XCTAssertEqual(result, ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: []))
+        XCTAssertEqual(
+            enumeratedGroups,
+            [41, 42],
+            "a dead current-owner root still requires exactly one group check before its row can be removed or retained"
+        )
         XCTAssertEqual(try store.load(), [lateGroup],
                        "drained rows must not consume the bounded ledger, while late group descendants retain exact ownership")
+    }
+
+    func test_periodicSweepSkipsGroupEnumerationForLiveExactCurrentOwnerRoots() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-ledger-live-current-owner-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let store = ProviderProcessOwnershipStore(fileURL: file)
+        let currentPID: pid_t = 700
+        let ownerIdentity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
+        let rootIdentity = ProviderProcessStartIdentity(seconds: 2, microseconds: 1)
+        let tags = (0..<32).map { offset in
+            let pid = pid_t(10_000 + offset)
+            return SpawnedProcessTag(
+                pgid: pid,
+                spawnedAt: Date(timeIntervalSince1970: 100),
+                ownerPID: currentPID,
+                ownerStartIdentity: ownerIdentity,
+                provider: .codex,
+                managedKind: .provider,
+                executablePath: "/opt/codex",
+                startIdentity: rootIdentity,
+                isolatedProcessGroup: pid
+            )
+        }
+        try store.replace(tags)
+        var groupEnumerationCount = 0
+
+        let result = try ProviderProcessSweeper.sweepPersistedOrphans(
+            store: store,
+            currentPID: currentPID,
+            minAge: 0,
+            ownerIsAlive: { _ in true },
+            ownerStartIdentity: { pid in
+                XCTAssertEqual(pid, currentPID)
+                return ownerIdentity
+            },
+            processCommand: { _ in
+                XCTFail("a live current-owner root needs no orphan command validation")
+                return nil
+            },
+            processStartIdentity: { _ in rootIdentity },
+            descendantPIDs: { _ in
+                XCTFail("a live current-owner root needs no descendant enumeration")
+                return []
+            },
+            processGroupMembers: { _ in
+                groupEnumerationCount += 1
+                return []
+            },
+            processIsAlive: { _ in true },
+            graceInterval: 0,
+            wait: { _ in XCTFail("a current-owner row must never enter signal grace") },
+            sendSignal: { _, _ in
+                XCTFail("a current-owner row must never be signalled")
+                return false
+            }
+        )
+
+        XCTAssertEqual(result, ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: []))
+        XCTAssertEqual(
+            groupEnumerationCount,
+            0,
+            "verified live roots are retained from their exact lifetime; scanning every system PID cannot affect that decision"
+        )
+        XCTAssertEqual(try store.load(), tags)
+    }
+
+    func test_periodicSweepSkipsGroupEnumerationWhileAnotherExactOwnerIsAlive() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-ledger-live-other-owner-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let store = ProviderProcessOwnershipStore(fileURL: file)
+        let ownerIdentity = ProviderProcessStartIdentity(seconds: 3, microseconds: 1)
+        let rootIdentity = ProviderProcessStartIdentity(seconds: 4, microseconds: 1)
+        let tag = SpawnedProcessTag(
+            pgid: 20_001,
+            spawnedAt: Date(timeIntervalSince1970: 100),
+            ownerPID: 701,
+            ownerStartIdentity: ownerIdentity,
+            provider: .claude,
+            managedKind: .provider,
+            executablePath: "/opt/claude",
+            startIdentity: rootIdentity,
+            isolatedProcessGroup: 20_001
+        )
+        try store.replace([tag])
+        var groupEnumerationCount = 0
+
+        let result = try ProviderProcessSweeper.sweepPersistedOrphans(
+            store: store,
+            currentPID: 700,
+            minAge: 0,
+            ownerIsAlive: { $0 == tag.ownerPID },
+            ownerStartIdentity: { $0 == tag.ownerPID ? ownerIdentity : nil },
+            processCommand: { _ in
+                XCTFail("a row protected by its exact live owner needs no orphan command validation")
+                return nil
+            },
+            processStartIdentity: { _ in
+                XCTFail("a row protected by its exact live owner needs no root validation")
+                return nil
+            },
+            descendantPIDs: { _ in
+                XCTFail("a row protected by its exact live owner needs no descendant enumeration")
+                return []
+            },
+            processGroupMembers: { _ in
+                groupEnumerationCount += 1
+                return []
+            },
+            processIsAlive: { _ in true },
+            graceInterval: 0,
+            wait: { _ in XCTFail("a live-owner row must never enter signal grace") },
+            sendSignal: { _, _ in
+                XCTFail("a live-owner row must never be signalled")
+                return false
+            }
+        )
+
+        XCTAssertEqual(result, ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: []))
+        XCTAssertEqual(groupEnumerationCount, 0)
+        XCTAssertEqual(try store.load(), [tag])
     }
 
     private enum TestSessionGone: Error { case gone }

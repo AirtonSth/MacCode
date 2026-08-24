@@ -2,14 +2,15 @@ import XCTest
 import CoreModel
 @testable import AgentRuntime
 
-// Tests verify the two perf fixes in ClaudeAgentSDKBridgeAdapter:
+// Tests verify performance fixes in ClaudeAgentSDKBridgeAdapter:
 //   (a) recoveredEventsPruneKeys: prune-eligibility logic is correct so abandoned
 //       rolled-back threads do not accumulate in memory indefinitely.
 //   (b) sdkInstallTimeoutSeconds / sdkInstallTimeoutNanoseconds: pure helpers are
 //       consistent so the async Task.sleep matches the sync semaphore deadline.
-// All helpers are nonisolated static — no adapter instantiation, no I/O, no MainActor.
+// Pure helpers cover the algorithms; one fake Node bridge pins the public
+// readThread bound through the real adapter ingest path.
 
-final class ClaudeAgentSDKBridgeAdapterPerfTests: XCTestCase {
+final class ClaudeAgentSDKBridgeAdapterPerfTests: ProviderProcessTestCase {
 
     // MARK: - recoveredEventsPruneKeys
 
@@ -99,6 +100,184 @@ final class ClaudeAgentSDKBridgeAdapterPerfTests: XCTestCase {
         XCTAssertGreaterThan(
             ClaudeAgentSDKBridgeAdapter.sdkInstallTimeoutSeconds(), 0,
             "Install timeout must be > 0 so the async Task.sleep guard is meaningful")
+    }
+
+    // MARK: - readable-event retention hysteresis
+
+    func test_readableEventPrune_waitsForHighWaterAndKeepsNewestOrder() {
+        let events = (0..<9).map {
+            AssistantEvent.turnStarted(turnId: "turn-\($0)")
+        }
+
+        XCTAssertNil(
+            ClaudeAgentSDKBridgeAdapter.prunedReadableEvents(
+                Array(events.prefix(8)), cap: 5, slack: 3
+            ),
+            "the internal slack must avoid a full suffix copy at and below the high-water mark"
+        )
+        let pruned = ClaudeAgentSDKBridgeAdapter.prunedReadableEvents(
+            events, cap: 5, slack: 3
+        )
+        XCTAssertEqual(pruned?.compactMap(Self.turnStartedID), ["turn-4", "turn-5", "turn-6", "turn-7", "turn-8"],
+                       "crossing high-water must retain exactly the newest public window in FIFO order")
+    }
+
+    /// Same-process A/B of the exact pre-checkpoint retention loop and the
+    /// production hysteresis helper. Primary metric: wall time to retain 10,000
+    /// representative deltas at the production 5,000-event cap (warmup=2, n=5).
+    func test_microbench_readableEventHysteresis_amortizesSuffixCopies() {
+        let cap = 5_000
+        let inputs: [AssistantEvent] = (0..<10_000).map {
+            .itemDelta(itemId: "item-\($0)", bodyAppend: "delta-\($0)", outputAppend: nil, summary: nil)
+        }
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            values.sorted()[values.count / 2]
+        }
+
+        func timeLegacy() -> Double {
+            var retained: [AssistantEvent] = []
+            retained.reserveCapacity(cap + 1)
+            let start = DispatchTime.now().uptimeNanoseconds
+            for event in inputs {
+                retained.append(event)
+                if retained.count > cap {
+                    retained = Array(retained.suffix(cap))
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(retained.count, cap)
+            XCTAssertEqual(Self.itemID(retained.first), "item-5000")
+            XCTAssertEqual(Self.itemID(retained.last), "item-9999")
+            return Double(end - start) / 1_000_000.0
+        }
+
+        func timeHysteresis() -> Double {
+            var retained: [AssistantEvent] = []
+            retained.reserveCapacity(cap + ClaudeAgentSDKBridgeAdapter.readableEventPruneSlack + 1)
+            let start = DispatchTime.now().uptimeNanoseconds
+            for event in inputs {
+                retained.append(event)
+                if let pruned = ClaudeAgentSDKBridgeAdapter.prunedReadableEvents(
+                    retained,
+                    cap: cap,
+                    slack: ClaudeAgentSDKBridgeAdapter.readableEventPruneSlack
+                ) {
+                    retained = pruned
+                }
+            }
+            let readable = Array(retained.suffix(cap))
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(readable.count, cap)
+            XCTAssertEqual(Self.itemID(readable.first), "item-5000")
+            XCTAssertEqual(Self.itemID(readable.last), "item-9999")
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup {
+            _ = timeLegacy()
+            _ = timeHysteresis()
+        }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeLegacy())
+            after.append(timeHysteresis())
+        }
+        let beforeMedian = median(before)
+        let afterMedian = median(after)
+        let improvement = (beforeMedian - afterMedian) / beforeMedian * 100
+        NSLog(
+            "[perf-proof] claudeSDKRetention per_event_suffix_ms=%@ hysteresis_ms=%@ improvement_pct=%.2f before=%@ after=%@ events=%d cap=%d slack=%d",
+            String(beforeMedian), String(afterMedian), improvement,
+            String(describing: before), String(describing: after), inputs.count, cap,
+            ClaudeAgentSDKBridgeAdapter.readableEventPruneSlack
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5,
+            "retention hysteresis must beat a 5,000-event suffix copy per delta by at least 5%"
+        )
+    }
+
+    func test_readThread_keepsExactPublicCapAfterInternalHysteresis() async throws {
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc2-sdk-retention-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let bridge = directory.appendingPathComponent("retention-bridge.mjs")
+        try """
+        import readline from 'node:readline';
+        import { once } from 'node:events';
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        async function write(obj) {
+          if (!process.stdout.write(JSON.stringify(obj) + '\\n')) {
+            await once(process.stdout, 'drain');
+          }
+        }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const command = JSON.parse(line);
+          if (command.type === 'rc_configure') {
+            await write({ type: 'system', subtype: 'init', session_id: 'retention-session' });
+          } else if (command.type === 'rc_turn') {
+            for (let index = 0; index < 1200; index += 1) {
+              await write({
+                type: 'assistant',
+                message: { id: 'message-' + index, content: [{ type: 'text', text: 'RETENTION_' + index }] },
+                session_id: 'retention-session'
+              });
+            }
+            await write({ type: 'result', subtype: 'success', is_error: false, result: 'RETENTION_DONE', session_id: 'retention-session' });
+          } else if (command.type === 'rc_close') {
+            process.exit(0);
+          }
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(
+            bridgeScriptPath: bridge.path,
+            maxReadableEvents: 5
+        )
+        let threadID = AgentThreadID()
+        let finished = expectation(description: "SDK retention turn finishes")
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadID,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: directory.path,
+            prompt: "stream a long turn",
+            providerBinary: "/usr/bin/true"
+        )) { event in
+            if case .finished = event { finished.fulfill() }
+        }
+        await fulfillment(of: [finished], timeout: 10)
+
+        let readable = try await adapter.readThread(threadId: threadID)
+        XCTAssertEqual(readable.count, 5,
+                       "internal hysteresis must never expand the public readThread contract")
+        XCTAssertTrue(readable.contains { event in
+            if case .turnCompleted(_, let message) = event { return message == "RETENTION_DONE" }
+            return false
+        }, "the newest terminal event must survive the capped readable suffix")
+        XCTAssertFalse(readable.contains { event in
+            if case .itemDelta(_, let body, _, _) = event { return body == "RETENTION_0" }
+            return false
+        }, "the oldest assistant output must not leak through the public cap")
+        try adapter.stopSession(threadId: threadID)
+    }
+
+    private static func turnStartedID(_ event: AssistantEvent) -> String? {
+        guard case .turnStarted(let id) = event else { return nil }
+        return id
+    }
+
+    private static func itemID(_ event: AssistantEvent?) -> String? {
+        guard let event, case .itemDelta(let id, _, _, _) = event else { return nil }
+        return id
     }
 
     // MARK: - decode-once SDK line ingest
