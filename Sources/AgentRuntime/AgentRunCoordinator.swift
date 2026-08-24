@@ -846,10 +846,29 @@ public enum TokenSaverExecutionReceiptSeam {
         to environment: [String: String]
     ) -> [String: String] {
         let statePath = environment["REMOTE_CODE_DISTILL_STATE_PATH"]
+        let managedBin = environment["RC_REMOTE_CODE_MANAGED_BIN"]
+        let pathBeforeScrub = environment["PATH"]
         var updated = scrub(environment)
         updated.merge(self.environment(from: receipt)) { _, receiptValue in receiptValue }
         if receipt.capabilities.distill == true, let statePath, !statePath.isEmpty {
             updated["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
+        }
+        // Receipt JSON does not carry PATH. scrub() strips the default managed
+        // bin so a denied receipt cannot keep wrappers. An admitted
+        // managed_path receipt must put them back or Codex/Grok (and Claude
+        // shell) lose the global interceptor on stampIdentity/propagate.
+        if receipt.capabilities.managedPath == true {
+            let trimmed = (managedBin ?? AgentSkillInstaller.defaultManagedCLIBinDirectory().path)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                updated["RC_REMOTE_CODE_MANAGED_BIN"] = trimmed
+                let currentPath = updated["PATH"] ?? pathBeforeScrub ?? ""
+                let parts = currentPath
+                    .split(separator: ":", omittingEmptySubsequences: false)
+                    .map(String.init)
+                    .filter { $0 != trimmed }
+                updated["PATH"] = ([trimmed] + parts).joined(separator: ":")
+            }
         }
         return updated
     }

@@ -55,19 +55,31 @@ enum CommandWrapRunner {
             return (127, nil)
         }
 
-        // Mutating / disabled invocations run untouched with all streams inherited.
-        if CommandWrapPolicy.passthroughReason(command: command, args: args, environment: env) != nil {
+        let isTerminalToAgent = WrapPipeInspector.isTerminalToAgent()
+        switch CommandWrapPolicy.childStreams(
+            command: command,
+            args: args,
+            environment: env,
+            isTerminalToAgent: isTerminalToAgent
+        ) {
+        case .inheritAll:
             return (runInheritingAllStreams(executable: realExe, args: args), nil)
+        case .captureSeparateStdoutAndStderr:
+            break
         }
 
-        let captured = runCapturingStdout(executable: realExe, args: args)
+        let captured = runCapturingSeparateStreams(executable: realExe, args: args)
         // Too large to hold / already streamed raw, or the spawn failed: nothing left to do.
         if captured.overflowed || captured.spawnFailed {
             return (captured.exitCode, nil)
         }
 
-        let text = String(data: captured.stdout, encoding: .utf8)
-        let byteCount = captured.stdout.count
+        let combined = CommandWrapPolicy.combinedDistillInput(
+            stdout: captured.stdout,
+            stderr: captured.stderr
+        )
+        let text = String(data: combined, encoding: .utf8)
+        let byteCount = combined.count
         // PERF: `decide` only needs lineCount when the byte gate fails. Multi-MB
         // captures that already clear minBytes must not full-split into Substrings.
         let minBytes = CommandWrapPolicy.minBytes(environment: env)
@@ -81,23 +93,25 @@ enum CommandWrapRunner {
         }
         let action = CommandWrapPolicy.decide(
             command: command,
-            isTerminalToAgent: WrapPipeInspector.isTerminalToAgent(),
+            isTerminalToAgent: isTerminalToAgent,
             outputIsValidUTF8: text != nil,
             byteCount: byteCount,
             lineCount: lineCount,
             environment: env
         )
 
-        switch action {
-        case .passthrough:
-            // POSIX write — FileHandle.write raises uncatchable ObjC on closed pipe.
-            _ = GuardedStdoutWrite.writeAll(captured.stdout)
+        switch CommandWrapPolicy.capturedDelivery(
+            action: action,
+            stdout: captured.stdout,
+            stderr: captured.stderr
+        ) {
+        case .passthrough(let stdout, let stderr):
+            _ = GuardedStdoutWrite.writeAll(stdout, to: STDOUT_FILENO)
+            _ = GuardedStdoutWrite.writeAll(stderr, to: STDERR_FILENO)
             return (captured.exitCode, nil)
-        case .compress:
+        case .distill(let payload):
             let query = CommandWrapPolicy.extractionQuery(forCommand: command)
-            let (bytes, deferred) = await compressedOrRaw(captured.stdout, query: query, compress: compress)
-            // The deferred ledger work is valid only when the complete payload
-            // reached the consumer. EPIPE/partial delivery must not claim savings.
+            let (bytes, deferred) = await compressedOrRaw(payload, query: query, compress: compress)
             let deliveredDeferred = GuardedStdoutWrite.deliveredValue(
                 deferred,
                 afterWriting: bytes
@@ -197,47 +211,102 @@ enum CommandWrapRunner {
 
     private struct CapturedOutput {
         var stdout: Data
+        var stderr: Data
         var exitCode: Int32
         var overflowed: Bool
         var spawnFailed: Bool
     }
 
-    /// Runs the real command capturing ONLY stdout; stdin and stderr are inherited so the
-    /// command reads its real input and its errors reach the agent unchanged. On overflow the
-    /// buffered + remaining bytes are streamed straight to our stdout (raw passthrough).
-    private static func runCapturingStdout(executable: String, args: [String]) -> CapturedOutput {
+    /// Independent stdout and stderr pipes. Distill may join the buffers only
+    /// after `decide` returns `.compress`. Overflow fail-opens each stream to
+    /// its original fd so a pipeline never sees mixed bytes.
+    private static func runCapturingSeparateStreams(executable: String, args: [String]) -> CapturedOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = args
         let outPipe = Pipe()
+        let errPipe = Pipe()
         process.standardOutput = outPipe
-        // standardInput / standardError inherited (unset).
+        process.standardError = errPipe
         do {
             try process.run()
         } catch {
             FileHandle.standardError.write(Data("\(CommandWrapPolicy.commandBasename(executable)): \(error.localizedDescription)\n".utf8))
-            return CapturedOutput(stdout: Data(), exitCode: 126, overflowed: false, spawnFailed: true)
+            return CapturedOutput(stdout: Data(), stderr: Data(), exitCode: 126, overflowed: false, spawnFailed: true)
         }
 
-        let handle = outPipe.fileHandleForReading
-        var buffer = Data()
+        let box = CaptureBox()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            Self.drain(
+                handle: outPipe.fileHandleForReading,
+                box: box,
+                isStdout: true
+            )
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            Self.drain(
+                handle: errPipe.fileHandleForReading,
+                box: box,
+                isStdout: false
+            )
+            group.leave()
+        }
+        process.waitUntilExit()
+        group.wait()
+        box.lock.lock()
+        let stdout = box.stdout
+        let stderr = box.stderr
+        let overflowed = box.overflowed
+        box.lock.unlock()
+        return CapturedOutput(
+            stdout: stdout,
+            stderr: stderr,
+            exitCode: process.terminationStatus,
+            overflowed: overflowed,
+            spawnFailed: false
+        )
+    }
+
+    private final class CaptureBox: @unchecked Sendable {
+        let lock = NSLock()
+        var stdout = Data()
+        var stderr = Data()
         var overflowed = false
+    }
+
+    private static func drain(handle: FileHandle, box: CaptureBox, isStdout: Bool) {
+        let liveFD: Int32 = isStdout ? STDOUT_FILENO : STDERR_FILENO
         while true {
             let chunk = handle.readData(ofLength: readChunk)
             if chunk.isEmpty { break }
-            if overflowed {
-                _ = GuardedStdoutWrite.writeAll(chunk)
+            box.lock.lock()
+            if box.overflowed {
+                box.lock.unlock()
+                _ = GuardedStdoutWrite.writeAll(chunk, to: liveFD)
                 continue
             }
-            buffer.append(chunk)
-            if buffer.count > captureCapBytes {
-                overflowed = true
-                _ = GuardedStdoutWrite.writeAll(buffer)
-                buffer.removeAll(keepingCapacity: false)
+            if isStdout {
+                box.stdout.append(chunk)
+            } else {
+                box.stderr.append(chunk)
             }
+            if box.stdout.count + box.stderr.count > captureCapBytes {
+                box.overflowed = true
+                let out = box.stdout
+                let err = box.stderr
+                box.stdout.removeAll(keepingCapacity: false)
+                box.stderr.removeAll(keepingCapacity: false)
+                box.lock.unlock()
+                _ = GuardedStdoutWrite.writeAll(out, to: STDOUT_FILENO)
+                _ = GuardedStdoutWrite.writeAll(err, to: STDERR_FILENO)
+                continue
+            }
+            box.lock.unlock()
         }
-        process.waitUntilExit()
-        return CapturedOutput(stdout: buffer, exitCode: process.terminationStatus, overflowed: overflowed, spawnFailed: false)
     }
 }
 

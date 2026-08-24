@@ -6,12 +6,12 @@ import Foundation
 /// when the LLM failed to load and the wrapped runtime is the deterministic fallback.
 /// So the "BERT technique" actually contributes saved tokens independently of the LLM.
 ///
-/// Ordering, for `.commandOutput`:
+/// Ordering, for Distill-eligible command/long-text/watch output:
 ///   1. precise deterministic intent extraction (PASS/FAIL, cwd+files, …) — fast + exact
 ///   2. BERT extractive line-selection for large, intent-less logs — `.encoderBERT`
-///   3. otherwise delegate to the wrapped runtime (LLM or deterministic fallback)
-/// Everything is fail-open: a nil encoder lane, an encoder miss, or no net reduction
-/// all fall through to the wrapped runtime, so this never regresses the working path.
+///   3. miss/no-shrink consults `TokenSaverRoutingPolicy`: eligible lanes invoke the
+///      wrapped local LLM; verbatim (follow-up / user-authored) returns original bytes.
+/// A shrinking lossless crusher or BERT extract still wins first and is never replaced.
 public struct EncoderFirstRuntime: DistillRuntime {
     private let wrapped: any DistillRuntime
     private let encoderLane: EncoderLane?
@@ -66,7 +66,16 @@ public struct EncoderFirstRuntime: DistillRuntime {
                 return DistillStageResult(output: bert, stage: .encoderBERT)
             }
         }
-        // 3. Delegate (LLM, deterministic router, or fallback).
+        // 3. Miss / no-shrink: Token Saver admitted eligible lanes invoke the local LLM
+        // (the wrapped DistillRuntime). Follow-up / user-authored stays off the LLM.
+        let lane = tokenSaverLane(for: request.mode)
+        let fallback = TokenSaverRoutingPolicy.fallbackAfterEncoderFailure(for: lane)
+        if fallback == .llmMLX || TokenSaverRoutingPolicy.stages(for: lane).contains(.llmMLX) {
+            return try await wrapped.distillStaged(request)
+        }
+        if fallback == .verbatim {
+            return DistillStageResult(output: request.input, stage: .verbatim)
+        }
         return try await wrapped.distillStaged(request)
     }
 

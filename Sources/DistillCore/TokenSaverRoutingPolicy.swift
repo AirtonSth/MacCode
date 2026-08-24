@@ -114,29 +114,39 @@ public enum TokenSaverRoutingPolicy {
 
     public static func stages(for lane: TokenSaverLane) -> [TokenSaverRouteStage] {
         switch lane {
-        case .wireEncode, .wireRenderEnglish, .naturalLanguage:
-            return orderedStages
-        case .commandOutput, .longText, .watchSummary, .followUpPrompt, .toolOutputHook:
+        case .followUpPrompt:
+            // User-authored never-list: crushers/BERT only — never the local LLM.
             return [.deterministic, .encoderBERT]
+        case .commandOutput, .longText, .watchSummary, .toolOutputHook,
+             .wireEncode, .wireRenderEnglish, .naturalLanguage:
+            return orderedStages
         }
     }
 
     public static func fallbackAfterEncoderFailure(for lane: TokenSaverLane) -> TokenSaverRouteStage {
         switch lane {
+        case .commandOutput, .longText, .watchSummary, .toolOutputHook:
+            return .llmMLX
+        case .followUpPrompt:
+            return .verbatim
         case .wireEncode, .wireRenderEnglish, .naturalLanguage:
             return .deterministic
-        case .commandOutput, .longText, .watchSummary, .followUpPrompt, .toolOutputHook:
-            return .verbatim
         }
     }
 
     public static func permitsLLM(lane: TokenSaverLane, justification: String?) -> Bool {
-        guard stages(for: lane).contains(.llmMLX),
-              let justification = justification?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !justification.isEmpty else {
+        switch lane {
+        case .commandOutput, .longText, .watchSummary, .toolOutputHook:
+            return true
+        case .followUpPrompt:
             return false
+        case .wireEncode, .wireRenderEnglish, .naturalLanguage:
+            guard stages(for: lane).contains(.llmMLX),
+                  let justification = justification?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !justification.isEmpty else {
+                return false
+            }
+            return true
         }
-        return lane == .wireEncode || lane == .wireRenderEnglish || lane == .naturalLanguage
-            || justification.localizedCaseInsensitiveContains("abstractive")
     }
 }
