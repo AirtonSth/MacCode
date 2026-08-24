@@ -183,6 +183,36 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
         XCTAssertEqual(router.authorizationMutations, [false, false, false])
     }
 
+    func test_peerContinuationRejectsMalformedOrWronglyTypedConsultationIDsBeforeDispatch() async {
+        // WHY: consultation ids are opaque authority handles. A malformed or
+        // non-string value must fail at the RPC boundary, before any provider
+        // dispatch can be attempted.
+        let router = HostCatalogReceiptRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let common: [String: JSONValue] = [
+            "thread_id": .string(UUID().uuidString.lowercased()),
+            "run_id": .string(UUID().uuidString.lowercased()),
+            BotPeerDelegation.capabilityRPCParameterKey: .string(String(repeating: "ab", count: 32)),
+            "handle": .string("quinn"),
+            "prompt": .string("continue the review"),
+            "reply_mode": .string("consult"),
+        ]
+
+        for malformed in [JSONValue.string("not-a-uuid"), .bool(true), .number(1)] {
+            var params = common
+            params[BotPeerDelegation.consultationIDParameterKey] = malformed
+            let response = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(40),
+                method: "bot.peer.ask",
+                params: params
+            ))
+            XCTAssertEqual(response.error?.code, JSONRPCError.invalidParams.code)
+            XCTAssertNil(response.result)
+        }
+        XCTAssertEqual(router.lastMethod, "", "malformed continuation must not reach peer dispatch")
+    }
+
     func test_legacyUnixCLIReadsRemainOutsideManagedProviderAuthentication() async {
         // WHY: RC2CLI shares this socket and intentionally has no provider-run
         // bearer. The private host.* namespace must not capture its legacy API.

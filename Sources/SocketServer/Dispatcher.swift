@@ -179,6 +179,7 @@ public protocol CommandRouting: AnyObject {
     func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext?) async throws -> AgentMessageSendResult
     func listBotPeers(callerThread: AgentThreadID, callerRun: AgentRunID, delegationCapability: String?) throws -> JSONValue
     func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, delegationCapability: String?) async throws -> JSONValue
+    func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, consultationID: UUID?, delegationCapability: String?) async throws -> JSONValue
     func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue], delegationCapability: String?) throws -> JSONValue
     func authenticateManagedHostCall(threadID: AgentThreadID, runID: AgentRunID, delegationCapability: String?, mutation: Bool, method: String) throws
     func createHostBot(name: String, title: String, description: String, handle: String?, soul: String, callerRun: AgentRunID) throws -> JSONValue
@@ -332,6 +333,17 @@ public extension CommandRouting {
 
     func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, delegationCapability: String?) async throws -> JSONValue {
         throw JSONRPCError.notSupported("Bot delegation")
+    }
+
+    func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, consultationID: UUID?, delegationCapability: String?) async throws -> JSONValue {
+        try await askBotPeer(
+            callerThread: callerThread,
+            callerRun: callerRun,
+            handle: handle,
+            prompt: prompt,
+            replyMode: replyMode,
+            delegationCapability: delegationCapability
+        )
     }
 
     func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue], delegationCapability: String?) throws -> JSONValue {
@@ -2440,6 +2452,16 @@ public final class JSONRPCDispatcher {
                       let replyMode = BotPeerDelegation.ReplyMode(rawValue: rawMode) else {
                     throw JSONRPCError.invalidParams
                 }
+                let consultationID: UUID?
+                if let rawConsultationID = params[BotPeerDelegation.consultationIDParameterKey] {
+                    guard let rawValue = rawConsultationID.stringValue,
+                          let value = UUID(uuidString: rawValue) else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    consultationID = value
+                } else {
+                    consultationID = nil
+                }
                 return .init(
                     id: id,
                     result: try await router.askBotPeer(
@@ -2448,6 +2470,7 @@ public final class JSONRPCDispatcher {
                         handle: handle,
                         prompt: prompt,
                         replyMode: replyMode,
+                        consultationID: consultationID,
                         delegationCapability: params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue
                     )
                 )
