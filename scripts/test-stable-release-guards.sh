@@ -259,6 +259,10 @@ expect_preflight_failure "non-PASS acceptance gate" "$preflight"
 export RC2_ACCEPTANCE_MANIFEST_BASE64="$saved_manifest_base64"
 export RC2_ACCEPTANCE_MANIFEST_SHA256="$saved_manifest_digest"
 
+unset RC2_VALIDATED_PIPELINE_ID RC2_VALIDATED_JOB_ID
+unset RC2_ACCEPTANCE_MANIFEST_BASE64 RC2_ACCEPTANCE_MANIFEST_SHA256
+"$preflight" >/dev/null
+
 stable_rules="$(awk '
   /^stable_macos_arm64_dmg:/ { in_job=1 }
   in_job && /^[^[:space:]][^:]*:/ && $0 !~ /^stable_macos_arm64_dmg:/ { exit }
@@ -277,8 +281,12 @@ then
   echo "FAIL: validation receipt is not a final successful production RUN_ALL artifact" >&2
   exit 1
 fi
-if printf '%s\n' "$stable_rules" | grep -F "if: '\$CI_COMMIT_TAG =~" >/dev/null; then
-  echo "FAIL: a bare semver tag still admits stable publication" >&2
+if ! printf '%s\n' "$stable_rules" | grep -F "if: '\$CI_COMMIT_TAG =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+$/'" >/dev/null; then
+  echo "FAIL: a bare semver tag does not admit stable publication" >&2
+  exit 1
+fi
+if printf '%s\n' "$stable_rules" | grep -F 'RC2_VALIDATED_PIPELINE_ID' >/dev/null; then
+  echo "FAIL: stable tag publish still requires a validation receipt" >&2
   exit 1
 fi
 # shellcheck disable=SC2016
