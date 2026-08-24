@@ -12977,7 +12977,7 @@ public struct AgentAppView: View {
                             // boundary. Larger windows retain viewport virtualization.
                             if Self.usesLazyTranscriptHistoryLayout(entryCount: historyRows.count) {
                                 LazyVStack(alignment: .leading, spacing: 32) {
-                                    ForEach(Array(historyRows.enumerated()), id: \.element.id) { _, row in
+                                    ForEach(historyRows) { row in
                                         chatFlowRowView(
                                             row,
                                             columnWidth: timelineColumnWidth,
@@ -12989,7 +12989,7 @@ public struct AgentAppView: View {
                                 }
                             } else {
                                 VStack(alignment: .leading, spacing: 32) {
-                                    ForEach(Array(historyRows.enumerated()), id: \.element.id) { _, row in
+                                    ForEach(historyRows) { row in
                                         chatFlowRowView(
                                             row,
                                             columnWidth: timelineColumnWidth,
@@ -13001,7 +13001,7 @@ public struct AgentAppView: View {
                                 }
                             }
                             // Live streaming turns — eager, outside Lazy.
-                            ForEach(Array(liveRows.enumerated()), id: \.element.id) { _, row in
+                            ForEach(liveRows) { row in
                                 chatFlowRowView(
                                     row,
                                     columnWidth: timelineColumnWidth,
