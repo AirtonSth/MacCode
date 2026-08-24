@@ -6,6 +6,18 @@
 - Do not add browser behavior that only works on one side without updating the other side in the same change.
 - User workflow state must survive closing and reopening RemoteCode. Persist the user's active workspace, panes, selected tabs, browser URLs/titles, surface metadata, agent thread state, and other explicit user choices unless the user intentionally closes/deletes them.
 
+## Loading and perceived performance (mandatory)
+
+Apply these rules to every user-visible load on macOS: navigation, tabs, rows, lists, details, search, reconnect, hydration, refresh, restore, and provider-backed content.
+
+- Acknowledge the user's intent immediately. Publish the selected destination, identity, and safe cached/local state before database, network, Docker, provider, transcript, inspector, or other freshness work. Target first feedback within 100 ms and zero unacknowledged dead time.
+- Mount the destination on the interaction turn. Do not put navigation-boundary animations, blocking overlays, or duplicate synchronous reloads in front of the first useful frame. Preserve local motion only when it does not delay acknowledgement, and respect reduced motion.
+- Run freshness after the initial state commit, in one coalesced asynchronous pass. `Task.yield()` is only a next-executor-turn boundary, not proof that a frame painted; use an actual render/frame barrier when correctness requires post-paint work.
+- Make deferred work latest-wins and destination-safe: use cancellation plus a monotonic generation/request identity, check the current destination/selection before every visible effect, and let only the task that owns a handle clear it. A stale task must never overwrite newer state or clear newer work.
+- Cache-first must remain honest. Never show another workspace/bot/thread's data, never present consequential stale data as fresh, never fake progress or success, and never suppress errors. If no safe cache exists, use a layout-stable placeholder or real progress appropriate to the latency.
+- Preserve exact behavior while deferring work: persistence, canonical events, read/attention state, routing, queued follow-ups, error surfaces, and other required side effects must still occur exactly once for the winning request.
+- Every loading-performance change needs regression coverage for the immediate path, eventual exact completion, rapid A→B races/stale-result rejection, and failure behavior. Performance claims require comparable before/after measurements on the same environment and workload, at least five warmed samples, and no settled-latency regression beyond `max(25 ms, 5%)`.
+
 ## Isolated sandbox (mandatory)
 
 The user's running RemoteCode (`io.remotecode.desktop`) is off-limits. A git worktree isolates files; it does not isolate bundle id, Application Support, SQLite, port `18217`, or `/tmp/RemoteCode.sock`.
