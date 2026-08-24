@@ -4223,6 +4223,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         requestedRunID: AgentRunID,
         routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil,
         orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil,
+        executionCwdOverride: String? = nil,
         allowProviderCatalogListingDuringPreflight: Bool = true
     ) async throws -> AgentMessageSendResult {
         try await sendAgentMessage(
@@ -4241,6 +4242,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             routingSnapshot: routingSnapshot,
             requestedRunID: requestedRunID,
             orchestrationRoutingSnapshot: orchestrationRoutingSnapshot,
+            executionCwdOverride: executionCwdOverride,
             allowProviderCatalogListingDuringPreflight: allowProviderCatalogListingDuringPreflight
         )
     }
@@ -4353,7 +4355,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, allowProviderCatalogListingDuringPreflight: Bool = true) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         let effectiveRouting = orchestrationRoutingSnapshot?.configuration
@@ -4440,7 +4442,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let prov = t.provider
         let m = t.model
-        let cwd = try prepareAgentExecutionCwd(thread: &t)
+        let cwd: String
+        if let executionCwdOverride {
+            cwd = GrokACPClient.resolvedSessionCwd(executionCwdOverride)
+        } else {
+            cwd = try prepareAgentExecutionCwd(thread: &t)
+        }
         // Provider-instance + host Token Saver injects for the Source provider.
         // Same-host Auto never switches provider. The previous empty Auto base
         // dropped instance config (HOME/CODEX_HOME/GROK_HOME, custom env) from the
@@ -5092,6 +5099,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             payload["thread_id"] = .string(threadId.value.uuidString)
         }
         EventBus.shared.publish(kind: "graphify.thread.roots", payload: .object(payload))
+    }
+
+    func effectiveAgentExecutionCwd(for thread: AgentThread) throws -> String {
+        switch thread.executionMode {
+        case .local:
+            guard let workspaceID = thread.workspaceId else {
+                throw LayoutError.workspaceNotFound
+            }
+            return try workspaceCwd(workspaceID)
+        case .worktree:
+            guard let path = thread.worktreePath,
+                  FileManager.default.fileExists(atPath: path) else {
+                throw JSONRPCError(
+                    code: -32013,
+                    message: "Agent worktree is unavailable."
+                )
+            }
+            return path
+        }
     }
 
     private func prepareAgentExecutionCwd(thread: inout AgentThread) throws -> String {

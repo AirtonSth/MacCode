@@ -498,6 +498,7 @@ private struct BotPeerRunPlan {
     let browser: BotBrowserTarget?
     let attachments: [AgentAttachment]
     let providerSnapshots: [AgentProviderSnapshot]
+    let executionCwd: String?
 
     func receipt(userText: String) -> ContextAssemblyReceipt {
         BotBrainCompiler.assemble(
@@ -1039,6 +1040,13 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             }
             let browserStore = BotBrowserStore(appSupportDirectory: appSupportDirectory)
             let browser = try? browserStore.loadTarget(botID: peer.id)
+            let executionCwd: String?
+            if originConversation == nil,
+               originThread.workspaceId != nil || originThread.executionMode == .worktree {
+                executionCwd = try router.effectiveAgentExecutionCwd(for: originThread)
+            } else {
+                executionCwd = nil
+            }
             let started = BotStartedRun(
                 conversation: conversation,
                 thread: thread,
@@ -1055,7 +1063,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 routines: (try? botStore.listRoutines(botID: peer.id)) ?? [],
                 browser: browser ?? nil,
                 attachments: [],
-                providerSnapshots: providerSnapshots
+                providerSnapshots: providerSnapshots,
+                executionCwd: executionCwd
             )
             submit(
                 BotPeerExecutionPlan(
@@ -1703,6 +1712,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                             attachments: plan.attachments,
                             requestedRunID: runID,
                             orchestrationRoutingSnapshot: peerOrchestrationRoutingSnapshot(plan),
+                            executionCwdOverride: plan.executionCwd,
                             allowProviderCatalogListingDuringPreflight: false
                         )
                         race.resolve(.success(result))

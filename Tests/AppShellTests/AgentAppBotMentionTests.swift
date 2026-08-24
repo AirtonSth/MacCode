@@ -426,6 +426,96 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(try ctx.botStore.get(id: quinn.id)?.name, "Nova")
     }
 
+    func test_agentAppLocalPeerUsesCallerWorkspaceCwdWithoutJoiningWorkspace() async throws {
+        // WHY: Bot peer threads must stay off the Agent App rail, but removing
+        // workspace membership must not make a local caller's peer run in the
+        // RemoteCode process directory instead of the caller's workspace.
+        let (router, botsVM, _, quinn, threadID, ctx) = try makeWiredMentionSurface(
+            peerReply: "unused controlled reply"
+        )
+        let runner = ControlledBotHandoffRunner(provider: .codex)
+        ctx.coordinator.replaceProviderAdapter(
+            .codex,
+            adapter: TerminalRetiringOneShotAdapter(runner: runner)
+        )
+
+        let callerThread = try XCTUnwrap(try ctx.threadRepo.get(id: threadID))
+        let callerWorkspaceID = try XCTUnwrap(callerThread.workspaceId)
+        let callerWorkspaceCwd = try XCTUnwrap(ctx.state.workspaces[callerWorkspaceID]?.cwd)
+        XCTAssertEqual(callerThread.executionMode, .local)
+        XCTAssertNotEqual(
+            URL(fileURLWithPath: callerWorkspaceCwd).standardizedFileURL.path,
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath).standardizedFileURL.path,
+            "the fixture must distinguish the workspace cwd from the process cwd"
+        )
+        let callerWorkspaceThreadIDsBeforeConsultation = Set(
+            try ctx.threadRepo.list(workspaceId: callerWorkspaceID).map(\.id)
+        )
+        let callerWorkspaceThreadCountBeforeConsultation = try ctx.threadRepo.count(
+            workspaceId: callerWorkspaceID
+        )
+
+        let hostSend = try await router.sendAgentMessage(
+            thread: threadID,
+            text: "Coordinate one local peer review.",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let hostRunID = try XCTUnwrap(hostSend.runId)
+        let hostStarted = await waitUntil(timeout: 5) { runner.requests.count == 1 }
+        XCTAssertTrue(hostStarted)
+        let hostRequest = try XCTUnwrap(runner.requests.first)
+        XCTAssertEqual(hostRequest.cwd, callerWorkspaceCwd)
+        let capability = try XCTUnwrap(
+            hostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
+        )
+
+        let peerAsk = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: threadID,
+                callerRun: hostRunID,
+                handle: quinn.handle,
+                prompt: "Review from the caller's local workspace.",
+                replyMode: .consult,
+                delegationCapability: capability
+            )
+        }
+        let peerStarted = await waitUntil(timeout: 5) { runner.requests.count == 2 }
+        XCTAssertTrue(peerStarted)
+        let peerRequest = try XCTUnwrap(runner.requests.last)
+        XCTAssertEqual(peerRequest.cwd, callerWorkspaceCwd)
+        XCTAssertTrue(runner.finish(
+            runID: peerRequest.runId,
+            status: .completed,
+            reply: "LOCAL_REVIEW"
+        ))
+        let peerResult = try await peerAsk.value
+        let activityID = try XCTUnwrap(
+            peerResult.objectValue?["activity_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+        )
+        let handoff = try XCTUnwrap(
+            botsVM.peerHandoffSnapshotsForTesting(
+                originConversationID: nil,
+                originThreadID: threadID
+            ).first { $0.activityID == activityID }
+        )
+        let peerThreadID = try XCTUnwrap(handoff.peerThreadID)
+        let peerThread = try XCTUnwrap(try ctx.threadRepo.get(id: peerThreadID))
+        XCTAssertEqual(peerThread.executionMode, .local)
+        XCTAssertNil(peerThread.workspaceId)
+        XCTAssertEqual(
+            Set(try ctx.threadRepo.list(workspaceId: callerWorkspaceID).map(\.id)),
+            callerWorkspaceThreadIDsBeforeConsultation
+        )
+        XCTAssertEqual(
+            try ctx.threadRepo.count(workspaceId: callerWorkspaceID),
+            callerWorkspaceThreadCountBeforeConsultation
+        )
+        XCTAssertTrue(runner.finish(runID: hostRunID, status: .completed, reply: "HOST_DONE"))
+    }
+
     func test_agentAppPeerConsultationIsFreshByDefaultAndReusesOnlyExplicitLiveContext() async throws {
         // WHY: omission is the independent-review boundary. Only an opaque id
         // returned to this exact active run and Bot may continue the prior peer
