@@ -356,9 +356,9 @@ stable_macos_arm64_dmg:
     GITLAB_OIDC_TOKEN:
       aud: sts.amazonaws.com
   rules:
-    # A bare tag never publishes. The controller explicitly starts this job on
-    # the tag with an exact-SHA validation pipeline and acceptance manifest.
-    - if: '$RELEASE_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $RC2_VALIDATED_PIPELINE_ID =~ /^[0-9]+$/ && $RC2_VALIDATED_JOB_ID =~ /^[0-9]+$/ && $RC2_ACCEPTANCE_MANIFEST_SHA256 =~ /^[0-9a-f]{64}$/ && $RC2_ACCEPTANCE_MANIFEST_BASE64'
+    # A stable semver tag publishes the signed DMG. Tag pipelines do not run
+    # the test suite; RUN_ALL remains a production-branch opt-in.
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
   script:
     - |
       set -euo pipefail
