@@ -700,6 +700,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     private var exactRunWaiters: [AgentRunID: [CheckedContinuation<AgentRun?, Never>]] = [:]
     private var observedTerminalRuns: [AgentRunID: AgentRun] = [:]
     private var agentAppDispatchWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+    private var lastPeerProgressByRunID: [AgentRunID: Date] = [:]
     private var deletionFences: [UUID: DeletionFence] = [:]
     private var deletionResolutionWaiters: [UUID: [CheckedContinuation<Bool, Never>]] = [:]
     private var retiredActivityIDs: Set<UUID> = []
@@ -2223,12 +2224,37 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         }
     }
 
+    func latestPeerProgress(hostRunID: AgentRunID) -> Date? {
+        var dates: [Date] = []
+        for handoff in handoffs.values where handoff.hostRunID == hostRunID {
+            switch handoff.phase {
+            case .peerPrepared, .peerRunning:
+                dates.append(handoff.createdAt)
+                if let peerRunID = handoff.peerRunID,
+                   let stamped = lastPeerProgressByRunID[peerRunID] {
+                    dates.append(stamped)
+                }
+                if let threadID = handoff.peerThreadID,
+                   let thread = try? threadRepo.get(id: threadID) {
+                    dates.append(thread.updatedAt)
+                }
+            default:
+                break
+            }
+        }
+        return dates.max()
+    }
+
     nonisolated func runCoordinator(
         _ coordinator: AgentRunCoordinator,
         didReceive event: AssistantEvent,
         run: AgentRunID,
         threadId: AgentThreadID
-    ) {}
+    ) {
+        Task { @MainActor [weak self] in
+            self?.lastPeerProgressByRunID[run] = Date()
+        }
+    }
 
     nonisolated func runCoordinator(
         _ coordinator: AgentRunCoordinator,

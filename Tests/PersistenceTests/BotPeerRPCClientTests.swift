@@ -89,6 +89,21 @@ final class BotPeerRPCClientTests: XCTestCase {
         XCTAssertFalse(closed.isEmpty, "the client FD must close after a hung newline read")
     }
 
+    func test_peerConsultationReadDeadlineResetsOnKeepalive() throws {
+        // WHY: the Unix server pings a space while Oliver is still working so
+        // the MCP child does not fire a wall-clock read timeout.
+        let server = try UnixEchoServer(keepaliveAfter: 0.04, replyDelay: 0.05) { _ in
+            #"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#
+        }
+        defer { server.stop() }
+        let result = try BotPeerRPCClient(
+            environment: Self.environment(socket: server.path),
+            timeoutOverride: 0.08
+        ).call(method: "bot.peer.ask", arguments: [:], budget: .peerConsultation)
+        let object = try XCTUnwrap(result as? [String: Any])
+        XCTAssertEqual(object["ok"] as? Bool, true)
+    }
+
     func test_oversizeReplyWithoutNewlineIsRejected() throws {
         let oversized = String(repeating: "x", count: BotPeerRPCClient.maximumResponseBytes + 8)
         let server = try UnixEchoServer { _ in oversized }
@@ -236,7 +251,11 @@ private final class UnixEchoServer {
     private let listenFD: Int32
     private var thread: Thread?
 
-    init(_ handler: @escaping ([String: Any]) throws -> String?) throws {
+    init(
+        keepaliveAfter: TimeInterval? = nil,
+        replyDelay: TimeInterval? = nil,
+        _ handler: @escaping ([String: Any]) throws -> String?
+    ) throws {
         path = NSTemporaryDirectory() + "rc-peer-rpc-\(UUID().uuidString).sock"
         unlink(path)
         listenFD = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -276,9 +295,19 @@ private final class UnixEchoServer {
                 data.append(buffer, count: count)
             }
             guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            if let keepaliveAfter {
+                Thread.sleep(forTimeInterval: keepaliveAfter)
+                let ping = Data([BotPeerDelegation.peerConsultationKeepaliveByte])
+                _ = ping.withUnsafeBytes { raw in
+                    Darwin.write(accepted, raw.baseAddress!, ping.count)
+                }
+            }
             guard let reply = try? handler(object) else {
                 Thread.sleep(forTimeInterval: 0.2)
                 return
+            }
+            if let replyDelay {
+                Thread.sleep(forTimeInterval: replyDelay)
             }
             var payload = Data(reply.utf8)
             if payload.last != 0x0A { payload.append(0x0A) }

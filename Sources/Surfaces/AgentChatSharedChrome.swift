@@ -894,13 +894,12 @@ public struct AgentChatPeerActivityRow: View {
     public var body: some View {
         TimelineView(AgentChatElapsedTickSchedule(start: startedAt)) { context in
             let seconds = max(0, Int(context.date.timeIntervalSince(startedAt)))
-            HStack(alignment: .top, spacing: DS.Space.sm) {
-                stateIcon
+            HStack(alignment: .center, spacing: DS.Space.sm) {
                 BotsAvatarView(
                     name: snapshot.name,
                     handle: snapshot.handle,
                     symbol: avatarSymbol,
-                    size: 22
+                    size: Self.chromeSize
                 )
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     Text(AgentPeerActivityPresentation.title(for: snapshot))
@@ -914,6 +913,7 @@ public struct AgentChatPeerActivityRow: View {
                     .foregroundColor(DS.Palette.textSecondary)
                 }
                 Spacer(minLength: 0)
+                stateIcon
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityElement(children: .ignore)
@@ -925,6 +925,8 @@ public struct AgentChatPeerActivityRow: View {
         }
     }
 
+    private static let chromeSize: CGFloat = 22
+
     @ViewBuilder
     private var stateIcon: some View {
         switch snapshot.phase {
@@ -933,13 +935,14 @@ public struct AgentChatPeerActivityRow: View {
                 .progressViewStyle(.circular)
                 .controlSize(.regular)
                 .tint(DS.Palette.accent)
-                .frame(width: 22, height: 22)
+                .frame(width: Self.chromeSize, height: Self.chromeSize)
                 .background(Circle().fill(DS.Palette.accent.opacity(0.16)))
                 .accessibilityHidden(true)
         case .needsAttention:
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Palette.danger)
+                .frame(width: Self.chromeSize, height: Self.chromeSize)
                 .accessibilityHidden(true)
         }
     }

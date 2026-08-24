@@ -433,6 +433,93 @@ final class UnixSocketServerTests: XCTestCase {
     }
 
     @MainActor
+    func testBotPeerAskIdleProgressOutlivesWallClock() async throws {
+        // WHY: Waiting for Oliver must not fire at 10 minutes of wall time
+        // while the peer is still producing updates.
+        let socketURL = URL(
+            fileURLWithPath: "/tmp/rc2-u-bot-peer-idle-\(UUID().uuidString.prefix(8)).sock"
+        )
+        let started = Date()
+        let server = UnixSocketServer(
+            socketPath: socketURL.path,
+            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            localRequestTimeoutForTesting: .milliseconds(40),
+            botPeerAskRequestTimeoutForTesting: .milliseconds(80),
+            activeRequestLimitForTesting: 2,
+            localRequestHandlerForTesting: { request in
+                try? await Task.sleep(nanoseconds: 160_000_000)
+                return JSONRPCResponse(
+                    id: request.id,
+                    result: .object(["status": .string("replied")])
+                )
+            }
+        )
+        server.botPeerAskProgress = { _, _ in Date() }
+        try server.start()
+        defer { server.stop() }
+
+        let path = socketURL.path
+        let response = try await Task.detached {
+            let client = try self.connectUnix(path: path)
+            defer { Darwin.close(client) }
+            try self.writeAll(
+                fd: client,
+                data: Data((
+                    #"{"jsonrpc":"2.0","id":"ask","method":"bot.peer.ask","params":{"thread_id":"00000000-0000-0000-0000-000000000001","run_id":"00000000-0000-0000-0000-000000000002"}}"#
+                        + "\n"
+                ).utf8)
+            )
+            return try self.readLine(fd: client)
+        }.value
+        XCTAssertTrue(response.contains(#""status":"replied""#), response)
+        XCTAssertGreaterThan(Date().timeIntervalSince(started), 0.12)
+    }
+
+    @MainActor
+    func testBotPeerAskStillTimesOutWithoutProgress() async throws {
+        let socketURL = URL(
+            fileURLWithPath: "/tmp/rc2-u-bot-peer-idle-stop-\(UUID().uuidString.prefix(8)).sock"
+        )
+        let server = UnixSocketServer(
+            socketPath: socketURL.path,
+            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            localRequestTimeoutForTesting: .milliseconds(40),
+            botPeerAskRequestTimeoutForTesting: .milliseconds(80),
+            activeRequestLimitForTesting: 2,
+            localRequestHandlerForTesting: { request in
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                return JSONRPCResponse(
+                    id: request.id,
+                    result: .object(["status": .string("late")])
+                )
+            }
+        )
+        try server.start()
+        defer { server.stop() }
+
+        let path = socketURL.path
+        let diagnosticCursor = EventBus.shared.currentSeq
+        let sawEOF = try await Task.detached {
+            let client = try self.connectUnix(path: path)
+            defer { Darwin.close(client) }
+            try self.writeAll(
+                fd: client,
+                data: Data((
+                    #"{"jsonrpc":"2.0","id":"ask","method":"bot.peer.ask","params":{"thread_id":"00000000-0000-0000-0000-000000000001","run_id":"00000000-0000-0000-0000-000000000002"}}"#
+                        + "\n"
+                ).utf8)
+            )
+            return self.waitForEOF(fd: client, timeout: 1)
+        }.value
+        XCTAssertTrue(sawEOF)
+        let timedOut = await waitUntil(timeout: 1) {
+            EventBus.shared.recentEvents(since: diagnosticCursor, maxBytes: nil).events
+                .contains(where: { $0.kind == "diagnostic.unix_request_timeout" })
+        }
+        XCTAssertTrue(timedOut, "a silent Bot hop must still idle-timeout")
+    }
+
+    @MainActor
     func testEventStreamDeliversLiveEventsOverSerializedUnixSocketWriter() throws {
         let socketURL = URL(
             fileURLWithPath: "/tmp/rc2-u-live-\(UUID().uuidString.prefix(8)).sock"

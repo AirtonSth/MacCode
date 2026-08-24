@@ -89,6 +89,7 @@ struct BotPeerRPCClient {
                 socketPath: context.socketPath,
                 payload: payload,
                 deadline: deadline,
+                idleTimeout: budget == .peerConsultation ? timeout : nil,
                 maximumResponseBytes: Self.maximumResponseBytes
             )
         } catch let error as BotPeerRPCError {
@@ -195,6 +196,7 @@ enum UnixDeadlineSession {
         socketPath: String,
         payload: Data,
         deadline: DispatchTime,
+        idleTimeout: TimeInterval? = nil,
         maximumResponseBytes: Int
     ) throws -> Data {
         let fd = syscalls.socket(AF_UNIX, SOCK_STREAM, 0)
@@ -255,6 +257,7 @@ enum UnixDeadlineSession {
             syscalls: syscalls,
             fd: fd,
             deadline: deadline,
+            idleTimeout: idleTimeout,
             maximumResponseBytes: maximumResponseBytes
         )
     }
@@ -319,12 +322,14 @@ enum UnixDeadlineSession {
         syscalls: UnixDeadlineSyscalls,
         fd: Int32,
         deadline: DispatchTime,
+        idleTimeout: TimeInterval?,
         maximumResponseBytes: Int
     ) throws -> Data {
         var response = Data()
         var buffer = [UInt8](repeating: 0, count: 8_192)
+        var readDeadline = deadline
         while response.last != 0x0A {
-            try wait(syscalls: syscalls, fd: fd, events: Int16(POLLIN), deadline: deadline, budget: "read")
+            try wait(syscalls: syscalls, fd: fd, events: Int16(POLLIN), deadline: readDeadline, budget: "read")
             let count = buffer.withUnsafeMutableBytes { raw in
                 syscalls.read(fd, raw.baseAddress!, raw.count)
             }
@@ -338,6 +343,9 @@ enum UnixDeadlineSession {
                 throw BotPeerRPCError.socket("RemoteCode closed the Bot delegation request before replying.")
             }
             response.append(buffer, count: count)
+            if let idleTimeout {
+                readDeadline = DispatchTime.now() + idleTimeout
+            }
             guard response.count <= maximumResponseBytes else {
                 throw BotPeerRPCError.invalidResponse
             }

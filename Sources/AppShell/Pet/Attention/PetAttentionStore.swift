@@ -130,7 +130,7 @@ public final class PetAttentionStore {
         }
     }
 
-    /// Marks projected outcome rows read. It deliberately never calls any
+    /// Marks projected viewable rows read. It deliberately never calls any
     /// callback-repository mutation, so approvals/questions cannot be bulk-resolved.
     @discardableResult
     public func markAllRead() throws -> Int {
@@ -141,12 +141,12 @@ public final class PetAttentionStore {
             marked += 1
         }
         for notification in try notificationRepository.list(unreadOnly: true)
-            where notificationItem(notification)?.classification == .completed {
+            where notificationItem(notification)?.kind.isBulkViewable == true {
             try markNotificationReadMutation(notification.id)
             marked += 1
         }
         if let dest = try destLookup?() {
-            for item in Self.projectDest(dest) where item.classification == .completed {
+            for item in Self.projectDest(dest) where item.kind.isBulkViewable {
                 if case .bot(_, let conversationID, let attentionItemID) = item.source {
                     if let conversationID {
                         try markBotConversationViewed?(conversationID)
@@ -419,8 +419,9 @@ public final class PetAttentionStore {
         return items
     }
 
-    /// Dest inbox kinds that still need the owner stay pet blockers. Completed
-    /// dest turns stay `.agentOutcome` so mark-read can dest dest unread.
+    /// Dest inbox kinds that still need a decision stay pet blockers.
+    /// Failed dest turns are outcomes (same as Agent App failed runs) so
+    /// Mark all viewed can dismiss them without answering a question.
     static func destPetKinds(for destKind: BotAttentionItemKind) -> (
         item: PetAttentionItemKind,
         presentation: PetAttentionKind
@@ -431,7 +432,7 @@ public final class PetAttentionStore {
         case .question, .handoff:
             return (.callback(.question, isStale: false), .question(isSecret: false))
         case .blocked, .unknownEffect:
-            return (.callback(.question, isStale: false), .agentOutcome(.failed))
+            return (.agentOutcome(.failed), .agentOutcome(.failed))
         case .unread:
             return (.agentOutcome(.completed), .agentOutcome(.completed))
         }

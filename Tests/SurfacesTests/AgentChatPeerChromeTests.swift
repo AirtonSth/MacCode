@@ -59,25 +59,31 @@ final class AgentChatPeerChromeTests: XCTestCase {
         )
     }
 
-    func test_waitingActivityUsesSpinnerBeforeMatchingBotAvatar() throws {
-        // WHY: a 14pt small spinner disappears against the dark transcript,
-        // and the waiting Bot must remain visible immediately to its right.
+    func test_waitingActivityPutsMatchingBotAvatarLeadingAndSpinnerTrailing() throws {
+        // WHY: the waiting Bot is the identity of the row, so its avatar
+        // owns the leading slot at spinner size; the spinner stays at the
+        // trailing edge instead of crowding the face.
         let source = try String(
             contentsOf: URL(fileURLWithPath: "Sources/Surfaces/AgentChatSharedChrome.swift"),
             encoding: .utf8
         )
         let row = try XCTUnwrap(source.range(of: "public struct AgentChatPeerActivityRow"))
         let slice = String(source[row.lowerBound...])
-        let stack = try XCTUnwrap(slice.range(of: "HStack(alignment: .top, spacing: DS.Space.sm)"))
+        let stack = try XCTUnwrap(slice.range(of: "HStack(alignment: .center, spacing: DS.Space.sm)"))
         let stackSlice = String(slice[stack.lowerBound...])
         let details = try XCTUnwrap(stackSlice.range(of: "VStack(alignment: .leading"))
         let leadingChrome = String(stackSlice[..<details.lowerBound])
-        let stateIcon = try XCTUnwrap(leadingChrome.range(of: "stateIcon"))
-        let botAvatar = try XCTUnwrap(leadingChrome.range(of: "BotsAvatarView("))
-        XCTAssertLessThan(stateIcon.lowerBound, botAvatar.lowerBound)
-        XCTAssertTrue(leadingChrome.contains("size: 22"))
+        let trailingChrome = String(stackSlice[details.upperBound...])
+        XCTAssertTrue(leadingChrome.contains("BotsAvatarView("))
+        XCTAssertFalse(leadingChrome.contains("stateIcon"))
+        XCTAssertTrue(trailingChrome.contains("Spacer(minLength: 0)"))
+        let spacer = try XCTUnwrap(trailingChrome.range(of: "Spacer(minLength: 0)"))
+        let stateIcon = try XCTUnwrap(trailingChrome.range(of: "stateIcon"))
+        XCTAssertLessThan(spacer.lowerBound, stateIcon.lowerBound)
+        XCTAssertTrue(leadingChrome.contains("size: Self.chromeSize"))
+        XCTAssertTrue(slice.contains("private static let chromeSize: CGFloat = 22"))
         XCTAssertTrue(slice.contains(".controlSize(.regular)"))
-        XCTAssertTrue(slice.contains(".frame(width: 22, height: 22)"))
+        XCTAssertTrue(slice.contains(".frame(width: Self.chromeSize, height: Self.chromeSize)"))
         XCTAssertTrue(slice.contains("Circle().fill(DS.Palette.accent.opacity(0.16))"))
     }
 }

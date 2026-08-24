@@ -32,7 +32,9 @@ public final class UnixSocketServer: @unchecked Sendable {
     private static let agentMessageSendLocalRequestTimeout: DispatchTimeInterval = .seconds(
         Int(RemoteCodeHostCatalog.unixServerDeadline.rounded(.towardZero))
     )
-    private static let botPeerAskLocalRequestTimeout: DispatchTimeInterval = .seconds(600)
+    private static let botPeerAskLocalRequestTimeout: DispatchTimeInterval = .seconds(
+        Int(BotPeerDelegation.peerConsultationTimeout.rounded(.towardZero))
+    )
 
     public let socketPath: String
     private let dispatcher: JSONRPCDispatcher
@@ -48,11 +50,14 @@ public final class UnixSocketServer: @unchecked Sendable {
     private var activeRequestCount = 0
     private let localRequestTimeout: DispatchTimeInterval
     private let agentMessageSendRequestTimeout: DispatchTimeInterval
+    private let botPeerAskRequestTimeout: DispatchTimeInterval
     private let activeRequestLimit: Int
     private let localRequestHandlerForTesting: (@MainActor @Sendable (JSONRPCRequest) async -> JSONRPCResponse)?
     var listenerFDObserverForTesting: (@Sendable (Int32) -> Void)?
     var acceptedFDObserverForTesting: (@Sendable (Int32) -> Void)?
     var outboundWriteWillBeginForTesting: (@Sendable (Data) -> Void)?
+    /// Latest peer-progress timestamp for `bot.peer.ask` (thread_id, run_id).
+    public var botPeerAskProgress: (@Sendable (String, String) -> Date?)?
     var listenFDForTesting: Int32 {
         lifecycleLock.lock(); defer { lifecycleLock.unlock() }
         return listenFD
@@ -71,6 +76,7 @@ public final class UnixSocketServer: @unchecked Sendable {
         self.dispatcher = dispatcher
         self.localRequestTimeout = Self.defaultLocalRequestTimeout
         self.agentMessageSendRequestTimeout = Self.agentMessageSendLocalRequestTimeout
+        self.botPeerAskRequestTimeout = Self.botPeerAskLocalRequestTimeout
         self.activeRequestLimit = Self.maxActiveRequests
         self.localRequestHandlerForTesting = nil
     }
@@ -80,6 +86,7 @@ public final class UnixSocketServer: @unchecked Sendable {
         dispatcher: JSONRPCDispatcher,
         localRequestTimeoutForTesting: DispatchTimeInterval,
         agentMessageSendRequestTimeoutForTesting: DispatchTimeInterval? = nil,
+        botPeerAskRequestTimeoutForTesting: DispatchTimeInterval? = nil,
         activeRequestLimitForTesting: Int,
         localRequestHandlerForTesting: @escaping @MainActor @Sendable (JSONRPCRequest) async -> JSONRPCResponse
     ) {
@@ -88,6 +95,8 @@ public final class UnixSocketServer: @unchecked Sendable {
         self.localRequestTimeout = localRequestTimeoutForTesting
         self.agentMessageSendRequestTimeout =
             agentMessageSendRequestTimeoutForTesting ?? localRequestTimeoutForTesting
+        self.botPeerAskRequestTimeout =
+            botPeerAskRequestTimeoutForTesting ?? Self.botPeerAskLocalRequestTimeout
         self.activeRequestLimit = max(1, activeRequestLimitForTesting)
         self.localRequestHandlerForTesting = localRequestHandlerForTesting
     }
@@ -487,25 +496,73 @@ public final class UnixSocketServer: @unchecked Sendable {
         }
         let requestTimeout: DispatchTimeInterval
         if req.method == "bot.peer.ask" {
-            requestTimeout = Self.botPeerAskLocalRequestTimeout
+            requestTimeout = botPeerAskRequestTimeout
         } else if req.method == "agent.message.send"
             || RemoteCodeHostCatalog.usesUnixCatalogDeadline(req.method) {
             requestTimeout = agentMessageSendRequestTimeout
         } else {
             requestTimeout = localRequestTimeout
         }
-        guard semaphore.wait(timeout: .now() + requestTimeout) == .success else {
-            task.cancel()
-            EventBus.shared.publish(kind: "diagnostic.unix_request_timeout", payload: .object([
-                "method": .string(req.method),
-                "timeout_seconds": .number(Self.timeoutSeconds(requestTimeout))
-            ]))
-            return false
+        if req.method == "bot.peer.ask" {
+            guard waitForBotPeerAsk(
+                semaphore: semaphore,
+                timeout: requestTimeout,
+                task: task,
+                req: req,
+                outbound: outbound
+            ) else {
+                return false
+            }
+        } else {
+            guard semaphore.wait(timeout: .now() + requestTimeout) == .success else {
+                task.cancel()
+                EventBus.shared.publish(kind: "diagnostic.unix_request_timeout", payload: .object([
+                    "method": .string(req.method),
+                    "timeout_seconds": .number(Self.timeoutSeconds(requestTimeout))
+                ]))
+                return false
+            }
         }
         if let resp = slot.value, let data = Self.encode(response: resp, encoder: encoder) {
             _ = outbound.enqueue(data)
         }
         return true
+    }
+
+    private func waitForBotPeerAsk(
+        semaphore: DispatchSemaphore,
+        timeout: DispatchTimeInterval,
+        task: Task<Void, Never>,
+        req: JSONRPCRequest,
+        outbound: WebSocketOutboundQueue
+    ) -> Bool {
+        let idle = Self.timeoutSeconds(timeout)
+        var lastProgress = Date()
+        let slice: DispatchTimeInterval = idle <= 0.25 ? .milliseconds(20) : .milliseconds(250)
+        let threadID = req.params?["thread_id"]?.stringValue ?? ""
+        let runID = req.params?["run_id"]?.stringValue ?? ""
+        while true {
+            if semaphore.wait(timeout: .now() + slice) == .success {
+                return true
+            }
+            if task.isCancelled { return false }
+            if let progress = botPeerAskProgress?(threadID, runID),
+               progress > lastProgress {
+                lastProgress = progress
+                _ = outbound.enqueue(Data([BotPeerDelegation.peerConsultationKeepaliveByte]))
+            }
+            if !BotPeerDelegation.peerConsultationStillActive(
+                lastProgress: lastProgress,
+                idle: idle
+            ) {
+                task.cancel()
+                EventBus.shared.publish(kind: "diagnostic.unix_request_timeout", payload: .object([
+                    "method": .string(req.method),
+                    "timeout_seconds": .number(idle)
+                ]))
+                return false
+            }
+        }
     }
 
     private static func timeoutSeconds(_ timeout: DispatchTimeInterval) -> Double {

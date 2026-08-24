@@ -91,6 +91,28 @@ public enum PetAttentionItemKind: Sendable, Equatable {
             return category.classification == .needsYou
         }
     }
+
+    /// Mark all viewed may dismiss these. Live decisions (approvals, questions,
+    /// file conflicts, listener failures, dest input) stay until resolved.
+    public var isBulkViewable: Bool {
+        switch self {
+        case .callback:
+            return false
+        case .agentOutcome:
+            return true
+        case .notification(let category):
+            switch category {
+            case .fileConflict, .serverListenerFailed, .notificationsDenied, .agentAttention:
+                return false
+            case .sshUnexpectedDisconnect,
+                 .gitCompleted, .gitFailed,
+                 .projectScriptCompleted, .projectScriptFailed,
+                 .sshTransferCompleted, .sshTransferFailed,
+                 .providerUpdateFailed:
+                return true
+            }
+        }
+    }
 }
 
 public enum PetAttentionRoute: Sendable, Equatable {
@@ -139,7 +161,15 @@ public struct PetAttentionItem: Sendable, Equatable, Identifiable {
     }
 
     public var classification: PetAttentionClassification {
-        kind.needsUserAction ? .needsYou : .completed
+        if case .bot = source {
+            switch kind {
+            case .agentOutcome(.failed), .agentOutcome(.interrupted):
+                return .needsYou
+            default:
+                break
+            }
+        }
+        return kind.needsUserAction ? .needsYou : .completed
     }
 }
 

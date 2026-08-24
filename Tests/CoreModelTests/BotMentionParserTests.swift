@@ -2,6 +2,33 @@ import XCTest
 @testable import CoreModel
 
 final class BotMentionParserTests: XCTestCase {
+    func test_peerConsultationIdleWindowRestartsOnProgress() {
+        // WHY: a live Bot must not be cut off at 10 minutes of wall time
+        // while it is still emitting updates.
+        let start = Date(timeIntervalSince1970: 0)
+        XCTAssertTrue(
+            BotPeerDelegation.peerConsultationStillActive(
+                now: start.addingTimeInterval(599),
+                lastProgress: start,
+                idle: 600
+            )
+        )
+        XCTAssertFalse(
+            BotPeerDelegation.peerConsultationStillActive(
+                now: start.addingTimeInterval(600),
+                lastProgress: start,
+                idle: 600
+            )
+        )
+        XCTAssertTrue(
+            BotPeerDelegation.peerConsultationStillActive(
+                now: start.addingTimeInterval(1_200),
+                lastProgress: start.addingTimeInterval(700),
+                idle: 600
+            )
+        )
+    }
+
     func test_mentionsResolveIdentityOnly_becauseTheProviderMustAuthorDelegatedPrompts() {
         // WHY: mention parsing may power autocomplete/identity, but must never
         // interpret prose or manufacture the prompt sent to another Bot.

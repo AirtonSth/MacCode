@@ -122,7 +122,8 @@ public final class PetController {
                 guard let store = context?.botStore,
                       var conversation = try store.conversation(id: conversationID) else { return }
                 conversation.unread = false
-                if conversation.attentionState == .unreadActivity {
+                if conversation.attentionState == .unreadActivity
+                    || conversation.attentionState == .needsAttention {
                     conversation.attentionState = .none
                 }
                 conversation.updatedAt = Date()

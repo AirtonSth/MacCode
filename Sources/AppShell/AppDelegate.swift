@@ -18,6 +18,10 @@ public enum BonjourPublicationState: String, Sendable {
     case failed
 }
 
+private final class UnixBotPeerProgressBox: @unchecked Sendable {
+    var date: Date?
+}
+
 @MainActor
 func flushPersistedTerminalHistoryForRegisteredSurfaces(
     timeout: TimeInterval = 2
@@ -252,6 +256,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let socketPath = AppPaths.socketPath(for: channel)
         let dispatcher = JSONRPCDispatcher(router: router)
         let server = UnixSocketServer(socketPath: socketPath, dispatcher: dispatcher)
+        server.botPeerAskProgress = { [weak router] threadID, runID in
+            let box = UnixBotPeerProgressBox()
+            let gate = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async {
+                box.date = router?.botPeerAskProgress(threadID: threadID, runID: runID)
+                gate.signal()
+            }
+            _ = gate.wait(timeout: .now() + 0.25)
+            return box.date
+        }
         do {
             try server.start()
             socketServer = server

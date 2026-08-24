@@ -2538,6 +2538,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ])
     }
 
+    public func botPeerAskProgress(threadID: String, runID: String) -> Date? {
+        guard let runUUID = UUID(uuidString: runID) else { return nil }
+        _ = threadID
+        return context?.botPeerHandoffAuthority.latestPeerProgress(hostRunID: AgentRunID(runUUID))
+    }
+
     public func askBotPeer(
         callerThread: AgentThreadID,
         callerRun: AgentRunID,

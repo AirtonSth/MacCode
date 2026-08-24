@@ -510,7 +510,7 @@ private struct PetAttentionPopoverView: View {
                 }
             }
             Spacer(minLength: 8)
-            Button(item.kind.needsUserAction ? "Review" : "Open") { onOpen(item) }
+            Button(item.classification == .needsYou ? "Review" : "Open") { onOpen(item) }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .frame(minWidth: 44, minHeight: 44)
