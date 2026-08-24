@@ -86,7 +86,7 @@ public enum BotSelfConfigCatalog: Sendable {
         case listPeers:
             return "List the live RemoteCode Bots available for AI-authored delegation, including each exact handle and id."
         case askPeer:
-            return "Ask one RemoteCode Bot a focused prompt written by you after interpreting the user's complete request. The `prompt` is sent literally; RemoteCode does not extract, truncate, translate, or otherwise infer it from the user message. Calls are repeatable: for multi-Bot comparison, debate, mediation, or consensus, use `consult` as often as needed, authoring each new prompt yourself based on real replies and including only the prior-reply context relevant to the next Bot. The primary AI mediates and produces the final synthesis; RemoteCode does not semantically route, sequence, or set a fixed iteration count. `reply_only` is terminal and is valid only when no comparison, follow-up, mediation, or synthesis remains and the whole user turn belongs to that Bot."
+            return "Ask one RemoteCode Bot a focused prompt written by you after interpreting the user's complete request. The `prompt` is sent literally; RemoteCode does not extract, truncate, translate, or otherwise infer it from the user message. Omit `consultation_id` for a clean independent review; pass only the opaque id returned by a successful prior call in this exact active run and for this same Bot to continue that conversation with a new peer run. Calls are repeatable: for multi-Bot comparison, debate, mediation, or consensus, use `consult` as often as needed, authoring each new prompt yourself based on real replies and including only the prior-reply context relevant to the next Bot. The primary AI mediates and produces the final synthesis; RemoteCode does not semantically route, sequence, or set a fixed iteration count. `reply_only` is terminal and is valid only when no comparison, follow-up, mediation, or synthesis remains and the whole user turn belongs to that Bot."
         default:
             return name
         }
@@ -198,6 +198,11 @@ public enum BotSelfConfigCatalog: Sendable {
                         "type": "string",
                         "enum": ["consult", "reply_only"],
                         "description": "consult to keep working with the reply; reply_only when the Bot reply itself is the complete user-facing answer.",
+                    ],
+                    "consultation_id": [
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Optional opaque id returned by a successful bot_ask_peer call. Omit for a clean independent review; pass it only to continue that exact Bot conversation in this active run.",
                     ],
                 ],
                 "required": ["handle", "prompt", "reply_mode"],
