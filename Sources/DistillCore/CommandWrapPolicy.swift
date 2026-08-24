@@ -99,6 +99,24 @@ public enum CommandWrapPolicy {
         return nil
     }
 
+    /// How the wrapper attaches the child's stdio. Compress-eligible invocations
+    /// capture stdout and stderr on one pipe so diagnostics cannot bypass Distill.
+    public enum CommandWrapChildStreams: Equatable {
+        case inheritAll
+        case captureCombinedStdoutAndStderr
+    }
+
+    public static func childStreams(
+        command: String,
+        args: [String],
+        environment: [String: String]
+    ) -> CommandWrapChildStreams {
+        if passthroughReason(command: command, args: args, environment: environment) != nil {
+            return .inheritAll
+        }
+        return .captureCombinedStdoutAndStderr
+    }
+
     // PERF: passthroughReason runs on every PATH-wrapped spawn. Array literals
     // for git exact-output subcommands / patch flags reallocated membership
     // tables per decision; share process-wide Sets (membership unchanged).

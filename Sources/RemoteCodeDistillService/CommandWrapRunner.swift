@@ -55,9 +55,11 @@ enum CommandWrapRunner {
             return (127, nil)
         }
 
-        // Mutating / disabled invocations run untouched with all streams inherited.
-        if CommandWrapPolicy.passthroughReason(command: command, args: args, environment: env) != nil {
+        switch CommandWrapPolicy.childStreams(command: command, args: args, environment: env) {
+        case .inheritAll:
             return (runInheritingAllStreams(executable: realExe, args: args), nil)
+        case .captureCombinedStdoutAndStderr:
+            break
         }
 
         let captured = runCapturingStdout(executable: realExe, args: args)
@@ -202,16 +204,17 @@ enum CommandWrapRunner {
         var spawnFailed: Bool
     }
 
-    /// Runs the real command capturing ONLY stdout; stdin and stderr are inherited so the
-    /// command reads its real input and its errors reach the agent unchanged. On overflow the
-    /// buffered + remaining bytes are streamed straight to our stdout (raw passthrough).
+    /// Runs the real command capturing stdout and stderr on the same pipe so
+    /// interleaved diagnostics enter Distill as one input. stdin is inherited.
+    /// On overflow the buffered + remaining bytes stream raw to our stdout.
     private static func runCapturingStdout(executable: String, args: [String]) -> CapturedOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = args
         let outPipe = Pipe()
         process.standardOutput = outPipe
-        // standardInput / standardError inherited (unset).
+        process.standardError = outPipe
+        // standardInput inherited (unset).
         do {
             try process.run()
         } catch {
