@@ -10,6 +10,7 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         let workspaceID = WorkspaceID()
         let threadID = AgentThreadID()
         let burstSize = 32
+        fixture.selectedThreadIDs = [threadID]
 
         for _ in 0..<7 {
             let before = fixture.rounds.count
@@ -49,6 +50,7 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         let workspaceID = WorkspaceID()
         let firstThreadID = AgentThreadID()
         let latestThreadID = AgentThreadID()
+        fixture.selectedThreadIDs = [firstThreadID, latestThreadID]
 
         coordinator.requestCoalescedSubagentActivityRefresh(
             workspaceID: workspaceID,
@@ -70,6 +72,34 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         )
     }
 
+    func test_childStatusEventRefreshesDifferentSelectedParentThread() async {
+        let fixture = ActivityRefreshFixture()
+        let coordinator = makeCoordinator(fixture: fixture)
+        let workspaceID = WorkspaceID()
+        let selectedParentThreadID = AgentThreadID()
+        let eventChildThreadID = AgentThreadID()
+        fixture.selectedThreadIDs = [selectedParentThreadID]
+
+        coordinator.requestCoalescedSubagentActivityRefresh(
+            workspaceID: workspaceID,
+            threadID: eventChildThreadID
+        )
+        await waitUntil { fixture.firstRoundEntered }
+        fixture.releaseFirstRound()
+        await waitUntil { fixture.appliedRounds.count == 1 }
+
+        XCTAssertEqual(
+            fixture.rounds,
+            [Set([selectedParentThreadID])],
+            "a child terminal event is a refresh trigger, not a selected-thread filter"
+        )
+        XCTAssertEqual(
+            fixture.appliedRounds,
+            [Set([selectedParentThreadID])],
+            "the selected parent surface must receive the refreshed snapshot"
+        )
+    }
+
     private func makeCoordinator(fixture: ActivityRefreshFixture) -> AgentWorkspaceRailReloadCoordinator {
         let coordinator = AgentWorkspaceRailReloadCoordinator(
             subagentPollNanoseconds: 1,
@@ -82,6 +112,9 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
             },
             subagentActivityRefreshApply: { threadIDs in
                 fixture.recordAppliedRound(threadIDs)
+            },
+            subagentActivityRefreshSelectedThreadIDs: {
+                fixture.selectedThreadIDs
             }
         )
         coordinator.debounceNanoseconds = 0
@@ -113,6 +146,7 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
 private final class ActivityRefreshFixture {
     var rounds: [Set<AgentThreadID>] = []
     var appliedRounds: [Set<AgentThreadID>] = []
+    var selectedThreadIDs: Set<AgentThreadID> = []
     var firstRoundEntered = false
     private var firstRoundContinuation: CheckedContinuation<Void, Never>?
 

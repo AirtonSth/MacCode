@@ -60,6 +60,7 @@ public final class AgentWorkspaceRailReloadCoordinator {
     private var subagentActivityRefreshSleepForTesting: ((UInt64) async throws -> Void)?
     private var subagentActivityRefreshRoundForTesting: ((Set<AgentThreadID>) async -> Void)?
     private var subagentActivityRefreshApplyForTesting: ((Set<AgentThreadID>) -> Void)?
+    private var subagentActivityRefreshSelectedThreadIDsForTesting: (() -> Set<AgentThreadID>)?
     var subagentPollIsRunningForTesting: Bool { subagentPollTask != nil }
     #endif
 
@@ -73,7 +74,8 @@ public final class AgentWorkspaceRailReloadCoordinator {
         pollRound: @escaping () async -> Void,
         subagentActivityRefreshSleep: ((UInt64) async throws -> Void)? = nil,
         subagentActivityRefreshRound: ((Set<AgentThreadID>) async -> Void)? = nil,
-        subagentActivityRefreshApply: ((Set<AgentThreadID>) -> Void)? = nil
+        subagentActivityRefreshApply: ((Set<AgentThreadID>) -> Void)? = nil,
+        subagentActivityRefreshSelectedThreadIDs: (() -> Set<AgentThreadID>)? = nil
     ) {
         self.subagentPollNanoseconds = subagentPollNanoseconds
         subagentPollHasMembersForTesting = hasMembers
@@ -82,6 +84,7 @@ public final class AgentWorkspaceRailReloadCoordinator {
         subagentActivityRefreshSleepForTesting = subagentActivityRefreshSleep
         subagentActivityRefreshRoundForTesting = subagentActivityRefreshRound
         subagentActivityRefreshApplyForTesting = subagentActivityRefreshApply
+        subagentActivityRefreshSelectedThreadIDsForTesting = subagentActivityRefreshSelectedThreadIDs
     }
 
     func reconcileSubagentPollForTesting() {
@@ -265,29 +268,31 @@ public final class AgentWorkspaceRailReloadCoordinator {
         generation: UInt64
     ) async {
         guard subagentActivityRefreshGenerations[workspaceID] == generation else { return }
-        let threadIDs = subagentActivityRefreshThreadIDs[workspaceID] ?? []
+        // Event thread IDs only trigger the coalesced read. A child lifecycle
+        // event must still refresh a surface currently showing its parent.
         let live = liveViewModels(for: workspaceID)
         #if DEBUG
-        if let refreshRound = subagentActivityRefreshRoundForTesting {
-            await refreshRound(threadIDs)
+        if let refreshRound = subagentActivityRefreshRoundForTesting,
+           let selectedThreadIDs = subagentActivityRefreshSelectedThreadIDsForTesting?() {
+            await refreshRound(selectedThreadIDs)
             guard subagentActivityRefreshGenerations[workspaceID] == generation else { return }
-            subagentActivityRefreshApplyForTesting?(threadIDs)
+            subagentActivityRefreshApplyForTesting?(selectedThreadIDs)
             clearSubagentActivityRefreshIfCurrent(workspaceID: workspaceID, generation: generation)
             return
         }
         #endif
         let targets: [(viewModel: AgentAppViewModel, threadId: AgentThreadID)] = live
             .compactMap { viewModel in
-                guard let threadId = viewModel.selectedThreadId,
-                      threadIDs.contains(threadId) else { return nil }
+                guard let threadId = viewModel.selectedThreadId else { return nil }
                 return (viewModel, threadId)
             }
-        guard let lead = live.first else {
+        guard let lead = targets.first else {
             clearSubagentActivityRefreshIfCurrent(workspaceID: workspaceID, generation: generation)
             return
         }
-        let snapshots = await lead.loadSubagentActivitySnapshotsOffMainActor(
-            for: Array(threadIDs),
+        let targetThreadIDs = Set(targets.map(\.threadId))
+        let snapshots = await lead.viewModel.loadSubagentActivitySnapshotsOffMainActor(
+            for: Array(targetThreadIDs),
             persistLifecycleReconciliation: true
         )
         guard subagentActivityRefreshGenerations[workspaceID] == generation else { return }
