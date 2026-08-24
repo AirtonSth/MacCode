@@ -106,6 +106,8 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
             try? FileManager.default.removeItem(at: fixture.rootURL)
         }
         shared.register(fixture.vm)
+        fixture.vm.scheduleReloadThreads(delayMilliseconds: 60_000)
+        fixture.livenessGate.markDead()
 
         fixture.vm.runCoordinator(
             fixture.runCoordinator,
@@ -186,7 +188,9 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         )
         vm.reloadThreads()
         vm.selectThread(parentThread.id, markRead: false)
-        vm.seedSelectedThreadChromeForTesting(parentThread.id)
+        if !seedReceipt {
+            vm.seedSelectedThreadChromeForTesting(parentThread.id)
+        }
         if seedReceipt {
             try activityRepository.save(deadReceipt)
         }
@@ -205,6 +209,7 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
             coordinator: coordinator,
             runCoordinator: runCoordinator,
             activityRepository: activityRepository,
+            livenessGate: livenessGate,
             deadRunID: deadRunID,
             deadReceiptID: deadReceipt.id,
             workspaceID: workspaceID,
@@ -261,6 +266,7 @@ private struct LiveParentSurfaceFixture {
     let coordinator: AgentWorkspaceRailReloadCoordinator
     let runCoordinator: AgentRunCoordinator
     let activityRepository: AgentOrchestrationRepository
+    let livenessGate: ReceiptLivenessGate
     let deadRunID: AgentRunID
     let deadReceiptID: UUID
     let workspaceID: WorkspaceID
@@ -297,12 +303,17 @@ private final class ActivityRefreshFixture {
 
 private final class ReceiptLivenessGate: @unchecked Sendable {
     private let lock = NSLock()
-    private var callCount = 0
+    private var alive = true
 
     func isAlive() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        callCount += 1
-        return callCount == 1
+        return alive
+    }
+
+    func markDead() {
+        lock.lock()
+        alive = false
+        lock.unlock()
     }
 }
