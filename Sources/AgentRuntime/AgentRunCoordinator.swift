@@ -7765,10 +7765,34 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         let metadata = activeRunMetadata[parentRunId]
         lock.unlock()
-        let parentReceipt = try? orchestrationRuntime.recentReceipts(limit: 500)
-            .first { $0.runId == parentRunId }
-        let parentRun = try? runRepo.get(id: parentRunId)
-        guard let parentProvider = metadata?.provider
+        // Grok `x.ai/session_update` shares this method with subagent lifecycle
+        // payloads. Parse first: ordinary session chunks must not decode the
+        // orchestration ledger (live freeze sampled 570 receipt scans / 8s).
+        var parentProvider = metadata?.provider
+        var updates = ProviderNativeSubagentLifecycle.updates(
+            from: event,
+            parentProvider: parentProvider ?? .grok
+        )
+        if updates.isEmpty {
+            if parentProvider != .codex, case .itemDelta = event {
+                let parentReceipt = try? orchestrationRuntime.receipt(runId: parentRunId)
+                let parentRun = try? runRepo.get(id: parentRunId)
+                parentProvider = parentReceipt?.provider ?? parentRun?.provider
+                if let parentProvider {
+                    updates = ProviderNativeSubagentLifecycle.updates(
+                        from: event,
+                        parentProvider: parentProvider
+                    )
+                }
+            }
+            guard !updates.isEmpty else { return }
+        }
+
+        let parentReceipt = metadata == nil
+            ? (try? orchestrationRuntime.receipt(runId: parentRunId))
+            : nil
+        let parentRun = metadata == nil ? (try? runRepo.get(id: parentRunId)) : nil
+        guard let parentProvider = parentProvider
                 ?? parentReceipt?.provider
                 ?? parentRun?.provider else { return }
         let parentProviderInstanceId = metadata?.providerInstanceId
@@ -7776,12 +7800,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             ?? parentRun?.providerInstanceId
             ?? parentProvider.rawValue
         let parentModel = metadata?.model ?? parentReceipt?.model ?? parentRun?.model ?? "unknown"
-
-        let updates = ProviderNativeSubagentLifecycle.updates(
-            from: event,
-            parentProvider: parentProvider
-        )
-        guard !updates.isEmpty else { return }
         for update in updates {
             do {
                 _ = try orchestrationRuntime.recordProviderNativeChild(
