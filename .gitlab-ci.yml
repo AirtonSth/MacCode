@@ -196,7 +196,19 @@ token_saver_mlx_live:
   script:
     - test "$(uname -m)" = "arm64"
     - export REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_DIR="${TMPDIR:-/tmp}/RemoteCodeTokenSaverLiveModel"
-    - swift test --filter 'DistillLiveModelTests|DistillLivePerfTests|MLXHotPathSafetyTests'
+    - |
+      log_path="token-saver-mlx-live.log"
+      set +e
+      swift test --filter 'DistillLiveModelTests|DistillLivePerfTests|MLXHotPathSafetyTests' >"$log_path" 2>&1
+      test_status=$?
+      set -e
+      if [ "$test_status" -ne 0 ]; then
+        echo "token_saver_mlx_live failed (exit $test_status); last 200 log lines:" >&2
+        tail -n 200 "$log_path" >&2
+        exit "$test_status"
+      fi
+      echo "token_saver_mlx_live passed; XCTest summary:"
+      grep -E "Test Suite 'Selected tests' passed|Executed [0-9]+ tests|✔ Test run" "$log_path" | tail -n 20 || true
 
 macos_agent_perf_guards:
   extends: .macos_large
@@ -227,7 +239,19 @@ pr_unit_tests:
       when: manual
       allow_failure: true
   script:
-    - scripts/test-unit.sh
+    - |
+      log_path="pr-unit-tests.log"
+      set +e
+      scripts/test-unit.sh >"$log_path" 2>&1
+      test_status=$?
+      set -e
+      if [ "$test_status" -ne 0 ]; then
+        echo "pr_unit_tests failed (exit $test_status); last 200 log lines:" >&2
+        tail -n 200 "$log_path" >&2
+        exit "$test_status"
+      fi
+      echo "pr_unit_tests passed; XCTest summary:"
+      grep -E "Test Suite 'Selected tests' passed|Executed [0-9]+ tests|✔ Test run" "$log_path" | tail -n 20 || true
 
 package_bundle_check:
   extends: .macos_large
