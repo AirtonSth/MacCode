@@ -76,6 +76,7 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         defer {
             fixture.coordinator.unregister(fixture.vm)
             fixture.vm.dispose()
+            try? FileManager.default.removeItem(at: fixture.rootURL)
         }
         let eventChildThreadID = AgentThreadID()
         XCTAssertNotEqual(eventChildThreadID, fixture.parentThreadID)
@@ -137,7 +138,8 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
             vm: vm,
             coordinator: coordinator,
             workspaceID: workspaceID,
-            parentThreadID: parentThread.id
+            parentThreadID: parentThread.id,
+            rootURL: URL(fileURLWithPath: tmp)
         )
     }
 
@@ -189,6 +191,7 @@ private struct LiveParentSurfaceFixture {
     let coordinator: AgentWorkspaceRailReloadCoordinator
     let workspaceID: WorkspaceID
     let parentThreadID: AgentThreadID
+    let rootURL: URL
 }
 
 @MainActor
