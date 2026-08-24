@@ -1,5 +1,7 @@
 import XCTest
 import CoreModel
+import AgentRuntime
+@testable import Persistence
 @testable import Surfaces
 
 @MainActor
@@ -16,8 +18,7 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
             let before = fixture.rounds.count
             for _ in 0..<burstSize {
                 coordinator.requestCoalescedSubagentActivityRefresh(
-                    workspaceID: workspaceID,
-                    threadID: threadID
+                    workspaceID: workspaceID
                 )
             }
             await waitUntil { fixture.rounds.count == before + 1 }
@@ -53,14 +54,12 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         fixture.selectedThreadIDs = [firstThreadID, latestThreadID]
 
         coordinator.requestCoalescedSubagentActivityRefresh(
-            workspaceID: workspaceID,
-            threadID: firstThreadID
+            workspaceID: workspaceID
         )
         await waitUntil { fixture.firstRoundEntered }
 
         coordinator.requestCoalescedSubagentActivityRefresh(
-            workspaceID: workspaceID,
-            threadID: latestThreadID
+            workspaceID: workspaceID
         )
         fixture.releaseFirstRound()
         await waitUntil { fixture.appliedRounds.count == 1 }
@@ -72,31 +71,73 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         )
     }
 
-    func test_childStatusEventRefreshesDifferentSelectedParentThread() async {
-        let fixture = ActivityRefreshFixture()
-        let coordinator = makeCoordinator(fixture: fixture)
-        let workspaceID = WorkspaceID()
-        let selectedParentThreadID = AgentThreadID()
+    func test_childStatusEventRefreshesDifferentSelectedParentThread() async throws {
+        let fixture = try makeLiveParentSurface()
+        defer {
+            fixture.coordinator.unregister(fixture.vm)
+            fixture.vm.dispose()
+        }
         let eventChildThreadID = AgentThreadID()
-        fixture.selectedThreadIDs = [selectedParentThreadID]
+        XCTAssertNotEqual(eventChildThreadID, fixture.parentThreadID)
 
-        coordinator.requestCoalescedSubagentActivityRefresh(
+        fixture.coordinator.requestCoalescedSubagentActivityRefresh(
+            workspaceID: fixture.workspaceID
+        )
+        await waitUntil { fixture.vm.subagentActivity.isEmpty }
+
+        XCTAssertEqual(
+            fixture.vm.selectedThreadId,
+            fixture.parentThreadID,
+            "the child event must refresh the surface's selected parent, not rebind selection"
+        )
+    }
+
+    private func makeLiveParentSurface() throws -> LiveParentSurfaceFixture {
+        let tmp = NSTemporaryDirectory() + "rc2-status-parent-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let workspaceID = WorkspaceID()
+        let parentThread = AgentThread(
+            workspaceId: workspaceID,
+            title: "parent",
+            provider: .codex,
+            model: "gpt-5.6-sol",
+            status: .completed
+        )
+        try threadRepo.upsert(parentThread)
+        let vm = AgentAppViewModel(
             workspaceID: workspaceID,
-            threadID: eventChildThreadID
+            cwd: tmp,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
         )
-        await waitUntil { fixture.firstRoundEntered }
-        fixture.releaseFirstRound()
-        await waitUntil { fixture.appliedRounds.count == 1 }
+        vm.reloadThreads()
+        vm.selectThread(parentThread.id, markRead: false)
+        vm.seedSelectedThreadChromeForTesting(parentThread.id)
 
-        XCTAssertEqual(
-            fixture.rounds,
-            [Set([selectedParentThreadID])],
-            "a child terminal event is a refresh trigger, not a selected-thread filter"
+        let coordinator = AgentWorkspaceRailReloadCoordinator(
+            subagentPollNanoseconds: 1,
+            hasMembers: { false },
+            sleep: { _ in },
+            pollRound: {},
+            subagentActivityRefreshSleep: { _ in }
         )
-        XCTAssertEqual(
-            fixture.appliedRounds,
-            [Set([selectedParentThreadID])],
-            "the selected parent surface must receive the refreshed snapshot"
+        coordinator.debounceNanoseconds = 0
+        coordinator.register(vm)
+        return LiveParentSurfaceFixture(
+            vm: vm,
+            coordinator: coordinator,
+            workspaceID: workspaceID,
+            parentThreadID: parentThread.id
         )
     }
 
@@ -140,6 +181,14 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         }
         XCTFail("condition did not become true", file: file, line: line)
     }
+}
+
+@MainActor
+private struct LiveParentSurfaceFixture {
+    let vm: AgentAppViewModel
+    let coordinator: AgentWorkspaceRailReloadCoordinator
+    let workspaceID: WorkspaceID
+    let parentThreadID: AgentThreadID
 }
 
 @MainActor

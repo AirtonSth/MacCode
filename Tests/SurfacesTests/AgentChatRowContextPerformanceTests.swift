@@ -91,12 +91,14 @@ final class AgentChatRowContextPerformanceTests: XCTestCase {
 
         let greenMedian = median(greenSamples)
         let greenP95 = p95(greenSamples)
+        let legacyMedian = median(legacySamples)
+        let legacyP95 = p95(legacySamples)
         let legacyWarmupText = format(legacyWarmups)
         let legacySampleText = format(legacySamples)
         let greenWarmupText = format(greenWarmups)
         let greenSampleText = format(greenSamples)
-        let legacyMedianText = format(median(legacySamples))
-        let legacyP95Text = format(p95(legacySamples))
+        let legacyMedianText = format(legacyMedian)
+        let legacyP95Text = format(legacyP95)
         let greenMedianText = format(greenMedian)
         let greenP95Text = format(greenP95)
         print(
@@ -106,10 +108,20 @@ final class AgentChatRowContextPerformanceTests: XCTestCase {
                 + "green_samples=\(greenSampleText) green_median_ms=\(greenMedianText) "
                 + "green_p95_ms=\(greenP95Text)"
         )
-        let allowedMedian = median(legacySamples) + max(25, median(legacySamples) * 0.05)
-        let allowedP95 = p95(legacySamples) + max(25, p95(legacySamples) * 0.05)
+        let allowedMedian = legacyMedian + max(25, legacyMedian * 0.05)
+        let allowedP95 = legacyP95 + max(25, legacyP95 * 0.05)
         XCTAssertLessThanOrEqual(greenMedian, allowedMedian, "row-context median regressed beyond the 25ms/5% budget")
         XCTAssertLessThanOrEqual(greenP95, allowedP95, "row-context p95 regressed beyond the 25ms/5% budget")
+        XCTAssertLessThanOrEqual(
+            greenMedian,
+            legacyMedian * 0.75,
+            "shared row derivation must materially beat the legacy per-row rescan"
+        )
+        XCTAssertLessThanOrEqual(
+            greenP95,
+            legacyP95 * 0.75,
+            "shared row derivation p95 must materially beat the legacy per-row rescan"
+        )
     }
 
     private struct PeerIdentity {

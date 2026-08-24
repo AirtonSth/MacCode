@@ -8441,8 +8441,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // Admission receipts finalize on terminal status. One shared,
             // off-main read updates every selected surface for this workspace.
             AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedSubagentActivityRefresh(
-                workspaceID: self.workspaceID,
-                threadID: threadId
+                workspaceID: self.workspaceID
             )
             self.onRunStateChange?()
         }
@@ -11475,9 +11474,9 @@ public struct AgentAppView: View {
         return rows
     }
 
-    /// Derive all row-local peer and prior-turn context in one linear pass per
-    /// input. This preserves the old contiguous-group and chronological prior
-    /// turn semantics without making every row scan the same transcript again.
+    /// Derive all row-local peer and prior-turn context once per paint input.
+    /// Bounded metadata preserves the old contiguous-group and chronological
+    /// prior-turn semantics without making every row scan the same input again.
     static func makeChatRowPaintContext(
         rows: [ChatFlowRow],
         visibleEntries: [TranscriptEntry],

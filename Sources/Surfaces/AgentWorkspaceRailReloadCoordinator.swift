@@ -45,7 +45,6 @@ public final class AgentWorkspaceRailReloadCoordinator {
     private var railDebounceTasks: [WorkspaceID: Task<Void, Never>] = [:]
     private var queueDebounceTasks: [WorkspaceID: Task<Void, Never>] = [:]
     private var subagentActivityRefreshTasks: [WorkspaceID: Task<Void, Never>] = [:]
-    private var subagentActivityRefreshThreadIDs: [WorkspaceID: Set<AgentThreadID>] = [:]
     private var subagentActivityRefreshGenerations: [WorkspaceID: UInt64] = [:]
     private var subagentPollTask: Task<Void, Never>?
     /// Debounce window for EventBus fan-out storms.
@@ -151,10 +150,8 @@ public final class AgentWorkspaceRailReloadCoordinator {
     /// workspace. The receipt read is off-main and the generation check keeps a
     /// slow, cancelled read from overwriting a newer lifecycle result.
     public func requestCoalescedSubagentActivityRefresh(
-        workspaceID: WorkspaceID,
-        threadID: AgentThreadID
+        workspaceID: WorkspaceID
     ) {
-        subagentActivityRefreshThreadIDs[workspaceID, default: []].insert(threadID)
         let generation = (subagentActivityRefreshGenerations[workspaceID] ?? 0) &+ 1
         subagentActivityRefreshGenerations[workspaceID] = generation
         subagentActivityRefreshTasks[workspaceID]?.cancel()
@@ -310,7 +307,6 @@ public final class AgentWorkspaceRailReloadCoordinator {
         generation: UInt64
     ) {
         guard subagentActivityRefreshGenerations[workspaceID] == generation else { return }
-        subagentActivityRefreshThreadIDs.removeValue(forKey: workspaceID)
         subagentActivityRefreshTasks.removeValue(forKey: workspaceID)
     }
 
