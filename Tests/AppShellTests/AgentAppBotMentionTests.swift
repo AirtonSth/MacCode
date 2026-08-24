@@ -512,6 +512,7 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertTrue(firstStarted)
         let firstPeerRequest = try XCTUnwrap(runner.requests.last)
         XCTAssertNotEqual(firstPeerRequest.runId, hostRunID)
+        XCTAssertNil(firstPeerRequest.providerThreadId, "a fresh peer consultation must start a new provider session")
         XCTAssertTrue(runner.finish(
             runID: firstPeerRequest.runId,
             status: .completed,
@@ -538,6 +539,7 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(firstPeerRequest.provider, .codex)
         XCTAssertEqual(inheritedPeerThread.provider, .codex)
         XCTAssertEqual(inheritedPeerThread.effectiveRoutingConfiguration.mode, .manual)
+        XCTAssertEqual(inheritedPeerThread.providerThreadId, firstPeerThreadID.value.uuidString)
         XCTAssertEqual(inheritedPeerThread.projectId, projectID)
         XCTAssertEqual(inheritedPeerThread.workspaceId, callerThread.workspaceId)
         XCTAssertEqual(inheritedPeerThread.executionMode, .worktree)
@@ -564,6 +566,7 @@ final class AgentAppBotMentionTests: XCTestCase {
         let continuationRequest = try XCTUnwrap(runner.requests.last)
         XCTAssertEqual(continuationRequest.threadId, firstPeerThreadID)
         XCTAssertNotEqual(continuationRequest.runId, firstPeerRequest.runId)
+        XCTAssertEqual(continuationRequest.providerThreadId, inheritedPeerThread.providerThreadId)
         XCTAssertTrue(runner.finish(
             runID: continuationRequest.runId,
             status: .completed,
@@ -602,6 +605,7 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertTrue(independentStarted)
         let independentRequest = try XCTUnwrap(runner.requests.last)
         XCTAssertNotEqual(independentRequest.threadId, firstPeerThreadID)
+        XCTAssertNil(independentRequest.providerThreadId, "omission must not inherit another consultation's provider session")
         XCTAssertTrue(runner.finish(
             runID: independentRequest.runId,
             status: .completed,
