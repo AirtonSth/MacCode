@@ -87,6 +87,27 @@ final class ProviderNativeSubagentLifecycleTests: XCTestCase {
         )
     }
 
+    func testOrdinaryGrokSessionUpdateProjectsNoChild() {
+        // WHY: live freeze pid 65678 decoded recentReceipts(limit: 500) on every
+        // Grok `x.ai/session/update`. Those events are the token hot path; only
+        // nested subagent_* kinds must persist a child.
+        let event = grokRuntimeEvent(
+            update: [
+                "sessionUpdate": "agent_message_chunk",
+                "content": ["type": "text", "text": "hello"],
+            ],
+            method: "x.ai/session/update"
+        )
+        XCTAssertTrue(
+            ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(event),
+            "session/update still has to be inspected for nested subagent payloads"
+        )
+        XCTAssertTrue(
+            ProviderNativeSubagentLifecycle.updates(from: event, parentProvider: .grok).isEmpty,
+            "ordinary Grok session chunks must not project a native child"
+        )
+    }
+
     func testOrdinaryProviderEventsSkipTheLifecyclePersistenceHotPath() {
         XCTAssertFalse(
             ProviderNativeSubagentLifecycle.isPotentialLifecycleEvent(

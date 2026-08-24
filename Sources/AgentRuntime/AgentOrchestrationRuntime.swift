@@ -2221,6 +2221,12 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         try repository.receipts(limit: max(1, limit))
     }
 
+    /// Keyed lookup for one run. Do not use `recentReceipts` and scan — Grok
+    /// session_update is on the token hot path.
+    public func receipt(runId: AgentRunID) throws -> AgentOrchestrationAdmissionReceipt? {
+        try repository.receipt(runId: runId)
+    }
+
     /// Default bound for nested-worker (`parentReceiptId`) rows in a thread-scoped
     /// activity fetch. Separate from the selected-thread window so children cannot
     /// starve the thread's own history (and vice versa). Must stay strictly below

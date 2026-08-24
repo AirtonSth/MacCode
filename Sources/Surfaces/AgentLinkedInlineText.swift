@@ -208,7 +208,10 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
         tv.isVerticallyResizable = false
         tv.textContainerInset = .zero
         tv.textContainer?.lineFragmentPadding = lineFragmentPadding
-        tv.textContainer?.widthTracksTextView = true
+        // SwiftUI proposes a concrete column width via sizeThatFits. Tracking
+        // the still-stale NSView frame fights that proposal and retriggers
+        // LazyVStack placement (live freeze: 100% main thread in sizeThatFits).
+        tv.textContainer?.widthTracksTextView = false
         tv.textContainer?.heightTracksTextView = false
         tv.textContainer?.containerSize = NSSize(
             width: 10_000,
@@ -371,40 +374,63 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
 /// NSTextView that reports vertical intrinsic size for SwiftUI layout.
 final class IntrinsicHeightTextView: NSTextView {
     private(set) var intrinsicInvalidationCountForTesting = 0
+    private var measuringProposedWidth = false
+    private var lastFittedWidth: CGFloat = 0
+    private var lastFittedSize: CGSize = .zero
 
     override func invalidateIntrinsicContentSize() {
+        lastFittedWidth = 0
+        lastFittedSize = .zero
         intrinsicInvalidationCountForTesting += 1
         super.invalidateIntrinsicContentSize()
     }
 
     override var intrinsicContentSize: NSSize {
-        let fitted = sizeThatFitsWidth(bounds.width > 0 ? bounds.width : 10_000)
+        if lastFittedSize.height > 0 {
+            return NSSize(width: NSView.noIntrinsicMetric, height: lastFittedSize.height)
+        }
+        let fitted = sizeThatFitsWidth(bounds.width)
         return NSSize(width: NSView.noIntrinsicMetric, height: fitted.height)
     }
 
     func sizeThatFitsWidth(_ width: CGFloat) -> CGSize {
+        textContainer?.widthTracksTextView = false
+        textContainer?.heightTracksTextView = false
         let fallback = font?.boundingRectForFont.height ?? 14
-        guard width.isFinite, width > 0 else {
+        let target = Self.wrappingWidth(width)
+            ?? Self.wrappingWidth(bounds.width)
+            ?? Self.wrappingWidth(lastFittedWidth)
+        guard let target else {
             return CGSize(width: 0, height: fallback)
         }
-        guard let layoutManager, let textContainer else {
-            return CGSize(width: width, height: fallback)
+        if abs(lastFittedWidth - target) <= 0.5, lastFittedSize.height > 0 {
+            return lastFittedSize
         }
-        applyContainerWidth(width)
+        guard let layoutManager, let textContainer else {
+            return CGSize(width: target, height: fallback)
+        }
+        measuringProposedWidth = true
+        defer { measuringProposedWidth = false }
+        applyContainerWidth(target)
         layoutManager.ensureLayout(for: textContainer)
         let used = layoutManager.usedRect(for: textContainer)
         let height = max(ceil(used.height + textContainerInset.height * 2), fallback)
-        return CGSize(width: width, height: height)
+        let size = CGSize(width: target, height: height)
+        lastFittedWidth = target
+        lastFittedSize = size
+        return size
     }
 
     override func layout() {
         super.layout()
-        // Track the laid-out width only. Do not invalidate here: SwiftUI
-        // LazyVStack placement calls sizeThatFits, then layout, and an
-        // invalidate retriggers placement (live sample: 100% main thread,
-        // 16 GB AttributeGraph RSS on ChatFlowRow + AgentLinkedInlineText).
+        // Track the laid-out width only. Do not invalidate here, and do not
+        // overwrite a sizeThatFits proposal with the still-stale frame:
+        // LazyVStack placement calls sizeThatFits, then layout, and a
+        // bounds-width clobber retriggers placement (live sample: 100% main
+        // thread, growing AttributeGraph RSS on ChatFlowRow + AgentLinkedInlineText).
+        guard !measuringProposedWidth else { return }
         let width = bounds.width
-        guard width > 0 else { return }
+        guard Self.wrappingWidth(width) != nil else { return }
         applyContainerWidth(width)
     }
 
@@ -413,11 +439,20 @@ final class IntrinsicHeightTextView: NSTextView {
         invalidateIntrinsicContentSize()
     }
 
+    private static func wrappingWidth(_ width: CGFloat) -> CGFloat? {
+        guard width.isFinite, width > 0, width < 1_000_000 else { return nil }
+        return width
+    }
+
     private func applyContainerWidth(_ width: CGFloat) {
         guard let textContainer else { return }
         let target = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
         if abs(textContainer.containerSize.width - width) > 0.5 {
             textContainer.containerSize = target
+            if abs(lastFittedWidth - width) > 0.5 {
+                lastFittedWidth = 0
+                lastFittedSize = .zero
+            }
         }
     }
 }
