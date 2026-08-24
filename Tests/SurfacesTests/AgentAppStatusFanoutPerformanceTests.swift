@@ -72,7 +72,7 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
     }
 
     func test_childStatusEventRefreshesDifferentSelectedParentThread() async throws {
-        let fixture = try makeLiveParentSurface()
+        let fixture = try makeLiveParentSurface(seedReceipt: false)
         defer {
             fixture.coordinator.unregister(fixture.vm)
             fixture.vm.dispose()
@@ -97,7 +97,37 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         )
     }
 
-    private func makeLiveParentSurface() throws -> LiveParentSurfaceFixture {
+    func test_terminalStatusCallbackRoutesToSharedRefreshAndPersistsLifecycleReconciliation() async throws {
+        let fixture = try makeLiveParentSurface()
+        let shared = AgentWorkspaceRailReloadCoordinator.shared
+        defer {
+            shared.unregister(fixture.vm)
+            fixture.vm.dispose()
+            try? FileManager.default.removeItem(at: fixture.rootURL)
+        }
+        shared.register(fixture.vm)
+
+        fixture.vm.runCoordinator(
+            fixture.runCoordinator,
+            didChangeStatus: .completed,
+            runId: AgentRunID(),
+            threadId: fixture.parentThreadID
+        )
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        await waitUntil {
+            (try? fixture.activityRepository.receipt(runId: fixture.deadRunID)?.lifecycleStatus) == .unknown
+        }
+
+        XCTAssertEqual(
+            try fixture.activityRepository.receipt(runId: fixture.deadRunID)?.lifecycleStatus,
+            .unknown,
+            "terminal status refreshes must retain lifecycle reconciliation persistence"
+        )
+        XCTAssertEqual(fixture.vm.selectedThreadId, fixture.parentThreadID)
+        XCTAssertEqual(fixture.vm.subagentActivity.unknown.map(\.id), [fixture.deadReceiptID])
+    }
+
+    private func makeLiveParentSurface(seedReceipt: Bool = true) throws -> LiveParentSurfaceFixture {
         let tmp = NSTemporaryDirectory() + "rc2-status-parent-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -109,6 +139,14 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
             threadRepo: threadRepo,
             providers: [:]
         )
+        let activityRepository = AgentOrchestrationRepository(db: db)
+        let livenessGate = ReceiptLivenessGate()
+        let orchestrationRuntime = AgentOrchestrationRuntime(
+            repository: activityRepository,
+            packageVerification: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in livenessGate.isAlive() }
+        )
         let workspaceID = WorkspaceID()
         let parentThread = AgentThread(
             workspaceId: workspaceID,
@@ -118,16 +156,39 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
             status: .completed
         )
         try threadRepo.upsert(parentThread)
+        let deadRunID = AgentRunID()
+        let deadReceipt = AgentOrchestrationAdmissionReceipt(
+            runId: deadRunID,
+            threadId: parentThread.id,
+            nodeId: "subagent.dead",
+            routingRevision: 0,
+            policyDigest: "test",
+            packageRevision: "test",
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            capabilitySnapshotId: "test",
+            decisionReason: "manual-agent-app-controller",
+            admittedAt: Date(timeIntervalSinceNow: -60),
+            lifecycleStatus: .accepted,
+            deadlineAt: Date(timeIntervalSinceNow: 60),
+            permissionMode: .supervised,
+            ownerProcessID: 999
+        )
         let vm = AgentAppViewModel(
             workspaceID: workspaceID,
             cwd: tmp,
             coordinator: runCoordinator,
             threadRepo: threadRepo,
-            messageRepo: messageRepo
+            messageRepo: messageRepo,
+            orchestrationRuntime: orchestrationRuntime
         )
         vm.reloadThreads()
         vm.selectThread(parentThread.id, markRead: false)
         vm.seedSelectedThreadChromeForTesting(parentThread.id)
+        if seedReceipt {
+            try activityRepository.save(deadReceipt)
+        }
 
         let coordinator = AgentWorkspaceRailReloadCoordinator(
             subagentPollNanoseconds: 1,
@@ -141,6 +202,10 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
         return LiveParentSurfaceFixture(
             vm: vm,
             coordinator: coordinator,
+            runCoordinator: runCoordinator,
+            activityRepository: activityRepository,
+            deadRunID: deadRunID,
+            deadReceiptID: deadReceipt.id,
             workspaceID: workspaceID,
             parentThreadID: parentThread.id,
             rootURL: URL(fileURLWithPath: tmp)
@@ -193,6 +258,10 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
 private struct LiveParentSurfaceFixture {
     let vm: AgentAppViewModel
     let coordinator: AgentWorkspaceRailReloadCoordinator
+    let runCoordinator: AgentRunCoordinator
+    let activityRepository: AgentOrchestrationRepository
+    let deadRunID: AgentRunID
+    let deadReceiptID: UUID
     let workspaceID: WorkspaceID
     let parentThreadID: AgentThreadID
     let rootURL: URL
@@ -222,5 +291,17 @@ private final class ActivityRefreshFixture {
     func releaseFirstRound() {
         firstRoundContinuation?.resume()
         firstRoundContinuation = nil
+    }
+}
+
+private final class ReceiptLivenessGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCount = 0
+
+    func isAlive() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        callCount += 1
+        return callCount == 1
     }
 }
