@@ -113,9 +113,10 @@ final class AgentAppStatusFanoutPerformanceTests: XCTestCase {
             runId: AgentRunID(),
             threadId: fixture.parentThreadID
         )
-        try? await Task.sleep(nanoseconds: 100_000_000)
+        try? await Task.sleep(nanoseconds: 500_000_000)
         await waitUntil {
             (try? fixture.activityRepository.receipt(runId: fixture.deadRunID)?.lifecycleStatus) == .unknown
+                && fixture.vm.subagentActivity.unknown.map(\.id) == [fixture.deadReceiptID]
         }
 
         XCTAssertEqual(
