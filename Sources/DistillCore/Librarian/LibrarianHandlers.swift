@@ -8,7 +8,11 @@ enum LibrarianHandlers {
         store: LibrarianHandleStore,
         generate: (any LibrarianGenerating)?
     ) async -> LibrarianHandlerOutput {
-        let resolved = resolve(request, store: store)
+        let resolved = resolve(
+            request,
+            store: store,
+            storeMissing: function.id != "duplicate_handle_notice"
+        )
         switch function.id {
         case "retrieve":
             return retrieve(request, store: store)
@@ -118,10 +122,7 @@ enum LibrarianHandlers {
             let handle = store.put(resolved.text, kind: "exemplar")
             return textNotice(resolved, text: "stored exemplar \(handle); never binds paid")
         case "duplicate_handle_notice":
-            if let dup = store.findDuplicate(of: resolved.text) {
-                return textNotice(resolved, text: "duplicate of \(dup)")
-            }
-            return textNotice(resolved, text: "no duplicate handle")
+            return duplicateHandleNotice(request, resolved: resolved, store: store)
         case "secret_presence_flag":
             return flag(resolved, on: LibrarianSecretGate.looksSecret(resolved.text), label: "secret")
         case "pii_presence_flag":
@@ -149,14 +150,66 @@ enum LibrarianHandlers {
         let original: String
     }
 
-    private static func resolve(_ request: LibrarianRequest, store: LibrarianHandleStore) -> Resolved {
+    private static func resolve(
+        _ request: LibrarianRequest,
+        store: LibrarianHandleStore,
+        storeMissing: Bool = true
+    ) -> Resolved {
         if let handle = request.handle, let blob = store.get(handle) {
             return Resolved(text: blob, handle: handle, original: blob)
         }
         let text = request.input
-        let handle = request.handle ?? store.put(text)
-        if store.get(handle) == nil { _ = store.put(text, handle: handle) }
+        // duplicate_handle_notice must inspect the pre-existing store. Inserting
+        // first makes every first-seen blob a false self-duplicate. Preserve the
+        // established resolve behavior for every other operation.
+        let handle = storeMissing ? (request.handle ?? store.put(text)) : LibrarianHandleStore.makeHandle(text)
+        if storeMissing, store.get(handle) == nil { _ = store.put(text, handle: handle) }
         return Resolved(text: text, handle: handle, original: text)
+    }
+
+    private static func duplicateHandleNotice(
+        _ request: LibrarianRequest,
+        resolved: Resolved,
+        store: LibrarianHandleStore
+    ) -> LibrarianHandlerOutput {
+        let original = request.input.isEmpty ? resolved.original : request.input
+        guard request.retrieveAvailable,
+              let handle = request.handle,
+              request.verifiedRecoveryHandle == handle,
+              resolved.handle == handle,
+              let stored = store.get(handle),
+              sameUTF8Bytes(stored, original) else {
+            return LibrarianHandlerOutput(
+                status: .ok,
+                text: original,
+                handle: request.handle,
+                stage: .verbatim,
+                originalForSavings: original
+            )
+        }
+
+        let notice = "duplicate [[rc:\(handle)]]"
+        guard notice.utf8.count < original.utf8.count,
+              TokenEstimator.estimate(notice) < TokenEstimator.estimate(original) else {
+            return LibrarianHandlerOutput(
+                status: .ok,
+                text: original,
+                handle: handle,
+                stage: .verbatim,
+                originalForSavings: original
+            )
+        }
+        return LibrarianHandlerOutput(
+            status: .ok,
+            text: notice,
+            handle: handle,
+            stage: .deterministic,
+            originalForSavings: original
+        )
+    }
+
+    private static func sameUTF8Bytes(_ lhs: String, _ rhs: String) -> Bool {
+        Data(lhs.utf8) == Data(rhs.utf8)
     }
 
     private static func retrieve(_ request: LibrarianRequest, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
@@ -461,11 +514,25 @@ enum LibrarianHandlers {
         guard let generate else {
             return unavailableHost(resolved, reason: "generate_runtime_unavailable")
         }
+        let baselineSource = String(resolved.text.prefix(6_000))
+        let evidencePack: LibrarianEvidencePack.Result?
+        if request.retrieveAvailable,
+           request.verifiedRecoveryHandle == resolved.handle {
+            evidencePack = LibrarianEvidencePack(
+                budgetBytes: baselineSource.utf8.count
+            ).pack(
+                source: resolved.text,
+                question: request.question ?? function.summary
+            )
+        } else {
+            evidencePack = nil
+        }
+        let displayedSource = evidencePack?.text ?? baselineSource
         let prompt = """
         Op: \(function.id)
         Question: \(request.question ?? "")
         Source (cite exact substrings only):
-        \(resolved.text.prefix(6000))
+        \(displayedSource)
         Reply with one JSON object only. Keys: answer, span. span MUST be an exact substring of Source. No analysis.
         """
         guard let raw = await generate.generate(LibrarianGenerateCall(
@@ -473,7 +540,7 @@ enum LibrarianHandlers {
             user: String(prompt),
             maxTokens: 512
         )), let clean = LibrarianThinkStrip.strip(raw),
-              let parsed = parseAnswerSpan(clean, source: resolved.text) else {
+              let parsed = parseAnswerSpan(clean, source: displayedSource) else {
             return LibrarianHandlerOutput(
                 status: .unavailable,
                 text: resolved.original,
@@ -495,7 +562,11 @@ enum LibrarianHandlers {
                 originalForSavings: resolved.original
             )
         }
-        if span.isEmpty || !resolved.text.contains(span) {
+        let spanWasShownVerbatim = evidencePack?.containsExactSpan(
+            span,
+            in: resolved.text
+        ) ?? displayedSource.contains(span)
+        if span.isEmpty || !spanWasShownVerbatim || !resolved.text.contains(span) {
             return LibrarianHandlerOutput(
                 status: .lowConfidence,
                 text: resolved.original,
@@ -517,7 +588,7 @@ enum LibrarianHandlers {
             op: function.id,
             answer: .object(["text": .string(answer)]),
             evidence: [LibrarianEvidence(handle: resolved.handle, span: span)],
-            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle, question: request.question)
+            fallback: LibrarianFallback(recommended: "retrieve", handle: resolved.handle)
         )
         let paid = function.safety == .candidate
             ? "NON-AUTHORITATIVE DRAFT\n\(answer)\n[[rc:\(resolved.handle)]]"

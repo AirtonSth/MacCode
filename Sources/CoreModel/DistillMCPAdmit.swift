@@ -27,7 +27,7 @@ public enum DistillMCPAdmit: Sendable {
     /// Librarian tool names served by the `mcp` subcommand. Must mirror
     /// `ManagedRetrieveMCP.*ToolName` (DistillCore, which CoreModel cannot
     /// import); a parity test pins the two lists together.
-    public static let toolNames = ["rc_stats", "rc_search", "rc_ask", "rc_retrieve", "rc_compress"]
+    public static let toolNames = ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_retrieve", "rc_compress"]
 
     /// Claude's supervised mode must not turn a local librarian lookup into a
     /// user confirmation: these tools only read/compress content the host

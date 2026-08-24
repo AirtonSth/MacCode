@@ -95,6 +95,10 @@ final class DistillInstructionsTemplateTests: XCTestCase {
         XCTAssertFalse(t.contains("O-first"))
         XCTAssertTrue(t.contains("not a conversation style or user command"),
                       "the surviving Distill policy must be tool-output-only")
+        XCTAssertTrue(t.contains("rc_catalog"),
+                      "providers must discover cold catalog operations just in time")
+        XCTAssertFalse(t.contains("schema enum = the implemented catalog"),
+                       "the full 168-id enum must not return to the always-loaded tool schema")
         XCTAssertTrue(
             t.contains("[N]{fields}"),
             "WHY: paid agents must be told TOON headers so they can read converted JSON arrays"

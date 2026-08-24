@@ -34,6 +34,15 @@ printf '%s\n' "$IDENTITY" | grep -qx 'http_port=18218' \
   || fail "default http_port must be 18218"
 printf '%s\n' "$IDENTITY" | grep -qx 'stable_bundle_id=io.remotecode.desktop' \
   || fail "identity must name the forbidden stable bundle"
+SANDBOX_HOME="$(printf '%s\n' "$IDENTITY" | sed -n 's/^sandbox_home=//p')"
+[ "$SANDBOX_HOME" = "$REPO_ROOT/.sandbox-state/home" ] \
+  || fail "default sandbox home must stay inside the worktree, got: $SANDBOX_HOME"
+grep -F -q 'CFFIXED_USER_HOME="$home"' "$SANDBOX" \
+  || fail "run must redirect Foundation home resolution into the sandbox"
+grep -F -q 'CODEX_HOME="$home/.codex"' "$SANDBOX" \
+  || fail "run must redirect Codex state into the sandbox"
+grep -F -q 'RC2_DISABLE_MANAGED_DISTILL_RECONCILE=1' "$SANDBOX" \
+  || fail "run must forbid provider-home reconciliation"
 
 if RC2_SANDBOX_BUNDLE_ID=io.remotecode.desktop "$SANDBOX" identity >/dev/null 2>&1; then
   fail "must refuse stable bundle id"
@@ -41,10 +50,12 @@ fi
 if RC2_SANDBOX_CHANNEL=stable "$SANDBOX" identity >/dev/null 2>&1; then
   fail "must refuse stable channel"
 fi
-if "$SANDBOX" test >/dev/null 2>&1; then
+PRIMARY_ROOT="$(printf '%s\n' "$IDENTITY" | sed -n 's/^primary_worktree=//p')"
+[ -d "$PRIMARY_ROOT" ] || fail "identity did not resolve the primary worktree"
+if (cd "$PRIMARY_ROOT" && "$SANDBOX" test >/dev/null 2>&1); then
   fail "test must refuse the primary checkout"
 fi
-if "$SANDBOX" build >/dev/null 2>&1; then
+if (cd "$PRIMARY_ROOT" && "$SANDBOX" build >/dev/null 2>&1); then
   fail "build must refuse the primary checkout"
 fi
 

@@ -20,6 +20,19 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         }
     }
 
+    private actor AskRecorder {
+        private var ops: [String] = []
+
+        func answer(op: String) -> String {
+            ops.append(op)
+            return "answered:\(op)"
+        }
+
+        func all() -> [String] {
+            ops
+        }
+    }
+
     private func server(_ map: [String: String] = [:], scoped: Bool = false) -> ManagedRetrieveMCP {
         ManagedRetrieveMCP(
             retrieve: { handle in map[handle] },
@@ -47,6 +60,29 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
+    private func callLine(id: Int, name: String, arguments: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": ["name": name, "arguments": arguments],
+        ])
+        return try XCTUnwrap(String(data: data, encoding: .utf8))
+    }
+
+    private func toolText(_ response: [String: Any]) throws -> String {
+        let result = try XCTUnwrap(response["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        return try XCTUnwrap(content.first?["text"] as? String)
+    }
+
+    private func catalogPage(_ response: [String: Any]) throws -> [String: Any] {
+        let text = try toolText(response)
+        return try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+        )
+    }
+
     func test_initialize() async throws {
         let obj = try parse(await server().handle(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#))
         XCTAssertEqual(obj["id"] as? Int, 1)
@@ -56,9 +92,13 @@ final class ManagedRetrieveMCPTests: XCTestCase {
     }
 
     func test_toolsListExposesOnlyNonRecoveryStatsUntilScopedCapabilitiesExist() async throws {
-        let obj = try parse(await server().handle(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
+        let srv = server()
+        let firstLine = await srv.handle(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+        let secondLine = await srv.handle(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+        XCTAssertEqual(firstLine, secondLine, "tools/list must be byte-stable for the same capability scope")
+        let obj = try parse(firstLine)
         let tools = try XCTUnwrap((obj["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_ask"])
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_catalog", "rc_ask"])
     }
 
     func test_unscopedRetrieveToolIsRejectedEvenWhenLegacyClosureCanReturnOriginal() async throws {
@@ -71,7 +111,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let srv = server(["rcv1.capability": "exact original"], scoped: true)
         let listed = try parse(await srv.handle(#"{"jsonrpc":"2.0","id":20,"method":"tools/list"}"#))
         let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_ask", "rc_retrieve", "rc_compress"])
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_retrieve", "rc_compress"])
 
         let called = try parse(await srv.handle(
             #"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"rc_retrieve","arguments":{"handle":"rcv1.capability"}}}"#
@@ -80,6 +120,21 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let content = try XCTUnwrap(result["content"] as? [[String: Any]])
         XCTAssertEqual(content.first?["text"] as? String, "exact original")
         XCTAssertEqual(result["isError"] as? Bool, false)
+    }
+
+    func test_toolCallReplyIsCanonicalSoShippingReplaysStayByteStable() async throws {
+        let srv = server(["rcv1.capability": "exact original"], scoped: true)
+        let request = #"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"rc_retrieve","arguments":{"handle":"rcv1.capability"}}}"#
+        let expected = #"{"id":21,"jsonrpc":"2.0","result":{"content":[{"text":"exact original","type":"text"}],"isError":false}}"#
+
+        for _ in 0..<20 {
+            let actual = await srv.handle(request)
+            XCTAssertEqual(
+                actual,
+                expected,
+                "provider-facing MCP bytes must not depend on dictionary iteration order"
+            )
+        }
     }
 
     func test_toolsCallUnavailableIsErrorResult() async throws {
@@ -114,11 +169,14 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let schema = try XCTUnwrap(ask["inputSchema"] as? [String: Any])
         let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
         let op = try XCTUnwrap(properties["op"] as? [String: Any])
-        let enumIDs = try XCTUnwrap(op["enum"] as? [String])
-        XCTAssertEqual(Set(enumIDs), Set(LibrarianCatalog.implementedIDs))
-        XCTAssertTrue(enumIDs.contains("json_crusher"))
-        XCTAssertTrue(enumIDs.contains("ask_handle"))
-        XCTAssertFalse(enumIDs.contains("apply_patch"))
+        XCTAssertEqual(op["type"] as? String, "string")
+        XCTAssertNil(op["enum"], "the 168-id catalog must be discovered just in time via rc_catalog")
+        let description = try XCTUnwrap(op["description"] as? String)
+        for id in LibrarianCatalog.hotHintIDs {
+            XCTAssertTrue(description.contains(id), "missing hot hint \(id)")
+        }
+        XCTAssertEqual(LibrarianCatalog.hotHintIDs.count, 8)
+        XCTAssertTrue(description.contains("rc_catalog"))
 
         let original = String(repeating: "ERROR payment failed\n", count: 40)
         let escaped = original.replacingOccurrences(of: "\n", with: "\\n")
@@ -130,6 +188,125 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let text = try XCTUnwrap(content.first?["text"] as? String)
         XCTAssertTrue(text.contains("log_crusher") || text.contains("[[rc:"), text)
         XCTAssertEqual(result["isError"] as? Bool, false)
+    }
+
+    func test_rcCatalogSchemaAndPagesReachEveryCallableOp() async throws {
+        let srv = server()
+        let listed = try parse(await srv.handle(#"{"jsonrpc":"2.0","id":42,"method":"tools/list"}"#))
+        let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+        let catalog = try XCTUnwrap(tools.first { ($0["name"] as? String) == "rc_catalog" })
+        let schema = try XCTUnwrap(catalog["inputSchema"] as? [String: Any])
+        let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+        let limit = try XCTUnwrap(properties["limit"] as? [String: Any])
+        XCTAssertEqual(limit["minimum"] as? Int, 1)
+        XCTAssertEqual(limit["maximum"] as? Int, 20)
+        XCTAssertNil(schema["required"], "query, cursor, and limit are all optional")
+
+        var cursor: String?
+        var ids: [String] = []
+        repeat {
+            var arguments: [String: Any] = ["limit": 13]
+            if let cursor { arguments["cursor"] = cursor }
+            let line = try callLine(id: 43, name: "rc_catalog", arguments: arguments)
+            let page = try catalogPage(try parse(await srv.handle(line)))
+            let items = try XCTUnwrap(page["items"] as? [[String: Any]])
+            ids.append(contentsOf: items.compactMap { $0["id"] as? String })
+            cursor = page["nextCursor"] as? String
+        } while cursor != nil
+
+        XCTAssertEqual(ids, LibrarianCatalog.implementedIDs)
+        XCTAssertEqual(Set(ids).count, 168)
+        XCTAssertTrue(Set(ids).isDisjoint(with: LibrarianCatalog.forbiddenIDs))
+        XCTAssertTrue(Set(ids).isDisjoint(with: LibrarianCatalog.disabledOnNineB))
+    }
+
+    func test_rcCatalogSearchAndInvalidCursorFailClosed() async throws {
+        let srv = server()
+        let exactLine = try callLine(
+            id: 44,
+            name: "rc_catalog",
+            arguments: ["query": "test_verdict", "limit": 20]
+        )
+        let exact = try catalogPage(try parse(await srv.handle(exactLine)))
+        let exactItems = try XCTUnwrap(exact["items"] as? [[String: Any]])
+        XCTAssertEqual(exactItems.first?["id"] as? String, "test_verdict")
+
+        let summaryLine = try callLine(
+            id: 45,
+            name: "rc_catalog",
+            arguments: ["query": "Ledger stats", "limit": 20]
+        )
+        let summary = try catalogPage(try parse(await srv.handle(summaryLine)))
+        let summaryItems = try XCTUnwrap(summary["items"] as? [[String: Any]])
+        XCTAssertTrue(summaryItems.contains { ($0["id"] as? String) == "stats" })
+
+        for hidden in ["apply_patch", "i18n_translation_draft"] {
+            let line = try callLine(id: 46, name: "rc_catalog", arguments: ["query": hidden])
+            let page = try catalogPage(try parse(await srv.handle(line)))
+            XCTAssertEqual((page["items"] as? [[String: Any]])?.count, 0, hidden)
+        }
+
+        let invalid = try parse(await srv.handle(try callLine(
+            id: 47,
+            name: "rc_catalog",
+            arguments: ["cursor": "not-a-cursor", "limit": 7]
+        )))
+        XCTAssertEqual((invalid["error"] as? [String: Any])?["code"] as? Int, -32602)
+
+        let first = try catalogPage(try parse(await srv.handle(try callLine(
+            id: 48,
+            name: "rc_catalog",
+            arguments: ["query": "handle", "limit": 1]
+        ))))
+        let boundCursor = try XCTUnwrap(first["nextCursor"] as? String)
+        let mismatched = try parse(await srv.handle(try callLine(
+            id: 49,
+            name: "rc_catalog",
+            arguments: ["query": "test", "cursor": boundCursor, "limit": 1]
+        )))
+        XCTAssertEqual((mismatched["error"] as? [String: Any])?["code"] as? Int, -32602)
+    }
+
+    func test_rcCatalogAndUnknownOpNeverCallGenerate() async throws {
+        let recorder = AskRecorder()
+        let srv = ManagedRetrieveMCP(
+            retrieve: { _ in nil },
+            ask: { op, _, _, _ in await recorder.answer(op: op) }
+        )
+
+        _ = try parse(await srv.handle(try callLine(
+            id: 50,
+            name: "rc_catalog",
+            arguments: ["query": "test", "limit": 3]
+        )))
+        let unknown = try parse(await srv.handle(try callLine(
+            id: 51,
+            name: "rc_ask",
+            arguments: ["op": "not_in_the_catalog"]
+        )))
+
+        let recorded = await recorder.all()
+        XCTAssertEqual(recorded, [])
+        XCTAssertEqual((unknown["result"] as? [String: Any])?["isError"] as? Bool, true)
+    }
+
+    func test_everyDiscoveredCatalogOpRoundTripsThroughRcAsk() async throws {
+        let recorder = AskRecorder()
+        let srv = ManagedRetrieveMCP(
+            retrieve: { _ in nil },
+            ask: { op, _, _, _ in await recorder.answer(op: op) }
+        )
+
+        for (offset, op) in LibrarianCatalog.implementedIDs.enumerated() {
+            let response = try parse(await srv.handle(try callLine(
+                id: 1_000 + offset,
+                name: "rc_ask",
+                arguments: ["op": op]
+            )))
+            XCTAssertEqual((response["result"] as? [String: Any])?["isError"] as? Bool, false, op)
+        }
+        let recorded = await recorder.all()
+        XCTAssertEqual(recorded, LibrarianCatalog.implementedIDs)
     }
 
     func test_statsToolReturnsSavingsSnapshot() async throws {

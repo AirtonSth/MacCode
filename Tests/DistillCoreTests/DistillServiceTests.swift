@@ -3,6 +3,74 @@ import CoreModel
 @testable import DistillCore
 
 final class DistillServiceTests: XCTestCase {
+    private final class ScopeBoundRecoveryStore: TokenSaverScopedRecoveryStoring, @unchecked Sendable {
+        private struct Entry {
+            let data: Data
+            let context: TokenSaverRecoveryRequestContext
+        }
+
+        private let lock = NSLock()
+        private var entries: [String: Entry] = [:]
+
+        func lookupInvocation(context: TokenSaverRecoveryRequestContext) throws -> TokenSaverScopedInvocationState? {
+            nil
+        }
+
+        func prepareOriginal(
+            _ data: Data,
+            context: TokenSaverRecoveryRequestContext,
+            lane: String
+        ) throws -> TokenSaverScopedPreparation {
+            let capability = "scope.\(UUID().uuidString)"
+            lock.withLock { entries[capability] = Entry(data: data, context: context) }
+            return .init(
+                capability: capability,
+                idempotencyKey: context.operationID,
+                readBackVerified: true
+            )
+        }
+
+        func retrieveOriginal(
+            capability: String,
+            context: TokenSaverRecoveryRequestContext
+        ) throws -> Data? {
+            lock.withLock {
+                guard let entry = entries[capability], Self.sameScope(entry.context, context) else {
+                    return nil
+                }
+                return entry.data
+            }
+        }
+
+        func markDelivered(
+            capability: String,
+            idempotencyKey: String,
+            context: TokenSaverRecoveryRequestContext,
+            outcome: TokenSaverScopedDeliveryOutcome
+        ) throws -> Bool {
+            try retrieveOriginal(capability: capability, context: context) != nil
+        }
+
+        func ack(
+            capability: String,
+            idempotencyKey: String,
+            context: TokenSaverRecoveryRequestContext
+        ) throws -> Bool {
+            try retrieveOriginal(capability: capability, context: context) != nil
+        }
+
+        private static func sameScope(
+            _ lhs: TokenSaverRecoveryRequestContext,
+            _ rhs: TokenSaverRecoveryRequestContext
+        ) -> Bool {
+            lhs.workspaceID == rhs.workspaceID
+                && lhs.projectID == rhs.projectID
+                && lhs.threadID == rhs.threadID
+                && lhs.provider == rhs.provider
+                && lhs.attemptID == rhs.attemptID
+        }
+    }
+
     private final class AdmissionSwitch: @unchecked Sendable {
         private let lock = NSLock()
         private var enabled: Bool
@@ -161,6 +229,37 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(acceptedE4B.modelID, e4b.id)
     }
 
+    func test_configurationSelectsOpenAICompatibleGenerateTarget() throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code",
+            generateBaseURL: "http://127.0.0.1:8000/v1",
+            generateModel: "samuelfaj--distill-1.7B-4bit-MLX",
+            generateToken: "local-api-token"
+        )
+
+        XCTAssertEqual(
+            configuration.generateTarget,
+            .openAICompatible(
+                baseURL: URL(string: "http://127.0.0.1:8000/v1")!,
+                model: "samuelfaj--distill-1.7B-4bit-MLX",
+                token: "local-api-token"
+            ),
+            "the parsed override must select the configured runtime instead of loading local MLX"
+        )
+    }
+
+    func test_configurationRejectsInvalidOpenAICompatibleGenerateURL() {
+        XCTAssertThrowsError(try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code",
+            generateBaseURL: "not-a-url",
+            generateModel: "model"
+        )) { error in
+            XCTAssertEqual(error as? DistillServiceError, .invalidGenerateBaseURL("not-a-url"))
+        }
+    }
+
     func test_httpServerRequiresBearerTokenAndServesDistillRequests() async throws {
         let configuration = try DistillServiceConfiguration(
             authToken: "secret-token",
@@ -218,6 +317,160 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(snapshot.toolOutputEligible, 1)
         XCTAssertEqual(snapshot.toolOutputCompressed, 1)
         XCTAssertEqual(snapshot.pipeHitRate, 1.0)
+    }
+
+    // WHY: /v1/librarian is a paid-context rewrite boundary. A handle supplied
+    // by the caller is trustworthy only after scoped host-store readback returns
+    // the exact input bytes; every other variant must preserve the input.
+    func test_librarianDuplicateNoticeRequiresScopedExactReadback() async throws {
+        struct RequestBody: Encodable {
+            let id: String
+            let input: String
+            let handle: String?
+            let provider: String
+        }
+        struct Reply: Decodable {
+            let status: String
+            let text: String
+            let savedTokens: Int
+
+            enum CodingKeys: String, CodingKey {
+                case status, text
+                case savedTokens = "saved_tokens"
+            }
+        }
+        struct RetrieveReply: Decodable {
+            let found: Bool
+            let original: String?
+        }
+
+        let recoveryStore = ScopeBoundRecoveryStore()
+        let context = testRecoveryContext()
+        let original = String(repeating: "identical compiler diagnostic and context\n", count: 40)
+        let preparation = try recoveryStore.prepareOriginal(
+            Data(original.utf8),
+            context: context,
+            lane: "test"
+        )
+        let configuration = try DistillServiceConfiguration(
+            authToken: "librarian-token",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: recoveryStore
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let exactResponse = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/librarian",
+            method: "POST",
+            token: "librarian-token",
+            headers: recoveryHeaders(context),
+            body: JSONEncoder().encode(RequestBody(
+                id: "duplicate_handle_notice",
+                input: original,
+                handle: preparation.capability,
+                provider: "codex"
+            ))
+        )
+        let exact = try JSONDecoder().decode(Reply.self, from: exactResponse.data)
+        XCTAssertEqual(exactResponse.status, 200)
+        XCTAssertEqual(exact.status, LibrarianStatus.ok.rawValue)
+        XCTAssertEqual(exact.text, "duplicate [[rc:\(preparation.capability)]]")
+        XCTAssertGreaterThan(exact.savedTokens, 0)
+
+        let retrieveResponse = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/retrieve/\(preparation.capability)",
+            token: "librarian-token",
+            headers: recoveryHeaders(context)
+        )
+        let retrieved = try JSONDecoder().decode(RetrieveReply.self, from: retrieveResponse.data)
+        XCTAssertEqual(retrieveResponse.status, 200)
+        XCTAssertTrue(retrieved.found)
+        XCTAssertEqual(retrieved.original, original)
+
+        let rawResponse = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/librarian",
+            method: "POST",
+            token: "librarian-token",
+            headers: recoveryHeaders(context),
+            body: JSONEncoder().encode(RequestBody(
+                id: "duplicate_handle_notice",
+                input: original,
+                handle: nil,
+                provider: "codex"
+            ))
+        )
+        let raw = try JSONDecoder().decode(Reply.self, from: rawResponse.data)
+        XCTAssertEqual(raw.text, original, "raw input must not become its own duplicate")
+        XCTAssertEqual(raw.savedTokens, 0)
+
+        let mismatch = "caller bytes do not match the scoped original"
+        let mismatchResponse = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/librarian",
+            method: "POST",
+            token: "librarian-token",
+            headers: recoveryHeaders(context),
+            body: JSONEncoder().encode(RequestBody(
+                id: "duplicate_handle_notice",
+                input: mismatch,
+                handle: preparation.capability,
+                provider: "codex"
+            ))
+        )
+        let mismatched = try JSONDecoder().decode(Reply.self, from: mismatchResponse.data)
+        XCTAssertEqual(mismatched.text, mismatch)
+        XCTAssertEqual(mismatched.savedTokens, 0)
+
+        let fabricatedResponse = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/librarian",
+            method: "POST",
+            token: "librarian-token",
+            headers: recoveryHeaders(context),
+            body: JSONEncoder().encode(RequestBody(
+                id: "duplicate_handle_notice",
+                input: original,
+                handle: "fabricated-capability",
+                provider: "codex"
+            ))
+        )
+        let fabricated = try JSONDecoder().decode(Reply.self, from: fabricatedResponse.data)
+        XCTAssertEqual(fabricated.text, original)
+        XCTAssertEqual(fabricated.savedTokens, 0)
+
+        let otherScope = TokenSaverRecoveryRequestContext(
+            workspaceID: context.workspaceID,
+            projectID: context.projectID,
+            threadID: "other-thread",
+            provider: context.provider,
+            attemptID: context.attemptID,
+            operationID: context.operationID,
+            invocationID: context.invocationID
+        )
+        let crossScopeResponse = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/librarian",
+            method: "POST",
+            token: "librarian-token",
+            headers: recoveryHeaders(otherScope),
+            body: JSONEncoder().encode(RequestBody(
+                id: "duplicate_handle_notice",
+                input: original,
+                handle: preparation.capability,
+                provider: "codex"
+            ))
+        )
+        let crossScope = try JSONDecoder().decode(Reply.self, from: crossScopeResponse.data)
+        XCTAssertEqual(crossScope.text, original)
+        XCTAssertEqual(crossScope.savedTokens, 0)
     }
 
     func test_httpCompressAliasServesLocalCompressionWithoutProviderProxying() async throws {
@@ -1047,6 +1300,7 @@ final class DistillServiceTests: XCTestCase {
         path: String,
         method: String = "GET",
         token: String? = nil,
+        headers: [String: String] = [:],
         body: Data? = nil
     ) async throws -> (status: Int, data: Data) {
         var request = URLRequest(url: URL(string: baseURL + path)!)
@@ -1054,6 +1308,9 @@ final class DistillServiceTests: XCTestCase {
         request.timeoutInterval = 3
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        for (field, value) in headers {
+            request.setValue(value, forHTTPHeaderField: field)
         }
         if let body {
             request.httpBody = body
@@ -1073,6 +1330,18 @@ final class DistillServiceTests: XCTestCase {
         let (data, response) = try await URLSession.shared.data(for: request)
         let http = try XCTUnwrap(response as? HTTPURLResponse)
         return (http.statusCode, data)
+    }
+
+    private func recoveryHeaders(_ context: TokenSaverRecoveryRequestContext) -> [String: String] {
+        [
+            "X-RemoteCode-Workspace-ID": context.workspaceID,
+            "X-RemoteCode-Project-ID": context.projectID,
+            "X-RemoteCode-Thread-ID": context.threadID,
+            "X-RemoteCode-Provider": context.provider,
+            "X-RemoteCode-Attempt-ID": context.attemptID,
+            "X-RemoteCode-Operation-ID": context.operationID,
+            "X-RemoteCode-Invocation-ID": context.invocationID,
+        ]
     }
 
     // MARK: - DeadlineDistillRuntime fallback counter wiring

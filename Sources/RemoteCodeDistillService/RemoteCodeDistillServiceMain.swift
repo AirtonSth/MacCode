@@ -922,6 +922,18 @@ struct RemoteCodeDistillServiceMain {
     }
 
     private static func runtime(for configuration: DistillServiceConfiguration) async throws -> RuntimeResolution {
+        if case let .openAICompatible(baseURL, model, token) = configuration.generateTarget {
+            return RuntimeResolution(
+                runtime: OpenAICompatibleDistillRuntime(
+                    baseURL: baseURL,
+                    model: model,
+                    token: token,
+                    timeout: Double(configuration.mlxCallDeadlineMS) / 1_000
+                ),
+                fallbackReason: nil
+            )
+        }
+
         if ProcessInfo.processInfo.environment["REMOTE_CODE_DISTILL_ALLOW_TEST_RUNTIME"] == "1" {
             return RuntimeResolution(runtime: LocalDistillRuntime(), fallbackReason: nil)
         }

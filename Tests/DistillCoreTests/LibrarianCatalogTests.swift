@@ -9,6 +9,36 @@ final class LibrarianCatalogTests: XCTestCase {
         XCTAssertEqual(LibrarianCatalog.forbiddenIDs.count, 19)
     }
 
+    func test_exposedCatalogHasOnlyEnabledNonForbiddenFunctionsInStableOrder() {
+        // WHY: rc_ask no longer pays to advertise every id in tools/list. The
+        // on-demand catalog must still make every callable operation reachable,
+        // while forbidden and runtime-disabled operations remain undiscoverable.
+        XCTAssertEqual(LibrarianCatalog.implementedIDs.count, 168)
+        XCTAssertEqual(Set(LibrarianCatalog.implementedIDs).count, 168)
+        XCTAssertEqual(
+            LibrarianCatalog.implementedIDs,
+            LibrarianCatalog.all.filter {
+                $0.safety != .forbidden && !LibrarianCatalog.disabledOnNineB.contains($0.id)
+            }.map(\.id)
+        )
+        XCTAssertTrue(Set(LibrarianCatalog.implementedIDs).isDisjoint(with: LibrarianCatalog.forbiddenIDs))
+        XCTAssertTrue(Set(LibrarianCatalog.implementedIDs).isDisjoint(with: LibrarianCatalog.disabledOnNineB))
+    }
+
+    func test_catalogPageSupportsExactAndSummarySearchWithOpaqueBoundCursor() throws {
+        let exact = try LibrarianCatalog.page(query: "test_verdict", cursor: nil, limit: 20)
+        XCTAssertEqual(exact.items.first?.id, "test_verdict")
+
+        let summary = try LibrarianCatalog.page(query: "Ledger stats", cursor: nil, limit: 20)
+        XCTAssertTrue(summary.items.contains { $0.id == "stats" })
+
+        let first = try LibrarianCatalog.page(query: nil, cursor: nil, limit: 7)
+        let cursor = try XCTUnwrap(first.nextCursor)
+        XCTAssertNil(Int(cursor), "cursor is an opaque continuation, not a public offset")
+        XCTAssertThrowsError(try LibrarianCatalog.page(query: "different", cursor: cursor, limit: 7))
+        XCTAssertThrowsError(try LibrarianCatalog.page(query: nil, cursor: "not-a-cursor", limit: 7))
+    }
+
     func test_persistCallback_emitsLibrarianModeRow() async {
         var persisted: [DistillSavingsRecord] = []
         let dispatcher = LibrarianDispatcher(persist: { persisted.append($0) })
@@ -305,6 +335,59 @@ final class LibrarianCatalogTests: XCTestCase {
         XCTAssertFalse(result.text.contains("reasoning_content"))
     }
 
+    func test_askHandle_successEnvelopeDoesNotRepeatToolQuestion() async throws {
+        let dispatcher = LibrarianDispatcher(generate: LibrarianScriptedGenerate())
+        let original = "ERROR payment failed at Sources/Billing.swift:12\nretry ignored\n"
+        let handle = dispatcher.store.put(original)
+        let result = await dispatcher.dispatch(LibrarianRequest(
+            id: "ask_handle",
+            question: "what failed?",
+            handle: handle,
+            provider: "grok"
+        ))
+
+        let envelope = try XCTUnwrap(result.envelope)
+        XCTAssertEqual(envelope.status, .ok)
+        XCTAssertEqual(envelope.op, "ask_handle")
+        XCTAssertEqual(envelope.fallback.recommended, "retrieve")
+        XCTAssertEqual(envelope.fallback.handle, handle)
+        XCTAssertNil(
+            envelope.fallback.question,
+            "the tool input already carries the question; repeating it in the paid tool result wastes context"
+        )
+        XCTAssertTrue(original.contains(try XCTUnwrap(envelope.evidence.first?.span)))
+
+        let encoded = envelope.jsonString()
+        let decoded = try JSONDecoder().decode(LibrarianEnvelope.self, from: Data(encoded.utf8))
+        XCTAssertEqual(decoded, envelope)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(encoded.utf8)) as? [String: Any]
+        )
+        let fallback = try XCTUnwrap(object["fallback"] as? [String: Any])
+        XCTAssertNil(fallback["question"], "the optional duplicate must be absent from the shipping JSON")
+    }
+
+    func test_librarianEnvelopeShippingJSONDoesNotEscapeSlashes() throws {
+        let envelope = LibrarianEnvelope(
+            status: .ok,
+            confidence: 1,
+            op: "ask_handle",
+            answer: .object(["text": .string("Sources/App.swift")]),
+            evidence: [LibrarianEvidence(handle: "rcv1.test", span: "Sources/App.swift")],
+            fallback: LibrarianFallback(recommended: "retrieve", handle: "rcv1.test")
+        )
+
+        let encoded = envelope.jsonString()
+
+        XCTAssertTrue(encoded.contains(#""text":"Sources/App.swift""#))
+        XCTAssertTrue(encoded.contains(#""span":"Sources/App.swift""#))
+        XCTAssertFalse(encoded.contains(#"\/"#))
+        XCTAssertEqual(
+            try JSONDecoder().decode(LibrarianEnvelope.self, from: Data(encoded.utf8)),
+            envelope
+        )
+    }
+
     func test_notebookCrusher_stripsOutputs() async {
         let dispatcher = LibrarianDispatcher()
         let notebook = #"{"cells":[{"cell_type":"code","source":["print(1)"],"outputs":[{"data":{"image/png":"aaaa"}}],"execution_count":3}]}"#
@@ -353,6 +436,128 @@ final class LibrarianCatalogTests: XCTestCase {
         request.retrieveAvailable = false
         let result = await dispatcher.dispatch(request)
         XCTAssertEqual(result.status, LibrarianStatus.unavailable)
+        XCTAssertEqual(result.analytics.savedTokens, 0)
+    }
+
+    // WHY: a duplicate notice replaces paid-facing bytes, so it is safe only when
+    // the host has already recovered the same scoped capability byte-for-byte.
+    func test_duplicateHandleNotice_compactsOnlyVerifiedExactRecoverableHandle() async {
+        let dispatcher = LibrarianDispatcher()
+        let original = String(repeating: "build step completed with identical output\n", count: 40)
+        let handle = "scope-owned-capability"
+        _ = dispatcher.store.put(original, handle: handle)
+        let request = LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: original,
+            handle: handle,
+            provider: "codex",
+            retrieveAvailable: true,
+            verifiedRecoveryHandle: handle
+        )
+
+        let result = await dispatcher.dispatch(request)
+
+        XCTAssertEqual(result.status, .ok)
+        XCTAssertEqual(result.text, "duplicate [[rc:\(handle)]]")
+        XCTAssertLessThan(result.text.utf8.count, original.utf8.count)
+        XCTAssertGreaterThan(result.analytics.savedTokens, 0)
+
+        let retrieved = await dispatcher.dispatch(LibrarianRequest(
+            id: "retrieve",
+            handle: handle,
+            provider: "codex"
+        ))
+        XCTAssertEqual(retrieved.status, .ok)
+        XCTAssertEqual(retrieved.text, original)
+    }
+
+    // WHY: resolve used to insert raw input before duplicate lookup, making every
+    // first-seen blob a false self-duplicate. Raw input must remain byte-identical.
+    func test_duplicateHandleNotice_rawInputDoesNotSelfDuplicate() async {
+        let dispatcher = LibrarianDispatcher()
+        let original = String(repeating: "first seen output\n", count: 20)
+
+        let result = await dispatcher.dispatch(LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: original,
+            provider: "claude"
+        ))
+
+        XCTAssertEqual(result.text, original)
+        XCTAssertEqual(result.analytics.savedTokens, 0)
+    }
+
+    // WHY: caller-provided handles, mismatched stores, unavailable recovery, and
+    // notices that are not actually smaller must all fail open without savings.
+    func test_duplicateHandleNotice_untrustedMismatchUnavailableAndShortFailOpen() async {
+        let original = String(repeating: "trusted original payload\n", count: 20)
+
+        let fabricated = LibrarianDispatcher()
+        let fabricatedResult = await fabricated.dispatch(LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: original,
+            handle: "fabricated",
+            provider: "grok",
+            retrieveAvailable: true,
+            verifiedRecoveryHandle: "fabricated"
+        ))
+        XCTAssertEqual(fabricatedResult.text, original)
+        XCTAssertEqual(fabricatedResult.analytics.savedTokens, 0)
+
+        let mismatched = LibrarianDispatcher()
+        _ = mismatched.store.put("different bytes", handle: "mismatch")
+        let mismatchResult = await mismatched.dispatch(LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: original,
+            handle: "mismatch",
+            provider: "grok",
+            retrieveAvailable: true,
+            verifiedRecoveryHandle: "mismatch"
+        ))
+        XCTAssertEqual(mismatchResult.text, original)
+        XCTAssertEqual(mismatchResult.analytics.savedTokens, 0)
+
+        let unavailable = LibrarianDispatcher()
+        _ = unavailable.store.put(original, handle: "unavailable")
+        let unavailableResult = await unavailable.dispatch(LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: original,
+            handle: "unavailable",
+            provider: "grok",
+            retrieveAvailable: false,
+            verifiedRecoveryHandle: "unavailable"
+        ))
+        XCTAssertEqual(unavailableResult.text, original)
+        XCTAssertEqual(unavailableResult.analytics.savedTokens, 0)
+
+        let short = LibrarianDispatcher()
+        _ = short.store.put("tiny", handle: "short-capability")
+        let shortResult = await short.dispatch(LibrarianRequest(
+            id: "duplicate_handle_notice",
+            input: "tiny",
+            handle: "short-capability",
+            provider: "grok",
+            retrieveAvailable: true,
+            verifiedRecoveryHandle: "short-capability"
+        ))
+        XCTAssertEqual(shortResult.text, "tiny")
+        XCTAssertEqual(shortResult.analytics.savedTokens, 0)
+    }
+
+    // WHY: an unknown op must stop at catalog admission and never reach the local
+    // model, even when a generate runtime is installed.
+    func test_unknownLibrarianOperationNeverCallsGenerate() async {
+        let generate = LibrarianInstrumentedGenerate(LibrarianScriptedGenerate())
+        let dispatcher = LibrarianDispatcher(generate: generate)
+
+        let result = await dispatcher.dispatch(LibrarianRequest(
+            id: "not-a-real-operation",
+            input: "do not send this to the model",
+            provider: "codex"
+        ))
+
+        XCTAssertEqual(result.status, .unavailable)
+        XCTAssertEqual(generate.callCount, 0)
         XCTAssertEqual(result.analytics.savedTokens, 0)
     }
 }

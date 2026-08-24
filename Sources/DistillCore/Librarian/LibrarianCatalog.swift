@@ -26,12 +26,40 @@ public struct LibrarianFunction: Sendable, Equatable, Codable {
     public let paidFallback: String
 }
 
+public struct LibrarianCatalogItem: Sendable, Equatable, Codable {
+    public let id: String
+    public let summary: String
+}
+
+public struct LibrarianCatalogPage: Sendable, Equatable, Codable {
+    public let items: [LibrarianCatalogItem]
+    public let nextCursor: String?
+    public let total: Int
+}
+
+public enum LibrarianCatalogPageError: Error, Sendable, Equatable {
+    case invalidLimit
+    case invalidCursor
+}
+
 public enum LibrarianCatalog {
     public static let version = "rc-local-llm-function-catalog-v1"
     /// Ornith-1.5-9B spends the generate budget on chain-of-thought and never
     /// emits extractive JSON. Sidecar returns unavailable without calling generate.
     public static let disabledOnNineB: Set<String> = [
         "i18n_translation_draft",
+    ]
+    /// Eight common ids stay in the compact rc_ask schema as a routing hint.
+    /// The complete callable surface is discovered on demand through rc_catalog.
+    public static let hotHintIDs = [
+        "test_verdict",
+        "ci_job_failures",
+        "handle_grep",
+        "retrieve_range",
+        "extract_schema",
+        "pick_candidates",
+        "cite_spans",
+        "multi_handle_ask",
     ]
     public static let all: [LibrarianFunction] = [
         LibrarianFunction(id: "retrieve", safety: .deterministic, mcp: "rc_retrieve", lane: "any", usesLLM: false, runtime: .none, summary: "Byte-exact original behind [[rc:handle]]", paidFallback: "Agent-sandbox read_file of the path cited in fallback; Distill sidecar never open(2); circuit-breaker disables lossy if retrieve is down"),
@@ -236,8 +264,102 @@ public enum LibrarianCatalog {
         Set(all.filter { $0.safety == .forbidden }.map(\.id))
     }
 
-    /// Catalog ops the paid model may call (`rc_ask.op`). Forbidden ids stay out.
+    /// Catalog ops the paid model may call (`rc_ask.op`). Forbidden and
+    /// runtime-disabled ids stay out of both discovery and execution.
     public static var implementedIDs: [String] {
-        all.filter { $0.safety != .forbidden }.map(\.id)
+        exposedFunctions.map(\.id)
+    }
+
+    public static var exposedFunctions: [LibrarianFunction] {
+        all.filter {
+            $0.safety != .forbidden && !disabledOnNineB.contains($0.id)
+        }
+    }
+
+    /// Deterministic, local-only catalog lookup. Cursor tokens are opaque,
+    /// query-bound continuations; malformed, stale, or cross-query tokens fail
+    /// closed instead of silently restarting at page one.
+    public static func page(
+        query: String?,
+        cursor: String?,
+        limit: Int
+    ) throws -> LibrarianCatalogPage {
+        guard (1...20).contains(limit) else {
+            throw LibrarianCatalogPageError.invalidLimit
+        }
+
+        let normalizedQuery = normalizeQuery(query)
+        let matches: [LibrarianFunction]
+        if normalizedQuery.isEmpty {
+            matches = exposedFunctions
+        } else {
+            let exact = exposedFunctions.filter { $0.id.lowercased() == normalizedQuery }
+            let textual = exposedFunctions.filter {
+                $0.id.lowercased() != normalizedQuery
+                    && ($0.id.lowercased().contains(normalizedQuery)
+                        || $0.summary.lowercased().contains(normalizedQuery))
+            }
+            matches = exact + textual
+        }
+
+        let offset: Int
+        if let cursor {
+            offset = try decodeCursor(cursor, query: normalizedQuery)
+            guard offset < matches.count else {
+                throw LibrarianCatalogPageError.invalidCursor
+            }
+        } else {
+            offset = 0
+        }
+
+        let upperBound = min(offset + limit, matches.count)
+        let items = matches[offset..<upperBound].map {
+            LibrarianCatalogItem(id: $0.id, summary: $0.summary)
+        }
+        let nextCursor = upperBound < matches.count
+            ? encodeCursor(offset: upperBound, query: normalizedQuery)
+            : nil
+        return LibrarianCatalogPage(items: items, nextCursor: nextCursor, total: matches.count)
+    }
+
+    private static func normalizeQuery(_ query: String?) -> String {
+        query?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+    }
+
+    private static func encodeCursor(offset: Int, query: String) -> String {
+        let signature = DistillSHA256.hex("\(version)\u{0}\(query)\u{0}\(offset)").prefix(16)
+        let payload = Data("\(offset):\(signature)".utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "rcc1.\(payload)"
+    }
+
+    private static func decodeCursor(_ cursor: String, query: String) throws -> Int {
+        guard cursor.hasPrefix("rcc1.") else {
+            throw LibrarianCatalogPageError.invalidCursor
+        }
+        var encoded = String(cursor.dropFirst("rcc1.".count))
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = encoded.count % 4
+        if remainder != 0 {
+            encoded += String(repeating: "=", count: 4 - remainder)
+        }
+        guard let data = Data(base64Encoded: encoded),
+              let payload = String(data: data, encoding: .utf8) else {
+            throw LibrarianCatalogPageError.invalidCursor
+        }
+        let parts = payload.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let offset = Int(parts[0]),
+              offset > 0,
+              encodeCursor(offset: offset, query: query) == cursor else {
+            throw LibrarianCatalogPageError.invalidCursor
+        }
+        return offset
     }
 }

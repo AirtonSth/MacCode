@@ -3402,6 +3402,17 @@ final class TokenSaverAppContextTests: XCTestCase {
             source.contains("TokenSaverAuditEventRepository"),
             "audit handler must be backed by TokenSaverAuditEventRepository"
         )
+        // WHY: Settings already passes the OpenAI-compatible target to this
+        // executable. If the composition root ignores it, both the scheduler
+        // and Librarian silently run a different runtime (or fail MLX validation).
+        XCTAssertTrue(
+            source.contains("configuration.generateTarget"),
+            "sidecar main must resolve the configured generate target"
+        )
+        XCTAssertTrue(
+            source.contains("OpenAICompatibleDistillRuntime("),
+            "sidecar main must construct the selected OpenAI-compatible runtime"
+        )
         XCTAssertTrue(
             source.contains("savingsRepo.record(") || source.contains("persistSavings"),
             "savings handler must persist via TokenSaverSavingsRepository"

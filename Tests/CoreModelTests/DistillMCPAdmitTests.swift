@@ -33,6 +33,10 @@ final class DistillMCPAdmitTests: XCTestCase {
 
     func test_claudeAutomaticallyAllowedToolsUseServerScopedNames() {
         XCTAssertEqual(
+            DistillMCPAdmit.toolNames,
+            ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_retrieve", "rc_compress"]
+        )
+        XCTAssertEqual(
             Set(DistillMCPAdmit.claudeAutomaticallyAllowedTools),
             Set(DistillMCPAdmit.toolNames.map { "mcp__remotecode-distill__\($0)" }),
             "Claude permission names must be scoped to the admitted server name"
