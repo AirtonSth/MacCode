@@ -558,6 +558,12 @@ compare_successful_slash_bytes() {
 
   baseline_string="$(jq -Rn --arg text "${baseline_envelope}" '$text')"
   candidate_string="$(jq -Rn --arg text "${candidate_envelope}" '$text')"
+  if [[ "${kind}" == emitted ]]; then
+    # ManagedRetrieveMCP's outer JSONSerialization escapes every slash. Encode
+    # the exact inner-string needles with that same wire representation.
+    baseline_string="$(printf '%s' "${baseline_string}" | perl -0pe 's{/}{\\/}g')"
+    candidate_string="$(printf '%s' "${candidate_string}" | perl -0pe 's{/}{\\/}g')"
+  fi
   BASELINE_ENVELOPE_STRING="${baseline_string}" CANDIDATE_ENVELOPE_STRING="${candidate_string}" perl -0pe '
     BEGIN { $needle = $ENV{"BASELINE_ENVELOPE_STRING"}; $replacement = $ENV{"CANDIDATE_ENVELOPE_STRING"}; $count = 0; }
     $count += s/\Q$needle\E/$replacement/g;

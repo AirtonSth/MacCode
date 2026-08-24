@@ -181,10 +181,10 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
             ])
         }
         func emittedBody(_ envelope: String) throws -> Data {
-            try canonicalJSON([
+            try JSONSerialization.data(withJSONObject: [
                 "jsonrpc": "2.0", "id": 2,
                 "result": ["isError": false, "content": [["type": "text", "text": envelope]]],
-            ])
+            ], options: [.sortedKeys])
         }
         let baselineBody = root.appendingPathComponent("provider-baseline.json")
         let candidateBody = root.appendingPathComponent("provider-candidate.json")
