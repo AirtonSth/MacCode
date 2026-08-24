@@ -2552,6 +2552,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         replyMode: BotPeerDelegation.ReplyMode,
         delegationCapability: String? = nil
     ) async throws -> JSONValue {
+        try await askBotPeer(
+            callerThread: callerThread,
+            callerRun: callerRun,
+            handle: handle,
+            prompt: prompt,
+            replyMode: replyMode,
+            consultationID: nil,
+            delegationCapability: delegationCapability
+        )
+    }
+
+    public func askBotPeer(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID,
+        handle: String,
+        prompt: String,
+        replyMode: BotPeerDelegation.ReplyMode,
+        consultationID: UUID?,
+        delegationCapability: String? = nil
+    ) async throws -> JSONValue {
         let ctx = try validatedBotPeerCaller(
             threadID: callerThread,
             runID: callerRun,
@@ -2569,13 +2589,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.")
         }
 
+        var claimedConsultationID: UUID?
+        if let consultationID {
+            try ctx.botPeerHandoffAuthority.claimContinuation(
+                consultationID: consultationID,
+                callerThread: callerThread,
+                hostRunID: callerRun,
+                peerBotID: peer.id
+            )
+            claimedConsultationID = consultationID
+        }
+        defer {
+            if let claimedConsultationID {
+                ctx.botPeerHandoffAuthority.releaseContinuation(consultationID: claimedConsultationID)
+            }
+        }
+
         ctx.botPeerHandoffAuthority.router = self
         guard let result = await ctx.botPeerHandoffAuthority.askPeerFromActiveProvider(
             peer: peer,
             prompt: delegatedPrompt,
             originThread: originThread,
             hostRunID: callerRun,
-            providerSnapshots: cachedProviderSnapshotsForSend()
+            providerSnapshots: cachedProviderSnapshotsForSend(),
+            consultationID: consultationID
         ) else {
             throw JSONRPCError(code: -32045, message: "The Bot delegation did not produce a verified reply.")
         }
@@ -2585,6 +2622,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         return .object([
             "activity_id": .string(result.activityID.uuidString.lowercased()),
+            BotPeerDelegation.consultationIDParameterKey: .string(result.consultationID.uuidString.lowercased()),
             "bot": .object([
                 "id": .string(current.id.value.uuidString.lowercased()),
                 "handle": .string(current.handle),

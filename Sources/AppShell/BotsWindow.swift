@@ -345,6 +345,7 @@ enum BotPeerHandoffPhase: String, Codable, Equatable {
 
 struct BotPeerHandoffSnapshot: Equatable {
     let activityID: UUID
+    let consultationID: UUID?
     let originBotID: BotID?
     let originConversationID: BotConversationID?
     let originThreadID: AgentThreadID?
@@ -450,6 +451,7 @@ private struct BotPeerHandoffRoute: Codable, Equatable {
 private struct PersistedBotPeerHandoff: Codable, Equatable {
     let version: Int
     let activityID: UUID
+    let consultationID: UUID?
     let originBotID: BotID?
     let originConversationID: BotConversationID?
     let originAgentThreadID: AgentThreadID?
@@ -640,7 +642,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     private static let emptyPayload = Data("[]".utf8)
     private static let peerRunStartTimeout: TimeInterval = 60
     private static let knownRecordFields: Set<String> = [
-        "version", "activityID", "originBotID", "originConversationID",
+        "version", "activityID", "consultationID", "originBotID", "originConversationID",
         "originAgentThreadID", "peerBotID", "peerConversationID", "peerThreadID",
         "peerRunID", "inboundMessageID", "peerName", "peerTitle", "peerHandle",
         "peerAvatarSymbol",
@@ -691,6 +693,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     weak var router: AppCommandRouter?
 
     private var handoffs: [UUID: PersistedBotPeerHandoff] = [:]
+    private var activeConsultationClaims: Set<UUID> = []
     /// Telemetry receipt id per delegated peer run, so finalization targets the
     /// exact bot row even when routing admission wrote a second receipt under
     /// the same runId.
@@ -766,6 +769,70 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         return handoffs
     }
 
+    func claimContinuation(
+        consultationID: UUID,
+        callerThread: AgentThreadID,
+        hostRunID: AgentRunID,
+        peerBotID: BotID
+    ) throws {
+        refreshStorageProjection()
+        if activeConsultationClaims.contains(consultationID)
+            || handoffs.values.contains(where: {
+                $0.consultationID == consultationID
+                    && ($0.phase == .peerPrepared || $0.phase == .peerRunning)
+            }) {
+            throw JSONRPCError(
+                code: -32051,
+                message: "This Bot consultation already has a peer run in progress."
+            )
+        }
+        guard continuationHandoff(
+            consultationID: consultationID,
+            callerThread: callerThread,
+            hostRunID: hostRunID,
+            peerBotID: peerBotID
+        ) != nil else {
+            throw JSONRPCError(
+                code: -32050,
+                message: "The consultation id is not valid for this active run and Bot."
+            )
+        }
+        activeConsultationClaims.insert(consultationID)
+    }
+
+    func releaseContinuation(consultationID: UUID) {
+        activeConsultationClaims.remove(consultationID)
+    }
+
+    private func continuationHandoff(
+        consultationID: UUID,
+        callerThread: AgentThreadID,
+        hostRunID: AgentRunID,
+        peerBotID: BotID
+    ) -> PersistedBotPeerHandoff? {
+        let candidates = handoffs.values.filter {
+            $0.consultationID == consultationID
+                && $0.peerBotID == peerBotID
+                && $0.hostThreadID == callerThread
+                && $0.hostRunID == hostRunID
+                && $0.requiresHostContinuation
+                && ($0.phase == .peerCompleted || $0.phase == .completed)
+        }
+        guard let handoff = candidates.max(by: { lhs, rhs in
+            lhs.createdAt == rhs.createdAt
+                ? lhs.activityID.uuidString < rhs.activityID.uuidString
+                : lhs.createdAt < rhs.createdAt
+        }),
+              let conversation = try? botStore.conversation(id: handoff.peerConversationID),
+              conversation.botID == peerBotID,
+              let peerThreadID = handoff.peerThreadID,
+              conversation.linkedAgentThreadID == peerThreadID,
+              (try? threadRepo.get(id: peerThreadID)) != nil else {
+            return nil
+        }
+        return handoff
+    }
+
     /// Grants an active primary run access only to peers it actually consulted.
     /// A requested id is required when that run consulted more than one peer.
     func delegatedBotID(forHostRunID runID: AgentRunID, requestedBotID: BotID? = nil) -> BotID? {
@@ -802,7 +869,10 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         providerSnapshots: [AgentProviderSnapshot],
         resumeHostAfterPeer: Bool,
         originBot: BotDefinition? = nil,
-        originConversation: BotConversation? = nil
+        originConversation: BotConversation? = nil,
+        consultationID: UUID? = nil,
+        continuationConversationID: BotConversationID? = nil,
+        continuationPeerThreadID: AgentThreadID? = nil
     ) -> Task<Void, Never>? {
         let display = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let peerDisplay = peerText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -817,10 +887,6 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             return nil
         }
 
-        var conversation = BotConversation(
-            botID: peer.id,
-            title: Self.titleFromFirstMessage(peerDisplay)
-        )
         let activeCallerRun: AgentRun?
         if let hostRunID,
            let run = try? runRepo.get(id: hostRunID),
@@ -829,32 +895,56 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         } else {
             activeCallerRun = nil
         }
-        let routing = BotDeskRouting(thread: originThread, activeRun: activeCallerRun)
+        var conversation = BotConversation(
+            botID: peer.id,
+            title: Self.titleFromFirstMessage(peerDisplay)
+        )
         let peerRunID = AgentRunID()
         do {
-            try botStore.upsertConversation(conversation)
-            let thread = try router.createAgentThread(
-                workspace: nil,
-                title: conversation.title,
-                provider: routing.provider,
-                model: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
-                permissionMode: routing.permissionMode,
-                reasoningEffort: routing.reasoningEffort,
-                serviceTier: routing.serviceTier,
-                modelSelection: AgentModelSelection(
+            let thread: AgentThread
+            let routing: BotDeskRouting
+            if let continuationConversationID {
+                guard let existing = try botStore.conversation(id: continuationConversationID),
+                      existing.botID == peer.id,
+                      let existingThreadID = existing.linkedAgentThreadID,
+                      existingThreadID == continuationPeerThreadID,
+                      let existingThread = try threadRepo.get(id: existingThreadID) else {
+                    return nil
+                }
+                conversation = existing
+                thread = existingThread
+                routing = BotDeskRouting(thread: existingThread)
+            } else {
+                conversation = BotConversation(
+                    botID: peer.id,
+                    title: Self.titleFromFirstMessage(peerDisplay)
+                )
+                routing = BotDeskRouting(thread: originThread, activeRun: activeCallerRun)
+                try botStore.upsertConversation(conversation)
+                thread = try router.createAgentThread(
+                    workspace: nil,
+                    title: conversation.title,
                     provider: routing.provider,
-                    modelId: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
+                    model: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
+                    permissionMode: routing.permissionMode,
                     reasoningEffort: routing.reasoningEffort,
-                    serviceTier: routing.serviceTier
-                ),
-                providerInstanceId: routing.providerInstanceID,
-                runAsUser: routing.runAsUser,
-                surfaceID: nil,
-                routingConfiguration: peerRoutingConfiguration(routing),
-                quiet: true
-            )
-            conversation.linkedAgentThreadID = thread.id
-            try botStore.upsertConversation(conversation)
+                    serviceTier: routing.serviceTier,
+                    modelSelection: AgentModelSelection(
+                        provider: routing.provider,
+                        modelId: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
+                        reasoningEffort: routing.reasoningEffort,
+                        serviceTier: routing.serviceTier
+                    ),
+                    providerInstanceId: routing.providerInstanceID,
+                    runAsUser: routing.runAsUser,
+                    surfaceID: nil,
+                    routingConfiguration: peerRoutingConfiguration(routing),
+                    quiet: true,
+                    inheriting: originThread
+                )
+                conversation.linkedAgentThreadID = thread.id
+                try botStore.upsertConversation(conversation)
+            }
 
             let createdAt = originConversation == nil
                 ? ((try? messageRepo.get(id: activityID))?.createdAt ?? Date())
@@ -862,6 +952,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             let handoff = PersistedBotPeerHandoff(
                 version: 2,
                 activityID: activityID.value,
+                consultationID: consultationID ?? UUID(),
                 originBotID: originBot?.id,
                 originConversationID: originConversation?.id,
                 originAgentThreadID: originConversation == nil ? originThread.id : nil,
@@ -992,11 +1083,25 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         prompt: String,
         originThread: AgentThread,
         hostRunID: AgentRunID,
-        providerSnapshots: [AgentProviderSnapshot]
-    ) async -> (activityID: UUID, reply: String)? {
+        providerSnapshots: [AgentProviderSnapshot],
+        consultationID: UUID? = nil
+    ) async -> (activityID: UUID, reply: String, consultationID: UUID)? {
+        refreshStorageProjection()
         let originConversation = try? botStore.conversationLinked(to: originThread.id)
         let originBot = originConversation.flatMap { try? botStore.get(id: $0.botID) }
         if originConversation != nil, originBot == nil { return nil }
+        let continuation = consultationID.flatMap {
+            continuationHandoff(
+                consultationID: $0,
+                callerThread: originThread.id,
+                hostRunID: hostRunID,
+                peerBotID: peer.id
+            )
+        }
+        if let consultationID {
+            guard continuation != nil,
+                  activeConsultationClaims.contains(consultationID) else { return nil }
+        }
 
         let activityID = AgentMessageID()
         if originConversation == nil {
@@ -1018,11 +1123,15 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             providerSnapshots: providerSnapshots,
             resumeHostAfterPeer: false,
             originBot: originBot,
-            originConversation: originConversation
+            originConversation: originConversation,
+            consultationID: consultationID,
+            continuationConversationID: continuation?.peerConversationID,
+            continuationPeerThreadID: continuation?.peerThreadID
         ) else { return nil }
         await milestone.value
-        guard let reply = replyText(forActivityID: activityID.value) else { return nil }
-        return (activityID.value, reply)
+        guard let reply = replyText(forActivityID: activityID.value),
+              let consultationID = handoffs[activityID.value]?.consultationID else { return nil }
+        return (activityID.value, reply, consultationID)
     }
 
     private func awaitAgentAppDispatch(activityID: UUID) async {
@@ -7282,6 +7391,7 @@ public final class BotsViewModel: ObservableObject {
             .map {
                 BotPeerHandoffSnapshot(
                     activityID: $0.activityID,
+                    consultationID: $0.consultationID,
                     originBotID: $0.originBotID,
                     originConversationID: $0.originConversationID,
                     originThreadID: $0.originAgentThreadID,
