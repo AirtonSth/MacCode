@@ -5,8 +5,14 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 fixture_rel="Tests/Fixtures/TokenSaverLocalLLMRound2/envelope-question.json"
 fixture_sha="2f7f815fa8efa3891809c1b66cbcc1b495c016d848401cf78d628cd836c00749"
-technique_id="librarian-success-fallback-question-elision-v1"
+profile="${RC_TOKEN_SAVER_ROUND2_PROFILE:-question-elision-v1}"
+case "${profile}" in
+  question-elision-v1) technique_id="librarian-success-fallback-question-elision-v1" ;;
+  envelope-slashes-v1) technique_id="librarian-envelope-unescaped-slashes-v1" ;;
+  *) echo "token-saver-round2-benchmark: unknown Round-2 profile: ${profile}" >&2; exit 1 ;;
+esac
 catalog_test_diff_sha="adcd7491dc68ec0cf3654b3321e3964f1dcb0e4289b3aa195fc9b6ed51ad14f3"
+slash_regression_added_sha="be4366df08a6ed418992c3ff7cac97067f8db314fec00ecbdb1f0da624fa7232"
 
 die() { echo "token-saver-round2-benchmark: $*" >&2; exit 1; }
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
@@ -22,6 +28,10 @@ Usage:
   scripts/token-saver-round2-benchmark.sh verify-source-materialization <exact-git-sha>
   scripts/token-saver-round2-benchmark.sh verify-envelope-hash <provider-body> <expected-sha256>
   scripts/token-saver-round2-benchmark.sh verify-model-catalog-pair <baseline-response> <candidate-response>
+  scripts/token-saver-round2-slash-benchmark.sh verify-slash-bytes <provider|emitted> <baseline-file> <candidate-file>
+  scripts/token-saver-round2-slash-benchmark.sh verify-slash-deltas <baseline-report> <candidate-report>
+  scripts/token-saver-round2-slash-benchmark.sh verify-slash-product-files <baseline-source> <candidate-source>
+  scripts/token-saver-round2-slash-benchmark.sh verify-slash-zero-bytes <baseline-file> <candidate-file>
 
 Required live environment (Authorization stays in process memory):
   RC_TOKEN_SAVER_ROUND2_BASE_URL=http://127.0.0.1:8000/v1
@@ -91,7 +101,7 @@ require_tools() {
 verify_fixture() {
   require_file "${repo_root}/${fixture_rel}"
   [[ "$(sha256_file "${repo_root}/${fixture_rel}")" == "${fixture_sha}" ]] || die "fixture SHA mismatch"
-  jq -e --arg technique "${technique_id}" '
+  jq -e --arg technique "librarian-success-fallback-question-elision-v1" '
     .schema_version == 1 and .technique_id == $technique and
     .counter == "anthropic-v1-shipping-episode" and
     (.cases | length == 24) and
@@ -288,9 +298,27 @@ verify_manifest() {
   [[ "${listed}" == "${actual}" ]] || die "manifest does not enumerate every artifact file"
 }
 
+expected_source_bindings() {
+  jq -cn --arg profile "${profile}" '
+    [
+      "Sources/DistillCore/Librarian/LibrarianEnvelope.swift",
+      "Sources/DistillCore/Librarian/LibrarianHandlers.swift",
+      "Sources/DistillCore/ManagedRetrieveMCP.swift",
+      "Tests/DistillCoreTests/TokenSaverRound2BenchmarkTests.swift",
+      "Tests/Fixtures/TokenSaverLocalLLMRound2/envelope-question.json",
+      "docs/benchmarks/token-saver-local-llm/round-2/PROTOCOL.md",
+      "scripts/token-saver-round2-benchmark.sh"
+    ] +
+    if $profile == "envelope-slashes-v1" then [
+      "docs/benchmarks/token-saver-local-llm/round-2/envelope-slashes/PROTOCOL.md",
+      "scripts/token-saver-round2-slash-benchmark.sh"
+    ] else [] end
+  '
+}
+
 verify_arm() {
   require_tools
-  local arm_dir="${1:-}" report
+  local arm_dir="${1:-}" report expected_bindings
   [[ -n "${arm_dir}" ]] || usage
   if [[ -n "${RC_TOKEN_SAVER_ROUND2_AUTH_TOKEN:-}" && ${#RC_TOKEN_SAVER_ROUND2_AUTH_TOKEN} -lt 8 ]]; then
     die "nonempty auth token must contain at least 8 characters for exact artifact scanning"
@@ -298,8 +326,9 @@ verify_arm() {
   report="${arm_dir}/report.json"
   require_file "${report}"
   verify_manifest "${arm_dir}"
+  expected_bindings="$(expected_source_bindings)"
 
-  jq -e --arg fixture "${fixture_sha}" --arg technique "${technique_id}" '
+  jq -e --arg fixture "${fixture_sha}" --arg technique "${technique_id}" --argjson expected_bindings "${expected_bindings}" '
     . as $report |
     .schema_version == 1 and .technique_id == $technique and
     (.arm == "baseline" or .arm == "candidate") and
@@ -315,15 +344,7 @@ verify_arm() {
       .tree_sha == $report.source.tree_sha and
       .status_porcelain == ""
     ) and
-    ([.source.bindings[].path] | sort) == [
-      "Sources/DistillCore/Librarian/LibrarianEnvelope.swift",
-      "Sources/DistillCore/Librarian/LibrarianHandlers.swift",
-      "Sources/DistillCore/ManagedRetrieveMCP.swift",
-      "Tests/DistillCoreTests/TokenSaverRound2BenchmarkTests.swift",
-      "Tests/Fixtures/TokenSaverLocalLLMRound2/envelope-question.json",
-      "docs/benchmarks/token-saver-local-llm/round-2/PROTOCOL.md",
-      "scripts/token-saver-round2-benchmark.sh"
-    ] and
+    ([.source.bindings[].path] | sort) == ($expected_bindings | sort) and
     all(.source.bindings[];
       (.blob_sha1 | test("^[0-9a-f]{40}$")) and
       (.sha256 | test("^[0-9a-f]{64}$")) and .bytes > 0
@@ -448,7 +469,9 @@ verify_arm() {
     for scenario_turn in 'S0/turn-1' 'S2/turn-1' 'S6/turn-2'; do
       shipped_envelope="$(shipping_envelope_text "${arm_dir}/envelopes/${case_id}/${scenario_turn}.json")"
       question_state="$(jq -r '.fallback | has("question")' <<<"${shipped_envelope}")"
-      if [[ "${arm}" == baseline ]]; then
+      if [[ "${profile}" == envelope-slashes-v1 ]]; then
+        [[ "${question_state}" == false ]] || die "slash profile restored fallback.question: ${case_id}/${scenario_turn}"
+      elif [[ "${arm}" == baseline ]]; then
         [[ "${question_state}" == true && "$(jq -r '.fallback.question' <<<"${shipped_envelope}")" == "${expected_question}" ]] || die "baseline fallback.question mismatch: ${case_id}/${scenario_turn}"
       else
         [[ "${question_state}" == false ]] || die "candidate retained fallback.question: ${case_id}/${scenario_turn}"
@@ -501,6 +524,124 @@ compare_question_elision_bytes() {
   rm -f "${temporary}"
 }
 
+successful_envelope_text() {
+  local file="$1" kind="$2"
+  case "${kind}" in
+    provider) shipping_envelope_text "${file}" ;;
+    emitted)
+      jq -jr '[
+        .result.content[]?
+        | select(.type=="text")
+        | select((try (.text | fromjson | .status) catch null) == "ok")
+        | .text
+      ][0] // empty' "${file}"
+      ;;
+    *) die "unknown slash comparison kind: ${kind}" ;;
+  esac
+}
+
+compare_successful_slash_bytes() {
+  local baseline_file="$1" candidate_file="$2" kind="$3"
+  local baseline_envelope candidate_envelope transformed_envelope baseline_string candidate_string temporary
+  require_file "${baseline_file}"
+  require_file "${candidate_file}"
+  baseline_envelope="$(successful_envelope_text "${baseline_file}" "${kind}")"
+  candidate_envelope="$(successful_envelope_text "${candidate_file}" "${kind}")"
+  [[ -n "${baseline_envelope}" && -n "${candidate_envelope}" ]] || die "successful envelope unavailable for slash comparison"
+  [[ "$(printf '%s' "${baseline_envelope}" | jq -cS .)" == "$(printf '%s' "${candidate_envelope}" | jq -cS .)" ]] || die "slash candidate changed envelope semantics"
+
+  temporary="$(mktemp "${TMPDIR:-/tmp}/token-saver-r2-slash-inner.XXXXXX")"
+  perl -0pe '$count += s{\\/}{/}g; END { print STDERR "$count\n"; }' \
+    <<<"${baseline_envelope}" > "${temporary}" 2> "${temporary}.count"
+  transformed_envelope="$(sed -n '1p' "${temporary}")"
+  [[ "${transformed_envelope}" == "${candidate_envelope}" ]] || { rm -f "${temporary}" "${temporary}.count"; die "candidate bytes are not slash-unescaped envelope bytes"; }
+
+  baseline_string="$(jq -Rn --arg text "${baseline_envelope}" '$text')"
+  candidate_string="$(jq -Rn --arg text "${candidate_envelope}" '$text')"
+  BASELINE_ENVELOPE_STRING="${baseline_string}" CANDIDATE_ENVELOPE_STRING="${candidate_string}" perl -0pe '
+    BEGIN { $needle = $ENV{"BASELINE_ENVELOPE_STRING"}; $replacement = $ENV{"CANDIDATE_ENVELOPE_STRING"}; $count = 0; }
+    $count += s/\Q$needle\E/$replacement/g;
+    END { die "successful envelope JSON string occurrence count is not one\n" unless $count == 1; }
+  ' "${baseline_file}" > "${temporary}" || { rm -f "${temporary}" "${temporary}.count"; die "could not isolate successful envelope JSON string"; }
+  cmp -s "${temporary}" "${candidate_file}" || { rm -f "${temporary}" "${temporary}.count"; die "bytes differ outside the successful envelope slash escaping"; }
+  cat "${temporary}.count"
+  rm -f "${temporary}" "${temporary}.count"
+}
+
+validate_slash_output_formatting_lines() {
+  local removed_lines="$1" added_lines="$2"
+  [[ "${removed_lines}" == '        e.outputFormatting = [.sortedKeys]' ]] || die "slash candidate removed unexpected product source"
+  [[ "${added_lines}" == '        e.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]' ]] || die "slash candidate is not the exact one-line outputFormatting transformation"
+}
+
+verify_slash_product_files() {
+  local baseline_file="$1" candidate_file="$2" removed_lines added_lines
+  require_file "${baseline_file}"
+  require_file "${candidate_file}"
+  [[ ! -x "${baseline_file}" && ! -x "${candidate_file}" ]] || die "slash product source mode changed"
+  removed_lines="$(diff --unified=0 "${baseline_file}" "${candidate_file}" | sed -n -e '/^--- /d' -e '/^-/s/^-//p' || true)"
+  added_lines="$(diff --unified=0 "${baseline_file}" "${candidate_file}" | sed -n -e '/^+++ /d' -e '/^+/s/^+//p' || true)"
+  validate_slash_output_formatting_lines "${removed_lines}" "${added_lines}"
+}
+
+verify_slash_source_diff() {
+  local bsha="$1" csha="$2" changed_paths expected_changed_paths envelope_path test_path
+  local removed_lines added_lines test_removed test_added test_added_sha declaration_count path baseline_mode candidate_mode
+  changed_paths="$(git -C "${repo_root}" diff --name-only "${bsha}" "${csha}" | LC_ALL=C sort)"
+  expected_changed_paths=$'Sources/DistillCore/Librarian/LibrarianEnvelope.swift\nTests/DistillCoreTests/LibrarianCatalogTests.swift'
+  [[ "${changed_paths}" == "${expected_changed_paths}" ]] || die "slash candidate path set is not exactly envelope plus focused regression test"
+  while IFS= read -r path; do
+    baseline_mode="$(git -C "${repo_root}" ls-tree "${bsha}" -- "${path}" | awk '{print $1}')"
+    candidate_mode="$(git -C "${repo_root}" ls-tree "${csha}" -- "${path}" | awk '{print $1}')"
+    [[ "${baseline_mode}" == 100644 && "${candidate_mode}" == 100644 ]] || die "slash candidate changed source mode: ${path}"
+  done <<<"${expected_changed_paths}"
+
+  envelope_path="Sources/DistillCore/Librarian/LibrarianEnvelope.swift"
+  removed_lines="$(git -C "${repo_root}" diff --no-ext-diff --unified=0 "${bsha}" "${csha}" -- "${envelope_path}" | sed -n -e '/^--- /d' -e '/^-/s/^-//p')"
+  added_lines="$(git -C "${repo_root}" diff --no-ext-diff --unified=0 "${bsha}" "${csha}" -- "${envelope_path}" | sed -n -e '/^+++ /d' -e '/^+/s/^+//p')"
+  validate_slash_output_formatting_lines "${removed_lines}" "${added_lines}"
+
+  test_path="Tests/DistillCoreTests/LibrarianCatalogTests.swift"
+  test_removed="$(git -C "${repo_root}" diff --no-ext-diff --unified=0 "${bsha}" "${csha}" -- "${test_path}" | sed -n -e '/^--- /d' -e '/^-/s/^-//p')"
+  test_added="$(git -C "${repo_root}" diff --no-ext-diff --unified=0 "${bsha}" "${csha}" -- "${test_path}" | sed -n -e '/^+++ /d' -e '/^+/s/^+//p')"
+  [[ -z "${test_removed}" ]] || die "slash focused regression diff removes existing test source"
+  test_added_sha="$(printf '%s\n' "${test_added}" | shasum -a 256 | awk '{print $1}')"
+  [[ "${test_added_sha}" == "${slash_regression_added_sha}" ]] || die "slash focused regression is not the exact frozen additive diff"
+  declaration_count="$(printf '%s\n' "${test_added}" | grep -Fxc '    func test_librarianEnvelopeShippingJSONDoesNotEscapeSlashes() throws {' || true)"
+  [[ "${declaration_count}" -eq 1 ]] || die "slash candidate omitted the required focused regression test"
+}
+
+verify_slash_deltas() {
+  local baseline_report="$1" candidate_report="$2"
+  require_file "${baseline_report}"
+  require_file "${candidate_report}"
+  jq -e --slurpfile candidate "${candidate_report}" '
+    def token($report;$id;$scenario):
+      [$report.cases[]|select(.id==$id)|.scenarios[]|select(.id==$scenario)|.input_tokens] as $tokens |
+      if ($tokens|length)==1 then $tokens[0] else error("scenario identity mismatch") end;
+    . as $baseline | $candidate[0] as $candidate |
+    ([.cases[].id]|sort) == ([$candidate.cases[].id]|sort) and
+    ([.cases[].id]|length) == ([.cases[].id]|unique|length) and
+    all(.cases[];
+      . as $case |
+      ([.scenarios[].id]|sort)==["S0","S2","S4","S6"] and
+      all(.scenarios[];
+        . as $scenario |
+        (.input_tokens|type)=="number" and .input_tokens>0 and .input_tokens==(.input_tokens|floor) and
+        (token($candidate;$case.id;$scenario.id)|type)=="number" and
+        (if .id=="S4"
+         then .input_tokens == token($candidate;$case.id;.id)
+         else .input_tokens >= token($candidate;$case.id;.id)
+         end)
+      )
+    ) and
+    all(["S0","S2","S6"][];
+      . as $scenario |
+      ([$baseline.cases[].id as $id | token($baseline;$id;$scenario)-token($candidate;$id;$scenario)] | add) > 0
+    )
+  ' "${baseline_report}" >/dev/null || die "slash token deltas violate per-case, aggregate, or S4 contract"
+}
+
 pair_checks() {
   local package="$1" baseline="${1}/baseline" candidate="${1}/candidate"
   verify_arm "${baseline}" >/dev/null
@@ -522,11 +663,18 @@ pair_checks() {
   [[ "$(jq -r '.model.openapi_response_sha256' "${baseline}/report.json")" == "$(jq -r '.model.openapi_response_sha256' "${candidate}/report.json")" ]] || die "oMLX server response changed between arms"
   local bound_path baseline_blob candidate_blob
   while IFS= read -r bound_path; do
-    [[ "${bound_path}" == "Sources/DistillCore/Librarian/LibrarianHandlers.swift" ]] && continue
+    if [[ "${profile}" == envelope-slashes-v1 ]]; then
+      [[ "${bound_path}" == "Sources/DistillCore/Librarian/LibrarianEnvelope.swift" ]] && continue
+    else
+      [[ "${bound_path}" == "Sources/DistillCore/Librarian/LibrarianHandlers.swift" ]] && continue
+    fi
     baseline_blob="$(jq -r --arg path "${bound_path}" '.source.bindings[]|select(.path==$path)|.blob_sha1' "${baseline}/report.json")"
     candidate_blob="$(jq -r --arg path "${bound_path}" '.source.bindings[]|select(.path==$path)|.blob_sha1' "${candidate}/report.json")"
     [[ "${baseline_blob}" == "${candidate_blob}" ]] || die "harness/protocol source changed between arms: ${bound_path}"
   done < <(jq -r '.source.bindings[].path' "${baseline}/report.json")
+  if [[ "${profile}" == envelope-slashes-v1 ]]; then
+    verify_slash_source_diff "${bsha}" "${csha}"
+  else
   local changed_paths expected_changed_paths
   changed_paths="$(git -C "${repo_root}" diff --name-only "${bsha}" "${csha}" | LC_ALL=C sort)"
   expected_changed_paths=$'Sources/DistillCore/Librarian/LibrarianHandlers.swift\nTests/DistillCoreTests/LibrarianCatalogTests.swift'
@@ -547,24 +695,42 @@ pair_checks() {
   [[ -z "${catalog_removed}" ]] || die "focused regression diff removes existing test source"
   regression_declaration_count="$(printf '%s\n' "${catalog_added}" | grep -Fxc '    func test_askHandle_successEnvelopeDoesNotRepeatToolQuestion() async throws {' || true)"
   [[ "${regression_declaration_count}" -eq 1 ]] || die "candidate omitted the required focused Librarian regression test"
+  fi
 
-  local case_id scenario turn bt ct question expected_removals
+  local case_id scenario turn bt ct question expected_removals slash_removals
   while IFS= read -r case_id; do
     question="$(jq -r --arg id "${case_id}" '.cases[]|select(.id==$id)|.question' "${repo_root}/${fixture_rel}")"
     for scenario in S0 S2 S4 S6; do
       turn="turn-1"; [[ "${scenario}" == S6 ]] && turn="turn-2"
-      expected_removals=1; [[ "${scenario}" == S4 ]] && expected_removals=0
-      compare_question_elision_bytes "${baseline}/envelopes/${case_id}/${scenario}/${turn}.json" "${candidate}/envelopes/${case_id}/${scenario}/${turn}.json" "${question}" "${expected_removals}" || die "non-question body difference: ${case_id}/${scenario}"
-      compare_question_elision_bytes "${baseline}/emitted/${case_id}/${scenario}.bin" "${candidate}/emitted/${case_id}/${scenario}.bin" "${question}" "${expected_removals}" || die "non-question emitted difference: ${case_id}/${scenario}"
+      if [[ "${profile}" == envelope-slashes-v1 ]]; then
+        if [[ "${scenario}" == S4 ]]; then
+          cmp -s "${baseline}/envelopes/${case_id}/${scenario}/${turn}.json" "${candidate}/envelopes/${case_id}/${scenario}/${turn}.json" || die "S4 provider body drifted: ${case_id}"
+          cmp -s "${baseline}/emitted/${case_id}/${scenario}.bin" "${candidate}/emitted/${case_id}/${scenario}.bin" || die "S4 MCP bytes drifted: ${case_id}"
+        else
+          slash_removals="$(compare_successful_slash_bytes "${baseline}/envelopes/${case_id}/${scenario}/${turn}.json" "${candidate}/envelopes/${case_id}/${scenario}/${turn}.json" provider)"
+          [[ "${slash_removals}" =~ ^[0-9]+$ ]] || die "invalid provider slash removal count: ${case_id}/${scenario}"
+          slash_removals="$(compare_successful_slash_bytes "${baseline}/emitted/${case_id}/${scenario}.bin" "${candidate}/emitted/${case_id}/${scenario}.bin" emitted)"
+          [[ "${slash_removals}" =~ ^[0-9]+$ ]] || die "invalid MCP slash removal count: ${case_id}/${scenario}"
+        fi
+      else
+        expected_removals=1; [[ "${scenario}" == S4 ]] && expected_removals=0
+        compare_question_elision_bytes "${baseline}/envelopes/${case_id}/${scenario}/${turn}.json" "${candidate}/envelopes/${case_id}/${scenario}/${turn}.json" "${question}" "${expected_removals}" || die "non-question body difference: ${case_id}/${scenario}"
+        compare_question_elision_bytes "${baseline}/emitted/${case_id}/${scenario}.bin" "${candidate}/emitted/${case_id}/${scenario}.bin" "${question}" "${expected_removals}" || die "non-question emitted difference: ${case_id}/${scenario}"
+      fi
       bt="$(jq -r --arg id "${case_id}" --arg s "${scenario}" '.cases[]|select(.id==$id)|.scenarios[]|select(.id==$s)|.input_tokens' "${baseline}/report.json")"
       ct="$(jq -r --arg id "${case_id}" --arg s "${scenario}" '.cases[]|select(.id==$id)|.scenarios[]|select(.id==$s)|.input_tokens' "${candidate}/report.json")"
       if [[ "${scenario}" == S4 ]]; then
         [[ "${bt}" -eq "${ct}" ]] || die "S4 fail-open delta is not zero: ${case_id}"
+      elif [[ "${profile}" == envelope-slashes-v1 ]]; then
+        [[ "${bt}" -ge "${ct}" ]] || die "negative slash candidate delta: ${case_id}/${scenario}"
       else
         [[ "${bt}" -gt "${ct}" ]] || die "non-positive candidate delta: ${case_id}/${scenario}"
       fi
     done
   done < <(jq -r '.cases[].id' "${baseline}/report.json")
+  if [[ "${profile}" == envelope-slashes-v1 ]]; then
+    verify_slash_deltas "${baseline}/report.json" "${candidate}/report.json"
+  fi
 }
 
 verify_pair() {
@@ -614,7 +780,7 @@ verify_suite() {
   [[ "$(jq -r '.baseline_manifest_sha256' "${suite}")" == "$(sha256_file "${package}/baseline/manifest.json")" ]] || die "suite baseline manifest hash mismatch"
   [[ "$(jq -r '.candidate_manifest_sha256' "${suite}")" == "$(sha256_file "${package}/candidate/manifest.json")" ]] || die "suite candidate manifest hash mismatch"
   [[ "$(jq -r '.pair_report_sha256' "${suite}")" == "$(sha256_file "${report}")" ]] || die "suite pair report hash mismatch"
-  jq -e --slurpfile baseline "${package}/baseline/report.json" --slurpfile candidate "${package}/candidate/report.json" '
+  jq -e --arg profile "${profile}" --slurpfile baseline "${package}/baseline/report.json" --slurpfile candidate "${package}/candidate/report.json" '
     def token($report;$id;$scenario): $report.cases[]|select(.id==$id)|.scenarios[]|select(.id==$scenario)|.input_tokens;
     .schema_version == 1 and
     .technique_id == $baseline[0].technique_id and
@@ -632,9 +798,18 @@ verify_suite() {
         .baseline_tokens == token($baseline[0];$case.id;$scenario.id) and
         .candidate_tokens == token($candidate[0];$case.id;$scenario.id) and
         .delta == (.baseline_tokens - .candidate_tokens) and
-        (if .id=="S4" then .delta==0 else .delta>0 end)
+        (if .id=="S4" then .delta==0
+         elif $profile=="envelope-slashes-v1" then .delta>=0
+         else .delta>0 end)
       )
-    )
+    ) and
+    (if $profile=="envelope-slashes-v1" then
+      . as $report |
+      all(["S0","S2","S6"][];
+        . as $scenario |
+        ([$report.cases[].scenarios[]|select(.id==$scenario)|.delta] | add) > 0
+      )
+     else true end)
   ' "${report}" >/dev/null || die "pair report arithmetic/decision mismatch"
   echo "verify-suite ok package=${package}"
 }
@@ -648,5 +823,30 @@ case "${command}" in
   verify-source-materialization) verify_source_materialization "$@" ;;
   verify-envelope-hash) verify_envelope_hash "$@" ;;
   verify-model-catalog-pair) verify_model_catalog_pair "$@" ;;
+  verify-slash-bytes)
+    [[ "${profile}" == envelope-slashes-v1 ]] || die "verify-slash-bytes requires the slash profile"
+    [[ "$#" -eq 3 ]] || usage
+    compare_successful_slash_bytes "$2" "$3" "$1" >/dev/null
+    echo "verify-slash-bytes ok kind=$1"
+    ;;
+  verify-slash-deltas)
+    [[ "${profile}" == envelope-slashes-v1 ]] || die "verify-slash-deltas requires the slash profile"
+    [[ "$#" -eq 2 ]] || usage
+    verify_slash_deltas "$1" "$2"
+    echo "verify-slash-deltas ok"
+    ;;
+  verify-slash-product-files)
+    [[ "${profile}" == envelope-slashes-v1 ]] || die "verify-slash-product-files requires the slash profile"
+    [[ "$#" -eq 2 ]] || usage
+    verify_slash_product_files "$1" "$2"
+    echo "verify-slash-product-files ok"
+    ;;
+  verify-slash-zero-bytes)
+    [[ "${profile}" == envelope-slashes-v1 ]] || die "verify-slash-zero-bytes requires the slash profile"
+    [[ "$#" -eq 2 ]] || usage
+    require_file "$1"; require_file "$2"
+    cmp -s "$1" "$2" || die "zero-delta slash bytes drifted"
+    echo "verify-slash-zero-bytes ok"
+    ;;
   *) usage ;;
 esac

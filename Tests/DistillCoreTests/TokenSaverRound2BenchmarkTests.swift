@@ -7,6 +7,7 @@ import XCTest
 final class TokenSaverRound2BenchmarkTests: XCTestCase {
     private static let fixtureSHA256 = "2f7f815fa8efa3891809c1b66cbcc1b495c016d848401cf78d628cd836c00749"
     private static let techniqueID = "librarian-success-fallback-question-elision-v1"
+    private static let slashTechniqueID = "librarian-envelope-unescaped-slashes-v1"
     private static let catalogTestDiffSHA256 = "adcd7491dc68ec0cf3654b3321e3964f1dcb0e4289b3aa195fc9b6ed51ad14f3"
 
     func test_fixtureFreezesTwentyFourAdversarialShippingCases() throws {
@@ -135,6 +136,148 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         for mutation in mutations {
             XCTAssertFalse(try differsOnlyByLiteralQuestionBytes(baseline: baseline, candidate: mutation, question: question))
         }
+    }
+
+    func test_slashVerifierRejectsSourceAndRawByteTampering() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-slash-raw-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let baselineSource = root.appendingPathComponent("Envelope-baseline.swift")
+        let candidateSource = root.appendingPathComponent("Envelope-candidate.swift")
+        try Data("let e = JSONEncoder()\n        e.outputFormatting = [.sortedKeys]\nreturn e\n".utf8)
+            .write(to: baselineSource)
+        try Data("let e = JSONEncoder()\n        e.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]\nreturn e\n".utf8)
+            .write(to: candidateSource)
+        XCTAssertEqual(
+            try runSlashBenchmark(["verify-slash-product-files", baselineSource.path, candidateSource.path]).status,
+            0
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: candidateSource.path)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-slash-product-files", baselineSource.path, candidateSource.path]).status,
+            0,
+            "an executable-bit source change must be rejected"
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: candidateSource.path)
+        try Data("let e = JSONEncoder()\n        e.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]\nreturn e\n".utf8)
+            .write(to: candidateSource, options: .atomic)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-slash-product-files", baselineSource.path, candidateSource.path]).status,
+            0,
+            "an adulterated product transformation must be rejected"
+        )
+
+        let baselineEnvelope = #"{"answer":{"text":"Sources\/App.swift"},"fallback":{"handle":"rcv1.test","recommended":"retrieve"},"status":"ok"}"#
+        let candidateEnvelope = #"{"answer":{"text":"Sources/App.swift"},"fallback":{"handle":"rcv1.test","recommended":"retrieve"},"status":"ok"}"#
+        func providerBody(_ envelope: String) throws -> Data {
+            try canonicalJSON([
+                "foreign": "https://example.test/a/b",
+                "messages": [["content": [[
+                    "type": "tool_result",
+                    "content": [["type": "text", "text": envelope]],
+                ]]]],
+            ])
+        }
+        func emittedBody(_ envelope: String) throws -> Data {
+            try canonicalJSON([
+                "jsonrpc": "2.0", "id": 2,
+                "result": ["isError": false, "content": [["type": "text", "text": envelope]]],
+            ])
+        }
+        let baselineBody = root.appendingPathComponent("provider-baseline.json")
+        let candidateBody = root.appendingPathComponent("provider-candidate.json")
+        try providerBody(baselineEnvelope).write(to: baselineBody)
+        try providerBody(candidateEnvelope).write(to: candidateBody)
+        XCTAssertEqual(
+            try runSlashBenchmark(["verify-slash-bytes", "provider", baselineBody.path, candidateBody.path]).status,
+            0
+        )
+        let baselineEmitted = root.appendingPathComponent("emitted-baseline.bin")
+        let candidateEmitted = root.appendingPathComponent("emitted-candidate.bin")
+        try emittedBody(baselineEnvelope).write(to: baselineEmitted)
+        try emittedBody(candidateEnvelope).write(to: candidateEmitted)
+        XCTAssertEqual(
+            try runSlashBenchmark(["verify-slash-bytes", "emitted", baselineEmitted.path, candidateEmitted.path]).status,
+            0
+        )
+
+        let sourceMutation = candidateEnvelope.replacingOccurrences(of: "Sources/App.swift", with: "Sources/Other.swift")
+        try providerBody(sourceMutation).write(to: candidateBody, options: .atomic)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-slash-bytes", "provider", baselineBody.path, candidateBody.path]).status,
+            0,
+            "semantic source drift must not be hidden by slash normalization"
+        )
+        try providerBody(baselineEnvelope).write(to: candidateBody, options: .atomic)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-slash-bytes", "provider", baselineBody.path, candidateBody.path]).status,
+            0,
+            "retaining the escaped envelope bytes must not count as the candidate"
+        )
+        let foreignMutation = String(decoding: try providerBody(candidateEnvelope), as: UTF8.self)
+            .replacingOccurrences(of: "https://example.test/a/b", with: #"https:\/\/example.test\/a\/b"#)
+        try Data(foreignMutation.utf8).write(to: candidateBody, options: .atomic)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-slash-bytes", "provider", baselineBody.path, candidateBody.path]).status,
+            0,
+            "foreign outer JSON slashes must remain byte-exact"
+        )
+
+        let s4Baseline = root.appendingPathComponent("s4-baseline.bin")
+        let s4Candidate = root.appendingPathComponent("s4-candidate.bin")
+        try Data("unchanged fail-open".utf8).write(to: s4Baseline)
+        try Data("changed fail-open".utf8).write(to: s4Candidate)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-slash-zero-bytes", s4Baseline.path, s4Candidate.path]).status,
+            0,
+            "S4 byte drift must be rejected"
+        )
+    }
+
+    func test_slashVerifierRejectsNegativeAndZeroAggregateTokenSavings() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("round2-slash-deltas-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let baselineURL = root.appendingPathComponent("baseline.json")
+        let candidateURL = root.appendingPathComponent("candidate.json")
+        let scenarios = ["S0", "S2", "S4", "S6"]
+        func report(_ tokens: [String: Int]) throws -> Data {
+            try canonicalJSON(["cases": [[
+                "id": "R2Q-001",
+                "scenarios": scenarios.map { ["id": $0, "input_tokens": tokens[$0]!] },
+            ]]])
+        }
+        let baseline = Dictionary(uniqueKeysWithValues: scenarios.map { ($0, 100) })
+        try report(baseline).write(to: baselineURL)
+        try report(["S0": 99, "S2": 99, "S4": 100, "S6": 99]).write(to: candidateURL)
+        let valid = try runSlashBenchmark(["verify-slash-deltas", baselineURL.path, candidateURL.path])
+        XCTAssertEqual(
+            valid.status,
+            0,
+            valid.stderr
+        )
+
+        try report(["S0": 101, "S2": 99, "S4": 100, "S6": 99]).write(to: candidateURL, options: .atomic)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-slash-deltas", baselineURL.path, candidateURL.path]).status,
+            0,
+            "a negative per-case token delta must be rejected"
+        )
+        try report(baseline).write(to: candidateURL, options: .atomic)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-slash-deltas", baselineURL.path, candidateURL.path]).status,
+            0,
+            "zero aggregate savings must be rejected for S0/S2/S6"
+        )
+        try report(["S0": 99, "S2": 99, "S4": 99, "S6": 99]).write(to: candidateURL, options: .atomic)
+        XCTAssertNotEqual(
+            try runSlashBenchmark(["verify-slash-deltas", baselineURL.path, candidateURL.path]).status,
+            0,
+            "S4 token drift must be rejected"
+        )
     }
 
     func test_verifierHashesRawEmbeddedEnvelopeTextWithoutReserializing() throws {
@@ -520,7 +663,11 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         )
         let head = initialSourceState.gitSHA
         let tree = initialSourceState.treeSHA
-        let sourceBindings = try sourceBindings(repository: repository, gitSHA: head)
+        let sourceBindings = try sourceBindings(
+            repository: repository,
+            gitSHA: head,
+            profile: configuration.profile
+        )
 
         let output = configuration.outputDirectory
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
@@ -662,8 +809,11 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
             }
 
             let hasQuestion = episode.envelope.fallback.question != nil
-            guard (configuration.arm == "baseline" && episode.envelope.fallback.question == item.question)
-                    || (configuration.arm == "candidate" && !hasQuestion) else {
+            let questionContractPassed = configuration.profile == .envelopeSlashes
+                ? !hasQuestion
+                : (configuration.arm == "baseline" && episode.envelope.fallback.question == item.question)
+                    || (configuration.arm == "candidate" && !hasQuestion)
+            guard questionContractPassed else {
                 throw Round2Error.invalid("\(item.id) arm does not match fallback.question contract")
             }
             guard episode.readbackExact,
@@ -737,7 +887,9 @@ final class TokenSaverRound2BenchmarkTests: XCTestCase {
         )
         let report: [String: Any] = [
             "schema_version": 1,
-            "technique_id": Self.techniqueID,
+            "technique_id": configuration.profile == .envelopeSlashes
+                ? Self.slashTechniqueID
+                : Self.techniqueID,
             "arm": configuration.arm,
             "counter": fixture.counter,
             "token_count_source": "omlx:/v1/messages/count_tokens",
@@ -1132,8 +1284,12 @@ private extension TokenSaverRound2BenchmarkTests {
         return (canonicalPath, revision, files, sha256(try canonicalJSON(files)))
     }
 
-    func sourceBindings(repository: URL, gitSHA: String) throws -> [[String: Any]] {
-        let paths = [
+    func sourceBindings(
+        repository: URL,
+        gitSHA: String,
+        profile: CaptureProfile = .questionElision
+    ) throws -> [[String: Any]] {
+        var paths = [
             "Sources/DistillCore/Librarian/LibrarianHandlers.swift",
             "Sources/DistillCore/Librarian/LibrarianEnvelope.swift",
             "Sources/DistillCore/ManagedRetrieveMCP.swift",
@@ -1142,6 +1298,10 @@ private extension TokenSaverRound2BenchmarkTests {
             "scripts/token-saver-round2-benchmark.sh",
             "docs/benchmarks/token-saver-local-llm/round-2/PROTOCOL.md",
         ]
+        if profile == .envelopeSlashes {
+            paths.append("scripts/token-saver-round2-slash-benchmark.sh")
+            paths.append("docs/benchmarks/token-saver-local-llm/round-2/envelope-slashes/PROTOCOL.md")
+        }
         return try paths.map { path in
             let blob = try git(["rev-parse", "\(gitSHA):\(path)"], repository).trimmed
             let bytes = try gitData(["show", "\(gitSHA):\(path)"], repository)
@@ -1313,6 +1473,24 @@ private extension TokenSaverRound2BenchmarkTests {
         return (process.terminationStatus, error)
     }
 
+    func runSlashBenchmark(
+        _ arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> (status: Int32, stderr: String) {
+        let process = Process()
+        let stderr = Pipe()
+        process.executableURL = repositoryURL().appendingPathComponent("scripts/token-saver-round2-slash-benchmark.sh")
+        process.arguments = arguments
+        process.currentDirectoryURL = repositoryURL()
+        process.environment = environment
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = stderr
+        try process.run()
+        let error = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        return (process.terminationStatus, error)
+    }
+
     func gitData(_ arguments: [String], _ repository: URL) throws -> Data {
         let process = Process()
         let output = Pipe()
@@ -1344,6 +1522,7 @@ private struct SourceCaptureState: Equatable {
 }
 
 private struct CaptureConfiguration {
+    let profile: CaptureProfile
     let arm: String
     let expectedGitSHA: String
     let outputDirectory: URL
@@ -1354,6 +1533,11 @@ private struct CaptureConfiguration {
     let authToken: String?
 
     init(_ environment: [String: String]) throws {
+        let profileValue = environment["RC_TOKEN_SAVER_ROUND2_PROFILE"] ?? CaptureProfile.questionElision.rawValue
+        guard let profile = CaptureProfile(rawValue: profileValue) else {
+            throw Round2Error.invalid("unknown Round-2 capture profile")
+        }
+        self.profile = profile
         arm = try Self.required(environment["RC_TOKEN_SAVER_ROUND2_ARM"], "RC_TOKEN_SAVER_ROUND2_ARM")
         guard arm == "baseline" || arm == "candidate" else { throw Round2Error.invalid("arm must be baseline or candidate") }
         expectedGitSHA = try Self.required(environment["RC_TOKEN_SAVER_ROUND2_EXPECTED_GIT_SHA"], "RC_TOKEN_SAVER_ROUND2_EXPECTED_GIT_SHA")
@@ -1382,6 +1566,11 @@ private struct CaptureConfiguration {
         guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw Round2Error.invalid("missing \(name)") }
         return value
     }
+}
+
+private enum CaptureProfile: String {
+    case questionElision = "question-elision-v1"
+    case envelopeSlashes = "envelope-slashes-v1"
 }
 
 private struct Round2Fixture: Decodable {
