@@ -197,9 +197,41 @@ token_saver_mlx_live:
     - test "$(uname -m)" = "arm64"
     - export REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_DIR="${TMPDIR:-/tmp}/RemoteCodeTokenSaverLiveModel"
     - |
+      build_log="token-saver-mlx-live-build.log"
+      set +e
+      swift build --build-tests >"$build_log" 2>&1
+      build_status=$?
+      set -e
+      if [ "$build_status" -ne 0 ]; then
+        echo "token_saver_mlx_live prebuild failed (exit $build_status); last 200 log lines:" >&2
+        tail -n 200 "$build_log" >&2
+        exit "$build_status"
+      fi
+
+      bin_path="$(swift build --show-bin-path)"
+      metallib_path="$bin_path/mlx.metallib"
+      set +e
+      scripts/build-mlx-metallib.sh "$metallib_path" >>"$build_log" 2>&1
+      metallib_status=$?
+      set -e
+      if [ "$metallib_status" -ne 0 ]; then
+        echo "token_saver_mlx_live metallib build failed (exit $metallib_status); last 200 log lines:" >&2
+        tail -n 200 "$build_log" >&2
+        exit "$metallib_status"
+      fi
+
+      test_bundle="$bin_path/RemoteCodePackageTests.xctest"
+      if [ ! -s "$metallib_path" ] || [ ! -d "$test_bundle/Contents/MacOS" ]; then
+        echo "token_saver_mlx_live could not provision mlx.metallib in the test bundle" >&2
+        exit 1
+      fi
+      cp "$metallib_path" "$test_bundle/Contents/MacOS/mlx.metallib"
+      test -s "$test_bundle/Contents/MacOS/mlx.metallib"
+      echo "provisioned mlx.metallib in $test_bundle/Contents/MacOS"
+    - |
       log_path="token-saver-mlx-live.log"
       set +e
-      swift test --filter 'DistillLiveModelTests|DistillLivePerfTests|MLXHotPathSafetyTests' >"$log_path" 2>&1
+      swift test --skip-build --filter 'DistillLiveModelTests|DistillLivePerfTests|MLXHotPathSafetyTests' >"$log_path" 2>&1
       test_status=$?
       set -e
       if [ "$test_status" -ne 0 ]; then
