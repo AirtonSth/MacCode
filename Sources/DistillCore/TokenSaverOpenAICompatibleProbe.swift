@@ -28,7 +28,10 @@ public enum TokenSaverOpenAICompatibleProbe {
             return .failed("Enter a URL like http://127.0.0.1:8000/v1")
         }
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let modelID = trimmedModel.isEmpty ? TokenSaverApprovedModels.distill17B.id : trimmedModel
+        guard !trimmedModel.isEmpty else {
+            return .failed("Enter the API model id used by your OpenAI-compatible server")
+        }
+        let modelID = trimmedModel
         let host = url.host ?? url.absoluteString
         let reply: String?
         if let complete {
@@ -50,7 +53,7 @@ public enum TokenSaverOpenAICompatibleProbe {
             )
         }
         guard let text = reply?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
-            return .failed("Could not reach \(host). Start the local server and check the URL, model id, and token.")
+            return .failed("Could not reach \(host). Check the API endpoint, URL, model id, and token.")
         }
         return .ok(model: modelID, host: host, preview: String(text.prefix(80)))
     }

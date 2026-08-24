@@ -9,6 +9,23 @@ import SocketServer
 
 @MainActor
 final class TokenSaverAppContextTests: XCTestCase {
+    private actor ActivationGate {
+        private var started = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        func suspend() async {
+            started = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func hasStarted() -> Bool { started }
+
+        func resume() {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
     private final class LockedEventCount: @unchecked Sendable {
         private let lock = NSLock()
         private var count = 0
@@ -766,6 +783,139 @@ final class TokenSaverAppContextTests: XCTestCase {
             )),
             .start
         )
+
+        XCTAssertEqual(
+            TokenSaverDistillLaunchPlanner.decide(TokenSaverDistillLaunchInput(
+                hasPrivateAccount: true,
+                isSubscribed: true,
+                tokenSaverEnabled: true,
+                modelValidation: .installed,
+                externalGenerateError: "Enter a valid OpenAI-compatible API URL"
+            )),
+            .skip(reason: "Enter a valid OpenAI-compatible API URL")
+        )
+    }
+
+    // WHY: API-only mode must never touch local manifests, hashes, or model
+    // activation. The lazy seam proves the local validation closure is skipped,
+    // while local mode preserves the existing validation requirement.
+    func test_tokenSaverModelValidationRunsOnlyForLocalTarget() {
+        var apiSettings = AppSettings()
+        apiSettings.tokenSaverModelSource = .openaiCompat
+        apiSettings.tokenSaverAPIBaseURL = "http://127.0.0.1:18080/v1"
+        apiSettings.tokenSaverAPIModel = "fixture-api-model"
+        var apiValidationCalls = 0
+
+        let apiValidation = AppContext.tokenSaverModelValidation(
+            settings: apiSettings,
+            localValidation: {
+                apiValidationCalls += 1
+                return TokenSaverModelValidation(state: .missing, reason: "must not run")
+            }
+        )
+
+        var invalidAPISettings = apiSettings
+        invalidAPISettings.tokenSaverAPIBaseURL = "not a url"
+        var invalidAPIValidationCalls = 0
+        let invalidAPIValidation = AppContext.tokenSaverModelValidation(
+            settings: invalidAPISettings,
+            localValidation: {
+                invalidAPIValidationCalls += 1
+                return TokenSaverModelValidation(state: .missing, reason: "must not run")
+            }
+        )
+
+        var localSettings = AppSettings()
+        localSettings.tokenSaverModelSource = .distill17b
+        var localValidationCalls = 0
+        let localValidation = AppContext.tokenSaverModelValidation(
+            settings: localSettings,
+            localValidation: {
+                localValidationCalls += 1
+                return TokenSaverModelValidation(state: .missing, reason: "fixture local missing")
+            }
+        )
+
+        XCTAssertFalse(AppContext.tokenSaverUsesLocalModel(settings: apiSettings))
+        XCTAssertFalse(AppContext.tokenSaverUsesLocalModel(settings: invalidAPISettings))
+        XCTAssertTrue(AppContext.tokenSaverUsesLocalModel(settings: localSettings))
+        XCTAssertEqual(apiValidation, .installed)
+        XCTAssertEqual(apiValidationCalls, 0)
+        XCTAssertEqual(invalidAPIValidation, .installed)
+        XCTAssertEqual(invalidAPIValidationCalls, 0)
+        XCTAssertEqual(localValidation.state, .missing)
+        XCTAssertEqual(localValidationCalls, 1)
+    }
+
+    func test_preferredModelActivationCancelledAfterSwitchToAPIPerformsNoLateEffects() async throws {
+        // WHY: a local activation download may outlive a Settings target change.
+        // Once API is authoritative, its continuation must not validate or
+        // restart a local sidecar after the suspended download returns.
+        let appSupport = NSTemporaryDirectory() + "RC2PreferredActivationCancel-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        savePrivateSession(in: context)
+        var localSettings = SettingsStore(db: context.db).load()
+        localSettings.tokenSaverEnabled = true
+        localSettings.tokenSaverModelSource = .distill17b
+        SettingsStore(db: context.db).save(localSettings)
+
+        let gate = ActivationGate()
+        var validationCalls = 0
+        var restartCalls = 0
+        context.tokenSaverPreferredModelActivationEligibilityOverrideForTesting = true
+        context.tokenSaverPreferredModelActivationDownloadForTesting = { await gate.suspend() }
+        context.beforeTokenSaverPreferredModelValidationForTesting = { validationCalls += 1 }
+        context.beforeTokenSaverPreferredModelRestartForTesting = { restartCalls += 1 }
+
+        context.activatePreferredTokenSaverModelIfDownloaded(
+            settings: localSettings,
+            session: PrivateAccountSessionStore(repo: context.settingsRepo).load()
+        )
+        while await !gate.hasStarted() { await Task.yield() }
+
+        var apiSettings = localSettings
+        apiSettings.tokenSaverModelSource = .openaiCompat
+        apiSettings.tokenSaverAPIBaseURL = "http://127.0.0.1:18080/v1"
+        apiSettings.tokenSaverAPIModel = "fixture-api-model"
+        SettingsStore(db: context.db).save(apiSettings)
+        context.activatePreferredTokenSaverModelIfDownloaded(
+            settings: apiSettings,
+            session: PrivateAccountSessionStore(repo: context.settingsRepo).load()
+        )
+        await gate.resume()
+        let finished = await waitUntil { !context.tokenSaverPreferredModelActivationInFlightForTesting }
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(validationCalls, 0)
+        XCTAssertEqual(restartCalls, 0)
+    }
+
+    func test_preferredModelActivationLocalCompletionPreservesValidationAndRestart() async throws {
+        // WHY: cancellation hardening must not suppress the normal local path.
+        let appSupport = NSTemporaryDirectory() + "RC2PreferredActivationLocal-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        savePrivateSession(in: context)
+        var localSettings = SettingsStore(db: context.db).load()
+        localSettings.tokenSaverEnabled = true
+        localSettings.tokenSaverModelSource = .distill17b
+        SettingsStore(db: context.db).save(localSettings)
+
+        var validationCalls = 0
+        var restartCalls = 0
+        context.tokenSaverPreferredModelActivationEligibilityOverrideForTesting = true
+        context.tokenSaverPreferredModelActivationDownloadForTesting = {}
+        context.beforeTokenSaverPreferredModelValidationForTesting = { validationCalls += 1 }
+        context.beforeTokenSaverPreferredModelRestartForTesting = { restartCalls += 1 }
+
+        context.activatePreferredTokenSaverModelIfDownloaded(
+            settings: localSettings,
+            session: PrivateAccountSessionStore(repo: context.settingsRepo).load()
+        )
+        let finished = await waitUntil { !context.tokenSaverPreferredModelActivationInFlightForTesting }
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(validationCalls, 1)
+        XCTAssertEqual(restartCalls, 1)
     }
 
     func test_tokenSaverDistillServiceDoesNotAutoResolveExecutableInsideUnitTests() {

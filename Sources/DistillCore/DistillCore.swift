@@ -687,6 +687,7 @@ public enum TokenSaverEngineLabel {
         case .deterministic: return "\(base) (deterministic)"
         case .encoderBERT: return "\(base) (bert)"
         case .llmMLX: return "\(base) (model)"
+        case .apiExternal: return "\(base) (api)"
         case .verbatim: return base
         }
     }
@@ -807,7 +808,10 @@ public actor DistillScheduler {
         let started = Date()
         let staged = try await runtime.distillStaged(request)
         let elapsedMs = Int(Date().timeIntervalSince(started) * 1_000)
-        let output = String(staged.output.prefix(request.maxOutputCharacters))
+        let isVerbatimOutput = staged.output == request.input
+        let output = isVerbatimOutput
+            ? staged.output
+            : String(staged.output.prefix(request.maxOutputCharacters))
         guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DistillError.invalidOutput
         }
@@ -818,7 +822,12 @@ public actor DistillScheduler {
                 wallClockMilliseconds: elapsedMs
             ))
         }
-        storeCachedOutput(output, stage: staged.stage, for: cacheKey)
+        storeCachedOutput(
+            output,
+            stage: staged.stage,
+            isVerbatimOutput: isVerbatimOutput,
+            for: cacheKey
+        )
         return response(for: request, output: output, stage: staged.stage)
     }
 
@@ -880,8 +889,15 @@ public actor DistillScheduler {
         return entry
     }
 
-    private func storeCachedOutput(_ output: String, stage: TokenSaverRouteStage?, for key: DistillResultCacheKey) {
+    private func storeCachedOutput(
+        _ output: String,
+        stage: TokenSaverRouteStage?,
+        isVerbatimOutput: Bool,
+        for key: DistillResultCacheKey
+    ) {
         guard resultCacheCapacity > 0,
+              !isVerbatimOutput,
+              stage != .verbatim,
               !RetrieveHandleSanitizer.containsHandle(output) else {
             return
         }

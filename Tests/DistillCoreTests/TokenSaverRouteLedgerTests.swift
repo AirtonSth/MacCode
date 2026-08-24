@@ -29,4 +29,15 @@ final class TokenSaverRouteLedgerTests: XCTestCase {
         XCTAssertEqual(ledger.resolvedWithoutLLMRate, 0)
         XCTAssertEqual(ledger.averageLatencyMillis(stage: .encoderBERT), 0)
     }
+
+    func test_externalAPIHasDistinctLedgerStageAndCountsAsGenerative() {
+        var ledger = TokenSaverRouteLedger()
+        ledger.record(.init(lane: .naturalLanguage, stage: .apiExternal, wallClockMilliseconds: 125))
+
+        XCTAssertEqual(ledger.total, 1)
+        XCTAssertEqual(ledger.resolvedWithoutLLM, 0)
+        XCTAssertEqual(ledger.resolvedWithoutLLMRate, 0)
+        XCTAssertEqual(ledger.averageLatencyMillis(stage: .apiExternal), 125)
+        XCTAssertEqual(ledger.averageLatencyMillis(stage: .llmMLX), 0)
+    }
 }

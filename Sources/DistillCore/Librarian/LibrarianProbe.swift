@@ -80,7 +80,7 @@ public enum LibrarianProbe {
             return "desabilitado"
         }
         if fn?.usesLLM == true, fn?.mcp != "none" {
-            let generated = result.analytics.record?.routeStage == .llmMLX
+            let generated = result.analytics.record?.routeStage?.usesGenerativeModel == true
             return (result.status == .ok && generated) ? "implementado" : "pendente"
         }
         if result.status == .ok || result.status == .unavailable {

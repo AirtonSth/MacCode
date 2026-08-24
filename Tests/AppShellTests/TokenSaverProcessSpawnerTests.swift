@@ -12,7 +12,10 @@
 import Foundation
 import XCTest
 @testable import AppShell
+import AgentRuntime
+import CoreModel
 import DistillCore
+import Persistence
 
 // MARK: - Helpers
 
@@ -45,9 +48,251 @@ private struct ShellSpawner: DistillProcessSpawning {
     }
 }
 
+/// Captures the exact helper argv and then fails before a real sidecar starts.
+/// This keeps the test at the controller's production spawn boundary without
+/// touching a developer's running service.
+private final class RecordingThrowingSpawner: DistillProcessSpawning, @unchecked Sendable {
+    struct LaunchError: Error {}
+
+    private let lock = NSLock()
+    private var recordedArguments: [String]?
+    private var recordedStandardInput: Data?
+
+    var arguments: [String]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedArguments
+    }
+
+    var standardInput: Data? {
+        lock.withLock { recordedStandardInput }
+    }
+
+    func spawn(executableURL: URL, arguments: [String]) throws -> DistillSpawnResult {
+        lock.lock()
+        recordedArguments = arguments
+        lock.unlock()
+        throw LaunchError()
+    }
+
+    func spawn(
+        executableURL: URL,
+        arguments: [String],
+        standardInput: Data?
+    ) throws -> DistillSpawnResult {
+        lock.withLock {
+            recordedArguments = arguments
+            recordedStandardInput = standardInput
+        }
+        throw LaunchError()
+    }
+}
+
 // MARK: - Tests
 
 final class TokenSaverProcessSpawnerTests: XCTestCase {
+
+    private func paidSession() -> PrivateAccountSession {
+        PrivateAccountSession(
+            accessToken: "access-token",
+            refreshToken: "refresh-token",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        )
+    }
+
+    @MainActor
+    private func waitForArguments(from spawner: RecordingThrowingSpawner) async -> [String]? {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if let arguments = spawner.arguments { return arguments }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return spawner.arguments
+    }
+
+    private func value(after option: String, in arguments: [String]) -> String? {
+        guard let index = arguments.firstIndex(of: option), arguments.indices.contains(index + 1) else {
+            return nil
+        }
+        return arguments[index + 1]
+    }
+
+    // WHY: selecting an API must make it the sole inference target. Passing
+    // local runtime/model flags beside API flags preserves the contradictory
+    // E4B identity and allows future local validation or warmup to leak back in.
+    @MainActor
+    func testControllerAPISelectionOmitsLocalModelArguments() async throws {
+        let spawner = RecordingThrowingSpawner()
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory()),
+            executableURLResolver: { URL(fileURLWithPath: "/bin/false") },
+            processSpawner: spawner,
+            terminateForeignServers: { _ in
+                ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+            }
+        )
+        let settings = AppSettings(
+            tokenSaverEnabled: true,
+            tokenSaverModelSource: .openaiCompat,
+            tokenSaverAPIBaseURL: "http://127.0.0.1:18080/v1",
+            tokenSaverAPIModel: "fixture-api-model",
+            tokenSaverAPIToken: "dummy-api-token"
+        )
+
+        controller.startIfEligible(
+            session: paidSession(),
+            settings: settings,
+            modelValidation: TokenSaverModelValidation(
+                state: .missing,
+                reason: "local model intentionally absent"
+            )
+        )
+        let capturedArguments = await waitForArguments(from: spawner)
+        let arguments = try XCTUnwrap(capturedArguments)
+        defer { controller.stop() }
+
+        XCTAssertEqual(value(after: "--generate-base-url", in: arguments), "http://127.0.0.1:18080/v1")
+        XCTAssertEqual(value(after: "--generate-model", in: arguments), "fixture-api-model")
+        XCTAssertFalse(arguments.contains("dummy-api-token"), "bearer token must never be exposed in child argv")
+        XCTAssertFalse(arguments.contains("--generate-token"))
+        XCTAssertEqual(value(after: "--generate-token-stdin", in: arguments), "true")
+        XCTAssertEqual(spawner.standardInput, Data("dummy-api-token".utf8))
+        XCTAssertFalse(arguments.contains("--runtime"), "API mode must not launch with an MLX runtime identity")
+        XCTAssertFalse(arguments.contains("--model-id"), "API mode must not launch with an E4B/local model id")
+        XCTAssertFalse(arguments.contains("--model-url"), "API mode must not launch with a local model URL")
+    }
+
+    // WHY: blank API configuration must block at the shared target owner and
+    // never start a helper that could publish false readiness.
+    @MainActor
+    func testControllerBlankAPIModelBlocksWithoutSpawn() async throws {
+        let spawner = RecordingThrowingSpawner()
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory()),
+            executableURLResolver: { URL(fileURLWithPath: "/bin/false") },
+            processSpawner: spawner,
+            terminateForeignServers: { _ in
+                ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+            }
+        )
+        let settings = AppSettings(
+            tokenSaverEnabled: true,
+            tokenSaverModelSource: .openaiCompat,
+            tokenSaverAPIBaseURL: "http://127.0.0.1:18080/v1",
+            tokenSaverAPIModel: "   "
+        )
+
+        controller.startIfEligible(
+            session: paidSession(),
+            settings: settings,
+            modelValidation: TokenSaverModelValidation(state: .missing, reason: nil)
+        )
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertNil(spawner.arguments)
+        XCTAssertEqual(
+            controller.status,
+            .blocked("Enter the API model id used by your OpenAI-compatible server")
+        )
+    }
+
+    // WHY: invalid API configuration must block before any process launch. It
+    // must never fall through to the approved local model branch.
+    @MainActor
+    func testControllerInvalidAPIURLDoesNotSpawnOrFallbackLocal() async {
+        let spawner = RecordingThrowingSpawner()
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory()),
+            executableURLResolver: { URL(fileURLWithPath: "/bin/false") },
+            processSpawner: spawner,
+            terminateForeignServers: { _ in
+                ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+            }
+        )
+        let settings = AppSettings(
+            tokenSaverEnabled: true,
+            tokenSaverModelSource: .openaiCompat,
+            tokenSaverAPIBaseURL: "not a url",
+            tokenSaverAPIModel: "fixture-api-model"
+        )
+
+        controller.startIfEligible(
+            session: paidSession(),
+            settings: settings,
+            modelValidation: .installed
+        )
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertNil(spawner.arguments)
+        XCTAssertEqual(controller.status, .blocked("Enter a valid OpenAI-compatible API URL"))
+    }
+
+    @MainActor
+    func testControllerEmbeddedAPICredentialsBlockWithoutSpawn() async {
+        let spawner = RecordingThrowingSpawner()
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory()),
+            executableURLResolver: { URL(fileURLWithPath: "/bin/false") },
+            processSpawner: spawner,
+            terminateForeignServers: { _ in
+                ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+            }
+        )
+        let settings = AppSettings(
+            tokenSaverEnabled: true,
+            tokenSaverModelSource: .openaiCompat,
+            tokenSaverAPIBaseURL: "https://user:password@api.example.com/v1",
+            tokenSaverAPIModel: "fixture-api-model"
+        )
+
+        controller.startIfEligible(
+            session: paidSession(),
+            settings: settings,
+            modelValidation: .installed
+        )
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertNil(spawner.arguments)
+        XCTAssertEqual(controller.status, .blocked("Enter a valid OpenAI-compatible API URL"))
+    }
+
+    // WHY: API exclusivity must not weaken the existing local branch. Local
+    // selection still needs the approved MLX identity and no API override.
+    @MainActor
+    func testControllerLocalSelectionKeepsApprovedModelArguments() async throws {
+        let spawner = RecordingThrowingSpawner()
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory()),
+            executableURLResolver: { URL(fileURLWithPath: "/bin/false") },
+            processSpawner: spawner,
+            terminateForeignServers: { _ in
+                ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+            }
+        )
+        let settings = AppSettings(tokenSaverEnabled: true, tokenSaverModelSource: .distill17b)
+
+        controller.startIfEligible(
+            session: paidSession(),
+            settings: settings,
+            modelValidation: .installed
+        )
+        let capturedArguments = await waitForArguments(from: spawner)
+        let arguments = try XCTUnwrap(capturedArguments)
+        defer { controller.stop() }
+        let model = TokenSaverApprovedModels.distill17B
+
+        XCTAssertEqual(value(after: "--runtime", in: arguments), model.runtime)
+        XCTAssertEqual(value(after: "--model-id", in: arguments), model.id)
+        XCTAssertEqual(value(after: "--model-url", in: arguments), model.url)
+        XCTAssertFalse(arguments.contains("--generate-base-url"))
+        XCTAssertFalse(arguments.contains("--generate-model"))
+        XCTAssertFalse(arguments.contains("--generate-token"))
+    }
 
     // MARK: - RealDistillProcessSpawner contract
 
@@ -78,6 +323,23 @@ final class TokenSaverProcessSpawnerTests: XCTestCase {
             "stdout and stderr handles must be distinct objects"
         )
         result.process.waitUntilExit()
+    }
+
+    func testLegacySpawnerFailsClosedInsteadOfDroppingAPIStandardInput() {
+        let spawner = ShellSpawner(command: "exit 0")
+
+        XCTAssertThrowsError(
+            try spawner.spawn(
+                executableURL: URL(fileURLWithPath: "/bin/sh"),
+                arguments: [],
+                standardInput: Data("must-not-be-dropped".utf8)
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? DistillProcessSpawningError,
+                .standardInputUnsupported
+            )
+        }
     }
 
     // WHY: crash scenario (process exits immediately): the spawner must still run()

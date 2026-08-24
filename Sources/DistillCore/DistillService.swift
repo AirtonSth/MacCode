@@ -341,20 +341,21 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         guard !appSupportDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DistillServiceError.missingRequiredOption("--app-support-dir")
         }
-        guard runtime == DistillApprovedModel.runtime else {
-            throw DistillServiceError.unsupportedRuntime(runtime)
-        }
-        guard DistillApprovedModel.isApproved(modelID: modelID, modelURL: modelURL, runtime: runtime) else {
-            throw DistillServiceError.unsupportedModel(modelID: modelID, modelURL: modelURL)
-        }
-
         let trimmedGenerateBaseURL = generateBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedGenerateModel = generateModel.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedGenerateBaseURL.isEmpty {
-            guard let url = URL(string: trimmedGenerateBaseURL),
-                  let scheme = url.scheme?.lowercased(),
-                  (scheme == "http" || scheme == "https"),
-                  url.host != nil else {
+            guard TokenSaverGenerateTarget.parseAPIBaseURL(trimmedGenerateBaseURL) != nil else {
                 throw DistillServiceError.invalidGenerateBaseURL(trimmedGenerateBaseURL)
+            }
+            guard !trimmedGenerateModel.isEmpty else {
+                throw DistillServiceError.missingRequiredOption("--generate-model")
+            }
+        } else {
+            guard runtime == DistillApprovedModel.runtime else {
+                throw DistillServiceError.unsupportedRuntime(runtime)
+            }
+            guard DistillApprovedModel.isApproved(modelID: modelID, modelURL: modelURL, runtime: runtime) else {
+                throw DistillServiceError.unsupportedModel(modelID: modelID, modelURL: modelURL)
             }
         }
 
@@ -371,7 +372,7 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         self.idleTimeoutMS = max(1_000, idleTimeoutMS)
         self.mlxCallDeadlineMS = max(1_000, mlxCallDeadlineMS)
         self.generateBaseURL = trimmedGenerateBaseURL
-        self.generateModel = generateModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.generateModel = trimmedGenerateModel
         self.generateToken = generateToken.trimmingCharacters(in: .whitespacesAndNewlines)
         self.saveTrainingPrompts = saveTrainingPrompts
     }
@@ -380,11 +381,38 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         guard !generateBaseURL.isEmpty, let url = URL(string: generateBaseURL) else {
             return .localMLX
         }
-        let selectedModel = generateModel.isEmpty ? modelID : generateModel
-        return .openAICompatible(baseURL: url, model: selectedModel, token: generateToken)
+        return .openAICompatible(baseURL: url, model: generateModel, token: generateToken)
     }
 
-    public static func parse(arguments: [String]) throws -> DistillServiceConfiguration {
+    public var effectiveRuntime: String {
+        switch generateTarget {
+        case .localMLX:
+            return runtime
+        case .openAICompatible:
+            return "openai-compatible"
+        }
+    }
+
+    public var effectiveModelID: String {
+        switch generateTarget {
+        case .localMLX:
+            return modelID
+        case .openAICompatible(_, let model, _):
+            return model
+        }
+    }
+
+    /// The BERT encoder lane is a local MLX optimization. An explicitly selected
+    /// API must not construct or warm it in the sidecar process.
+    public var usesLocalEncoderLane: Bool {
+        if case .localMLX = generateTarget { return true }
+        return false
+    }
+
+    public static func parse(
+        arguments: [String],
+        generateTokenFromStandardInput: String? = nil
+    ) throws -> DistillServiceConfiguration {
         var values: [String: String] = [:]
         var index = 0
         while index < arguments.count {
@@ -427,7 +455,10 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
             mlxCallDeadlineMS: try intValue("mlx-call-deadline-ms", default: 20_000),
             generateBaseURL: values["generate-base-url"] ?? "",
             generateModel: values["generate-model"] ?? "",
-            generateToken: values["generate-token"] ?? "",
+            // API credentials are accepted only through the controller-owned
+            // stdin pipe. Never recover them from argv, where other local
+            // processes can inspect them.
+            generateToken: generateTokenFromStandardInput ?? "",
             saveTrainingPrompts: ["1", "true", "yes"].contains((values["save-training-prompts"] ?? "").lowercased())
         )
     }
@@ -891,8 +922,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
             port: port,
             pid: ProcessInfo.processInfo.processIdentifier,
             protocolVersion: 1,
-            runtime: configuration.runtime,
-            modelID: configuration.modelID,
+            runtime: configuration.effectiveRuntime,
+            modelID: configuration.effectiveModelID,
             maxConcurrentRequests: configuration.maxConcurrentRequests,
             maxQueueDepth: configuration.maxQueueDepth
         )

@@ -29,7 +29,7 @@ public final class TokenSaverTrainingDatasetWriter: @unchecked Sendable {
         modelID: String,
         source: String
     ) {
-        guard stage == .llmMLX else { return }
+        guard stage?.usesGenerativeModel == true else { return }
         let assistant = datasetAssistant(output)
         let failOpen = output == request.input || assistant == nil
         if failOpen {

@@ -447,6 +447,7 @@ public final class SidebarViewModel: ObservableObject {
     private var tokenSaverLocalUsageBaseline: [AgentProvider: Int]?
     private var sidecarStatusObserver: NSObjectProtocol?
     private var tokenSaverToggleObserver: NSObjectProtocol?
+    private var tokenSaverConfigurationObserver: NSObjectProtocol?
     private let updateChecker: AppUpdateChecking?
     private let settingsStore: SettingsStore
     private let insomniaPower: InsomniaPowerManaging
@@ -459,6 +460,10 @@ public final class SidebarViewModel: ObservableObject {
     private var lastPowerState: ExternalPowerState
     private var showingInsomniaBatteryPrompt = false
     private var tokenSaverModelDownloadTask: Task<TokenSaverModelManifest, Error>?
+    private var tokenSaverModelDownloadTaskID: UUID?
+    var tokenSaverModelDownloadInFlightForTesting: Bool {
+        tokenSaverModelDownloadTask != nil
+    }
     // Aggregate download progress across all files. Reset at the start of each download.
     @Published public private(set) var tokenSaverAggregatedDownloadedBytes: Int64 = 0
     @Published public private(set) var tokenSaverAggregatedTotalBytes: Int64 = 0
@@ -538,6 +543,16 @@ public final class SidebarViewModel: ObservableObject {
             guard let viewModel = self else { return }
             Task { @MainActor in viewModel.setTokenSaverEnabled(!viewModel.tokenSaverEnabled) }
         }
+        self.tokenSaverConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .rc2TokenSaverConfigurationChanged,
+            object: context,
+            queue: nil
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let viewModel = self else { return }
+                viewModel.cancelTokenSaverModelDownload()
+            }
+        }
         self.updateChecker?.onAvailabilityChanged = { [weak self] availability in
             self?.updateAvailability = availability
         }
@@ -571,6 +586,9 @@ public final class SidebarViewModel: ObservableObject {
         }
         if let tokenSaverToggleObserver {
             NotificationCenter.default.removeObserver(tokenSaverToggleObserver)
+        }
+        if let tokenSaverConfigurationObserver {
+            NotificationCenter.default.removeObserver(tokenSaverConfigurationObserver)
         }
         tokenSaverModelDownloadTask?.cancel()
         powerMonitor.stop()
@@ -1197,7 +1215,9 @@ public final class SidebarViewModel: ObservableObject {
             if let provider = tokenSaverDisableConfirmProvider {
                 confirmed = provider()
             } else {
-                confirmed = Self.defaultTokenSaverDisableConfirm()
+                confirmed = Self.defaultTokenSaverDisableConfirm(
+                    source: settingsStore.load().tokenSaverModelSource
+                )
             }
             guard confirmed else { return }
             tokenSaverEnabled = false
@@ -1215,6 +1235,17 @@ public final class SidebarViewModel: ObservableObject {
             return
         }
         guard privateAccountUser?.subscribed == true else { return }
+        let settings = settingsStore.load()
+        guard AppContext.tokenSaverUsesLocalModel(settings: settings) else {
+            tokenSaverEnabled = true
+            settingsStore.update {
+                $0.tokenSaverEnabled = true
+            }
+            graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
+            refreshTokenSaverDistillService(modelValidation: .installed)
+            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+            return
+        }
         let selectedValidation = validateTokenSaverModel(requireSelectedModel: true)
         if selectedValidation.state == .installed {
             tokenSaverEnabled = true
@@ -1268,8 +1299,7 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func cancelTokenSaverModelDownload() {
-        tokenSaverModelDownloadTask?.cancel()
-        tokenSaverModelDownloadTask = nil
+        cancelTokenSaverModelDownloadTask()
         tokenSaverModelDownloadState = TokenSaverModelDownloadState(
             phase: .paused,
             downloadedBytes: tokenSaverModelDownloadState.downloadedBytes,
@@ -1415,7 +1445,10 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     private func beginTokenSaverModelDownload(reason: String?) {
-        tokenSaverModelDownloadTask?.cancel()
+        cancelTokenSaverModelDownloadTask()
+        let enabledAtStart = settingsStore.load().tokenSaverEnabled
+        let taskID = UUID()
+        tokenSaverModelDownloadTaskID = taskID
         tokenSaverModelDownloadState = .required(reason: reason)
         showsTokenSaverModelDownload = true
         // Reset aggregate counters for this download session.
@@ -1429,9 +1462,16 @@ public final class SidebarViewModel: ObservableObject {
 
         let task = Task { @MainActor [weak self] in
             guard let self else { throw CancellationError() }
+            defer {
+                if self.tokenSaverModelDownloadTaskID == taskID {
+                    self.tokenSaverModelDownloadTask = nil
+                    self.tokenSaverModelDownloadTaskID = nil
+                }
+            }
             do {
                 let manifest = try await self.downloadTokenSaverModel { [weak self] state in
-                    guard let self else { return }
+                    guard let self,
+                          self.tokenSaverModelDownloadTaskID == taskID else { return }
                     // Detect per-file resets: if bytes went backward, a file finished.
                     if state.downloadedBytes < self._aggregateLastFileBytes {
                         self._aggregateCompletedBytes += self._aggregateLastFileBytes
@@ -1453,20 +1493,54 @@ public final class SidebarViewModel: ObservableObject {
                     self.tokenSaverAggregatedTotalBytes = aggregateTotal
                     self.tokenSaverModelDownloadState = state
                 }
+                guard self.tokenSaverModelDownloadTaskID == taskID else {
+                    throw CancellationError()
+                }
+                try Task.checkCancellation()
+                let settingsAfterDownload = self.settingsStore.load()
+                guard settingsAfterDownload.tokenSaverEnabled == enabledAtStart,
+                      AppContext.tokenSaverUsesLocalModel(settings: settingsAfterDownload) else {
+                    throw CancellationError()
+                }
                 let validation = self.validateTokenSaverModel()
                 guard validation.state == .installed else {
                     throw TokenSaverModelDownloadError.validationFailed(validation.reason)
                 }
+                try Task.checkCancellation()
+                let settingsAfterValidation = self.settingsStore.load()
+                guard settingsAfterValidation.tokenSaverEnabled == enabledAtStart,
+                      AppContext.tokenSaverUsesLocalModel(settings: settingsAfterValidation) else {
+                    throw CancellationError()
+                }
+                guard self.tokenSaverModelDownloadTaskID == taskID else {
+                    throw CancellationError()
+                }
                 self.tokenSaverModelDownloadState = .ready
+                guard self.tokenSaverModelDownloadTaskID == taskID else {
+                    throw CancellationError()
+                }
                 self.showsTokenSaverModelDownload = false
+                guard self.tokenSaverModelDownloadTaskID == taskID else {
+                    throw CancellationError()
+                }
                 self.invalidateInstalledTokenSaverModelBytes()
+                guard self.tokenSaverModelDownloadTaskID == taskID else {
+                    throw CancellationError()
+                }
                 self.tokenSaverEnabled = true
-                self.settingsStore.update {
-                    $0.tokenSaverEnabled = true
+                guard self.tokenSaverModelDownloadTaskID == taskID else {
+                    throw CancellationError()
+                }
+                self.settingsStore.update { $0.tokenSaverEnabled = true }
+                guard self.tokenSaverModelDownloadTaskID == taskID else {
+                    throw CancellationError()
                 }
                 self.refreshTokenSaverDistillService(modelValidation: validation)
                 return manifest
             } catch is CancellationError {
+                guard self.tokenSaverModelDownloadTaskID == taskID else {
+                    throw CancellationError()
+                }
                 self.tokenSaverModelDownloadState = TokenSaverModelDownloadState(
                     phase: .paused,
                     downloadedBytes: self.tokenSaverModelDownloadState.downloadedBytes,
@@ -1475,6 +1549,9 @@ public final class SidebarViewModel: ObservableObject {
                 )
                 throw CancellationError()
             } catch {
+                guard self.tokenSaverModelDownloadTaskID == taskID else {
+                    throw error
+                }
                 let headline = Self.downloadErrorMessage(error)
                 let detail = String(describing: error)
                 let message = detail == headline ? headline : "\(headline)\n\(detail)"
@@ -1490,6 +1567,11 @@ public final class SidebarViewModel: ObservableObject {
             }
         }
         tokenSaverModelDownloadTask = task
+    }
+
+    private func cancelTokenSaverModelDownloadTask() {
+        guard let tokenSaverModelDownloadTask else { return }
+        tokenSaverModelDownloadTask.cancel()
     }
 
     private func downloadTokenSaverModel(
@@ -1577,11 +1659,19 @@ public final class SidebarViewModel: ObservableObject {
 
     /// Blocking NSAlert shown before Token Saver is disabled. Disabling stops
     /// the sidecar process and uninstalls the managed distill skill.
-    public static func defaultTokenSaverDisableConfirm() -> Bool {
+    nonisolated public static func tokenSaverDisableInformativeText(
+        source: TokenSaverModelSource
+    ) -> String {
+        source == .openaiCompat
+            ? "Disabling Token Saver stops API-backed compression and uninstalls the compression skill. You can re-enable it at any time."
+            : "Disabling Token Saver stops the local model and uninstalls the compression skill. You can re-enable it at any time."
+    }
+
+    public static func defaultTokenSaverDisableConfirm(source: TokenSaverModelSource) -> Bool {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Disable Token Saver?"
-        alert.informativeText = "Disabling Token Saver stops the local model and uninstalls the compression skill. You can re-enable it at any time."
+        alert.informativeText = tokenSaverDisableInformativeText(source: source)
         alert.addButton(withTitle: "Disable")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn

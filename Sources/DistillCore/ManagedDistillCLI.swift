@@ -854,6 +854,7 @@ public struct ManagedDistillCLI: Sendable {
     }
 
     private static func aggregateRouteStage(_ stages: [TokenSaverRouteStage]) -> TokenSaverRouteStage? {
+        if stages.contains(.apiExternal) { return .apiExternal }
         if stages.contains(.llmMLX) { return .llmMLX }
         if stages.contains(.encoderBERT) { return .encoderBERT }
         if stages.contains(.deterministic) { return .deterministic }

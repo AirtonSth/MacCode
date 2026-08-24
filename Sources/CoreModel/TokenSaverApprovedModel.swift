@@ -90,6 +90,17 @@ public enum TokenSaverModelSource: String, Codable, Sendable, Equatable, CaseIte
 public enum TokenSaverGenerateTarget: Sendable, Equatable {
     case local(TokenSaverApprovedModel)
     case openaiCompatible(baseURL: URL, model: String, token: String)
+    case invalidOpenAICompatible(reason: String)
+
+    public var usesExternalGenerate: Bool {
+        if case .openaiCompatible = self { return true }
+        return false
+    }
+
+    public var configurationError: String? {
+        if case let .invalidOpenAICompatible(reason) = self { return reason }
+        return nil
+    }
 
     public static func resolve(
         source: TokenSaverModelSource,
@@ -98,12 +109,19 @@ public enum TokenSaverGenerateTarget: Sendable, Equatable {
         apiToken: String,
         totalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory
     ) -> TokenSaverGenerateTarget {
-        if source == .openaiCompat,
-           let url = Self.parseAPIBaseURL(apiBaseURL) {
+        if source == .openaiCompat {
+            guard let url = Self.parseAPIBaseURL(apiBaseURL) else {
+                return .invalidOpenAICompatible(reason: "Enter a valid OpenAI-compatible API URL")
+            }
             let model = apiModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !model.isEmpty else {
+                return .invalidOpenAICompatible(
+                    reason: "Enter the API model id used by your OpenAI-compatible server"
+                )
+            }
             return .openaiCompatible(
                 baseURL: url,
-                model: model.isEmpty ? TokenSaverApprovedModels.distill17B.id : model,
+                model: model,
                 token: apiToken.trimmingCharacters(in: .whitespacesAndNewlines)
             )
         }
@@ -116,8 +134,18 @@ public enum TokenSaverGenerateTarget: Sendable, Equatable {
               let url = URL(string: trimmed),
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
-              url.host != nil else {
+              let host = url.host,
+              url.user == nil,
+              url.password == nil else {
             return nil
+        }
+        if scheme == "http" {
+            let normalizedHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+            guard normalizedHost == "localhost"
+                    || normalizedHost == "127.0.0.1"
+                    || normalizedHost == "::1" else {
+                return nil
+            }
         }
         return url
     }

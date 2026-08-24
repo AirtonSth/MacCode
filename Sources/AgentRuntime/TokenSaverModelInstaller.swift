@@ -316,6 +316,47 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
     }
 
     public func validateInstalledModel(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
+        do {
+            return try validateInstalledModelCooperatively(
+                requireSelectedModel: requireSelectedModel,
+                cancellationCheck: {}
+            )
+        } catch {
+            return TokenSaverModelValidation(state: .incomplete, reason: "manifest has no files")
+        }
+    }
+
+    public func validateInstalledTokenSaverModels(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
+        let llmValidation = validateInstalledModel(requireSelectedModel: requireSelectedModel)
+        guard llmValidation.state == .installed else { return llmValidation }
+        return validateInstalledEncoderModels()
+    }
+
+    public func validateInstalledTokenSaverModelsCooperatively(
+        requireSelectedModel: Bool = false,
+        cancellationCheck: () throws -> Void
+    ) throws -> TokenSaverModelValidation {
+        let llmValidation = try validateInstalledModelCooperatively(
+            requireSelectedModel: requireSelectedModel,
+            cancellationCheck: cancellationCheck
+        )
+        guard llmValidation.state == .installed else { return llmValidation }
+        return try validateInstalledEncoderModelsCooperatively(cancellationCheck: cancellationCheck)
+    }
+
+    public func validateInstalledEncoderModels() -> TokenSaverModelValidation {
+        do {
+            return try validateInstalledEncoderModelsCooperatively(cancellationCheck: {})
+        } catch {
+            return TokenSaverModelValidation(state: .incomplete, reason: "encoder validation failed")
+        }
+    }
+
+    public func validateInstalledModelCooperatively(
+        requireSelectedModel: Bool,
+        cancellationCheck: () throws -> Void
+    ) throws -> TokenSaverModelValidation {
+        try cancellationCheck()
         guard let manifest = loadManifest() else {
             return TokenSaverModelValidation(state: .missing, reason: "manifest missing")
         }
@@ -331,17 +372,17 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
         guard !manifest.files.isEmpty else {
             return TokenSaverModelValidation(state: .incomplete, reason: "manifest has no files")
         }
-
-        return validateFiles(manifest.files, emptyReason: "manifest has no files")
+        return try validateFilesCooperatively(
+            manifest.files,
+            emptyReason: "manifest has no files",
+            cancellationCheck: cancellationCheck
+        )
     }
 
-    public func validateInstalledTokenSaverModels(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
-        let llmValidation = validateInstalledModel(requireSelectedModel: requireSelectedModel)
-        guard llmValidation.state == .installed else { return llmValidation }
-        return validateInstalledEncoderModels()
-    }
-
-    public func validateInstalledEncoderModels() -> TokenSaverModelValidation {
+    public func validateInstalledEncoderModelsCooperatively(
+        cancellationCheck: () throws -> Void
+    ) throws -> TokenSaverModelValidation {
+        try cancellationCheck()
         guard !requiredAuxiliaryModels.isEmpty else { return .installed }
         guard let manifest = loadEncoderManifest() else {
             return TokenSaverModelValidation(state: .missing, reason: "encoder manifest missing")
@@ -365,13 +406,18 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
             files.append(contentsOf: installed.files)
         }
 
-        return validateFiles(files, emptyReason: "encoder manifest has no files")
+        return try validateFilesCooperatively(
+            files,
+            emptyReason: "encoder manifest has no files",
+            cancellationCheck: cancellationCheck
+        )
     }
 
-    private func validateFiles(
+    private func validateFilesCooperatively(
         _ files: [TokenSaverModelFile],
-        emptyReason: String
-    ) -> TokenSaverModelValidation {
+        emptyReason: String,
+        cancellationCheck: () throws -> Void
+    ) throws -> TokenSaverModelValidation {
         guard !files.isEmpty else {
             return TokenSaverModelValidation(state: .incomplete, reason: emptyReason)
         }
@@ -380,6 +426,7 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
         var cacheUpdated = false
 
         for file in files {
+            try cancellationCheck()
             let url = distillDirectory.appendingPathComponent(file.relativePath)
             guard fileManager.fileExists(atPath: url.path) else {
                 return TokenSaverModelValidation(state: .incomplete, reason: "missing file \(file.relativePath)")
@@ -396,7 +443,15 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
             let cached: (size: Int64, mtime: Date)? = entry.map { ($0.sizeBytes, $0.modificationDate) }
 
             if Self.needsRehash(cached: cached, current: (size: currentSize, mtime: currentMtime)) {
-                guard (try? Self.sha256Hex(url: url)) == file.sha256.lowercased() else {
+                let checksum: String
+                do {
+                    checksum = try Self.sha256Hex(url: url, cancellationCheck: cancellationCheck)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    return TokenSaverModelValidation(state: .incomplete, reason: "checksum mismatch \(file.relativePath)")
+                }
+                guard checksum == file.sha256.lowercased() else {
                     return TokenSaverModelValidation(state: .incomplete, reason: "checksum mismatch \(file.relativePath)")
                 }
                 cache[file.relativePath] = ModelValidationCacheEntry(
@@ -410,6 +465,7 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
         }
 
         if cacheUpdated {
+            try cancellationCheck()
             writeValidationCache(Array(cache.values))
         }
 
@@ -432,16 +488,26 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
     }
 
     public static func sha256Hex(url: URL) throws -> String {
+        try sha256Hex(url: url, cancellationCheck: {})
+    }
+
+    public static func sha256Hex(
+        url: URL,
+        cancellationCheck: () throws -> Void
+    ) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
 
         var hasher = SHA256()
-        while autoreleasepool(invoking: {
-            let chunk = handle.readData(ofLength: 1024 * 1024)
-            guard !chunk.isEmpty else { return false }
+        while true {
+            try cancellationCheck()
+            let chunk = autoreleasepool {
+                handle.readData(ofLength: 1024 * 1024)
+            }
+            guard !chunk.isEmpty else { break }
             hasher.update(data: chunk)
-            return true
-        }) {}
+        }
+        try cancellationCheck()
 
         return hexDigest(hasher.finalize())
     }
@@ -606,7 +672,99 @@ public enum TokenSaverHuggingFaceAuth {
     }
 }
 
+actor TokenSaverModelDownloadCoordinator {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private var owners: Set<String> = []
+    private var waiters: [String: [Waiter]] = [:]
+
+    func acquire(_ key: String) async throws {
+        try Task.checkCancellation()
+        if owners.insert(key).inserted {
+            do {
+                try Task.checkCancellation()
+                return
+            } catch {
+                release(key)
+                throw error
+            }
+        }
+
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    waiters[key, default: []].append(
+                        Waiter(id: waiterID, continuation: continuation)
+                    )
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(key: key, id: waiterID) }
+        }
+        do {
+            try Task.checkCancellation()
+        } catch {
+            // If cancellation raced after promotion, this task owns the key and
+            // must hand it to the next waiter before propagating cancellation.
+            release(key)
+            throw error
+        }
+    }
+
+    func release(_ key: String) {
+        guard var queued = waiters[key], !queued.isEmpty else {
+            owners.remove(key)
+            waiters[key] = nil
+            return
+        }
+        let next = queued.removeFirst()
+        waiters[key] = queued.isEmpty ? nil : queued
+        next.continuation.resume()
+    }
+
+    func waiterCount(for key: String) -> Int {
+        waiters[key]?.count ?? 0
+    }
+
+    private func cancelWaiter(key: String, id: UUID) {
+        guard var queued = waiters[key],
+              let index = queued.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let waiter = queued.remove(at: index)
+        waiters[key] = queued.isEmpty ? nil : queued
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+}
+
 public final class TokenSaverModelDownloader: @unchecked Sendable {
+    private static let operationCoordinator = TokenSaverModelDownloadCoordinator()
+
+    enum ManifestKind: Sendable, Equatable {
+        case llm
+        case encoder
+    }
+
+    enum CancellationPoint: Sendable, Equatable {
+        case operationBoundary
+        case appendChunk
+        case beforeMove
+        case hashChunk
+    }
+
+    /// Test-only suspension seam for the final cancellation boundary. Production
+    /// leaves this nil, so there is no extra work on normal downloads.
+    var beforeManifestWriteForTesting: (@Sendable (ManifestKind) async -> Void)?
+    var afterManifestWriteForTesting: (@Sendable (ManifestKind) async -> Void)?
+    var afterStagedDownloadForTesting: (@Sendable () -> Void)?
+    var cancellationCheckForTesting: ((CancellationPoint) throws -> Void)?
+
     private final class DownloadSessionDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         private let lock = NSLock()
         private let relativePath: String
@@ -614,22 +772,27 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
         private let stagingDirectory: URL
         private let fileManager: FileManager
         private let progress: TokenSaverModelDownloadProgress?
+        private let afterStagedDownload: (@Sendable () -> Void)?
         private var continuation: CheckedContinuation<(URL, URLResponse), Error>?
         private var task: URLSessionDownloadTask?
         private var result: Result<(URL, URLResponse), Error>?
+        private var stagedURL: URL?
+        private var cancelled = false
 
         init(
             relativePath: String,
             resumeOffset: Int64,
             stagingDirectory: URL,
             fileManager: FileManager,
-            progress: TokenSaverModelDownloadProgress?
+            progress: TokenSaverModelDownloadProgress?,
+            afterStagedDownload: (@Sendable () -> Void)?
         ) {
             self.relativePath = relativePath
             self.resumeOffset = resumeOffset
             self.stagingDirectory = stagingDirectory
             self.fileManager = fileManager
             self.progress = progress
+            self.afterStagedDownload = afterStagedDownload
         }
 
         func start(task: URLSessionDownloadTask, continuation: CheckedContinuation<(URL, URLResponse), Error>) {
@@ -642,9 +805,13 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
 
         func cancel() {
             lock.lock()
+            cancelled = true
             let task = self.task
             self.task = nil
+            let stagedURL = self.stagedURL
+            self.stagedURL = nil
             lock.unlock()
+            if let stagedURL { try? fileManager.removeItem(at: stagedURL) }
             task?.cancel()
         }
 
@@ -674,11 +841,22 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
             do {
                 try? fileManager.removeItem(at: stagedURL)
                 try fileManager.moveItem(at: location, to: stagedURL)
+                afterStagedDownload?()
                 guard let response = downloadTask.response else {
                     throw URLError(.badServerResponse)
                 }
-                setResult(.success((stagedURL, response)))
+                lock.lock()
+                if cancelled {
+                    lock.unlock()
+                    try? fileManager.removeItem(at: stagedURL)
+                    setResult(.failure(CancellationError()))
+                } else {
+                    self.stagedURL = stagedURL
+                    result = .success((stagedURL, response))
+                    lock.unlock()
+                }
             } catch {
+                try? fileManager.removeItem(at: stagedURL)
                 setResult(.failure(error))
             }
         }
@@ -702,13 +880,24 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
 
         private func complete(_ result: Result<(URL, URLResponse), Error>) {
             lock.lock()
+            let effectiveResult: Result<(URL, URLResponse), Error> = cancelled
+                ? .failure(CancellationError())
+                : result
+            let stagedToRemove: URL?
+            if case .success = effectiveResult {
+                stagedToRemove = nil
+            } else {
+                stagedToRemove = stagedURL
+            }
+            stagedURL = nil
             let continuation = self.continuation
             self.continuation = nil
             self.task = nil
             lock.unlock()
 
+            if let stagedToRemove { try? fileManager.removeItem(at: stagedToRemove) }
             guard let continuation else { return }
-            switch result {
+            switch effectiveResult {
             case .success(let value):
                 continuation.resume(returning: value)
             case .failure(let error):
@@ -762,27 +951,64 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
     public func downloadApprovedModel(
         progress: TokenSaverModelDownloadProgress? = nil
     ) async throws -> TokenSaverModelManifest {
-        try await downloadApprovedModel(progress: progress, emitReady: true)
+        try await withExclusiveDownloadAccess {
+            try await self.downloadApprovedModel(progress: progress, emitReady: true)
+        }
     }
 
     public func downloadRequiredModels(
         progress: TokenSaverModelDownloadProgress? = nil
     ) async throws -> TokenSaverModelManifest {
-        let manifest = try await downloadApprovedModel(progress: progress, emitReady: false)
-        _ = try await downloadRequiredEncoderModels(progress: progress)
-        let validation = installer.validateInstalledTokenSaverModels(requireSelectedModel: true)
-        guard validation.state == .installed else {
-            throw TokenSaverModelDownloadError.validationFailed(validation.reason)
+        try await withExclusiveDownloadAccess {
+            try await self.downloadRequiredModelsExclusively(progress: progress)
         }
-        progress?(.ready)
-        return manifest
+    }
+
+    private func downloadRequiredModelsExclusively(
+        progress: TokenSaverModelDownloadProgress?
+    ) async throws -> TokenSaverModelManifest {
+        let previousLLMManifest = try? Data(contentsOf: installer.manifestURL)
+        let previousEncoderManifest = try? Data(contentsOf: installer.encoderManifestURL)
+        do {
+            try checkCancellation(.operationBoundary)
+            let manifest = try await downloadApprovedModel(progress: progress, emitReady: false)
+            try checkCancellation(.operationBoundary)
+            _ = try await downloadRequiredEncoderModelsExclusively(progress: progress)
+            try checkCancellation(.operationBoundary)
+            let validation = try installer.validateInstalledTokenSaverModelsCooperatively(
+                requireSelectedModel: true
+            ) {
+                try self.checkCancellation(.hashChunk)
+            }
+            guard validation.state == .installed else {
+                throw TokenSaverModelDownloadError.validationFailed(validation.reason)
+            }
+            try checkCancellation(.operationBoundary)
+            progress?(.ready)
+            return manifest
+        } catch is CancellationError {
+            restoreManifest(previousLLMManifest, at: installer.manifestURL)
+            restoreManifest(previousEncoderManifest, at: installer.encoderManifestURL)
+            throw CancellationError()
+        }
     }
 
     public func downloadRequiredEncoderModels(
         progress: TokenSaverModelDownloadProgress? = nil
     ) async throws -> TokenSaverRequiredModelsInstallManifest {
+        try await withExclusiveDownloadAccess {
+            try await self.downloadRequiredEncoderModelsExclusively(progress: progress)
+        }
+    }
+
+    private func downloadRequiredEncoderModelsExclusively(
+        progress: TokenSaverModelDownloadProgress?
+    ) async throws -> TokenSaverRequiredModelsInstallManifest {
+        try checkCancellation(.operationBoundary)
         guard !installer.requiredAuxiliaryModels.isEmpty else {
             let manifest = TokenSaverRequiredModelsInstallManifest(models: [])
+            await beforeManifestWriteForTesting?(.encoder)
+            try Task.checkCancellation()
             try installer.writeEncoderManifest(manifest)
             return manifest
         }
@@ -823,10 +1049,22 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
             statusText: "Verifying downloaded encoder models"
         ))
         let manifest = TokenSaverRequiredModelsInstallManifest(models: installedModels)
-        try installer.writeEncoderManifest(manifest)
-        let validation = installer.validateInstalledEncoderModels()
-        guard validation.state == .installed else {
-            throw TokenSaverModelDownloadError.validationFailed(validation.reason)
+        await beforeManifestWriteForTesting?(.encoder)
+        try Task.checkCancellation()
+        let previousManifest = try? Data(contentsOf: installer.encoderManifestURL)
+        do {
+            try installer.writeEncoderManifest(manifest)
+            await afterManifestWriteForTesting?(.encoder)
+            let validation = try installer.validateInstalledEncoderModelsCooperatively {
+                try self.checkCancellation(.hashChunk)
+            }
+            guard validation.state == .installed else {
+                throw TokenSaverModelDownloadError.validationFailed(validation.reason)
+            }
+            try checkCancellation(.operationBoundary)
+        } catch is CancellationError {
+            restoreManifest(previousManifest, at: installer.encoderManifestURL)
+            throw CancellationError()
         }
         return manifest
     }
@@ -835,6 +1073,7 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
         progress: TokenSaverModelDownloadProgress?,
         emitReady: Bool
     ) async throws -> TokenSaverModelManifest {
+        try checkCancellation(.operationBoundary)
         progress?(TokenSaverModelDownloadState(
             phase: .preparing,
             statusText: "Fetching Hugging Face model manifest"
@@ -870,10 +1109,24 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
             runtime: installer.approvedModel.runtime,
             files: manifestFiles
         )
-        try installer.writeManifest(manifest)
-        let validation = installer.validateInstalledModel()
-        guard validation.state == .installed else {
-            throw TokenSaverModelDownloadError.validationFailed(validation.reason)
+        await beforeManifestWriteForTesting?(.llm)
+        try checkCancellation(.operationBoundary)
+        let previousManifest = try? Data(contentsOf: installer.manifestURL)
+        do {
+            try installer.writeManifest(manifest)
+            await afterManifestWriteForTesting?(.llm)
+            let validation = try installer.validateInstalledModelCooperatively(
+                requireSelectedModel: true
+            ) {
+                try self.checkCancellation(.hashChunk)
+            }
+            guard validation.state == .installed else {
+                throw TokenSaverModelDownloadError.validationFailed(validation.reason)
+            }
+            try checkCancellation(.operationBoundary)
+        } catch is CancellationError {
+            restoreManifest(previousManifest, at: installer.manifestURL)
+            throw CancellationError()
         }
         if emitReady {
             progress?(.ready)
@@ -935,6 +1188,7 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
         storageRoot: String,
         progress: TokenSaverModelDownloadProgress?
     ) async throws -> TokenSaverModelFile {
+        try checkCancellation(.operationBoundary)
         let relativeStoragePath = Self.localRelativePath(
             storageRoot: storageRoot,
             modelID: modelID,
@@ -949,11 +1203,17 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
         let partial = destination.appendingPathExtension("partial")
         try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         try await downloadBody(file: file, partial: partial, progress: progress)
+        try checkCancellation(.beforeMove)
         if fileManager.fileExists(atPath: destination.path) {
             try fileManager.removeItem(at: destination)
         }
         try fileManager.moveItem(at: partial, to: destination)
-        return try manifestFile(relativePath: relativeStoragePath, url: destination)
+        do {
+            return try manifestFile(relativePath: relativeStoragePath, url: destination)
+        } catch is CancellationError {
+            try? fileManager.removeItem(at: destination)
+            throw CancellationError()
+        }
     }
 
     /// Minimum I/O unit for the download path. Exposed as a pure seam so tests
@@ -1004,6 +1264,13 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
                 stagingDirectory: partial.deletingLastPathComponent(),
                 progress: progress
             )
+            defer { try? fileManager.removeItem(at: tempURL) }
+            do {
+                try checkCancellation(.operationBoundary)
+            } catch {
+                try? fileManager.removeItem(at: tempURL)
+                throw error
+            }
             let http = response as? HTTPURLResponse
             let status = http?.statusCode ?? 200
             guard (200..<300).contains(status) else {
@@ -1034,18 +1301,27 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
                 let srcHandle = try FileHandle(forReadingFrom: tempURL)
                 defer { try? srcHandle.close() }
                 try srcHandle.seek(toOffset: 0)
-                while true {
-                    guard let chunk = try srcHandle.read(upToCount: TokenSaverModelDownloader.downloadChunkSize),
-                          !chunk.isEmpty else { break }
-                    try destHandle.write(contentsOf: chunk)
+                do {
+                    while true {
+                        try checkCancellation(.appendChunk)
+                        guard let chunk = try srcHandle.read(upToCount: TokenSaverModelDownloader.downloadChunkSize),
+                              !chunk.isEmpty else { break }
+                        try destHandle.write(contentsOf: chunk)
+                    }
+                } catch {
+                    try? destHandle.truncate(atOffset: UInt64(resumeOffset))
+                    try? fileManager.removeItem(at: tempURL)
+                    throw error
                 }
                 try? fileManager.removeItem(at: tempURL)
             } else {
                 // Full response: move the temp file into place.
+                try checkCancellation(.beforeMove)
                 try? fileManager.removeItem(at: partial)
                 try fileManager.moveItem(at: tempURL, to: partial)
             }
 
+            try checkCancellation(.operationBoundary)
             let downloaded = resumeOffset + downloadedLength
             progress?(TokenSaverModelDownloadState(
                 phase: .downloading,
@@ -1069,7 +1345,8 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
             resumeOffset: resumeOffset,
             stagingDirectory: stagingDirectory,
             fileManager: fileManager,
-            progress: progress
+            progress: progress,
+            afterStagedDownload: afterStagedDownloadForTesting
         )
         let progressSession = URLSession(
             configuration: session.configuration,
@@ -1089,10 +1366,41 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
     }
 
     private func manifestFile(relativePath: String, url: URL) throws -> TokenSaverModelFile {
+        try checkCancellation(.operationBoundary)
         let attrs = try fileManager.attributesOfItem(atPath: url.path)
         let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
-        let checksum = try TokenSaverModelInstaller.sha256Hex(url: url)
+        let checksum = try TokenSaverModelInstaller.sha256Hex(url: url) {
+            try self.checkCancellation(.hashChunk)
+        }
         return TokenSaverModelFile(relativePath: relativePath, sha256: checksum, sizeBytes: size)
+    }
+
+    private func checkCancellation(_ point: CancellationPoint) throws {
+        try Task.checkCancellation()
+        try cancellationCheckForTesting?(point)
+    }
+
+    private func withExclusiveDownloadAccess<T>(
+        _ operation: () async throws -> T
+    ) async throws -> T {
+        let key = installer.distillDirectory.standardizedFileURL.path
+        try await Self.operationCoordinator.acquire(key)
+        do {
+            let result = try await operation()
+            await Self.operationCoordinator.release(key)
+            return result
+        } catch {
+            await Self.operationCoordinator.release(key)
+            throw error
+        }
+    }
+
+    private func restoreManifest(_ data: Data?, at url: URL) {
+        if let data {
+            try? data.write(to: url, options: .atomic)
+        } else {
+            try? fileManager.removeItem(at: url)
+        }
     }
 
     private func fileSize(at url: URL) -> Int64 {

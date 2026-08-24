@@ -3,6 +3,50 @@ import CoreModel
 @testable import AgentRuntime
 
 final class TokenSaverInstallTests: XCTestCase {
+    private actor ManifestWriteGate {
+        private var started = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        func suspend() async {
+            started = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func hasStarted() -> Bool { started }
+
+        func resume() {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
+    private final class StagedDownloadGate: @unchecked Sendable {
+        private let condition = NSCondition()
+        private var started = false
+        private var released = false
+
+        func suspend() {
+            condition.lock()
+            started = true
+            condition.broadcast()
+            while !released { condition.wait() }
+            condition.unlock()
+        }
+
+        var hasStarted: Bool {
+            condition.lock()
+            defer { condition.unlock() }
+            return started
+        }
+
+        func resume() {
+            condition.lock()
+            released = true
+            condition.broadcast()
+            condition.unlock()
+        }
+    }
+
     private final class URLProtocolStub: URLProtocol {
         typealias Handler = (URLRequest) throws -> (Int, [String: String], Data)
         static var handler: Handler?
@@ -1052,6 +1096,44 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(installer.validateInstalledModel().state, .incomplete)
     }
 
+    func test_modelInstallerCooperativeValidationCancelsDuringChunkedHashing() throws {
+        // WHY: cancelling boot/entitlement validation must stop an in-flight
+        // multi-GB hash, not merely discard its result after all bytes were read.
+        let appSupport = tempDir("TokenSaverCooperativeValidation")
+        let installer = TokenSaverModelInstaller(
+            appSupportDirectory: appSupport,
+            approvedModel: TokenSaverApprovedModels.distill17B,
+            requiredAuxiliaryModels: []
+        )
+        let modelFile = installer.distillDirectory.appendingPathComponent("large-weights.bin")
+        try FileManager.default.createDirectory(at: installer.distillDirectory, withIntermediateDirectories: true)
+        let data = Data(repeating: 0x5a, count: 4 * 1_024 * 1_024)
+        try data.write(to: modelFile)
+        let manifest = TokenSaverModelManifest(
+            modelID: installer.approvedModel.id,
+            modelURL: installer.approvedModel.url,
+            revision: "cooperative-cancel",
+            runtime: installer.approvedModel.runtime,
+            files: [TokenSaverModelFile(
+                relativePath: "large-weights.bin",
+                sha256: try TokenSaverModelInstaller.sha256Hex(url: modelFile),
+                sizeBytes: Int64(data.count)
+            )]
+        )
+        try installer.writeManifest(manifest)
+        var cancellationChecks = 0
+
+        XCTAssertThrowsError(try installer.validateInstalledTokenSaverModelsCooperatively {
+            cancellationChecks += 1
+            if cancellationChecks == 4 { throw CancellationError() }
+        }) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(cancellationChecks, 4)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installer.validationCacheURL.path))
+        XCTAssertEqual(installer.validateInstalledTokenSaverModels(), .installed)
+    }
+
     func test_modelInstallerAcceptsAnyApprovedModelManifest() throws {
         let appSupport = tempDir()
         let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
@@ -1191,6 +1273,420 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertTrue(recorder.phases.contains(.downloading))
         XCTAssertTrue(recorder.phases.contains(.verifying))
         XCTAssertTrue(recorder.phases.contains(.ready))
+    }
+
+    func test_modelDownloaderCancellationImmediatelyBeforeLLMManifestWritesNothing() async throws {
+        // WHY: changing Token Saver to API can cancel activation after weights
+        // arrive but before the local manifest becomes authoritative.
+        let appSupport = tempDir("TokenSaverCancelLLMManifest")
+        let model = TokenSaverApprovedModels.distill17B
+        let installer = TokenSaverModelInstaller(
+            appSupportDirectory: appSupport,
+            approvedModel: model,
+            requiredAuxiliaryModels: []
+        )
+        let revision = "cancel-before-manifest"
+        let api = #"{"id":"samuelfaj/distill-1.7B-4bit-MLX","sha":"cancel-before-manifest","siblings":[{"rfilename":"model.safetensors"}]}"#
+        let gate = ManifestWriteGate()
+        let downloader = TokenSaverModelDownloader(installer: installer, session: stubbedSession())
+        downloader.beforeManifestWriteForTesting = { kind in
+            if kind == .llm { await gate.suspend() }
+        }
+
+        let task = Task {
+            try await URLProtocolStub.withHandler({ request in
+                if request.url?.path.contains("/api/models/") == true {
+                    return (200, ["Content-Length": "\(api.utf8.count)"], Data(api.utf8))
+                }
+                return (200, ["Content-Length": "7"], Data("weights".utf8))
+            }, run: {
+                try await downloader.downloadApprovedModel()
+            })
+        }
+        while await !gate.hasStarted() { await Task.yield() }
+        task.cancel()
+        await gate.resume()
+
+        do {
+            _ = try await task.value
+            XCTFail("cancelled manifest write must throw")
+        } catch is CancellationError {}
+        XCTAssertNil(installer.loadManifest())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: installer.modelStorageDirectory(revision: revision)
+            .appendingPathComponent("model.safetensors").path))
+    }
+
+    func test_modelDownloaderCancellationDuringExistingFileHashWritesNoManifest() async throws {
+        // WHY: switching to API while hashing an already-downloaded multi-GB
+        // weight must stop the hash itself, not merely reject its later manifest.
+        let appSupport = tempDir("TokenSaverCancelExistingHash")
+        let model = TokenSaverApprovedModels.distill17B
+        let installer = TokenSaverModelInstaller(
+            appSupportDirectory: appSupport,
+            approvedModel: model,
+            requiredAuxiliaryModels: []
+        )
+        let revision = "cancel-existing-hash"
+        let storedModel = installer.modelStorageDirectory(revision: revision)
+            .appendingPathComponent("model.safetensors")
+        try FileManager.default.createDirectory(
+            at: storedModel.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(repeating: 0x4a, count: 4 * TokenSaverModelDownloader.downloadChunkSize)
+            .write(to: storedModel)
+        let api = #"{"id":"samuelfaj/distill-1.7B-4bit-MLX","sha":"cancel-existing-hash","siblings":[{"rfilename":"model.safetensors"}]}"#
+        let downloader = TokenSaverModelDownloader(installer: installer, session: stubbedSession())
+        var hashChecks = 0
+        downloader.cancellationCheckForTesting = { point in
+            guard point == .hashChunk else { return }
+            hashChecks += 1
+            if hashChecks == 3 { throw CancellationError() }
+        }
+
+        do {
+            _ = try await URLProtocolStub.withHandler({ request in
+                if request.url?.path.contains("/api/models/") == true {
+                    return (200, ["Content-Length": "\(api.utf8.count)"], Data(api.utf8))
+                }
+                return (500, [:], Data())
+            }, run: {
+                try await downloader.downloadApprovedModel()
+            })
+            XCTFail("cancelled existing-file hash must throw")
+        } catch is CancellationError {}
+
+        XCTAssertEqual(hashChecks, 3)
+        XCTAssertNil(installer.loadManifest())
+    }
+
+    func test_modelDownloaderCancellationDuringResumeAppendPreservesExistingPartialAndWritesNoManifest() async throws {
+        // WHY: cancellation during a resumed temp-file copy must stop before
+        // appending another chunk or making the partial download authoritative.
+        let appSupport = tempDir("TokenSaverCancelAppend")
+        let model = TokenSaverApprovedModels.distill17B
+        let installer = TokenSaverModelInstaller(
+            appSupportDirectory: appSupport,
+            approvedModel: model,
+            requiredAuxiliaryModels: []
+        )
+        let revision = "cancel-resume-append"
+        let storedModel = installer.modelStorageDirectory(revision: revision)
+            .appendingPathComponent("model.safetensors")
+        let partial = storedModel.appendingPathExtension("partial")
+        try FileManager.default.createDirectory(
+            at: partial.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let originalPartial = Data("existing".utf8)
+        try originalPartial.write(to: partial)
+        let api = #"{"id":"samuelfaj/distill-1.7B-4bit-MLX","sha":"cancel-resume-append","siblings":[{"rfilename":"model.safetensors"}]}"#
+        let downloader = TokenSaverModelDownloader(installer: installer, session: stubbedSession())
+        downloader.cancellationCheckForTesting = { point in
+            if point == .appendChunk { throw CancellationError() }
+        }
+
+        do {
+            _ = try await URLProtocolStub.withHandler({ request in
+                if request.url?.path.contains("/api/models/") == true {
+                    return (200, ["Content-Length": "\(api.utf8.count)"], Data(api.utf8))
+                }
+                return (206, ["Content-Length": "\(2 * TokenSaverModelDownloader.downloadChunkSize)"],
+                        Data(repeating: 0x6b, count: 2 * TokenSaverModelDownloader.downloadChunkSize))
+            }, run: {
+                try await downloader.downloadApprovedModel()
+            })
+            XCTFail("cancelled resume append must throw")
+        } catch is CancellationError {}
+
+        XCTAssertEqual(try Data(contentsOf: partial), originalPartial)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storedModel.path))
+        XCTAssertNil(installer.loadManifest())
+    }
+
+    func test_modelDownloaderCancellationBeforeFullResponseMoveRemovesStagedDownload() async throws {
+        // WHY: URLSession has already materialized the full multi-GB staging
+        // file at this boundary; cancellation must not strand `.download-*`.
+        let appSupport = tempDir("TokenSaverCancelStagedDownload")
+        let model = TokenSaverApprovedModels.distill17B
+        let installer = TokenSaverModelInstaller(
+            appSupportDirectory: appSupport,
+            approvedModel: model,
+            requiredAuxiliaryModels: []
+        )
+        let revision = "cancel-staged-download"
+        let destination = installer.modelStorageDirectory(revision: revision)
+            .appendingPathComponent("model.safetensors")
+        let api = #"{"id":"samuelfaj/distill-1.7B-4bit-MLX","sha":"cancel-staged-download","siblings":[{"rfilename":"model.safetensors"}]}"#
+        let downloader = TokenSaverModelDownloader(installer: installer, session: stubbedSession())
+        downloader.cancellationCheckForTesting = { point in
+            if point == .beforeMove { throw CancellationError() }
+        }
+
+        do {
+            _ = try await URLProtocolStub.withHandler({ request in
+                if request.url?.path.contains("/api/models/") == true {
+                    return (200, ["Content-Length": "\(api.utf8.count)"], Data(api.utf8))
+                }
+                return (200, ["Content-Length": "7"], Data("weights".utf8))
+            }, run: {
+                try await downloader.downloadApprovedModel()
+            })
+            XCTFail("cancelled staging move must throw")
+        } catch is CancellationError {}
+
+        let siblings = (try? FileManager.default.contentsOfDirectory(
+            atPath: destination.deletingLastPathComponent().path
+        )) ?? []
+        XCTAssertFalse(siblings.contains { $0.hasPrefix(".download-") })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathExtension("partial").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertNil(installer.loadManifest())
+    }
+
+    func test_downloadDelegateCancellationAfterStagingMoveRemovesOwnedTempBeforeFailureHandoff() async throws {
+        // WHY: once didFinishDownloadingTo moves the system temp into our
+        // directory, delegate failure owns cleanup until success transfers it.
+        let appSupport = tempDir("TokenSaverCancelDelegateStaging")
+        let model = TokenSaverApprovedModels.distill17B
+        let installer = TokenSaverModelInstaller(
+            appSupportDirectory: appSupport,
+            approvedModel: model,
+            requiredAuxiliaryModels: []
+        )
+        let revision = "cancel-delegate-staging"
+        let destination = installer.modelStorageDirectory(revision: revision)
+            .appendingPathComponent("model.safetensors")
+        let api = #"{"id":"samuelfaj/distill-1.7B-4bit-MLX","sha":"cancel-delegate-staging","siblings":[{"rfilename":"model.safetensors"}]}"#
+        let gate = StagedDownloadGate()
+        let downloader = TokenSaverModelDownloader(installer: installer, session: stubbedSession())
+        downloader.afterStagedDownloadForTesting = { gate.suspend() }
+
+        let task = Task {
+            try await URLProtocolStub.withHandler({ request in
+                if request.url?.path.contains("/api/models/") == true {
+                    return (200, ["Content-Length": "\(api.utf8.count)"], Data(api.utf8))
+                }
+                return (200, ["Content-Length": "7"], Data("weights".utf8))
+            }, run: {
+                try await downloader.downloadApprovedModel()
+            })
+        }
+        while !gate.hasStarted { await Task.yield() }
+        task.cancel()
+        gate.resume()
+
+        do {
+            _ = try await task.value
+            XCTFail("cancelled delegate handoff must fail")
+        } catch {}
+
+        let siblings = (try? FileManager.default.contentsOfDirectory(
+            atPath: destination.deletingLastPathComponent().path
+        )) ?? []
+        XCTAssertFalse(siblings.contains { $0.hasPrefix(".download-") })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathExtension("partial").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertNil(installer.loadManifest())
+    }
+
+    func test_modelDownloaderCancellationImmediatelyBeforeEncoderManifestWritesNothing() async throws {
+        // WHY: the empty encoder bundle still writes a durable manifest, so it
+        // needs the same final cancellation boundary as a populated bundle.
+        let appSupport = tempDir("TokenSaverCancelEncoderManifest")
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport, requiredAuxiliaryModels: [])
+        let gate = ManifestWriteGate()
+        let downloader = TokenSaverModelDownloader(installer: installer)
+        downloader.beforeManifestWriteForTesting = { kind in
+            if kind == .encoder { await gate.suspend() }
+        }
+
+        let task = Task { try await downloader.downloadRequiredEncoderModels() }
+        while await !gate.hasStarted() { await Task.yield() }
+        task.cancel()
+        await gate.resume()
+
+        do {
+            _ = try await task.value
+            XCTFail("cancelled encoder manifest write must throw")
+        } catch is CancellationError {}
+        XCTAssertNil(installer.loadEncoderManifest())
+    }
+
+    func test_cancelledLLMDownloadCannotRollBackNewerManifestOrArtifact() async throws {
+        // WHY: a cancelled generation must finish its rollback before a newer
+        // generation can publish into the same shared Distill directory.
+        let appSupport = tempDir("TokenSaverLLMManifestGeneration")
+        let modelA = TokenSaverApprovedModels.distill17B
+        let modelB = TokenSaverApprovedModels.distillE4B
+        let installerA = TokenSaverModelInstaller(
+            appSupportDirectory: appSupport,
+            approvedModel: modelA,
+            requiredAuxiliaryModels: []
+        )
+        let installerB = TokenSaverModelInstaller(
+            appSupportDirectory: appSupport,
+            approvedModel: modelB,
+            requiredAuxiliaryModels: []
+        )
+        let revisionA = "generation-a"
+        let revisionB = "generation-b"
+        let gateA = ManifestWriteGate()
+        let gateB = ManifestWriteGate()
+        let downloaderA = TokenSaverModelDownloader(installer: installerA, session: stubbedSession())
+        let downloaderB = TokenSaverModelDownloader(installer: installerB, session: stubbedSession())
+        downloaderA.afterManifestWriteForTesting = { kind in
+            if kind == .llm { await gateA.suspend() }
+        }
+        downloaderB.beforeManifestWriteForTesting = { kind in
+            if kind == .llm { await gateB.suspend() }
+        }
+
+        func apiJSON(model: TokenSaverApprovedModel, revision: String) -> Data {
+            Data(#"{"id":"\#(model.id)","sha":"\#(revision)","siblings":[{"rfilename":"model.safetensors"}]}"#.utf8)
+        }
+
+        try await URLProtocolStub.withHandler({ request in
+            let path = request.url?.path ?? ""
+            if path.contains("/api/models/\(modelA.id)") {
+                return (200, [:], apiJSON(model: modelA, revision: revisionA))
+            }
+            if path.contains("/api/models/\(modelB.id)") {
+                return (200, [:], apiJSON(model: modelB, revision: revisionB))
+            }
+            if path.hasSuffix("/model.safetensors") {
+                return (200, [:], Data("weights".utf8))
+            }
+            return (404, [:], Data())
+        }, run: {
+            let taskA = Task { try await downloaderA.downloadApprovedModel() }
+            while await !gateA.hasStarted() { await Task.yield() }
+            taskA.cancel()
+
+            let taskB = Task { try await downloaderB.downloadApprovedModel() }
+            for _ in 0..<200 where await !gateB.hasStarted() {
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            let bStartedBeforeAFinished = await gateB.hasStarted()
+            XCTAssertFalse(bStartedBeforeAFinished,
+                           "new download must not touch shared artifacts until cancelled owner finishes rollback")
+            let bArtifact = installerB
+                .modelStorageDirectory(modelID: modelB.id, revision: revisionB)
+                .appendingPathComponent("model.safetensors")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: bArtifact.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: bArtifact.appendingPathExtension("partial").path))
+
+            if bStartedBeforeAFinished {
+                await gateB.resume()
+                _ = try await taskB.value
+                await gateA.resume()
+            } else {
+                await gateA.resume()
+            }
+            do {
+                _ = try await taskA.value
+                XCTFail("cancelled generation must throw")
+            } catch is CancellationError {}
+            if !bStartedBeforeAFinished {
+                while await !gateB.hasStarted() { await Task.yield() }
+                await gateB.resume()
+                _ = try await taskB.value
+            }
+        })
+
+        XCTAssertEqual(installerB.loadManifest()?.modelID, modelB.id)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: installerB
+            .modelStorageDirectory(modelID: modelB.id, revision: revisionB)
+            .appendingPathComponent("model.safetensors").path))
+    }
+
+    func test_cancelledEncoderDownloadCannotRollBackNewerManifestOrArtifact() async throws {
+        // WHY: encoder manifests and artifacts share the same generation risk
+        // as the LLM manifest and must use the same exclusive ownership.
+        let appSupport = tempDir("TokenSaverEncoderManifestGeneration")
+        let modelA = TokenSaverRequiredModel(
+            id: "test/encoder-a",
+            url: "https://huggingface.co/test/encoder-a",
+            revision: String(repeating: "a", count: 40),
+            runtime: "mlx-bert",
+            role: "embedder-a"
+        )
+        let modelB = TokenSaverRequiredModel(
+            id: "test/encoder-b",
+            url: "https://huggingface.co/test/encoder-b",
+            revision: String(repeating: "b", count: 40),
+            runtime: "mlx-bert",
+            role: "embedder-b"
+        )
+        let installerA = TokenSaverModelInstaller(appSupportDirectory: appSupport, requiredAuxiliaryModels: [modelA])
+        let installerB = TokenSaverModelInstaller(appSupportDirectory: appSupport, requiredAuxiliaryModels: [modelB])
+        let gateA = ManifestWriteGate()
+        let gateB = ManifestWriteGate()
+        let downloaderA = TokenSaverModelDownloader(installer: installerA, session: stubbedSession())
+        let downloaderB = TokenSaverModelDownloader(installer: installerB, session: stubbedSession())
+        downloaderA.afterManifestWriteForTesting = { kind in
+            if kind == .encoder { await gateA.suspend() }
+        }
+        downloaderB.beforeManifestWriteForTesting = { kind in
+            if kind == .encoder { await gateB.suspend() }
+        }
+
+        func apiJSON(model: TokenSaverRequiredModel) -> Data {
+            Data(#"{"id":"\#(model.id)","sha":"\#(model.revision)","siblings":[{"rfilename":"model.safetensors"}]}"#.utf8)
+        }
+
+        try await URLProtocolStub.withHandler({ request in
+            let path = request.url?.path ?? ""
+            if path.contains("/api/models/\(modelA.id)/revision/") {
+                return (200, [:], apiJSON(model: modelA))
+            }
+            if path.contains("/api/models/\(modelB.id)/revision/") {
+                return (200, [:], apiJSON(model: modelB))
+            }
+            if path.hasSuffix("/model.safetensors") {
+                return (200, [:], Data("weights".utf8))
+            }
+            return (404, [:], Data())
+        }, run: {
+            let taskA = Task { try await downloaderA.downloadRequiredEncoderModels() }
+            while await !gateA.hasStarted() { await Task.yield() }
+            taskA.cancel()
+
+            let taskB = Task { try await downloaderB.downloadRequiredEncoderModels() }
+            for _ in 0..<200 where await !gateB.hasStarted() {
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            let bStartedBeforeAFinished = await gateB.hasStarted()
+            XCTAssertFalse(bStartedBeforeAFinished,
+                           "new encoder download must wait for cancelled owner rollback")
+            let bArtifact = installerB
+                .encoderStorageDirectory(modelID: modelB.id, revision: modelB.revision)
+                .appendingPathComponent("model.safetensors")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: bArtifact.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: bArtifact.appendingPathExtension("partial").path))
+
+            if bStartedBeforeAFinished {
+                await gateB.resume()
+                _ = try await taskB.value
+                await gateA.resume()
+            } else {
+                await gateA.resume()
+            }
+            do {
+                _ = try await taskA.value
+                XCTFail("cancelled encoder generation must throw")
+            } catch is CancellationError {}
+            if !bStartedBeforeAFinished {
+                while await !gateB.hasStarted() { await Task.yield() }
+                await gateB.resume()
+                _ = try await taskB.value
+            }
+        })
+
+        XCTAssertEqual(installerB.loadEncoderManifest()?.models.map(\.modelID), [modelB.id])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: installerB
+            .encoderStorageDirectory(modelID: modelB.id, revision: modelB.revision)
+            .appendingPathComponent("model.safetensors").path))
     }
 
     func test_modelDownloaderUsesSelectedApprovedModel() async throws {
@@ -1535,5 +2031,40 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(updated.daily[1].actualProviderTokens, 80)
         XCTAssertEqual(updated.daily[1].measuredSavedTokens, 120)
         XCTAssertEqual(store.load().daily, updated.daily)
+    }
+
+    func test_downloadCoordinatorCancellationRemovesQueuedWaiterAndNextOwnerProceeds() async throws {
+        let coordinator = TokenSaverModelDownloadCoordinator()
+        let key = "/tmp/token-saver-coordinator-cancellation"
+        try await coordinator.acquire(key)
+
+        let cancelled = expectation(description: "queued acquisition cancelled promptly")
+        let waiter = Task {
+            do {
+                try await coordinator.acquire(key)
+                XCTFail("cancelled queued downloader must never acquire the directory")
+            } catch is CancellationError {
+                cancelled.fulfill()
+            } catch {
+                XCTFail("unexpected cancellation error: \(error)")
+            }
+        }
+        while await coordinator.waiterCount(for: key) == 0 {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        waiter.cancel()
+        await fulfillment(of: [cancelled], timeout: 0.25)
+        let remainingWaiters = await coordinator.waiterCount(for: key)
+        XCTAssertEqual(remainingWaiters, 0)
+
+        let thirdAcquired = expectation(description: "next owner proceeds after release")
+        let third = Task {
+            try await coordinator.acquire(key)
+            thirdAcquired.fulfill()
+            await coordinator.release(key)
+        }
+        await coordinator.release(key)
+        await fulfillment(of: [thirdAcquired], timeout: 0.25)
+        _ = try await third.value
     }
 }

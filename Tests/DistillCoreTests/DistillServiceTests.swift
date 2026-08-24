@@ -249,6 +249,63 @@ final class DistillServiceTests: XCTestCase {
         )
     }
 
+    // WHY: selecting an external API must not construct or warm the local
+    // EncoderFirst MLX/BERT lane. Local inference still owns that optimization.
+    func test_configurationUsesLocalEncoderLaneOnlyForLocalTarget() throws {
+        let api = try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code",
+            generateBaseURL: "http://127.0.0.1:8000/v1",
+            generateModel: "fixture-api-model"
+        )
+        let local = try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code"
+        )
+
+        XCTAssertFalse(api.usesLocalEncoderLane)
+        XCTAssertTrue(local.usesLocalEncoderLane)
+    }
+
+    // WHY: API selection is authoritative. Local defaults may be absent or
+    // invalid on an API-only machine and must not be validated or exposed as
+    // the ready identity when the API configuration is complete.
+    func test_configurationOpenAICompatibleUsesOnlyEffectiveAPIIdentity() throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code",
+            runtime: "not-a-local-runtime",
+            modelID: "not-a-local-model",
+            modelURL: "https://example.invalid/not-a-local-model",
+            generateBaseURL: "http://127.0.0.1:8000/v1",
+            generateModel: "fixture-api-model"
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: TestScopedRecoveryStore()
+        )
+        let ready = server.readyEvent()
+
+        XCTAssertEqual(ready.runtime, "openai-compatible")
+        XCTAssertEqual(ready.modelID, "fixture-api-model")
+        XCTAssertNotEqual(ready.runtime, configuration.runtime)
+        XCTAssertNotEqual(ready.modelID, configuration.modelID)
+    }
+
+    // WHY: an incomplete API selection must fail loudly. Inheriting the local
+    // E4B/default model id silently turns an API-only choice into mixed identity.
+    func test_configurationRejectsOpenAICompatibleTargetWithoutExplicitModel() {
+        XCTAssertThrowsError(try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code",
+            generateBaseURL: "http://127.0.0.1:8000/v1",
+            generateModel: "   "
+        )) { error in
+            XCTAssertEqual(error as? DistillServiceError, .missingRequiredOption("--generate-model"))
+        }
+    }
+
     func test_configurationRejectsInvalidOpenAICompatibleGenerateURL() {
         XCTAssertThrowsError(try DistillServiceConfiguration(
             authToken: "sidecar-token",
@@ -258,6 +315,62 @@ final class DistillServiceTests: XCTestCase {
         )) { error in
             XCTAssertEqual(error as? DistillServiceError, .invalidGenerateBaseURL("not-a-url"))
         }
+    }
+
+    func test_configurationRejectsRemotePlaintextHTTPButAllowsLoopbackHTTPAndRemoteHTTPS() throws {
+        XCTAssertThrowsError(try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code",
+            generateBaseURL: "http://api.example.com/v1",
+            generateModel: "model"
+        )) { error in
+            XCTAssertEqual(error as? DistillServiceError, .invalidGenerateBaseURL("http://api.example.com/v1"))
+        }
+
+        _ = try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code",
+            generateBaseURL: "http://localhost:8000/v1",
+            generateModel: "model"
+        )
+        _ = try DistillServiceConfiguration(
+            authToken: "sidecar-token",
+            appSupportDirectory: "/tmp/remote-code",
+            generateBaseURL: "https://api.example.com/v1",
+            generateModel: "model"
+        )
+    }
+
+    func test_configurationParsesGenerateTokenFromSecureStandardInputTransport() throws {
+        let token = "secret-that-must-not-appear-in-argv"
+        let configuration = try DistillServiceConfiguration.parse(
+            arguments: [
+                "--auth-token", "sidecar-token",
+                "--app-support-dir", "/tmp/remote-code",
+                "--generate-base-url", "https://api.example.com/v1",
+                "--generate-model", "model",
+                "--generate-token-stdin", "true",
+            ],
+            generateTokenFromStandardInput: token
+        )
+
+        XCTAssertEqual(configuration.generateToken, token)
+    }
+
+    func test_configurationNeverAcceptsGenerateTokenFromProcessArguments() throws {
+        let configuration = try DistillServiceConfiguration.parse(arguments: [
+            "--auth-token", "sidecar-token",
+            "--app-support-dir", "/tmp/remote-code",
+            "--generate-base-url", "https://api.example.com/v1",
+            "--generate-model", "model",
+            "--generate-token", "secret-visible-in-process-list",
+        ])
+
+        XCTAssertEqual(
+            configuration.generateToken,
+            "",
+            "API credentials must come only from the private stdin pipe, never argv"
+        )
     }
 
     func test_httpServerRequiresBearerTokenAndServesDistillRequests() async throws {

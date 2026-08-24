@@ -62,6 +62,39 @@ public struct AppSettingsKeys {
     ]
 }
 
+public enum TokenSaverSettingsCopy {
+    public static func overview(source: TokenSaverModelSource) -> String {
+        source == .openaiCompat
+            ? "Compresses large tool output using your OpenAI-compatible API so fewer tokens reach the remote provider."
+            : "Compresses large tool output using the local MLX model so fewer tokens reach the remote provider."
+    }
+
+    public static func sourceDescription(source: TokenSaverModelSource) -> String {
+        source == .openaiCompat
+            ? "Catalog generate and Distill both use the configured API endpoint and model."
+            : "Default: 1.7B on 16 GiB or less, E4B when RAM is greater than 16 GiB. Catalog generate and Distill both use this choice."
+    }
+
+    public static func trainingDescription(source: TokenSaverModelSource) -> String {
+        source == .openaiCompat
+            ? "When on, every API-backed Distill generate (CLI, HTTP, MCP, catalog) writes ChatML JSONL under TokenSaver/training."
+            : "When on, every local Distill generate (CLI, HTTP, MCP, catalog) writes ChatML JSONL under TokenSaver/training."
+    }
+
+    public static let apiProbeHint = "Sends a short request to the configured OpenAI-compatible API."
+
+    public static func apiProbeProgress(baseURL: String) -> String {
+        guard let host = TokenSaverGenerateTarget.parseAPIBaseURL(baseURL)?.host?
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            .lowercased() else {
+            return "Waiting for the API…"
+        }
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
+            ? "Waiting for the local API…"
+            : "Waiting for the API…"
+    }
+}
+
 // MARK: - Devices panel pure formatters
 
 /// Pure display fields derived from a DeviceTrust value. No MainActor needed;
@@ -714,6 +747,7 @@ public final class SettingsViewModel: ObservableObject {
         )
         appSettings = settingsStore.reload()
         appSettings.tokenSaverEnabled = outcome.isEnabled
+        context.tokenSaverConfigurationDidChange()
         refreshDistillInstallStatus()
     }
 
@@ -721,6 +755,7 @@ public final class SettingsViewModel: ObservableObject {
         appSettings.tokenSaverModelSource = source
         settingsStore.update { $0.tokenSaverModelSource = source }
         resetTokenSaverAPIProbe()
+        context.tokenSaverConfigurationDidChange()
         context.restartTokenSaverDistillIfRunning()
     }
 
@@ -728,6 +763,7 @@ public final class SettingsViewModel: ObservableObject {
         appSettings.tokenSaverAPIBaseURL = value
         settingsStore.update { $0.tokenSaverAPIBaseURL = value }
         resetTokenSaverAPIProbe()
+        context.tokenSaverConfigurationDidChange()
         scheduleTokenSaverDistillRestart()
     }
 
@@ -735,6 +771,7 @@ public final class SettingsViewModel: ObservableObject {
         appSettings.tokenSaverAPIModel = value
         settingsStore.update { $0.tokenSaverAPIModel = value }
         resetTokenSaverAPIProbe()
+        context.tokenSaverConfigurationDidChange()
         scheduleTokenSaverDistillRestart()
     }
 
@@ -742,21 +779,28 @@ public final class SettingsViewModel: ObservableObject {
         appSettings.tokenSaverAPIToken = value
         settingsStore.update { $0.tokenSaverAPIToken = value }
         resetTokenSaverAPIProbe()
+        context.tokenSaverConfigurationDidChange()
         scheduleTokenSaverDistillRestart()
     }
 
     public var canTestTokenSaverAPI: Bool {
-        appSettings.tokenSaverEnabled
-            && appSettings.tokenSaverModelSource == .openaiCompat
+        appSettings.tokenSaverModelSource == .openaiCompat
             && tokenSaverAPIProbeStatus != .testing
             && TokenSaverGenerateTarget.parseAPIBaseURL(appSettings.tokenSaverAPIBaseURL) != nil
+            && !appSettings.tokenSaverAPIModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     public func testTokenSaverAPI() {
-        guard appSettings.tokenSaverEnabled, appSettings.tokenSaverModelSource == .openaiCompat else { return }
+        guard appSettings.tokenSaverModelSource == .openaiCompat else { return }
         guard tokenSaverAPIProbeStatus != .testing else { return }
         guard TokenSaverGenerateTarget.parseAPIBaseURL(appSettings.tokenSaverAPIBaseURL) != nil else {
             tokenSaverAPIProbeStatus = .failed("Enter a URL like http://127.0.0.1:8000/v1")
+            return
+        }
+        guard !appSettings.tokenSaverAPIModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            tokenSaverAPIProbeStatus = .failed(
+                "Enter the API model id used by your OpenAI-compatible server"
+            )
             return
         }
         tokenSaverAPIProbeStatus = .testing
@@ -1862,7 +1906,7 @@ public struct SettingsView: View {
                 .labelsHidden()
                 .accessibilityIdentifier("settings.tokenSaver.enabled.toggle")
             }
-            Text("Compresses large tool output using the local MLX model so fewer tokens reach the remote provider. Settings and the sidebar share the same subscription, model-readiness, and cleanup lifecycle.")
+            Text(TokenSaverSettingsCopy.overview(source: vm.appSettings.tokenSaverModelSource))
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
             settingRow("Distill model") {
@@ -1878,10 +1922,9 @@ public struct SettingsView: View {
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .frame(maxWidth: 260)
-                .disabled(!vm.appSettings.tokenSaverEnabled)
                 .accessibilityIdentifier("settings.tokenSaver.modelSource.picker")
             }
-            Text("Default: 1.7B on 16 GiB or less, E4B when RAM is greater than 16 GiB. Catalog generate and Distill both use this choice.")
+            Text(TokenSaverSettingsCopy.sourceDescription(source: vm.appSettings.tokenSaverModelSource))
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
             if vm.appSettings.tokenSaverModelSource == .openaiCompat {
@@ -1892,7 +1935,6 @@ public struct SettingsView: View {
                     ))
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 320)
-                    .disabled(!vm.appSettings.tokenSaverEnabled)
                     .accessibilityIdentifier("settings.tokenSaver.apiBaseURL.field")
                 }
                 settingRow("API model") {
@@ -1902,7 +1944,6 @@ public struct SettingsView: View {
                     ))
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 320)
-                    .disabled(!vm.appSettings.tokenSaverEnabled)
                     .accessibilityIdentifier("settings.tokenSaver.apiModel.field")
                 }
                 settingRow("API token") {
@@ -1912,7 +1953,6 @@ public struct SettingsView: View {
                     ))
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 320)
-                    .disabled(!vm.appSettings.tokenSaverEnabled)
                     .accessibilityIdentifier("settings.tokenSaver.apiToken.field")
                 }
                 settingRow("Connection") {
@@ -1934,7 +1974,7 @@ public struct SettingsView: View {
                     .buttonStyle(DSSecondaryButtonStyle())
                     .disabled(!vm.canTestTokenSaverAPI)
                     .accessibilityLabel(vm.tokenSaverAPIProbeStatus == .testing ? "Testing API" : "Test API")
-                    .accessibilityHint("Sends a short request to the OpenAI-compatible URL to confirm the local model answers.")
+                    .accessibilityHint(TokenSaverSettingsCopy.apiProbeHint)
                     .accessibilityIdentifier("settings.tokenSaver.testAPI.button")
                 }
                 tokenSaverAPIProbeStatusRow
@@ -1948,7 +1988,7 @@ public struct SettingsView: View {
                 .disabled(!vm.appSettings.tokenSaverEnabled)
                 .accessibilityIdentifier("settings.tokenSaver.saveTrainingPrompts.toggle")
             }
-            Text("When on, every local Distill generate (CLI, HTTP, MCP, catalog) writes ChatML JSONL under TokenSaver/training.")
+            Text(TokenSaverSettingsCopy.trainingDescription(source: vm.appSettings.tokenSaverModelSource))
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
             Button("Show training folder") {
@@ -2038,7 +2078,7 @@ public struct SettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("settings.tokenSaver.testAPI.idle")
         case .testing:
-            Text("Waiting for the local API…")
+            Text(TokenSaverSettingsCopy.apiProbeProgress(baseURL: vm.appSettings.tokenSaverAPIBaseURL))
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)

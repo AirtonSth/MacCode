@@ -11,6 +11,10 @@ import os
 
 private let appContextRuntimeLog = Logger(subsystem: "io.remotecode.agent", category: "app-context")
 
+public extension Notification.Name {
+    static let rc2TokenSaverConfigurationChanged = Notification.Name("rc2TokenSaverConfigurationChanged")
+}
+
 // MARK: - Token Saver per-lane kill switch + governance snapshot
 
 /// WHY: Operators need a per-lane incident control point without full Token Saver
@@ -512,12 +516,27 @@ public final class AppContext {
         let subscribed: Bool
     }
     private var tokenSaverAccountObserver: NSObjectProtocol?
+    private var tokenSaverBootModelValidationTask: Task<Void, Never>?
     private var tokenSaverEntitlementReconcileTask: Task<Void, Never>?
+    private var tokenSaverEntitlementReconcileTaskID: UUID?
+    private var tokenSaverPreferredModelActivationTask: Task<Void, Never>?
     private var lastTokenSaverAccountIdentity: TokenSaverAccountIdentity?
     private var tokenSaverRuntimeAdmitted = false
     /// Test seam for account-change readiness without installing multi-GB models.
     /// Production leaves this nil and validates the real on-disk manifests.
     var tokenSaverEntitlementModelValidationOverrideForTesting: TokenSaverModelValidation?
+    var beforeTokenSaverBackgroundModelValidationForTesting: (@Sendable () -> Void)?
+    var tokenSaverBackgroundModelValidationOverrideForTesting: (@Sendable () -> TokenSaverModelValidation)?
+    var tokenSaverEntitlementReconcileInFlightForTesting: Bool {
+        tokenSaverEntitlementReconcileTask != nil
+    }
+    var tokenSaverPreferredModelActivationEligibilityOverrideForTesting: Bool?
+    var tokenSaverPreferredModelActivationDownloadForTesting: (@Sendable () async throws -> Void)?
+    var beforeTokenSaverPreferredModelValidationForTesting: (() -> Void)?
+    var beforeTokenSaverPreferredModelRestartForTesting: (() -> Void)?
+    var tokenSaverPreferredModelActivationInFlightForTesting: Bool {
+        tokenSaverPreferredModelActivationTask != nil
+    }
     var queueDrainWaiterCountForTesting: Int { queueDrainWaiters.count }
     var queueDrainSuppressedThreadCountForTesting: Int { queueDrainSuppressionLeases.count }
     #if DEBUG
@@ -1085,6 +1104,15 @@ public final class AppContext {
                         ),
                         persistPreference: false
                     )
+                } else if !Self.tokenSaverUsesLocalModel(settings: bootSettings) {
+                    // API targets have no local readiness work. The lifecycle
+                    // planner admits a valid API immediately and fails an invalid
+                    // API loudly without ever falling back to local validation.
+                    _ = applyTokenSaverLifecycle(
+                        requestedEnabled: true,
+                        modelValidation: .installed,
+                        persistPreference: false
+                    )
                 } else {
                     // Model validation may hash multi-GB weights on a cold cache.
                     // Revoke paid runtime synchronously, then admit it only after
@@ -1094,13 +1122,22 @@ public final class AppContext {
                         persistPreference: false
                     )
                     let appSupport = appSupportDirectory
-                    Task { @MainActor [weak self] in
-                        let validation = await Task.detached(priority: .utility) {
-                            TokenSaverModelInstaller(appSupportDirectory: appSupport)
-                                .validateInstalledTokenSaverModels()
-                        }.value
-                        guard let self,
-                              SettingsStore(db: self.db).load().tokenSaverEnabled else {
+                    tokenSaverBootModelValidationTask = Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        defer {
+                            self.tokenSaverBootModelValidationTask = nil
+                        }
+                        let validation = await Self.tokenSaverBackgroundModelValidation(
+                            appSupportDirectory: appSupport,
+                            settings: bootSettings,
+                            beforeValidation: self.beforeTokenSaverBackgroundModelValidationForTesting,
+                            validationOverride: self.tokenSaverBackgroundModelValidationOverrideForTesting
+                        )
+                        let currentSettings = SettingsStore(db: self.db).load()
+                        guard !Task.isCancelled,
+                              let validation,
+                              currentSettings.tokenSaverEnabled,
+                              Self.tokenSaverUsesLocalModel(settings: currentSettings) else {
                             return
                         }
                         _ = self.applyTokenSaverLifecycle(
@@ -1590,7 +1627,9 @@ public final class AppContext {
 
     deinit {
         deletedThreadRetirementRetryTask?.cancel()
+        tokenSaverBootModelValidationTask?.cancel()
         tokenSaverEntitlementReconcileTask?.cancel()
+        tokenSaverPreferredModelActivationTask?.cancel()
         if let tokenSaverAccountObserver {
             NotificationCenter.default.removeObserver(tokenSaverAccountObserver)
         }
@@ -2312,6 +2351,50 @@ public final class AppContext {
     /// `persistPreference` is false at boot so a temporarily unavailable account
     /// does not erase the user's choice. Interactive toggles pass true so a
     /// rejected enable cannot leave the UI/store claiming Token Saver is active.
+    nonisolated static func tokenSaverUsesLocalModel(settings: AppSettings) -> Bool {
+        if case .local = settings.tokenSaverGenerateTarget { return true }
+        return false
+    }
+
+    nonisolated static func tokenSaverModelValidation(
+        settings: AppSettings,
+        localValidation: () -> TokenSaverModelValidation
+    ) -> TokenSaverModelValidation {
+        guard tokenSaverUsesLocalModel(settings: settings) else { return .installed }
+        return localValidation()
+    }
+
+    nonisolated static func tokenSaverBackgroundModelValidation(
+        appSupportDirectory: URL,
+        settings: AppSettings,
+        beforeValidation: (@Sendable () -> Void)? = nil,
+        validationOverride: (@Sendable () -> TokenSaverModelValidation)? = nil
+    ) async -> TokenSaverModelValidation? {
+        guard tokenSaverUsesLocalModel(settings: settings) else { return .installed }
+        let child = Task.detached(priority: .utility) { () throws -> TokenSaverModelValidation in
+            beforeValidation?()
+            try Task.checkCancellation()
+            if let validationOverride { return validationOverride() }
+            return try TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+                .validateInstalledTokenSaverModelsCooperatively {
+                    try Task.checkCancellation()
+                }
+        }
+        return await withTaskCancellationHandler {
+            try? await child.value
+        } onCancel: {
+            child.cancel()
+        }
+    }
+
+    public func tokenSaverConfigurationDidChange() {
+        let settings = SettingsStore(db: db).load()
+        if !settings.tokenSaverEnabled || !Self.tokenSaverUsesLocalModel(settings: settings) {
+            cancelTokenSaverLocalAsyncWork()
+            NotificationCenter.default.post(name: .rc2TokenSaverConfigurationChanged, object: self)
+        }
+    }
+
     @discardableResult
     public func applyTokenSaverLifecycle(
         requestedEnabled: Bool,
@@ -2327,6 +2410,7 @@ public final class AppContext {
         }
 
         func disableRuntime() -> String? {
+            cancelTokenSaverLocalAsyncWork()
             tokenSaverRuntimeAdmitted = false
             if persistPreference {
                 settingsStore.update { $0.tokenSaverEnabled = false }
@@ -2346,19 +2430,24 @@ public final class AppContext {
             return .disabled
         }
 
-        let session = PrivateAccountSessionStore(repo: settingsRepo).load()
-        let validation = modelValidation
-            ?? TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
-                .validateInstalledTokenSaverModels()
         let enabledSettings = settings(enabled: true)
-        let allowsExternal: Bool
-        if case .openaiCompatible = enabledSettings.tokenSaverGenerateTarget { allowsExternal = true } else { allowsExternal = false }
+        if !Self.tokenSaverUsesLocalModel(settings: enabledSettings) {
+            cancelTokenSaverLocalAsyncWork()
+        }
+        let session = PrivateAccountSessionStore(repo: settingsRepo).load()
+        let validation = Self.tokenSaverModelValidation(settings: enabledSettings) {
+            modelValidation
+                ?? TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+                    .validateInstalledTokenSaverModels()
+        }
+        let target = enabledSettings.tokenSaverGenerateTarget
         let decision = TokenSaverDistillLaunchPlanner.decide(.init(
             hasPrivateAccount: session != nil,
             isSubscribed: session?.user.subscribed == true,
             tokenSaverEnabled: true,
             modelValidation: validation,
-            allowsExternalGenerate: allowsExternal
+            allowsExternalGenerate: target.usesExternalGenerate,
+            externalGenerateError: target.configurationError
         ))
 
         switch decision {
@@ -2400,10 +2489,15 @@ public final class AppContext {
     /// Restart the Distill sidecar so Settings model / API / training changes take effect.
     public func restartTokenSaverDistillIfRunning() {
         let settings = SettingsStore(db: db).load()
+        if !settings.tokenSaverEnabled || !Self.tokenSaverUsesLocalModel(settings: settings) {
+            cancelTokenSaverLocalAsyncWork()
+        }
         guard settings.tokenSaverEnabled, tokenSaverRuntimeAdmitted else { return }
         let session = PrivateAccountSessionStore(repo: settingsRepo).load()
-        let validation = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
-            .validateInstalledTokenSaverModels()
+        let validation = Self.tokenSaverModelValidation(settings: settings) {
+            TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+                .validateInstalledTokenSaverModels()
+        }
         tokenSaverDistillServiceController.stop()
         tokenSaverDistillServiceController.startIfEligible(
             session: session,
@@ -2445,10 +2539,9 @@ public final class AppContext {
         guard identity != lastTokenSaverAccountIdentity else { return }
         lastTokenSaverAccountIdentity = identity
         tokenSaverEntitlementReconcileTask?.cancel()
-        tokenSaverEntitlementReconcileTask = nil
 
-        let requested = SettingsStore(db: db).load().tokenSaverEnabled
-        guard requested else {
+        let storedSettings = SettingsStore(db: db).load()
+        guard storedSettings.tokenSaverEnabled else {
             _ = applyTokenSaverLifecycle(
                 requestedEnabled: false,
                 persistPreference: false
@@ -2462,6 +2555,14 @@ public final class AppContext {
                     state: .missing,
                     reason: "model readiness not evaluated without subscription"
                 ),
+                persistPreference: false
+            )
+            return
+        }
+        guard Self.tokenSaverUsesLocalModel(settings: storedSettings) else {
+            _ = applyTokenSaverLifecycle(
+                requestedEnabled: true,
+                modelValidation: .installed,
                 persistPreference: false
             )
             return
@@ -2483,18 +2584,30 @@ public final class AppContext {
         }
 
         let appSupport = appSupportDirectory
+        let validationID = UUID()
+        tokenSaverEntitlementReconcileTaskID = validationID
         tokenSaverEntitlementReconcileTask = Task { @MainActor [weak self] in
-            let validation = await Task.detached(priority: .utility) {
-                TokenSaverModelInstaller(appSupportDirectory: appSupport)
-                    .validateInstalledTokenSaverModels()
-            }.value
+            guard let self else { return }
+            defer {
+                if self.tokenSaverEntitlementReconcileTaskID == validationID {
+                    self.tokenSaverEntitlementReconcileTask = nil
+                    self.tokenSaverEntitlementReconcileTaskID = nil
+                }
+            }
+            let validation = await Self.tokenSaverBackgroundModelValidation(
+                appSupportDirectory: appSupport,
+                settings: storedSettings,
+                beforeValidation: self.beforeTokenSaverBackgroundModelValidationForTesting,
+                validationOverride: self.tokenSaverBackgroundModelValidationOverrideForTesting
+            )
+            let currentSettings = SettingsStore(db: self.db).load()
             guard !Task.isCancelled,
-                  let self,
+                  let validation,
                   self.currentTokenSaverAccountIdentity() == identity,
-                  SettingsStore(db: self.db).load().tokenSaverEnabled else {
+                  currentSettings.tokenSaverEnabled,
+                  Self.tokenSaverUsesLocalModel(settings: currentSettings) else {
                 return
             }
-            self.tokenSaverEntitlementReconcileTask = nil
             _ = self.applyTokenSaverLifecycle(
                 requestedEnabled: true,
                 modelValidation: validation,
@@ -2520,17 +2633,19 @@ public final class AppContext {
         }
 
         let session = PrivateAccountSessionStore(repo: settingsRepo).load()
-        let validation = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
-            .validateInstalledTokenSaverModels()
         let currentSettings = SettingsStore(db: db).load()
-        let allowsExternal: Bool
-        if case .openaiCompatible = currentSettings.tokenSaverGenerateTarget { allowsExternal = true } else { allowsExternal = false }
+        let validation = Self.tokenSaverModelValidation(settings: currentSettings) {
+            TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+                .validateInstalledTokenSaverModels()
+        }
+        let target = currentSettings.tokenSaverGenerateTarget
         let decision = TokenSaverDistillLaunchPlanner.decide(.init(
             hasPrivateAccount: session != nil,
             isSubscribed: session?.user.subscribed == true,
             tokenSaverEnabled: true,
             modelValidation: validation,
-            allowsExternalGenerate: allowsExternal
+            allowsExternalGenerate: target.usesExternalGenerate,
+            externalGenerateError: target.configurationError
         ))
         switch decision {
         case .start:
@@ -2787,8 +2902,10 @@ public final class AppContext {
     private func startTokenSaverDistillServiceIfEligible() {
         let settings = SettingsStore(db: db).load()
         let session = PrivateAccountSessionStore(repo: settingsRepo).load()
-        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
-        let modelValidation = installer.validateInstalledTokenSaverModels()
+        let modelValidation = Self.tokenSaverModelValidation(settings: settings) {
+            TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+                .validateInstalledTokenSaverModels()
+        }
         tokenSaverDistillServiceController.startIfEligible(
             session: session,
             settings: settings,
@@ -2804,39 +2921,74 @@ public final class AppContext {
     /// activate it (write its manifest) and restart the sidecar so it actually loads it (`start()`
     /// no-ops while the sidecar is running). A not-yet-downloaded model is left alone: that
     /// multi-GB download stays toggle/UI-driven so launch never starts one silently.
-    private func activatePreferredTokenSaverModelIfDownloaded(settings: AppSettings, session: PrivateAccountSession?) {
-        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+    func activatePreferredTokenSaverModelIfDownloaded(settings: AppSettings, session: PrivateAccountSession?) {
         guard settings.tokenSaverEnabled,
-              installer.validateInstalledModel(requireSelectedModel: true).state != .installed,  // selected not active
-              installer.validateInstalledModel(requireSelectedModel: false).state == .installed,  // a fallback IS active
-              installer.modelArtifactsPresent() else {                                           // selected already downloaded
+              Self.tokenSaverUsesLocalModel(settings: settings) else {
+            cancelTokenSaverLocalAsyncWork()
+            return
+        }
+        guard tokenSaverPreferredModelActivationTask == nil else { return }
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+        let eligible = tokenSaverPreferredModelActivationEligibilityOverrideForTesting ?? (
+            installer.validateInstalledModel(requireSelectedModel: true).state != .installed
+                && installer.validateInstalledModel(requireSelectedModel: false).state == .installed
+                && installer.modelArtifactsPresent()
+        )
+        guard eligible else {
             return
         }
         let appSupport = appSupportDirectory
-        Task { @MainActor [weak self] in
+        tokenSaverPreferredModelActivationTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            defer {
+                self.tokenSaverPreferredModelActivationTask = nil
+            }
             let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
             do {
                 // Writes the selected model's manifest; the already-present files are skipped via
                 // their cached checksums, so this does not re-download multiple GB.
-                _ = try await TokenSaverModelDownloader(installer: installer).downloadRequiredModels { _ in }
-                guard self.isTokenSaverRuntimeActive(),
+                if let download = self.tokenSaverPreferredModelActivationDownloadForTesting {
+                    try await download()
+                } else {
+                    _ = try await TokenSaverModelDownloader(installer: installer).downloadRequiredModels { _ in }
+                }
+                try Task.checkCancellation()
+                let currentSettings = SettingsStore(db: self.db).load()
+                guard currentSettings.tokenSaverEnabled,
+                      Self.tokenSaverUsesLocalModel(settings: currentSettings),
+                      self.isTokenSaverRuntimeActive(settings: currentSettings),
                       let currentSession = PrivateAccountSessionStore(repo: self.settingsRepo).load(),
                       currentSession.user.subscribed else {
                     return
                 }
-                let currentSettings = SettingsStore(db: self.db).load()
+                try Task.checkCancellation()
+                self.beforeTokenSaverPreferredModelValidationForTesting?()
+                let validation = installer.validateInstalledTokenSaverModels()
+                try Task.checkCancellation()
+                self.beforeTokenSaverPreferredModelRestartForTesting?()
                 self.tokenSaverDistillServiceController.stop()
                 self.tokenSaverDistillServiceController.startIfEligible(
                     session: currentSession,
                     settings: currentSettings,
-                    modelValidation: installer.validateInstalledTokenSaverModels()
+                    modelValidation: validation
                 )
                 NSLog("RemoteCode Token Saver: activated preferred model \(TokenSaverApprovedModels.selected().id)")
+            } catch is CancellationError {
+                return
             } catch {
                 NSLog("RemoteCode Token Saver preferred-model activation failed: \(error)")
             }
         }
+    }
+
+    private func cancelTokenSaverPreferredModelActivation() {
+        tokenSaverPreferredModelActivationTask?.cancel()
+    }
+
+    private func cancelTokenSaverLocalAsyncWork() {
+        cancelTokenSaverPreferredModelActivation()
+        tokenSaverBootModelValidationTask?.cancel()
+        tokenSaverEntitlementReconcileTask?.cancel()
     }
 
     private func recordTokenSaverAccountUsage(_ usage: AssistantAccountUsage) {

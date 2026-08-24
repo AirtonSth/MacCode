@@ -1,5 +1,14 @@
 import Foundation
 
+public enum OpenAICompatibleDistillRuntimeError: Error, Sendable, Equatable {
+    case warmupFailed
+}
+
+public enum OpenAICompatibleFallbackReason: String, Sendable, Equatable {
+    case requestFailed
+    case unusableOutput
+}
+
 /// Distill generate via an OpenAI-compatible HTTP endpoint (oMLX, llama.cpp server).
 /// Deterministic crushers still run first. Transport errors fail open to the original.
 public struct OpenAICompatibleDistillRuntime: DistillRuntime {
@@ -8,18 +17,21 @@ public struct OpenAICompatibleDistillRuntime: DistillRuntime {
     public let token: String
     public let timeout: TimeInterval
     private let complete: @Sendable (String, String, String, Int) async -> String?
+    private let onFallback: @Sendable (OpenAICompatibleFallbackReason) async -> Void
 
     public init(
         baseURL: URL,
         model: String,
         token: String = "",
         timeout: TimeInterval = 20,
-        complete: (@Sendable (String, String, String, Int) async -> String?)? = nil
+        complete: (@Sendable (String, String, String, Int) async -> String?)? = nil,
+        onFallback: @escaping @Sendable (OpenAICompatibleFallbackReason) async -> Void = { _ in }
     ) {
         self.baseURL = baseURL
         self.model = model
         self.token = token
         self.timeout = timeout
+        self.onFallback = onFallback
         if let complete {
             self.complete = complete
         } else {
@@ -70,19 +82,32 @@ public struct OpenAICompatibleDistillRuntime: DistillRuntime {
         let requested = max(32, request.maxOutputCharacters / 4)
         let maxTokens = request.mode == .wireEncode ? min(128, requested) : min(512, requested)
         guard let raw = await complete(system, user, model, maxTokens) else {
-            return DistillStageResult(output: request.input, stage: .llmMLX)
+            await onFallback(.requestFailed)
+            return DistillStageResult(output: request.input, stage: .apiExternal)
         }
         let cleaned = MLXDistillRuntime.cleanOutput(raw)
         let normalized = request.mode == .commandOutput
             ? MLXDistillRuntime.collapseDuplicatedCommandOutput(cleaned)
             : cleaned
         guard MLXDistillRuntime.isUsefulOutput(normalized, mode: request.mode) else {
-            return DistillStageResult(output: request.input, stage: .llmMLX)
+            await onFallback(.unusableOutput)
+            return DistillStageResult(output: request.input, stage: .apiExternal)
         }
         return DistillStageResult(
             output: MLXDistillRuntime.guardLossyProseOutput(normalized, request: request),
-            stage: .llmMLX
+            stage: .apiExternal
         )
+    }
+
+    public func warmup() async throws {
+        guard let reply = await complete(
+            "Reply with exactly ready.",
+            "ready",
+            model,
+            8
+        ), !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw OpenAICompatibleDistillRuntimeError.warmupFailed
+        }
     }
 
     public func rawGenerate(system: String, user: String, maxTokens: Int) async -> String? {

@@ -70,19 +70,22 @@ public struct TokenSaverDistillLaunchInput: Sendable, Equatable {
     public let tokenSaverEnabled: Bool
     public let modelValidation: TokenSaverModelValidation
     public let allowsExternalGenerate: Bool
+    public let externalGenerateError: String?
 
     public init(
         hasPrivateAccount: Bool,
         isSubscribed: Bool,
         tokenSaverEnabled: Bool,
         modelValidation: TokenSaverModelValidation,
-        allowsExternalGenerate: Bool = false
+        allowsExternalGenerate: Bool = false,
+        externalGenerateError: String? = nil
     ) {
         self.hasPrivateAccount = hasPrivateAccount
         self.isSubscribed = isSubscribed
         self.tokenSaverEnabled = tokenSaverEnabled
         self.modelValidation = modelValidation
         self.allowsExternalGenerate = allowsExternalGenerate
+        self.externalGenerateError = externalGenerateError
     }
 }
 
@@ -96,6 +99,9 @@ public enum TokenSaverDistillLaunchPlanner {
         }
         guard input.tokenSaverEnabled else {
             return .skip(reason: "token saver disabled")
+        }
+        if let error = input.externalGenerateError {
+            return .skip(reason: error)
         }
         if !input.allowsExternalGenerate {
             guard input.modelValidation.state == .installed else {
@@ -510,6 +516,28 @@ public protocol DistillProcessSpawning: Sendable {
     /// Create and run a process.  Must call `process.run()` before returning.
     /// Throws if the process cannot be launched.
     func spawn(executableURL: URL, arguments: [String]) throws -> DistillSpawnResult
+    func spawn(
+        executableURL: URL,
+        arguments: [String],
+        standardInput: Data?
+    ) throws -> DistillSpawnResult
+}
+
+public enum DistillProcessSpawningError: Error, Sendable, Equatable {
+    case standardInputUnsupported
+}
+
+public extension DistillProcessSpawning {
+    func spawn(
+        executableURL: URL,
+        arguments: [String],
+        standardInput: Data?
+    ) throws -> DistillSpawnResult {
+        guard standardInput == nil else {
+            throw DistillProcessSpawningError.standardInputUnsupported
+        }
+        return try spawn(executableURL: executableURL, arguments: arguments)
+    }
 }
 
 /// Real (production) spawner: creates a `Process` with two `Pipe` instances and
@@ -519,14 +547,28 @@ public struct RealDistillProcessSpawner: DistillProcessSpawning, Sendable {
     public init() {}
 
     public func spawn(executableURL: URL, arguments: [String]) throws -> DistillSpawnResult {
+        try spawn(executableURL: executableURL, arguments: arguments, standardInput: nil)
+    }
+
+    public func spawn(
+        executableURL: URL,
+        arguments: [String],
+        standardInput: Data?
+    ) throws -> DistillSpawnResult {
         let process = Process()
         let stdout = Pipe()
         let stderr = Pipe()
+        let stdin = standardInput == nil ? nil : Pipe()
         process.executableURL = executableURL
         process.standardOutput = stdout
         process.standardError = stderr
+        process.standardInput = stdin
         process.arguments = arguments
         try process.run()
+        if let standardInput, let stdin {
+            stdin.fileHandleForWriting.write(standardInput)
+            try? stdin.fileHandleForWriting.close()
+        }
         let ownershipTag = try ProcessSpawnTagger.tagProcess(process, managedKind: .sidecar)
         return DistillSpawnResult(
             process: process,
@@ -710,14 +752,14 @@ public final class TokenSaverDistillServiceController {
         modelValidation: TokenSaverModelValidation
     ) {
         lastStartSettings = settings
-        let allowsExternal: Bool
-        if case .openaiCompatible = settings.tokenSaverGenerateTarget { allowsExternal = true } else { allowsExternal = false }
+        let target = settings.tokenSaverGenerateTarget
         let decision = TokenSaverDistillLaunchPlanner.decide(TokenSaverDistillLaunchInput(
             hasPrivateAccount: session != nil,
             isSubscribed: session?.user.subscribed == true,
             tokenSaverEnabled: settings.tokenSaverEnabled,
             modelValidation: modelValidation,
-            allowsExternalGenerate: allowsExternal
+            allowsExternalGenerate: target.usesExternalGenerate,
+            externalGenerateError: target.configurationError
         ))
 
         switch decision {
@@ -917,39 +959,51 @@ public final class TokenSaverDistillServiceController {
         stderrOutputBuffer.removeAll(keepingCapacity: false)
         lastStderrLine = nil
         let settings = lastStartSettings ?? AppSettings()
-        let localModel = settings.tokenSaverLocalModel
-        let model: TokenSaverApprovedModel
-        if case .openaiCompatible = settings.tokenSaverGenerateTarget {
-            model = localModel
-        } else {
-            model = localModel
-        }
         let memoryProfile = memoryProfileProvider()
         var arguments = [
             "--auth-token", token,
             "--app-support-dir", appSupportDirectory.path,
             "--host", "127.0.0.1",
-            "--port", "0",
-            "--runtime", model.runtime,
-            "--model-id", model.id,
-            "--model-url", model.url,
+            "--port", "0"
+        ]
+        var standardInput: Data?
+        switch settings.tokenSaverGenerateTarget {
+        case .local(let model):
+            arguments += [
+                "--runtime", model.runtime,
+                "--model-id", model.id,
+                "--model-url", model.url
+            ]
+        case let .openaiCompatible(url, apiModel, apiToken):
+            arguments += [
+                "--generate-base-url", url.absoluteString,
+                "--generate-model", apiModel
+            ]
+            if !apiToken.isEmpty {
+                arguments += ["--generate-token-stdin", "true"]
+                standardInput = Data(apiToken.utf8)
+            }
+        case let .invalidOpenAICompatible(reason):
+            shouldRun = false
+            status = .blocked(reason)
+            return
+        }
+        arguments += [
             "--max-concurrent-requests", String(memoryProfile.sidecarMaxConcurrentRequests),
             "--max-queue-depth", String(memoryProfile.sidecarMaxQueueDepth),
             "--max-queue-wait-ms", String(memoryProfile.sidecarMaxQueueWaitMilliseconds),
             "--idle-timeout-ms", String(idleTimeoutMS)
         ]
-        if case let .openaiCompatible(url, apiModel, apiToken) = settings.tokenSaverGenerateTarget {
-            arguments += ["--generate-base-url", url.absoluteString, "--generate-model", apiModel]
-            if !apiToken.isEmpty {
-                arguments += ["--generate-token", apiToken]
-            }
-        }
         if settings.tokenSaverSaveTrainingPrompts {
             arguments += ["--save-training-prompts", "true"]
         }
 
         do {
-            let spawned = try processSpawner.spawn(executableURL: executableURL, arguments: arguments)
+            let spawned = try processSpawner.spawn(
+                executableURL: executableURL,
+                arguments: arguments,
+                standardInput: standardInput
+            )
             let process = spawned.process
             self.process = process
             self.processOwnershipTag = spawned.ownershipTag

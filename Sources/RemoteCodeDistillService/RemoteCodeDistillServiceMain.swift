@@ -281,8 +281,18 @@ struct RemoteCodeDistillServiceMain {
                 return
             }
 
-            let configuration = try DistillServiceConfiguration.parse(arguments: programArguments)
-            let runtimeResolution = try await runtime(for: configuration)
+            let generateToken = programArguments.contains("--generate-token-stdin")
+                ? String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8)
+                : nil
+            let configuration = try DistillServiceConfiguration.parse(
+                arguments: programArguments,
+                generateTokenFromStandardInput: generateToken
+            )
+            let sharedMetrics = DistillServiceMetricsRecorder()
+            let runtimeResolution = try await runtime(
+                for: configuration,
+                onAPIFallback: { _ in await sharedMetrics.recordFallback() }
+            )
             let trainingRoot = TokenSaverTrainingDatasetWriter.defaultRoot(
                 appSupportDirectory: URL(fileURLWithPath: configuration.appSupportDirectory, isDirectory: true)
             )
@@ -307,20 +317,22 @@ struct RemoteCodeDistillServiceMain {
             // WHY: without this wiring fallback responses went through the success
             // path, so fallbackRequests stayed zero even when the model never warmed
             // up -- a permanently-cold model was undetectable via /metrics.
-            let sharedMetrics = DistillServiceMetricsRecorder()
-            // BERT-first lane (C3): a real encoder extracts the relevant lines of large
-            // command output before the LLM is touched — and runs even when the LLM failed
-            // to load (deterministic fallback above), so the BERT technique always
-            // contributes. nil embedder => behaves exactly like the base runtime.
-            let encoderRuntime = EncoderFirstRuntime(
-                wrapping: baseRuntime,
-                encoderLane: EncoderFirstRuntime.makeEncoderLane()
-            )
+            // BERT-first is a local-MLX optimization. An explicitly selected API
+            // must not construct or warm its encoder model in this process.
+            let requestRuntime: any DistillRuntime
+            if configuration.usesLocalEncoderLane {
+                requestRuntime = EncoderFirstRuntime(
+                    wrapping: baseRuntime,
+                    encoderLane: EncoderFirstRuntime.makeEncoderLane()
+                )
+            } else {
+                requestRuntime = baseRuntime
+            }
             // Per-call deadline + fail-open so a stalled/cold generation never blocks
             // the agent loop (N2). Warmup below pays the cold-start before we serve.
             let scheduler = DistillScheduler(
                 runtime: DeadlineDistillRuntime(
-                    wrapping: encoderRuntime,
+                    wrapping: requestRuntime,
                     deadlineMilliseconds: configuration.mlxCallDeadlineMS,
                     onFallback: { await sharedMetrics.recordFallback() }
                 ),
@@ -427,13 +439,10 @@ struct RemoteCodeDistillServiceMain {
             // we flip readiness and emit the ready event the controller waits for.
             // If warmup fails, skip markReady() so /readyz stays 503 and the
             // controller sees a degraded service rather than a falsely-ready one.
-            do {
-                // Warm both the encoder lane and the base runtime before readiness.
-                try await encoderRuntime.warmup()
-                server.markReady()
-            } catch {
-                FileHandle.standardError.write(Data("RemoteCodeDistillService warmup failed (service degraded, /readyz will stay 503): \(error)\n".utf8))
-            }
+            // Local mode warms encoder + base; API mode must prove the remote
+            // endpoint/model is usable before publishing readiness.
+            try await requestRuntime.warmup()
+            server.markReady()
             let encoder = JSONEncoder()
             let payload = try encoder.encode(ready)
             FileHandle.standardOutput.write(payload)
@@ -921,14 +930,18 @@ struct RemoteCodeDistillServiceMain {
         let fallbackReason: String?
     }
 
-    private static func runtime(for configuration: DistillServiceConfiguration) async throws -> RuntimeResolution {
+    private static func runtime(
+        for configuration: DistillServiceConfiguration,
+        onAPIFallback: @escaping @Sendable (OpenAICompatibleFallbackReason) async -> Void
+    ) async throws -> RuntimeResolution {
         if case let .openAICompatible(baseURL, model, token) = configuration.generateTarget {
             return RuntimeResolution(
                 runtime: OpenAICompatibleDistillRuntime(
                     baseURL: baseURL,
                     model: model,
                     token: token,
-                    timeout: Double(configuration.mlxCallDeadlineMS) / 1_000
+                    timeout: Double(configuration.mlxCallDeadlineMS) / 1_000,
+                    onFallback: onAPIFallback
                 ),
                 fallbackReason: nil
             )

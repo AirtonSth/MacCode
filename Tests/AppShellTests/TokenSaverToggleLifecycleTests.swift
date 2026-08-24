@@ -6,6 +6,51 @@ import Persistence
 
 @MainActor
 final class TokenSaverToggleLifecycleTests: XCTestCase {
+    private final class BlockingValidationGate: @unchecked Sendable {
+        private let condition = NSCondition()
+        private var started = false
+        private var released = false
+
+        func suspend() {
+            condition.lock()
+            started = true
+            condition.broadcast()
+            while !released { condition.wait() }
+            condition.unlock()
+        }
+
+        var hasStarted: Bool {
+            condition.lock()
+            defer { condition.unlock() }
+            return started
+        }
+
+        func resume() {
+            condition.lock()
+            released = true
+            condition.broadcast()
+            condition.unlock()
+        }
+    }
+
+    private final class LockedCount: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func increment() { lock.withLock { count += 1 } }
+        var value: Int { lock.withLock { count } }
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        condition: @escaping @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
     private struct Fixture {
         let context: AppContext
         let home: URL
@@ -346,6 +391,66 @@ final class TokenSaverToggleLifecycleTests: XCTestCase {
         XCTAssertTrue(SettingsStore(db: fixture.context.db).load().tokenSaverEnabled)
     }
 
+    func test_entitlementValidationSwitchToAPICancelsDetachedChildBeforeLocalValidation() async throws {
+        // WHY: entitlement renewal hashes multi-GB files off-main. A real
+        // Settings source change must cancel both its parent and detached child
+        // before the local validator can run.
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.appSupport.deletingLastPathComponent()) }
+        SettingsStore(db: fixture.context.db).update {
+            $0.tokenSaverEnabled = true
+            $0.tokenSaverModelSource = .distill17b
+        }
+        let gate = BlockingValidationGate()
+        let validations = LockedCount()
+        fixture.context.beforeTokenSaverBackgroundModelValidationForTesting = { gate.suspend() }
+        fixture.context.tokenSaverBackgroundModelValidationOverrideForTesting = {
+            validations.increment()
+            return .installed
+        }
+
+        saveSession(in: fixture.context, subscribed: true)
+        let started = await waitUntil { gate.hasStarted }
+        XCTAssertTrue(started)
+
+        let settings = SettingsViewModel(context: fixture.context)
+        settings.setTokenSaverModelSource(.openaiCompat)
+        gate.resume()
+        let finished = await waitUntil {
+            !fixture.context.tokenSaverEntitlementReconcileInFlightForTesting
+        }
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(validations.value, 0)
+        XCTAssertEqual(SettingsStore(db: fixture.context.db).load().tokenSaverModelSource, .openaiCompat)
+        XCTAssertFalse(fixture.context.isTokenSaverRuntimeActive())
+    }
+
+    func test_entitlementBackgroundValidationLocalTargetStillCompletesNormally() async throws {
+        // WHY: cancellation propagation must preserve the subscribed local path.
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.appSupport.deletingLastPathComponent()) }
+        SettingsStore(db: fixture.context.db).update {
+            $0.tokenSaverEnabled = true
+            $0.tokenSaverModelSource = .distill17b
+        }
+        let validations = LockedCount()
+        fixture.context.tokenSaverBackgroundModelValidationOverrideForTesting = {
+            validations.increment()
+            return .installed
+        }
+
+        saveSession(in: fixture.context, subscribed: true)
+        let finished = await waitUntil {
+            !fixture.context.tokenSaverEntitlementReconcileInFlightForTesting
+                && validations.value == 1
+        }
+
+        XCTAssertTrue(finished)
+        XCTAssertEqual(validations.value, 1)
+        XCTAssertTrue(fixture.context.isTokenSaverRuntimeActive())
+    }
+
     func test_terminationDoesNotReinstallFromPersistedBoolWhenEntitlementIsUnavailable() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.appSupport.deletingLastPathComponent()) }
@@ -394,5 +499,32 @@ final class TokenSaverToggleLifecycleTests: XCTestCase {
             "boot-time entitlement failure preserves the user's requested preference"
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.agentAppMiddleware.path))
+    }
+
+    func test_bootPersistedValidAPITargetAdmitsImmediatelyWithoutLocalModelAccess() throws {
+        // WHY: API-only relaunch must not revoke paid lifecycle and then wait on
+        // a local-only completion guard. A subscribed valid API target is ready
+        // synchronously and must not create local manifests or validation cache.
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.appSupport.deletingLastPathComponent()) }
+        SettingsStore(db: fixture.context.db).update {
+            $0.tokenSaverEnabled = true
+            $0.tokenSaverModelSource = .openaiCompat
+            $0.tokenSaverAPIBaseURL = "http://127.0.0.1:18080/v1"
+            $0.tokenSaverAPIModel = "fixture-api-model"
+        }
+        saveSession(in: fixture.context, subscribed: true)
+        let installer = TokenSaverModelInstaller(appSupportDirectory: fixture.appSupport)
+
+        let relaunched = try AppContext(
+            channel: .debug,
+            appSupportOverride: fixture.appSupport.path,
+            agentSkillsHomeOverrideForTesting: fixture.home
+        )
+
+        XCTAssertTrue(relaunched.isTokenSaverRuntimeActive())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installer.manifestURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installer.encoderManifestURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installer.validationCacheURL.path))
     }
 }

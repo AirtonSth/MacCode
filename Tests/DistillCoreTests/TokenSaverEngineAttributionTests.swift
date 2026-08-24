@@ -12,6 +12,7 @@ final class TokenSaverEngineAttributionTests: XCTestCase {
         XCTAssertEqual(TokenSaverEngineLabel.mode(base: "command-output", stage: .deterministic), "command-output (deterministic)")
         XCTAssertEqual(TokenSaverEngineLabel.mode(base: "command-output", stage: .encoderBERT), "command-output (bert)")
         XCTAssertEqual(TokenSaverEngineLabel.mode(base: "command-output", stage: .llmMLX), "command-output (model)")
+        XCTAssertEqual(TokenSaverEngineLabel.mode(base: "command-output", stage: .apiExternal), "command-output (api)")
         // verbatim produced no real saving -> keep the base label unchanged.
         XCTAssertEqual(TokenSaverEngineLabel.mode(base: "command-output", stage: .verbatim), "command-output")
         // unknown engine (older sidecar / legacy rows) -> base label, no suffix.

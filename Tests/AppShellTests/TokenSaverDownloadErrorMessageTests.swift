@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import AgentRuntime
+import Persistence
 @testable import AppShell
 
 // WHY these tests exist (Rule 8):
@@ -142,6 +143,56 @@ final class TokenSaverDownloadErrorMessageTests: XCTestCase {
 // Each test case must fail when the relevant boundary condition is violated.
 @MainActor
 final class TokenSaverDownloadConfirmDecisionTests: XCTestCase {
+    @MainActor
+    private final class DownloadAttemptHarness {
+        struct Attempt {
+            let progress: @MainActor (TokenSaverModelDownloadState) -> Void
+            let continuation: CheckedContinuation<TokenSaverModelManifest, Error>
+        }
+
+        private(set) var attempts: [Attempt] = []
+
+        func run(
+            progress: @escaping @MainActor (TokenSaverModelDownloadState) -> Void
+        ) async throws -> TokenSaverModelManifest {
+            try await withCheckedThrowingContinuation { continuation in
+                attempts.append(Attempt(progress: progress, continuation: continuation))
+            }
+        }
+
+        func publish(_ state: TokenSaverModelDownloadState, attempt: Int) {
+            attempts[attempt].progress(state)
+        }
+
+        func succeed(attempt: Int) {
+            attempts[attempt].continuation.resume(
+                returning: TokenSaverModelManifest(revision: "attempt-\(attempt)", files: [])
+            )
+        }
+
+        func fail(attempt: Int) {
+            attempts[attempt].continuation.resume(
+                throwing: URLError(.cannotConnectToHost)
+            )
+        }
+    }
+
+    private actor DownloadGate {
+        private var started = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        func suspend() async {
+            started = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func hasStarted() -> Bool { started }
+
+        func resume() {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
 
     private func waitUntil(
         timeout: TimeInterval = 2,
@@ -212,6 +263,61 @@ final class TokenSaverDownloadConfirmDecisionTests: XCTestCase {
     }
 
     // MARK: - Confirm gate blocks download when user cancels
+
+    func test_setTokenSaverEnabled_apiTargetSkipsAllLocalModelGates() throws {
+        // WHY: choosing an API is authoritative. The sidebar toggle must reach
+        // lifecycle admission without validating, confirming, or downloading a
+        // local model first.
+        var validationCalls = 0
+        let unexpectedValidation: SidebarViewModel.TokenSaverModelValidationProvider = {
+            validationCalls += 1
+            return TokenSaverModelValidation(state: .missing, reason: "must not run")
+        }
+        var downloadCalls = 0
+        let unexpectedDownload: SidebarViewModel.TokenSaverModelDownloadHandler = { _ in
+            downloadCalls += 1
+            throw CancellationError()
+        }
+        var confirmCalls = 0
+        let unexpectedConfirm: SidebarViewModel.TokenSaverDownloadConfirmProvider = { _, _ in
+            confirmCalls += 1
+            return false
+        }
+
+        let dir = NSTemporaryDirectory() + "RC2APIEnableNoLocalModel-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        PrivateAccountSessionStore(repo: ctx.settingsRepo).save(PrivateAccountSession(
+            accessToken: "tok",
+            refreshToken: "ref",
+            user: PrivateAccountUser(daysRemaing: nil, daysRemaining: 30, email: "paid@example.com", id: "paid", subscribed: true)
+        ))
+        SettingsStore(db: ctx.db).update {
+            $0.tokenSaverEnabled = false
+            $0.tokenSaverModelSource = .openaiCompat
+            $0.tokenSaverAPIBaseURL = "http://127.0.0.1:18080/v1"
+            $0.tokenSaverAPIModel = "fixture-api-model"
+        }
+
+        let vm = SidebarViewModel(
+            context: ctx,
+            router: router,
+            tokenSaverModelValidationProvider: unexpectedValidation,
+            tokenSaverModelDownloadHandler: unexpectedDownload,
+            tokenSaverDownloadConfirmProvider: unexpectedConfirm
+        )
+        vm.reload()
+
+        vm.setTokenSaverEnabled(true)
+
+        XCTAssertEqual(validationCalls, 0)
+        XCTAssertEqual(downloadCalls, 0)
+        XCTAssertEqual(confirmCalls, 0)
+        XCTAssertTrue(vm.tokenSaverEnabled)
+        XCTAssertTrue(SettingsStore(db: ctx.db).load().tokenSaverEnabled)
+        XCTAssertFalse(vm.showsTokenSaverModelDownload)
+    }
 
     func test_setTokenSaverEnabled_doesNotBeginDownload_whenConfirmDenied() async throws {
         // WHY: if the confirm provider returns false the download must not
@@ -297,6 +403,143 @@ final class TokenSaverDownloadConfirmDecisionTests: XCTestCase {
                       "an accepted confirm must reach the download handler; the gate must not block a willing user")
         XCTAssertTrue(vm.showsTokenSaverModelDownload,
                       "the download modal must open after confirm accepted")
+    }
+
+    func test_manualLocalDownloadSwitchToAPICancelsBeforeLateEnableOrLifecycle() async throws {
+        // WHY: Settings is authoritative even while a multi-GB local download
+        // is suspended. Resuming after local -> API must observe cancellation
+        // and must not validate, persist-enable, or admit a local lifecycle.
+        let gate = DownloadGate()
+        var validationCalls = 0
+        var cancellationObserved = false
+        let validation: SidebarViewModel.TokenSaverModelValidationProvider = {
+            validationCalls += 1
+            return validationCalls == 1
+                ? TokenSaverModelValidation(state: .missing, reason: "fixture missing")
+                : .installed
+        }
+        let suspendedDownload: SidebarViewModel.TokenSaverModelDownloadHandler = { _ in
+            await gate.suspend()
+            cancellationObserved = Task.isCancelled
+            return TokenSaverModelManifest(revision: "fixture", files: [])
+        }
+
+        let dir = NSTemporaryDirectory() + "RC2ManualDownloadSwitchAPI-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "tok",
+            refreshToken: "ref",
+            user: PrivateAccountUser(daysRemaing: nil, daysRemaining: 30, email: "paid@example.com", id: "paid", subscribed: true)
+        ))
+        SettingsStore(db: context.db).update {
+            $0.tokenSaverEnabled = false
+            $0.tokenSaverModelSource = .distill17b
+            $0.tokenSaverAPIBaseURL = "http://127.0.0.1:18080/v1"
+            $0.tokenSaverAPIModel = "fixture-api-model"
+        }
+        let sidebar = SidebarViewModel(
+            context: context,
+            router: router,
+            tokenSaverModelValidationProvider: validation,
+            tokenSaverModelDownloadHandler: suspendedDownload,
+            tokenSaverDownloadConfirmProvider: { _, _ in true }
+        )
+        sidebar.reload()
+
+        sidebar.setTokenSaverEnabled(true)
+        while await !gate.hasStarted() { await Task.yield() }
+        let validationCallsBeforeSwitch = validationCalls
+        let settings = SettingsViewModel(context: context)
+        settings.setTokenSaverModelSource(.openaiCompat)
+        await gate.resume()
+        let finished = await waitUntil { !sidebar.tokenSaverModelDownloadInFlightForTesting }
+
+        XCTAssertTrue(finished)
+        XCTAssertTrue(cancellationObserved)
+        XCTAssertEqual(validationCalls, validationCallsBeforeSwitch)
+        XCTAssertEqual(validationCallsBeforeSwitch, 2)
+        XCTAssertTrue(sidebar.tokenSaverEnabled)
+        XCTAssertTrue(SettingsStore(db: context.db).load().tokenSaverEnabled)
+        XCTAssertTrue(context.isTokenSaverRuntimeActive())
+    }
+
+    func test_rapidRetryLatestDownloadOwnsProgressCompletionAndFailureEffects() async throws {
+        // WHY: a cancelled multi-GB attempt can ignore cancellation briefly.
+        // Once retry B/C owns the UI, late progress, completion, or failure from
+        // an older attempt must never replace the newest honest state.
+        let harness = DownloadAttemptHarness()
+        var validationCalls = 0
+        let validation: SidebarViewModel.TokenSaverModelValidationProvider = {
+            validationCalls += 1
+            return validationCalls == 1
+                ? TokenSaverModelValidation(state: .missing, reason: "selected missing")
+                : .installed
+        }
+        let dir = NSTemporaryDirectory() + "RC2DownloadLatestWins-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "tok",
+            refreshToken: "ref",
+            user: PrivateAccountUser(daysRemaing: nil, daysRemaining: 30, email: "paid@example.com", id: "paid", subscribed: true)
+        ))
+        SettingsStore(db: context.db).update {
+            $0.tokenSaverEnabled = false
+            $0.tokenSaverModelSource = .distill17b
+        }
+        let sidebar = SidebarViewModel(
+            context: context,
+            router: router,
+            tokenSaverModelValidationProvider: validation,
+            tokenSaverModelDownloadHandler: { progress in
+                try await harness.run(progress: progress)
+            },
+            tokenSaverDownloadConfirmProvider: { _, _ in true }
+        )
+        sidebar.reload()
+
+        sidebar.setTokenSaverEnabled(true) // A
+        let aStarted = await waitUntil { harness.attempts.count == 1 }
+        XCTAssertTrue(aStarted)
+        sidebar.retryTokenSaverModelDownload() // B owns the UI
+        let bStarted = await waitUntil { harness.attempts.count == 2 }
+        XCTAssertTrue(bStarted)
+        let bState = TokenSaverModelDownloadState(
+            phase: .downloading,
+            downloadedBytes: 200,
+            expectedBytes: 1_000,
+            statusText: "B active"
+        )
+        harness.publish(bState, attempt: 1)
+        harness.publish(.init(phase: .downloading, downloadedBytes: 999, statusText: "A stale"), attempt: 0)
+        harness.succeed(attempt: 0)
+        for _ in 0..<4 { await Task.yield() }
+        XCTAssertEqual(sidebar.tokenSaverModelDownloadState, bState)
+
+        sidebar.retryTokenSaverModelDownload() // C supersedes B
+        let cStarted = await waitUntil { harness.attempts.count == 3 }
+        XCTAssertTrue(cStarted)
+        let cState = TokenSaverModelDownloadState(
+            phase: .downloading,
+            downloadedBytes: 300,
+            expectedBytes: 1_000,
+            statusText: "C active"
+        )
+        harness.publish(cState, attempt: 2)
+        harness.publish(.init(phase: .downloading, downloadedBytes: 888, statusText: "B stale"), attempt: 1)
+        harness.fail(attempt: 1)
+        for _ in 0..<4 { await Task.yield() }
+        XCTAssertEqual(sidebar.tokenSaverModelDownloadState, cState)
+        XCTAssertTrue(sidebar.showsTokenSaverModelDownload)
+
+        harness.succeed(attempt: 2)
+        let finished = await waitUntil { !sidebar.tokenSaverModelDownloadInFlightForTesting }
+        XCTAssertTrue(finished)
+        XCTAssertEqual(sidebar.tokenSaverModelDownloadState, .ready)
+        XCTAssertTrue(sidebar.tokenSaverEnabled)
     }
 
     // MARK: - No confirm when model already installed

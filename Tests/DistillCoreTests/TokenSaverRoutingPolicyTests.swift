@@ -34,6 +34,9 @@ final class TokenSaverRoutingPolicyTests: XCTestCase {
 
         let llm = TokenSaverRouteTelemetryEvent(lane: .wireEncode, stage: .llmMLX, wallClockMilliseconds: 200)
         XCTAssertFalse(llm.resolvedWithoutLLM)
+
+        let api = TokenSaverRouteTelemetryEvent(lane: .naturalLanguage, stage: .apiExternal, wallClockMilliseconds: 80)
+        XCTAssertFalse(api.resolvedWithoutLLM)
     }
 }
 

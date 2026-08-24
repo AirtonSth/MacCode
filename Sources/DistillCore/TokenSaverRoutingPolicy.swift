@@ -4,7 +4,12 @@ public enum TokenSaverRouteStage: String, Codable, Sendable, Equatable {
     case deterministic
     case encoderBERT = "encoder_bert"
     case llmMLX = "llm_mlx"
+    case apiExternal = "api_external"
     case verbatim
+
+    public var usesGenerativeModel: Bool {
+        self == .llmMLX || self == .apiExternal
+    }
 }
 
 public enum TokenSaverLaneDisposition: String, Codable, Sendable, Equatable {
@@ -44,7 +49,7 @@ public struct TokenSaverRouteTelemetryEvent: Codable, Sendable, Equatable {
     ) {
         self.lane = lane
         self.stage = stage
-        self.resolvedWithoutLLM = stage != .llmMLX
+        self.resolvedWithoutLLM = !stage.usesGenerativeModel
         self.wallClockMilliseconds = max(0, wallClockMilliseconds)
     }
 }

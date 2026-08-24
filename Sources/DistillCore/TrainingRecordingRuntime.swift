@@ -25,7 +25,7 @@ public struct TrainingRecordingRuntime: DistillRuntime {
 
     public func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
         let staged = try await wrapped.distillStaged(request)
-        if let writer, staged.stage == .llmMLX {
+        if let writer, staged.stage?.usesGenerativeModel == true {
             writer.record(
                 request: request,
                 output: staged.output,
