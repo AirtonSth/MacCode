@@ -146,6 +146,9 @@ final class BotsDeskLiveReplayPerformanceTests: XCTestCase {
         viewModel.claudeSlashDiscoveryForTesting = { _ in
             ClaudeSlashCommandDiscovery.discover(cwd: nil, home: home.path)
         }
+        viewModel.claudeSlashCatalogRevisionForTesting = { _ in
+            BotsViewModel.claudeSlashCatalogRevision(home: home.path)
+        }
 
         func legacySuggestions() -> [AgentComposerSuggestion] {
             AgentComposerSuggestions.suggestions(

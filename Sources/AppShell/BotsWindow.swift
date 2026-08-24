@@ -2911,8 +2911,19 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var attentionListCountForTesting = 0
     private var cachedPreviewBrain: ContextAssemblyReceipt?
     private var cachedPreviewBrainKey: String?
-    private var cachedClaudeSlashEntries: (home: String, entries: [String])?
+    private var cachedClaudeSlashEntries: (
+        home: String,
+        revision: String,
+        refreshedAt: TimeInterval,
+        entries: [String]
+    )?
     var claudeSlashDiscoveryForTesting: ((String) -> [String])? {
+        didSet { cachedClaudeSlashEntries = nil }
+    }
+    var claudeSlashCatalogRevisionForTesting: ((String) -> String)? {
+        didSet { cachedClaudeSlashEntries = nil }
+    }
+    var claudeSlashCacheTimeForTesting: (() -> TimeInterval)? {
         didSet { cachedClaudeSlashEntries = nil }
     }
     private var studioSupportByBot: [BotID: BotStudioSupportSnapshot] = [:]
@@ -6517,17 +6528,48 @@ public final class BotsViewModel: ObservableObject {
         providers = snapshots
     }
 
+    /// Cheap user-catalog fingerprint used on every composer reevaluation. Entry
+    /// add/remove/rename mutates the parent directory metadata, invalidating the
+    /// expensive recursive discovery without rescanning it on each keystroke.
+    nonisolated static func claudeSlashCatalogRevision(home: String) -> String {
+        let claudeRoot = URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent(".claude", isDirectory: true)
+        return ["skills", "commands"].map { component in
+            let path = claudeRoot.appendingPathComponent(component, isDirectory: true).path
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else {
+                return "missing"
+            }
+            let modificationNanoseconds = (attributes[.modificationDate] as? Date).map {
+                Int64(($0.timeIntervalSince1970 * 1_000_000_000).rounded())
+            } ?? 0
+            let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+            return "\(fileNumber):\(modificationNanoseconds)"
+        }.joined(separator: "|")
+    }
+
+    private static let claudeSlashCacheTTL: TimeInterval = 1
+
     /// Bots have no project cwd, so Claude discovery is user-scoped. Cache it
-    /// by home for this Desk's lifetime, matching Agent App's cwd-keyed cache.
+    /// while the catalog fingerprint and short freshness bound are stable.
+    /// The bound also retries empty/error results and catches nested manifest
+    /// changes that do not mutate the top-level skills directory metadata.
     private func claudeSlashEntries() -> [String] {
         let home = ProcessInfo.processInfo.environment["HOME"]
             ?? FileManager.default.homeDirectoryForCurrentUser.path
-        if let cached = cachedClaudeSlashEntries, cached.home == home {
+        let revision = claudeSlashCatalogRevisionForTesting?(home)
+            ?? Self.claudeSlashCatalogRevision(home: home)
+        let now = claudeSlashCacheTimeForTesting?()
+            ?? ProcessInfo.processInfo.systemUptime
+        if let cached = cachedClaudeSlashEntries,
+           cached.home == home,
+           cached.revision == revision,
+           now >= cached.refreshedAt,
+           now - cached.refreshedAt < Self.claudeSlashCacheTTL {
             return cached.entries
         }
         let entries = claudeSlashDiscoveryForTesting?(home)
             ?? ClaudeSlashCommandDiscovery.discover(cwd: nil, home: home)
-        cachedClaudeSlashEntries = (home, entries)
+        cachedClaudeSlashEntries = (home, revision, now, entries)
         return entries
     }
 

@@ -6903,19 +6903,44 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.composerSuggestions.contains { $0.kind == .skill })
     }
 
-    func test_claudeComposerCachesSlashDiscovery_becauseTypingMustNotRescanTheFilesystem() throws {
+    func test_claudeComposerCachesUntilCatalogChanges_becauseTypingMustStayFastAndFresh() throws {
         // WHY: SwiftUI reevaluates composer suggestions while the user types.
-        // Claude's on-disk skill catalog is stable for the life of this Desk,
-        // so each keystroke must reuse the first discovery like Agent App.
+        // Repeated reads of one catalog (including an empty one) must reuse
+        // discovery, while the short freshness bound must also catch skill
+        // manifests installed or removed inside a pre-existing directory.
+        let home = URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent("claude-home", isDirectory: true)
+        let skills = home.appendingPathComponent(".claude/skills", isDirectory: true)
+        let commands = home.appendingPathComponent(".claude/commands", isDirectory: true)
+        try FileManager.default.createDirectory(at: skills, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+
+        func installSkill(_ name: String) throws {
+            let skill = skills.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: skill, withIntermediateDirectories: true)
+            try Data("# \(name)".utf8).write(to: skill.appendingPathComponent("SKILL.md"))
+        }
+
+        try installSkill("sam-work")
+        let stagedSkill = skills.appendingPathComponent("sam-new", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagedSkill, withIntermediateDirectories: true)
+        let oldCommand = commands.appendingPathComponent("old-command.md")
+        try Data("# old".utf8).write(to: oldCommand)
+
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let piper = try vm.create(name: "Piper", title: "Seller")
         vm.openDesk(piper)
         vm.setDeskProvider(.claude)
         var discoveryCount = 0
+        var cacheTime: TimeInterval = 100
+        vm.claudeSlashCatalogRevisionForTesting = { _ in
+            BotsViewModel.claudeSlashCatalogRevision(home: home.path)
+        }
+        vm.claudeSlashCacheTimeForTesting = { cacheTime }
         vm.claudeSlashDiscoveryForTesting = { _ in
             discoveryCount += 1
-            return ["sam-work"]
+            return ClaudeSlashCommandDiscovery.discover(cwd: nil, home: home.path)
         }
 
         vm.composerText = "/sam"
@@ -6926,9 +6951,62 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(discoveryCount, 1)
         XCTAssertTrue(first.contains { $0.insertText == "/sam-work " })
         XCTAssertTrue(second.contains { $0.insertText == "/sam-work " })
+
+        let beforeInstall = BotsViewModel.claudeSlashCatalogRevision(home: home.path)
+        try Data("# sam-new".utf8).write(to: stagedSkill.appendingPathComponent("SKILL.md"))
+        XCTAssertEqual(
+            BotsViewModel.claudeSlashCatalogRevision(home: home.path),
+            beforeInstall,
+            "writing SKILL.md inside an existing skill directory does not mutate the parent revision"
+        )
+        vm.composerText = "/sam-n"
+        XCTAssertFalse(vm.composerSuggestions.contains { $0.insertText == "/sam-new " })
+        XCTAssertEqual(discoveryCount, 1, "a stable fingerprint must remain a per-keystroke cache hit before TTL")
+
+        cacheTime += 2
+        let refreshed = vm.composerSuggestions
+        XCTAssertEqual(discoveryCount, 2)
+        XCTAssertTrue(refreshed.contains { $0.insertText == "/sam-new " })
+
+        let beforeManifestRemoval = BotsViewModel.claudeSlashCatalogRevision(home: home.path)
+        try FileManager.default.removeItem(at: stagedSkill.appendingPathComponent("SKILL.md"))
+        XCTAssertEqual(
+            BotsViewModel.claudeSlashCatalogRevision(home: home.path),
+            beforeManifestRemoval,
+            "removing only SKILL.md also leaves the parent revision unchanged"
+        )
+        XCTAssertTrue(vm.composerSuggestions.contains { $0.insertText == "/sam-new " })
+        XCTAssertEqual(discoveryCount, 2)
+        cacheTime += 2
+        XCTAssertFalse(vm.composerSuggestions.contains { $0.insertText == "/sam-new " })
+        XCTAssertEqual(discoveryCount, 3, "TTL must bound stale nested-manifest results")
+
+        let beforeCommandRemoval = BotsViewModel.claudeSlashCatalogRevision(home: home.path)
+        try FileManager.default.removeItem(at: oldCommand)
+        XCTAssertNotEqual(
+            BotsViewModel.claudeSlashCatalogRevision(home: home.path),
+            beforeCommandRemoval,
+            "removing a normal ~/.claude/commands/<name>.md file must invalidate the cache"
+        )
+        vm.composerText = "/old"
+        XCTAssertFalse(vm.composerSuggestions.contains { $0.insertText == "/old-command " })
+        XCTAssertEqual(discoveryCount, 4)
+
+        try FileManager.default.removeItem(at: skills.appendingPathComponent("sam-work"))
+        try FileManager.default.removeItem(at: stagedSkill)
+        vm.composerText = "/sam"
+        XCTAssertFalse(vm.composerSuggestions.contains { $0.kind == .skill })
+        _ = vm.composerSuggestions
+        XCTAssertEqual(discoveryCount, 5,
+            "a stable empty catalog must not rescan once per composer reevaluation")
+        cacheTime += 2
+        _ = vm.composerSuggestions
+        XCTAssertEqual(discoveryCount, 6,
+            "an empty or transiently failed discovery must be retried after the short TTL")
+
         vm.setDeskProvider(.grok)
         _ = vm.composerSuggestions
-        XCTAssertEqual(discoveryCount, 1, "non-Claude providers must not touch the Claude filesystem")
+        XCTAssertEqual(discoveryCount, 6, "non-Claude providers must not touch the Claude filesystem")
     }
 
     func test_deskApplyComposerSuggestionUsesCursorOffset() throws {
