@@ -2552,6 +2552,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         replyMode: BotPeerDelegation.ReplyMode,
         delegationCapability: String? = nil
     ) async throws -> JSONValue {
+        try await askBotPeer(
+            callerThread: callerThread,
+            callerRun: callerRun,
+            handle: handle,
+            prompt: prompt,
+            replyMode: replyMode,
+            consultationID: nil,
+            delegationCapability: delegationCapability
+        )
+    }
+
+    public func askBotPeer(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID,
+        handle: String,
+        prompt: String,
+        replyMode: BotPeerDelegation.ReplyMode,
+        consultationID: UUID?,
+        delegationCapability: String? = nil
+    ) async throws -> JSONValue {
         let ctx = try validatedBotPeerCaller(
             threadID: callerThread,
             runID: callerRun,
@@ -2569,13 +2589,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.")
         }
 
+        var claimedConsultationID: UUID?
+        if let consultationID {
+            try ctx.botPeerHandoffAuthority.claimContinuation(
+                consultationID: consultationID,
+                callerThread: callerThread,
+                hostRunID: callerRun,
+                peerBotID: peer.id
+            )
+            claimedConsultationID = consultationID
+        }
+        defer {
+            if let claimedConsultationID {
+                ctx.botPeerHandoffAuthority.releaseContinuation(consultationID: claimedConsultationID)
+            }
+        }
+
         ctx.botPeerHandoffAuthority.router = self
         guard let result = await ctx.botPeerHandoffAuthority.askPeerFromActiveProvider(
             peer: peer,
             prompt: delegatedPrompt,
             originThread: originThread,
             hostRunID: callerRun,
-            providerSnapshots: cachedProviderSnapshotsForSend()
+            providerSnapshots: cachedProviderSnapshotsForSend(),
+            consultationID: consultationID
         ) else {
             throw JSONRPCError(code: -32045, message: "The Bot delegation did not produce a verified reply.")
         }
@@ -2585,6 +2622,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         return .object([
             "activity_id": .string(result.activityID.uuidString.lowercased()),
+            BotPeerDelegation.consultationIDParameterKey: .string(result.consultationID.uuidString.lowercased()),
             "bot": .object([
                 "id": .string(current.id.value.uuidString.lowercased()),
                 "handle": .string(current.handle),
@@ -4185,6 +4223,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         requestedRunID: AgentRunID,
         routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil,
         orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil,
+        executionCwdOverride: String? = nil,
         allowProviderCatalogListingDuringPreflight: Bool = true
     ) async throws -> AgentMessageSendResult {
         try await sendAgentMessage(
@@ -4203,6 +4242,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             routingSnapshot: routingSnapshot,
             requestedRunID: requestedRunID,
             orchestrationRoutingSnapshot: orchestrationRoutingSnapshot,
+            executionCwdOverride: executionCwdOverride,
             allowProviderCatalogListingDuringPreflight: allowProviderCatalogListingDuringPreflight
         )
     }
@@ -4315,7 +4355,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, allowProviderCatalogListingDuringPreflight: Bool = true) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         let effectiveRouting = orchestrationRoutingSnapshot?.configuration
@@ -4402,7 +4442,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let prov = t.provider
         let m = t.model
-        let cwd = try prepareAgentExecutionCwd(thread: &t)
+        let cwd: String
+        if let executionCwdOverride {
+            cwd = GrokACPClient.resolvedSessionCwd(executionCwdOverride)
+        } else {
+            cwd = try prepareAgentExecutionCwd(thread: &t)
+        }
         // Provider-instance + host Token Saver injects for the Source provider.
         // Same-host Auto never switches provider. The previous empty Auto base
         // dropped instance config (HOME/CODEX_HOME/GROK_HOME, custom env) from the
@@ -5054,6 +5099,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             payload["thread_id"] = .string(threadId.value.uuidString)
         }
         EventBus.shared.publish(kind: "graphify.thread.roots", payload: .object(payload))
+    }
+
+    func effectiveAgentExecutionCwd(for thread: AgentThread) throws -> String {
+        switch thread.executionMode {
+        case .local:
+            guard let workspaceID = thread.workspaceId else {
+                throw LayoutError.workspaceNotFound
+            }
+            return try workspaceCwd(workspaceID)
+        case .worktree:
+            guard let path = thread.worktreePath,
+                  FileManager.default.fileExists(atPath: path) else {
+                throw JSONRPCError(
+                    code: -32013,
+                    message: "Agent worktree is unavailable."
+                )
+            }
+            return path
+        }
     }
 
     private func prepareAgentExecutionCwd(thread: inout AgentThread) throws -> String {

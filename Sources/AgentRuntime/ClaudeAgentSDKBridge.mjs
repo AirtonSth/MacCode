@@ -559,15 +559,14 @@ async function bestEffortRecordTokenSaverSavings(
   recoveryConfirmations
 ) {
   if (!delivered || delivered === candidate.input) return;
+  if (!recoveryConfirmations?.length) return;
   await postTokenSaverRequest(state, {
     ...candidate,
     id: randomUUID(),
-    recordSavings: true,
+    recordSavings: false,
     precomputedOutput: delivered,
     precomputedRouteStage: routeStage,
-    precomputedRecoveryConfirmations: recoveryConfirmations?.length
-      ? recoveryConfirmations
-      : undefined,
+    precomputedRecoveryConfirmations: recoveryConfirmations,
   });
 }
 
@@ -592,9 +591,10 @@ async function tokenSaverPostToolUse(input) {
     input: rawOutput,
     question: tokenSaverContractQuestion(input.tool_name, input.tool_input, decision.profile),
     provider: current.env.REMOTE_CODE_AGENT_PROVIDER || 'claude',
-    // Candidate compression is never delivery proof. A separate precomputed-output
-    // request records only the exact receipt/handle-inclusive replacement below.
-    recordSavings: false,
+    // Display accounting uses the sidecar compressed body (before handle/receipt).
+    // A follow-up POST only attests recovery delivery — it must not write a
+    // second savings row.
+    recordSavings: true,
     runMode: 'optimize',
     maxOutputCharacters: Math.max(512, Math.min(rawOutput.length, 48000)),
     cacheState: 'tool_output_hooked',
@@ -614,7 +614,7 @@ async function tokenSaverPostToolUse(input) {
       updatedMCPToolOutput: replaced,
     },
   };
-  // The bridge is long-lived, so the best-effort ledger write can run after the
+  // The bridge is long-lived, so recovery confirmation can run after the
   // replacement has cleared every gate without delaying Claude's hook response.
   setImmediate(() => {
     void bestEffortRecordTokenSaverSavings(

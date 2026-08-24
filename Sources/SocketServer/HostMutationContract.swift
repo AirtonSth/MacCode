@@ -160,6 +160,7 @@ public enum HostMutationContract {
 
     private enum SyntaxRule {
         case uuid(String)
+        case optionalUUID(String)
         case anyUUID([String])
         case string(String, nonempty: Bool = false)
         case anyString([String], nonempty: Bool = false)
@@ -209,6 +210,10 @@ public enum HostMutationContract {
         switch rule {
         case .uuid(let key):
             guard params[key]?.stringValue.flatMap(UUID.init) != nil else { throw JSONRPCError.invalidParams }
+        case .optionalUUID(let key):
+            guard params[key] == nil || params[key]?.stringValue.flatMap(UUID.init) != nil else {
+                throw JSONRPCError.invalidParams
+            }
         case .anyUUID(let keys):
             guard keys.contains(where: { params[$0]?.stringValue.flatMap(UUID.init) != nil }) else {
                 throw JSONRPCError.invalidParams
@@ -358,7 +363,7 @@ public enum HostMutationContract {
         case "agent.checkpoint.revert": return [.uuid("thread_id"), .firstPresentInt(["turn_count", "checkpoint_turn_count"])]
         case "agent.attachment.upload": return [.uuid("workspace_id"), .string("filename"), .anyString(["data_base64", "dataBase64"])]
         case "agent.attachment.import": return [.uuid("workspace_id"), .string("relative_path", nonempty: true)]
-        case "bot.peer.ask": return [.uuid("thread_id"), .uuid("run_id"), .string("handle"), .string("prompt"), .stringEnum("reply_mode", ["consult", "reply_only"])]
+        case "bot.peer.ask": return [.uuid("thread_id"), .uuid("run_id"), .string("handle"), .string("prompt"), .stringEnum("reply_mode", ["consult", "reply_only"]), .optionalUUID(BotPeerDelegation.consultationIDParameterKey)]
         case "bot.peer.self_config": return [.uuid("thread_id"), .uuid("run_id"), .string("tool_name"), .object("arguments")]
         case "host.bot.create": return [.string("name", nonempty: true)]
         case "host.bot.open": return [.uuid("bot_id")]
@@ -415,6 +420,7 @@ public enum HostMutationContract {
     private static func applyValid(_ rule: SyntaxRule, to params: inout [String: JSONValue]) {
         switch rule {
         case .uuid(let key): params[key] = .string(probeUUID)
+        case .optionalUUID: break
         case .anyUUID(let keys): params[keys[0]] = .string(probeUUID)
         case .string(let key, _): params[key] = .string("value")
         case .anyString(let keys, _): params[keys[0]] = .string("value")
@@ -452,6 +458,9 @@ public enum HostMutationContract {
         switch rule {
         case .uuid(let key):
             add("\(key).missing") { $0.removeValue(forKey: key) }
+            add("\(key).type") { $0[key] = .bool(true) }
+            add("\(key).uuid") { $0[key] = .string("not-a-uuid") }
+        case .optionalUUID(let key):
             add("\(key).type") { $0[key] = .bool(true) }
             add("\(key).uuid") { $0[key] = .string("not-a-uuid") }
         case .anyUUID(let keys):

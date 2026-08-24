@@ -55,6 +55,19 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
             let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
             let prompt = try XCTUnwrap(properties["prompt"] as? [String: Any])
             XCTAssertTrue((prompt["description"] as? String)?.contains("Only this text is sent") == true)
+            let consultationID = try XCTUnwrap(
+                properties[BotPeerDelegation.consultationIDParameterKey] as? [String: Any]
+            )
+            XCTAssertEqual(consultationID["type"] as? String, "string")
+            XCTAssertEqual(consultationID["format"] as? String, "uuid")
+            XCTAssertTrue(
+                (consultationID["description"] as? String)?.contains("Omit") == true,
+                "consultation_id must be optional so existing omission call sites stay fresh"
+            )
+            XCTAssertFalse(
+                (schema["required"] as? [String])?.contains(BotPeerDelegation.consultationIDParameterKey) == true,
+                "continuation is explicit; omission must remain the clean independent-review path"
+            )
         }
     }
 

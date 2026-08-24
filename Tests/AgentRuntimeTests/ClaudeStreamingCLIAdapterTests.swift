@@ -2322,9 +2322,9 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             .deletingLastPathComponent()
         let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
 
-        // WHY: the compression POST precedes the receipt-inclusive client gate.
-        // It must be accounting-disabled; only an accepted updatedToolOutput may
-        // enqueue one precomputed-output POST with those exact provider-visible bytes.
+        // WHY: displayed savings use the sidecar compressed body on the first POST.
+        // Recovery confirmation is a second POST after the hook returns and must
+        // not write another savings row.
         let harness = #"""
         import { readFileSync } from 'fs';
         import { createHash, createHmac, randomBytes, randomUUID } from 'crypto';
@@ -2342,7 +2342,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           const body = JSON.parse(options.body);
           requests.push(body);
           deferredHeaders.push(options.headers['X-RemoteCode-Delivery-Deferred'] || null);
-          if (body.recordSavings === true) {
+          if (body.recordSavings === false && body.precomputedOutput) {
             return { ok: true, json: async () => ({
               output: body.precomputedOutput,
               routeStage: body.precomputedRouteStage
@@ -2471,12 +2471,12 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             options: .regularExpression
         ))
         XCTAssertEqual(json["acceptedRequestCountAtReturn"] as? Int, 1,
-                       "the ledger POST must not start until after the native hook result returns")
+                       "recovery confirm must not start until after the native hook result returns")
         let acceptedRequests = try XCTUnwrap(json["acceptedRequests"] as? [[String: Any]])
         XCTAssertEqual(acceptedRequests.count, 2)
-        XCTAssertEqual(acceptedRequests[0]["recordSavings"] as? Bool, false)
+        XCTAssertEqual(acceptedRequests[0]["recordSavings"] as? Bool, true)
         XCTAssertNil(acceptedRequests[0]["precomputedOutput"])
-        XCTAssertEqual(acceptedRequests[1]["recordSavings"] as? Bool, true)
+        XCTAssertEqual(acceptedRequests[1]["recordSavings"] as? Bool, false)
         XCTAssertEqual(acceptedRequests[1]["precomputedOutput"] as? String, updated)
         XCTAssertEqual(acceptedRequests[1]["precomputedRouteStage"] as? String, "llm_mlx")
         let confirmations = try XCTUnwrap(
@@ -2492,8 +2492,8 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual((json["rejected"] as? [String: Any])?.count, 0)
         let rejectedRequests = try XCTUnwrap(json["rejectedRequests"] as? [[String: Any]])
         XCTAssertEqual(rejectedRequests.count, 1)
-        XCTAssertEqual(rejectedRequests[0]["recordSavings"] as? Bool, false)
-        XCTAssertFalse(rejectedRequests.contains { $0["recordSavings"] as? Bool == true })
+        XCTAssertEqual(rejectedRequests[0]["recordSavings"] as? Bool, true)
+        XCTAssertNil(rejectedRequests[0]["precomputedOutput"])
         XCTAssertEqual(json["rejectedDeferredHeaders"] as? [String], ["1"])
         XCTAssertEqual((json["worldReadable"] as? [String: Any])?.count, 0,
                        "a group/world-readable key file must fail open")
@@ -2503,7 +2503,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                        "a secure pre-v2 state must decode but cannot authorize replacement")
         let legacyRequests = try XCTUnwrap(json["legacyStateRequests"] as? [[String: Any]])
         XCTAssertEqual(legacyRequests.count, 1)
-        XCTAssertEqual(legacyRequests.first?["recordSavings"] as? Bool, false)
+        XCTAssertEqual(legacyRequests.first?["recordSavings"] as? Bool, true)
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {
