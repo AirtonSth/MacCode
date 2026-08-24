@@ -367,27 +367,6 @@ final class LibrarianCatalogTests: XCTestCase {
         XCTAssertNil(fallback["question"], "the optional duplicate must be absent from the shipping JSON")
     }
 
-    func test_librarianEnvelopeShippingJSONDoesNotEscapeSlashes() throws {
-        let envelope = LibrarianEnvelope(
-            status: .ok,
-            confidence: 1,
-            op: "ask_handle",
-            answer: .object(["text": .string("Sources/App.swift")]),
-            evidence: [LibrarianEvidence(handle: "rcv1.test", span: "Sources/App.swift")],
-            fallback: LibrarianFallback(recommended: "retrieve", handle: "rcv1.test")
-        )
-
-        let encoded = envelope.jsonString()
-
-        XCTAssertTrue(encoded.contains(#""text":"Sources/App.swift""#))
-        XCTAssertTrue(encoded.contains(#""span":"Sources/App.swift""#))
-        XCTAssertFalse(encoded.contains(#"\/"#))
-        XCTAssertEqual(
-            try JSONDecoder().decode(LibrarianEnvelope.self, from: Data(encoded.utf8)),
-            envelope
-        )
-    }
-
     func test_notebookCrusher_stripsOutputs() async {
         let dispatcher = LibrarianDispatcher()
         let notebook = #"{"cells":[{"cell_type":"code","source":["print(1)"],"outputs":[{"data":{"image/png":"aaaa"}}],"execution_count":3}]}"#

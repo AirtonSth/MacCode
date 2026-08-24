@@ -72,7 +72,7 @@ public struct LibrarianEnvelope: Sendable, Equatable, Codable {
     private static let jsonEncoderLock = NSLock()
     private static let jsonEncoder: JSONEncoder = {
         let e = JSONEncoder()
-        e.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        e.outputFormatting = [.sortedKeys]
         return e
     }()
 
