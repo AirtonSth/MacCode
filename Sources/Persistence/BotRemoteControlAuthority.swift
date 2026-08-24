@@ -70,6 +70,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var routingPref: [String: [String: Any]] = [:]
     private var selectedConversation: [String: String] = [:]
     private var generation: Int = 1
+#if DEBUG
+    /// Exact per-write formatter path retained only for same-process A/B receipts.
+    var useLegacySidecarDateFormatterForBenchmark = false
+#endif
 
     public init(db: SQLiteDB, store: BotStore, settings: SettingsStore, appSupportDirectory: URL) {
         self.db = db
@@ -1313,7 +1317,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard JSONSerialization.isValidJSONObject(value),
               let data = try? JSONSerialization.data(withJSONObject: value),
               let text = String(data: data, encoding: .utf8) else { return }
-        let iso = ISO8601DateFormatter().string(from: Date())
+#if DEBUG
+        let timestamp = useLegacySidecarDateFormatterForBenchmark
+            ? ISO8601DateFormatter().string(from: Date())
+            : iso.string(from: Date())
+#else
+        let timestamp = iso.string(from: Date())
+#endif
         try? db.performSync { database in
             let statement = try database.prepare(
                 "INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;"
@@ -1321,7 +1331,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             defer { statement.reset() }
             try statement.bind(1, key)
             try statement.bind(2, text)
-            try statement.bind(3, iso)
+            try statement.bind(3, timestamp)
             _ = try statement.step()
         }
     }

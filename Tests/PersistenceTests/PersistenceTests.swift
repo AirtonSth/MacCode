@@ -554,6 +554,77 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(provider, stamps, "paired provider rows must reuse the same batch timestamp")
     }
 
+    func test_persistStreamBatch_decodesOnlyPossibleDurableHostMetadata() throws {
+        // WHY: ordinary token-rate stream rows cannot create a durable host
+        // attestation, so decoding all 16 rows in every flush adds JSON work
+        // under the SQLite writer. A conservatively escaped discriminator must
+        // still reach the authoritative decoder and durable ledger.
+        let tmp = NSTemporaryDirectory() + "RC2HostMetadataScreen-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "host metadata screen", provider: .codex, model: "m")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m")
+        let runs = AgentRunRepository(db: db)
+        try runs.upsert(run)
+
+        let ordinary = (1...16).map { seq in
+            AgentRunRepository.StreamWriteIntent(
+                seq: seq,
+                kind: "itemDelta(i1)",
+                payloadJSON: #"{"itemDelta":{"itemId":"i1","seq":\#(seq)}}"#,
+                providerEvent: nil
+            )
+        }
+        try runs.persistStreamBatch(
+            runId: run.id,
+            threadId: thread.id,
+            items: ordinary,
+            shouldPruneStreamEvents: false
+        )
+        XCTAssertEqual(
+            runs.durableHostMetadataDecodeCountForTesting,
+            0,
+            "a full ordinary stream flush must perform no host-attestation JSON decodes"
+        )
+
+        let proof = AssistantItemHostAttestation(
+            itemType: .tool,
+            body: AssistantContentFingerprint(
+                byteCount: 4,
+                sha256: Data(repeating: 1, count: 32)
+            ),
+            output: nil
+        )
+        let hostEvent = AssistantEvent.itemHostMetadata(
+            turnId: "turn",
+            itemId: "item",
+            distillApplied: true,
+            attestation: proof
+        )
+        let canonical = String(decoding: try JSONEncoder().encode(hostEvent), as: UTF8.self)
+        let escaped = canonical.replacingOccurrences(
+            of: #""itemHostMetadata""#,
+            with: #""\u0069temHostMetadata""#
+        )
+        XCTAssertNotEqual(escaped, canonical, "fixture must exercise the escaped-key fallback")
+        try runs.appendStreamEvent(
+            runId: run.id,
+            seq: 17,
+            kind: "unexpected-but-payload-authoritative",
+            payloadJSON: escaped
+        )
+        XCTAssertEqual(runs.durableHostMetadataDecodeCountForTesting, 1)
+
+        let count = try db.prepare(
+            "SELECT COUNT(*) FROM agent_item_host_attestations WHERE run_id = ? AND seq = 17;"
+        )
+        try count.bind(1, run.id.value.uuidString)
+        XCTAssertTrue(try count.step())
+        XCTAssertEqual(count.columnInt64(0), 1,
+                       "escaped valid host metadata must retain its durable identity")
+    }
+
     func test_persistStreamBatch_skipsReversibleStoreWhenUnderLimit() throws {
         // WHY: persistStreamBatch and boundPayloadForPersistence constructed
         // ReversibleContentStore on every token-sized row even though

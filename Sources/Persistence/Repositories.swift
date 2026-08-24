@@ -3702,6 +3702,9 @@ public final class AgentRunRepository: @unchecked Sendable {
     // a short lock so concurrent thread reads avoid per-call codec construction.
     private let streamEventCodecLock = NSLock()
     private let streamEventDecoder = JSONDecoder()
+    // Used only inside db.performSync writer transactions. Keep it separate
+    // from the read decoder to avoid reversing the database/codec lock order.
+    private let durableHostMetadataDecoder = JSONDecoder()
     /// Highest durable `seq` observed for a run on this repository instance.
     /// Token-rate flushes used to SELECT `(run_id, seq)` before every INSERT
     /// even when the coordinator had just allocated a never-written sequence.
@@ -3720,6 +3723,8 @@ public final class AgentRunRepository: @unchecked Sendable {
     private static let committedProviderEventCacheLimit = 128
     public init(db: SQLiteDB) { self.db = db }
 #if DEBUG
+    /// Exact pre-screening path retained only for same-process A/B receipts.
+    var useLegacyDurableHostMetadataDecodingForBenchmark = false
     /// `iso.string(from:)` calls from `persistStreamBatch` (one per flush).
     private(set) var streamBatchISO8601FormatCountForTesting = 0
     /// Identity `SELECT` probes from `persistStreamEventIdempotently`.
@@ -3728,6 +3733,8 @@ public final class AgentRunRepository: @unchecked Sendable {
     private(set) var providerEventIdentitySelectCountForTesting = 0
     /// ReversibleContentStore constructions from bound/persist helpers.
     private(set) var reversibleStoreInitCountForTesting = 0
+    /// AssistantEvent decodes attempted while screening durable host metadata.
+    private(set) var durableHostMetadataDecodeCountForTesting = 0
 #endif
 
     /// Store-before-loss soft bound used by coordinator + repository (S3).
@@ -4103,9 +4110,10 @@ public final class AgentRunRepository: @unchecked Sendable {
         payloadJSON: String,
         createdAt: String
     ) throws {
-        guard let data = payloadJSON.data(using: .utf8),
-              let event = try? JSONDecoder().decode(AssistantEvent.self, from: data),
-              case .itemHostMetadata(_, _, let applied, let attestation) = event,
+        guard let event = durableHostMetadataEvent(payloadJSON: payloadJSON) else {
+            return
+        }
+        guard case .itemHostMetadata(_, _, let applied, let attestation) = event,
               applied == true,
               let attestation,
               attestation.isWellFormed else {
@@ -4156,6 +4164,27 @@ public final class AgentRunRepository: @unchecked Sendable {
         try insert.bind(5, payloadJSON)
         try insert.bind(6, createdAt)
         _ = try insert.step()
+    }
+
+    private func durableHostMetadataEvent(payloadJSON: String) -> AssistantEvent? {
+#if DEBUG
+        if useLegacyDurableHostMetadataDecodingForBenchmark {
+            guard let data = payloadJSON.data(using: .utf8) else { return nil }
+            return try? JSONDecoder().decode(AssistantEvent.self, from: data)
+        }
+#endif
+        // Valid JSON can spell an ASCII key literally or with a `\u` escape.
+        // Ordinary stream events have neither signal, so avoid materializing
+        // Data and decoding AssistantEvent for every token-rate row.
+        guard payloadJSON.contains(#""itemHostMetadata""#)
+                || payloadJSON.contains("\\u") else {
+            return nil
+        }
+        guard let data = payloadJSON.data(using: .utf8) else { return nil }
+#if DEBUG
+        durableHostMetadataDecodeCountForTesting += 1
+#endif
+        return try? durableHostMetadataDecoder.decode(AssistantEvent.self, from: data)
     }
 
     private func rememberedCommittedStreamSeq(runId: AgentRunID) -> Int? {
@@ -5803,6 +5832,11 @@ public final class AgentTurnCheckpointRepository {
     let db: SQLiteDB
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+#if DEBUG
+    /// Exact growing-prefix path retained only for same-process A/B receipts.
+    var useLegacyBoundedFileSummaryForBenchmark = false
+    private(set) var fileSummaryEncodedElementCountForTesting = 0
+#endif
     /// Checkpoint list keyset timestamps must round-trip sub-second values so
     /// iOS item equality and DB continuation use the same bound string.
     private static let completedAtFractional: ISO8601DateFormatter = {
@@ -5906,22 +5940,47 @@ public final class AgentTurnCheckpointRepository {
     ) throws -> (json: String, truncated: Bool) {
         let maxFiles = AgentTurnCheckpointListWireProjection.maxFiles
         let maxBytes = AgentTurnCheckpointListWireProjection.maxEncodedFilesBytes
-        var kept: [AgentTurnCheckpointFile] = []
-        kept.reserveCapacity(min(files.count, maxFiles))
-        var encoded = try encoder.encode(kept)
+#if DEBUG
+        if useLegacyBoundedFileSummaryForBenchmark {
+            var kept: [AgentTurnCheckpointFile] = []
+            kept.reserveCapacity(min(files.count, maxFiles))
+            var encoded = try encoder.encode(kept)
+            for file in files {
+                guard kept.count < maxFiles else { break }
+                let candidate = kept + [file]
+                let candidateData = try encoder.encode(candidate)
+                guard candidateData.count <= maxBytes else {
+                    break
+                }
+                kept = candidate
+                encoded = candidateData
+            }
+            return (
+                String(data: encoded, encoding: .utf8) ?? "[]",
+                kept.count < files.count
+            )
+        }
+#endif
+        var keptCount = 0
+        var encoded = Data([0x5B]) // [
         for file in files {
-            guard kept.count < maxFiles else { break }
-            let candidate = kept + [file]
-            let candidateData = try encoder.encode(candidate)
-            guard candidateData.count <= maxBytes else {
+            guard keptCount < maxFiles else { break }
+#if DEBUG
+            fileSummaryEncodedElementCountForTesting += 1
+#endif
+            let fileData = try encoder.encode(file)
+            let separatorBytes = keptCount == 0 ? 0 : 1
+            guard encoded.count + separatorBytes + fileData.count + 1 <= maxBytes else {
                 break
             }
-            kept = candidate
-            encoded = candidateData
+            if separatorBytes == 1 { encoded.append(0x2C) } // ,
+            encoded.append(fileData)
+            keptCount += 1
         }
+        encoded.append(0x5D) // ]
         return (
             String(data: encoded, encoding: .utf8) ?? "[]",
-            kept.count < files.count
+            keptCount < files.count
         )
     }
 
