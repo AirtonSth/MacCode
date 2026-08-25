@@ -10,8 +10,24 @@ public struct BotComputerGuestReady: Equatable, Sendable {
     public var resumed: Bool
 }
 
+public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStringConvertible {
+    case screenshotTooLarge(actualBytes: Int, maximumBytes: Int)
+    case screenshotResultTooLarge(actualBytes: Int, maximumBytes: Int)
+
+    public var description: String {
+        switch self {
+        case .screenshotTooLarge(let actualBytes, let maximumBytes):
+            return "Guest screenshot is too large: \(actualBytes) bytes (maximum \(maximumBytes))."
+        case .screenshotResultTooLarge(let actualBytes, let maximumBytes):
+            return "Guest screenshot result is too large: \(actualBytes) bytes (maximum \(maximumBytes))."
+        }
+    }
+}
+
 public final class BotComputerGuestService: @unchecked Sendable {
     public static let pngMagicHex = "89504e47"
+    public static let maxScreenshotBytes = 8 * 1_024 * 1_024
+    public static let maxScreenshotBase64Bytes = ((maxScreenshotBytes + 2) / 3) * 4
     private static let viewerTokenLock = NSLock()
     private static let legacyUnauthenticatedStartScriptSHA256 =
         "fc19d6b61e02c4ee713dde41886f4dfbae6d8631ce990dbd045f36eced478d8e"
@@ -205,10 +221,17 @@ public final class BotComputerGuestService: @unchecked Sendable {
         switch action.kind {
         case BotComputerCatalog.observe:
             let shot = try observe(botID: botID)
+            let base64 = shot.png.base64EncodedString()
+            guard base64.utf8.count <= Self.maxScreenshotBase64Bytes else {
+                throw BotComputerGuestServiceError.screenshotResultTooLarge(
+                    actualBytes: base64.utf8.count,
+                    maximumBytes: Self.maxScreenshotBase64Bytes
+                )
+            }
             return [
                 "png_magic": shot.magic,
                 "png_hash": shot.hash,
-                "png_base64": shot.png.base64EncodedString(),
+                "png_base64": base64,
                 "host": "127.0.0.1",
                 "image": BotComputerGuestSpec.imageTag,
             ]
@@ -243,8 +266,30 @@ public final class BotComputerGuestService: @unchecked Sendable {
                     user: nil,
                     detach: false
                 )
+                guard png.count <= Self.maxScreenshotBytes else {
+                    throw BotComputerGuestServiceError.screenshotTooLarge(
+                        actualBytes: png.count,
+                        maximumBytes: Self.maxScreenshotBytes
+                    )
+                }
                 _ = try BotComputerGuestObserve.validatePNG(png)
                 return png
+            } catch let error as BotComputerGuestServiceError {
+                // An oversized frame is deterministic for the current guest
+                // state. Retrying it 60 times only repeats the allocation and
+                // keeps the Docker worker busy without changing the outcome.
+                if case .screenshotTooLarge = error {
+                    throw error
+                }
+                lastError = error
+            } catch let error as BotComputerDockerError {
+                // The bounded subprocess reader has already terminated this
+                // exact-output command; repeating it only recreates the same
+                // oversized frame and burns the retry window.
+                if error == .outputTooLarge {
+                    throw error
+                }
+                lastError = error
             } catch {
                 lastError = error
                 if attempt + 1 < observeAttempts {

@@ -100,12 +100,15 @@ public struct ComputerUseNativeActivityEvent: Sendable, Equatable {
 public final class ComputerUseNativeActivityMonitor: @unchecked Sendable {
     public static let quietWindowNanoseconds: UInt64 = 2_000_000_000
     public static let syntheticEventUserData: Int64 = 0x5243_4355
+    static let maximumTrackedActivityEntries = 512
 
     private let lock = NSLock()
     private let quietWindowNanoseconds: UInt64
     private let now: @Sendable () -> UInt64
     private var keyboardActivity: [Int32: UInt64] = [:]
     private var mouseActivity: [ComputerUseNativeHostTarget: UInt64] = [:]
+    private var activityOverflowedUntil: UInt64?
+    private var lastPrunedAt: UInt64?
 
     public init(
         quietWindowNanoseconds: UInt64 = ComputerUseNativeActivityMonitor.quietWindowNanoseconds,
@@ -119,6 +122,11 @@ public final class ComputerUseNativeActivityMonitor: @unchecked Sendable {
         guard !event.isSynthetic else { return }
         lock.lock()
         defer { lock.unlock() }
+        pruneExpired(at: event.timestampNanoseconds)
+        if let activityOverflowedUntil,
+           event.timestampNanoseconds <= activityOverflowedUntil {
+            return
+        }
         switch event.kind {
         case .keyboard:
             keyboardActivity[event.pid] = event.timestampNanoseconds
@@ -126,12 +134,27 @@ public final class ComputerUseNativeActivityMonitor: @unchecked Sendable {
             guard let windowID = event.windowID else { return }
             mouseActivity[.init(pid: event.pid, windowID: windowID)] = event.timestampNanoseconds
         }
+        guard keyboardActivity.count + mouseActivity.count > Self.maximumTrackedActivityEntries else {
+            return
+        }
+        keyboardActivity.removeAll()
+        mouseActivity.removeAll()
+        let (quietEnd, overflow) = event.timestampNanoseconds.addingReportingOverflow(quietWindowNanoseconds)
+        activityOverflowedUntil = overflow ? UInt64.max : quietEnd
     }
 
     public func activity(for target: ComputerUseNativeHostTarget) -> ComputerUseNativeUserActivity {
         let current = now()
         lock.lock()
         defer { lock.unlock() }
+        pruneExpired(at: current)
+        if let activityOverflowedUntil,
+           current <= activityOverflowedUntil {
+            // We cannot retain every recent target without making this map an
+            // unbounded memory sink. Unknown activity is conservative here:
+            // mutation callers fail closed while the quiet window drains.
+            return .human
+        }
         if let timestamp = keyboardActivity[target.pid], isRecent(timestamp, at: current) {
             return .human
         }
@@ -145,7 +168,24 @@ public final class ComputerUseNativeActivityMonitor: @unchecked Sendable {
         lock.lock()
         keyboardActivity.removeAll()
         mouseActivity.removeAll()
+        activityOverflowedUntil = nil
+        lastPrunedAt = nil
         lock.unlock()
+    }
+
+    private func pruneExpired(at current: UInt64) {
+        if let lastPrunedAt,
+           current >= lastPrunedAt,
+           current - lastPrunedAt < quietWindowNanoseconds {
+            return
+        }
+        keyboardActivity = keyboardActivity.filter { isRecent($0.value, at: current) }
+        mouseActivity = mouseActivity.filter { isRecent($0.value, at: current) }
+        self.lastPrunedAt = current
+        if let activityOverflowedUntil,
+           current > activityOverflowedUntil {
+            self.activityOverflowedUntil = nil
+        }
     }
 
     private func isRecent(_ timestamp: UInt64, at current: UInt64) -> Bool {
@@ -276,6 +316,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         case activation_forbidden
         case semantic_action_failed
         case capture_unavailable
+        case capture_too_large
         case ui_tree_unavailable
         case invalid_region
     }
@@ -316,6 +357,15 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     }
 
     private let hooks: Hooks
+
+    // A native screenshot is retained as decoded pixels, PNG bytes, base64,
+    // and then once more in the MCP JSON envelope. Rejecting before base64
+    // keeps the wire shape unchanged while bounding the peak allocation.
+    static let maximumCapturePixelDimension = 8_192
+    static let maximumCapturePixelCount = 24_000_000
+    static let maximumCaptureEncodedBytes = 8 * 1_024 * 1_024
+    static let maximumCaptureBase64Characters =
+        ((maximumCaptureEncodedBytes + 2) / 3) * 4
 
     public init(hooks: Hooks = Hooks()) {
         self.hooks = hooks
@@ -358,8 +408,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             if hooks.screenCapturePermission(), window.isOnScreen, !window.isMinimized {
                 switch await hooks.capture(target) {
                 case .success(let image), .quartzFallback(let image):
-                    capture = image
-                    captureFailure = nil
+                    if Self.captureDataExceedsBudget(image) {
+                        capture = nil
+                        captureFailure = "capture_too_large"
+                    } else {
+                        capture = image
+                        captureFailure = nil
+                    }
                 case .unavailable(let reason):
                     capture = nil
                     captureFailure = reason
@@ -483,6 +538,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             } else if renderable {
                 switch await hooks.capture(window.target) {
                 case .success(let capture), .quartzFallback(let capture):
+                    guard !Self.captureDataExceedsBudget(capture) else {
+                        observedContent = "<pixels-unavailable>"
+                        effectivePixelScope = nil
+                        break
+                    }
                     if let fullImageSize = Self.imageSize(capture: capture),
                        let pixelScope {
                         if let region = pixelScope.region,
@@ -555,6 +615,9 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return failure(.pixel_target_not_renderable, encodeObservation(observation))
         }
         guard let image else {
+            if failureReason == Failure.capture_too_large.rawValue {
+                return failure(.capture_too_large, encodeObservation(observation))
+            }
             let diagnostic = failureReason.map { "\n capture_failure: \($0)" } ?? ""
             return failure(.capture_unavailable, encodeObservation(observation) + diagnostic)
         }
@@ -937,7 +1000,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         capture: ComputerUseNativeCapture,
         region: CGRect
     ) -> ComputerUseNativeCapture? {
-        guard let data = Data(base64Encoded: capture.data),
+        guard let data = decodedCaptureData(capture),
               let representation = NSBitmapImageRep(data: data),
               let image = representation.cgImage,
               region.maxX <= CGFloat(image.width),
@@ -952,6 +1015,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 .representation(using: .png, properties: [:]) else {
             return nil
         }
+        guard croppedData.count <= maximumCaptureEncodedBytes else { return nil }
         return ComputerUseNativeCapture(
             data: croppedData.base64EncodedString(),
             mimeType: "image/png"
@@ -959,13 +1023,48 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     }
 
     private static func imageSize(capture: ComputerUseNativeCapture) -> [Int]? {
-        guard let data = Data(base64Encoded: capture.data),
+        guard let data = decodedCaptureData(capture),
               let representation = NSBitmapImageRep(data: data),
               representation.pixelsWide > 0,
               representation.pixelsHigh > 0 else {
             return nil
         }
         return [representation.pixelsWide, representation.pixelsHigh]
+    }
+
+    private static func captureDataExceedsBudget(_ capture: ComputerUseNativeCapture) -> Bool {
+        guard capture.data.utf8.count <= maximumCaptureBase64Characters,
+              let data = Data(base64Encoded: capture.data),
+              data.count <= maximumCaptureEncodedBytes else {
+            return true
+        }
+        return encodedImageDimensionsExceedBudget(data)
+    }
+
+    private static func decodedCaptureData(_ capture: ComputerUseNativeCapture) -> Data? {
+        guard capture.data.utf8.count <= maximumCaptureBase64Characters,
+              let data = Data(base64Encoded: capture.data),
+              data.count <= maximumCaptureEncodedBytes,
+              !encodedImageDimensionsExceedBudget(data) else {
+            return nil
+        }
+        return data
+    }
+
+    private static func encodedImageDimensionsExceedBudget(_ data: Data) -> Bool {
+        let pngSignature: [UInt8] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+        ]
+        guard data.count >= 24,
+              data.prefix(pngSignature.count).elementsEqual(pngSignature) else {
+            return false
+        }
+        let width = data[16..<20].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        let height = data[20..<24].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        guard width > 0, height > 0 else { return true }
+        return width > UInt32(maximumCapturePixelDimension)
+            || height > UInt32(maximumCapturePixelDimension)
+            || UInt64(height) > UInt64(maximumCapturePixelCount) / UInt64(width)
     }
 
     private static func cursorPosition() -> String {
@@ -1262,10 +1361,23 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             }
             let filter = SCContentFilter(desktopIndependentWindow: window)
             let configuration = SCStreamConfiguration()
-            let width = Int(filter.contentRect.width * CGFloat(filter.pointPixelScale))
-            let height = Int(filter.contentRect.height * CGFloat(filter.pointPixelScale))
+            let scaledWidth = filter.contentRect.width * CGFloat(filter.pointPixelScale)
+            let scaledHeight = filter.contentRect.height * CGFloat(filter.pointPixelScale)
+            guard scaledWidth.isFinite,
+                  scaledHeight.isFinite,
+                  scaledWidth > 0,
+                  scaledHeight > 0,
+                  scaledWidth <= CGFloat(ComputerUseNativeHostBackend.maximumCapturePixelDimension),
+                  scaledHeight <= CGFloat(ComputerUseNativeHostBackend.maximumCapturePixelDimension) else {
+                return .unavailable("capture_too_large")
+            }
+            let width = Int(scaledWidth)
+            let height = Int(scaledHeight)
             guard width > 0, height > 0 else {
                 return .unavailable("target_window_empty_content_rect")
+            }
+            guard height <= ComputerUseNativeHostBackend.maximumCapturePixelCount / width else {
+                return .unavailable("capture_too_large")
             }
             configuration.width = width
             configuration.height = height
@@ -1284,9 +1396,19 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             }
             switch imageResult {
             case .success(let image):
+                guard image.width > 0,
+                      image.height > 0,
+                      image.width <= ComputerUseNativeHostBackend.maximumCapturePixelDimension,
+                      image.height <= ComputerUseNativeHostBackend.maximumCapturePixelDimension,
+                      image.height <= ComputerUseNativeHostBackend.maximumCapturePixelCount / image.width else {
+                    return .unavailable("capture_too_large")
+                }
                 let bitmap = NSBitmapImageRep(cgImage: image)
                 guard let data = bitmap.representation(using: NSBitmapImageRep.FileType.png, properties: [:]) else {
                     return .unavailable("png_encoding_failed")
+                }
+                guard data.count <= ComputerUseNativeHostBackend.maximumCaptureEncodedBytes else {
+                    return .unavailable("capture_too_large")
                 }
                 let capture = ComputerUseNativeCapture(data: data.base64EncodedString(), mimeType: "image/png")
                 return usedQuartzFallback ? .quartzFallback(capture) : .success(capture)

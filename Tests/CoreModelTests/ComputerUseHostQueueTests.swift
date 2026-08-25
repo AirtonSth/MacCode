@@ -228,6 +228,42 @@ final class ComputerUseHostQueueTests: XCTestCase {
         XCTAssertEqual(secondBodies.value, 1, "only the post-cancellation lease may enter")
     }
 
+    func test_excessiveSameTargetWaitersFailExplicitly() async throws {
+        let queue = makeQueue()
+        let firstStarted = expectation(description: "first acquired")
+        let first = Task {
+            try await queue.withExclusive(kind: .mutation) {
+                firstStarted.fulfill()
+                try await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        await fulfillment(of: [firstStarted], timeout: 1)
+
+        let waiterCount = ComputerUseHostQueue.maximumWaitersPerTarget + 1
+        let waiters = (0..<waiterCount).map { _ in
+            Task { () -> ComputerUseHostQueueError? in
+                do {
+                    try await queue.withExclusive(kind: .mutation) {}
+                    return nil
+                } catch let error as ComputerUseHostQueueError {
+                    return error
+                } catch {
+                    return nil
+                }
+            }
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        _ = try await first.value
+
+        var fullCount = 0
+        for waiter in waiters {
+            if case .queueFull? = await waiter.value {
+                fullCount += 1
+            }
+        }
+        XCTAssertEqual(fullCount, 1, "the bounded queue must reject excess waiters explicitly")
+    }
+
     private func assertExclusivePair(label: String) async throws {
         let queue = makeQueue()
         let leases = LockBox<[ComputerUseHostQueue.Lease]>([])

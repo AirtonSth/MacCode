@@ -162,23 +162,34 @@ final class BotHomeTests: XCTestCase {
         XCTAssertTrue(migrated.contains("Prefers dark mode"))
         XCTAssertFalse(migrated.contains("Memory projection"))
         XCTAssertFalse(migrated.contains("Store leftover"))
-        // On case-insensitive APFS `memory.md` and `MEMORY.md` are the same inode;
-        // `fileExists` is case-insensitive and returns true when MEMORY.md exists.
-        // Use a case-sensitive directory listing to verify the legacy entry is gone.
-        let entriesAfter = try? FileManager.default.contentsOfDirectory(atPath: home.root.path)
-        let legacyGoneCaseSensitive = entriesAfter?.contains(BotHome.legacyMemoryName) == false
-        let isSameFileCaseInsensitive = BotHome.legacyMemoryName.lowercased() == BotHome.memoryName.lowercased()
-        if isSameFileCaseInsensitive {
-            XCTAssertTrue(legacyGoneCaseSensitive, "legacy memory.md entry must be gone case-sensitively (now MEMORY.md)")
-        } else {
-            XCTAssertFalse(
-                FileManager.default.fileExists(
-                    atPath: home.root.appendingPathComponent(BotHome.legacyMemoryName).path
-                )
-            )
-        }
+        let entriesAfter = try FileManager.default.contentsOfDirectory(atPath: home.root.path)
+        XCTAssertTrue(entriesAfter.contains(BotHome.memoryName))
+        XCTAssertFalse(entriesAfter.contains(BotHome.legacyMemoryName))
+        let editedMemory = migrated + "\nUser-edited canonical memory\n"
+        try editedMemory.write(to: home.memoryURL, atomically: true, encoding: .utf8)
         try home.migrateLegacyMemoryIfNeeded(legacyFacts: ["Must not clobber"])
-        XCTAssertEqual(try String(contentsOf: home.memoryURL, encoding: .utf8), migrated)
+        XCTAssertEqual(try String(contentsOf: home.memoryURL, encoding: .utf8), editedMemory)
+    }
+
+    func test_legacyAndMemoryAliasOnlyWhenDirectoryHasOneCaseVariant() {
+        // WHY: Lowercasing the two paths always compares equal, even on a
+        // case-sensitive volume where both files can coexist. Treating those
+        // distinct entries as aliases would overwrite the bot-edited MEMORY.md.
+        XCTAssertTrue(BotHome.legacyAndMemoryShareDirectoryEntry(
+            legacyExists: true,
+            memoryExists: true,
+            directoryEntries: [BotHome.legacyMemoryName]
+        ))
+        XCTAssertTrue(BotHome.legacyAndMemoryShareDirectoryEntry(
+            legacyExists: true,
+            memoryExists: true,
+            directoryEntries: [BotHome.memoryName]
+        ))
+        XCTAssertFalse(BotHome.legacyAndMemoryShareDirectoryEntry(
+            legacyExists: true,
+            memoryExists: true,
+            directoryEntries: [BotHome.legacyMemoryName, BotHome.memoryName]
+        ))
     }
 
     func test_removeOwnedSkillDeletesSkillDirectory() throws {

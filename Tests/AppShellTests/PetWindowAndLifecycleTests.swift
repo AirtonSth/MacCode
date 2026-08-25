@@ -411,7 +411,11 @@ final class PetWindowAndLifecycleTests: XCTestCase {
             "run_id": .string(UUID().uuidString)
         ]))
         try await Task.sleep(nanoseconds: 20_000_000)
-        XCTAssertEqual(controller.modelForTests.animationState, .coding)
+        XCTAssertEqual(
+            controller.modelForTests.animationState,
+            .waiting,
+            "Attention remains visible, but work pose requires an authoritative Active row."
+        )
         XCTAssertFalse(controller.animationTimerIsRunningForTests, "Disabled pet must not own a repeating timer.")
 
         controller.stop()
@@ -560,7 +564,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         let after = try XCTUnwrap(controller.modelForTests.activeThreads.first)
         XCTAssertEqual(
             after.lastUpdatePreview,
-            "git status",
+            "Running: git status",
             "item.started must land lastUpdatePreview for single-active LA description"
         )
         XCTAssertEqual(
@@ -706,8 +710,8 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         )
         XCTAssertEqual(
             controller.modelForTests.animationState,
-            .coding,
-            "The post-cursor startup event must replay, while pre-cursor terminal history stays excluded."
+            .idle,
+            "The post-cursor startup event must not expose work without an authoritative Active row, while pre-cursor terminal history stays excluded."
         )
     }
 

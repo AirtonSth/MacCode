@@ -113,10 +113,15 @@ public struct BotHome: Sendable {
         let legacyURL = root.appendingPathComponent(Self.legacyMemoryName)
         let legacyExists = FileManager.default.fileExists(atPath: legacyURL.path)
         let memoryExists = FileManager.default.fileExists(atPath: memoryURL.path)
+        let directoryEntries = try FileManager.default.contentsOfDirectory(atPath: root.path)
         // On case-insensitive APFS `memory.md` and `MEMORY.md` resolve to the same inode.
         // fileExists on the second then shadows the legacy file. Detect the collision
         // and migrate in place instead of early-returning with the projection header.
-        let isSameFileCaseInsensitive = legacyURL.path.lowercased() == memoryURL.path.lowercased()
+        let isSameFileCaseInsensitive = Self.legacyAndMemoryShareDirectoryEntry(
+            legacyExists: legacyExists,
+            memoryExists: memoryExists,
+            directoryEntries: directoryEntries
+        )
         if isSameFileCaseInsensitive, legacyExists {
             let raw = try mappedString(at: legacyURL)
             let body = Self.stripProjectionHeader(raw)
@@ -124,13 +129,7 @@ public struct BotHome: Sendable {
             if alreadyMigrated && !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 // Already a proper MEMORY.md on a case-insensitive volume; ensure the
                 // directory entry case is MEMORY.md (case-preserving rename via temp).
-                if let entries = try? FileManager.default.contentsOfDirectory(atPath: root.path),
-                   entries.contains(Self.legacyMemoryName), !entries.contains(Self.memoryName) {
-                    let tmp = root.appendingPathComponent(".tmp-memory-case")
-                    try? FileManager.default.removeItem(at: tmp)
-                    try? FileManager.default.moveItem(at: legacyURL, to: tmp)
-                    try? FileManager.default.moveItem(at: tmp, to: memoryURL)
-                }
+                try normalizeMemoryFilenameCaseIfNeeded(legacyURL: legacyURL)
                 return
             }
             try writeAtomic(
@@ -140,16 +139,7 @@ public struct BotHome: Sendable {
                 to: memoryURL
             )
             // Ensure the stored case becomes MEMORY.md on case-insensitive volumes.
-            if let entries = try? FileManager.default.contentsOfDirectory(atPath: root.path),
-               entries.contains(Self.legacyMemoryName), !entries.contains(Self.memoryName) {
-                let tmp = root.appendingPathComponent(".tmp-memory-case")
-                try? FileManager.default.removeItem(at: tmp)
-                if (try? FileManager.default.moveItem(at: legacyURL, to: tmp)) != nil {
-                    try? FileManager.default.moveItem(at: tmp, to: memoryURL)
-                } else if (try? FileManager.default.moveItem(at: memoryURL, to: tmp)) != nil {
-                    try? FileManager.default.moveItem(at: tmp, to: memoryURL)
-                }
-            }
+            try normalizeMemoryFilenameCaseIfNeeded(legacyURL: legacyURL)
             return
         }
         if memoryExists { return }
@@ -172,6 +162,32 @@ public struct BotHome: Sendable {
         var lines = ["# Memory", ""]
         lines.append(contentsOf: facts.map { "- \($0)" })
         try writeAtomic(lines.joined(separator: "\n") + "\n", to: memoryURL)
+    }
+
+    static func legacyAndMemoryShareDirectoryEntry(
+        legacyExists: Bool,
+        memoryExists: Bool,
+        directoryEntries: [String]
+    ) -> Bool {
+        guard legacyExists, memoryExists else { return false }
+        return !(directoryEntries.contains(Self.legacyMemoryName)
+            && directoryEntries.contains(Self.memoryName))
+    }
+
+    private func normalizeMemoryFilenameCaseIfNeeded(legacyURL: URL) throws {
+        let entries = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        guard entries.contains(Self.legacyMemoryName), !entries.contains(Self.memoryName) else { return }
+
+        let temporaryURL = root.appendingPathComponent(".tmp-memory-case-\(UUID().uuidString)")
+        try FileManager.default.moveItem(at: legacyURL, to: temporaryURL)
+        do {
+            try FileManager.default.moveItem(at: temporaryURL, to: memoryURL)
+        } catch {
+            if FileManager.default.fileExists(atPath: temporaryURL.path) {
+                try? FileManager.default.moveItem(at: temporaryURL, to: legacyURL)
+            }
+            throw error
+        }
     }
 
     // PERF: DateFormatter ICU init is expensive. Share one for bootstrap yyyy-MM-dd
