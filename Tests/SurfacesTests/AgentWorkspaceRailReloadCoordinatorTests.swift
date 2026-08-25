@@ -44,6 +44,34 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
         )
     }
 
+    func test_railRefreshReadsOnceAndAppliesExactSnapshotToEveryWorkspaceMember() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/Surfaces/AgentWorkspaceRailReloadCoordinator.swift"
+            ),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "private func flushRail(_ workspaceID: WorkspaceID)"))
+        let tail = source[start.upperBound...]
+        let end = tail.range(of: "\n    private func flushQueue")?.lowerBound ?? tail.endIndex
+        let body = String(tail[..<end])
+
+        XCTAssertTrue(body.contains("let live = liveViewModels(for: workspaceID)"),
+                      "the coalesced read must enumerate all live members of one workspace")
+        XCTAssertTrue(body.contains("guard let lead = live.first else { return }"),
+                      "one deterministic member must own the off-main snapshot read")
+        XCTAssertTrue(body.contains("let snapshot = await lead.loadRailSnapshotOffMainActor()"),
+                      "rail freshness must perform exactly one repository read per workspace")
+        XCTAssertTrue(body.contains("for viewModel in live {\n            viewModel.applyRailSnapshot(snapshot)\n        }"),
+                      "every surface must receive the exact winning workspace snapshot")
+        XCTAssertFalse(body.contains("reloadThreads()"),
+                       "fan-out must not restore per-surface thread reads")
+    }
+
     func test_benchmarkEmptyMembershipPollTicks() async {
         let fixture = PollFixture()
         let coordinator = AgentWorkspaceRailReloadCoordinator(

@@ -1,6 +1,7 @@
 import XCTest
 import CoreModel
 @testable import AppShell
+@testable import Persistence
 
 final class ScheduledTasksWindowTests: XCTestCase {
     func test_editorBuildsFullTaskWithNextRun_becauseSavedSchedulesMustBeImmediatelyRunnable() throws {
@@ -141,6 +142,91 @@ final class ScheduledTasksWindowTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func test_scopedRefreshPublishesExactTaskAndRunResults_latestSearchWins() async throws {
+        let directory = NSTemporaryDirectory() + "rc-scheduled-refresh-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let store = ScheduledTaskStore(db: context.db)
+        let workspaceID = WorkspaceID()
+        let older = ScheduledTask(
+            title: "Alpha task", prompt: "Alpha prompt", workspaceID: workspaceID,
+            workspacePathSnapshot: "/tmp", runAsUser: NSUserName(), runAsUID: 501,
+            provider: .codex, providerInstanceID: "codex", model: "gpt-5", reasoningEffort: .high,
+            recurrence: .hourly(anchor: Date(timeIntervalSince1970: 0), intervalHours: 1),
+            timeZoneIdentifier: "UTC",
+            createdAt: Date(timeIntervalSince1970: 10), updatedAt: Date(timeIntervalSince1970: 10)
+        )
+        let newer = ScheduledTask(
+            title: "Beta task", prompt: "Beta prompt", workspaceID: workspaceID,
+            workspacePathSnapshot: "/tmp", runAsUser: NSUserName(), runAsUID: 501,
+            provider: .codex, providerInstanceID: "codex", model: "gpt-5", reasoningEffort: .high,
+            recurrence: .hourly(anchor: Date(timeIntervalSince1970: 0), intervalHours: 1),
+            timeZoneIdentifier: "UTC",
+            createdAt: Date(timeIntervalSince1970: 20), updatedAt: Date(timeIntervalSince1970: 20)
+        )
+        try store.save(older)
+        try store.save(newer)
+        let claim = try store.claimManual(
+            taskID: older.id,
+            now: Date(timeIntervalSince1970: 30),
+            owner: "scheduled-refresh-test"
+        )
+        try store.finish(
+            runID: claim.run.id,
+            status: .failed,
+            errorCode: "provider_unavailable",
+            errorSummary: "provider unavailable",
+            at: Date(timeIntervalSince1970: 40)
+        )
+        let expectedTasks = try store.list()
+
+        let viewModel = ScheduledTasksViewModel(context: context, router: router, loadImmediately: false)
+        viewModel.scheduleFreshnessPass()
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.tasks, expectedTasks,
+                       "the initial pass must publish the exact persisted task order")
+        XCTAssertEqual(viewModel.fullHydrationCountForTesting, 1)
+
+        viewModel.selectedTaskID = older.id
+        XCTAssertEqual(viewModel.selectedTaskID, older.id,
+                       "selection must be acknowledged before the scoped history read")
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.runs.map(\.id), [claim.run.id])
+        XCTAssertEqual(viewModel.runs.first?.taskID, older.id)
+        XCTAssertEqual(viewModel.runs.first?.status, .failed)
+        XCTAssertEqual(viewModel.runs.first?.errorCode, "provider_unavailable")
+        XCTAssertEqual(viewModel.runs.first?.errorSummary, "provider unavailable")
+
+        let hydrationCount = viewModel.fullHydrationCountForTesting
+        viewModel.searchText = "Alpha"
+        viewModel.searchText = "Beta"
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.tasks.map(\.id), [newer.id],
+                       "the latest search must win and publish only its exact task projection")
+        XCTAssertEqual(viewModel.fullHydrationCountForTesting, hydrationCount,
+                       "search refreshes must not repeat the full overview hydration")
+    }
+
+    func test_scopedTaskAndRunRefreshesKeepLatestWinsAndFailureVisible() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        for marker in [
+            "guard !Task.isCancelled,\n                  self.tasksRefreshGeneration == generation else { return }",
+            "guard !Task.isCancelled,\n                  self.runsRefreshGeneration == generation else { return }",
+            "self.reloadTasks()",
+            "self.reloadRuns()",
+            "errorMessage = String(describing: error)"
+        ] {
+            XCTAssertTrue(source.contains(marker), "scoped refresh contract missing: \(marker)")
+        }
+        XCTAssertTrue(source.contains("self.selectedTaskID = nil"),
+                      "a stale selection must clear when the winning task projection no longer contains it")
+        XCTAssertTrue(source.contains("activeRunStatuses = next"),
+                      "exact run status results must republish the overview badge state")
+    }
+
     func test_scheduledExecutionUsesHeadlessSendPath_becauseSchedulesMustNotStealFocus() throws {
         let runtime = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTaskRuntime.swift"), encoding: .utf8)
         let main = try String(contentsOf: sourceURL("Sources/AppShell/AppDelegate.swift"), encoding: .utf8)
@@ -173,7 +259,17 @@ final class ScheduledTasksWindowTests: XCTestCase {
         let end = tail.range(of: "\n    public func checkForUpdatesAfterOpeningApp")?.lowerBound ?? tail.endIndex
         let body = String(tail[..<end])
         XCTAssertTrue(body.contains("var workspaceIDs = Set<WorkspaceID>()"))
+        XCTAssertTrue(body.contains("workspaceIDs.insert(agent.viewModel.workspaceID)"),
+                      "multiple Agent surfaces must collapse to one workspace identity")
+        XCTAssertTrue(body.contains("selectedThreads.append((agent.viewModel, selected))"),
+                      "the currently selected thread must survive the rail refresh")
+        XCTAssertTrue(body.contains("for workspaceID in workspaceIDs"),
+                      "rail refresh requests must be one per workspace, not one per surface")
         XCTAssertTrue(body.contains("requestCoalescedReload(workspaceID: workspaceID)"))
+        XCTAssertTrue(body.contains("selection.viewModel.selectThread(selection.threadID, markRead: false)"),
+                      "scheduled-store refresh must preserve read/attention state")
+        XCTAssertTrue(body.contains("refreshSurfaceRuntimeState()"),
+                      "the app shell must reconcile runtime chrome after fan-out")
         XCTAssertFalse(
             body.contains("agent.viewModel.reloadThreads()"),
             "scheduled-run bursts must not enqueue one rail refresh per open Agent tab"

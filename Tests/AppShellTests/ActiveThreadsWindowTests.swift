@@ -74,6 +74,38 @@ final class ActiveThreadsWindowTests: XCTestCase {
                       "opening a row must route into the agent thread")
     }
 
+    func test_tabRefreshAcknowledgesSelectionImmediatelyAndKeepsLatestCompletionSafe() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ActiveThreadsWindow.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "public func scheduleTabRefresh(_ tab: Tab)"))
+        let tail = source[start.upperBound...]
+        let end = tail.range(of: "\n    public func openActive")?.lowerBound ?? tail.endIndex
+        let refreshBody = String(tail[..<end])
+
+        XCTAssertTrue(refreshBody.contains("await Task.yield()"),
+                      "tab selection must acknowledge first and defer repository work")
+        XCTAssertTrue(refreshBody.contains("guard !Task.isCancelled"),
+                      "a cancelled tab refresh must not publish stale data")
+        XCTAssertTrue(refreshBody.contains("self.tabRefreshGeneration == generation"),
+                      "a slower A refresh must not win over a newer B selection")
+        XCTAssertTrue(refreshBody.contains("self.selectedTab == tab"),
+                      "a refresh must re-check the visible destination before applying results")
+        XCTAssertTrue(refreshBody.contains("case .active:\n                self.reloadActive()"))
+        XCTAssertTrue(refreshBody.contains("case .lastFinished:\n                self.reloadFinished()"))
+        XCTAssertTrue(source.contains("finishedItems = runs.compactMap"),
+                      "the winning refresh must publish the exact finished projection")
+        XCTAssertTrue(source.contains("catch {\n            errorMessage = String(describing: error)\n        }"),
+                      "database failures must remain visible instead of being swallowed")
+
+        let change = try XCTUnwrap(source.range(of: ".onChange(of: vm.selectedTab)"))
+        let changeTail = source[change.upperBound...]
+        let changeEnd = changeTail.range(of: "\n        }", options: [])?.lowerBound ?? changeTail.endIndex
+        let changeBody = String(changeTail[..<changeEnd])
+        XCTAssertTrue(changeBody.contains("vm.scheduleTabRefresh(tab)"),
+                      "the click path must schedule only the selected projection")
+        XCTAssertFalse(changeBody.contains("vm.scheduleFreshnessPass()"),
+                       "tab switching must not repeat full active+finished hydration")
+    }
+
     func test_appContextPublishesSidebarRefreshOnActiveCountChange_becauseBadgeMustStayLive() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/AppContext.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("lastPublishedActiveThreadCount"),
