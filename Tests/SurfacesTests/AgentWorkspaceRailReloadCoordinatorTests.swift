@@ -1,4 +1,7 @@
 import XCTest
+import CoreModel
+import AgentRuntime
+@testable import Persistence
 @testable import Surfaces
 
 @MainActor
@@ -44,32 +47,89 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
         )
     }
 
-    func test_railRefreshReadsOnceAndAppliesExactSnapshotToEveryWorkspaceMember() throws {
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let source = try String(
-            contentsOf: repositoryRoot.appendingPathComponent(
-                "Sources/Surfaces/AgentWorkspaceRailReloadCoordinator.swift"
-            ),
-            encoding: .utf8
+    func test_registeredMembersShareOneWorkspaceReadAndKeepSelectionIdentity() async throws {
+        let root = NSTemporaryDirectory() + "rc-rail-refresh-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
         )
-        let start = try XCTUnwrap(source.range(of: "private func flushRail(_ workspaceID: WorkspaceID)"))
-        let tail = source[start.upperBound...]
-        let end = tail.range(of: "\n    private func flushQueue")?.lowerBound ?? tail.endIndex
-        let body = String(tail[..<end])
+        let workspaceID = WorkspaceID()
+        var firstThread = AgentThread(workspaceId: workspaceID, title: "First", provider: .codex, model: "gpt-5")
+        firstThread.hasUnread = true
+        let secondThread = AgentThread(workspaceId: workspaceID, title: "Second", provider: .codex, model: "gpt-5")
+        try threadRepo.upsert(firstThread)
+        try threadRepo.upsert(secondThread)
+        let first = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: root,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        let second = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: root,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        first.selectThread(firstThread.id, markRead: false)
+        second.selectThread(secondThread.id, markRead: false)
+        XCTAssertEqual(first.selectedThreadId, firstThread.id)
+        XCTAssertEqual(second.selectedThreadId, secondThread.id)
+        var markReadCalls = 0
+        first.markThreadRead = { _ in markReadCalls += 1 }
+        second.markThreadRead = { _ in markReadCalls += 1 }
 
-        XCTAssertTrue(body.contains("let live = liveViewModels(for: workspaceID)"),
-                      "the coalesced read must enumerate all live members of one workspace")
-        XCTAssertTrue(body.contains("guard let lead = live.first else { return }"),
-                      "one deterministic member must own the off-main snapshot read")
-        XCTAssertTrue(body.contains("let snapshot = await lead.loadRailSnapshotOffMainActor()"),
-                      "rail freshness must perform exactly one repository read per workspace")
-        XCTAssertTrue(body.contains("for viewModel in live {\n            viewModel.applyRailSnapshot(snapshot)\n        }"),
-                      "every surface must receive the exact winning workspace snapshot")
-        XCTAssertFalse(body.contains("reloadThreads()"),
-                       "fan-out must not restore per-surface thread reads")
+        var readCount = 0
+        let coordinator = AgentWorkspaceRailReloadCoordinator(
+            subagentPollNanoseconds: 1,
+            hasMembers: { false },
+            sleep: { _ in },
+            pollRound: {},
+            railSnapshotLoad: { _ in
+                readCount += 1
+                return AgentWorkspaceRailReloadCoordinator.RailSnapshot(
+                    workspaceID: workspaceID,
+                    threads: [firstThread, secondThread],
+                    prunedThreadIDs: []
+                )
+            }
+        )
+        coordinator.debounceNanoseconds = 0
+        coordinator.register(first)
+        coordinator.register(second)
+        defer {
+            coordinator.unregister(first)
+            coordinator.unregister(second)
+            first.dispose()
+            second.dispose()
+        }
+
+        coordinator.requestCoalescedReload(workspaceID: workspaceID)
+        for _ in 0..<1_000 {
+            if readCount == 1 && first.threads.count == 2 && second.threads.count == 2 { break }
+            await Task.yield()
+        }
+        XCTAssertEqual(readCount, 1,
+                       "one workspace snapshot read must serve every registered Agent surface")
+        XCTAssertEqual(first.threads.map(\.id), [firstThread.id, secondThread.id])
+        XCTAssertEqual(second.threads.map(\.id), [firstThread.id, secondThread.id])
+        XCTAssertEqual(first.selectedThreadId, firstThread.id,
+                       "rail fan-out must preserve the first surface's selected identity")
+        XCTAssertEqual(second.selectedThreadId, secondThread.id,
+                       "rail fan-out must preserve the second surface's selected identity")
+        XCTAssertEqual(markReadCalls, 0,
+                       "rail fan-out must preserve read state instead of marking selected threads read")
+        XCTAssertTrue(try threadRepo.get(id: firstThread.id)?.hasUnread == true,
+                      "the persisted selected thread must remain unread after fan-out")
     }
 
     func test_benchmarkEmptyMembershipPollTicks() async {

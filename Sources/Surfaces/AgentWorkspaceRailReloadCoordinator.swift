@@ -56,6 +56,7 @@ public final class AgentWorkspaceRailReloadCoordinator {
     private var subagentPollHasMembersForTesting: (() -> Bool)?
     private var subagentPollSleepForTesting: ((UInt64) async throws -> Void)?
     private var subagentPollRoundForTesting: (() async -> Void)?
+    private var railSnapshotLoadForTesting: ((AgentAppViewModel) async -> RailSnapshot)?
     private var subagentActivityRefreshSleepForTesting: ((UInt64) async throws -> Void)?
     private var subagentActivityRefreshRoundForTesting: ((Set<AgentThreadID>) async -> Void)?
     private var subagentActivityRefreshApplyForTesting: ((Set<AgentThreadID>) -> Void)?
@@ -71,6 +72,7 @@ public final class AgentWorkspaceRailReloadCoordinator {
         hasMembers: @escaping () -> Bool,
         sleep: @escaping (UInt64) async throws -> Void,
         pollRound: @escaping () async -> Void,
+        railSnapshotLoad: ((AgentAppViewModel) async -> RailSnapshot)? = nil,
         subagentActivityRefreshSleep: ((UInt64) async throws -> Void)? = nil,
         subagentActivityRefreshRound: ((Set<AgentThreadID>) async -> Void)? = nil,
         subagentActivityRefreshApply: ((Set<AgentThreadID>) -> Void)? = nil,
@@ -80,6 +82,7 @@ public final class AgentWorkspaceRailReloadCoordinator {
         subagentPollHasMembersForTesting = hasMembers
         subagentPollSleepForTesting = sleep
         subagentPollRoundForTesting = pollRound
+        railSnapshotLoadForTesting = railSnapshotLoad
         subagentActivityRefreshSleepForTesting = subagentActivityRefreshSleep
         subagentActivityRefreshRoundForTesting = subagentActivityRefreshRound
         subagentActivityRefreshApplyForTesting = subagentActivityRefreshApply
@@ -225,7 +228,16 @@ public final class AgentWorkspaceRailReloadCoordinator {
     private func flushRail(_ workspaceID: WorkspaceID) async {
         let live = liveViewModels(for: workspaceID)
         guard let lead = live.first else { return }
+        #if DEBUG
+        let snapshot: RailSnapshot
+        if let railSnapshotLoadForTesting {
+            snapshot = await railSnapshotLoadForTesting(lead)
+        } else {
+            snapshot = await lead.loadRailSnapshotOffMainActor()
+        }
+        #else
         let snapshot = await lead.loadRailSnapshotOffMainActor()
+        #endif
         for viewModel in live {
             viewModel.applyRailSnapshot(snapshot)
         }

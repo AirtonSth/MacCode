@@ -74,36 +74,49 @@ final class ActiveThreadsWindowTests: XCTestCase {
                       "opening a row must route into the agent thread")
     }
 
-    func test_tabRefreshAcknowledgesSelectionImmediatelyAndKeepsLatestCompletionSafe() throws {
-        let source = try String(contentsOf: sourceURL("Sources/AppShell/ActiveThreadsWindow.swift"), encoding: .utf8)
-        let start = try XCTUnwrap(source.range(of: "public func scheduleTabRefresh(_ tab: Tab)"))
-        let tail = source[start.upperBound...]
-        let end = tail.range(of: "\n    public func openActive")?.lowerBound ?? tail.endIndex
-        let refreshBody = String(tail[..<end])
+    @MainActor
+    func test_tabRefreshAcknowledgesSelectionAndKeepsLatestProjectionAndFailure() async throws {
+        let directory = NSTemporaryDirectory() + "rc-active-refresh-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "Finished target", provider: .codex, model: "gpt-5")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id, provider: .codex, providerInstanceId: "codex", model: "gpt-5",
+            status: .completed, startedAt: Date(timeIntervalSince1970: 10), finishedAt: Date(timeIntervalSince1970: 20)
+        )
+        try context.runRepo.upsert(run)
 
-        XCTAssertTrue(refreshBody.contains("await Task.yield()"),
-                      "tab selection must acknowledge first and defer repository work")
-        XCTAssertTrue(refreshBody.contains("guard !Task.isCancelled"),
-                      "a cancelled tab refresh must not publish stale data")
-        XCTAssertTrue(refreshBody.contains("self.tabRefreshGeneration == generation"),
-                      "a slower A refresh must not win over a newer B selection")
-        XCTAssertTrue(refreshBody.contains("self.selectedTab == tab"),
-                      "a refresh must re-check the visible destination before applying results")
-        XCTAssertTrue(refreshBody.contains("case .active:\n                self.reloadActive()"))
-        XCTAssertTrue(refreshBody.contains("case .lastFinished:\n                self.reloadFinished()"))
-        XCTAssertTrue(source.contains("finishedItems = runs.compactMap"),
-                      "the winning refresh must publish the exact finished projection")
-        XCTAssertTrue(source.contains("catch {\n            errorMessage = String(describing: error)\n        }"),
-                      "database failures must remain visible instead of being swallowed")
+        let viewModel = ActiveThreadsViewModel(context: context, router: router, loadImmediately: false)
+        viewModel.selectedTab = .lastFinished
+        XCTAssertEqual(viewModel.selectedTab, .lastFinished,
+                       "tab selection must be acknowledged before the deferred read")
+        viewModel.scheduleTabRefresh(.lastFinished)
+        viewModel.selectedTab = .active
+        viewModel.scheduleTabRefresh(.active)
+        viewModel.selectedTab = .lastFinished
+        viewModel.scheduleTabRefresh(.lastFinished)
+        for _ in 0..<1_000 {
+            if viewModel.finishedItems.count == 1 { break }
+            await Task.yield()
+        }
+        XCTAssertEqual(viewModel.selectedTab, .lastFinished)
+        XCTAssertEqual(viewModel.finishedItems.map(\.runID), [run.id],
+                       "the latest selected tab must publish the exact finished projection")
+        XCTAssertEqual(viewModel.finishedItems.first?.title, "Finished target")
 
-        let change = try XCTUnwrap(source.range(of: ".onChange(of: vm.selectedTab)"))
-        let changeTail = source[change.upperBound...]
-        let changeEnd = changeTail.range(of: "\n        }", options: [])?.lowerBound ?? changeTail.endIndex
-        let changeBody = String(changeTail[..<changeEnd])
-        XCTAssertTrue(changeBody.contains("vm.scheduleTabRefresh(tab)"),
-                      "the click path must schedule only the selected projection")
-        XCTAssertFalse(changeBody.contains("vm.scheduleFreshnessPass()"),
-                       "tab switching must not repeat full active+finished hydration")
+        try context.db.execute("DROP TABLE agent_runs")
+        viewModel.selectedTab = .lastFinished
+        viewModel.scheduleTabRefresh(.lastFinished)
+        for _ in 0..<1_000 {
+            if viewModel.errorMessage != nil { break }
+            await Task.yield()
+        }
+        XCTAssertNotNil(viewModel.errorMessage,
+                        "a failed finished-run repository read must remain visible")
     }
 
     func test_appContextPublishesSidebarRefreshOnActiveCountChange_becauseBadgeMustStayLive() throws {

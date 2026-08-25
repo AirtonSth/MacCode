@@ -208,6 +208,15 @@ final class ScheduledTasksWindowTests: XCTestCase {
                        "the latest search must win and publish only its exact task projection")
         XCTAssertEqual(viewModel.fullHydrationCountForTesting, hydrationCount,
                        "search refreshes must not repeat the full overview hydration")
+
+        let publishedTasksBeforeFailure = viewModel.tasks
+        try context.db.execute("DROP TABLE scheduled_tasks")
+        viewModel.searchText = "Beta"
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.tasks, publishedTasksBeforeFailure,
+                       "a failed scoped read must not replace the last known task projection")
+        XCTAssertNotNil(viewModel.errorMessage,
+                        "a failed scoped read must remain visible to the user")
     }
 
     func test_scopedTaskAndRunRefreshesKeepLatestWinsAndFailureVisible() throws {
@@ -250,32 +259,6 @@ final class ScheduledTasksWindowTests: XCTestCase {
             runtime.contains("context.coordinator.startRun("),
             "scheduled execute must start via sendAgentMessage, not a raw coordinator call"
         )
-    }
-
-    func test_scheduledStoreFanoutCoalescesByWorkspace_becauseManyAgentTabsShareOneRailRead() throws {
-        let source = try String(contentsOf: sourceURL("Sources/AppShell/AppDelegate.swift"), encoding: .utf8)
-        let start = try XCTUnwrap(source.range(of: "private func reloadAgentSurfacesFromScheduledStoreChange()"))
-        let tail = source[start.upperBound...]
-        let end = tail.range(of: "\n    public func checkForUpdatesAfterOpeningApp")?.lowerBound ?? tail.endIndex
-        let body = String(tail[..<end])
-        XCTAssertTrue(body.contains("var workspaceIDs = Set<WorkspaceID>()"))
-        XCTAssertTrue(body.contains("workspaceIDs.insert(agent.viewModel.workspaceID)"),
-                      "multiple Agent surfaces must collapse to one workspace identity")
-        XCTAssertTrue(body.contains("selectedThreads.append((agent.viewModel, selected))"),
-                      "the currently selected thread must survive the rail refresh")
-        XCTAssertTrue(body.contains("for workspaceID in workspaceIDs"),
-                      "rail refresh requests must be one per workspace, not one per surface")
-        XCTAssertTrue(body.contains("requestCoalescedReload(workspaceID: workspaceID)"))
-        XCTAssertTrue(body.contains("selection.viewModel.selectThread(selection.threadID, markRead: false)"),
-                      "scheduled-store refresh must preserve read/attention state")
-        XCTAssertTrue(body.contains("refreshSurfaceRuntimeState()"),
-                      "the app shell must reconcile runtime chrome after fan-out")
-        XCTAssertFalse(
-            body.contains("agent.viewModel.reloadThreads()"),
-            "scheduled-run bursts must not enqueue one rail refresh per open Agent tab"
-        )
-        XCTAssertTrue(body.contains("selectThread(selection.threadID, markRead: false)"))
-        XCTAssertTrue(body.contains("refreshSurfaceRuntimeState()"))
     }
 
     func test_rootViewUsesDesignSystemSurfaces_becauseScheduledTasksMustMatchLatestRemoteCodeChrome() throws {

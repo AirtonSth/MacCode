@@ -227,18 +227,19 @@ extension ScheduledTasksWindowTests {
         )
         try ScheduledTaskStore(db: context.db).save(task)
         let viewModel = ScheduledTasksViewModel(context: context, router: router, loadImmediately: false)
+        let beforeFilter = viewModel.fullHydrationCountForTesting
         viewModel.scheduleFreshnessPass()
         await viewModel.waitForFreshnessForTesting()
         viewModel.selectedTaskID = task.id
         await viewModel.waitForFreshnessForTesting()
-        let beforeFilter = viewModel.fullHydrationCountForTesting
+        let beforeScopedSearch = viewModel.fullHydrationCountForTesting
 
         viewModel.searchText = "does-not-match"
         await viewModel.waitForFreshnessForTesting()
 
         XCTAssertNil(viewModel.selectedTaskID)
-        viewModel.scheduleFreshnessPass()
-        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.fullHydrationCountForTesting, beforeScopedSearch,
+                       "search changes use the scoped task projection and must not re-run full overview hydration")
         XCTAssertEqual(viewModel.fullHydrationCountForTesting, beforeFilter + 1)
     }
 
@@ -276,7 +277,7 @@ extension ScheduledTasksWindowTests {
     }
 
     func test_scheduledTaskFilterDefersHydration() throws {
-        var source = try String(
+        let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
@@ -284,11 +285,8 @@ extension ScheduledTasksWindowTests {
                 .appendingPathComponent("Sources/AppShell/ScheduledTasksWindow.swift"),
             encoding: .utf8
         )
-        // Retain the pre-scoped contract assertion while the focused test below
-        // verifies that the implementation now uses the narrower task pass.
-        source += "\nif deferHydration { scheduleFreshnessPass() }"
         XCTAssertTrue(source.contains("private func reloadTasksOrDefer()"))
-        XCTAssertTrue(source.contains("if deferHydration { scheduleFreshnessPass() }"))
+        XCTAssertTrue(source.contains("if deferHydration { scheduleTasksRefreshPass() }"))
     }
 
     func test_scheduledTaskFilterUsesScopedProjectionWithoutOverviewHydration() throws {
