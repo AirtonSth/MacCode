@@ -29,15 +29,15 @@
 # BRANCH=bug-fix
 # MACOS_BASE=production
 # IOS_BASE=main
-# # AUTH padrão para login E2E (usar quando a UI pedir email/senha — não inventar outro usuário)
-# AUTH_EMAIL=samuelfaj@icloud.com
-# AUTH_PASS=12345678
-# export AUTH_EMAIL="samuelfaj@icloud.com"
-# export AUTH_PASS="12345678"
-# export TEST_USER_EMAIL="samuelfaj@icloud.com"
-# export TEST_USER_PASS="12345678"
-# export E2E_USER="samuelfaj@icloud.com"
-# export E2E_PASS="12345678"
+# # AUTH E2E: inject only at runtime; never persist credentials in this prompt or repository.
+# : "${REMOTECODE_E2E_EMAIL:?configure REMOTECODE_E2E_EMAIL outside tracked files}"
+# : "${REMOTECODE_E2E_PASSWORD:?configure REMOTECODE_E2E_PASSWORD outside tracked files}"
+# export AUTH_EMAIL="$REMOTECODE_E2E_EMAIL"
+# export AUTH_PASS="$REMOTECODE_E2E_PASSWORD"
+# export TEST_USER_EMAIL="$REMOTECODE_E2E_EMAIL"
+# export TEST_USER_PASS="$REMOTECODE_E2E_PASSWORD"
+# export E2E_USER="$REMOTECODE_E2E_EMAIL"
+# export E2E_PASS="$REMOTECODE_E2E_PASSWORD"
 # SAM_GOAL=~/.grok/skills/sam-goal/SKILL.md
 # SAM_TASK=~/.grok/skills/sam-task/SKILL.md
 # mkdir -p "$STATE"
@@ -138,7 +138,7 @@
 # - Drive the rebuilt debug/sim app as a user would: pair/connect to the SANDBOX host (18218), open a real workspace on disk, send a REAL agent/user prompt, wait for a real model/provider turn, observe the transcript/UI.
 # - Rotate real prompts (not “hello”, not lorem, not “test test”). Examples of the class required: ask the agent to list files in the open workspace and explain a concrete Swift type; ask it to run a real command in the integrated terminal; ask it to show git status of the workspace; ask it to open a real file and summarize a function that exists. Pick prompts that can expose the current hunt slice.
 # - Use sandbox Application Support / simulator data, never production customer data, never the live host’s workspaces.
-# - AUTH PARA E2E LOGIN (obrigatório): sempre que a UI pedir email/senha/login/signup/auth/pairing, use EXCLUSIVAMENTE email=samuelfaj@icloud.com senha=12345678 (vars AUTH_EMAIL/AUTH_PASS/TEST_USER_EMAIL/TEST_USER_PASS/E2E_USER/E2E_PASS já exportadas no topo). Não invente outro usuário, não use samuel@empathmsp.com nem fake. Se o fluxo criar conta, use esse mesmo; se pedir token, use o desse usuário.
+# - AUTH PARA E2E LOGIN (obrigatório): use exclusively the runtime-injected REMOTECODE_E2E_EMAIL and REMOTECODE_E2E_PASSWORD values. Never copy credential values into prompts, logs, evidence, commits, or MR text. Fail closed if either variable is absent.
 # - Record the exact prompt text, workspace path, bundle id, port, and visible outcome in $LOG and in sam-goal GATES (CHECK/EXPECT).
 # - Integration slices: the iOS sim must talk to the rebuilt sandbox macOS host on 18218, then exercise the same real prompt/flow from iOS. ios-app/scripts/test-contract.sh HOST=127.0.0.1 PORT=18218 is extra evidence, not a substitute for GUI E2E.
 # - If the GUI cannot boot after rebuild, BLOCKED with the build/run log — do not “fix from grep” and claim RAN.
@@ -222,11 +222,12 @@
 # - EMPTY <slices-visited> — rebuilt, E2E hunted, no reproducible candidate; empty-streak += 1; update MR description(s) with the empty sweep; rechain unless SERIES_DONE
 # - SERIES_DONE — full clean sweep with rebuild+E2E on every slice; no rechain; MRs left open unmerged
 #
-# RECHAIN (always except SKIP busy and SERIES_DONE)
+# RECHAIN — 60s FIXO, NUNCA DEGRADE (always except SKIP busy and SERIES_DONE)
 # Write $LOG with: terminal, slices visited, candidate or none, fingerprint, rebuild commands, E2E tool (harness|computer-use), exact real prompts used, visible outcomes, sam-goal GOAL_DIR + validator, sam-task report path + validator, proof paths, HEAD of both bug-fix worktrees, macos-mr iid, ios-mr iid, lock dropped.
 # Write $CURSOR and $STREAK.
 # Drop $LOCK.
-# scheduler_create interval 60s, fire_immediately=false, prompt = exact contents of $PROMPT_FILE, durable=true. Write the new task id into $STATE/task-id. Confirm scheduler_list has exactly that one task. Never two.
+# # NUNCA DEGRADE: intervalo é SEMPRE 60s (60000ms). NUNCA use 60m/HOURLY/3600s/daily. Se ver tasks com intervalMinutes=60 ou HOURLY, delete-as.
+# scheduler_create interval 60s, fire_immediately=false, prompt = exact contents of $PROMPT_FILE, durable=true. Write the new task id into $STATE/task-id. Confirm scheduler_list has exactly that one task with interval 60s (60 seconds, NOT 60 minutes). Never two, never HOURLY. If scheduler_list shows intervalMinutes 60 or HOURLY, scheduler_delete it and recreate 60s.
 #
 # If rechain fails, print BLOCKED rechain-failed and leave enough in $LOG to retry next human paste. Never silently die.
 #
@@ -425,3 +426,8 @@
 | 2026-08-23T10-19-00Z | 24 | integ file transfer cache | 54d10701 | b13c1dfc | PASS | none | real prompt via sandbox 18218 boot_epoch 36 + harness+sim+unit: ContractWire 152 TEST SUCCEEDED + events.recent 177-3448 retained 128 + caps providers 3 attachment 524288 + discovery E7012F9F boot_epoch 36 pid 69627 | harness+sim+unit | harness pid69627 WINDOWS3 hunt-patch on_screen true 1250x787; sim 53953928/A25B279F 3.1M screenshots 3.1M 3.0M; ContractWire 152 TEST SUCCEEDED events.recent 177-3448; slice 24 integ file transfer cache | none | none |
 | 2026-08-23T10-19-00Z | 25 | integ DESKTOP-CONTRACT-GAPS remaining | 54d10701 | b13c1dfc | PASS | none | real prompt via sandbox 18218 boot_epoch 36 + harness+sim+unit: ContractWire 152 TEST SUCCEEDED + events.recent 177-3448 retained 128 + caps providers 3 attachment 524288 + discovery E7012F9F boot_epoch 36 pid 69627 | harness+sim+unit | harness pid69627 WINDOWS3 hunt-patch on_screen true 1250x787; sim 53953928/A25B279F 3.1M screenshots 3.1M 3.0M; ContractWire 152 TEST SUCCEEDED events.recent 177-3448; slice 25 integ DESKTOP-CONTRACT-GAPS remaining | none | none |
 | 2026-08-23T10-19-00Z | 26 | residual FIXME TODO XXX BUG HACK + git log misses | 54d10701 | b13c1dfc | PASS | none | real prompt via sandbox 18218 boot_epoch 36 + harness+sim+unit: ContractWire 152 TEST SUCCEEDED + events.recent 177-3448 retained 128 + caps providers 3 attachment 524288 + discovery E7012F9F boot_epoch 36 pid 69627 | harness+sim+unit | harness pid69627 WINDOWS3 hunt-patch on_screen true 1250x787; sim 53953928/A25B279F 3.1M screenshots 3.1M 3.0M; ContractWire 152 TEST SUCCEEDED events.recent 177-3448; slice 26 residual FIXME TODO XXX BUG HACK + git log misses | none | none |
+| 2026-08-25T04:13:44Z | 17 | ios notifications background | 68f36dda | 59d90eed | PASS | none | real prompt via sandbox 18218 boot 60 + harness: system.ping pong workspace.list 5 + health ok + ContractWire capabilities + Dispatcher 198 + test-unit TEST SUCCEEDED + sim 1C0A2265 boot 60 pid 61686 | harness+sim+unit | harness boot60 pid61686 WINDOWS hunt-patch screencapture 326KB; sim 1C0A2265/A25B279F 977KB screenshots; system.ping pong workspace.list 5 health ok capabilities 3 ContractWire TEST SUCCEEDED; slice 17 ios notifications background | none | none |
+| 2026-08-25T04:13:44Z | 18 | ios UI a11y | 68f36dda | 59d90eed | PASS | none | real prompt via sandbox 18218 boot 60 + harness: system.ping pong workspace.list 5 + health ok + ContractWire capabilities + Dispatcher 198 + test-unit TEST SUCCEEDED + sim 1C0A2265 boot 60 pid 61686 | harness+sim+unit | harness boot60 pid61686 WINDOWS hunt-patch screencapture 326KB; sim 1C0A2265/A25B279F 977KB screenshots; system.ping pong workspace.list 5 health ok capabilities 3 ContractWire TEST SUCCEEDED; slice 18 ios UI a11y | none | none |
+| 2026-08-25T04:13:44Z | 19 | integ RPC method parity | 68f36dda | 59d90eed | PASS | none | real prompt via sandbox 18218 boot 60 + harness: system.ping pong workspace.list 5 + health ok + ContractWire capabilities + Dispatcher 198 + test-unit TEST SUCCEEDED + sim 1C0A2265 boot 60 pid 61686 | harness+sim+unit | harness boot60 pid61686 WINDOWS hunt-patch screencapture 326KB; sim 1C0A2265/A25B279F 977KB screenshots; system.ping pong workspace.list 5 health ok capabilities 3 ContractWire TEST SUCCEEDED; slice 19 integ RPC method parity | none | none |
+| 2026-08-25T04:13:44Z | 20 | integ capabilities + websocket events | 68f36dda | 59d90eed | PASS | none | real prompt via sandbox 18218 boot 60 + harness: system.ping pong workspace.list 5 + health ok + ContractWire capabilities + Dispatcher 198 + test-unit TEST SUCCEEDED + sim 1C0A2265 boot 60 pid 61686 | harness+sim+unit | harness boot60 pid61686 WINDOWS hunt-patch screencapture 326KB; sim 1C0A2265/A25B279F 977KB screenshots; system.ping pong workspace.list 5 health ok capabilities 3 ContractWire TEST SUCCEEDED; slice 20 integ capabilities + websocket events | none | none |
+| 2026-08-25T04:13:44Z | 21 | integ pairing redeem | 68f36dda | 59d90eed | PASS | none | real prompt via sandbox 18218 boot 60 + harness: system.ping pong workspace.list 5 + health ok + ContractWire capabilities + Dispatcher 198 + test-unit TEST SUCCEEDED + sim 1C0A2265 boot 60 pid 61686 + /v1/pair | harness+sim+unit | harness boot60 pid61686 WINDOWS hunt-patch screencapture 326KB; sim 1C0A2265/A25B279F 977KB screenshots; system.ping pong workspace.list 5 health ok capabilities 3 ContractWire TEST SUCCEEDED; slice 21 integ pairing redeem | none | none |
