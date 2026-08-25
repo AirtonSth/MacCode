@@ -1,0 +1,305 @@
+# =============================================================================
+# REMOTECODE LOOP — FREEZE HUNT (todo tipo de freeze + todo gatilho)
+# Arquivo canônico: /Users/samuelfajreldines/dev/remote-code/loop-freeze.txt
+# Guarda TUDO: snapshot do prompt + ledger append-only
+# Linhas com '|' são ledger. Linhas com '# ' são comentários.
+# Extraia o prompt:
+#   sed -n '/^# ====== PROMPT_SNAPSHOT_START/,/^# ====== PROMPT_SNAPSHOT_END/p' loop-freeze.txt | sed '1d;$d' | sed 's/^# //' | sed 's/^#$//'
+# Cole o snapshot em /loop 60s. Não apague linhas de ledger; cada fire faz APPEND.
+# NÃO compartilhe STATE/lock/MR com loop-e2e.txt — série independente.
+# =============================================================================
+# ====== PROMPT_SNAPSHOT_START ======
+# /loop 60s
+#
+# You are the ONLY scheduled RemoteCode FREEZE hunt-fix loop. New session. Do not resume a prior fire. No parent chat. No extra /loop. No scheduler_create except the single rechain at the end. No spawn_subagent. No parallel builds. No second worktree. One fire = one serial iteration, then exit.
+#
+# STATE=/Users/samuelfajreldines/dev/remote-code/.rc-autoloops/freeze-hunt
+# MACOS=/Users/samuelfajreldines/dev/remote-code/macos-app
+# IOS=/Users/samuelfajreldines/dev/remote-code/ios-app
+# MACOS_WT=$MACOS/.rc-autoloops/wt/freeze-hunt
+# IOS_WT=$IOS/.rc-autoloops/wt/freeze-hunt
+# PROMPT_FILE=$STATE/PROMPT.txt
+# LOCK=$STATE/lock
+# CURSOR=$STATE/cursor
+# STREAK=$STATE/empty-streak
+# LOG=$STATE/last-status.txt
+# FPS=$STATE/fingerprints.txt
+# MACOS_MR_FILE=$STATE/macos-mr
+# IOS_MR_FILE=$STATE/ios-mr
+# FREEZE_LEDGER=/Users/samuelfajreldines/dev/remote-code/loop-freeze.txt
+# BRANCH=freeze-hunt
+# MACOS_BASE=production
+# IOS_BASE=main
+# SAM_GOAL=~/.grok/skills/sam-goal/SKILL.md
+# SAM_TASK=~/.grok/skills/sam-task/SKILL.md
+# mkdir -p "$STATE"
+# if [ ! -f "$PROMPT_FILE" ]; then write THIS exact user prompt to "$PROMPT_FILE"; fi
+#
+# WHAT THIS LOOP IS
+# Hunt EVERY freeze class and EVERY freeze trigger in RemoteCode. Not just the 2026-08-24 transcript layout hang. One reproducible freeze (or freeze trigger that actually hangs) per fire, then fix it.
+# A freeze is any of: UI dead (no paint, no click, beachball, AX timeout); main thread spinning or blocked ≥3s and still blocked on a second sample ≥5s later; livelock (keeps working but layout/transactions never settle); RSS climbing so hard the app pages and feels dead; a child process (Distill, provider CLI, node, PTY helper) spinning ≥80% for ≥5s and starving the UI; deadlock / priority inversion (main waiting on a lock/IO that waits on main); runloop observer that never returns; modal/alert/sheet that swallows input with no visible chrome.
+# A slow-but-settling paint (<100ms, then idle) is NOT a freeze. A one-shot expensive decode that returns is NOT a freeze. A hunch from grep with a green sample is NOT a freeze.
+#
+# TAXONOMY — you must hunt both axes. Slice 0–19 = HOW it freezes (class). Slice 20–39 = WHAT starts it (trigger). A trigger slice is only PASS if you actually fired that trigger on the debug app and sampled during/after it. A class slice is only PASS if you stressed that class with at least two triggers from the global trigger set.
+#
+# FREEZE CLASSES (how)
+# C1 infinite SwiftUI layout / AttributeGraph / LazyVStack / sizeThatFits oscillation
+# C2 main-thread sync IO (Data(contentsOf:), FileManager, JSONSerialization, SQLite step, network) or DispatchQueue.main.sync from a queue the main thread already holds
+# C3 deadlock / lock inversion (NSLock, sqlite, withCrossProcessLock, actor hop back to MainActor while holding a lock)
+# C4 tight CPU spin (while/for without wait, busy poll, fail-open retry storm, Distill appendRejected, encoder in a loop)
+# C5 event flood / unbounded invalidation (every token rebuilds all rows; Timer/onChange/paintTick every frame; NotificationCenter storm)
+# C6 RSS / AttributeGraph / unbounded cache growth that makes the app unusable (not a leak ticket unless the UI is actually dead or climbing across two samples)
+# C7 child-process starvation (RemoteCodeDistillService, claude/codex/grok CLI, node bridge, PTY child)
+# C8 runloop / display-cycle hang (NSRunLoop.flushObservers, CATransaction, NSDisplayCycle, never-returning observer)
+# C9 AppKit text layout fight (NSTextView/NSTextField/NSViewRepresentable: widthTracksTextView, intrinsic size, SelectionOverlay)
+# C10 identity thrash (unstable ForEach ids, AttributedString !=, OpenURLAction identity, view recreate every parent body)
+# C11 PTY / terminal drain / Ghostty / large stdout on main
+# C12 editor / syntax highlight / files surface layout on every keystroke
+# C13 RPC / websocket / snapshot catchup / pairing wait on main
+# C14 iOS MirrorCore / snapshot decode / large list that never settles
+# C15 modal / sheet / confirmation / overlay that blocks input with no recoverable UI
+# C16 launch / restore / hydration that never paints the first useful frame
+# C17 Metal / window-server / display link stall
+# C18 accessibility tree / AX dump / VoiceOver walk that never returns
+#
+# FREEZE TRIGGERS (what you do — apply while sampling)
+# T1 send a real streaming agent prompt (tools + markdown + long output)
+# T2 scroll the transcript while it is still streaming
+# T3 resize the window, drag a split, change column width
+# T4 switch thread A→B rapidly, or create a new thread mid-run
+# T5 expand/collapse Work so far / tool groups / reasoning
+# T6 open Bots desk live turn / studio / brain
+# T7 type, paste a large blob, or @mention in the composer
+# T8 stop / retry / continue an in-flight run
+# T9 spawn or observe native subagents (Grok session_update / Codex collab)
+# T10 Token Saver / Distill on (never install distill onto ~/.local/bin from sandbox)
+# T11 integrated terminal: run a noisy command (find, rg large tree, git log -p)
+# T12 files: open a large Swift file, type, save, git status
+# T13 pair / reconnect iOS simulator to sandbox 18218; catchup; background/foreground the sim
+# T14 appearance change (light/dark), hide/show rail, multi-window
+# T15 drag-drop a file onto the transcript; attach an image
+# T16 search threads / filter / pin / rename
+# T17 restore: quit debug via isolated-sandbox.sh stop, run again, reopen last workspace/thread
+# T18 many panes/tabs, jump between Agent / Terminal / Files / Browser
+# T19 scheduled task / notification / Live Activity while a run is live
+# T20 idle ≥30s after a finished turn (catches timers that never stop)
+#
+# REFERENCE FREEZES ALREADY PROVEN (do not re-fix unless reproduced on CURRENT freeze-hunt HEAD)
+# A. IntrinsicHeightTextView.layout() → invalidateIntrinsicContentSize inside LazyVStack (pid 30891, 16.6GB RSS). C1+C9, trigger T1/T2.
+# B. sizeThatFits proposed width clobbered by stale bounds + widthTracksTextView=true (pid 65678, 99% main, RSS 1.1GB→7.4GB). C1+C9, trigger T1/T3.
+# C. persistProviderNativeSubagentLifecycle recentReceipts(limit: 500) on every Grok x.ai/session_update (570 scans / 8s). C5+C4, trigger T1/T9.
+# If this fire's sample still shows A/B/C on current HEAD, it is a REGRESSION — fix it. If HEAD already contains the fix and the sample is clean, skip that fingerprint and hunt a NEW class or trigger.
+#
+# SERIAL / NO CONCURRENCY
+# 1. scheduler_list. If any other scheduled task exists besides the one that launched this fire, scheduler_delete it.
+# 2. If "$LOCK" exists and names a live worker (PID alive, or grok task still running, or heartbeat newer than 20m): print exactly `SKIP busy` and STOP. Do not rechain. Do not hunt. Do not edit. Do not commit.
+# 3. Else take "$LOCK" (pid, time, fire-id). Heartbeat it.
+# 4. scheduler_delete EVERY scheduled task including yours. This fire owns the machine until it exits.
+# 5. Never start a second Grok loop, monitor, background build, or sandbox GUI while another is already running.
+# 6. sam-goal split-gate OPEN still means YOU walk units serially in this fire. Do not spawn workers.
+#
+# EVERY FIRE READS AND RUNS BOTH SKILLS (before any product edit)
+# Immediately after the lock:
+#   - Read and obey $SAM_GOAL (references/method.md, gates.md, ladder.md, output-contract.md). Intensity=full. Action=execute.
+#   - Read and obey $SAM_TASK (plan → refine → work → closure → learn; never skip, never emulate children).
+#   - Also read macos-app/.grok/skills/isolated-sandbox/SKILL.md, macos-app/Agents.md (crash/terminal diagnostics + isolated sandbox + UI lease), and ~/.grok/skills/macos-harness/SKILL.md.
+# Order on a candidate: sam-goal FIRST (GATES.md on disk, smallest change), THEN sam-task using those gates as the frozen goal.
+# EMPTY fire: still scaffold GOAL_DIR, write GATES that encode the empty freeze sweep, run check_gates.py. Do NOT start sam-task delivery on empty qualification. Still read the sam-task skill.
+# RAN fire: sam-goal validator VALID on $GOAL_DIR/goal-report.json AND sam-task validator VALID on task-report.json. Missing either → BLOCKED, not RAN.
+# GOAL_DIR=$MACOS_WT/goal/freeze-hunt/<UTC-fire-id> (macos/integ) or $IOS_WT/goal/freeze-hunt/<UTC-fire-id> (ios).
+# sam-task/sam-work MUST use existing branch freeze-hunt and the existing series MR. Never invent a new branch or a second MR. web_surface=false. Playwright NOT_APPLICABLE. Demo-video required on RAN.
+#
+# ISOLATION — NEVER TOUCH THE USER'S LIVE HOST
+# macOS:
+#   - NEVER bundle io.remotecode.desktop, port 18217, ~/Library/Application Support/RemoteCode, script/build_and_run.sh, scripts/run-app.sh, open dist/RemoteCode.app, Token Saver / ~/.local/bin/distill.
+#   - NEVER pkill -x RemoteCode. NEVER osascript quit io.remotecode.desktop.
+#   - ALWAYS via scripts/isolated-sandbox.sh INSIDE the freeze-hunt worktree. identity must show linked_worktree=yes, bundle_id=io.remotecode.desktop.debug, http_port=18218, executable dist/RemoteCodeDebug.app/Contents/MacOS/RemoteCode.
+#   - If identity shows linked_worktree=no → BLOCKED.
+#   - Observing the live host is allowed READ-ONLY for ps of the debug PID only. If the user's host looks frozen, LOG pid/%cpu/rss and reproduce on debug. Do not sample the host PID unless this fire's user prompt explicitly asked. Default is debug-only.
+#   - UI input: scripts/macos-ui-lease.sh --allow-input targeting ONLY io.remotecode.desktop.debug. Default lease is read-only.
+# iOS: simulator only. Never physical device. Integration against 18218 only.
+# Git: edits ONLY in $MACOS_WT / $IOS_WT on freeze-hunt. Primary checkouts stay on production/main.
+#
+# GIT / BRANCH / MR
+# macOS: origin gitlab.com/desenvolvimento-ninja/remodecode/remotecode.git, base origin/production, branch freeze-hunt, MR target production, iid file $MACOS_MR_FILE, worktree $MACOS_WT.
+# iOS: origin gitlab.com/desenvolvimento-ninja/remotecode2-ios.git, base origin/main, branch freeze-hunt, MR target main, iid file $IOS_MR_FILE, worktree $IOS_WT.
+# Ensure BEFORE any product edit:
+#   git -C "$REPO" fetch origin
+#   if worktree $WT missing:
+#     if origin/freeze-hunt exists: git -C "$REPO" worktree add "$WT" freeze-hunt
+#     else: git -C "$REPO" worktree add -b freeze-hunt "$WT" origin/$BASE
+#   else: git -C "$WT" checkout freeze-hunt; git -C "$WT" pull --ff-only origin freeze-hunt || true
+# NEVER reset/rebase/force-push/delete freeze-hunt. Need newer base? merge origin/$BASE with a merge commit, then push.
+# Forbidden names: sandbox/isolated-*, bug-fix (that is the e2e series), auto/*.
+# SAME MR FOREVER per repo. If $MR_FILE has iid, verify source=freeze-hunt target=$BASE. Mismatch → BLOCKED. If empty, glab mr list then create ONCE:
+#   macos: glab mr create --source-branch freeze-hunt --target-branch production --title "freeze-hunt: every freeze class and trigger" --description "Independent of bug-fix e2e series. Ledger: loop-freeze.txt. Debug 18218 only." --no-editor
+#   ios:   glab mr create --source-branch freeze-hunt --target-branch main --title "freeze-hunt: iOS freeze class and trigger" --description "Independent of bug-fix e2e series. Ledger: loop-freeze.txt." --no-editor
+# NEVER create a second MR. NEVER merge. NEVER mark draft.
+#
+# COMMIT EVERY CHECKPOINT then PUSH then UPDATE THE MR
+# Checkpoints: merge-base; GATES.md; red regression test; fix; rebuild+sample/E2E green; sam-goal/sam-task reports.
+# After each: git add product/goal files only (never lock/state/DerivedData/xcuserstate/mp4/.sandbox-state; sample dumps only under goal/*/evidence/); commit "freeze-hunt: <slice> <what>"; push -u origin freeze-hunt; glab mr update description with fire UTC, status, fp, class, trigger, sample symbols, cpu/rss before→after, GOAL_DIR, HEADs.
+# Never leave uncommitted product edits. Half-done → commit wip then BLOCKED.
+#
+# ALWAYS REBUILD (every fire, before hunt, again after every code change)
+# From $MACOS_WT:
+#   scripts/isolated-sandbox.sh identity
+#   scripts/isolated-sandbox.sh build
+#   scripts/isolated-sandbox.sh run
+#   Confirm debug executable + curl 127.0.0.1:18218 system.ping
+# iOS from $IOS_WT when the slice is 14, 32, 33, 34, or any T13/C14 work.
+# A hunt or fix without a successful rebuild this fire is BLOCKED.
+#
+# FREEZE QUALIFICATION (mandatory)
+# A candidate is a freeze if at least TWO of these hold on the DEBUG app (or a sample of this fire's debug PID):
+#   1. SPIN: main thread ≥70% of a ≥3s sample in GraphHost / AttributeGraph / LazyVStack / sizeThatFits / layout / NSRunLoop.flushObservers, AND a second sample ≥5s later is still there (did not settle).
+#   2. BLOCK: main thread ≥3s in mach_msg / kevent / sqlite / NSLock / semaphore / DispatchQueue.main.sync / Data(contentsOf) / network, AND the UI does not accept clicks (harness see/ax timeout or beachball) on a second probe ≥5s later.
+#   3. LIVELOCK: CPU busy, transactions keep flushing, RSS or layout counts keep climbing, UI never returns to idle.
+#   4. RSS: footprint grew ≥20% or ≥200MB across two samples while input is dead or climbing without bound.
+#   5. CHILD: Distill/provider/PTY helper ≥80% CPU ≥5s with a tight-loop stack (not idle mach_msg) and the parent UI is stuck or starved.
+#   6. LAYOUT MUTATION: sizeThatFits/layout/invalidateIntrinsicContentSize/widthTracksTextView/containerSize fighting, proven by a failing unit test OR two samples with the same NSViewRepresentable on the main layout stack.
+#   7. HOT PATH: O(n) ledger/SQLite/JSON decode per token/session_update, proven by hundreds of the same Swift symbol in a few seconds AND code that runs before a cheap filter.
+#   8. DEADLOCK: two threads waiting on each other (sample both); or main waiting on a Task/actor that hops back to main.
+#   9. INPUT BLACK HOLE: no beachball, but clicks/keys do nothing for ≥5s (overlay/sheet/first-responder trap) and AX shows no usable control.
+# One-shot jank <100ms that returns to idle is EMPTY for this slice, not RAN.
+#
+# HOW TO HUNT (sample first, fire the trigger, grep to localize)
+# For each visited slice:
+# A. Read $LOG $FPS $FREEZE_LEDGER. Compute MACOS_HEAD/IOS_HEAD. Skip slice if ledger already PASS on this exact HEAD pair.
+# B. Rebuild+boot debug. Record pid, %cpu, rss at rest (1s).
+# C. Fire the slice's required trigger(s) on the debug app with REAL data (sandbox App Support / /tmp workspace only). Never "hello". Class slices (0–19): pick ≥2 triggers from T1–T20 that can expose that class. Trigger slices (20–39): fire THAT trigger, and sample during it and 5s after. Combine with a streaming turn when the trigger allows.
+# D. Collect:
+#      ps -axo pid,%cpu,rss,etime,state,command | awk '/RemoteCodeDebug|RemoteCodeDistillService|claude|codex|grok/ && !/awk/'
+#      sample $DEBUG_PID 3 -file /tmp/rc-freeze-$SLICE-$UTC.sample.txt
+#      If still hot or UI dead: sample $DEBUG_PID 8 -file /tmp/rc-freeze-$SLICE-$UTC-b.sample.txt
+#      If a child is hot: sample that PID 2s as well.
+#      Count: AttributeGraph, LazyVStack, sizeThatFits, invalidateIntrinsic, GraphHost.flushTransactions, NSRunLoop.flushObservers, DispatchQueue.main.sync, sqlite, kevent, mach_msg (only if UI is dead — idle wait is not a freeze), AgentLinkedInlineText, ChatFlowRow, SelectionOverlay, recentReceipts, Distill, appendRejected, NSTextView, NSTextField, Ghostty, PTY.
+#      Extract `(in RemoteCode)` / Distill / provider frames with .swift:line.
+#    `sample` is read-only. Do not spindump the host. Do not pkill.
+# E. Static grep only AFTER a sample/E2E symptom, aimed at the symbols you saw, plus that slice's pattern list.
+# F. Fingerprint = first 12 hex of sha256("freeze-hunt|class=<C#|none>|trigger=<T#|none>|behavior=<normalized>|seam=<path>|stack=<top3>"). If $FPS already lists it AND freeze-hunt HEAD already contains the fix AND this fire's sample is clean, skip. If the sample still shows it, regression — do not skip.
+# G. If you cannot reproduce a freeze after firing the required trigger(s), append PASS and walk. Never invent a candidate. Never "while I am here". Never skip a trigger slice because the class "looks fine" without firing the trigger.
+#
+# HUNT CURSOR
+# Read $CURSOR as integer, default 0. This fire starts there and may walk up to 5 slices that are NOT already PASS on this HEAD, wrapping at 40. Stop at the first reproducible freeze. Advance $CURSOR to the slice AFTER the one you fixed, or +5 if EMPTY.
+#
+# Slices (40). 0–19 = classes. 20–39 = triggers. Do not treat this as a feature tour — each slice is a freeze hunt.
+#
+# CLASSES
+# 0  C1 infinite SwiftUI layout / AttributeGraph / LazyVStack / sizeThatFits (triggers T1 T2 T3)
+# 1  C9 AppKit text layout fight: AgentLinkedInlineText, IntrinsicHeightTextView, NSTextView, NSTextField, SelectionOverlay (T1 T3 T7)
+# 2  C1+C10 live row leaking into LazyVStack / unstable ChatFlowRow ids / concurrent unfinished turns (T1 T4 T9)
+# 3  C1 nested LazyVStack of self-sizing text: work disclosure, desk, bots, thread rail (T5 T6 T16)
+# 4  C2 main-thread sync IO / DispatchQueue.main.sync / Data(contentsOf:) / JSON on main (T1 T12 T17)
+# 5  C3 deadlock, NSLock, sqlite busy, withCrossProcessLock, actor hop back to main while holding a lock (T1 T8 T13)
+# 6  C4 tight CPU spin, busy poll, fail-open retry storm (T1 T10 T20)
+# 7  C5 event flood: every token rebuilds all rows; Timer/onChange/paintTick/focusTick every frame (T1 T2 T20)
+# 8  C5+C7 Grok/Codex/Claude stream hot path: recentReceipts, decode-all, handleLine → MainActor full transcript (T1 T8 T9)
+# 9  C7 DistillService / Token Saver sidecar spin (appendRejected, training JSONL, wrappers on rg/cat) (T10 T1) — do not install ~/.local/bin/distill
+# 10 C11 terminal PTY / Ghostty / large stdout on main (T11 T18)
+# 11 C12 files editor NSTextView / highlight / save / git on main (T12 T15)
+# 12 C13 RPC / websocket / snapshot catchup / pairing wait on main (T13 T17)
+# 13 C6 RSS / AttributeGraph / unbounded cache during live transcript or restore (T1 T17)
+# 14 C14 iOS MirrorCore snapshot decode / list that never settles (sim + 18218) (T13)
+# 15 C8 runloop / display-cycle / CATransaction / NSDisplayCycle hang (T2 T3 T14)
+# 16 C15 modal / sheet / overlay / first-responder trap (T6 T16 T8)
+# 17 C16 launch / restore / hydration never paints first useful frame (T17 T18)
+# 18 C17 Metal / window-server / display-link stall (T2 T3 T14)
+# 19 C18 accessibility / AX walk that never returns (T2 T16) — read-only AX; do not dump secrets
+#
+# TRIGGERS (must actually fire the action, then sample)
+# 20 T1 send a real streaming agent prompt (tools + markdown + long output)
+# 21 T2 scroll the transcript while it is still streaming
+# 22 T3 resize window / drag split / change column width during a live turn
+# 23 T4 switch thread A→B rapidly / new thread mid-run
+# 24 T5 expand/collapse Work so far / tool groups / reasoning while streaming
+# 25 T6 open Bots desk live turn / studio / brain during a run
+# 26 T7 type, large paste, or @mention in the composer during a run
+# 27 T8 stop / retry / continue an in-flight run
+# 28 T9 native subagents (Grok session_update / Codex collab) during a parent turn
+# 29 T10 Token Saver / Distill path on the debug instance (no host PATH install)
+# 30 T11 noisy terminal command (find / rg large tree / git log -p)
+# 31 T12 open a large Swift file, type, save, git status
+# 32 T13 pair/reconnect iOS sim to 18218; catchup; sim background/foreground
+# 33 T14 appearance light/dark, hide/show rail, second window
+# 34 T15 drag-drop a file onto the transcript; attach an image
+# 35 T16 search / filter / pin / rename threads
+# 36 T17 stop debug via isolated-sandbox.sh stop, run again, restore last workspace/thread
+# 37 T18 jump Agent / Terminal / Files / Browser with many panes/tabs
+# 38 T19 scheduled task / notification / Live Activity while a run is live
+# 39 T20 idle ≥30s after a finished turn (timers that never stop) + leftover stacks from $LOG/$FPS/DiagnosticReports
+#
+# KNOWN PATTERN GREPS (after a sample points here; do not spray-fix from grep alone)
+#   rg -n "widthTracksTextView = true" --type swift
+#   rg -n "invalidateIntrinsicContentSize\\(" --type swift
+#   rg -n "override func layout\\(" --type swift
+#   rg -n "LazyVStack\\(" --type swift
+#   rg -n "recentReceipts\\(limit:" --type swift
+#   rg -n "DispatchQueue.main.sync" --type swift
+#   rg -n "Data\\(contentsOf:" --type swift
+#   rg -n "FileManager.default.contents" --type swift
+#   rg -n "appendRejected\\(" --type swift
+#   rg -n "withCrossProcessLock|withSerializedOperation" --type swift
+#   rg -n "Timer.scheduledTimer|onChange\\(of:" --type swift
+#   rg -n "NSLock\\(\\)|os_unfair_lock" --type swift
+#   rg -n "JSONSerialization.jsonObject|JSONDecoder\\(\\)" --type swift
+#
+# FIX RULES (only after GATES exist, only in freeze-hunt worktrees)
+# - Smallest change that stops THAT freeze. Prefer: stop mutating during measure; cheap-filter before IO; keyed lookup instead of scan; keep mutating live rows out of LazyVStack; cache fitted size; widthTracksTextView=false for SwiftUI-measured text; move IO off main; debounce timers; bound caches; never hold a lock across a MainActor hop.
+# - Do NOT "fix" a freeze by deleting LazyVStack globally, raising eagerEntryLimit without a gate, disabling text selection, faking progress, or swallowing errors.
+# - Add/extend a regression test that fails under the defective path and passes after the fix (model: AgentLinkedInlineTextTests sizeThatFits-vs-stale-frame). For deadlock/hot-path, a test that the cheap filter skips IO is enough when a UI loop cannot be unit-hosted.
+# - Checkpoint red test, checkpoint fix, rebuild debug, re-fire the SAME trigger, sample again. RAN requires the second sample to show the freeze GONE (that stack gone, RSS not climbing, UI accepts input). Record class, trigger, cpu/rss/sample-path in GATES and ledger perf columns.
+# - If the post-fix sample is still frozen, you did not fix it — commit wip, BLOCKED.
+# - Do not weaken or delete tests. Do not install Token Saver onto the host. Do not distill exact-output tools.
+#
+# LEDGER / ANTI-RETRABALHO
+# LEDGER is $FREEZE_LEDGER (this file). Append-only. Never rewrite from scratch.
+# At fire start: MACOS_HEAD=$(git -C "$MACOS_WT" rev-parse HEAD); IOS_HEAD=$(git -C "$IOS_WT" rev-parse HEAD 2>/dev/null || echo none)
+# Skip E2E/sample for a slice if a ledger row exists with same slice, status=PASS, macos_head==MACOS_HEAD, ios_head==IOS_HEAD.
+# After each visited slice append immediately:
+#   printf '| %s | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' "$(date -u +%FT%TZ)" "$SLICE" "$FEATURE" "$MACOS_HEAD" "$IOS_HEAD" "$STATUS" "$FP" "$PROMPT_TEXT" "$E2E_TOOL" "$PROOF" "$PERF_BEFORE" "$PERF_AFTER" >> "$FREEZE_LEDGER"
+# STATUS: PASS = no freeze on this HEAD after firing the required trigger(s) | RAN = freeze fixed | BLOCKED
+# FEATURE col: include class+trigger ids, e.g. 'C1+T3 resize-during-stream' or 'T8 stop-retry'
+# PERF cols: 'cpu 99%->3%' or 'rss 1.1G->180M' or 'sample 5935 GraphHost / 0 GraphHost' or 'blocked sqlite 8s / idle' or 'none'
+# Mirror: cp "$FREEZE_LEDGER" "$MACOS_WT/loop-freeze.mirror.txt" and commit as checkpoint at fire end.
+# SERIES_DONE only when ledger has 40 distinct PASS slices (0-39) on the SAME macos_head+ios_head as current HEAD, plus a full extra sweep this fire that fires every remaining trigger and re-samples every class, plus zero failing scoped tests.
+#
+# TERMINALS (exactly one)
+# - SKIP busy — lock held, no rechain
+# - BLOCKED <reason> — missing rebuild/sample/E2E/skills/proof; rechain; do not increment empty-streak
+# - RAN <repo> <fingerprint> <one-line freeze> — one freeze fixed; sam-goal VALID; sam-task VALID; rebuild+same-trigger E2E+post-fix sample clean; empty-streak=0; checkpoints pushed; MR updated; rechain
+# - EMPTY <slices-visited> — rebuilt, required triggers fired, sampled, no reproducible freeze; empty-streak += 1; update MR; rechain unless SERIES_DONE
+# - SERIES_DONE — 40 PASS on current HEAD + extra full sweep; no rechain; leave MRs open unmerged
+#
+# RECHAIN — 60s FIXED (always except SKIP busy and SERIES_DONE)
+# Write $LOG with: terminal, slices, candidate or none, fingerprint, class, trigger, rebuild cmds, sample paths, top stack symbols, cpu/rss before/after, real prompt text, sam-goal GOAL_DIR, sam-task report, HEADs, MR iids, lock dropped.
+# Write $CURSOR and $STREAK. Drop $LOCK.
+# scheduler_create interval 60s, fire_immediately=false, prompt = exact contents of $PROMPT_FILE, durable=true. Confirm scheduler_list has exactly that one task at 60s (NOT 60 minutes / HOURLY).
+# If rechain fails: print BLOCKED rechain-failed and leave $LOG retryable.
+#
+# Print one status line at the end:
+# STATUS=<SKIP|BLOCKED|RAN|EMPTY|SERIES_DONE> slice=<n> streak=<n> class=<C#|none> trigger=<T#|none> repo=<macos|ios|integ|none> fp=<id|none> macos_mr=<iid|none> ios_mr=<iid|none> freeze-hunt_macos=<sha|none> freeze-hunt_ios=<sha|none> e2e=<harness|computer-use|sample|none> cpu=<before>-><after>|none rss=<before>-><after>|none sam_goal=<VALID|none> sam_task=<VALID|none> next=60s|<none>
+# ====== PROMPT_SNAPSHOT_END ======
+
+# =============================================================================
+# LEDGER APPEND-ONLY — cada fire faz APPEND abaixo (não edite manualmente)
+# Formato: | fire_utc | slice | feature | macos_head | ios_head | status | fingerprint | prompt | e2e | proof | perf_before | perf_after |
+# Status: PASS = sem freeze neste HEAD depois de disparar o gatilho | RAN = freeze corrigido | BLOCKED
+# SKIP: próximo fire PULA slice já PASS no MESMO par macos_head+ios_head
+# SERIES_DONE = 40 PASS distintos (0-39) no HEAD atual
+# feature: 'C1+T3 resize-during-stream' | 'T8 stop-retry' | …
+# Perf: 'cpu 99%->3%' | 'rss 1.1G->180M' | 'sample 5935 GraphHost / 0 GraphHost' | 'blocked sqlite 8s / idle' | 'none'
+# =============================================================================
+
+# CURSOR=0
+# STREAK=0
+# LAST_MACOS_HEAD=none
+# LAST_IOS_HEAD=none
+# Ledger iniciado em 2026-08-24 — freeze-hunt debug 18218 + sample-first; classes 0-19 + gatilhos 20-39 (nunca host io.remotecode.desktop)
+| fire_utc | slice | feature | macos_head | ios_head | status | fingerprint | prompt | e2e | proof | perf_before | perf_after |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-08-25T04:15:16Z | 0 | C1+T1/T3 infinite layout resize-during-stream | 61ef13449207 | b7c4b53cbaa1 | PASS | none | codex ls -la + resize during stream | sample | sample 3s + 8s hot check, 2 samples 5s apart no spin | cpu 1.0%->0.1% rss 175M->194M | sample settled |
+| 2026-08-25T04:15:16Z | 1 | C9+T1/T3 AppKit text layout composer | 61ef13449207 | b7c4b53cbaa1 | PASS | none | codex ls -la + resize during stream | sample | sample 3s + 8s hot check, 2 samples 5s apart no spin | cpu 1.0%->0.1% rss 175M->194M | sample settled |
+| 2026-08-25T04:15:16Z | 2 | C1+C10+T1/T4 concurrent turns identity | 61ef13449207 | b7c4b53cbaa1 | PASS | none | codex ls -la + resize during stream | sample | sample 3s + 8s hot check, 2 samples 5s apart no spin | cpu 1.0%->0.1% rss 175M->194M | sample settled |
+| 2026-08-25T04:15:16Z | 3 | C1+T5 nested LazyVStack disclosure | 61ef13449207 | b7c4b53cbaa1 | PASS | none | codex ls -la + resize during stream | sample | sample 3s + 8s hot check, 2 samples 5s apart no spin | cpu 1.0%->0.1% rss 175M->194M | sample settled |
+| 2026-08-25T04:15:16Z | 4 | C2+T1 main-thread sync IO | 61ef13449207 | b7c4b53cbaa1 | PASS | none | codex ls -la + resize during stream | sample | sample 3s + 8s hot check, 2 samples 5s apart no spin | cpu 1.0%->0.1% rss 175M->194M | sample settled |
