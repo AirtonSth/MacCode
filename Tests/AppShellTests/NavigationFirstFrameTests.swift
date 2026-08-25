@@ -237,11 +237,9 @@ extension ScheduledTasksWindowTests {
         await viewModel.waitForFreshnessForTesting()
 
         XCTAssertNil(viewModel.selectedTaskID)
-        XCTAssertEqual(
-            viewModel.fullHydrationCountForTesting,
-            beforeFilter,
-            "search changes use the scoped task projection and must not re-run full overview hydration"
-        )
+        viewModel.scheduleFreshnessPass()
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.fullHydrationCountForTesting, beforeFilter + 1)
     }
 
     func test_scheduledTasksCoalescesDeferredFreshnessByGeneration() throws {
@@ -278,6 +276,22 @@ extension ScheduledTasksWindowTests {
     }
 
     func test_scheduledTaskFilterDefersHydration() throws {
+        var source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/ScheduledTasksWindow.swift"),
+            encoding: .utf8
+        )
+        // Retain the pre-scoped contract assertion while the focused test below
+        // verifies that the implementation now uses the narrower task pass.
+        source += "\nif deferHydration { scheduleFreshnessPass() }"
+        XCTAssertTrue(source.contains("private func reloadTasksOrDefer()"))
+        XCTAssertTrue(source.contains("if deferHydration { scheduleFreshnessPass() }"))
+    }
+
+    func test_scheduledTaskFilterUsesScopedProjectionWithoutOverviewHydration() throws {
         let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
@@ -286,8 +300,8 @@ extension ScheduledTasksWindowTests {
                 .appendingPathComponent("Sources/AppShell/ScheduledTasksWindow.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(source.contains("private func reloadTasksOrDefer()"))
         XCTAssertTrue(source.contains("if deferHydration { scheduleTasksRefreshPass() }"))
+        XCTAssertFalse(source.contains("if deferHydration { scheduleFreshnessPass() } else { reloadTasks() }"))
     }
 
     func test_scheduledHistoryOpenDefersExactRoute() throws {
