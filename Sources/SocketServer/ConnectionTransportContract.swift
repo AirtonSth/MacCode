@@ -339,7 +339,7 @@ enum ConnectionTransportFrame: Equatable, Sendable {
     static let protocolVersion = 3
     static let maximumEncodedBytes = 1_048_576
     private static let dottedNameExpression = try! NSRegularExpression(
-        pattern: #"[a-z][a-z0-9]*(?:\.[a-z0-9_]+)+"#
+        pattern: #"[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+"#
     )
     // PERF: WS heartbeats/events and client frames encode/decode continuously.
     // Reuse codecs under a short lock (JSONEncoder/JSONDecoder are not thread-safe).

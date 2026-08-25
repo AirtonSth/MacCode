@@ -576,6 +576,28 @@ final class WebSocketIntegrationTests: XCTestCase {
         XCTAssertNil(event["seq"], "v3 events must use the canonical sequence field")
     }
 
+    func testRetainedTokenSaverDigestReplaysWithoutInvalidEventClose() async throws {
+        // WHY: token_saver.digest is retained before mobile reconnect. The
+        // canonical underscore namespace must replay as an event instead of
+        // terminating the new socket with closing.reason=invalidEvent.
+        let baseline = EventBus.shared.currentSeq
+        EventBus.shared.publish(
+            kind: "token_saver.digest",
+            payload: .object(["enabled": .bool(false)])
+        )
+        let (server, port) = try startServer(serverId: "token-saver-host")
+        defer { server.stop() }
+        let task = wsTask(port: port, sinceSeq: baseline)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual(welcome["type"] as? String, "welcome")
+        let event = try await receiveEvent(task, kind: "token_saver.digest")
+        XCTAssertEqual(event["type"] as? String, "event")
+        XCTAssertEqual((event["sequence"] as? NSNumber)?.int64Value, baseline + 1)
+        XCTAssertEqual(event["hostId"] as? String, "token-saver-host")
+    }
+
     func test_CONN005_welcomeExposesReplayWindowForGapDetection() async throws {
         let (server, port) = try startServer()
         defer { server.stop() }
