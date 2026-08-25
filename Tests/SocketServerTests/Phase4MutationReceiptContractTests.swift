@@ -88,6 +88,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     private(set) var phase4ClaimCallCount = 0
     private(set) var finalizedEventKinds: [String: [String]] = [:]
     private(set) var finalizedEvents: [String: [EventBus.MutationEventIntent]] = [:]
+    private(set) var botAttentionBindings: [(profileID: String, hostID: String, deviceID: String)] = []
     private var phase4Receipts: [String: Receipt] = [:]
 
     private func phase4ReceiptKey(method: String, clientRequestId: String) -> String {
@@ -382,6 +383,10 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     ) throws -> JSONValue {
         synchronousBatchEffectCallCount += 1
         return .object(["ok": .bool(true)])
+    }
+
+    override func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {
+        botAttentionBindings.append((profileID, hostID, deviceID))
     }
 
     private func phase4FileEditResult(sessionID: String, action: String) throws -> JSONValue {
@@ -2032,6 +2037,102 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                 XCTAssertTrue(faultRecorder.events.isEmpty, testCase.method)
             }
         }
+    }
+
+    /// WHY: profile_id is local iOS routing identity. The Mac may persist it
+    /// only when a bearer-authenticated push registration binds the exact
+    /// device to this host; a client-declared foreign host must never bind.
+    func test_privatePushRegistrationBindsBotAttentionProfileToAuthenticatedHost() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_733)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "attention-profile-binding",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["push_token"] = "opaque-alert-token"
+        params["push_token_type"] = "apns"
+        params["device_id"] = "ios-device-1"
+        params["profile_id"] = "ios-profile-1"
+
+        let first = try await live.rpc(method: "private.push_token.update", params: params)
+        let replay = try await live.rpc(method: "private.push_token.update", params: params)
+        XCTAssertNil(first["error"])
+        XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary)
+        XCTAssertEqual(router.botAttentionBindings.count, 1)
+        XCTAssertEqual(router.botAttentionBindings.first?.profileID, "ios-profile-1")
+        XCTAssertEqual(router.botAttentionBindings.first?.hostID, Phase4LiveServer.hostId)
+        XCTAssertEqual(router.botAttentionBindings.first?.deviceID, "ios-device-1")
+
+        var foreign = params
+        foreign["client_request_id"] = "attention-profile-foreign-host"
+        foreign["server_id"] = "foreign-host"
+        let rejected = try await live.rpc(method: "private.push_token.update", params: foreign)
+        XCTAssertNotNil(rejected["error"])
+        XCTAssertEqual(router.botAttentionBindings.count, 1)
+    }
+
+    /// WHY: only the exact completed acknowledgement may advance remote UI.
+    /// The canonical event must preserve the same profile/host/item/Bot tuple;
+    /// failed acknowledgements remain eventless.
+    func test_botAttentionAckPublishesExactCompletedIdentityAndNoFailedEvent() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let itemID = UUID().uuidString.lowercased()
+        let profileID = UUID().uuidString.lowercased()
+        let router = Phase4ReceiptFakeRouter()
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "request_id": .string("attention-ack-completed"),
+            "receipt_id": .string("attention-receipt"),
+            "bot_id": .string(botID),
+            "readback": .object([
+                "state": .string("none"),
+                "profile_id": .string(profileID),
+                "host_id": .string(Phase4LiveServer.hostId),
+                "attention_item_id": .string(itemID),
+                "notification_id": .string(itemID),
+                "bot_id": .string(botID),
+                "source": .string("bot"),
+            ]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_734)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "attention-ack-completed",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["profile_id"] = profileID
+        params["attention_item_id"] = itemID
+        params["bot_id"] = botID
+        _ = try await live.rpc(method: "bot.attention.ack", params: params)
+        let event = try XCTUnwrap(router.finalizedEvents["bot.attention.ack:attention-ack-completed"]?.first)
+        XCTAssertEqual(event.kind, "bot.attention.updated")
+        let payload = try XCTUnwrap(event.payload.objectValue)
+        XCTAssertEqual(payload["profile_id"]?.stringValue, profileID)
+        XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId)
+        XCTAssertEqual(payload["attention_item_id"]?.stringValue, itemID)
+        XCTAssertEqual(payload["notification_id"]?.stringValue, itemID)
+        XCTAssertEqual(payload["bot_id"]?.stringValue, botID)
+
+        let failedRouter = Phase4ReceiptFakeRouter()
+        failedRouter.pairedBotRemoteResult = .object([
+            "status": .string("failed"),
+            "request_id": .string("attention-ack-failed"),
+            "receipt_id": .string("attention-failed-receipt"),
+            "bot_id": .string(botID),
+            "readback": .object(["state": .string("finished")]),
+        ])
+        let failedLive = try await Phase4LiveServer.start(router: failedRouter, bootEpoch: 1_735)
+        defer { failedLive.stop() }
+        params["client_request_id"] = "attention-ack-failed"
+        _ = try await failedLive.rpc(method: "bot.attention.ack", params: params)
+        XCTAssertTrue(failedRouter.finalizedEvents["bot.attention.ack:attention-ack-failed"]?.isEmpty ?? true)
     }
 
     func test_gitSSHAndProjectLaunchBatchIsDurableAndNoReplay() async throws {

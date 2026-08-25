@@ -1345,6 +1345,113 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(notifications, 1, "login verification must not reopen the page")
     }
 
+    /// WHY: a notification acknowledgement is a security-sensitive remote
+    /// mutation. It must clear only the exact host/item/Bot target for a
+    /// profile learned from authenticated push registration, never a stale or
+    /// client-invented profile/item tuple.
+    func test_attentionAckRequiresRegisteredProfileAndExactHostItemBot() throws {
+        let profileID = "ios-profile-1"
+        let hostID = "host-attention-1"
+        try BotAttentionPushBindingStore(db: db).bind(
+            profileID: profileID,
+            hostID: hostID,
+            deviceID: "ios-device-1"
+        )
+        XCTAssertTrue(
+            BotAttentionPushBindingStore(db: db).contains(profileID: profileID, hostID: hostID),
+            "the authenticated registration binding must survive a new store instance"
+        )
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "attention-bot",
+            "name": "Attention Bot",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "attention-run",
+            "host_id": hostID,
+            "bot_id": botID,
+            "text": "Finish this",
+        ])
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let item = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first)
+        let itemID = try XCTUnwrap(item["id"] as? String)
+        XCTAssertEqual(item["profile_id"] as? String, profileID)
+        XCTAssertEqual(item["host_id"] as? String, hostID)
+        XCTAssertEqual(item["attention_item_id"] as? String, itemID)
+        XCTAssertEqual(item["notification_id"] as? String, itemID)
+        XCTAssertEqual(item["bot_id"] as? String, botID)
+        XCTAssertEqual(item["source"] as? String, "bot")
+
+        try BotAttentionPushBindingStore(db: db).bind(
+            profileID: profileID,
+            hostID: "host-attention-2",
+            deviceID: "ios-device-2"
+        )
+
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.ack", params: [
+            "client_request_id": "attention-wrong-profile",
+            "profile_id": "invented-profile",
+            "host_id": hostID,
+            "attention_item_id": itemID,
+            "bot_id": botID,
+        ]))
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.ack", params: [
+            "client_request_id": "attention-wrong-item",
+            "profile_id": profileID,
+            "host_id": hostID,
+            "attention_item_id": "stale-item",
+            "bot_id": botID,
+        ]))
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.ack", params: [
+            "client_request_id": "attention-wrong-host",
+            "profile_id": profileID,
+            "host_id": "host-attention-2",
+            "attention_item_id": itemID,
+            "bot_id": botID,
+        ]))
+        let otherBot = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "attention-other-bot",
+            "name": "Other Attention Bot",
+        ])
+        let otherBotID = try XCTUnwrap(otherBot["bot_id"] as? String)
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.ack", params: [
+            "client_request_id": "attention-wrong-bot",
+            "profile_id": profileID,
+            "host_id": hostID,
+            "attention_item_id": itemID,
+            "bot_id": otherBotID,
+        ]))
+
+        let acknowledged = try authority.dispatch(method: "bot.attention.ack", params: [
+            "client_request_id": "attention-exact",
+            "profile_id": profileID,
+            "host_id": hostID,
+            "attention_item_id": itemID,
+            "bot_id": botID,
+        ])
+        let readback = try XCTUnwrap(acknowledged["readback"] as? [String: Any])
+        XCTAssertEqual(acknowledged["status"] as? String, "completed")
+        XCTAssertEqual(readback["state"] as? String, "none")
+        XCTAssertEqual(readback["profile_id"] as? String, profileID)
+        XCTAssertEqual(readback["host_id"] as? String, hostID)
+        XCTAssertEqual(readback["attention_item_id"] as? String, itemID)
+        XCTAssertEqual(readback["notification_id"] as? String, itemID)
+        XCTAssertEqual(readback["bot_id"] as? String, botID)
+        XCTAssertNil(readback["conversation_id"], "P003 has no conversation claim")
+        let cleared = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let clearedItem = try XCTUnwrap((cleared["items"] as? [[String: Any]])?.first)
+        XCTAssertEqual(clearedItem["state"] as? String, "none")
+        XCTAssertEqual(clearedItem["profile_id"] as? String, profileID)
+        XCTAssertEqual(clearedItem["host_id"] as? String, hostID)
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.ack", params: [
+            "client_request_id": "attention-stale-repeat",
+            "profile_id": profileID,
+            "host_id": hostID,
+            "attention_item_id": itemID,
+            "bot_id": botID,
+        ]), "an already-cleared item is stale and must not emit another completed receipt")
+    }
+
     private func fileRootGrant(
         botID: String,
         hostID: String = ""

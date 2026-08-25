@@ -7545,6 +7545,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return .object(result)
     }
 
+    public func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try BotAttentionPushBindingStore(db: ctx.db).bind(
+            profileID: profileID,
+            hostID: hostID,
+            deviceID: deviceID
+        )
+    }
+
     public func settingsGet(keys: [String]) throws -> [String: String] {
         guard let ctx = context else { return [:] }
         var values: [String: String] = [:]

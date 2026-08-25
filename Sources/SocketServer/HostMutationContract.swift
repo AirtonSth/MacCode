@@ -320,6 +320,13 @@ public enum HostMutationContract {
                 return []
             case "bot.settings.set":
                 return [.string("key")]
+            case "bot.attention.ack":
+                return [
+                    .uuid("bot_id"),
+                    .string("profile_id", nonempty: true),
+                    .string("host_id", nonempty: true),
+                    .anyString(["attention_item_id", "notification_id", "item_id"], nonempty: true),
+                ]
             default:
                 return [.uuid("bot_id")]
             }

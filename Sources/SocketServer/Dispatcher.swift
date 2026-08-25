@@ -322,6 +322,7 @@ public protocol CommandRouting: AnyObject {
         contractVersion: Int?,
         capabilities: [String]?
     ) throws -> JSONValue
+    func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws
     // settings
     func settingsGet(keys: [String]) throws -> [String: String]
     func settingsSet(key: String, value: String) throws
@@ -345,6 +346,8 @@ public protocol CommandRouting: AnyObject {
 public extension CommandRouting {
     /// Test/fake hosts may omit Token Saver entirely.
     func tokenSaverDigest() -> JSONValue? { nil }
+
+    func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {}
 
     func closeWorkspace(_ id: WorkspaceID) throws {
         try closeWorkspace(id, publishEvent: true)
@@ -1224,6 +1227,7 @@ public final class JSONRPCDispatcher {
                     "host_id", "root", "root_handle", "handle", "generation", "previous_generation",
                     "root_cas", "previous_cas", "expected_cas", "current_cas",
                     "entry_generation", "entry_cas", "path", "op",
+                    "profile_id", "attention_item_id", "notification_id", "source",
                     "surface_id", "snapshot_generation", "url", "title", "loading", "action",
                     "session_before_digest", "session_after_digest", "cleared", "removed_count", "partial",
                 ] {
@@ -1418,6 +1422,15 @@ public final class JSONRPCDispatcher {
             // than accepting a client-declared host id.
             businessParams["client_request_id"] = .string(clientRequestId)
             businessParams["host_id"] = .string(context.hostId)
+        } else if req.method == "private.push_token.update" {
+            if let declaredHost = businessParams["server_id"]?.stringValue,
+               declaredHost != context.hostId {
+                return .init(id: req.id, error: JSONRPCError(
+                    code: -32098,
+                    message: "Push registration host does not match the authenticated host."
+                ))
+            }
+            businessParams["authenticated_host_id"] = .string(context.hostId)
         }
         do {
             try HostMutationContract.preflight(method: req.method, params: businessParams)
@@ -3859,6 +3872,10 @@ public final class JSONRPCDispatcher {
                       let pushTokenType = params["push_token_type"]?.stringValue,
                       pushTokenType == "apns" || pushTokenType == "fcm" else { throw JSONRPCError.invalidParams }
                 let tokenPurpose = params["token_purpose"]?.stringValue
+                let profileID = params["profile_id"]?.stringValue
+                let authenticatedHostID = params["authenticated_host_id"]?.stringValue
+                var boundProfileID: String?
+                var boundHostID: String?
                 let environment = params["environment"]?.stringValue
                 let serverID = params["server_id"]?.stringValue
                 let bootEpoch = params["boot_epoch"]?.intValue
@@ -3914,7 +3931,7 @@ public final class JSONRPCDispatcher {
                         throw JSONRPCError.invalidParams
                     }
                 }
-                let result = try router.privatePushTokenUpdate(
+                var result = try router.privatePushTokenUpdate(
                     pushToken: pushToken,
                     pushTokenType: pushTokenType,
                     liveActivityToken: params["live_activity_token"]?.stringValue,
@@ -3930,9 +3947,30 @@ public final class JSONRPCDispatcher {
                     contractVersion: contractVersion,
                     capabilities: capabilities
                 )
+                if tokenPurpose == nil || tokenPurpose == "alert", let profileID {
+                    guard !profileID.isEmpty,
+                          let authenticatedHostID, !authenticatedHostID.isEmpty,
+                          let deviceID = params["device_id"]?.stringValue, !deviceID.isEmpty else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    try router.bindBotAttentionProfile(
+                        profileID: profileID,
+                        hostID: authenticatedHostID,
+                        deviceID: deviceID
+                    )
+                    boundProfileID = profileID
+                    boundHostID = authenticatedHostID
+                    var readback = result.objectValue ?? [:]
+                    readback["profile_id"] = .string(profileID)
+                    readback["host_id"] = .string(authenticatedHostID)
+                    readback["device_id"] = .string(deviceID)
+                    result = .object(readback)
+                }
                 EventBus.shared.publish(kind: "private.push_token.updated", payload: .object([
                     "push_token_type": .string(pushTokenType),
                     "device_id": params["device_id"] ?? .null,
+                    "profile_id": boundProfileID.map(JSONValue.string) ?? .null,
+                    "host_id": boundHostID.map(JSONValue.string) ?? .null,
                     "token_purpose": tokenPurpose.map(JSONValue.string) ?? .null,
                     "environment": environment.map(JSONValue.string) ?? .null
                 ]))

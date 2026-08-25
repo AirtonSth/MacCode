@@ -996,6 +996,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         )
         return .object(["ok": .bool(true), "push_token_type": .string(pushTokenType)])
     }
+    func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {}
     var settings: [String: String] = [:]
     func settingsGet(keys: [String]) throws -> [String: String] {
         Dictionary(uniqueKeysWithValues: keys.map { ($0, settings[$0] ?? "") })

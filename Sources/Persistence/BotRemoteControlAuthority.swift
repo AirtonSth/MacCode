@@ -44,6 +44,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private let db: SQLiteDB
     private let appSupport: URL
     private let browserStore: BotBrowserStore
+    private let attentionBindings: BotAttentionPushBindingStore
 
     public var onHasLiveRun: ((BotID) -> Bool)?
     public var onStopRun: ((BotID, Bool, String) -> Void)?
@@ -86,6 +87,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         self.settings = settings
         self.appSupport = appSupportDirectory
         self.browserStore = BotBrowserStore(appSupportDirectory: appSupportDirectory)
+        self.attentionBindings = BotAttentionPushBindingStore(db: db)
         loadSidecar()
         migrateSidecarQueueIfNeeded()
     }
@@ -142,7 +144,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "peer.receipt.status":
             return peerReceiptStatus(params: params)
         case "attention.list":
-            return ["items": Array(attention.values)]
+            return ["items": attention.values.map { canonicalAttentionItem($0) }]
         case "reserved.probe":
             throw Error.reserved
         default:
@@ -372,7 +374,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "attention.ack":
             return try attentionAck(params: params, requestID: requestID)
         case "scheduler.tick":
-            return try schedulerTick(now: now, requestID: requestID)
+            return try schedulerTick(params: params, now: now, requestID: requestID)
         case "peer.ask":
             return try peerAsk(params: params, requestID: requestID)
         case "self_config":
@@ -607,7 +609,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "conversation_id": conversationID ?? NSNull(),
             "routing": routing,
         ]
-        attention[botID] = [
+        attention[botID] = canonicalAttentionItem([
             "id": UUID().uuidString.lowercased(),
             "bot_id": botID,
             "conversation_id": conversationID ?? NSNull(),
@@ -620,7 +622,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "title": bot.name,
             "detail": text,
             "source": "bot",
-        ]
+        ], hostID: string(params, "host_id"))
         if let routingReceiptID = routing["routing_receipt_id"] as? String {
             consumedRoutingReceipts.insert(routingReceiptID)
         }
@@ -662,7 +664,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             ]
             drained = encodeQueue([next]).first
         }
-        attention[botID] = [
+        attention[botID] = canonicalAttentionItem([
             "id": attention[botID]?["id"] ?? UUID().uuidString.lowercased(),
             "bot_id": botID,
             "conversation_id": run?["conversation_id"] ?? NSNull(),
@@ -677,7 +679,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "title": bot.name,
             "detail": drained == nil ? "Finished" : "Running queued follow-up",
             "source": "bot",
-        ]
+        ], hostID: string(params, "host_id"))
         return receipt(
             requestID: requestID,
             status: liveStop ? .accepted : .completed,
@@ -802,7 +804,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             ))
         }
         routineRuntime[routineID.lowercased()] = runtime
-        attention[id(bot)] = [
+        attention[id(bot)] = canonicalAttentionItem([
             "id": UUID().uuidString.lowercased(),
             "bot_id": id(bot),
             "conversation_id": selectedConversation[id(bot)] ?? NSNull(),
@@ -815,7 +817,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "title": "Routine: \(routineID)",
             "detail": "Manual routine run accepted",
             "source": "routine",
-        ]
+        ], hostID: string(params, "host_id"))
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: run)
     }
 
@@ -827,7 +829,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["deleted": true])
     }
 
-    private func schedulerTick(now: Date, requestID: String) throws -> [String: Any] {
+    private func schedulerTick(params: [String: Any], now: Date, requestID: String) throws -> [String: Any] {
         var fired: [[String: Any]] = []
         for bot in try store.list() {
             for routine in try store.listRoutines(botID: bot.id) where routine.activation.isEnabled {
@@ -867,7 +869,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                     )
                 ))
                 routineRuntime[routineKey] = runtime
-                attention[id(bot)] = [
+                attention[id(bot)] = canonicalAttentionItem([
                     "id": UUID().uuidString.lowercased(),
                     "bot_id": id(bot),
                     "conversation_id": selectedConversation[id(bot)] ?? NSNull(),
@@ -880,7 +882,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                     "title": routine.definition.name,
                     "detail": "Scheduled routine completed",
                     "source": "routine",
-                ]
+                ], hostID: string(params, "host_id"))
                 fired.append(run)
             }
         }
@@ -1361,8 +1363,54 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func attentionAck(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
-        attention[id(bot)] = ["bot_id": id(bot), "state": "none", "source": "bot"]
-        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["state": "none"])
+        let botID = id(bot)
+        let profileID = string(params, "profile_id") ?? ""
+        let hostID = string(params, "host_id") ?? ""
+        let itemID = string(params, "attention_item_id")
+            ?? string(params, "notification_id")
+            ?? string(params, "item_id")
+            ?? ""
+        guard !profileID.isEmpty, !hostID.isEmpty, !itemID.isEmpty,
+              attentionBindings.contains(profileID: profileID, hostID: hostID),
+              let stored = attention[botID] else { throw Error.crossTarget }
+        let item = canonicalAttentionItem(stored)
+        guard item["id"] as? String == itemID,
+              item["bot_id"] as? String == botID,
+              item["profile_id"] as? String == profileID,
+              item["host_id"] as? String == hostID,
+              item["state"] as? String != "none" else { throw Error.crossTarget }
+        var cleared = item
+        cleared["state"] = "none"
+        attention[botID] = cleared
+        return receipt(requestID: requestID, status: .completed, botID: botID, readback: [
+            "state": "none",
+            "profile_id": profileID,
+            "host_id": hostID,
+            "attention_item_id": itemID,
+            "notification_id": itemID,
+            "bot_id": botID,
+            "source": item["source"] as? String ?? "bot",
+        ])
+    }
+
+    private func canonicalAttentionItem(_ raw: [String: Any], hostID: String? = nil) -> [String: Any] {
+        var item = raw
+        guard let itemID = item["id"] as? String, !itemID.isEmpty else { return item }
+        item["attention_item_id"] = itemID
+        item["notification_id"] = itemID
+        if item["profile_id"] as? String != nil,
+           item["host_id"] as? String != nil {
+            return item
+        }
+        let requestedHost = hostID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let storedHost = item["host_id"] as? String
+        let selectedHost = storedHost?.isEmpty == false ? storedHost : requestedHost
+        if let selectedHost, !selectedHost.isEmpty,
+           let binding = attentionBindings.latest(hostID: selectedHost) {
+            item["profile_id"] = binding.profileID
+            item["host_id"] = binding.hostID
+        }
+        return item
     }
 
     private func peerAsk(params: [String: Any], requestID: String) throws -> [String: Any] {
