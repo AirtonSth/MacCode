@@ -2532,14 +2532,22 @@ final class BotsWindowTests: XCTestCase {
             row.contains(".padding(.horizontal, DS.Space.sm)"),
             "roster rows must use the same horizontal inset as workspace rows"
         )
-        XCTAssertTrue(
-            row.contains("size: 16"),
-            "the avatar must sit inside the 20pt workspace icon slot, not overflow into the rail margin"
+        XCTAssertEqual(
+            BotsChrome.rosterAvatarSize, 48,
+            "roster avatars follow a messenger conversation list, not the 20pt workspace icon slot"
         )
-        XCTAssertTrue(row.contains(".frame(width: 20, height: 20)"))
+        XCTAssertGreaterThanOrEqual(
+            BotsChrome.rosterAvatarSize, 40,
+            "blobatar eyes/glance only paint at ≥40pt; a 16pt chip hides the teammate face"
+        )
+        XCTAssertTrue(
+            row.contains("size: BotsChrome.rosterAvatarSize"),
+            "the roster must paint the conversation-list avatar, not a one-off 16pt chip"
+        )
+        XCTAssertTrue(row.contains(".frame(width: BotsChrome.rosterAvatarSize, height: BotsChrome.rosterAvatarSize)"))
         XCTAssertFalse(
-            row.contains("size: 22"),
-            "a 22pt blob in a 20pt slot eats the Space.sm inset the folder icon keeps"
+            row.contains("size: 16"),
+            "a 16pt blob in a 20pt workspace slot is too small to read as a teammate"
         )
     }
 

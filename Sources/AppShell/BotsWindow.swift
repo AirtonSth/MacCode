@@ -9736,7 +9736,7 @@ public struct BotsRosterList: View {
                         name: bot.name,
                         handle: bot.handle,
                         symbol: bot.avatarSymbol,
-                        size: 16,
+                        size: BotsChrome.rosterAvatarSize,
                         attention: state
                     )
                     Circle()
@@ -9744,7 +9744,7 @@ public struct BotsRosterList: View {
                         .frame(width: 7, height: 7)
                         .overlay(Circle().stroke(DS.Palette.surface, lineWidth: 1))
                 }
-                .frame(width: 20, height: 20)
+                .frame(width: BotsChrome.rosterAvatarSize, height: BotsChrome.rosterAvatarSize)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(bot.name)
                         .font(selected ? DS.Font.bodyStrong : DS.Font.body)

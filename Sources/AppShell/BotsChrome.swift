@@ -45,6 +45,9 @@ public enum BotsChrome {
     }
 
     public static let hitTarget: CGFloat = 44
+    /// Roster conversation-list avatar. Workspace folder icons stay 20pt;
+    /// blobatar faces (eyes / glance) only paint at ≥40pt.
+    public static let rosterAvatarSize: CGFloat = 48
     public static let rosterWidth: CGFloat = 272
     public static let threadRailWidth: CGFloat = 320
     public static let threadRailMinWidth: CGFloat = 320
