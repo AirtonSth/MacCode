@@ -46,11 +46,13 @@ public struct BotBrowserPageState: Codable, Equatable, Sendable {
     public var url: String
     public var title: String
     public var cookies: [String: String]
+    public var loading: Bool?
 
-    public init(url: String, title: String = "", cookies: [String: String] = [:]) {
+    public init(url: String, title: String = "", cookies: [String: String] = [:], loading: Bool? = nil) {
         self.url = url
         self.title = title
         self.cookies = cookies
+        self.loading = loading
     }
 
     /// Live login wait reads WKHTTPCookieStore through this helper.

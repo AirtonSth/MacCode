@@ -87,6 +87,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     private(set) var pairedBotRemoteCallCount = 0
     private(set) var phase4ClaimCallCount = 0
     private(set) var finalizedEventKinds: [String: [String]] = [:]
+    private(set) var finalizedEvents: [String: [EventBus.MutationEventIntent]] = [:]
     private var phase4Receipts: [String: Receipt] = [:]
 
     private func phase4ReceiptKey(method: String, clientRequestId: String) -> String {
@@ -749,7 +750,9 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
             throw Phase4InjectedReceiptUnavailable()
         }
         finalizationCallCount += 1
-        finalizedEventKinds[phase4ReceiptKey(method: method, clientRequestId: clientRequestId)] = events.map(\.kind)
+        let key = phase4ReceiptKey(method: method, clientRequestId: clientRequestId)
+        finalizedEventKinds[key] = events.map(\.kind)
+        finalizedEvents[key] = events
         try commitCommandReceipt(
             method: method,
             clientRequestId: clientRequestId,
@@ -2684,6 +2687,95 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             XCTAssertEqual(router.finalizationCallCount, 1, testCase.method)
             XCTAssertEqual(router.finalizedEventKinds["\(testCase.method):\(requestID)"], [testCase.event], testCase.method)
             live.stop()
+        }
+    }
+
+    /// WHY: Files/Browser projections are invalid without their authority
+    /// coordinates. Phase4 must publish those exact completed fields once,
+    /// while accepted and failed receipts remain eventless.
+    func test_pairedBotFilesAndBrowserEventsCarryAuthorityAndExcludeNonCompletedStatuses() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let completedCases: [(method: String, event: String, readback: [String: JSONValue])] = [
+            (
+                "bot.files.mutate",
+                "bot.files.changed",
+                [
+                    "bot_id": .string(botID),
+                    "host_id": .string(Phase4LiveServer.hostId),
+                    "root": .string("bot_home"),
+                    "handle": .string("opaque-file-grant"),
+                    "path": .string("MEMORY.md"),
+                    "op": .string("write"),
+                    "generation": .number(7),
+                    "security": .object(["opaque_handle": .bool(true), "symlink_safe": .bool(true)]),
+                ]
+            ),
+            (
+                "bot.browser.action",
+                "bot.browser.updated",
+                [
+                    "bot_id": .string(botID),
+                    "host_id": .string(Phase4LiveServer.hostId),
+                    "surface_id": .string("bot-surface"),
+                    "snapshot_generation": .number(11),
+                    "generation": .number(12),
+                    "url": .string("https://example.test/home"),
+                    "title": .string("Home"),
+                    "loading": .bool(false),
+                    "action": .string("login.complete"),
+                    "session_after_digest": .string("opaque-session-after"),
+                    "security": .object(["cookie_exported": .bool(false)]),
+                    "session": .object(["authenticated": .bool(true), "cookie_exported": .bool(false)]),
+                ]
+            ),
+        ]
+
+        for (index, testCase) in completedCases.enumerated() {
+            let router = Phase4ReceiptFakeRouter()
+            let requestID = "bot-authority-completed-\(index)"
+            router.pairedBotRemoteResult = .object([
+                "status": .string("completed"),
+                "request_id": .string(requestID),
+                "receipt_id": .string("authority-receipt-\(index)"),
+                "bot_id": .string(botID),
+                "readback": .object(testCase.readback),
+            ])
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(1_510 + index))
+            defer { live.stop() }
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            params["bot_id"] = botID
+
+            _ = try await live.rpc(method: testCase.method, params: params)
+            let event = try XCTUnwrap(router.finalizedEvents["\(testCase.method):\(requestID)"]?.first)
+            XCTAssertEqual(event.kind, testCase.event)
+            let payload = try XCTUnwrap(event.payload.objectValue)
+            XCTAssertEqual(payload["bot_id"]?.stringValue, botID)
+            for key in testCase.readback.keys where key != "bot_id" {
+                XCTAssertEqual(payload[key], testCase.readback[key], "\(testCase.method) must publish \(key)")
+            }
+        }
+
+        for (index, status) in ["accepted", "failed"].enumerated() {
+            let router = Phase4ReceiptFakeRouter()
+            let requestID = "bot-authority-nonterminal-\(status)"
+            router.pairedBotRemoteResult = .object([
+                "status": .string(status),
+                "request_id": .string(requestID),
+                "receipt_id": .string("authority-\(status)"),
+                "bot_id": .string(botID),
+                "readback": .object(["bot_id": .string(botID), "generation": .number(99)]),
+            ])
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(1_520 + index))
+            defer { live.stop() }
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            params["bot_id"] = botID
+
+            _ = try await live.rpc(method: "bot.browser.action", params: params)
+            XCTAssertEqual(router.finalizedEventKinds["bot.browser.action:\(requestID)"], [])
         }
     }
 

@@ -186,7 +186,7 @@
     {"method": "bot.guest.start", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.guest.updated"], "readbackMethods": ["bot.receipt.status", "bot.guest.state"]},
     {"method": "bot.guest.stop", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.guest.updated"], "readbackMethods": ["bot.receipt.status", "bot.guest.state"]},
     {"method": "bot.guest.rebuild", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.guest.updated"], "readbackMethods": ["bot.receipt.status", "bot.guest.state"]},
-    {"method": "bot.docker.clear", "family": "bot-remote", "risk": "destructive", "eventKinds": ["bot.docker.cleared"], "readbackMethods": ["bot.files.list"]},
+    {"method": "bot.docker.clear", "family": "bot-remote", "risk": "destructive", "eventKinds": ["bot.docker.cleared"], "readbackMethods": ["bot.receipt.status", "bot.files.list"]},
     {"method": "bot.notify.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},
     {"method": "bot.desktop.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},
     {"method": "bot.avatar.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},

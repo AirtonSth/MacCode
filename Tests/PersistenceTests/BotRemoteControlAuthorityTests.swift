@@ -514,7 +514,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertNotNil(result["receipt_id"] as? String)
     }
 
-    func test_filesMutate_rejectsPathEscapeAndReturnsOpaqueHandle() throws {
+    func test_filesMutate_requiresOpaqueGenerationBoundGrantAndRejectsPathEscape() throws {
         let created = try authority.dispatch(method: "bot.create", params: [
             "client_request_id": "fl",
             "name": "Piper",
@@ -522,21 +522,35 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let botID = try XCTUnwrap(created["bot_id"] as? String)
         XCTAssertThrowsError(
             try authority.dispatch(method: "bot.files.mutate", params: [
+                "client_request_id": "raw-path-bypass",
+                "bot_id": botID,
+                "path": "MEMORY.md",
+                "op": "write",
+            ])
+        )
+        let grant = try fileRootGrant(botID: botID)
+        XCTAssertThrowsError(
+            try authority.dispatch(method: "bot.files.mutate", params: [
                 "client_request_id": "esc",
                 "bot_id": botID,
-                "path": "../etc/passwd",
+                "handle": grant.handle,
+                "expected_generation": grant.generation,
+                "relative_path": "../etc/passwd",
                 "op": "write",
             ])
         )
         let wrote = try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "ok",
             "bot_id": botID,
-            "path": "MEMORY.md",
+            "handle": grant.handle,
+            "expected_generation": grant.generation,
+            "relative_path": "MEMORY.md",
             "op": "write",
         ])
         let handle = (wrote["readback"] as? [String: Any])?["handle"] as? String
-        XCTAssertTrue(handle?.contains(botID) == true)
+        XCTAssertFalse(handle?.contains(botID) == true, "opaque grants must not encode Bot identity")
         XCTAssertFalse(handle?.contains("/Users") == true)
+        XCTAssertEqual((wrote["readback"] as? [String: Any])?["generation"] as? Int, grant.generation + 1)
     }
 
     func test_forceStop_returnsTerminalReadbackDistinctFromMissingRun() throws {
@@ -676,10 +690,13 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "name": "Piper",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let grant = try fileRootGrant(botID: botID)
         _ = try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "disk-w",
             "bot_id": botID,
-            "path": "notes.txt",
+            "handle": grant.handle,
+            "expected_generation": grant.generation,
+            "relative_path": "notes.txt",
             "op": "write",
             "contents": "from remote",
         ])
@@ -755,10 +772,13 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "bot_id": botID,
             "root": "docker_home",
         ])
+        let grant = try fileRootGrant(botID: botID)
         _ = try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "dock-w",
             "bot_id": botID,
-            "path": "scratch.txt",
+            "handle": grant.handle,
+            "expected_generation": grant.generation,
+            "relative_path": "scratch.txt",
             "op": "write",
             "contents": "guest bytes",
         ])
@@ -801,10 +821,13 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "name": "Piper",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let grant = try fileRootGrant(botID: botID)
         let wrote = try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "open-w",
             "bot_id": botID,
-            "path": "notes.txt",
+            "handle": grant.handle,
+            "expected_generation": grant.generation,
+            "relative_path": "notes.txt",
             "op": "write",
             "contents": "surface",
         ])
@@ -832,7 +855,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             try authority.dispatch(method: "bot.files.open_tab", params: [
                 "client_request_id": "open-missing",
                 "bot_id": botID,
-                "handle": "\(botID):bot_home:1:missing.txt",
+                "handle": UUID().uuidString.lowercased(),
             ])
         )
     }
@@ -1075,5 +1098,219 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "Conversations without a first run have no thread yet; the key must be absent, not fabricated"
         )
         XCTAssertNotNil(linkedRow["updated_at"] as? Double)
+    }
+
+    /// WHY: an iOS retry must never overwrite bytes through a stale projection.
+    /// The host returns durable conflict/recovery readback instead of silently
+    /// accepting the old generation.
+    func test_filesMutationCASConflictDoesNotChangeDiskAndSurvivesReceiptReplay() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "files-cas-bot", "name": "Files CAS",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let grant = try fileRootGrant(botID: botID)
+        _ = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "files-cas-first",
+            "bot_id": botID,
+            "handle": grant.handle,
+            "expected_generation": grant.generation,
+            "relative_path": "cas.txt",
+            "op": "write",
+            "contents": "authoritative",
+        ])
+        let conflictParams: [String: Any] = [
+            "client_request_id": "files-cas-stale",
+            "bot_id": botID,
+            "handle": grant.handle,
+            "expected_generation": grant.generation,
+            "relative_path": "cas.txt",
+            "op": "write",
+            "contents": "stale",
+        ]
+        let conflict = try authority.dispatch(method: "bot.files.mutate", params: conflictParams)
+        let replay = try authority.dispatch(method: "bot.files.mutate", params: conflictParams)
+        XCTAssertEqual(conflict["status"] as? String, "failed")
+        XCTAssertEqual(conflict as NSDictionary, replay as NSDictionary)
+        let readback = try XCTUnwrap(conflict["readback"] as? [String: Any])
+        XCTAssertEqual(readback["conflict"] as? Bool, true)
+        XCTAssertEqual((readback["recovery"] as? [String: Any])?["method"] as? String, "bot.files.list")
+        let bot = try XCTUnwrap(store.get(id: BotID(try XCTUnwrap(UUID(uuidString: botID)))))
+        XCTAssertEqual(try String(contentsOf: BotHome(appSupportDirectory: supportDir, bot: bot).root
+            .appendingPathComponent("cas.txt")), "authoritative")
+    }
+
+    /// WHY: a grant is authority, not a parseable path token. It remains usable
+    /// after host relaunch only for its exact Bot, root, and generation.
+    func test_fileGrantIsOpaqueDurableAndRejectsCrossBotAndSymlinkEscape() throws {
+        let first = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "files-owner", "name": "Owner",
+        ])
+        let second = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "files-thief", "name": "Thief",
+        ])
+        let ownerID = try XCTUnwrap(first["bot_id"] as? String)
+        let thiefID = try XCTUnwrap(second["bot_id"] as? String)
+        let grant = try fileRootGrant(botID: ownerID, hostID: "host-a")
+        XCTAssertFalse(grant.handle.contains(ownerID))
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "files-cross-bot",
+            "host_id": "host-a",
+            "bot_id": thiefID,
+            "handle": grant.handle,
+            "expected_generation": grant.generation,
+            "relative_path": "stolen.txt",
+            "op": "write",
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+
+        let owner = try XCTUnwrap(store.get(id: BotID(try XCTUnwrap(UUID(uuidString: ownerID)))))
+        let home = BotHome(appSupportDirectory: supportDir, bot: owner)
+        try home.ensure(name: owner.name, handle: owner.handle, title: owner.title, description: owner.description, soul: "")
+        let outside = supportDir.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: home.root.appendingPathComponent("escape"), withDestinationURL: outside)
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "files-symlink",
+            "bot_id": ownerID,
+            "handle": grant.handle,
+            "expected_generation": grant.generation,
+            "relative_path": "escape/payload.txt",
+            "op": "write",
+        ]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("payload.txt").path))
+
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.files.list", params: [
+            "host_id": "host-b", "bot_id": ownerID,
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+
+        _ = try authority.dispatch(method: "bot.files.location.set", params: [
+            "client_request_id": "files-switch-docker",
+            "host_id": "host-a",
+            "bot_id": ownerID,
+            "root": "docker_home",
+            "expected_generation": grant.generation,
+        ])
+        _ = try authority.dispatch(method: "bot.files.location.set", params: [
+            "client_request_id": "files-switch-back",
+            "host_id": "host-a",
+            "bot_id": ownerID,
+            "root": "bot_home",
+        ])
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "files-revoked-switch",
+            "host_id": "host-a",
+            "bot_id": ownerID,
+            "handle": grant.handle,
+            "relative_path": "revoked.txt",
+            "op": "write",
+        ]), "root switches must revoke every prior handle")
+
+        let relaunched = BotRemoteControlAuthority(db: db, store: store, settings: settings, appSupportDirectory: supportDir)
+        let listed = try relaunched.dispatch(method: "bot.files.list", params: ["bot_id": ownerID])
+        XCTAssertGreaterThan(listed["generation"] as? Int ?? 0, grant.generation)
+        XCTAssertEqual((listed["security"] as? [String: Any])?["symlink_safe"] as? Bool, true)
+    }
+
+    /// WHY: iOS may persist only a projection. Host relaunch must restore the
+    /// exact Bot surface/session metadata without exporting website data.
+    func test_browserStateRestoresExactHostBotSurfaceAndOpaqueSessionWithoutCookies() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "browser-restore", "name": "Browser",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let opened = try authority.dispatch(method: "bot.link.open", params: [
+            "client_request_id": "browser-open",
+            "host_id": "host-a",
+            "bot_id": botID,
+            "url": "https://example.test/login",
+            "title": "Sign in",
+        ])
+        let openedState = try XCTUnwrap(opened["readback"] as? [String: Any])
+        let surfaceID = try XCTUnwrap(openedState["surface_id"] as? String)
+        let session = try XCTUnwrap(openedState["session"] as? [String: Any])
+        XCTAssertNotNil(session["digest"] as? String)
+        XCTAssertNil(openedState["cookies"])
+
+        let relaunched = BotRemoteControlAuthority(db: db, store: store, settings: settings, appSupportDirectory: supportDir)
+        let state = try relaunched.dispatch(method: "bot.browser.state", params: [
+            "host_id": "host-a", "bot_id": botID,
+        ])
+        XCTAssertEqual(state["host_id"] as? String, "host-a")
+        XCTAssertEqual(state["surface_id"] as? String, surfaceID)
+        XCTAssertEqual(state["url"] as? String, "https://example.test/login")
+        XCTAssertEqual((state["session"] as? [String: Any])?["digest"] as? String, session["digest"] as? String)
+        XCTAssertEqual((state["security"] as? [String: Any])?["cookie_exported"] as? Bool, false)
+        XCTAssertNil(state["cookies"])
+        XCTAssertThrowsError(try relaunched.dispatch(method: "bot.browser.state", params: [
+            "host_id": "host-b", "bot_id": botID,
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+    }
+
+    /// WHY: login completion comes from the host-owned page state, while stale
+    /// snapshot actions fail with recovery and never enqueue a second action.
+    func test_browserCASAndLoginCompletionUseAuthoritativeHostSession() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "browser-login", "name": "Login",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        var notifications = 0
+        authority.notifyBrowserPendingOpen = { _ in notifications += 1 }
+        let opened = try authority.dispatch(method: "bot.link.open", params: [
+            "client_request_id": "browser-login-open",
+            "host_id": "host-a",
+            "bot_id": botID,
+            "url": "https://example.test/login",
+        ])
+        let before = try XCTUnwrap(opened["readback"] as? [String: Any])
+        let stale = try authority.dispatch(method: "bot.browser.action", params: [
+            "client_request_id": "browser-stale",
+            "host_id": "host-a",
+            "bot_id": botID,
+            "surface_id": before["surface_id"] as Any,
+            "snapshot_generation": 0,
+            "expected_generation": 0,
+            "action": "navigate",
+            "url": "https://evil.invalid",
+        ])
+        XCTAssertEqual(stale["status"] as? String, "failed")
+        XCTAssertEqual(((stale["readback"] as? [String: Any])?["recovery"] as? [String: Any])?["method"] as? String, "bot.browser.state")
+        XCTAssertEqual(notifications, 1, "conflicts must not enqueue host work")
+
+        let uuid = try XCTUnwrap(UUID(uuidString: botID))
+        try BotBrowserStore(appSupportDirectory: supportDir).persistPageState(
+            BotBrowserPageState(url: "https://example.test/home", title: "Home", cookies: ["session": "host-only"]),
+            botID: BotID(uuid)
+        )
+        let completed = try authority.dispatch(method: "bot.browser.action", params: [
+            "client_request_id": "browser-login-complete",
+            "host_id": "host-a",
+            "bot_id": botID,
+            "surface_id": before["surface_id"] as Any,
+            "snapshot_generation": before["generation"] as Any,
+            "expected_generation": before["generation"] as Any,
+            "action": "login.complete",
+        ])
+        let after = try XCTUnwrap(completed["readback"] as? [String: Any])
+        XCTAssertEqual(completed["status"] as? String, "completed")
+        XCTAssertEqual((after["session"] as? [String: Any])?["authenticated"] as? Bool, true)
+        XCTAssertNotEqual(after["session_before_digest"] as? String, after["session_after_digest"] as? String)
+        XCTAssertEqual(after["url"] as? String, "https://example.test/home")
+        XCTAssertNil(after["cookies"])
+        XCTAssertEqual(notifications, 1, "login verification must not reopen the page")
+    }
+
+    private func fileRootGrant(botID: String, hostID: String = "") throws -> (handle: String, generation: Int) {
+        var params: [String: Any] = ["bot_id": botID]
+        if !hostID.isEmpty { params["host_id"] = hostID }
+        let listed = try authority.dispatch(method: "bot.files.list", params: params)
+        return (
+            try XCTUnwrap(listed["root_handle"] as? String),
+            try XCTUnwrap(listed["generation"] as? Int)
+        )
     }
 }

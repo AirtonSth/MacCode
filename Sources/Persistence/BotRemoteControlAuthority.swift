@@ -68,6 +68,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var schedulerRuns: [[String: Any]] = []
     private var routineRuntime: [String: [String: Any]] = [:]
     private var filesLocation: [String: String] = [:]
+    private var fileGenerations: [String: Int] = [:]
+    private var fileHosts: [String: String] = [:]
     private var routingPref: [String: [String: Any]] = [:]
     private var consumedRoutingReceipts: Set<String> = []
     private var selectedConversation: [String: String] = [:]
@@ -228,48 +230,27 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func filesList(params: [String: Any]) throws -> [String: Any] {
         let bot = try requireBot(params)
         let botID = id(bot)
+        let hostID = try requireFileHost(params: params, botID: botID)
         let root = filesLocation[botID] ?? "bot_home"
+        let currentGeneration = fileGeneration(botID: botID, root: root)
         let paths = try listDiskPaths(bot: bot, root: root)
-        var entries: [[String: Any]] = []
-        for path in paths {
-            let handle = handleFor(botID: botID, root: root, path: path)
-            let entry: [String: Any] = [
-                "handle": handle,
-                "bot_id": botID,
-                "root": root,
-                "path": path,
-                "generation": generation,
-            ]
-            files[handle] = entry
-            entries.append(entry)
-        }
+        let rootEntry = mintFileGrant(hostID: hostID, botID: botID, root: root, path: "", kind: "root")
+        let entries = paths.map { mintFileGrant(hostID: hostID, botID: botID, root: root, path: $0, kind: "file") }
+        persistSidecar()
         return [
+            "bot_id": botID,
+            "host_id": hostID,
             "root": root,
-            "generation": generation,
+            "generation": currentGeneration,
+            "root_handle": rootEntry["handle"] as Any,
             "entries": entries,
+            "security": fileSecurity(),
         ]
     }
 
     private func browserState(params: [String: Any]) throws -> [String: Any] {
         let bot = try requireBot(params)
-        let botID = id(bot)
-        if let target = try browserStore.loadTarget(botID: bot.id) {
-            return [
-                "bot_id": botID,
-                "url": target.url,
-                "title": target.title,
-                "loading": false,
-                "generation": (browser[botID]?["generation"] as? Int) ?? generation,
-                "host_first": true,
-            ]
-        }
-        return browser[botID] ?? [
-            "bot_id": botID,
-            "url": "",
-            "title": "",
-            "loading": false,
-            "generation": 0,
-        ]
+        return try authoritativeBrowserState(bot: bot, hostID: string(params, "host_id"))
     }
 
     private func guestState(params: [String: Any]) -> [String: Any] {
@@ -929,33 +910,73 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func filesMutate(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         let botID = id(bot)
-        let root = filesLocation[botID] ?? "bot_home"
-        let path = string(params, "path") ?? ""
-        if path.contains("..") || path.hasPrefix("/") {
-            throw Error(code: -32086, message: "Path escapes Bot home containment.")
+        let hostID = try requireFileHost(params: params, botID: botID)
+        let handle = string(params, "handle") ?? ""
+        guard !handle.isEmpty else { throw Error.invalidParams }
+        let entry = try resolveFileEntry(bot: bot, handle: handle)
+        guard entry["host_id"] as? String == hostID else { throw Error.crossTarget }
+        let root = entry["root"] as? String ?? ""
+        let selectedRoot = filesLocation[botID] ?? "bot_home"
+        let currentGeneration = fileGeneration(botID: botID, root: root)
+        let grantedGeneration = entry["generation"] as? Int ?? 0
+        let expectedGeneration = int(params, "expected_generation") ?? grantedGeneration
+        guard root == selectedRoot, grantedGeneration == currentGeneration,
+              expectedGeneration == currentGeneration else {
+            return fileConflictReceipt(
+                requestID: requestID,
+                botID: botID,
+                root: selectedRoot,
+                expectedGeneration: expectedGeneration
+            )
         }
+        let kind = entry["kind"] as? String ?? "file"
+        let path = kind == "root"
+            ? (string(params, "relative_path") ?? string(params, "path") ?? "")
+            : (entry["path"] as? String ?? "")
+        guard !path.isEmpty else { throw Error.invalidParams }
         let op = string(params, "op") ?? "write"
+        guard op == "write" || op == "delete" else { throw Error.invalidParams }
         let contents = string(params, "contents") ?? string(params, "body") ?? ""
         try applyDiskMutation(bot: bot, root: root, path: path, op: op, contents: contents)
-        generation += 1
-        let handle = "\(botID):\(root):\(generation):\(path)"
-        let entry: [String: Any] = [
-            "handle": handle,
+        let nextGeneration = currentGeneration + 1
+        fileGenerations[fileGenerationKey(botID: botID, root: root)] = nextGeneration
+        let nextEntry = op == "delete"
+            ? nil
+            : mintFileGrant(hostID: hostID, botID: botID, root: root, path: path, kind: "file")
+        var readback: [String: Any] = [
             "bot_id": botID,
+            "host_id": hostID,
             "root": root,
             "path": path,
-            "generation": generation,
+            "previous_generation": currentGeneration,
+            "generation": nextGeneration,
             "op": op,
+            "security": fileSecurity(),
         ]
-        files[handle] = entry
-        return receipt(requestID: requestID, status: .completed, botID: botID, readback: entry)
+        if let nextEntry { readback["handle"] = nextEntry["handle"] }
+        return receipt(requestID: requestID, status: .completed, botID: botID, readback: readback)
     }
 
     private func filesOpen(params: [String: Any], requestID: String, split: Bool) throws -> [String: Any] {
         let bot = try requireBot(params)
+        let hostID = try requireFileHost(params: params, botID: id(bot))
         let handle = string(params, "handle") ?? ""
         let entry = try resolveFileEntry(bot: bot, handle: handle)
+        guard entry["host_id"] as? String == hostID else { throw Error.crossTarget }
         let root = (entry["root"] as? String) ?? (filesLocation[id(bot)] ?? "bot_home")
+        let currentGeneration = fileGeneration(botID: id(bot), root: root)
+        let expectedGeneration = int(params, "expected_generation") ?? (entry["generation"] as? Int ?? 0)
+        guard root == (filesLocation[id(bot)] ?? "bot_home"),
+              entry["kind"] as? String == "file",
+              entry["generation"] as? Int == currentGeneration,
+              expectedGeneration == currentGeneration else {
+            return fileConflictReceipt(
+                requestID: requestID,
+                botID: id(bot),
+                root: filesLocation[id(bot)] ?? "bot_home",
+                expectedGeneration: expectedGeneration
+            )
+        }
         let path = entry["path"] as? String ?? ""
         guard try diskFileExists(bot: bot, root: root, path: path) else {
             throw Error(code: -32090, message: "Bot file was not found.")
@@ -965,27 +986,88 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
             "mounted": true,
+            "host_id": hostID,
             "split": split,
             "handle": handle,
             "path": path,
-            "generation": entry["generation"] as Any,
+            "root": root,
+            "generation": currentGeneration,
+            "security": fileSecurity(),
         ])
     }
 
     private func filesLocationSet(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
+        let botID = id(bot)
+        let hostID = try requireFileHost(params: params, botID: botID)
         let root = string(params, "root") ?? "bot_home"
         guard root == "bot_home" || root == "docker_home" else { throw Error.invalidParams }
-        filesLocation[id(bot)] = root
-        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["root": root])
+        let previousRoot = filesLocation[botID] ?? "bot_home"
+        let currentGeneration = fileGeneration(botID: botID, root: previousRoot)
+        if let expectedGeneration = int(params, "expected_generation"), expectedGeneration != currentGeneration {
+            return fileConflictReceipt(
+                requestID: requestID,
+                botID: botID,
+                root: previousRoot,
+                expectedGeneration: expectedGeneration
+            )
+        }
+        if root == "docker_home" { _ = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id) }
+        if root != previousRoot {
+            fileGenerations[fileGenerationKey(botID: botID, root: previousRoot)] = currentGeneration + 1
+            files = files.filter { $0.value["bot_id"] as? String != botID }
+        }
+        filesLocation[botID] = root
+        let rootEntry = mintFileGrant(hostID: hostID, botID: botID, root: root, path: "", kind: "root")
+        return receipt(requestID: requestID, status: .completed, botID: botID, readback: [
+            "bot_id": botID,
+            "host_id": hostID,
+            "root": root,
+            "previous_root": previousRoot,
+            "generation": fileGeneration(botID: botID, root: root),
+            "root_handle": rootEntry["handle"] as Any,
+            "security": fileSecurity(),
+        ])
     }
 
     private func browserAction(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         let botID = id(bot)
-        generation += 1
-        let url = string(params, "url") ?? (browser[botID]?["url"] as? String) ?? ""
-        let title = string(params, "title") ?? url
+        let before = try authoritativeBrowserState(bot: bot, hostID: string(params, "host_id"))
+        let currentGeneration = before["generation"] as? Int ?? 0
+        if let expected = int(params, "expected_generation"), expected != currentGeneration {
+            return browserConflictReceipt(requestID: requestID, botID: botID, current: before, expected: expected)
+        }
+        if let surfaceID = string(params, "surface_id"), surfaceID != before["surface_id"] as? String {
+            throw Error.crossTarget
+        }
+        if let snapshot = int(params, "snapshot_generation"), snapshot != currentGeneration {
+            return browserConflictReceipt(requestID: requestID, botID: botID, current: before, expected: snapshot)
+        }
+        let action = (string(params, "action") ?? "navigate").lowercased()
+        let url = string(params, "url") ?? (before["url"] as? String) ?? ""
+        let title = string(params, "title") ?? (before["title"] as? String) ?? url
+        let beforeSession = before["session"] as? [String: Any] ?? [:]
+        if action == "login.complete" {
+            let page = try browserStore.loadPageState(botID: bot.id) ?? BotBrowserPageState(url: url, title: title)
+            guard BotBrowserLoginPredicate.standard.isLoggedIn(page, openedURL: url) else {
+                return receipt(requestID: requestID, status: .failed, botID: botID, readback: [
+                    "bot_id": botID,
+                    "error": "Login is not complete in the host-owned Bot browser session.",
+                    "login_state": "pending",
+                    "recovery": ["method": "bot.browser.state", "bot_id": botID],
+                ])
+            }
+        } else if action != "login.cancel" && action != "navigate" && action != "open" {
+            return receipt(requestID: requestID, status: .failed, botID: botID, readback: [
+                "bot_id": botID,
+                "error": "Browser action is not admitted by the paired host.",
+                "action": action,
+                "recovery": ["method": "bot.browser.state", "bot_id": botID],
+            ])
+        }
+        if action == "navigate" || action == "open" {
+            guard !url.isEmpty else { throw Error.invalidParams }
         do {
             _ = try BotBrowserHost.requestOpen(
                 store: browserStore,
@@ -1003,16 +1085,28 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         } catch {
             throw Error(code: -32087, message: "Bot browser persist failed.")
         }
-        let state: [String: Any] = [
-            "bot_id": botID,
-            "url": url,
-            "title": title,
-            "loading": false,
-            "generation": generation,
-            "action_id": requestID,
-            "host_first": true,
+        if action == "login.cancel" {
+            let remaining = try browserStore.loadPendingOpens().filter { $0.botID != botID }
+            try browserStore.replacePendingOpens(remaining)
+        }
+        }
+        let nextGeneration = currentGeneration + 1
+        var persisted: [String: Any] = [
+            "generation": nextGeneration,
+            "session_id": beforeSession["id"] as? String ?? UUID().uuidString.lowercased(),
+            "session_digest": UUID().uuidString.lowercased(),
+            "login_state": action == "login.complete" ? "authenticated" : (action == "login.cancel" ? "cancelled" : "pending"),
+            "host_id": string(params, "host_id") ?? before["host_id"] as? String ?? "",
         ]
-        browser[botID] = state
+        browser[botID] = persisted
+        var state = try authoritativeBrowserState(bot: bot, hostID: string(params, "host_id"))
+        state["action"] = action
+        state["action_id"] = requestID
+        state["session_before_digest"] = beforeSession["digest"] as Any
+        state["session_after_digest"] = persisted["session_digest"]
+        persisted["url"] = state["url"]
+        persisted["title"] = state["title"]
+        browser[botID] = persisted
         return receipt(requestID: requestID, status: .completed, botID: botID, readback: state)
     }
 
@@ -1089,15 +1183,19 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             (files[key]?["bot_id"] as? String) == botID && (files[key]?["root"] as? String) == "docker_home"
         }
         for key in removed { files[key] = nil }
+        let dockerGeneration = fileGeneration(botID: botID, root: "docker_home") + 1
+        fileGenerations[fileGenerationKey(botID: botID, root: "docker_home")] = dockerGeneration
         guest[botID] = ["bot_id": botID, "status": "stopped", "viewer": "/vnc.html"]
         return receipt(
             requestID: requestID,
             status: partial ? .partial : .completed,
             botID: botID,
             readback: [
+                "bot_id": botID,
                 "cleared": true,
                 "removed_count": max(removed.count, removedPaths.count),
                 "partial": partial,
+                "generation": dockerGeneration,
             ]
         )
     }
@@ -1397,6 +1495,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return nil
     }
 
+    private func int(_ params: [String: Any], _ key: String) -> Int? {
+        if let value = params[key] as? Int { return value }
+        if let number = params[key] as? NSNumber { return number.intValue }
+        if let text = params[key] as? String { return Int(text) }
+        return nil
+    }
+
     private func stringArray(_ params: [String: Any], _ key: String) -> [String] {
         (params[key] as? [Any])?.compactMap { $0 as? String } ?? []
     }
@@ -1432,44 +1537,92 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     }
 
     private func resolveFileEntry(bot: BotDefinition, handle: String) throws -> [String: Any] {
-        if let entry = files[handle], entry["bot_id"] as? String == id(bot) {
-            return entry
-        }
-        let botID = id(bot)
-        let prefix = botID + ":"
-        guard handle.hasPrefix(prefix) else { throw Error.invalidParams }
-        let parts = String(handle.dropFirst(prefix.count))
-            .split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
-            .map(String.init)
-        guard parts.count == 3, parts[0] == "bot_home" || parts[0] == "docker_home" else {
-            throw Error.invalidParams
-        }
-        return [
-            "handle": handle,
-            "bot_id": botID,
-            "root": parts[0],
-            "path": parts[2],
-            "generation": Int(parts[1]) ?? 0,
-        ]
+        guard let entry = files[handle] else { throw Error.invalidParams }
+        guard entry["bot_id"] as? String == id(bot) else { throw Error.crossTarget }
+        return entry
     }
 
     private func diskFileExists(bot: BotDefinition, root: String, path: String) throws -> Bool {
         if root == "docker_home" {
-            let url = try containedURL(root: BotGuestHome.url(appSupport: appSupport, botID: bot.id), path: path)
+            let url = try secureContainedURL(root: BotGuestHome.url(appSupport: appSupport, botID: bot.id), path: path)
             return FileManager.default.fileExists(atPath: url.path)
         }
-        return FileManager.default.fileExists(atPath: try botHome(bot).resolvedURL(path).path)
+        return FileManager.default.fileExists(atPath: try secureContainedURL(root: botHome(bot).root, path: path).path)
     }
 
-    private func handleFor(botID: String, root: String, path: String) -> String {
-        if let existing = files.first(where: {
-            ($0.value["bot_id"] as? String) == botID
-                && ($0.value["root"] as? String) == root
-                && ($0.value["path"] as? String) == path
+    private func fileGenerationKey(botID: String, root: String) -> String {
+        "\(botID)|\(root)"
+    }
+
+    private func fileGeneration(botID: String, root: String) -> Int {
+        fileGenerations[fileGenerationKey(botID: botID, root: root)] ?? 1
+    }
+
+    private func fileSecurity() -> [String: Any] {
+        [
+            "opaque_handle": true,
+            "bot_bound": true,
+            "root_bound": true,
+            "generation_bound": true,
+            "symlink_safe": true,
+        ]
+    }
+
+    private func requireFileHost(params: [String: Any], botID: String) throws -> String {
+        let requested = string(params, "host_id")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let admitted = fileHosts[botID] ?? ""
+        guard admitted.isEmpty || requested.isEmpty || admitted == requested else { throw Error.crossTarget }
+        if admitted.isEmpty, !requested.isEmpty { fileHosts[botID] = requested }
+        return admitted.isEmpty ? requested : admitted
+    }
+
+    private func mintFileGrant(hostID: String, botID: String, root: String, path: String, kind: String) -> [String: Any] {
+        let currentGeneration = fileGeneration(botID: botID, root: root)
+        if let existing = files.values.first(where: {
+            $0["bot_id"] as? String == botID
+                && $0["host_id"] as? String == hostID
+                && $0["root"] as? String == root
+                && $0["path"] as? String == path
+                && $0["kind"] as? String == kind
+                && $0["generation"] as? Int == currentGeneration
         }) {
-            return existing.key
+            return existing
         }
-        return "\(botID):\(root):\(generation):\(path)"
+        let handle = UUID().uuidString.lowercased()
+        let entry: [String: Any] = [
+            "handle": handle,
+            "host_id": hostID,
+            "bot_id": botID,
+            "root": root,
+            "path": path,
+            "kind": kind,
+            "generation": currentGeneration,
+            "security": fileSecurity(),
+        ]
+        files[handle] = entry
+        return entry
+    }
+
+    private func fileConflictReceipt(
+        requestID: String,
+        botID: String,
+        root: String,
+        expectedGeneration: Int
+    ) -> [String: Any] {
+        let current = fileGeneration(botID: botID, root: root)
+        return receipt(requestID: requestID, status: .failed, botID: botID, readback: [
+            "bot_id": botID,
+            "conflict": true,
+            "root": root,
+            "expected_generation": expectedGeneration,
+            "current_generation": current,
+            "recovery": [
+                "method": "bot.files.list",
+                "bot_id": botID,
+                "root": root,
+                "current_generation": current,
+            ],
+        ])
     }
 
     private func applyDiskMutation(
@@ -1479,37 +1632,31 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         op: String,
         contents: String
     ) throws {
+        let rootURL: URL
         if root == "docker_home" {
-            let home = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id)
-            let url = try containedURL(root: home, path: path)
-            if op == "delete" {
-                if FileManager.default.fileExists(atPath: url.path) {
-                    try FileManager.default.removeItem(at: url)
-                }
-            } else {
-                try FileManager.default.createDirectory(
-                    at: url.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try contents.write(to: url, atomically: true, encoding: .utf8)
-            }
-            return
+            rootURL = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id)
+        } else {
+            let home = botHome(bot)
+            try home.ensure(
+                name: bot.name,
+                handle: bot.handle,
+                title: bot.title,
+                description: bot.description,
+                soul: ""
+            )
+            rootURL = home.root
         }
-        let home = botHome(bot)
-        try home.ensure(
-            name: bot.name,
-            handle: bot.handle,
-            title: bot.title,
-            description: bot.description,
-            soul: ""
-        )
+        let url = try secureContainedURL(root: rootURL, path: path)
         if op == "delete" {
-            let url = try home.resolvedURL(path)
             if FileManager.default.fileExists(atPath: url.path) {
                 try FileManager.default.removeItem(at: url)
             }
         } else {
-            try home.writeFile(relativePath: path, contents: contents)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try contents.write(to: url, atomically: true, encoding: .utf8)
         }
     }
 
@@ -1525,13 +1672,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard FileManager.default.fileExists(atPath: resolvedRoot.path) else { return [] }
         let enumerator = FileManager.default.enumerator(
             at: resolvedRoot,
-            includingPropertiesForKeys: [.isRegularFileKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey],
             options: [.skipsHiddenFiles]
         )
         var paths: [String] = []
         let rootPath = resolvedRoot.path
         while let url = enumerator?.nextObject() as? URL {
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey])
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey])
+            if values.isSymbolicLink == true {
+                if values.isDirectory == true { enumerator?.skipDescendants() }
+                continue
+            }
             guard values.isRegularFile == true else { continue }
             let path = url.resolvingSymlinksInPath().path
             guard path.hasPrefix(rootPath + "/") else { continue }
@@ -1540,17 +1691,96 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return paths.sorted()
     }
 
-    private func containedURL(root: URL, path: String) throws -> URL {
+    private func secureContainedURL(root: URL, path: String) throws -> URL {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.hasPrefix("/"), !trimmed.contains("..") else {
             throw Error(code: -32086, message: "Path escapes Bot home containment.")
         }
-        let url = root.appendingPathComponent(trimmed).standardizedFileURL
-        let rootPath = root.standardizedFileURL.path
-        guard url.path == rootPath || url.path.hasPrefix(rootPath + "/") else {
+        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL
+        let url = resolvedRoot.appendingPathComponent(trimmed).standardizedFileURL
+        let resolvedCandidate = FileManager.default.fileExists(atPath: url.path)
+            ? url.resolvingSymlinksInPath()
+            : url.deletingLastPathComponent().resolvingSymlinksInPath().appendingPathComponent(url.lastPathComponent)
+        let rootPath = resolvedRoot.path
+        guard resolvedCandidate.path == rootPath || resolvedCandidate.path.hasPrefix(rootPath + "/") else {
             throw Error(code: -32086, message: "Path escapes Bot home containment.")
         }
-        return url
+        return resolvedCandidate
+    }
+
+    private func browserSurfaceID(_ bot: BotDefinition) -> String {
+        BotBrowserIdentity.dataStoreIdentifier(for: bot.id).uuidString.lowercased()
+    }
+
+    private func authoritativeBrowserState(bot: BotDefinition, hostID: String?) throws -> [String: Any] {
+        let botID = id(bot)
+        let stored = browser[botID] ?? [:]
+        let storedSession = stored["session"] as? [String: Any] ?? [:]
+        let admittedHostID = stored["host_id"] as? String ?? ""
+        let requestedHostID = hostID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard admittedHostID.isEmpty || requestedHostID.isEmpty || admittedHostID == requestedHostID else {
+            throw Error.crossTarget
+        }
+        let target = try browserStore.loadTarget(botID: bot.id)
+        let page = try browserStore.loadPageState(botID: bot.id)
+        let url = page?.url.isEmpty == false ? page?.url ?? "" : target?.url ?? stored["url"] as? String ?? ""
+        let title = page?.title.isEmpty == false ? page?.title ?? "" : target?.title ?? stored["title"] as? String ?? ""
+        let openedURL = target?.url ?? url
+        let authenticated = page.map {
+            BotBrowserLoginPredicate.standard.isLoggedIn($0, openedURL: openedURL)
+        } ?? false
+        let sessionID = stored["session_id"] as? String
+            ?? storedSession["id"] as? String
+            ?? UUID().uuidString.lowercased()
+        let digest = stored["session_digest"] as? String
+            ?? storedSession["digest"] as? String
+            ?? UUID().uuidString.lowercased()
+        let loginState = authenticated
+            ? "authenticated"
+            : (stored["login_state"] as? String ?? (url.isEmpty ? "empty" : "anonymous"))
+        let currentGeneration = stored["generation"] as? Int ?? (url.isEmpty ? 0 : 1)
+        var result: [String: Any] = [
+            "host_id": admittedHostID.isEmpty ? requestedHostID : admittedHostID,
+            "bot_id": botID,
+            "surface_id": browserSurfaceID(bot),
+            "url": url,
+            "title": title,
+            "generation": currentGeneration,
+            "snapshot_generation": currentGeneration,
+            "host_first": true,
+            "security": [
+                "bot_bound": true,
+                "host_owned_website_data": true,
+                "cookie_exported": false,
+            ],
+            "session": [
+                "id": sessionID,
+                "digest": digest,
+                "state": loginState,
+                "authenticated": authenticated,
+                "cookie_exported": false,
+            ],
+        ]
+        if let loading = page?.loading ?? stored["loading"] as? Bool {
+            result["loading"] = loading
+        }
+        return result
+    }
+
+    private func browserConflictReceipt(
+        requestID: String,
+        botID: String,
+        current: [String: Any],
+        expected: Int
+    ) -> [String: Any] {
+        receipt(requestID: requestID, status: .failed, botID: botID, readback: [
+            "bot_id": botID,
+            "conflict": true,
+            "expected_generation": expected,
+            "current_generation": current["generation"] as? Int ?? 0,
+            "surface_id": current["surface_id"] as Any,
+            "recovery": ["method": "bot.browser.state", "bot_id": botID],
+        ])
     }
 
     private func loadSidecar() {
@@ -1562,6 +1792,22 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         if let data = loadData("bot.remote.files_location"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
             filesLocation = decoded
+        }
+        if let data = loadData("bot.remote.file_grants"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
+            files = decoded
+        }
+        if let data = loadData("bot.remote.file_generations"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Int] {
+            fileGenerations = decoded
+        }
+        if let data = loadData("bot.remote.file_hosts"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            fileHosts = decoded
+        }
+        if let data = loadData("bot.remote.browser_state"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
+            browser = decoded
         }
         if let data = loadData("bot.remote.routing"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
@@ -1620,6 +1866,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         saveJSON("bot.remote.unpublished", Array(unpublished).sorted())
         saveJSON("bot.remote.receipts", receipts)
         saveJSON("bot.remote.files_location", filesLocation)
+        saveJSON("bot.remote.file_grants", files)
+        saveJSON("bot.remote.file_generations", fileGenerations)
+        saveJSON("bot.remote.file_hosts", fileHosts)
+        saveJSON("bot.remote.browser_state", browser)
         saveJSON("bot.remote.routing", routingPref)
         saveJSON("bot.remote.routing_consumed", Array(consumedRoutingReceipts).sorted())
         saveJSON("bot.remote.selected_conversations", selectedConversation)

@@ -7016,7 +7016,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let store = BotBrowserStore(appSupportDirectory: appSupport)
         try? store.persistTarget(BotBrowserTarget(url: url, title: title), botID: botID)
         let cookies = (try? store.readWebsiteData(botID: botID)) ?? [:]
-        try? store.persistPageState(BotBrowserPageState(url: url, title: title, cookies: cookies), botID: botID)
+        try? store.persistPageState(
+            BotBrowserPageState(
+                url: url,
+                title: title,
+                cookies: cookies,
+                loading: payload["loading"] as? Bool
+            ),
+            botID: botID
+        )
     }
 
     /// Drain MCP pending open/snapshot/act/state commands onto this bot's
