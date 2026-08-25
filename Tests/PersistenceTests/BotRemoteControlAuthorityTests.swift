@@ -261,7 +261,8 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
                        "the first host-admitted conversation becomes authoritative selection")
 
         XCTAssertFalse(authority.settleRuntime(botID: botID, runID: "wrong-run", failed: true))
-        XCTAssertTrue(authority.settleRuntime(botID: botID, runID: runID, failed: true))
+        XCTAssertTrue(authority.settleRuntime(botID: botID, runID: runID.uppercased(), failed: true),
+                      "Foundation UUID casing must not prevent exact runtime settlement")
         let attention = try authority.dispatch(method: "bot.attention.list", params: [:])
         let item = try XCTUnwrap((attention["items"] as? [[String: Any]])?.first {
             $0["bot_id"] as? String == botID

@@ -183,9 +183,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let run = liveRuns[botID],
-              run["run_id"] as? String == runID,
+              let storedRunID = run["run_id"] as? String,
+              runtimeIDsMatch(storedRunID, runID),
               var item = attention[botID],
-              item["run_id"] as? String == runID else { return false }
+              let attentionRunID = item["run_id"] as? String,
+              runtimeIDsMatch(attentionRunID, runID) else { return false }
         liveRuns.removeValue(forKey: botID)
         item["state"] = "finished"
         item["finished_at"] = now.timeIntervalSince1970
@@ -194,6 +196,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         attention[botID] = canonicalAttentionItem(item)
         persistSidecar()
         return true
+    }
+
+    private func runtimeIDsMatch(_ lhs: String, _ rhs: String) -> Bool {
+        let canonicalLeft = UUID(uuidString: lhs)?.uuidString.lowercased() ?? lhs
+        let canonicalRight = UUID(uuidString: rhs)?.uuidString.lowercased() ?? rhs
+        return canonicalLeft == canonicalRight
     }
 
     public func effectiveSettings() -> (raw: [String: Bool], effective: [String: Bool]) {

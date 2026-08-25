@@ -59,7 +59,29 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
         XCTAssertFalse(projector.registerCompletedSend(.object(failed)))
     }
 
-    private func sendReceipt() -> JSONValue {
+    /// WHY: Bot receipts intentionally use lowercase UUIDs while canonical
+    /// Agent lifecycle events use Foundation's uppercase UUID spelling. UUID
+    /// casing must not strand an otherwise exact Bot run in Working.
+    func test_projectsExactTerminalAcrossUUIDCasing() throws {
+        let bus = EventBus(recentLimit: 8)
+        var terminals: [BotRuntimeEvidenceProjector.TerminalEvidence] = []
+        let projector = BotRuntimeEvidenceProjector(eventBus: bus) { terminals.append($0) }
+        let runID = "54943aa2-59c1-40e4-b56d-edb6b382edb8"
+        let threadID = "2969b74d-0bab-4486-bbf1-8b9a9761f936"
+        XCTAssertTrue(projector.registerCompletedSend(sendReceipt(runID: runID, threadID: threadID)))
+
+        bus.publish(kind: "agent.run.completed", payload: agentPayload(
+            runID: runID.uppercased(),
+            threadID: threadID.uppercased()
+        ))
+
+        XCTAssertEqual(terminals, [.init(botID: "bot-a", runID: runID, failed: false)])
+    }
+
+    private func sendReceipt(
+        runID: String = "run-a",
+        threadID: String = "thread-a"
+    ) -> JSONValue {
         .object([
             "status": .string("completed"),
             "host_id": .string("host-a"),
@@ -73,7 +95,7 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
                 "conversation_id": .string("conversation-a"),
                 "request_id": .string("request-a"),
                 "client_request_id": .string("request-a"),
-                "run_id": .string("run-a"),
+                "run_id": .string(runID),
                 "enqueued": .bool(false),
                 "run": .object([
                     "host_id": .string("host-a"),
@@ -81,8 +103,8 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
                     "conversation_id": .string("conversation-a"),
                     "request_id": .string("request-a"),
                     "client_request_id": .string("request-a"),
-                    "run_id": .string("run-a"),
-                    "thread_id": .string("thread-a"),
+                    "run_id": .string(runID),
+                    "thread_id": .string(threadID),
                 ]),
             ]),
         ])

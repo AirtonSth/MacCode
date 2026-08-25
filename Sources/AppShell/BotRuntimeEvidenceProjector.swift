@@ -74,11 +74,11 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
             botID: botID,
             conversationID: conversationID,
             requestID: requestID,
-            runID: runID,
-            threadID: threadID
+            runID: canonicalRuntimeID(runID),
+            threadID: canonicalRuntimeID(threadID)
         )
         lock.lock()
-        bindingsByRunID[runID] = binding
+        bindingsByRunID[binding.runID] = binding
         lock.unlock()
         return true
     }
@@ -96,8 +96,10 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
             return
         }
         guard let source = event.payload.objectValue,
-              let runID = nonempty(source["run_id"]?.stringValue),
-              let threadID = nonempty(source["thread_id"]?.stringValue) else { return }
+              let rawRunID = nonempty(source["run_id"]?.stringValue),
+              let rawThreadID = nonempty(source["thread_id"]?.stringValue) else { return }
+        let runID = canonicalRuntimeID(rawRunID)
+        let threadID = canonicalRuntimeID(rawThreadID)
         lock.lock()
         guard let binding = bindingsByRunID[runID], binding.threadID == threadID else {
             lock.unlock()
@@ -128,5 +130,9 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
     private func nonempty(_ value: String?) -> String? {
         let value = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         return value?.isEmpty == false ? value : nil
+    }
+
+    private func canonicalRuntimeID(_ value: String) -> String {
+        UUID(uuidString: value)?.uuidString.lowercased() ?? value
     }
 }
