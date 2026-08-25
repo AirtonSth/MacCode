@@ -1,6 +1,7 @@
 import XCTest
 @testable import AgentRuntime
 import CoreModel
+import Persistence
 
 /// A1: codex must resume by session id (so it keeps context), use the
 /// account default model when none is chosen, and map effort/sandbox.
@@ -139,6 +140,121 @@ final class CodexRunnerArgsTests: XCTestCase {
     func test_supportedEfforts_omitMinimalRejectedByCodexCli() {
         XCTAssertEqual(AgentReasoningEffort.supportedCases, [.low, .medium, .high, .xhigh],
                        "Codex CLI rejects minimal; the picker must expose only efforts that run")
+    }
+
+    func test_botCatalogMCPIsPerProcessAndNotGatedOnDesktop() {
+        let command = "/tmp/RemoteCodeDistillService"
+        let overrides = CodexRunner.botCatalogMCPOverrides(command: command)
+        let names = [
+            BotSelfConfigMCPAdmit.serverName,
+            BotBrowserMCPAdmit.serverName,
+            BotComputerMCPAdmit.serverName,
+            BotWebMCPAdmit.serverName,
+        ]
+        for name in names {
+            XCTAssertTrue(
+                overrides.contains { $0.contains("mcp_servers.\(name).command=") },
+                "RemoteCode Codex must admit \(name) via -c so ChatGPT.app does not inherit it from config.toml"
+            )
+        }
+        XCTAssertEqual(overrides.first, "-c")
+
+        let args = CodexRunner.buildArgs(req())
+        for name in names {
+            XCTAssertTrue(args.contains { $0.contains("mcp_servers.\(name).command=") }, name)
+        }
+
+        let appServer = CodexRunner.appServerArguments(command: command)
+        XCTAssertEqual(appServer.first, "app-server")
+        XCTAssertTrue(appServer.contains("-c"))
+        for name in names {
+            XCTAssertTrue(appServer.contains { $0.contains("mcp_servers.\(name).command=") }, name)
+        }
+    }
+
+    func test_botCatalogMCPCarriesScopedBotAuthorityIntoEveryServer() {
+        let environment = [
+            BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof",
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": "/tmp/rc-proof-support",
+            BotPeerDelegation.threadEnvironmentKey: "thread-proof",
+            BotPeerDelegation.runEnvironmentKey: "run-proof",
+            BotPeerDelegation.socketEnvironmentKey: "/tmp/rc-proof.sock",
+            BotPeerDelegation.capabilityEnvironmentKey: "capability-proof",
+        ]
+        let overrides = CodexRunner.botCatalogMCPOverrides(
+            command: "/tmp/RemoteCodeDistillService",
+            environment: environment
+        )
+        for name in [
+            BotSelfConfigMCPAdmit.serverName,
+            BotBrowserMCPAdmit.serverName,
+            BotComputerMCPAdmit.serverName,
+            BotWebMCPAdmit.serverName,
+        ] {
+            XCTAssertTrue(overrides.contains { $0.contains("mcp_servers.\(name).env.RC_REMOTE_CODE_BOT_ID=\"bot-proof\"") })
+        }
+        XCTAssertTrue(
+            overrides.contains {
+                $0.contains(
+                    "mcp_servers.\(BotSelfConfigMCPAdmit.serverName).env.\(BotPeerDelegation.capabilityEnvironmentKey)=\"capability-proof\""
+                )
+            },
+            "bot self-config must receive the exact delegated-run capability, not only a tool name"
+        )
+        XCTAssertFalse(
+            overrides.contains { $0.contains("mcp_servers.\(BotBrowserMCPAdmit.serverName).env.\(BotPeerDelegation.capabilityEnvironmentKey)") },
+            "peer capability must stay scoped to bot self-config"
+        )
+    }
+
+    func test_rawCodexResumeAndAppServerReceiveTheSamePerProcessOverlay() {
+        let environment = [
+            BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof",
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": "/tmp/rc-proof-support",
+        ]
+        let rawResume = AgentSkillInstaller.providerProxyArguments(
+            provider: .codex,
+            arguments: ["exec", "resume", "session-proof", "continue"],
+            environment: environment
+        )
+        XCTAssertEqual(Array(rawResume.prefix(2)), ["exec", "resume"])
+        XCTAssertEqual(Array(rawResume.suffix(2)), ["session-proof", "continue"])
+        for name in [
+            BotSelfConfigMCPAdmit.serverName,
+            BotBrowserMCPAdmit.serverName,
+            BotComputerMCPAdmit.serverName,
+            BotWebMCPAdmit.serverName,
+        ] {
+            XCTAssertTrue(rawResume.contains { $0.contains("mcp_servers.\(name).command=") }, name)
+            XCTAssertTrue(rawResume.contains { $0.contains("mcp_servers.\(name).env.RC_REMOTE_CODE_BOT_ID=\"bot-proof\"") }, name)
+        }
+
+        let rawAppServer = AgentSkillInstaller.providerProxyArguments(
+            provider: .codex,
+            arguments: ["app-server", "--stdio"],
+            environment: environment
+        )
+        XCTAssertEqual(rawAppServer.first, "app-server")
+        XCTAssertTrue(rawAppServer.contains("-c"))
+        XCTAssertTrue(
+            rawAppServer.contains {
+                $0.contains("mcp_servers.\(BotWebMCPAdmit.serverName).command=")
+            },
+            "raw app-server must keep bot-web too; it is a separate catalog entry"
+        )
+    }
+
+    func test_computerUseMCPOverrideStaysHostGated() {
+        XCTAssertEqual(
+            CodexRunner.computerUseMCPOverrides(environment: [:], command: "/tmp/RemoteCodeDistillService"),
+            [],
+            "computer-use must stay off for Docker/VM Codex so host HID does not leak"
+        )
+        let host = CodexRunner.computerUseMCPOverrides(
+            environment: [AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey: "1"],
+            command: "/tmp/RemoteCodeDistillService"
+        )
+        XCTAssertTrue(host.contains { $0.contains("mcp_servers.\(ComputerUseMCPAdmit.serverName).command=") })
     }
 
     func test_processLocatorAcceptsAbsoluteExecutablePath() {

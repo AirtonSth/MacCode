@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import Persistence
 
 public enum AgentRunError: Error, CustomStringConvertible {
     case missingBinary(String)
@@ -156,6 +157,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         if request.serviceTier == .fast {
             args += ["-c", "model_service_tier=\"fast\""]
         }
+        args += botCatalogMCPOverrides(environment: request.environment)
         args += computerUseMCPOverrides(environment: request.environment)
         if !resuming {
             let model = request.model.trimmingCharacters(in: .whitespaces)
@@ -181,8 +183,9 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     /// Codex has no per-turn MCP JSON input. `-c` overrides are scoped to this
-    /// process, so the host MCP can be admitted for logical Desktop without
-    /// persisting it in the user's global config or leaking it to Docker/VM.
+    /// process, so host MCP can be admitted without persisting it in the user's
+    /// global `~/.codex/config.toml` (ChatGPT.app shares that file and otherwise
+    /// leaks one stdio server per conversation).
     public static func computerUseMCPOverrides(
         environment: [String: String],
         command: String? = nil
@@ -193,14 +196,116 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         let resolved = command
             ?? AgentSkillInstaller.resolveServiceBinary()?.path
             ?? ComputerUseMCPAdmit.fallbackCommand
-        let escaped = resolved
+        return stdioMCPServerOverrides(
+            serverName: ComputerUseMCPAdmit.serverName,
+            cliArgument: ComputerUseMCPAdmit.cliArgument,
+            command: resolved
+        )
+    }
+
+    /// Bot catalog MCPs (`bot-self-config` / `bot-browser` / `bot-computer` /
+    /// `bot-web`). Always admitted on RemoteCode-spawned Codex, matching Grok's
+    /// per-session ACP list. Must not be written to the user-global config.toml.
+    public static func botCatalogMCPOverrides(
+        command: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String] {
+        let resolved = command
+            ?? AgentSkillInstaller.resolveServiceBinary()?.path
+            ?? BotSelfConfigMCPAdmit.fallbackCommand
+        let servers: [(name: String, argument: String, environment: [String: String])] = [
+            (
+                BotSelfConfigMCPAdmit.serverName,
+                BotSelfConfigMCPAdmit.cliArgument,
+                mcpEnvironment(for: BotSelfConfigMCPAdmit.serverName, from: environment)
+            ),
+            (
+                BotBrowserMCPAdmit.serverName,
+                BotBrowserMCPAdmit.cliArgument,
+                mcpEnvironment(for: BotBrowserMCPAdmit.serverName, from: environment)
+            ),
+            (
+                BotComputerMCPAdmit.serverName,
+                BotComputerMCPAdmit.cliArgument,
+                mcpEnvironment(for: BotComputerMCPAdmit.serverName, from: environment)
+            ),
+            (
+                BotWebMCPAdmit.serverName,
+                BotWebMCPAdmit.cliArgument,
+                mcpEnvironment(for: BotWebMCPAdmit.serverName, from: environment)
+            ),
+        ]
+        return servers.flatMap {
+            stdioMCPServerOverrides(
+                serverName: $0.name,
+                cliArgument: $0.argument,
+                command: resolved,
+                environment: $0.environment
+            )
+        }
+    }
+
+    /// `codex app-server` accepts the same `-c` overrides as `exec`. Keep the
+    /// subcommand first so fork-protocol probing can still recognize production
+    /// app-server argv (`arguments.first == "app-server"`).
+    public static func appServerArguments(
+        command: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String] {
+        ["app-server"] + botCatalogMCPOverrides(command: command, environment: environment)
+    }
+
+    static func stdioMCPServerOverrides(
+        serverName: String,
+        cliArgument: String,
+        command: String,
+        environment: [String: String] = [:]
+    ) -> [String] {
+        let prefix = "mcp_servers.\(serverName)"
+        var overrides = [
+            "-c", "\(prefix).command=\"\(tomlBasicString(command))\"",
+            "-c", "\(prefix).args=[\"\(tomlBasicString(cliArgument))\"]",
+        ]
+        for (key, value) in environment.sorted(by: { $0.key < $1.key }) {
+            overrides += [
+                "-c", "\(prefix).env.\(key)=\"\(tomlBasicString(value))\"",
+            ]
+        }
+        return overrides
+    }
+
+    private static func mcpEnvironment(
+        for serverName: String,
+        from environment: [String: String]
+    ) -> [String: String] {
+        var keys = [
+            BotSelfConfigCatalog.callerEnvironmentKey,
+            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY",
+        ]
+        if serverName == BotSelfConfigMCPAdmit.serverName {
+            keys += [
+                BotPeerDelegation.threadEnvironmentKey,
+                BotPeerDelegation.runEnvironmentKey,
+                BotPeerDelegation.socketEnvironmentKey,
+                BotPeerDelegation.capabilityEnvironmentKey,
+            ]
+        }
+        return keys.reduce(into: [String: String]()) { result, key in
+            guard let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else {
+                return
+            }
+            result[key] = value
+        }
+    }
+
+    private static func tomlBasicString(_ value: String) -> String {
+        value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
-        let prefix = "mcp_servers.\(ComputerUseMCPAdmit.serverName)"
-        return [
-            "-c", "\(prefix).command=\"\(escaped)\"",
-            "-c", "\(prefix).args=[\"\(ComputerUseMCPAdmit.cliArgument)\"]",
-        ]
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
     }
 
     public func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {

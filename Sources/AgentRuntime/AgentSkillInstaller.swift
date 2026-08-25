@@ -382,7 +382,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         guard !prompt.isEmpty,
               isSupportedProviderTurn(provider: provider, arguments: rewritten)
         else {
-            return rewritten
+            return ensuringCodexBotCatalogMCP(
+                provider: provider,
+                arguments: rewritten,
+                environment: environment
+            )
         }
 
         switch provider {
@@ -401,27 +405,198 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 arguments: rewritten
             )
         case .codex:
+            let withInstructions: [String]
             let scan = scanProviderArguments(provider: provider, arguments: rewritten)
-            guard !scan.malformed else { return rewritten }
+            guard !scan.malformed else {
+                return ensuringCodexBotCatalogMCP(
+                    provider: provider,
+                    arguments: rewritten,
+                    environment: environment
+                )
+            }
             let configValues = (scan.optionValues["--config"] ?? [])
                 + (scan.optionValues["-c"] ?? [])
             let hasDeveloperOverride = configValues.contains {
                 codexDeveloperInstructionsAssignment($0) != nil
             }
             if hasDeveloperOverride {
-                return mergingCodexDeveloperInstructions(
+                withInstructions = mergingCodexDeveloperInstructions(
                     prompt,
                     arguments: rewritten
                 )
+            } else {
+                let quoted = "\""
+                    + prompt
+                        .replacingOccurrences(of: "\\", with: "\\\\")
+                        .replacingOccurrences(of: "\"", with: "\\\"")
+                        .replacingOccurrences(of: "\n", with: "\\n")
+                    + "\""
+                withInstructions = ["--config", "developer_instructions=\(quoted)"] + rewritten
             }
-            let quoted = "\""
-                + prompt
-                    .replacingOccurrences(of: "\\", with: "\\\\")
-                    .replacingOccurrences(of: "\"", with: "\\\"")
-                    .replacingOccurrences(of: "\n", with: "\\n")
-                + "\""
-            return ["--config", "developer_instructions=\(quoted)"] + rewritten
+            return ensuringCodexBotCatalogMCP(
+                provider: provider,
+                arguments: withInstructions,
+                environment: environment
+            )
         }
+    }
+
+    /// Raw nested Codex invocations do not pass through `CodexRunner` or the
+    /// app-server adapter. Admit the same four bot MCPs on the process argv so
+    /// `codex exec resume` and other strict/raw turns retain the host catalog
+    /// without consulting the shared `~/.codex/config.toml`.
+    static func ensuringCodexBotCatalogMCP(
+        provider: AgentProvider,
+        arguments: [String],
+        environment: [String: String]
+    ) -> [String] {
+        guard provider == .codex else { return arguments }
+        let subcommandIndex: Int? = {
+            var index = 0
+            let valueOptions: Set<String> = [
+                "--config", "-c", "--model", "-m", "--sandbox", "-s",
+                "--ask-for-approval", "-a", "--image", "-i", "--color",
+                "--cd", "-C", "--profile", "-p",
+            ]
+            let flagOptions: Set<String> = [
+                "--dangerously-bypass-approvals-and-sandbox", "--ephemeral",
+                "--full-auto", "--ignore-user-config", "--json", "--oss",
+                "--search", "--skip-git-repo-check", "--strict-config",
+            ]
+            while index < arguments.count {
+                let argument = arguments[index]
+                if valueOptions.contains(argument) {
+                    guard index + 1 < arguments.count else { return nil }
+                    index += 2
+                    continue
+                }
+                if valueOptions.contains(where: { argument.hasPrefix("\($0)=") }) {
+                    index += 1
+                    continue
+                }
+                if flagOptions.contains(argument) {
+                    index += 1
+                    continue
+                }
+                return argument == "exec" || argument == "app-server" ? index : nil
+            }
+            return nil
+        }()
+        guard let subcommandIndex else {
+            return arguments
+        }
+        let names = [
+            BotSelfConfigMCPAdmit.serverName,
+            BotBrowserMCPAdmit.serverName,
+            BotComputerMCPAdmit.serverName,
+            BotWebMCPAdmit.serverName,
+        ]
+        let callerIsScoped = environment[BotSelfConfigCatalog.callerEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasManagedCommand = { (name: String) in
+            arguments.contains { $0.contains("mcp_servers.\(name).command=") }
+        }
+        let hasScopedBotID = { (name: String) in
+            arguments.contains { $0.contains("mcp_servers.\(name).env.\(BotSelfConfigCatalog.callerEnvironmentKey)=") }
+        }
+        guard names.contains(where: { !hasManagedCommand($0) || (callerIsScoped && !hasScopedBotID($0)) }) else {
+            return arguments
+        }
+        let overrides = CodexRunner.botCatalogMCPOverrides(environment: environment)
+        guard !overrides.isEmpty else { return arguments }
+        switch arguments[subcommandIndex] {
+        case "exec":
+            // Prompt injection intentionally excludes resumed sessions, but the
+            // process-scoped MCP catalog must survive `codex exec resume` after
+            // the legacy global config entry is stripped. Administrative,
+            // version, and unknown-option invocations still remain exact.
+            guard isSupportedCodexExecMCPInvocation(
+                arguments: arguments,
+                callerIsScoped: callerIsScoped
+            ) else {
+                return arguments
+            }
+        case "app-server":
+            guard isSupportedCodexAppServerInvocation(
+                arguments: arguments,
+                subcommandIndex: subcommandIndex
+            ) else {
+                return arguments
+            }
+        default:
+            return arguments
+        }
+
+        // `exec` may have global `--config`/Token Saver options in front of
+        // it. Place the overlay before that subcommand so the original skill
+        // ABI remains the suffix. A bare app-server/raw exec keeps its
+        // subcommand first, which is required by Codex's protocol adapter.
+        let insertionIndex: Int
+        if subcommandIndex == arguments.startIndex {
+            let afterSubcommand = arguments.index(after: subcommandIndex)
+            if arguments[subcommandIndex] == "exec",
+               afterSubcommand < arguments.endIndex,
+               arguments[afterSubcommand] == "resume" {
+                insertionIndex = arguments.index(after: afterSubcommand)
+            } else {
+                insertionIndex = afterSubcommand
+            }
+        } else {
+            insertionIndex = subcommandIndex
+        }
+        return Array(arguments[..<insertionIndex])
+            + overrides
+            + Array(arguments[insertionIndex...])
+    }
+
+    private static func isSupportedCodexExecMCPInvocation(
+        arguments: [String],
+        callerIsScoped: Bool
+    ) -> Bool {
+        let scan = scanProviderArguments(provider: .codex, arguments: arguments)
+        guard !scan.malformed,
+              scan.positionals.first == "exec",
+              scan.flags.isDisjoint(with: ["--version", "-V", "--help", "-h"])
+        else {
+            return false
+        }
+        // An unscoped resume is still an administrative/session-control ABI.
+        // A bot-scoped resume is the A-005 nested path that previously relied
+        // on the now-removed global MCP configuration.
+        return scan.positionals.dropFirst().first != "resume" || callerIsScoped
+    }
+
+    private static func isSupportedCodexAppServerInvocation(
+        arguments: [String],
+        subcommandIndex: Int
+    ) -> Bool {
+        let valueOptions: Set<String> = [
+            "-c", "--config", "--listen", "--code-mode-host", "--enable", "--disable",
+            "--ws-auth", "--ws-token-file", "--ws-token-sha256", "--ws-shared-secret-file",
+            "--ws-issuer", "--ws-audience", "--ws-max-clock-skew-seconds",
+        ]
+        let flagOptions: Set<String> = ["--stdio", "--analytics-default-enabled"]
+        var index = arguments.index(after: subcommandIndex)
+        while index < arguments.endIndex {
+            let argument = arguments[index]
+            if valueOptions.contains(argument) {
+                guard index + 1 < arguments.endIndex else { return false }
+                index += 2
+                continue
+            }
+            if valueOptions.contains(where: { argument.hasPrefix("\($0)=") }) {
+                index += 1
+                continue
+            }
+            if flagOptions.contains(argument) {
+                index += 1
+                continue
+            }
+            // Do not rewrite `app-server --help`/`--version` or an option
+            // introduced by a newer Codex without knowing its ABI.
+            return false
+        }
+        return true
     }
 
     /// Inject Claude CLI `--settings` PostToolUse hooks on the raw provider-proxy
@@ -1742,38 +1917,50 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try installCodexComputerUseMCP(binary: binary)
     }
 
-    /// Admit the bot self-config MCP into Claude and Codex configs.
-    /// Idempotent; leftover / user-authored servers stay. Bot id is not baked here.
+    /// Bot catalog MCP is per-process on every provider:
+    /// Claude `--mcp-config` / SDK `mcp_servers`, Codex `-c`, Grok ACP `session/new`.
+    /// `~/.claude/settings.json` is a dead location (`claude mcp list` omits it;
+    /// Distill retrieve already stopped writing there). `~/.codex/config.toml` is
+    /// shared with ChatGPT.app and leaks one stdio child per conversation.
+    /// Grok never had a global file. Install strips legacy Claude/Codex entries.
     public func installBotSelfConfigMCP(serviceBinaryURL: URL? = nil) throws {
-        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
-            throw AgentSkillCLIError.serviceBinaryUnavailable
-        }
-        try installClaudeBotSelfConfigMCP(binary: binary)
-        try installCodexBotSelfConfigMCP(binary: binary)
+        _ = serviceBinaryURL
+        try stripClaudeManagedMCP(serverName: BotSelfConfigMCPAdmit.serverName)
+        try stripCodexManagedMCP(
+            begin: BotSelfConfigMCPAdmit.tomlBeginMarker,
+            end: BotSelfConfigMCPAdmit.tomlEndMarker,
+            tableName: "mcp_servers.\(BotSelfConfigMCPAdmit.serverName)"
+        )
     }
 
     public func installBotBrowserMCP(serviceBinaryURL: URL? = nil) throws {
-        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
-            throw AgentSkillCLIError.serviceBinaryUnavailable
-        }
-        try installClaudeBotBrowserMCP(binary: binary)
-        try installCodexBotBrowserMCP(binary: binary)
+        _ = serviceBinaryURL
+        try stripClaudeManagedMCP(serverName: BotBrowserMCPAdmit.serverName)
+        try stripCodexManagedMCP(
+            begin: BotBrowserMCPAdmit.tomlBeginMarker,
+            end: BotBrowserMCPAdmit.tomlEndMarker,
+            tableName: "mcp_servers.\(BotBrowserMCPAdmit.serverName)"
+        )
     }
 
     public func installBotComputerMCP(serviceBinaryURL: URL? = nil) throws {
-        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
-            throw AgentSkillCLIError.serviceBinaryUnavailable
-        }
-        try installClaudeBotComputerMCP(binary: binary)
-        try installCodexBotComputerMCP(binary: binary)
+        _ = serviceBinaryURL
+        try stripClaudeManagedMCP(serverName: BotComputerMCPAdmit.serverName)
+        try stripCodexManagedMCP(
+            begin: BotComputerMCPAdmit.tomlBeginMarker,
+            end: BotComputerMCPAdmit.tomlEndMarker,
+            tableName: "mcp_servers.\(BotComputerMCPAdmit.serverName)"
+        )
     }
 
     public func installBotWebMCP(serviceBinaryURL: URL? = nil) throws {
-        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
-            throw AgentSkillCLIError.serviceBinaryUnavailable
-        }
-        try installClaudeBotWebMCP(binary: binary)
-        try installCodexBotWebMCP(binary: binary)
+        _ = serviceBinaryURL
+        try stripClaudeManagedMCP(serverName: BotWebMCPAdmit.serverName)
+        try stripCodexManagedMCP(
+            begin: BotWebMCPAdmit.tomlBeginMarker,
+            end: BotWebMCPAdmit.tomlEndMarker,
+            tableName: "mcp_servers.\(BotWebMCPAdmit.serverName)"
+        )
     }
 
     public func uninstallComputerUseMCP() throws {
@@ -1820,92 +2007,47 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try Data(next.utf8).write(to: url, options: .atomic)
     }
 
-    private func installClaudeBotSelfConfigMCP(binary: URL) throws {
-        let url = claudeSettingsURL()
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            root = obj
-        }
-        let existing = root["mcpServers"] as? [String: Any] ?? [:]
-        root["mcpServers"] = BotSelfConfigMCPAdmit.admitClaude(existing: existing, command: binary.path)
-        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-        try out.write(to: url, options: .atomic)
-    }
-
-    private func installCodexBotSelfConfigMCP(binary: URL) throws {
+    /// ChatGPT.app and RemoteCode-spawned Codex share `~/.codex/config.toml`.
+    /// Persisting host-catalog MCP there leaks one stdio child per Codex
+    /// conversation. Strip legacy managed blocks; admit per-process instead.
+    private func stripCodexManagedMCP(
+        begin: String,
+        end: String,
+        tableName: String
+    ) throws {
         let url = codexConfigURL()
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
-        let next = BotSelfConfigMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
-        try Data(next.utf8).write(to: url, options: .atomic)
+        guard fileManager.fileExists(atPath: url.path),
+              let text = (try? Data(contentsOf: url, options: .mappedIfSafe))
+                .flatMap({ String(data: $0, encoding: .utf8) })
+        else { return }
+        let stripped = Self.removingManagedMCP(
+            text,
+            begin: begin,
+            end: end,
+            tableName: tableName
+        )
+        guard stripped != text else { return }
+        try Data(stripped.utf8).write(to: url, options: .atomic)
     }
 
-    private func installClaudeBotBrowserMCP(binary: URL) throws {
+    /// Claude Code does not spawn `mcpServers` from settings.json (live:
+    /// `claude mcp list` omits RemoteCode bot entries). Strip leftover keys so
+    /// a future Claude that starts reading this file cannot leak stdio servers
+    /// into interactive `claude` / Claude.app the way Codex leaked into ChatGPT.
+    private func stripClaudeManagedMCP(serverName: String) throws {
         let url = claudeSettingsURL()
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            root = obj
-        }
-        let existing = root["mcpServers"] as? [String: Any] ?? [:]
-        root["mcpServers"] = BotBrowserMCPAdmit.admitClaude(existing: existing, command: binary.path)
-        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              var servers = root["mcpServers"] as? [String: Any],
+              servers[serverName] != nil
+        else { return }
+        servers.removeValue(forKey: serverName)
+        root["mcpServers"] = servers
+        guard let out = try? JSONSerialization.data(
+            withJSONObject: root,
+            options: [.prettyPrinted, .sortedKeys]
+        ) else { return }
         try out.write(to: url, options: .atomic)
-    }
-
-    private func installCodexBotBrowserMCP(binary: URL) throws {
-        let url = codexConfigURL()
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
-        let next = BotBrowserMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
-        try Data(next.utf8).write(to: url, options: .atomic)
-    }
-
-    private func installClaudeBotComputerMCP(binary: URL) throws {
-        let url = claudeSettingsURL()
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            root = obj
-        }
-        let existing = root["mcpServers"] as? [String: Any] ?? [:]
-        root["mcpServers"] = BotComputerMCPAdmit.admitClaude(existing: existing, command: binary.path)
-        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-        try out.write(to: url, options: .atomic)
-    }
-
-    private func installCodexBotComputerMCP(binary: URL) throws {
-        let url = codexConfigURL()
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
-        let next = BotComputerMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
-        try Data(next.utf8).write(to: url, options: .atomic)
-    }
-
-    private func installClaudeBotWebMCP(binary: URL) throws {
-        let url = claudeSettingsURL()
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            root = obj
-        }
-        let existing = root["mcpServers"] as? [String: Any] ?? [:]
-        root["mcpServers"] = BotWebMCPAdmit.admitClaude(existing: existing, command: binary.path)
-        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-        try out.write(to: url, options: .atomic)
-    }
-
-    private func installCodexBotWebMCP(binary: URL) throws {
-        let url = codexConfigURL()
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
-        let next = BotWebMCPAdmit.admitCodexTOML(existing: existing, command: binary.path)
-        try Data(next.utf8).write(to: url, options: .atomic)
     }
 
     public func uninstallRetrieveMCP() throws {
@@ -1955,6 +2097,37 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         var result = text
         result.removeSubrange(b.lowerBound..<e.upperBound)
         return result.replacingOccurrences(of: "\n\n\n", with: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
+    }
+
+    /// Remove every legacy managed block plus the equivalent unmarked TOML
+    /// table. The latter is the live Codex format written by older installers;
+    /// marker-only stripping left that table active in the shared config.
+    private static func removingManagedMCP(
+        _ text: String,
+        begin: String,
+        end: String,
+        tableName: String
+    ) -> String {
+        var result = text
+        while let start = result.range(of: begin) {
+            if let stop = result.range(of: end, range: start.upperBound..<result.endIndex) {
+                result.removeSubrange(start.lowerBound..<stop.upperBound)
+            } else {
+                // A truncated marker is still our unique ownership marker. Remove
+                // only the marker line; the table pass below removes its table
+                // without consuming a following user-authored table.
+                result.removeSubrange(start)
+            }
+        }
+        while result.range(of: end) != nil {
+            result = result.replacingOccurrences(of: end, with: "")
+        }
+        result = removingTOMLTable(result, named: tableName)
+        guard result != text else { return text }
+        let normalized = result
+            .replacingOccurrences(of: "\n\n\n", with: "\n\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? "" : normalized + "\n"
     }
 
     static func upsertMarkerBlock(_ text: String, begin: String, end: String, block: String) -> String {

@@ -25,11 +25,17 @@ final class BotComputerMCPInstallTests: XCTestCase {
         let settings = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: claudeSettings)) as? [String: Any])
         let servers = try XCTUnwrap(settings["mcpServers"] as? [String: Any])
         XCTAssertNotNil(servers["other"])
-        XCTAssertTrue(BotComputerMCPAdmit.containsAdmittedClaude(servers))
+        XCTAssertFalse(
+            BotComputerMCPAdmit.containsAdmittedClaude(servers),
+            "Claude bot catalog MCP must not persist in settings.json; Claude Code does not spawn it from there"
+        )
 
         let toml = try String(contentsOf: codexConfig, encoding: .utf8)
         XCTAssertTrue(toml.contains("model = \"gpt\""))
-        XCTAssertTrue(BotComputerMCPAdmit.containsAdmittedCodexTOML(toml))
+        XCTAssertFalse(
+            BotComputerMCPAdmit.containsAdmittedCodexTOML(toml),
+            "Codex bot catalog MCP must not persist in the user-global config.toml that ChatGPT.app shares"
+        )
 
         let grok = GrokACPClient.sessionMCPServers(
             existing: [["name": "user-slack", "command": "npx"]],
