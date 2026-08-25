@@ -7561,6 +7561,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return opened
     }
 
+    public func filesEditSession(sessionID: String) throws -> JSONValue {
+        guard let session = FileEditSessionStore.shared.session(sessionID: sessionID) else {
+            throw JSONRPCError(
+                code: -32602,
+                message: "edit session not found",
+                data: .string(sessionID)
+            )
+        }
+        return session
+    }
+
     public func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue {
         let result = try FileEditSessionStore.shared.applyPatch(sessionID: sessionID, baseDraftRevision: baseDraftRevision, rangeLocation: rangeLocation, rangeLength: rangeLength, replacement: replacement, deviceID: deviceID)
         if let body = result.objectValue,

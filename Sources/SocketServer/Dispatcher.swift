@@ -308,6 +308,7 @@ public protocol CommandRouting: AnyObject {
     func fsWorkspaceCreateFile(workspace: WorkspaceID, path: String, content: String) throws -> JSONValue
     func fsWorkspaceRename(workspace: WorkspaceID, path: String, newName: String) throws -> JSONValue
     func fsWorkspaceDelete(workspace: WorkspaceID, paths: [String]) throws -> JSONValue
+    func filesEditSession(sessionID: String) throws -> JSONValue
     func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue
     func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue
     func filesEditSave(sessionID: String) throws -> JSONValue
@@ -1859,6 +1860,7 @@ public final class JSONRPCDispatcher {
                             .string("files.tab.split"),
                             .string("files.state.get"),
                             .string("files.state.update"),
+                            .string("files.edit.session"),
                             .string("files.edit.open"),
                             .string("files.edit.apply_patch"),
                             .string("files.edit.save"),
@@ -2092,6 +2094,9 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let patch = params["patch"]?.objectValue else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: try router.filesStateUpdate(surface: sid, patch: patch, baseRevision: params["base_revision"]?.intValue, deviceID: params["device_id"]?.stringValue))
+            case "files.edit.session":
+                guard let sessionID = params["session_id"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.filesEditSession(sessionID: sessionID))
             case "files.edit.open":
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
@@ -4034,7 +4039,7 @@ public final class JSONRPCDispatcher {
         "events.recent", "settings.get", "token_saver.digest.get",
         "ssh.host.list", "ssh.files.local.list", "ssh.files.remote.list",
         "fs.roots", "fs.list", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url",
-        "files.state.get",
+        "files.state.get", "files.edit.session",
         "workspace.list", "workspace.current",
         "surface.health", "surface.read_text", "surface.read_history",
         "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",

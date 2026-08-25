@@ -1013,6 +1013,12 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func fsWorkspaceCreateFile(workspace: WorkspaceID, path: String, content: String) throws -> JSONValue { try WorkspaceFileService().createFile(root: projectCwd, path: path, content: content) }
     func fsWorkspaceRename(workspace: WorkspaceID, path: String, newName: String) throws -> JSONValue { try WorkspaceFileService().rename(root: projectCwd, path: path, newName: newName) }
     func fsWorkspaceDelete(workspace: WorkspaceID, paths: [String]) throws -> JSONValue { try WorkspaceFileService().delete(root: projectCwd, paths: paths) }
+    func filesEditSession(sessionID: String) throws -> JSONValue {
+        guard let session = FileEditSessionStore.shared.session(sessionID: sessionID) else {
+            throw JSONRPCError(code: -32602, message: "edit session not found")
+        }
+        return session
+    }
     func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue { try FileEditSessionStore.shared.open(surfaceID: surface, workspaceID: WorkspaceID(), root: projectCwd, path: path) }
     func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue {
         try FileEditSessionStore.shared.applyPatch(sessionID: sessionID, baseDraftRevision: baseDraftRevision, rangeLocation: rangeLocation, rangeLength: rangeLength, replacement: replacement, deviceID: deviceID)
@@ -1739,6 +1745,76 @@ final class DispatcherTests: XCTestCase {
         ]))
         XCTAssertEqual(deleted.result?.objectValue?["deleted"]?.arrayValue?.compactMap { $0.stringValue }, ["Sources/Renamed.swift"],
                        "bulk delete must delete every selected file through one RPC mutation")
+    }
+
+    @MainActor
+    func test_filesEditSession_routesAuthoritativeLegacyDraftReadback() async throws {
+        // WHY: after an ambiguous patch response, iOS must inspect the existing
+        // host draft instead of replaying the patch or reopening disk content.
+        let directory = NSTemporaryDirectory() + "rc2-disp-edit-session-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        try "before".write(toFile: directory + "/draft.txt", atomically: true, encoding: .utf8)
+        FileEditSessionStore.shared.resetForTests()
+        defer {
+            FileEditSessionStore.shared.resetForTests()
+            try? FileManager.default.removeItem(atPath: directory)
+        }
+
+        let router = FakeRouter()
+        router.projectCwd = directory
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let opened = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "files.edit.open",
+            params: [
+                "surface_id": .string(UUID().uuidString),
+                "path": .string("draft.txt"),
+            ]
+        ))
+        let openedBody = try XCTUnwrap(opened.result?.objectValue)
+        let sessionID = try XCTUnwrap(openedBody["session_id"]?.stringValue)
+        let revision = try XCTUnwrap(openedBody["draft_revision"]?.intValue)
+
+        let patched = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "files.edit.apply_patch",
+            params: [
+                "session_id": .string(sessionID),
+                "base_draft_revision": .number(Double(revision)),
+                "range_utf16": .object(["location": .number(6), "length": .number(0)]),
+                "replacement": .string(" after"),
+            ]
+        ))
+        XCTAssertNil(patched.error)
+
+        let readback = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(3),
+            method: "files.edit.session",
+            params: ["session_id": .string(sessionID)]
+        ))
+        XCTAssertNil(readback.error)
+        let readbackBody = try XCTUnwrap(readback.result?.objectValue)
+        XCTAssertEqual(readbackBody["session_id"], .string(sessionID))
+        XCTAssertEqual(readbackBody["content"], .string("before after"))
+        XCTAssertEqual(readbackBody["draft_revision"]?.intValue, revision + 1)
+        XCTAssertEqual(readbackBody["dirty"], .bool(true))
+
+        _ = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(4),
+            method: "files.edit.close",
+            params: ["session_id": .string(sessionID)]
+        ))
+        let missing = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(5),
+            method: "files.edit.session",
+            params: ["session_id": .string(sessionID)]
+        ))
+        XCTAssertEqual(missing.error?.code, -32602, "closed sessions must fail loudly, never return stale content")
     }
 
     @MainActor

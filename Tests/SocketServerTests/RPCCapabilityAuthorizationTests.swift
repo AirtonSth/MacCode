@@ -33,7 +33,7 @@ final class RPCCapabilityAuthorizationTests: XCTestCase {
         // "all", every existing phone would lose access on upgrade.
         for method in ["workspace.list", "workspace.create", "git.commit",
                        "fs.workspace.read", "fs.workspace.delete",
-                       "files.edit.save", "some.future.method"] {
+                       "files.edit.session", "files.edit.save", "some.future.method"] {
             XCTAssertTrue(authorized(method, "*"),
                           "\"*\" must authorize \(method)")
         }
@@ -69,7 +69,7 @@ final class RPCCapabilityAuthorizationTests: XCTestCase {
         // operator also grants the "file" capability.
         for method in ["fs.workspace.read", "fs.workspace.list",
                        "fs.workspace.delete", "fs.workspace.create_file",
-                       "files.edit.open", "files.edit.save"] {
+                       "files.edit.session", "files.edit.open", "files.edit.save"] {
             XCTAssertFalse(authorized(method, "read"),
                            "read scope must DENY file op \(method)")
         }
@@ -85,6 +85,8 @@ final class RPCCapabilityAuthorizationTests: XCTestCase {
                       "file scope must authorize fs.workspace.read")
         XCTAssertTrue(authorized("files.edit.save", "file"),
                       "file scope must authorize files.edit.save")
+        XCTAssertTrue(authorized("files.edit.session", "file"),
+                      "file scope must authorize authenticated edit-session readback")
         XCTAssertFalse(authorized("git.commit", "file"),
                        "file scope must DENY a non-file write (git.commit)")
     }
