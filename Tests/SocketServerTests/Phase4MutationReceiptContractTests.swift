@@ -84,6 +84,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     private(set) var createWorkspaceCallCount = 0
     private(set) var finalizationCallCount = 0
     private(set) var synchronousBatchEffectCallCount = 0
+    private(set) var pairedBotRemoteCallCount = 0
     private(set) var phase4ClaimCallCount = 0
     private(set) var finalizedEventKinds: [String: [String]] = [:]
     private var phase4Receipts: [String: Receipt] = [:]
@@ -95,6 +96,15 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     override func createWorkspace(name: String, cwd: String) throws -> Workspace {
         createWorkspaceCallCount += 1
         return try super.createWorkspace(name: name, cwd: cwd)
+    }
+
+    override func dispatchPairedBotRemote(
+        method: String,
+        params: [String: JSONValue]
+    ) async throws -> JSONValue {
+        pairedBotRemoteCallCount += 1
+        synchronousBatchEffectCallCount += 1
+        return try await super.dispatchPairedBotRemote(method: method, params: params)
     }
 
     override func selectWorkspace(_ id: WorkspaceID) throws {
@@ -1163,7 +1173,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        XCTAssertEqual(canonical.count, 99)
+        XCTAssertEqual(canonical.count, 141)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -2620,6 +2630,125 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
 
         try assertStatusResult(committed, status: "committed", requestId: "status-committed")
         try assertStatusResult(absent, status: "absent", requestId: "status-absent")
+    }
+
+    /// WHY: paired Bot mutations used to return before the central receipt and
+    /// event transaction. A lost HTTP response then left iOS with neither a
+    /// replayable receipt nor a canonical event even though the Mac mutated.
+    func test_pairedBotMutationsFinalizeExactlyOnceWithCanonicalEvents() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let routineID = UUID().uuidString.lowercased()
+        let conversationID = UUID().uuidString.lowercased()
+        let cases: [(method: String, params: [String: Any], event: String)] = [
+            ("bot.create", ["name": "Phase4 Bot"], "bot.created"),
+            ("bot.settings.set", ["bot_id": botID, "key": "notifications_enabled", "value": true], "bot.settings.updated"),
+            ("bot.routine.create", ["bot_id": botID, "name": "Daily", "prompt": "Report"], "bot.routine.updated"),
+            ("bot.routine.run", ["bot_id": botID, "routine_id": routineID], "bot.routine.run_requested"),
+            ("bot.conversation.select", ["bot_id": botID, "conversation_id": conversationID], "bot.conversation.selected"),
+            ("bot.delete", ["bot_id": botID], "bot.deleted"),
+        ]
+
+        for (index, testCase) in cases.enumerated() {
+            let router = Phase4ReceiptFakeRouter()
+            let requestID = "bot-phase4-\(index)"
+            router.pairedBotRemoteResult = .object([
+                "status": .string("completed"),
+                "request_id": .string(requestID),
+                "receipt_id": .string("receipt-\(index)"),
+                "bot_id": .string(botID),
+                "readback": .object([
+                    "bot_id": .string(botID),
+                    "routine_id": .string(routineID),
+                    "conversation_id": .string(conversationID),
+                ]),
+            ])
+            let live = try await Phase4LiveServer.start(
+                router: router,
+                bootEpoch: UInt64(1_400 + index)
+            )
+            var params = live.mutationParams(
+                requestId: requestID,
+                threadId: AgentThreadID(),
+                text: "unused"
+            )
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            for (key, value) in testCase.params { params[key] = value }
+
+            let first = try await live.rpc(method: testCase.method, params: params)
+            let replay = try await live.rpc(method: testCase.method, params: params)
+
+            XCTAssertNil(first["error"], testCase.method)
+            XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary, testCase.method)
+            XCTAssertEqual(router.pairedBotRemoteCallCount, 1, testCase.method)
+            XCTAssertEqual(router.finalizationCallCount, 1, testCase.method)
+            XCTAssertEqual(router.finalizedEventKinds["\(testCase.method):\(requestID)"], [testCase.event], testCase.method)
+            live.stop()
+        }
+    }
+
+    /// WHY: once the authoritative Bot mutation returns, failed receipt/event
+    /// persistence is an unknown outcome. Retrying must never execute it twice.
+    func test_pairedBotResponseLossStaysUnknownWithoutDuplicateEffectOrEvent() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        router.finalizationPersistenceUnavailable = true
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "request_id": .string("bot-response-loss"),
+            "receipt_id": .string("authority-receipt"),
+            "bot_id": .string(UUID().uuidString.lowercased()),
+            "readback": .object([:]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_499)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "bot-response-loss",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params["name"] = "Lost Response Bot"
+
+        let first = try await live.rpc(method: "bot.create", params: params)
+        let retry = try await live.rpc(method: "bot.create", params: params)
+
+        XCTAssertEqual(errorCode(first), commandOutcomeUnknown)
+        XCTAssertEqual(errorCode(retry), commandOutcomeUnknown)
+        XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(router.finalizationCallCount, 0)
+        XCTAssertNil(router.finalizedEventKinds["bot.create:bot-response-loss"])
+    }
+
+    /// WHY: an authoritative domain rejection is itself durable readback. It
+    /// must replay without rerunning and must never masquerade as a mutation
+    /// event merely because transport delivery succeeded.
+    func test_pairedBotFailedReceiptReplaysWithoutCanonicalEvent() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        router.pairedBotRemoteResult = .object([
+            "status": .string("failed"),
+            "request_id": .string("bot-domain-rejection"),
+            "receipt_id": .string("failed-authority-receipt"),
+            "bot_id": .null,
+            "readback": .object(["error": .string("Account limit reached")]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_500)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "bot-domain-rejection",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params["name"] = "Rejected Bot"
+
+        let first = try await live.rpc(method: "bot.create", params: params)
+        let replay = try await live.rpc(method: "bot.create", params: params)
+
+        XCTAssertEqual((first["result"] as? [String: Any])?["status"] as? String, "failed")
+        XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary)
+        XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(router.finalizationCallCount, 1)
+        XCTAssertEqual(router.finalizedEventKinds["bot.create:bot-domain-rejection"], [])
     }
 
     private func canonicalMutationMethods() throws -> Set<String> {

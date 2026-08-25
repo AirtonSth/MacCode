@@ -52,7 +52,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onRebuildGuest: ((BotID, String) -> Void)?
     public var onGuestInput: ((BotID, [String: Any], String) throws -> Void)?
     public var onDockerClear: ((BotID) throws -> Void)?
-    public var onSend: ((BotID, String) throws -> Void)?
+    public var onSend: ((BotID, String, BotConversationID?, [String: Any]) throws -> [String: Any])?
     public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
     public var notifyBrowserPendingOpen: ((Notification.Name) throws -> Void)?
 
@@ -66,8 +66,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var attention: [String: [String: Any]] = [:]
     private var peerReceipts: [String: [String: Any]] = [:]
     private var schedulerRuns: [[String: Any]] = []
+    private var routineRuntime: [String: [String: Any]] = [:]
     private var filesLocation: [String: String] = [:]
     private var routingPref: [String: [String: Any]] = [:]
+    private var consumedRoutingReceipts: Set<String> = []
     private var selectedConversation: [String: String] = [:]
     private var generation: Int = 1
 #if DEBUG
@@ -140,8 +142,6 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return ["items": Array(attention.values)]
         case "reserved.probe":
             throw Error.reserved
-        case "scheduler.tick":
-            return try schedulerTick(now: now, params: params)
         default:
             return try mutate(name: name, params: params, now: now)
         }
@@ -388,6 +388,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try routingSet(params: params, requestID: requestID)
         case "attention.ack":
             return try attentionAck(params: params, requestID: requestID)
+        case "scheduler.tick":
+            return try schedulerTick(now: now, requestID: requestID)
         case "peer.ask":
             return try peerAsk(params: params, requestID: requestID)
         case "self_config":
@@ -474,14 +476,27 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let copy = try store.duplicate(id: bot.id, now: now)
         let routines = try store.listRoutines(botID: copy.id)
         let specs = routines.map { $0.definition.scheduleSpecJSON }
+        let copiedRouting: [String: Any]?
+        if var routing = routingPref[id(bot)] {
+            routing.removeValue(forKey: "effective")
+            routing["routing_receipt_id"] = UUID().uuidString.lowercased()
+            routing["bot_id"] = id(copy)
+            routing["effective"] = routing
+            routingPref[id(copy)] = routing
+            copiedRouting = routing
+        } else {
+            copiedRouting = nil
+        }
+        var duplicateReadback = encodeBot(copy, extra: [
+            "source_bot_id": id(bot),
+            "schedule_spec_jsons": specs,
+        ])
+        if let copiedRouting { duplicateReadback["routing"] = copiedRouting }
         return receipt(
             requestID: requestID,
             status: .completed,
             botID: id(copy),
-            readback: encodeBot(copy, extra: [
-                "source_bot_id": id(bot),
-                "schedule_spec_jsons": specs,
-            ])
+            readback: duplicateReadback
         )
     }
 
@@ -518,6 +533,23 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let text = string(params, "text")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !text.isEmpty else { throw Error.invalidParams }
         let botID = id(bot)
+        let requestedConversationID = string(params, "conversation_id")
+        let conversation: BotConversationID?
+        if let requestedConversationID, !requestedConversationID.isEmpty {
+            guard let uuid = UUID(uuidString: requestedConversationID),
+                  let stored = try store.conversation(id: BotConversationID(uuid)),
+                  stored.botID == bot.id else {
+                throw Error.crossTarget
+            }
+            conversation = stored.id
+        } else {
+            conversation = nil
+        }
+        let routing = try effectiveRouting(
+            botID: botID,
+            params: params,
+            requireConversationID: requestedConversationID
+        )
         let attachmentIDs = stringArray(params, "attachment_ids")
         var bound: [[String: Any]] = []
         for attachmentID in attachmentIDs {
@@ -532,11 +564,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             bound.append(next)
         }
         let live = onHasLiveRun?(bot.id) ?? (liveRuns[botID] != nil)
-        if live {
+        // Production delegates live-run queueing to BotsViewModel so the
+        // receipt can bind the authoritative conversation/thread/run. The
+        // standalone path remains for persistence-level callers without a UI
+        // runtime hook.
+        if live, onSend == nil {
             var payload: [String: Any] = ["attachments": bound]
-            if let conversationID = selectedConversation[botID] {
+            if let conversationID = requestedConversationID ?? selectedConversation[botID] {
                 payload["conversation_id"] = conversationID
             }
+            payload["routing"] = routing
             let payloadJSON = jsonString(payload) ?? "{}"
             let stored = try store.enqueueQueuedFollowUp(
                 BotQueuedFollowUpRecord(
@@ -547,30 +584,71 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                     createdAt: now
                 )
             )
+            if let routingReceiptID = routing["routing_receipt_id"] as? String {
+                consumedRoutingReceipts.insert(routingReceiptID)
+            }
             return receipt(requestID: requestID, status: .completed, botID: botID, readback: [
                 "enqueued": true,
                 "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
                 "id": stored.id,
+                "conversation_id": (requestedConversationID ?? selectedConversation[botID])
+                    .map { $0 as Any } ?? NSNull(),
+                "run_id": liveRuns[botID]?["run_id"] ?? NSNull(),
+                "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
+                "effective_routing": routing,
             ])
         }
+        let authoritativeSend: [String: Any]
         if let onSend {
-            try onSend(bot.id, text)
+            authoritativeSend = try onSend(bot.id, text, conversation, routing)
+        } else {
+            authoritativeSend = [
+                "bot_id": botID,
+                "conversation_id": (requestedConversationID ?? selectedConversation[botID])
+                    .map { $0 as Any } ?? NSNull(),
+                "run_id": UUID().uuidString.lowercased(),
+                "enqueued": true,
+            ]
         }
+        let runID = authoritativeSend["run_id"] as? String
+            ?? UUID().uuidString.lowercased()
+        let conversationID = authoritativeSend["conversation_id"] as? String
+            ?? requestedConversationID
+            ?? selectedConversation[botID]
         liveRuns[botID] = [
             "bot_id": botID,
             "status": "working",
             "text": text,
             "started_at": now.timeIntervalSince1970,
+            "run_id": runID,
+            "conversation_id": conversationID ?? NSNull(),
+            "routing": routing,
         ]
         attention[botID] = [
+            "id": UUID().uuidString.lowercased(),
             "bot_id": botID,
+            "conversation_id": conversationID ?? NSNull(),
+            "run_id": runID,
             "state": "working",
+            "finished_at": NSNull(),
+            "ownership": "primary",
+            "primary": true,
+            "delegated": false,
+            "title": bot.name,
+            "detail": text,
             "source": "bot",
         ]
+        if let routingReceiptID = routing["routing_receipt_id"] as? String {
+            consumedRoutingReceipts.insert(routingReceiptID)
+        }
         return receipt(requestID: requestID, status: .completed, botID: botID, readback: [
-            "enqueued": false,
+            "enqueued": authoritativeSend["enqueued"] as? Bool ?? false,
             "run": liveRuns[botID] as Any,
             "workspace": NSNull(),
+            "conversation_id": conversationID as Any,
+            "run_id": runID,
+            "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
+            "effective_routing": routing,
         ])
     }
 
@@ -602,8 +680,19 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             drained = encodeQueue([next]).first
         }
         attention[botID] = [
+            "id": attention[botID]?["id"] ?? UUID().uuidString.lowercased(),
             "bot_id": botID,
-            "state": drained == nil ? "none" : "working",
+            "conversation_id": run?["conversation_id"] ?? NSNull(),
+            "run_id": run?["run_id"] ?? NSNull(),
+            "state": drained == nil ? "finished" : "working",
+            "finished_at": drained == nil
+                ? Date().timeIntervalSince1970 as Any
+                : NSNull(),
+            "ownership": "primary",
+            "primary": true,
+            "delegated": false,
+            "title": bot.name,
+            "detail": drained == nil ? "Finished" : "Running queued follow-up",
             "source": "bot",
         ]
         return receipt(
@@ -667,9 +756,20 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             updatedAt: now
         )
         try store.saveRoutine(definition)
+        let routineKey = definition.id.value.uuidString.lowercased()
+        var runtime = routineRuntime[routineKey] ?? [:]
+        runtime["next_run_at"] = dateValue(nextRunDate(
+            definition: definition,
+            enabled: (try store.listRoutines(botID: bot.id).first {
+                $0.definition.id == definition.id
+            })?.activation.isEnabled == true,
+            after: now
+        ))
+        routineRuntime[routineKey] = runtime
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
             "routine_id": definition.id.value.uuidString.lowercased(),
             "schedule_spec_json": specJSON,
+            "next_run_at": runtime["next_run_at"] ?? NSNull(),
         ])
     }
 
@@ -678,10 +778,19 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let raw = string(params, "routine_id"), let uuid = UUID(uuidString: raw) else { throw Error.invalidParams }
         let enabled = bool(params, "enabled") ?? false
         try store.setRoutineEnabled(id: BotRoutineID(uuid), enabled: enabled)
+        let stored = try store.listRoutines(botID: bot.id).first {
+            $0.definition.id == BotRoutineID(uuid)
+        }
+        let nextRunAt = stored.flatMap {
+            nextRunDate(definition: $0.definition, enabled: enabled, after: now)
+        }
+        var runtime = routineRuntime[raw.lowercased()] ?? [:]
+        runtime["next_run_at"] = dateValue(nextRunAt)
+        routineRuntime[raw.lowercased()] = runtime
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
             "routine_id": raw.lowercased(),
             "enabled": enabled,
-            "next_run_at": enabled ? now.addingTimeInterval(60).timeIntervalSince1970 : NSNull(),
+            "next_run_at": dateValue(nextRunAt),
         ])
     }
 
@@ -696,6 +805,34 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "result": "accepted",
         ]
         schedulerRuns.append(run)
+        var runtime = routineRuntime[routineID.lowercased()] ?? [:]
+        runtime["last_run_id"] = run["run_id"]
+        runtime["last_execution_at"] = now.timeIntervalSince1970
+        runtime["last_result"] = run["result"]
+        if let routine = try store.listRoutines(botID: bot.id).first(where: {
+            $0.definition.id.value.uuidString.caseInsensitiveCompare(routineID) == .orderedSame
+        }) {
+            runtime["next_run_at"] = dateValue(nextRunDate(
+                definition: routine.definition,
+                enabled: routine.activation.isEnabled,
+                after: now
+            ))
+        }
+        routineRuntime[routineID.lowercased()] = runtime
+        attention[id(bot)] = [
+            "id": UUID().uuidString.lowercased(),
+            "bot_id": id(bot),
+            "conversation_id": selectedConversation[id(bot)] ?? NSNull(),
+            "run_id": run["run_id"] ?? NSNull(),
+            "state": "working",
+            "finished_at": NSNull(),
+            "ownership": "primary",
+            "primary": true,
+            "delegated": false,
+            "title": "Routine: \(routineID)",
+            "detail": "Manual routine run accepted",
+            "source": "routine",
+        ]
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: run)
     }
 
@@ -703,23 +840,64 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         guard let raw = string(params, "routine_id"), let uuid = UUID(uuidString: raw) else { throw Error.invalidParams }
         try store.deleteRoutine(id: BotRoutineID(uuid))
+        routineRuntime.removeValue(forKey: raw.lowercased())
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["deleted": true])
     }
 
-    private func schedulerTick(now: Date, params: [String: Any]) throws -> [String: Any] {
-        let requestID = string(params, "client_request_id") ?? "scheduler-tick"
+    private func schedulerTick(now: Date, requestID: String) throws -> [String: Any] {
         var fired: [[String: Any]] = []
         for bot in try store.list() {
             for routine in try store.listRoutines(botID: bot.id) where routine.activation.isEnabled {
+                let routineKey = routine.definition.id.value.uuidString.lowercased()
+                let persistedDue = routineRuntime[routineKey]?["next_run_at"] as? Double
+                guard let due = persistedDue else {
+                    var runtime = routineRuntime[routineKey] ?? [:]
+                    runtime["next_run_at"] = dateValue(nextRunDate(
+                        definition: routine.definition,
+                        enabled: true,
+                        after: now
+                    ))
+                    routineRuntime[routineKey] = runtime
+                    continue
+                }
+                guard due <= now.timeIntervalSince1970 else { continue }
                 let run: [String: Any] = [
                     "run_id": UUID().uuidString.lowercased(),
-                    "routine_id": routine.definition.id.value.uuidString.lowercased(),
+                    "routine_id": routineKey,
                     "bot_id": id(bot),
                     "executed_at": now.timeIntervalSince1970,
+                    "scheduled_at": due,
                     "automatic": true,
+                    "result": "completed",
                     "schedule_spec_json": routine.definition.scheduleSpecJSON,
                 ]
                 schedulerRuns.append(run)
+                var runtime = routineRuntime[routineKey] ?? [:]
+                runtime["last_run_id"] = run["run_id"]
+                runtime["last_execution_at"] = now.timeIntervalSince1970
+                runtime["last_result"] = "completed"
+                runtime["next_run_at"] = dateValue(nextRunDate(
+                    definition: routine.definition,
+                    enabled: true,
+                    after: Date(timeIntervalSince1970: due).addingTimeInterval(
+                        ScheduledTaskOccurrenceCalculator.spentOccurrenceAdvance
+                    )
+                ))
+                routineRuntime[routineKey] = runtime
+                attention[id(bot)] = [
+                    "id": UUID().uuidString.lowercased(),
+                    "bot_id": id(bot),
+                    "conversation_id": selectedConversation[id(bot)] ?? NSNull(),
+                    "run_id": run["run_id"] ?? NSNull(),
+                    "state": "finished",
+                    "finished_at": now.timeIntervalSince1970,
+                    "ownership": "primary",
+                    "primary": true,
+                    "delegated": false,
+                    "title": routine.definition.name,
+                    "detail": "Scheduled routine completed",
+                    "source": "routine",
+                ]
                 fired.append(run)
             }
         }
@@ -987,15 +1165,32 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func routingSet(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
-        let pref: [String: Any] = [
+        let provider = string(params, "provider") ?? "grok"
+        let providerInstanceID = string(params, "provider_instance_id") ?? provider
+        let routingReceiptID = UUID().uuidString.lowercased()
+        let runAsUser = params["run_as_user"] ?? Self.runAsUserObject(AgentRunAsUser.current())
+        var pref: [String: Any] = [
             "provider": string(params, "provider") ?? "grok",
+            "provider_instance_id": providerInstanceID,
             "model": string(params, "model") ?? "",
             "routing_mode": string(params, "routing_mode") ?? "auto",
             "permission_mode": string(params, "permission_mode") ?? "supervised",
             "reasoning_effort": string(params, "reasoning_effort") ?? "medium",
+            "service_tier": string(params, "service_tier") ?? "auto",
+            "run_as_user": runAsUser,
+            "routing_receipt_id": routingReceiptID,
+            "host_id": string(params, "host_id") ?? "",
+            "bot_id": id(bot),
         ]
+        pref["effective"] = pref
         routingPref[id(bot)] = pref
-        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: pref)
+        return receipt(
+            requestID: requestID,
+            status: .completed,
+            botID: id(bot),
+            readback: pref,
+            receiptID: routingReceiptID
+        )
     }
 
     private func attentionAck(params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -1056,12 +1251,15 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "notifications_enabled": bot.notificationsEnabled,
             "workspace_id": NSNull(),
         ]
+        if let routing = routingPref[id(bot)] {
+            body["routing"] = routing
+        }
         for (key, value) in extra { body[key] = value }
         return body
     }
 
     private func encodeRoutine(_ routine: BotRoutine) -> [String: Any] {
-        [
+        var result: [String: Any] = [
             "id": routine.definition.id.value.uuidString.lowercased(),
             "bot_id": routine.definition.botID.value.uuidString.lowercased(),
             "name": routine.definition.name,
@@ -1070,16 +1268,119 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "schedule_spec_json": routine.definition.scheduleSpecJSON,
             "enabled": routine.activation.isEnabled,
         ]
+        if let runtime = routineRuntime[routine.definition.id.value.uuidString.lowercased()] {
+            result.merge(runtime) { _, runtimeValue in runtimeValue }
+        }
+        return result
     }
 
-    private func receipt(requestID: String, status: Status, botID: String?, readback: [String: Any]) -> [String: Any] {
+    private func nextRunDate(
+        definition: BotRoutineDefinition,
+        enabled: Bool,
+        after date: Date
+    ) -> Date? {
+        guard enabled,
+              let spec = definition.scheduleSpec,
+              let recurrence = try? spec.makeRecurrence(),
+              let timeZone = TimeZone(identifier: spec.timeZoneIdentifier) else {
+            return nil
+        }
+        return ScheduledTaskOccurrenceCalculator.nextOccurrence(
+            after: date,
+            recurrence: recurrence,
+            timeZone: timeZone,
+            calendar: Calendar(identifier: .gregorian)
+        )
+    }
+
+    private func dateValue(_ date: Date?) -> Any {
+        if let date { return date.timeIntervalSince1970 }
+        return NSNull()
+    }
+
+    private func receipt(
+        requestID: String,
+        status: Status,
+        botID: String?,
+        readback: [String: Any],
+        receiptID: String = UUID().uuidString.lowercased()
+    ) -> [String: Any] {
         [
             "request_id": requestID,
-            "receipt_id": UUID().uuidString.lowercased(),
+            "receipt_id": receiptID,
             "status": status.rawValue,
             "bot_id": botID as Any,
             "readback": readback,
         ]
+    }
+
+    private func effectiveRouting(
+        botID: String,
+        params: [String: Any],
+        requireConversationID: String?
+    ) throws -> [String: Any] {
+        let requestedReceipt = string(params, "routing_receipt_id")
+        var routing = routingPref[botID] ?? [
+            "provider": "grok",
+            "provider_instance_id": "grok",
+            "model": "",
+            "routing_mode": "auto",
+            "permission_mode": "supervised",
+            "reasoning_effort": "medium",
+            "service_tier": "auto",
+            "run_as_user": Self.runAsUserObject(AgentRunAsUser.current()),
+            "host_id": string(params, "host_id") ?? "",
+            "bot_id": botID,
+        ]
+        guard let requestedReceipt else { return routing }
+        guard !requestedReceipt.isEmpty,
+              !consumedRoutingReceipts.contains(requestedReceipt),
+              routing["routing_receipt_id"] as? String == requestedReceipt,
+              routing["host_id"] as? String == string(params, "host_id"),
+              requireConversationID?.isEmpty == false,
+              params["run_as_user"] != nil else {
+            throw Error.crossTarget
+        }
+        for key in [
+            "provider", "provider_instance_id", "model", "routing_mode",
+            "permission_mode", "reasoning_effort", "service_tier",
+        ] {
+            guard let requested = params[key] as? String,
+                  requested == routing[key] as? String else {
+                throw Error.crossTarget
+            }
+        }
+        if let requestedRunAs = params["run_as_user"],
+           !Self.jsonObjectsEqual(requestedRunAs, routing["run_as_user"]) {
+            throw Error.crossTarget
+        }
+        routing["routing_receipt_id"] = requestedReceipt
+        return routing
+    }
+
+    private static func jsonObjectsEqual(_ lhs: Any, _ rhs: Any?) -> Bool {
+        guard let rhs,
+              JSONSerialization.isValidJSONObject(["value": lhs]),
+              JSONSerialization.isValidJSONObject(["value": rhs]),
+              let left = try? JSONSerialization.data(
+                withJSONObject: ["value": lhs],
+                options: [.sortedKeys]
+              ),
+              let right = try? JSONSerialization.data(
+                withJSONObject: ["value": rhs],
+                options: [.sortedKeys]
+              ) else {
+            return false
+        }
+        return left == right
+    }
+
+    private static func runAsUserObject(_ user: AgentRunAsUser) -> Any {
+        guard let data = try? JSONEncoder().encode(user),
+              let object = try? JSONSerialization.jsonObject(with: data) else {
+            return [String: Any]()
+        }
+        return object
     }
 
     private func string(_ params: [String: Any], _ key: String) -> String? {
@@ -1262,6 +1563,30 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
             filesLocation = decoded
         }
+        if let data = loadData("bot.remote.routing"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
+            routingPref = decoded
+        }
+        if let data = loadData("bot.remote.routing_consumed"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String] {
+            consumedRoutingReceipts = Set(decoded)
+        }
+        if let data = loadData("bot.remote.selected_conversations"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            selectedConversation = decoded
+        }
+        if let data = loadData("bot.remote.attention"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
+            attention = decoded
+        }
+        if let data = loadData("bot.remote.scheduler_runs"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            schedulerRuns = decoded
+        }
+        if let data = loadData("bot.remote.routine_runtime"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
+            routineRuntime = decoded
+        }
     }
 
     private func migrateSidecarQueueIfNeeded() {
@@ -1295,6 +1620,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         saveJSON("bot.remote.unpublished", Array(unpublished).sorted())
         saveJSON("bot.remote.receipts", receipts)
         saveJSON("bot.remote.files_location", filesLocation)
+        saveJSON("bot.remote.routing", routingPref)
+        saveJSON("bot.remote.routing_consumed", Array(consumedRoutingReceipts).sorted())
+        saveJSON("bot.remote.selected_conversations", selectedConversation)
+        saveJSON("bot.remote.attention", attention)
+        saveJSON("bot.remote.scheduler_runs", schedulerRuns)
+        saveJSON("bot.remote.routine_runtime", routineRuntime)
     }
 
     private func loadData(_ key: String) -> Data? {

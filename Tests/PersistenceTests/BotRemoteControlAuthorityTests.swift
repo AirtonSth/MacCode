@@ -122,6 +122,107 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertNotNil(items.first?["id"] as? String)
     }
 
+    /// WHY: a routing choice is an admitted host capability, not an iOS hint.
+    /// The exact outer receipt and run-as tuple must bind one conversation/run
+    /// and must not be reusable after response loss or relaunch.
+    func test_routingReceiptBindsExactSendTupleAndIsOneShotAcrossRelaunch() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "route-create",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "route-conversation",
+            "bot_id": botID,
+            "title": "Exact route",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        let runAs: [String: Any] = [
+            "generatedUID": "generated-user",
+            "shortName": "runner",
+            "uid": 501,
+            "gid": 20,
+            "homePath": "/Users/runner",
+            "fullName": "Runner User",
+        ]
+        let admitted = try authority.dispatch(method: "bot.routing.set", params: [
+            "client_request_id": "route-admit",
+            "bot_id": botID,
+            "host_id": "host-exact",
+            "provider": "grok",
+            "provider_instance_id": "grok-work",
+            "model": "grok-4",
+            "routing_mode": "explicit",
+            "permission_mode": "fullAccess",
+            "reasoning_effort": "high",
+            "service_tier": "priority",
+            "run_as_user": runAs,
+        ])
+        let routingReceiptID = try XCTUnwrap(admitted["receipt_id"] as? String)
+        let admittedReadback = try XCTUnwrap(admitted["readback"] as? [String: Any])
+        XCTAssertEqual(admittedReadback["routing_receipt_id"] as? String, routingReceiptID,
+                       "the outer durable receipt is the routing authority")
+        XCTAssertEqual(admittedReadback["provider_instance_id"] as? String, "grok-work")
+        XCTAssertEqual(admittedReadback["run_as_user"] as? NSDictionary, runAs as NSDictionary)
+
+        let expectedRunID = UUID().uuidString.lowercased()
+        authority.onHasLiveRun = { _ in true }
+        authority.onSend = { callbackBotID, callbackText, callbackConversationID, callbackRouting in
+            XCTAssertEqual(callbackBotID.value.uuidString.lowercased(), botID)
+            XCTAssertEqual(callbackText, "Use this exact route")
+            XCTAssertEqual(callbackConversationID?.value.uuidString.lowercased(), conversationID)
+            XCTAssertEqual(callbackRouting["routing_receipt_id"] as? String, routingReceiptID)
+            XCTAssertEqual(callbackRouting["run_as_user"] as? NSDictionary, runAs as NSDictionary)
+            return [
+                "bot_id": botID,
+                "conversation_id": conversationID,
+                "run_id": expectedRunID,
+                "enqueued": true,
+            ]
+        }
+        let sendParams: [String: Any] = [
+            "client_request_id": "route-send",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "Use this exact route",
+            "host_id": "host-exact",
+            "routing_receipt_id": routingReceiptID,
+            "provider": "grok",
+            "provider_instance_id": "grok-work",
+            "model": "grok-4",
+            "routing_mode": "explicit",
+            "permission_mode": "fullAccess",
+            "reasoning_effort": "high",
+            "service_tier": "priority",
+            "run_as_user": runAs,
+        ]
+        let sent = try authority.dispatch(method: "bot.send", params: sendParams)
+        let sendReadback = try XCTUnwrap(sent["readback"] as? [String: Any])
+        let run = try XCTUnwrap(sendReadback["run"] as? [String: Any])
+        let runRouting = try XCTUnwrap(run["routing"] as? [String: Any])
+        XCTAssertEqual(sendReadback["conversation_id"] as? String, conversationID)
+        XCTAssertEqual(sendReadback["run_id"] as? String, expectedRunID)
+        XCTAssertEqual(sendReadback["routing_receipt_id"] as? String, routingReceiptID)
+        XCTAssertEqual(runRouting["routing_receipt_id"] as? String, routingReceiptID)
+        XCTAssertEqual(runRouting["provider_instance_id"] as? String, "grok-work")
+        XCTAssertEqual(runRouting["run_as_user"] as? NSDictionary, runAs as NSDictionary)
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+        var stale = sendParams
+        stale["client_request_id"] = "route-stale"
+        XCTAssertThrowsError(try relaunched.dispatch(method: "bot.send", params: stale)) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget,
+                           "routing receipts are one-shot across host relaunch")
+        }
+    }
+
     func test_attachmentGrant_rejectsCrossBotReuse() throws {
         let a = try authority.dispatch(method: "bot.create", params: ["client_request_id": "ca", "name": "A"])
         let b = try authority.dispatch(method: "bot.create", params: ["client_request_id": "cb", "name": "B"])
@@ -160,12 +261,83 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "prompt": "scan",
             "schedule_spec_json": spec,
         ])
+        let sourceRouting = try authority.dispatch(method: "bot.routing.set", params: [
+            "client_request_id": "dup-route",
+            "bot_id": botID,
+            "host_id": "host-duplicate",
+            "provider": "grok",
+            "provider_instance_id": "grok-team",
+            "model": "grok-4",
+            "routing_mode": "explicit",
+            "permission_mode": "fullAccess",
+            "reasoning_effort": "high",
+            "service_tier": "priority",
+            "run_as_user": ["generatedUID": "duplicate-user", "shortName": "runner", "uid": 501, "gid": 20, "homePath": "/Users/runner"],
+        ])
         let copy = try authority.dispatch(method: "bot.duplicate", params: [
             "client_request_id": "dup",
             "bot_id": botID,
         ])
         let specs = (copy["readback"] as? [String: Any])?["schedule_spec_jsons"] as? [String]
         XCTAssertEqual(specs, [spec])
+        let copyID = try XCTUnwrap(copy["bot_id"] as? String)
+        let copyRouting = try XCTUnwrap(
+            ((copy["readback"] as? [String: Any])?["routing"] as? [String: Any])
+        )
+        XCTAssertEqual(copyRouting["bot_id"] as? String, copyID)
+        XCTAssertEqual(copyRouting["provider_instance_id"] as? String, "grok-team")
+        XCTAssertNotEqual(copyRouting["routing_receipt_id"] as? String,
+                          sourceRouting["receipt_id"] as? String,
+                          "the duplicate gets independent routing authority")
+
+        _ = try authority.dispatch(method: "bot.routing.set", params: [
+            "client_request_id": "dup-source-change",
+            "bot_id": botID,
+            "provider_instance_id": "grok-source-changed",
+        ])
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+        let readCopy = try relaunched.dispatch(method: "bot.get", params: ["bot_id": copyID])
+        let persistedRouting = try XCTUnwrap(
+            (readCopy["routing"] as? [String: Any])
+        )
+        XCTAssertEqual(persistedRouting["provider_instance_id"] as? String, "grok-team",
+                       "source changes must not drift the duplicate")
+    }
+
+    /// WHY: duplicate admission must be atomic at the account cap. A rejected
+    /// copy may not mint hidden routing state or alter the source.
+    func test_duplicateAtCapLeavesSourceRoutingAndBotCountUnchanged() throws {
+        let source = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "dup-cap-source", "name": "Source",
+        ])
+        let sourceID = try XCTUnwrap(source["bot_id"] as? String)
+        let route = try authority.dispatch(method: "bot.routing.set", params: [
+            "client_request_id": "dup-cap-route",
+            "bot_id": sourceID,
+            "provider_instance_id": "grok-cap",
+        ])
+        for index in 1..<BotRemoteControlAuthority.liveAccountCap {
+            _ = try authority.dispatch(method: "bot.create", params: [
+                "client_request_id": "dup-cap-\(index)", "name": "Bot \(index)",
+            ])
+        }
+
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.duplicate", params: [
+            "client_request_id": "dup-cap-reject", "bot_id": sourceID,
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .cap)
+        }
+        let listed = try authority.dispatch(method: "bot.list", params: [:])
+        XCTAssertEqual((listed["bots"] as? [[String: Any]])?.count,
+                       BotRemoteControlAuthority.liveAccountCap)
+        let sourceRead = try authority.dispatch(method: "bot.get", params: ["bot_id": sourceID])
+        XCTAssertEqual(((sourceRead["routing"] as? [String: Any])?["routing_receipt_id"] as? String),
+                       route["receipt_id"] as? String)
     }
 
     func test_createAtCap_doesNotCreateBot() throws {
@@ -185,6 +357,95 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         }
         let listed = try authority.dispatch(method: "bot.list", params: [:])
         XCTAssertEqual((listed["bots"] as? [[String: Any]])?.count, BotRemoteControlAuthority.liveAccountCap)
+    }
+
+    /// WHY: iOS active/finished routing and schedule screens must be projections
+    /// of durable host truth. A due routine must fire once, then retain its exact
+    /// execution/result and attention identity after the Mac authority relaunches.
+    func test_dueRoutinePersistsExecutionResultNextRunAndAttentionIdentity() throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "schedule-bot", "name": "Scheduler",
+        ], now: base)
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "schedule-conversation",
+            "bot_id": botID,
+            "title": "Scheduled work",
+        ], now: base)
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        var spec = BotScheduleSpec(
+            frequency: .once,
+            scheduledDate: base.addingTimeInterval(60),
+            timeZoneIdentifier: "UTC"
+        )
+        spec.model = "grok-scheduled"
+        let routine = try authority.dispatch(method: "bot.routine.create", params: [
+            "client_request_id": "schedule-create",
+            "bot_id": botID,
+            "name": "Once",
+            "prompt": "Run exactly once",
+            "schedule_note": spec.displayNote(),
+            "schedule_spec_json": spec.encodedJSON(),
+        ], now: base)
+        let routineID = try XCTUnwrap(
+            (routine["readback"] as? [String: Any])?["routine_id"] as? String
+        )
+        let enabled = try authority.dispatch(method: "bot.routine.enable", params: [
+            "client_request_id": "schedule-enable",
+            "bot_id": botID,
+            "routine_id": routineID,
+            "enabled": true,
+        ], now: base)
+        let due = try XCTUnwrap(
+            (enabled["readback"] as? [String: Any])?["next_run_at"] as? Double
+        )
+        XCTAssertEqual(due, base.addingTimeInterval(60).timeIntervalSince1970, accuracy: 1)
+
+        let early = try authority.dispatch(method: "bot.scheduler.tick", params: [
+            "client_request_id": "schedule-early",
+        ], now: base.addingTimeInterval(30))
+        XCTAssertTrue((((early["readback"] as? [String: Any])?["runs"] as? [[String: Any]]) ?? []).isEmpty,
+                      "scheduler must not fabricate an early execution")
+        let fired = try authority.dispatch(method: "bot.scheduler.tick", params: [
+            "client_request_id": "schedule-due",
+        ], now: Date(timeIntervalSince1970: due))
+        let run = try XCTUnwrap(
+            ((fired["readback"] as? [String: Any])?["runs"] as? [[String: Any]])?.first
+        )
+        let runID = try XCTUnwrap(run["run_id"] as? String)
+        XCTAssertEqual(run["routine_id"] as? String, routineID)
+        XCTAssertEqual(run["result"] as? String, "completed")
+        XCTAssertEqual(run["schedule_spec_json"] as? String, spec.encodedJSON())
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+        let routines = try relaunched.dispatch(method: "bot.routine.list", params: ["bot_id": botID])
+        let persisted = try XCTUnwrap((routines["routines"] as? [[String: Any]])?.first)
+        XCTAssertEqual(persisted["last_run_id"] as? String, runID)
+        XCTAssertEqual(persisted["last_result"] as? String, "completed")
+        XCTAssertTrue(persisted["next_run_at"] is NSNull,
+                      "one-shot schedules must persist that no next run exists")
+        let attention = try relaunched.dispatch(method: "bot.attention.list", params: [:])
+        let item = try XCTUnwrap((attention["items"] as? [[String: Any]])?.first)
+        XCTAssertNotNil(item["id"] as? String)
+        XCTAssertEqual(item["bot_id"] as? String, botID)
+        XCTAssertEqual(item["conversation_id"] as? String, conversationID)
+        XCTAssertEqual(item["run_id"] as? String, runID)
+        XCTAssertEqual(item["state"] as? String, "finished")
+        XCTAssertNotNil(item["finished_at"] as? Double)
+        XCTAssertEqual(item["ownership"] as? String, "primary")
+        XCTAssertEqual(item["primary"] as? Bool, true)
+        XCTAssertEqual(item["delegated"] as? Bool, false)
+        XCTAssertNotNil(item["title"] as? String)
+        XCTAssertNotNil(item["detail"] as? String)
+        XCTAssertEqual(item["source"] as? String, "routine")
     }
 
     func test_reservedCapability_neverGetsPositiveParity() {

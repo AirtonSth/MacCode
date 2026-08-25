@@ -5321,7 +5321,7 @@ public final class BotsViewModel: ObservableObject {
                 throw BotStoreError.notFound
             }
             if let threadID = existing.linkedAgentThreadID,
-               context.coordinator.activeRunId(threadId: threadID) != nil {
+               let activeRunID = context.coordinator.activeRunId(threadId: threadID) {
                 enqueueFollowUp(
                     BotQueuedFollowUp(
                         text: message,
@@ -5334,7 +5334,7 @@ public final class BotsViewModel: ObservableObject {
                     "bot_id": .string(bot.id.value.uuidString.lowercased()),
                     "conversation_id": .string(existing.id.value.uuidString.lowercased()),
                     "thread_id": .string(threadID.value.uuidString.lowercased()),
-                    "run_id": .null,
+                    "run_id": .string(activeRunID.value.uuidString.lowercased()),
                     "enqueued": .bool(true),
                     "queued_follow_up": .bool(true),
                 ])

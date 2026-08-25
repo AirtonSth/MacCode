@@ -2917,6 +2917,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             return JSONValue.from(result)
         } catch let error as BotRemoteControlAuthority.Error {
+            if let requestID = foundation["client_request_id"] as? String,
+               let failed = try? authority.dispatch(
+                   method: "bot.receipt.status",
+                   params: ["client_request_id": requestID]
+               ),
+               failed["status"] as? String == BotRemoteControlAuthority.Status.failed.rawValue {
+                return JSONValue.from(failed)
+            }
             throw JSONRPCError(code: error.code, message: error.message)
         }
     }
@@ -3059,14 +3067,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             try service.removeGuestRuntime(botID: id)
         }
-        created.onSend = { [weak self] id, text in
-            guard let vm = self?.botsViewModel else { return }
-            _ = try vm.enqueueHostMessage(
+        created.onSend = { [weak self] id, text, conversationID, routingValues in
+            guard let vm = self?.botsViewModel else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32091,
+                    message: "Bot runtime is unavailable."
+                )
+            }
+            let routing = try Self.pairedBotDeskRouting(routingValues)
+            let result = try vm.enqueueHostMessage(
                 botID: id,
                 text: text,
-                conversationID: nil,
-                routing: BotDeskRouting()
+                conversationID: conversationID,
+                routing: routing
             )
+            return Self.foundationObject(result.objectValue ?? [:])
         }
         created.onOpenFile = { [weak self] botID, path, split, root in
             guard let vm = self?.botsViewModel else {
@@ -3122,6 +3137,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             return [BotComputerActStep(action: "click", x: x, y: y)]
         }
         throw BotRemoteControlAuthority.Error.invalidParams
+    }
+
+    private static func pairedBotDeskRouting(
+        _ values: [String: Any]
+    ) throws -> BotDeskRouting {
+        guard let providerRaw = values["provider"] as? String,
+              let provider = AgentProvider(rawValue: providerRaw),
+              let providerInstanceID = values["provider_instance_id"] as? String,
+              !providerInstanceID.isEmpty,
+              let routingRaw = values["routing_mode"] as? String,
+              let routingMode = AgentRoutingMode(rawValue: routingRaw),
+              let permissionRaw = values["permission_mode"] as? String,
+              let permissionMode = AgentPermissionMode(rawValue: permissionRaw),
+              let reasoningRaw = values["reasoning_effort"] as? String,
+              let reasoningEffort = AgentReasoningEffort(rawValue: reasoningRaw),
+              let runAsObject = values["run_as_user"],
+              JSONSerialization.isValidJSONObject(runAsObject),
+              let runAsData = try? JSONSerialization.data(withJSONObject: runAsObject),
+              let runAsUser = try? JSONDecoder().decode(AgentRunAsUser.self, from: runAsData)
+        else {
+            throw BotRemoteControlAuthority.Error.invalidParams
+        }
+        return BotDeskRouting(
+            provider: provider,
+            providerInstanceID: providerInstanceID,
+            model: values["model"] as? String ?? "",
+            routingMode: routingMode,
+            permissionMode: permissionMode,
+            reasoningEffort: reasoningEffort,
+            serviceTier: (values["service_tier"] as? String)
+                .flatMap(AgentServiceTier.init(rawValue:)) ?? .auto,
+            runAsUser: runAsUser
+        )
     }
 
     private static func foundationObject(_ params: [String: JSONValue]) -> [String: Any] {
@@ -5618,6 +5666,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             return AgentActiveRunSnapshot(runId: durable.id, startedAt: durable.startedAt)
         }
         return nil
+    }
+
+    public func activeAgentDelegation(
+        thread: AgentThreadID,
+        run: AgentRunID
+    ) throws -> AgentActiveDelegationSnapshot? {
+        guard let ctx = context,
+              let active = try ctx.coordinator.activeDelegationCapability(
+                threadId: thread,
+                runId: run
+              ) else {
+            return nil
+        }
+        return AgentActiveDelegationSnapshot(
+            threadId: active.threadId,
+            runId: active.runId,
+            hostId: ctx.liveActivityHostIdentity.serverId,
+            capability: active.capability,
+            expiresAt: active.expiresAt
+        )
     }
 
     /// UX-MAC_AGENT-CONTINUE parity for mirror clients: resume a

@@ -804,8 +804,16 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         stoppedAgentThreads.append(thread)
     }
     var activeAgentRuns: [AgentThreadID: AgentActiveRunSnapshot] = [:]
+    var activeAgentDelegations: [AgentThreadID: AgentActiveDelegationSnapshot] = [:]
     func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot? {
         activeAgentRuns[thread]
+    }
+    func activeAgentDelegation(
+        thread: AgentThreadID,
+        run: AgentRunID
+    ) throws -> AgentActiveDelegationSnapshot? {
+        guard activeAgentDelegations[thread]?.runId == run else { return nil }
+        return activeAgentDelegations[thread]
     }
     var continueAgentRunCallCount = 0
     var continuedAgentThreads: [AgentThreadID] = []
@@ -1343,7 +1351,7 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
-    func test_httpBotCreateKeepsClientRequestIdOnPairedRemote() async {
+    func test_localBotCreateKeepsClientRequestIdOnPairedRemote() async {
         let router = FakeRouter()
         router.pairedBotRemoteResult = .object([
             "status": .string("completed"),
@@ -1352,7 +1360,7 @@ final class DispatcherTests: XCTestCase {
             "request_id": .string("e2e"),
         ])
         let d = JSONRPCDispatcher(router: router)
-        let resp = await d.dispatchHTTP(
+        let resp = await d.dispatch(
             JSONRPCRequest(
                 jsonrpc: "2.0",
                 id: .number(1),
@@ -1361,11 +1369,6 @@ final class DispatcherTests: XCTestCase {
                     "client_request_id": .string("e2e"),
                     "name": .string("Piper"),
                 ]
-            ),
-            mutationContext: MutationRequestContext(
-                ownerFingerprint: "owner",
-                hostId: "host",
-                bootEpoch: 1
             )
         )
         XCTAssertNil(resp.error, "paired Bot create must not fall through to methodNotFound")
@@ -4733,6 +4736,75 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNotNil(result["events"]?.arrayValue?.first?.objectValue?["turnStarted"],
                         "the mirror snapshot must preserve the typed AssistantEvent wire shape")
         XCTAssertEqual(result["events_truncated"], .bool(false))
+    }
+
+    /// WHY: peer discovery is authenticated with the active-run bearer. iOS
+    /// must receive the exact bounded credential through readback without ever
+    /// persisting it in a mutating command receipt.
+    @MainActor
+    func testAgentThreadReadReturnsOnlyTheExactActiveRunDelegationCapability() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        let run = AgentRunID()
+        router.activeAgentRuns[thread] = AgentActiveRunSnapshot(runId: run, startedAt: Date())
+        router.activeAgentDelegations[thread] = AgentActiveDelegationSnapshot(
+            threadId: thread,
+            runId: run,
+            hostId: "host-delegation",
+            capability: "bounded-active-run-capability",
+            expiresAt: Date(timeIntervalSince1970: 1_900_000_000)
+        )
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let response = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.thread.read",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "include_event_watermark": .bool(true)
+            ]
+        ))
+
+        let result = try XCTUnwrap(response.result?.objectValue)
+        XCTAssertEqual(result["delegation_capability"], .string("bounded-active-run-capability"))
+        XCTAssertEqual(result["delegation_thread_id"], .string(thread.value.uuidString.lowercased()))
+        XCTAssertEqual(result["delegation_run_id"], .string(run.value.uuidString.lowercased()))
+        XCTAssertEqual(result["delegation_host_id"], .string("host-delegation"))
+        XCTAssertEqual(result["delegation_expires_at_ms"], .number(1_900_000_000_000))
+
+        router.activeAgentRuns[thread] = AgentActiveRunSnapshot(runId: AgentRunID(), startedAt: Date())
+        let crossRun = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "agent.thread.read",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "include_event_watermark": .bool(true)
+            ]
+        ))
+        XCTAssertNil(crossRun.result?.objectValue?["delegation_capability"],
+                     "a credential bound to another run must fail closed")
+
+        router.activeAgentRuns[thread] = AgentActiveRunSnapshot(runId: run, startedAt: Date())
+        router.activeAgentDelegations[thread] = AgentActiveDelegationSnapshot(
+            threadId: thread,
+            runId: run,
+            hostId: "host-delegation",
+            capability: "expired-capability",
+            expiresAt: Date(timeIntervalSince1970: 1)
+        )
+        let expired = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(3),
+            method: "agent.thread.read",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "include_event_watermark": .bool(true)
+            ]
+        ))
+        XCTAssertNil(expired.result?.objectValue?["delegation_capability"],
+                     "an expired active-run credential must never cross the readback boundary")
     }
 
     @MainActor
