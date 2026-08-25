@@ -46,6 +46,41 @@ wait_for_bundle_exit() {
   return 1
 }
 
+# BEGIN codesign metadata summary parser
+# Consume all metadata instead of piping printf into an early-exiting parser.
+# Under pipefail, a large `codesign -dv` response otherwise makes printf fail
+# with SIGPIPE after awk has found the first matching line.
+codesign_metadata_summary() {
+  local sign_meta="$1"
+  local sign_team=""
+  local sign_flags=""
+  local line
+  local flags
+
+  while IFS= read -r line; do
+    case "$line" in
+      TeamIdentifier=*)
+        if [ -z "$sign_team" ]; then
+          sign_team="${line#TeamIdentifier=}"
+        fi
+        ;;
+      *flags=*\(*\)*)
+        if [ -z "$sign_flags" ]; then
+          flags="${line#*\(}"
+          sign_flags="${flags%%\)*}"
+        fi
+        ;;
+    esac
+  done <<< "$sign_meta"
+
+  if [[ "$sign_flags" == *adhoc* ]] || [ -z "$sign_team" ] || [ "$sign_team" = "not set" ]; then
+    printf '%s\n' 'codesign team=none class=adhoc (TCC grants will not survive rebuilds)'
+  else
+    printf 'codesign team=%s class=durable flags=%s\n' "$sign_team" "${sign_flags:-none}"
+  fi
+}
+# END codesign metadata summary parser
+
 if [ -z "${DEVELOPER_DIR:-}" ] && [ -d "/Applications/Xcode.app/Contents/Developer" ]; then
   export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
 fi
@@ -301,13 +336,7 @@ codesign --verify --deep --strict --verbose=2 "$STAGING_APP"
 # Surface identity summary so a packaging log proves TCC durability class.
 if command -v codesign >/dev/null 2>&1; then
   SIGN_META="$(codesign -dv --verbose=4 "$STAGING_APP" 2>&1 || true)"
-  SIGN_TEAM="$(printf '%s\n' "$SIGN_META" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
-  SIGN_FLAGS="$(printf '%s\n' "$SIGN_META" | awk -F'[()]' '/flags=/{print $2; exit}')"
-  if printf '%s\n' "$SIGN_FLAGS" | grep -q adhoc || [ "${SIGN_TEAM:-not set}" = "not set" ]; then
-    echo "[package] codesign team=none class=adhoc (TCC grants will not survive rebuilds)" >&2
-  else
-    echo "[package] codesign team=${SIGN_TEAM} class=durable flags=${SIGN_FLAGS:-none}" >&2
-  fi
+  printf '[package] %s\n' "$(codesign_metadata_summary "$SIGN_META")" >&2
 fi
 
 rm -rf "$APP_PATH"
