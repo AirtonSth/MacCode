@@ -2905,6 +2905,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private var pairedBotRemote: BotRemoteControlAuthority?
+    private let botRuntimeEvidenceProjector = BotRuntimeEvidenceProjector()
 
     public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
         let authority = try pairedBotAuthority()
@@ -2914,6 +2915,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             botsViewModel?.reloadQueuedFollowUpsFromStore()
             if method == "bot.get" || method == "bot.send" {
                 result = enrichPairedBotAssistant(params: foundation, result: result)
+            }
+            if method == "bot.send" {
+                botRuntimeEvidenceProjector.registerCompletedSend(JSONValue.from(result))
             }
             return JSONValue.from(result)
         } catch let error as BotRemoteControlAuthority.Error {

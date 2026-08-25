@@ -5322,15 +5322,14 @@ public final class BotsViewModel: ObservableObject {
             }
             if let threadID = existing.linkedAgentThreadID,
                let activeRunID = context.coordinator.activeRunId(threadId: threadID) {
-                enqueueFollowUp(
-                    BotQueuedFollowUp(
-                        text: message,
-                        conversationID: existing.id,
-                        routing: routing
-                    ),
-                    botID: bot.id
+                let followUp = BotQueuedFollowUp(
+                    text: message,
+                    conversationID: existing.id,
+                    routing: routing
                 )
+                enqueueFollowUp(followUp, botID: bot.id)
                 return .object([
+                    "id": .string(followUp.id.uuidString.lowercased()),
                     "bot_id": .string(bot.id.value.uuidString.lowercased()),
                     "conversation_id": .string(existing.id.value.uuidString.lowercased()),
                     "thread_id": .string(threadID.value.uuidString.lowercased()),

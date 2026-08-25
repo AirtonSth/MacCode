@@ -122,6 +122,91 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertNotNil(items.first?["id"] as? String)
     }
 
+    /// WHY: iOS may only adopt a Bot turn when response, receipt status, and
+    /// later stream frames share one exact authenticated execution tuple.
+    func test_sendReceiptBindsStartedAndQueuedRuntimeEvidenceWithoutReplay() throws {
+        let hostID = "runtime-host"
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "runtime-create",
+            "name": "Runtime Bot",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "runtime-conversation",
+            "bot_id": botID,
+            "title": "Runtime",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        let runID = UUID().uuidString.lowercased()
+        let threadID = UUID().uuidString.lowercased()
+        var sendCalls = 0
+        authority.onSend = { callbackBotID, _, callbackConversationID, _ in
+            sendCalls += 1
+            XCTAssertEqual(callbackBotID.value.uuidString.lowercased(), botID)
+            XCTAssertEqual(callbackConversationID?.value.uuidString.lowercased(), conversationID)
+            return [
+                "bot_id": botID,
+                "conversation_id": conversationID,
+                "thread_id": threadID,
+                "run_id": runID,
+                "enqueued": true,
+                "queued_follow_up": false,
+            ]
+        }
+        let params: [String: Any] = [
+            "client_request_id": "runtime-send",
+            "host_id": hostID,
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "Start exactly once",
+        ]
+        let started = try authority.dispatch(method: "bot.send", params: params)
+        let replay = try authority.dispatch(method: "bot.send", params: params)
+        XCTAssertEqual(started as NSDictionary, replay as NSDictionary)
+        XCTAssertEqual(sendCalls, 1)
+        XCTAssertEqual(started["host_id"] as? String, hostID)
+        XCTAssertEqual(started["request_id"] as? String, "runtime-send")
+        XCTAssertEqual(started["client_request_id"] as? String, "runtime-send")
+        XCTAssertEqual(started["bot_id"] as? String, botID)
+        let readback = try XCTUnwrap(started["readback"] as? [String: Any])
+        XCTAssertEqual(readback["host_id"] as? String, hostID)
+        XCTAssertEqual(readback["request_id"] as? String, "runtime-send")
+        XCTAssertEqual(readback["client_request_id"] as? String, "runtime-send")
+        XCTAssertEqual(readback["bot_id"] as? String, botID)
+        XCTAssertEqual(readback["conversation_id"] as? String, conversationID)
+        XCTAssertEqual(readback["run_id"] as? String, runID)
+        XCTAssertEqual(readback["enqueued"] as? Bool, false)
+        let run = try XCTUnwrap(readback["run"] as? [String: Any])
+        XCTAssertEqual(run["host_id"] as? String, hostID)
+        XCTAssertEqual(run["request_id"] as? String, "runtime-send")
+        XCTAssertEqual(run["client_request_id"] as? String, "runtime-send")
+        XCTAssertEqual(run["bot_id"] as? String, botID)
+        XCTAssertEqual(run["conversation_id"] as? String, conversationID)
+        XCTAssertEqual(run["run_id"] as? String, runID)
+        XCTAssertEqual(run["thread_id"] as? String, threadID)
+
+        authority.onSend = nil
+        let queued = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "runtime-queued",
+            "host_id": hostID,
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "Queue for the same conversation",
+        ])
+        let queuedReadback = try XCTUnwrap(queued["readback"] as? [String: Any])
+        XCTAssertEqual(queuedReadback["enqueued"] as? Bool, true)
+        XCTAssertEqual(queuedReadback["run_id"] as? String, runID)
+        let itemID = try XCTUnwrap(queuedReadback["id"] as? String)
+        let queue = try XCTUnwrap(queuedReadback["queue"] as? [[String: Any]])
+        XCTAssertTrue(queue.contains {
+            $0["id"] as? String == itemID
+                && $0["bot_id"] as? String == botID
+                && $0["conversation_id"] as? String == conversationID
+        })
+    }
+
     /// WHY: a routing choice is an admitted host capability, not an iOS hint.
     /// The exact outer receipt and run-as tuple must bind one conversation/run
     /// and must not be reusable after response loss or relaunch.
@@ -168,6 +253,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(admittedReadback["run_as_user"] as? NSDictionary, runAs as NSDictionary)
 
         let expectedRunID = UUID().uuidString.lowercased()
+        let expectedThreadID = UUID().uuidString.lowercased()
         authority.onHasLiveRun = { _ in true }
         authority.onSend = { callbackBotID, callbackText, callbackConversationID, callbackRouting in
             XCTAssertEqual(callbackBotID.value.uuidString.lowercased(), botID)
@@ -178,8 +264,10 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             return [
                 "bot_id": botID,
                 "conversation_id": conversationID,
+                "thread_id": expectedThreadID,
                 "run_id": expectedRunID,
                 "enqueued": true,
+                "queued_follow_up": false,
             ]
         }
         let sendParams: [String: Any] = [

@@ -2880,6 +2880,106 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         }
     }
 
+    /// WHY: a Bot send is not usable on iOS without one exact receipt plus a
+    /// lifecycle event that survives response replay without a second effect.
+    func test_botSendPublishesExactStartedOrQueuedLifecycleOnce() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let conversationID = UUID().uuidString.lowercased()
+        let runID = UUID().uuidString.lowercased()
+        let threadID = UUID().uuidString.lowercased()
+        for (index, queued) in [false, true].enumerated() {
+            let requestID = queued ? "bot-send-queued" : "bot-send-started"
+            var readback: [String: JSONValue] = [
+                "host_id": .string(Phase4LiveServer.hostId),
+                "bot_id": .string(botID),
+                "conversation_id": .string(conversationID),
+                "request_id": .string(requestID),
+                "client_request_id": .string(requestID),
+                "run_id": .string(runID),
+                "enqueued": .bool(queued),
+            ]
+            if queued {
+                readback["id"] = .string("queue-item")
+                readback["queue"] = .array([])
+            } else {
+                readback["run"] = .object([
+                    "host_id": .string(Phase4LiveServer.hostId),
+                    "bot_id": .string(botID),
+                    "conversation_id": .string(conversationID),
+                    "request_id": .string(requestID),
+                    "client_request_id": .string(requestID),
+                    "run_id": .string(runID),
+                    "thread_id": .string(threadID),
+                ])
+            }
+            let router = Phase4ReceiptFakeRouter()
+            router.pairedBotRemoteResult = .object([
+                "status": .string("completed"),
+                "host_id": .string(Phase4LiveServer.hostId),
+                "bot_id": .string(botID),
+                "request_id": .string(requestID),
+                "client_request_id": .string(requestID),
+                "receipt_id": .string("receipt-\(index)"),
+                "readback": .object(readback),
+            ])
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(1_530 + index))
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "send")
+            params.removeValue(forKey: "thread_id")
+            params["bot_id"] = botID
+            params["conversation_id"] = conversationID
+
+            let first = try await live.rpc(method: "bot.send", params: params)
+            let replay = try await live.rpc(method: "bot.send", params: params)
+            XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary)
+            XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
+            XCTAssertEqual(router.finalizationCallCount, 1)
+            let events = try XCTUnwrap(router.finalizedEvents["bot.send:\(requestID)"])
+            XCTAssertEqual(events.map(\.kind), [
+                "bot.message.accepted",
+                queued ? "bot.message.queued" : "bot.run.started",
+            ])
+            let payload = try XCTUnwrap(events.last?.payload.objectValue)
+            XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId)
+            XCTAssertEqual(payload["bot_id"]?.stringValue, botID)
+            XCTAssertEqual(payload["conversation_id"]?.stringValue, conversationID)
+            XCTAssertEqual(payload["request_id"]?.stringValue, requestID)
+            XCTAssertEqual(payload["client_request_id"]?.stringValue, requestID)
+            XCTAssertEqual(payload["run_id"]?.stringValue, runID)
+            live.stop()
+        }
+    }
+
+    /// WHY: response loss must retain the original request identity without a
+    /// second Bot effect or any falsely committed lifecycle event.
+    func test_botSendResponseLossDoesNotReplayEffectOrLifecycleEvent() async throws {
+        let requestID = "bot-send-response-loss"
+        let botID = UUID().uuidString.lowercased()
+        let router = Phase4ReceiptFakeRouter()
+        router.finalizationPersistenceUnavailable = true
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "host_id": .string(Phase4LiveServer.hostId),
+            "bot_id": .string(botID),
+            "request_id": .string(requestID),
+            "client_request_id": .string(requestID),
+            "receipt_id": .string("lost-receipt"),
+            "readback": .object([:]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_532)
+        defer { live.stop() }
+        var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "lost")
+        params.removeValue(forKey: "thread_id")
+        params["bot_id"] = botID
+
+        let first = try await live.rpc(method: "bot.send", params: params)
+        let replay = try await live.rpc(method: "bot.send", params: params)
+        XCTAssertEqual(errorCode(first), commandOutcomeUnknown)
+        XCTAssertEqual(errorCode(replay), commandOutcomeUnknown)
+        XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(router.finalizationCallCount, 0)
+        XCTAssertNil(router.finalizedEvents["bot.send:\(requestID)"])
+    }
+
     /// WHY: Files/Browser projections are invalid without their authority
     /// coordinates. Phase4 must publish those exact completed fields once,
     /// while accepted and failed receipts remain eventless.

@@ -1129,8 +1129,50 @@ public final class JSONRPCDispatcher {
             if let body = object["body"]?.stringValue { payload["body"] = .string(body) }
             return .object(payload)
         }
+        func canonicalBotSendLifecycle(
+            receipt: [String: JSONValue],
+            readback: [String: JSONValue]
+        ) -> (kind: String, payload: JSONValue)? {
+            guard let hostID = receipt["host_id"]?.stringValue,
+                  let botID = receipt["bot_id"]?.stringValue,
+                  let requestID = receipt["request_id"]?.stringValue,
+                  receipt["client_request_id"]?.stringValue == requestID,
+                  readback["host_id"]?.stringValue == hostID,
+                  readback["bot_id"]?.stringValue == botID,
+                  readback["request_id"]?.stringValue == requestID,
+                  readback["client_request_id"]?.stringValue == requestID,
+                  let runID = readback["run_id"]?.stringValue,
+                  !hostID.isEmpty, !botID.isEmpty, !requestID.isEmpty, !runID.isEmpty,
+                  let enqueued = readback["enqueued"]?.boolValue else { return nil }
+            let conversationID = readback["conversation_id"] ?? .null
+            var payload: [String: JSONValue] = [
+                "host_id": .string(hostID),
+                "bot_id": .string(botID),
+                "conversation_id": conversationID,
+                "request_id": .string(requestID),
+                "client_request_id": .string(requestID),
+                "run_id": .string(runID),
+            ]
+            if enqueued {
+                guard let itemID = readback["id"]?.stringValue, !itemID.isEmpty else { return nil }
+                payload["queue_item_id"] = .string(itemID)
+                return ("bot.message.queued", .object(payload))
+            }
+            guard let run = readback["run"]?.objectValue,
+                  run["host_id"]?.stringValue == hostID,
+                  run["bot_id"]?.stringValue == botID,
+                  run["request_id"]?.stringValue == requestID,
+                  run["client_request_id"]?.stringValue == requestID,
+                  run["run_id"]?.stringValue == runID,
+                  (run["conversation_id"] ?? .null) == conversationID else { return nil }
+            if let threadID = run["thread_id"]?.stringValue, !threadID.isEmpty {
+                payload["thread_id"] = .string(threadID)
+            }
+            return ("bot.run.started", .object(payload))
+        }
         var payload: [String: JSONValue] = [:]
         var botNotifications: [JSONValue] = []
+        var botLifecycleEvents: [(kind: String, payload: JSONValue)] = []
         let kind: String
         switch method {
         case "agent.message.send":
@@ -1241,11 +1283,18 @@ public final class JSONRPCDispatcher {
             payload["method"] = .string(botMethod)
             payload["request_id"] = object["request_id"]
                 ?? string("client_request_id")
+            payload["client_request_id"] = object["client_request_id"]
+                ?? object["request_id"]
+                ?? string("client_request_id")
             payload["receipt_id"] = object["receipt_id"]
             payload["bot_id"] = object["bot_id"]
                 ?? object["readback"]?.objectValue?["bot_id"]
                 ?? string("bot_id")
             if let readback = object["readback"]?.objectValue {
+                if botMethod == "bot.send",
+                   let lifecycle = canonicalBotSendLifecycle(receipt: object, readback: readback) {
+                    botLifecycleEvents.append(lifecycle)
+                }
                 if let notification = readback["notification"].flatMap(canonicalBotNotification) {
                     botNotifications.append(notification)
                 }
@@ -1261,10 +1310,10 @@ public final class JSONRPCDispatcher {
                 payload["routing_receipt_id"] = readback["routing_receipt_id"]
                 payload["key"] = readback["key"] ?? string("key")
                 for key in [
-                    "host_id", "root", "root_handle", "handle", "generation", "previous_generation",
+                    "host_id", "client_request_id", "root", "root_handle", "handle", "generation", "previous_generation",
                     "root_cas", "previous_cas", "expected_cas", "current_cas",
                     "entry_generation", "entry_cas", "path", "op",
-                    "profile_id", "attention_item_id", "notification_id", "source",
+                    "profile_id", "attention_item_id", "notification_id", "source", "enqueued", "id",
                     "surface_id", "snapshot_generation", "url", "title", "loading", "action",
                     "session_before_digest", "session_after_digest", "cleared", "removed_count", "partial",
                 ] {
@@ -1277,6 +1326,9 @@ public final class JSONRPCDispatcher {
             return
         }
         EventBus.shared.publish(kind: kind, payload: .object(payload.compactMapValues { $0 }))
+        for event in botLifecycleEvents {
+            EventBus.shared.publish(kind: event.kind, payload: event.payload)
+        }
         for notification in botNotifications {
             EventBus.shared.publish(kind: "notification.created", payload: notification)
         }

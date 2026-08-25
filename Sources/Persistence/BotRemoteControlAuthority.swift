@@ -520,6 +520,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let text = string(params, "text")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !text.isEmpty else { throw Error.invalidParams }
         let botID = id(bot)
+        let hostID = string(params, "host_id") ?? ""
         let requestedConversationID = string(params, "conversation_id")
         let conversation: BotConversationID?
         if let requestedConversationID, !requestedConversationID.isEmpty {
@@ -565,7 +566,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             let stored = try store.enqueueQueuedFollowUp(
                 BotQueuedFollowUpRecord(
                     botID: bot.id,
-                    conversationID: selectedConversation[botID],
+                    conversationID: requestedConversationID ?? selectedConversation[botID],
                     text: text,
                     payloadJSON: payloadJSON,
                     createdAt: now
@@ -574,27 +575,47 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             if let routingReceiptID = routing["routing_receipt_id"] as? String {
                 consumedRoutingReceipts.insert(routingReceiptID)
             }
-            return receipt(requestID: requestID, status: .completed, botID: botID, readback: [
-                "enqueued": true,
-                "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
-                "id": stored.id,
-                "conversation_id": (requestedConversationID ?? selectedConversation[botID])
-                    .map { $0 as Any } ?? NSNull(),
-                "run_id": liveRuns[botID]?["run_id"] ?? NSNull(),
-                "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
-                "effective_routing": routing,
-            ])
+            let conversationID = requestedConversationID ?? selectedConversation[botID]
+            let runID = liveRuns[botID]?["run_id"] as? String ?? ""
+            return runtimeReceipt(
+                requestID: requestID,
+                hostID: hostID,
+                botID: botID,
+                conversationID: conversationID,
+                runID: runID,
+                readback: [
+                    "enqueued": true,
+                    "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
+                    "id": stored.id,
+                    "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
+                    "effective_routing": routing,
+                ]
+            )
         }
         let authoritativeSend: [String: Any]
         if let onSend {
             authoritativeSend = try onSend(bot.id, text, conversation, routing)
+            guard authoritativeSend["bot_id"] as? String == botID,
+                  let admittedConversationID = authoritativeSend["conversation_id"] as? String,
+                  let admittedConversationUUID = UUID(uuidString: admittedConversationID),
+                  let admittedConversation = try store.conversation(
+                    id: BotConversationID(admittedConversationUUID)
+                  ),
+                  admittedConversation.botID == bot.id,
+                  let admittedRunID = authoritativeSend["run_id"] as? String,
+                  !admittedRunID.isEmpty,
+                  let admittedThreadID = authoritativeSend["thread_id"] as? String,
+                  !admittedThreadID.isEmpty,
+                  authoritativeSend["queued_follow_up"] as? Bool != nil else {
+                throw Error.crossTarget
+            }
         } else {
             authoritativeSend = [
                 "bot_id": botID,
                 "conversation_id": (requestedConversationID ?? selectedConversation[botID])
                     .map { $0 as Any } ?? NSNull(),
                 "run_id": UUID().uuidString.lowercased(),
-                "enqueued": true,
+                "enqueued": false,
             ]
         }
         let runID = authoritativeSend["run_id"] as? String
@@ -602,8 +623,27 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let conversationID = authoritativeSend["conversation_id"] as? String
             ?? requestedConversationID
             ?? selectedConversation[botID]
-        liveRuns[botID] = [
+        if authoritativeSend["queued_follow_up"] as? Bool == true {
+            return runtimeReceipt(
+                requestID: requestID,
+                hostID: hostID,
+                botID: botID,
+                conversationID: conversationID,
+                runID: runID,
+                readback: [
+                    "enqueued": true,
+                    "id": authoritativeSend["id"] ?? NSNull(),
+                    "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
+                    "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
+                    "effective_routing": routing,
+                ]
+            )
+        }
+        var liveRun: [String: Any] = [
             "bot_id": botID,
+            "host_id": hostID,
+            "request_id": requestID,
+            "client_request_id": requestID,
             "status": "working",
             "text": text,
             "started_at": now.timeIntervalSince1970,
@@ -611,6 +651,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "conversation_id": conversationID ?? NSNull(),
             "routing": routing,
         ]
+        if let threadID = authoritativeSend["thread_id"] as? String, !threadID.isEmpty {
+            liveRun["thread_id"] = threadID
+        }
+        liveRuns[botID] = liveRun
         attention[botID] = canonicalAttentionItem([
             "id": UUID().uuidString.lowercased(),
             "bot_id": botID,
@@ -628,15 +672,20 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         if let routingReceiptID = routing["routing_receipt_id"] as? String {
             consumedRoutingReceipts.insert(routingReceiptID)
         }
-        return receipt(requestID: requestID, status: .completed, botID: botID, readback: [
-            "enqueued": authoritativeSend["enqueued"] as? Bool ?? false,
-            "run": liveRuns[botID] as Any,
-            "workspace": NSNull(),
-            "conversation_id": conversationID as Any,
-            "run_id": runID,
-            "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
-            "effective_routing": routing,
-        ])
+        return runtimeReceipt(
+            requestID: requestID,
+            hostID: hostID,
+            botID: botID,
+            conversationID: conversationID,
+            runID: runID,
+            readback: [
+                "enqueued": false,
+                "run": liveRuns[botID] as Any,
+                "workspace": NSNull(),
+                "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
+                "effective_routing": routing,
+            ]
+        )
     }
 
     private func queueRemove(params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -1605,6 +1654,32 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "bot_id": botID as Any,
             "readback": readback,
         ]
+    }
+
+    private func runtimeReceipt(
+        requestID: String,
+        hostID: String,
+        botID: String,
+        conversationID: String?,
+        runID: String,
+        readback: [String: Any]
+    ) -> [String: Any] {
+        var exactReadback = readback
+        exactReadback["host_id"] = hostID
+        exactReadback["bot_id"] = botID
+        exactReadback["request_id"] = requestID
+        exactReadback["client_request_id"] = requestID
+        exactReadback["conversation_id"] = conversationID ?? NSNull()
+        exactReadback["run_id"] = runID
+        var exactReceipt = receipt(
+            requestID: requestID,
+            status: .completed,
+            botID: botID,
+            readback: exactReadback
+        )
+        exactReceipt["host_id"] = hostID
+        exactReceipt["client_request_id"] = requestID
+        return exactReceipt
     }
 
     private func effectiveRouting(
