@@ -5273,8 +5273,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             providerInstanceId: providerInstanceId,
                             model: model,
                             permissionMode: permissionMode, reasoningEffort: reasoningEffort,
-                            executionMode: executionMode,
-                            baseBranch: executionMode == .worktree ? (baseBranch.isEmpty ? (gitBranch ?? "main") : baseBranch) : nil,
                             serviceTier: serviceTier, modelSelection: currentModelSelection,
                             runAsUser: runAsUser, routingConfiguration: routingConfiguration)
         let prunedThreadIDs: [AgentThreadID]

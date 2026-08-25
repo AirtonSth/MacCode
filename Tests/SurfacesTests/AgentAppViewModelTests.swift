@@ -863,6 +863,24 @@ final class AgentAppViewModelTests: XCTestCase {
                        "execution mode must lock after conversation start so a long-running agent cannot silently move between local and worktree cwd")
     }
 
+    func test_newThreadDoesNotInheritWorktreeExecution() throws {
+        let (vm, repo) = try makeVM()
+        vm.gitBranch = "production"
+        vm.createThread(title: "isolated source")
+        vm.setExecutionMode(.worktree)
+        vm.setBaseBranch("production")
+
+        vm.createThread(title: "local successor")
+
+        let thread = try XCTUnwrap(try repo.get(id: try XCTUnwrap(vm.selectedThreadId)))
+        XCTAssertEqual(thread.executionMode, .local,
+                       "a new thread must not create a worktree just because the previous thread used one")
+        XCTAssertNil(thread.baseBranch,
+                     "a local new thread must not retain the previous worktree base branch")
+        XCTAssertNil(thread.worktreePath,
+                     "a new thread must not point at a workspace it did not explicitly create")
+    }
+
     func test_providerStatusMessageComesFromSnapshot() throws {
         let (vm, _) = try makeVM()
         vm.provider = .codex
