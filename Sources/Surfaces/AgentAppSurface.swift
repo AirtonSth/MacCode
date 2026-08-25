@@ -358,6 +358,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// switch; read through `backgroundShellCount`, which also gates on a live
     /// run so a finished run cannot leave a stale count on screen.
     @Published public private(set) var liveBackgroundShellCount: Int = 0
+    /// Named CLI background tasks (type + description) for the Stop strip.
+    /// Gated through `visibleBackgroundTasks` so a finished run cannot keep
+    /// advertising work the adapter already dropped.
+    @Published public private(set) var liveBackgroundTasks: [AgentBackgroundTask] = []
     /// Thread footer display figure (credible total: measured + dialect + …).
     /// 0 when Token Saver is off, not subscribed, or no savings yet.
     @Published public private(set) var tokenSaverThreadSavedTokens: Int = 0
@@ -1793,6 +1797,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // count on its next snapshot, so carrying the previous thread's
         // shell count over would advertise work that isn't this thread's.
         liveBackgroundShellCount = 0
+        liveBackgroundTasks = []
         // Plan-suppression is per open thread session: do not carry a queued
         // follow-up suppress flag onto a different thread's durable plan.
         suppressStaleActivePlanUpdates = false
@@ -3530,9 +3535,58 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
     }
 
+    public var visibleBackgroundTasks: [AgentBackgroundTask] {
+        Self.visibleBackgroundTasks(
+            reported: liveBackgroundTasks,
+            runIsLive: selectedThreadRunIsStartingOrRunning
+        )
+    }
+
+    /// Named work holding Stop, or nil when the run is idle / has no CLI tasks.
+    public var backgroundHoldSummary: AgentBackgroundHoldSummary? {
+        let tasks = Self.enrichingBackgroundTasks(
+            visibleBackgroundTasks,
+            timeline: timeline
+        )
+        guard !tasks.isEmpty else { return nil }
+        return AgentBackgroundHoldSummary(tasks: tasks)
+    }
+
+    /// CLI `task_started` rows already land in the timeline as
+    /// "Background shell" / "Background agent" with the human `description`.
+    /// Their `task_id` is the timeline item's id, so details are joined only to
+    /// the exact snapshot id that owns them.
+    nonisolated static func enrichingBackgroundTasks(
+        _ tasks: [AgentBackgroundTask],
+        timeline: AssistantTimelineState
+    ) -> [AgentBackgroundTask] {
+        var latestItemsByID: [String: AssistantItem] = [:]
+        for item in timeline.turns.flatMap(\.items).reversed() where latestItemsByID[item.id] == nil {
+            latestItemsByID[item.id] = item
+        }
+        return tasks.map { task in
+            guard task.description == nil, let item = latestItemsByID[task.id] else { return task }
+            let summary = item.summary ?? ""
+            let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            let kind: AgentBackgroundTaskKind
+            if summary == "Background shell" { kind = .shell }
+            else if summary == "Background agent" { kind = .agent }
+            else { return task }
+            let enriched = AgentBackgroundTask(id: task.id, kind: kind, description: body)
+            return enriched.description == nil ? AgentBackgroundTask(id: task.id, kind: kind) : enriched
+        }
+    }
+
     /// Pure seam for the staleness gate above.
     nonisolated static func visibleBackgroundShellCount(reported: Int, runIsLive: Bool) -> Int {
         runIsLive ? reported : 0
+    }
+
+    nonisolated static func visibleBackgroundTasks(
+        reported: [AgentBackgroundTask],
+        runIsLive: Bool
+    ) -> [AgentBackgroundTask] {
+        runIsLive ? reported : []
     }
 
     /// Reason for the incomplete-turn chrome, if any (drives Continue prompt).
@@ -5659,6 +5713,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         providerThreadSnapshotLastConfirmedAt = nil
         selectedThreadHasRecoverableContext = false
         liveBackgroundShellCount = 0
+        liveBackgroundTasks = []
         currentRunId = nil
         runStartedAt = nil
         stopScheduledLivePoll()
@@ -6927,6 +6982,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // never be left permanently loading.
         // Run identity is fixed at acceptance so Stop can cancel this generation.
         let runId = requestedRunId ?? AgentRunID()
+        // A prior run's last snapshot is not evidence for this run. Clear the
+        // holder projection at acceptance, before the new run becomes live, so
+        // an idle → new-run transition cannot resurrect old Stop-strip details.
+        if selectedThreadId == tid {
+            liveBackgroundShellCount = 0
+            liveBackgroundTasks = []
+        }
         // S5: accept surface-owned preparation generation before any Graphify work.
         // Capture the generation for this startProviderRun invocation — never
         // re-read state.generation after await (Stop + resend can advance it).
@@ -7779,6 +7841,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             status: status,
             lastErrorRecoverable: lastErrorRecoverable,
             liveBackgroundShellCount: liveBackgroundShellCount,
+            liveBackgroundTasks: liveBackgroundTasks,
             runsAllowedToMarkActive: allowedActiveRuns,
             entries: pending.map { StreamQuantumEntry(event: $0.0, run: $0.1, threadId: $0.2) }
         )
@@ -7844,12 +7907,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         var nextStatus = input.status
         var nextLastErrorRecoverable = input.lastErrorRecoverable
         var nextBackgroundShellCount = input.liveBackgroundShellCount
+        var nextBackgroundTasks = input.liveBackgroundTasks
         var suppress = input.suppressStaleActivePlanUpdates
         var appliedEvent = false
         var seedRunStartedAt = false
         var runThreadBindings: [AgentRunID: AgentThreadID] = [:]
         var hasProposedPlan = false
         var appliedEvents: [AssistantEvent] = []
+        var holderRunId = input.currentRunId
         appliedEvents.reserveCapacity(input.entries.count)
 
         for entry in input.entries {
@@ -7868,8 +7933,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             appliedEvent = true
             appliedEvents.append(entry.event)
-            if let count = backgroundShellCount(fromRuntimeEvent: entry.event) {
-                nextBackgroundShellCount = count
+            if case .turnStarted = entry.event, holderRunId != entry.run {
+                // A new run owns a fresh pending-task set. Do this before any
+                // snapshot from that run can repopulate the holder projection.
+                nextBackgroundShellCount = 0
+                nextBackgroundTasks = []
+                holderRunId = entry.run
+            }
+            if entry.run == holderRunId,
+               let tasks = backgroundTasks(fromRuntimeEvent: entry.event) {
+                nextBackgroundTasks = tasks
+                nextBackgroundShellCount = tasks.count
             }
             if input.runsAllowedToMarkActive.contains(entry.run) {
                 nextCurrentRunId = entry.run
@@ -7912,6 +7986,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             status: nextStatus,
             lastErrorRecoverable: nextLastErrorRecoverable,
             liveBackgroundShellCount: nextBackgroundShellCount,
+            liveBackgroundTasks: nextBackgroundTasks,
             suppressStaleActivePlanUpdates: suppress,
             seedRunStartedAt: seedRunStartedAt,
             runThreadBindings: runThreadBindings,
@@ -8016,6 +8091,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if liveBackgroundShellCount != reduced.liveBackgroundShellCount {
             liveBackgroundShellCount = reduced.liveBackgroundShellCount
         }
+        if liveBackgroundTasks != reduced.liveBackgroundTasks {
+            liveBackgroundTasks = reduced.liveBackgroundTasks
+        }
         timeline = reduced.timeline
         let budget = Self.aggregateBudgetDecision(
             force: reduced.forceAggregateBudget,
@@ -8050,13 +8128,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// report background tasks). Returning nil rather than 0 is deliberate: an
     /// unrelated event must not clear a live count. Pure, for unit testing.
     nonisolated static func backgroundShellCount(fromRuntimeEvent event: AssistantEvent) -> Int? {
+        backgroundTasks(fromRuntimeEvent: event)?.count
+    }
+
+    /// CLI background task ids from the adapter's `claude.session.snapshot`.
+    /// Timeline task rows carry the human type/description and are joined by
+    /// exact task id in `enrichingBackgroundTasks`. nil when the event is not
+    /// a snapshot that carries the producer's id field.
+    nonisolated static func backgroundTasks(fromRuntimeEvent event: AssistantEvent) -> [AgentBackgroundTask]? {
         guard case .providerRuntime(let runtime) = event,
               runtime.provider == .claude,
               runtime.method == "claude.session.snapshot",
               let data = runtime.payloadJSON.data(using: .utf8),
-              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let ids = payload["pendingBackgroundTaskIds"] as? [String] else { return nil }
-        return ids.count
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        guard let ids = payload["pendingBackgroundTaskIds"] as? [String] else { return nil }
+        return AgentBackgroundTask.placeholders(fromIds: ids)
     }
 
     /// Apply one event that the hot queue refused, without growing the queue.
@@ -8699,6 +8787,7 @@ struct StreamQuantumReduceInput: Sendable {
     let status: AgentRunStatus
     let lastErrorRecoverable: Bool
     let liveBackgroundShellCount: Int
+    let liveBackgroundTasks: [AgentBackgroundTask]
     let runsAllowedToMarkActive: Set<AgentRunID>
     let entries: [StreamQuantumEntry]
 }
@@ -8711,6 +8800,7 @@ struct StreamQuantumReduceResult: Sendable {
     let status: AgentRunStatus
     let lastErrorRecoverable: Bool
     let liveBackgroundShellCount: Int
+    let liveBackgroundTasks: [AgentBackgroundTask]
     let suppressStaleActivePlanUpdates: Bool
     let seedRunStartedAt: Bool
     let runThreadBindings: [AgentRunID: AgentThreadID]
@@ -13034,6 +13124,7 @@ public struct AgentAppView: View {
                                     context: activeBotPeerReviewName.map {
                                         AgentChatWorkingContext.reviewing(peerName: $0)
                                     },
+                                    hold: vm.backgroundHoldSummary,
                                     onStop: { vm.stop() }
                                 )
                                 .id("agent.workingStatus")
@@ -15875,7 +15966,11 @@ public struct AgentAppView: View {
             guard let start = vm.runStartedAt else { return nil }
             return max(0, Int(vm.currentTime().timeIntervalSince(start)))
         }()
-        if let label = AgentWorkingStripPresentation.label(phase: phase, elapsedSeconds: elapsed) {
+        if let label = AgentWorkingStripPresentation.label(
+            phase: phase,
+            elapsedSeconds: elapsed,
+            hold: vm.backgroundHoldSummary
+        ) {
             let tone: DSPill.Tone = {
                 switch phase {
                 case .awaitingBackground: return .warning
@@ -15883,12 +15978,15 @@ public struct AgentAppView: View {
                 case .idle: return .neutral
                 }
             }()
+            let holdHelp = vm.backgroundHoldSummary.map {
+                $0.accessibilityLabel(elapsedSeconds: elapsed ?? 0)
+            }
             AgentChatWorkingPill(
                 label: label,
                 identifier: "agent.workingPhase",
                 tone: tone,
-                help: phase.accessibilityLabel,
-                accessibilityLabelText: phase.accessibilityLabel,
+                help: vm.backgroundHoldSummary?.helpText ?? phase.accessibilityLabel,
+                accessibilityLabelText: holdHelp ?? phase.accessibilityLabel,
                 padded: false
             )
         } else {

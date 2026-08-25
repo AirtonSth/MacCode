@@ -550,6 +550,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
             status: .pending,
             lastErrorRecoverable: false,
             liveBackgroundShellCount: 0,
+            liveBackgroundTasks: [],
             runsAllowedToMarkActive: [run],
             entries: [
                 StreamQuantumEntry(event: .turnStarted(turnId: turnId), run: run, threadId: tid),
@@ -592,6 +593,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
             status: .pending,
             lastErrorRecoverable: false,
             liveBackgroundShellCount: 0,
+            liveBackgroundTasks: [],
             runsAllowedToMarkActive: [allowed],
             entries: [
                 StreamQuantumEntry(event: .turnStarted(turnId: "other"), run: denied, threadId: other),
@@ -1165,6 +1167,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
             status: .pending,
             lastErrorRecoverable: false,
             liveBackgroundShellCount: 0,
+            liveBackgroundTasks: [],
             runsAllowedToMarkActive: [run],
             entries: entries
         )
@@ -1346,6 +1349,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
             status: .running,
             lastErrorRecoverable: false,
             liveBackgroundShellCount: 0,
+            liveBackgroundTasks: [],
             suppressStaleActivePlanUpdates: false,
             seedRunStartedAt: false,
             runThreadBindings: [:],
